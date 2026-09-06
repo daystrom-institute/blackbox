@@ -186,7 +186,9 @@ mod tests {
     use std::sync::Arc;
 
     fn test_server(root: &Path) -> BlackboxServer {
-        BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(root)))
+        BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(
+            &root.join("bro"),
+        )))
     }
 
     #[test]

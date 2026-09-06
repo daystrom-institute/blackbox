@@ -776,7 +776,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_allocator_status",
         category: ToolCategory::Orchestration,
         summary: "Read pool-backed runtime allocation config plus bounded in-flight, probe, lease, and preview-candidate pages.",
-        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, and current runtime state. in_flight, probes, leases, and preview.candidates are paged (default 20, maximum 100 rows); continue each section from its next_offset. Probe rows are compact lane status; read one exact lane record with bro_allocator_probe body paging. Pass tier/pool/capability/pin fields to preview the candidate table without spawning a task or writing a lease.",
+        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, and current runtime state. in_flight, probes, leases, and preview.candidates are paged (default 20, maximum 100 rows); continue each section from its next_offset. Large sections become counts with exact recovery hints. detail=config|preview|in_flight|probes|leases returns exact JSON body pages; continue with body.next_cursor while preserving runtime selectors. candidate_offset pages preview.candidates. Read one exact lane record with bro_allocator_probe body paging. Pass tier/pool/capability/pin fields to preview the candidate table without spawning a task or writing a lease.",
         example: Some(
             r#"bro_allocator_status(project_dir="/repo/x", tier="standard", pool_name="coding")"#,
         ),

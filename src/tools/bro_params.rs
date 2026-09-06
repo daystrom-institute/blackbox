@@ -369,6 +369,18 @@ pub(crate) struct AllocatorStatusParams {
     /// Continue the lease inventory page from its next_offset.
     #[serde(default)]
     pub(crate) lease_offset: Option<usize>,
+    /// Exact JSON plane: config, preview, in_flight, probes, or leases.
+    /// Live state changes reject continuation; restart without cursor.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per exact body page (default/max 4096).
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
+    /// Continue the preview candidates using candidates.next_offset.
+    #[serde(default)]
+    pub(crate) candidate_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

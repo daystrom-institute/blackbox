@@ -602,7 +602,8 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(reconstructed, long_note, "exact note must reconstruct");
+        let recovered: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered["note"], long_note, "exact note must reconstruct");
 
         // detail=note without note_index is rejected.
         let missing_index = server
@@ -640,7 +641,7 @@ mod tests {
             handoff_page["body"]["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("指針 🦀"),
+                .contains("指針 🦀"),
             "{handoff_page}"
         );
 

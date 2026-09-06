@@ -421,9 +421,18 @@ fn apply_tool_and_audit_tool() {
         mode: None,
     };
     let report_text = store.audit_tool(&audit_params).unwrap();
-    assert!(report_text.contains("\"total\": 5"));
-    assert!(report_text.contains("\"correct\": 5"));
-    assert!(report_text.contains("\"fidelity\": 1.0"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report_text).unwrap()["total"],
+        5
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report_text).unwrap()["correct"],
+        5
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report_text).unwrap()["fidelity"],
+        1.0
+    );
 }
 
 #[test]
@@ -445,8 +454,14 @@ fn audit_flags_mismatches() {
             mode: None,
         })
         .unwrap();
-    assert!(report_text.contains("\"total\": 2"));
-    assert!(report_text.contains("\"correct\": 1"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report_text).unwrap()["total"],
+        2
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report_text).unwrap()["correct"],
+        1
+    );
 }
 
 #[test]

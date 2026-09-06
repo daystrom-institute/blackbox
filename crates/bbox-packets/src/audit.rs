@@ -379,8 +379,17 @@ mod tests {
                 mode: Some(ApplyMode::All),
             })
             .unwrap();
-        assert!(report.contains("\"mode\": \"all\""));
-        assert!(report.contains("\"correct\": 1"));
-        assert!(report.contains("\"fidelity\": 1.0"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report).unwrap()["mode"],
+            "all"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report).unwrap()["correct"],
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report).unwrap()["fidelity"],
+            1.0
+        );
     }
 }

@@ -100,20 +100,22 @@ impl AnthropicTransport {
             })
             .collect();
         if opts.web_search && !self.is_kimi() {
-            // Server-side; provider executes it and returns results inline.
-            // The `input_schema` is redundant for Anthropic/GLM/DeepSeek (which
-            // ignore it on a typed server tool) but REQUIRED by MiniMax, whose
-            // Anthropic-compatible endpoint validates that every tool block —
-            // server tools included — carries a non-empty schema and otherwise
-            // rejects the whole request with `invalid_request_error` 2013
-            // ("function name or parameters is empty"). Verified live: GLM and
-            // DeepSeek run the search identically with the field present.
-            tool_defs.push(json!({
+            // Typed server tools own their input schema. MiniMax's compatible
+            // endpoint requires an extra schema, so keep that variation local
+            // to MiniMax instead of injecting it into every provider request.
+            let mut search = json!({
                 "type": "web_search_20250305",
                 "name": "web_search",
                 "max_uses": 5,
-                "input_schema": { "type": "object", "properties": {} },
-            }));
+            });
+            let minimax = match self.provider.as_deref() {
+                Some(provider) => provider == "minimax",
+                None => self.is_minimax(),
+            };
+            if minimax {
+                search["input_schema"] = json!({"type":"object", "properties":{}});
+            }
+            tool_defs.push(search);
         }
 
         let cc = cache_control(self.is_minimax());
@@ -1132,21 +1134,31 @@ mod tests {
     }
 
     #[test]
-    fn web_search_tool_carries_input_schema() {
-        // MiniMax's Anthropic-compatible endpoint rejects (error 2013) any tool
-        // block — server tools included — that lacks a non-empty input_schema;
-        // GLM/DeepSeek/Anthropic ignore the field. Keep it present so the one
-        // server tool the harness injects stays portable across all three.
+    fn server_search_schema_variation_is_local_to_minimax() {
         let mut o = opts(SystemPrompt::default());
         o.web_search = true;
-        let body = transport().build_body(&[], &o);
-        let tools = body["tools"].as_array().expect("tools array");
-        let ws = tools
-            .iter()
-            .find(|t| t["type"] == "web_search_20250305")
-            .expect("web_search tool present when web_search enabled");
-        assert_eq!(ws["input_schema"]["type"], "object");
-        assert!(ws["input_schema"].get("properties").is_some());
+        for provider in [None, Some("glm"), Some("deepseek"), Some("minimax")] {
+            let mut tx = transport();
+            tx.provider = provider.map(str::to_owned);
+            tx.base_url = "https://gateway.invalid/anthropic".into();
+            let body = tx.build_body(&[], &o);
+            let search = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["type"] == "web_search_20250305")
+                .unwrap();
+            assert_eq!(search["name"], "web_search");
+            assert_eq!(search["max_uses"], 5);
+            assert_eq!(
+                search.get("input_schema").is_some(),
+                provider == Some("minimax")
+            );
+        }
+        let mut standalone = transport();
+        standalone.base_url = "https://api.minimax.io/anthropic".into();
+        let body = standalone.build_body(&[], &o);
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     }
 
     #[test]

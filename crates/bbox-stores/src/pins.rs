@@ -1098,7 +1098,8 @@ mod tests {
         assert!(preview.len() <= 200, "preview must be bounded: {preview:?}");
         assert_eq!(row["content_truncated"], true);
         let huge_prefix: String = huge.chars().take(10).collect();
-        assert!(!preview.contains(&huge_prefix));
+        assert!(preview.starts_with(&huge_prefix));
+        assert!(!preview.contains(&huge));
 
         // Continuation reaches the second row.
         let out = pins

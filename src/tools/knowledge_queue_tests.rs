@@ -169,7 +169,28 @@ async fn review_list_serialized_envelope_bounds_worst_case_escaping() {
         "serialized review list was {wire_bytes} bytes"
     );
     let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(reply["rows"].as_array().unwrap().len(), 100);
+    let first_count = reply["rows"].as_array().unwrap().len();
+    assert!(first_count > 0 && first_count < 100);
+    assert_eq!(reply["next_offset"], first_count);
+    let mut recovered = first_count;
+    let mut cursor = reply["next_cursor"].as_str().map(str::to_owned);
+    while cursor.is_some() {
+        let page = server
+            .bbox_review(Parameters(ReviewParams {
+                action: Some("list".into()),
+                limit: Some(100),
+                cursor,
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(page.is_error, Some(true));
+        let (bytes, text) = serialized_text(&page);
+        assert!(bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        recovered += value["rows"].as_array().unwrap().len();
+        cursor = value["next_cursor"].as_str().map(str::to_owned);
+    }
+    assert_eq!(recovered, 100);
     for row in reply["rows"].as_array().unwrap() {
         assert!(row["title_preview"].as_str().unwrap().len() < 192);
         assert!(row["content_preview"].as_str().unwrap().len() < 192);

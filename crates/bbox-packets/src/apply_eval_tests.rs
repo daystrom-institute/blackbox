@@ -456,9 +456,18 @@ fn apply_tool_all_mode_returns_aggregate() {
             mode: Some(ApplyMode::All),
         })
         .unwrap();
-    assert!(out.contains("\"mode\": \"all\""));
-    assert!(out.contains("\"verdict\": \"flag\""));
-    assert!(out.contains("\"finding_count\": 3"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["mode"],
+        "all"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["verdict"],
+        "flag"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["finding_count"],
+        3
+    );
     assert!(out.contains("flag_a"));
     assert!(out.contains("flag_b"));
     assert!(out.contains("pass_c"));

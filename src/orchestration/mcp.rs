@@ -664,6 +664,7 @@ pub enum McpAction {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct McpToolParams {
     pub action: McpAction,
     /// Server name (required for add/remove/get).
@@ -754,6 +755,36 @@ pub fn handle(p: &McpToolParams) -> Result<McpToolReply> {
 /// store access so typos cannot widen into global/effective lookup and a
 /// supplied project selector cannot be silently ignored.
 fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
+    use McpAction::*;
+    anyhow::ensure!(
+        matches!(p.action, List) || (p.limit.is_none() && p.offset.is_none()),
+        "limit and offset require action=list"
+    );
+    anyhow::ensure!(
+        matches!(p.action, Get | GetFilters) || (p.cursor.is_none() && p.body_limit.is_none()),
+        "cursor and body_limit require action=get or get_filters"
+    );
+    anyhow::ensure!(
+        matches!(p.action, Add)
+            || (p.url.is_none()
+                && p.transport.is_none()
+                && p.exclude_tools.is_none()
+                && p.headers.is_none()
+                && p.surface.is_none()),
+        "server configuration fields require action=add"
+    );
+    anyhow::ensure!(
+        matches!(p.action, Allow | Disallow) || p.pattern.is_none(),
+        "pattern requires action=allow or disallow"
+    );
+    anyhow::ensure!(
+        matches!(p.action, Add | Remove | Get) || p.name.is_none(),
+        "name requires action=add, remove, or get"
+    );
+    anyhow::ensure!(
+        !p.project.as_deref().is_some_and(|v| v.trim().is_empty()),
+        "project must not be blank"
+    );
     let scope = p.scope.as_deref().unwrap_or("global");
     match scope {
         "global" => {
@@ -1101,6 +1132,20 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn mcp_action_mismatches_refuse_before_store_access() {
+        for value in [
+            serde_json::json!({"action":"remove","name":"server","cursor":"stale"}),
+            serde_json::json!({"action":"clear_filters","limit":2}),
+            serde_json::json!({"action":"list","headers":{"Authorization":"synthetic-secret"}}),
+            serde_json::json!({"action":"get_filters","name":"ignored"}),
+            serde_json::json!({"action":"list","scope":"project","project":" "}),
+        ] {
+            let params: McpToolParams = serde_json::from_value(value).unwrap();
+            assert!(validate_selection(&params).is_err());
+        }
+    }
 
     fn text_reply(reply: McpToolReply) -> String {
         match reply {

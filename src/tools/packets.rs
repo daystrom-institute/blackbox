@@ -656,7 +656,10 @@ mod tests {
                 rows.iter()
                     .map(|row| row["rule_id"].as_str().unwrap().to_owned()),
             );
-            offset = page["next_finding_offset"].as_u64().unwrap() as usize;
+            match page["next_finding_offset"].as_u64() {
+                Some(next) => offset = next as usize,
+                None => break,
+            }
         }
         assert_eq!(rule_ids.len(), 250);
         assert_eq!(rule_ids[0], "r000");

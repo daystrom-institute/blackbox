@@ -1543,7 +1543,11 @@ fn diagnostic_recovery_arguments(p: &KnowledgeListParams) -> serde_json::Value {
 }
 
 fn compact_text_fragment(text: &str, limit: usize) -> String {
-    let mut end = limit.min(text.len());
+    let mut end = if text.len() > limit {
+        limit.saturating_sub(3)
+    } else {
+        text.len()
+    };
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }

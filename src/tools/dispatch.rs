@@ -969,6 +969,26 @@ impl BlackboxServer {
     }
 }
 
+fn compact_allocator_plane(value: serde_json::Value, detail: &str) -> serde_json::Value {
+    if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 2048) {
+        return value;
+    }
+    let count = value
+        .as_array()
+        .map(Vec::len)
+        .or_else(|| value.as_object().map(serde_json::Map::len));
+    let mut summary = json!({"truncated":true,"count":count,
+        "detail_hint":if detail == "trace body in this response" { "Exact trace JSON is in this response's body; continue bro_allocator_trace with body.next_cursor".into() } else { format!("Exact JSON: bro_allocator_status(detail={detail:?}); keep the same runtime selectors, continue with body.next_cursor") }});
+    for key in ["total", "selected", "error", "candidate_count"] {
+        if let Some(v) = value.get(key) {
+            if serde_json::to_vec(v).is_ok_and(|bytes| bytes.len() <= 256) {
+                summary[key] = v.clone();
+            }
+        }
+    }
+    summary
+}
+
 #[tool_router(router = dispatch_tools)]
 impl BlackboxServer {
     #[tool(
@@ -1010,6 +1030,19 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<AllocatorStatusParams>,
     ) -> CallToolResult {
+        if p.detail.as_deref().is_some_and(|detail| {
+            !matches!(
+                detail,
+                "config" | "preview" | "in_flight" | "probes" | "leases"
+            )
+        }) {
+            return Self::err_text(
+                "invalid detail: use config, preview, in_flight, probes, or leases",
+            );
+        }
+        if p.detail.is_none() && (p.cursor.is_some() || p.body_limit.is_some()) {
+            return Self::err_text("cursor and body_limit require an exact detail plane");
+        }
         let cfg = orchestration::allocator::load_effective_config(
             &self.state.store_dir,
             p.project_dir.as_deref(),
@@ -1025,7 +1058,7 @@ impl BlackboxServer {
             Ok(request) => request,
             Err(err) => return Self::err_text(&err),
         };
-        let preview = preview_request.map(|request| {
+        let mut preview = preview_request.map(|request| {
             let bro_config = orchestration::brofile::load_config(&self.state.store_dir);
             let allocation =
                 orchestration::allocator::allocate(request, &cfg, &bro_config, &ctx);
@@ -1062,9 +1095,6 @@ impl BlackboxServer {
                     })
                 })
                 .collect();
-            let candidate_page =
-                bbox_corpus_core::response_page::collection_page(candidates, "candidates", p.limit, None)
-                    .unwrap_or_else(|_| json!({"candidates": [], "truncated": true}));
             json!({
                 "trace_id": &allocation.trace.id,
                 "request": &allocation.trace.request,
@@ -1072,9 +1102,67 @@ impl BlackboxServer {
                 "required_capabilities": &allocation.trace.required_capabilities,
                 "selected": &allocation.trace.selected,
                 "error": &allocation.trace.error,
-                "candidates": candidate_page,
+                "candidates": candidates,
             })
         });
+        let config = json!({"tiers": &cfg.tiers, "tier_ladders": &cfg.tier_ladders,
+            "pools": &cfg.pools, "selection_policies": &cfg.selection_policies});
+        if let Some(detail) = p.detail.as_deref() {
+            let value = match detail {
+                "config" => config.clone(),
+                "preview" => {
+                    let Some(mut value) = preview.clone() else {
+                        return Self::err_text(
+                            "preview detail requires runtime allocation selectors",
+                        );
+                    };
+                    value.as_object_mut().unwrap().remove("trace_id");
+                    if let Some(rows) = value["candidates"].as_array_mut() {
+                        for row in rows {
+                            row.as_object_mut().unwrap().remove("probe_staleness_ms");
+                        }
+                    }
+                    value
+                }
+                "in_flight" => json!(&ctx.in_flight),
+                "probes" => json!(&probes),
+                "leases" => json!(&leases),
+                _ => unreachable!(),
+            };
+            let value = Self::redact_config_credentials(&value);
+            let selection = format!(
+                "allocator-status:{detail}:{}",
+                p.project_dir.as_deref().unwrap_or("global")
+            );
+            return match super::body_page::json_body_page(
+                &selection,
+                &value,
+                p.cursor.as_deref(),
+                p.body_limit,
+            ) {
+                Ok(body) => Self::ok_json(&json!({"detail":detail,"body":body})),
+                Err(error) => Self::err_text(&format!(
+                    "error.allocator_body_page: {error}; restart without cursor"
+                )),
+            };
+        }
+        if let Some(preview) = preview.as_mut() {
+            let rows = preview["candidates"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            preview["candidates"] = match bbox_corpus_core::response_page::collection_page(
+                rows,
+                "candidates",
+                p.limit,
+                p.candidate_offset,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    json!({"error":error.to_string(), "detail_hint":"bro_allocator_status(detail=preview) with the same runtime selectors"})
+                }
+            };
+        }
         let now = orchestration::now_ms();
         let in_flight_rows: Vec<_> = ctx
             .in_flight
@@ -1131,14 +1219,14 @@ impl BlackboxServer {
         };
         Self::ok_json(&json!({
             "provider_binary_location": ctx.provider_binary_location,
-            "tiers": cfg.tiers,
-            "tier_ladders": cfg.tier_ladders,
-            "pools": cfg.pools,
-            "selection_policies": cfg.selection_policies,
-            "in_flight": in_flight,
-            "probes": probe_page,
-            "leases": lease_page,
-            "preview": preview,
+            "tiers": compact_allocator_plane(config["tiers"].clone(), "config"),
+            "tier_ladders": compact_allocator_plane(config["tier_ladders"].clone(), "config"),
+            "pools": compact_allocator_plane(config["pools"].clone(), "config"),
+            "selection_policies": compact_allocator_plane(config["selection_policies"].clone(), "config"),
+            "in_flight": compact_allocator_plane(in_flight, "in_flight"),
+            "probes": compact_allocator_plane(probe_page, "probes"),
+            "leases": compact_allocator_plane(lease_page, "leases"),
+            "preview": compact_allocator_plane(json!(preview), "preview"),
         }))
     }
 
@@ -1152,40 +1240,16 @@ impl BlackboxServer {
     ) -> CallToolResult {
         match orchestration::allocator::load_trace(&self.state.store_dir, &p.selection_trace_id) {
             Some(trace) => {
-                let candidate_rows: Vec<_> = trace
-                    .candidates
-                    .iter()
-                    .map(|candidate| {
-                        json!({
-                            "lane": &candidate.lane,
-                            "eligible": candidate.eligible,
-                            "exclusion_reason": &candidate.exclusion_reason,
-                            "score": candidate.score,
-                            "score_components": &candidate.score_components,
-                        })
-                    })
-                    .collect();
-                let candidates = match bbox_corpus_core::response_page::collection_page(
-                    candidate_rows,
-                    "candidates",
-                    None,
-                    None,
-                ) {
-                    Ok(page) => page,
-                    Err(error) => {
-                        return Self::err_text(&format!("candidate page failed: {error}"));
-                    }
-                };
-                let summary = json!({
-                    "id": &trace.id,
-                    "request": &trace.request,
-                    "candidate_tiers": &trace.candidate_tiers,
-                    "required_capabilities": &trace.required_capabilities,
-                    "selected": &trace.selected,
-                    "error": &trace.error,
-                    "candidate_count": trace.candidates.len(),
-                    "candidates": candidates,
-                });
+                let summary = compact_allocator_plane(
+                    json!({
+                        "id": &trace.id, "request": &trace.request,
+                        "candidate_tiers": &trace.candidate_tiers,
+                        "required_capabilities": &trace.required_capabilities,
+                        "selected": &trace.selected, "error": &trace.error,
+                        "candidate_count": trace.candidates.len(),
+                    }),
+                    "trace body in this response",
+                );
                 let body_value = match serde_json::to_value(&trace) {
                     Ok(value) => Self::redact_config_credentials(&value),
                     Err(error) => {
@@ -4453,6 +4517,10 @@ mod tests {
             in_flight_offset: None,
             probe_offset: None,
             lease_offset: None,
+            detail: None,
+            cursor: None,
+            body_limit: None,
+            candidate_offset: None,
         };
         let request = allocator_status_runtime_request(&params).unwrap().unwrap();
         assert_eq!(request.tier.as_deref(), Some("standard"));
@@ -4729,6 +4797,51 @@ mod tests {
     }
 
     #[test]
+    fn allocator_status_bounds_large_config_and_recovers_exact_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let ladders: std::collections::BTreeMap<String, Vec<String>> = (0..80)
+            .map(|i| (format!("synthetic-{i}"), vec!["\u{0001}🦀".repeat(200)]))
+            .collect();
+        std::fs::write(
+            server.state.store_dir.join("allocator.json"),
+            serde_json::to_vec(&json!({"tier_ladders":ladders})).unwrap(),
+        )
+        .unwrap();
+        let summary =
+            server.bro_allocator_status(Parameters(serde_json::from_value(json!({})).unwrap()));
+        assert_ne!(summary.is_error, Some(true), "{summary:?}");
+        assert!(
+            serde_json::to_vec(&summary).unwrap().len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: serde_json::Value = serde_json::from_str(&call_result_text(&summary)).unwrap();
+        assert_eq!(value["tier_ladders"]["truncated"], true);
+        let mut joined = String::new();
+        let mut cursor = None;
+        loop {
+            let response = server.bro_allocator_status(Parameters(
+                serde_json::from_value(json!({"detail":"config", "cursor":cursor})).unwrap(),
+            ));
+            assert_ne!(response.is_error, Some(true), "{response:?}");
+            assert!(
+                serde_json::to_vec(&response).unwrap().len()
+                    <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&call_result_text(&response)).unwrap();
+            joined.push_str(value["body"]["text"].as_str().unwrap());
+            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let exact: serde_json::Value = serde_json::from_str(&joined).unwrap();
+        for (key, value) in ladders {
+            assert_eq!(exact["tier_ladders"][&key], json!(value));
+        }
+    }
+
+    #[test]
     fn allocator_status_pages_probe_lease_and_inflight_inventories() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -4778,6 +4891,10 @@ mod tests {
                 in_flight_offset: None,
                 probe_offset: None,
                 lease_offset: None,
+                detail: None,
+                cursor: None,
+                body_limit: None,
+                candidate_offset: None,
             }
         }));
         assert_ne!(result.is_error, Some(true));
@@ -4832,6 +4949,10 @@ mod tests {
                 in_flight_offset: None,
                 probe_offset: None,
                 lease_offset: None,
+                detail: None,
+                cursor: None,
+                body_limit: None,
+                candidate_offset: None,
             }
         }));
         let body2: serde_json::Value = serde_json::from_str(&call_result_text(&page2)).unwrap();
