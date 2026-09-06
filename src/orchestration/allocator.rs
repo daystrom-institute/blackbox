@@ -1423,17 +1423,50 @@ pub fn lease_store_save(store_dir: &Path, store: &RuntimeLeaseStore) {
 }
 
 pub fn probe_store_load(store_dir: &Path) -> ProbeStore {
-    fs::read_to_string(probes_file(store_dir))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    probe_store_read(store_dir).unwrap_or_default()
 }
 
-/// Persist the probe store. Errors are real: the previous file (if any) is
-/// untouched because publication is an atomic rename, so callers must
-/// propagate the failure instead of reporting a durable update.
+/// Only an absent store is empty. Callers must not replace unreadable or
+/// malformed observations with a successful empty result or a new snapshot.
+pub fn probe_store_read(store_dir: &Path) -> anyhow::Result<ProbeStore> {
+    match fs::read(probes_file(store_dir)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid allocator probe store at line {}, column {}; existing bytes retained",
+                error.line(),
+                error.column()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProbeStore::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// All observation writers share this transaction, including background
+/// refresh and runtime cooldowns. Validation failures leave the file unchanged.
+pub fn probe_store_update<T>(
+    store_dir: &Path,
+    update: impl FnOnce(&mut ProbeStore) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let path = probes_file(store_dir);
+    crate::json_store::with_store_lock(&path, || {
+        let mut store = probe_store_read(store_dir)?;
+        let result = update(&mut store)?;
+        crate::json_store::atomic_write_json_locked(&path, &store)?;
+        Ok(result)
+    })
+}
+
+/// Replace a complete probe snapshot under the shared store lock. Normal
+/// writers use probe_store_update so their read belongs to the transaction.
+/// Errors propagate; a post-publication directory-sync failure can leave the
+/// new snapshot visible without confirmed durability.
 pub fn probe_store_save(store_dir: &Path, store: &ProbeStore) -> std::io::Result<()> {
-    write_json_atomic(&probes_file(store_dir), store)
+    let path = probes_file(store_dir);
+    crate::json_store::with_store_lock(&path, || {
+        crate::json_store::atomic_write_json_locked(&path, store)
+    })
+    .map_err(std::io::Error::other)
 }
 
 pub fn record_lease(store_dir: &Path, lease: RuntimeLease) {
@@ -1730,6 +1763,72 @@ pub fn provider_candidates_for_request(
     config: &AllocatorConfig,
 ) -> Vec<Provider> {
     resolve_provider_pool(request, config)
+}
+
+#[cfg(test)]
+mod probe_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn probe_transaction_preserves_corruption_and_rejected_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = probes_file(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = b"{synthetic malformed observation";
+        fs::write(&path, original).unwrap();
+        assert!(probe_store_read(&root).is_err());
+        assert!(
+            probe_store_update(&root, |_| -> anyhow::Result<()> {
+                panic!("corrupt stores must refuse before invoking a writer");
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        probe_store_save(&root, &ProbeStore::default()).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(
+            probe_store_update(&root, |_| -> anyhow::Result<()> {
+                anyhow::bail!("synthetic validation refusal")
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn concurrent_probe_transactions_preserve_distinct_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|threads| {
+            for n in 0..8 {
+                let root = &root;
+                let barrier = barrier.clone();
+                threads.spawn(move || {
+                    barrier.wait();
+                    probe_store_update(root, |store| {
+                        let account = format!("synthetic-{n}");
+                        let record: ProbeRecord = serde_json::from_value(serde_json::json!({
+                            "provider":"brodex", "account":account,
+                            "credential_status":"present", "quota_status":"unknown",
+                            "quota_confidence":"none"
+                        }))?;
+                        store
+                            .records
+                            .insert(lane_key(Provider::Brodex, Some(&account)), record);
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let store = probe_store_read(&root).unwrap();
+        assert_eq!(store.records.len(), 8);
+        for n in 0..8 {
+            assert!(store.records.contains_key(&format!("brodex:synthetic-{n}")));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -406,7 +406,8 @@ pub(crate) struct AllocatorProbeParams {
     /// Optional account name; omitted means the provider default lane.
     #[serde(default)]
     pub(crate) account: Option<String>,
-    /// Remove this provider/account probe record.
+    /// Remove this provider/account probe record. Exclusive with update fields,
+    /// cursor, and body_limit.
     #[serde(default)]
     pub(crate) clear: Option<bool>,
     /// Credential status: present, missing, expired, or unknown.
@@ -428,16 +429,17 @@ pub(crate) struct AllocatorProbeParams {
     /// Fractional PAYG/balance capacity, where 1.0 means fully available.
     #[serde(default)]
     pub(crate) balance_capacity: Option<f64>,
-    /// Absolute cooldown deadline in epoch milliseconds.
+    /// Absolute cooldown deadline in epoch milliseconds. Exclusive with cooldown_ms.
     #[serde(default)]
     pub(crate) cooldown_until: Option<u64>,
-    /// Relative cooldown duration in milliseconds from now.
+    /// Relative cooldown duration in milliseconds from now. Exclusive with cooldown_until.
     #[serde(default)]
     pub(crate) cooldown_ms: Option<u64>,
     /// Short raw probe or observation summary for audit/debugging.
     #[serde(default)]
     pub(crate) raw_summary: Option<String>,
-    /// Continue exact raw-summary/probe body pages from body.next_cursor.
+    /// Continue exact raw-summary/probe body pages from body.next_cursor. Read-only:
+    /// omit all update fields and clear when supplying a cursor.
     #[serde(default)]
     pub(crate) cursor: Option<String>,
     /// Maximum bytes per exact body page (default 4096, capped at 4096).

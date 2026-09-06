@@ -1071,12 +1071,28 @@ impl BlackboxServer {
         if p.detail.is_none() && (p.cursor.is_some() || p.body_limit.is_some()) {
             return Self::err_text("cursor and body_limit require an exact detail plane");
         }
+        if p.detail.is_some()
+            && (p.limit.is_some()
+                || p.in_flight_offset.is_some()
+                || p.probe_offset.is_some()
+                || p.lease_offset.is_some()
+                || p.candidate_offset.is_some())
+        {
+            return Self::err_text(
+                "exact detail uses cursor/body_limit; omit row limit and offsets",
+            );
+        }
         let cfg = orchestration::allocator::load_effective_config(
             &self.state.store_dir,
             p.project_dir.as_deref(),
         );
         let leases = orchestration::allocator::lease_store_load(&self.state.store_dir);
-        let probes = orchestration::allocator::probe_store_load(&self.state.store_dir);
+        let probes = match orchestration::allocator::probe_store_read(&self.state.store_dir) {
+            Ok(probes) => probes,
+            Err(error) => {
+                return Self::err_text(&format!("error.probe_store_unavailable: {error}"));
+            }
+        };
         let ctx = orchestration::allocator::allocation_context_with_probes(
             &self.state.task_store.read(),
             &leases,
@@ -1328,22 +1344,56 @@ impl BlackboxServer {
             provider.as_str(),
             p.account.as_deref().unwrap_or("default")
         );
-        let mut probes = orchestration::allocator::probe_store_load(&self.state.store_dir);
+        let has_update = p.credential_status.is_some()
+            || p.quota_status.is_some()
+            || p.quota_confidence.is_some()
+            || p.five_hour_utilization.is_some()
+            || p.seven_day_utilization.is_some()
+            || p.balance_capacity.is_some()
+            || p.cooldown_until.is_some()
+            || p.cooldown_ms.is_some()
+            || p.raw_summary.is_some();
+        if p.clear == Some(true) && (has_update || p.cursor.is_some() || p.body_limit.is_some()) {
+            return Self::err_text("clear cannot be combined with update fields or body paging");
+        }
+        if has_update && p.cursor.is_some() {
+            return Self::err_text(
+                "cursor is read-only; omit update fields to continue an exact probe read",
+            );
+        }
+        if p.cooldown_until.is_some() && p.cooldown_ms.is_some() {
+            return Self::err_text("provide either cooldown_until or cooldown_ms, not both");
+        }
+        if [
+            p.five_hour_utilization,
+            p.seven_day_utilization,
+            p.balance_capacity,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|n| !n.is_finite() || n < 0.0)
+        {
+            return Self::err_text("probe utilization and capacity must be finite and nonnegative");
+        }
         if p.clear == Some(true) {
-            let removed = probes.records.remove(&lane_key);
-            if let Err(error) =
-                orchestration::allocator::probe_store_save(&self.state.store_dir, &probes)
-            {
-                return Self::err_text(&format!(
-                    "error.probe_persistence_failed: clear for lane '{lane_key}' was not persisted: {error}; the stored probe record is unchanged. Repair the allocator store path/permissions and retry"
-                ));
-            }
-            return Self::ok_json(&json!({
-                "lane_key": lane_key,
-                "cleared": removed.is_some(),
-                "probe": serde_json::Value::Null,
-                "persisted": true,
-            }));
+            let result =
+                orchestration::allocator::probe_store_update(&self.state.store_dir, |store| {
+                    let removed = store.records.remove(&lane_key).is_some();
+                    let response = Self::ok_json(&json!({"lane_key":lane_key,"cleared":removed,
+                    "probe":Value::Null,"persisted":true}));
+                    anyhow::ensure!(
+                        response.is_error != Some(true),
+                        "clear receipt is too large; no change applied"
+                    );
+                    Ok(response)
+                });
+            return match result {
+                Ok(response) => response,
+                Err(error) => Self::err_text(&format!(
+                    "error.probe_persistence_failed: clear for lane '{}' was not confirmed durable: {error}; inspect the lane before retrying because a storage error can occur after publication",
+                    orch::truncated_chars(&lane_key, 128)
+                )),
+            };
         }
 
         let credential_status = match parse_allocator_probe_enum::<
@@ -1367,74 +1417,75 @@ impl BlackboxServer {
             Ok(confidence) => confidence,
             Err(err) => return Self::err_text(&err),
         };
-        let has_update = credential_status.is_some()
-            || quota_status.is_some()
-            || quota_confidence.is_some()
-            || p.five_hour_utilization.is_some()
-            || p.seven_day_utilization.is_some()
-            || p.balance_capacity.is_some()
-            || p.cooldown_until.is_some()
-            || p.cooldown_ms.is_some()
-            || p.raw_summary.is_some();
         if has_update {
-            let now = orchestration::now_ms();
-            let record = probes.records.entry(lane_key.clone()).or_insert_with(|| {
-                orchestration::allocator::ProbeRecord {
-                    provider,
-                    account: p.account.clone(),
-                    credential_status: Default::default(),
-                    quota_status: Default::default(),
-                    quota_confidence: Default::default(),
-                    five_hour_utilization: None,
-                    seven_day_utilization: None,
-                    balance_capacity: None,
-                    cooldown_until: None,
-                    last_probe_at: None,
-                    last_runtime_observation_at: None,
-                    raw_summary: None,
-                }
-            });
-            if let Some(status) = credential_status {
-                record.credential_status = status;
-            }
-            if let Some(status) = quota_status {
-                record.quota_status = status;
-            }
-            if let Some(confidence) = quota_confidence {
-                record.quota_confidence = confidence;
-            }
-            if p.five_hour_utilization.is_some() {
-                record.five_hour_utilization = p.five_hour_utilization;
-            }
-            if p.seven_day_utilization.is_some() {
-                record.seven_day_utilization = p.seven_day_utilization;
-            }
-            if p.balance_capacity.is_some() {
-                record.balance_capacity = p.balance_capacity;
-            }
-            if let Some(until) = p.cooldown_until {
-                record.cooldown_until = Some(until);
-            } else if let Some(ms) = p.cooldown_ms {
-                record.cooldown_until = Some(now.saturating_add(ms));
-            }
-            if p.raw_summary.is_some() {
-                record.raw_summary = p.raw_summary;
-            }
-            record.last_probe_at = Some(now);
-            if let Err(error) =
-                orchestration::allocator::probe_store_save(&self.state.store_dir, &probes)
-            {
-                return Self::err_text(&format!(
-                    "error.probe_persistence_failed: update for lane '{lane_key}' was not persisted: {error}; the stored probe record is unchanged. Repair the allocator store path/permissions and retry"
-                ));
-            }
-            return Self::allocator_probe_response(
-                &probes.records[&lane_key],
-                &lane_key,
-                p.cursor.as_deref(),
-                p.body_limit,
-            );
+            let result =
+                orchestration::allocator::probe_store_update(&self.state.store_dir, |probes| {
+                    let now = orchestration::now_ms();
+                    let record = probes.records.entry(lane_key.clone()).or_insert_with(|| {
+                        orchestration::allocator::ProbeRecord {
+                            provider,
+                            account: p.account.clone(),
+                            credential_status: Default::default(),
+                            quota_status: Default::default(),
+                            quota_confidence: Default::default(),
+                            five_hour_utilization: None,
+                            seven_day_utilization: None,
+                            balance_capacity: None,
+                            cooldown_until: None,
+                            last_probe_at: None,
+                            last_runtime_observation_at: None,
+                            raw_summary: None,
+                        }
+                    });
+                    if let Some(status) = credential_status {
+                        record.credential_status = status;
+                    }
+                    if let Some(status) = quota_status {
+                        record.quota_status = status;
+                    }
+                    if let Some(confidence) = quota_confidence {
+                        record.quota_confidence = confidence;
+                    }
+                    if p.five_hour_utilization.is_some() {
+                        record.five_hour_utilization = p.five_hour_utilization;
+                    }
+                    if p.seven_day_utilization.is_some() {
+                        record.seven_day_utilization = p.seven_day_utilization;
+                    }
+                    if p.balance_capacity.is_some() {
+                        record.balance_capacity = p.balance_capacity;
+                    }
+                    if let Some(until) = p.cooldown_until {
+                        record.cooldown_until = Some(until);
+                    } else if let Some(ms) = p.cooldown_ms {
+                        record.cooldown_until = Some(now.saturating_add(ms));
+                    }
+                    if p.raw_summary.is_some() {
+                        record.raw_summary = p.raw_summary;
+                    }
+                    record.last_probe_at = Some(now);
+                    let response =
+                        Self::allocator_probe_response(record, &lane_key, None, p.body_limit);
+                    anyhow::ensure!(
+                        response.is_error != Some(true),
+                        "probe response cannot be represented; no change applied"
+                    );
+                    Ok(response)
+                });
+            return match result {
+                Ok(response) => response,
+                Err(error) => Self::err_text(&format!(
+                    "error.probe_persistence_failed: update for lane '{}' was not confirmed durable: {error}; inspect the lane before retrying because a storage error can occur after publication",
+                    orch::truncated_chars(&lane_key, 128)
+                )),
+            };
         }
+        let probes = match orchestration::allocator::probe_store_read(&self.state.store_dir) {
+            Ok(probes) => probes,
+            Err(error) => {
+                return Self::err_text(&format!("error.probe_store_unavailable: {error}"));
+            }
+        };
         match probes.records.get(&lane_key) {
             Some(record) => {
                 Self::allocator_probe_response(record, &lane_key, p.cursor.as_deref(), p.body_limit)
@@ -4752,6 +4803,37 @@ mod tests {
     }
 
     #[test]
+    fn allocator_probe_invalid_mutation_combinations_leave_store_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        assert_ne!(
+            server
+                .bro_allocator_probe(Parameters(update_probe_params()))
+                .is_error,
+            Some(true)
+        );
+        let path = server.state.store_dir.join("allocator/probes.json");
+        let original = std::fs::read(&path).unwrap();
+        for case in 0..5 {
+            let mut p = update_probe_params();
+            match case {
+                0 => p.clear = Some(true),
+                1 => p.cursor = Some("synthetic stale cursor".into()),
+                2 => {
+                    p.cooldown_ms = Some(10);
+                    p.cooldown_until = Some(20);
+                }
+                3 => p.five_hour_utilization = Some(-1.0),
+                _ => p.account = Some("界".repeat(20_000)),
+            }
+            let response = server.bro_allocator_probe(Parameters(p));
+            assert_eq!(response.is_error, Some(true), "case {case}");
+            assert_eq!(std::fs::read(&path).unwrap(), original, "case {case}");
+            assert!(serde_json::to_vec(&response).unwrap().len() < 16 * 1024);
+        }
+    }
+
+    #[test]
     fn allocator_probe_update_failed_save_returns_persistence_error() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -4763,8 +4845,8 @@ mod tests {
         let text = call_result_text(&result);
         assert!(
             text.contains("error.probe_persistence_failed")
-                && text.contains("not persisted")
-                && text.contains("stored probe record is unchanged"),
+                && text.contains("not confirmed durable")
+                && text.contains("inspect the lane before retrying"),
             "got: {text}"
         );
     }
