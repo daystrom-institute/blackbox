@@ -144,12 +144,37 @@ Returns three kinds:
 ## Inspecting state
 
 ```json
-// Full state (filtered for the requesting agent's visibility)
+// Bounded visible preview with complete visible counts
 whiteboard_state(board_id = "adr-2026-05-07", agent_name = "mkdocs-advocate")
 
 // Summary without full post bodies
 whiteboard_summarize(board_id = "adr-2026-05-07", agent_name = "facilitator-claude")
 ```
+
+State previews return up to five posts, annotations, and votes. Large records
+identify omitted fields and carry short text previews. Summaries preserve exact
+scalar counts for the reader's visible scope, while post-standing arrays and
+agent/vote maps are bounded previews. Conflicts return at most ten previews with
+the exact conflict count. `preview=true` means these responses are not complete
+evidence for a final decision.
+
+For any of these three read tools, set `detail="full"` to retrieve exact JSON
+through `body.text` pages. Pass `cursor=body.next_cursor` on the same tool with
+the same board, reader, and selectors until there is no next cursor. Concatenate
+the text exactly, then parse JSON. `body_limit` requests 4 to 4096 UTF-8 bytes;
+JSON escaping may reduce the page size. Changed evidence, phase, or reader scope
+rejects a cursor, requiring a restart. Ticking phase age does not invalidate
+stable evidence pages; current age and readiness remain outside the body.
+
+Use `whiteboard_state(..., post_id="post-001", detail="full")` to focus a
+visible post and its visible annotations and votes. Unknown and invisible post
+ids return the same not-found error. Every page reapplies registration and
+visibility checks. During debate, specialists see their own annotations and
+annotations on their own posts, plus only their own votes; facilitators and
+operators see the full debate. Summary counts, post-standing ids, and vote
+tallies follow those same restrictions. Blind summaries do not expose peer
+post counts, findings, or whether a peer has posted. Workflow template scope
+and facilitator gate calculations retain the complete board semantics.
 
 ## Archiving
 

@@ -203,9 +203,24 @@ pub(crate) struct WhiteboardPostParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WhiteboardStateParams {
     pub(crate) board_id: String,
     pub(crate) agent_name: String,
+    /// summary (default) returns a bounded preview; full returns exact visible
+    /// JSON in body.text pages. Concatenate pages, then parse JSON.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque body.next_cursor; keep board_id, agent_name, and selectors.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body bytes per page, 4..4096; escaping may reduce the page.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
+    /// Optional visible post id; restrict posts, annotations and votes to it.
+    /// Unknown and invisible post ids both return not found.
+    #[serde(default)]
+    pub(crate) post_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -247,15 +262,37 @@ pub(crate) struct WhiteboardVoteParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WhiteboardConflictsParams {
     pub(crate) board_id: String,
     pub(crate) agent_name: String,
+    /// summary (default) returns a bounded preview; full returns exact visible
+    /// JSON in body.text pages. Concatenate pages, then parse JSON.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque body.next_cursor; keep board_id, agent_name, and selectors.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body bytes per page, 4..4096; escaping may reduce the page.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WhiteboardSummarizeParams {
     pub(crate) board_id: String,
     pub(crate) agent_name: String,
+    /// summary (default) returns a bounded preview; full returns exact visible
+    /// JSON in body.text pages. Concatenate pages, then parse JSON.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque body.next_cursor; keep board_id, agent_name, and selectors.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body bytes per page, 4..4096; escaping may reduce the page.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
