@@ -673,6 +673,7 @@ mod tests {
 
         let state = SharedState::for_test(tmp.path());
         let packets = state.packets.read();
+        let work = "mcp__blackbox__work_bash";
         let emit = "mcp__blackbox__system_event_emit";
         let compact = "mcp__blackbox__system_event_compact";
         let list = "mcp__blackbox__system_event_list";
@@ -684,6 +685,7 @@ mod tests {
         let r_deliveries = "mcp__blackbox__reaction_deliveries";
         let r_retry = "mcp__blackbox__reaction_retry";
         let universe: Vec<String> = vec![
+            work.into(),
             emit.into(),
             compact.into(),
             list.into(),
@@ -716,16 +718,16 @@ mod tests {
         check(
             "readonly",
             &[list, open, r_list, r_replay, r_deliveries],
-            &[emit, compact, r_install, r_execute, r_retry],
+            &[emit, compact, r_install, r_execute, r_retry, work],
         );
         check(
             "default",
             &[list, open, r_list, r_replay, r_deliveries],
-            &[emit, compact, r_install, r_execute, r_retry],
+            &[emit, compact, r_install, r_execute, r_retry, work],
         );
         check(
             "agent-internal",
-            &[list, open, r_list, r_replay, r_deliveries],
+            &[list, open, r_list, r_replay, r_deliveries, work],
             &[emit, compact, r_install, r_execute, r_retry],
         );
         check(

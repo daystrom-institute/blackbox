@@ -759,8 +759,8 @@ pub struct AbsorbParams {
     #[serde(default)]
     pub project: Option<String>,
     /// Absorb is a compatibility no-op for generated projections. Use
-    /// bbox_bootstrap to import hand-authored instruction files, then render
-    /// unidirectionally from the knowledge store.
+    /// indexed search and explicit bbox_learn/bbox_remember writes to retain
+    /// selected knowledge; rendered files are not import sources.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -3894,7 +3894,7 @@ impl Knowledge {
                     ));
                 } else if !should_write_project_projection(&path)? {
                     results.push(format!(
-                        "Refused project {}: existing file is not blackbox-generated; run bbox_bootstrap/import first or move hand-authored content to PROJECT.md",
+                        "Refused project {}: existing file is not blackbox-generated; preserve hand-authored content in PROJECT.md on the checkout owner before requesting a managed render",
                         path.display()
                     ));
                 } else {
@@ -4251,15 +4251,14 @@ impl Knowledge {
 
     fn absorb_project(&mut self, project_dir: &str) -> Result<String> {
         Ok(format!(
-            "Project absorb is no-op for {project_dir}: project CLAUDE.md/AGENTS.md/GEMINI.md are unidirectional bbox projections. Use bbox_bootstrap to import hand-authored project instruction files, then bbox_render to publish."
+            "Project absorb is no-op for {project_dir}: project CLAUDE.md/AGENTS.md/GEMINI.md are unidirectional bbox projections. No knowledge was imported. Use indexed search to find instruction content and bbox_learn or bbox_remember to retain selected facts."
         ))
     }
 
-    /// Global provider files are unidirectional projections now. Bootstrap
-    /// imports hand-authored files; render publishes the store into compact
-    /// provider files plus a common include.
+    /// Global provider files are unidirectional projections. Explicit
+    /// knowledge writes populate the store; render publishes managed files.
     fn absorb_global(&mut self) -> Result<String> {
-        Ok("Global absorb is no-op: rendered global files are unidirectional bbox projections. Use bbox_bootstrap to import hand-authored instruction files before rendering.".to_string())
+        Ok("Global absorb is no-op: rendered global files are unidirectional bbox projections. No knowledge was imported. Use bbox_learn or bbox_remember for explicit knowledge writes.".to_string())
     }
 
     // ── Lint ───────────────────────────────────────────────────────
