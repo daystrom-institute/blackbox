@@ -4989,10 +4989,10 @@ fn task_view_json_from_inner(
             obj["structuredExit"] = exit.clone();
         }
     }
+    if !deliverable && let Some(preview) = inner.latest_assistant_preview.text() {
+        obj["lastAssistantSnippet"] = json!(preview);
+    }
     if !deliverable && let Some(message) = inner.last_assistant_message.as_deref() {
-        if let Some(preview) = inner.latest_assistant_preview.text() {
-            obj["lastAssistantSnippet"] = json!(preview);
-        }
         obj["resultBytes"] = json!(message.len());
         obj["resultHint"] = json!(
             "Read the deliverable with bro_status(task_id=..., detail=result); follow body.next_cursor for additional pages."

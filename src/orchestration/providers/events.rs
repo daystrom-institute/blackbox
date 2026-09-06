@@ -37,6 +37,8 @@ pub struct AssistantPreview {
     text: Option<String>,
     #[serde(default)]
     replace_on_text: bool,
+    #[serde(default)]
+    separate_on_text: bool,
 }
 
 impl AssistantPreview {
@@ -47,6 +49,8 @@ impl AssistantPreview {
     pub fn set(&mut self, text: &str) {
         if !text.is_empty() {
             self.text = Some(text.chars().take(256).collect());
+            self.replace_on_text = true;
+            self.separate_on_text = false;
         }
     }
 
@@ -59,6 +63,11 @@ impl AssistantPreview {
             self.replace_on_text = false;
         }
         let current = self.text.get_or_insert_with(String::new);
+        if self.separate_on_text {
+            let remaining = 256usize.saturating_sub(current.chars().count());
+            current.extend("\n\n".chars().take(remaining));
+            self.separate_on_text = false;
+        }
         let remaining = 256usize.saturating_sub(current.chars().count());
         current.extend(text.chars().take(remaining));
     }
@@ -68,9 +77,12 @@ impl AssistantPreview {
             Some("stream_event") => {
                 let event = &evt["event"];
                 match event["type"].as_str() {
-                    Some("message_start") => self.replace_on_text = true,
-                    Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                    Some("message_start") => {
                         self.replace_on_text = true;
+                        self.separate_on_text = false;
+                    }
+                    Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                        self.separate_on_text = !self.replace_on_text && self.text.is_some();
                         if let Some(text) = event["content_block"]["text"].as_str() {
                             self.append(text);
                         }
@@ -102,6 +114,7 @@ impl AssistantPreview {
                     }
                 }
                 self.replace_on_text = true;
+                self.separate_on_text = false;
             }
             Some("result") if self.text.is_none() && evt["is_error"] != true => {
                 if let Some(text) = evt["result"].as_str() {
@@ -442,6 +455,21 @@ mod disruption_tests {
 mod preview_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn multiple_streamed_text_blocks_belong_to_one_message() {
+        let mut preview = AssistantPreview::default();
+        preview.set("old message");
+        for text in ["First block", "Second block"] {
+            preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}));
+            preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_delta", "delta":{"type":"text_delta", "text":text}}}));
+        }
+        assert_eq!(preview.text(), Some("First block\n\nSecond block"));
+        preview.observe(&json!({"type":"stream_event", "event":{"type":"message_start"}}));
+        assert_eq!(preview.text(), Some("First block\n\nSecond block"));
+        preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_delta", "delta":{"type":"text_delta", "text":"New turn"}}}));
+        assert_eq!(preview.text(), Some("New turn"));
+    }
 
     #[test]
     fn preview_is_bounded_and_empty_or_non_text_events_do_not_erase_it() {
