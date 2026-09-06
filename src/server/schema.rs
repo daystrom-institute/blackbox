@@ -119,6 +119,9 @@ impl BlackboxServer {
             .filter_map(|s| {
                 let (manifest, _) = registry.load_manifest_degraded(&s.name);
                 let manifest = manifest?;
+                if manifest.dispatch_adapter.is_some() {
+                    return None;
+                }
                 let cost_str = match manifest.cost_class {
                     orchestration::agents::types::AgentCostClass::Cheap => "cheap",
                     orchestration::agents::types::AgentCostClass::Normal => "normal",

@@ -93,6 +93,9 @@ impl BlackboxServer {
                     ),
                     ("source".into(), serde_json::Value::String(rec.source)),
                 ]);
+                if rec.retired {
+                    m.insert("retired".into(), true.into());
+                }
                 if let Some(s) = rec.metadata.supersedes {
                     m.insert("supersedes".into(), serde_json::Value::String(s));
                 }
@@ -359,6 +362,9 @@ impl BlackboxServer {
                 serde_json::Value::Array(install_warnings),
             ),
         ]);
+        if rec.retired {
+            result.insert("retired".into(), true.into());
+        }
         if !brofile_name.is_empty() {
             result.insert(
                 "brofile_name".into(),
@@ -531,6 +537,11 @@ impl BlackboxServer {
                     ));
                 }
             };
+            if rec.retired {
+                anyhow::bail!(
+                    "custom dispatch adapters are retired; use a simple brofile-bound agent"
+                );
+            }
             if !rec.active {
                 return Self::err_text(&format!(
                     "agent '{}' is not active (superseded or deactivated)",

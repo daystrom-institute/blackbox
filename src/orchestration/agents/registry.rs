@@ -60,6 +60,7 @@ pub struct AgentSummary {
     pub name: String,
     pub version: String,
     pub active: bool,
+    pub retired: bool,
     pub description: Option<String>,
     pub cost_class: Option<AgentCostClass>,
     pub provenance_kind: Option<String>,
@@ -73,6 +74,9 @@ impl AgentSummary {
     pub fn response_view(&self, detail: bool) -> serde_json::Value {
         let mut row =
             serde_json::json!({"name": self.name, "version": self.version, "active": self.active});
+        if self.retired {
+            row["retired"] = true.into();
+        }
         if let Some(description) = &self.description {
             row["description"] = serde_json::json!(description);
         }
@@ -106,6 +110,7 @@ pub struct AgentRecord {
     pub name: String,
     pub version: String,
     pub active: bool,
+    pub retired: bool,
     pub installed_at: String,
     pub source: String,
     pub metadata: ArtifactRecordMeta,
@@ -144,7 +149,12 @@ impl<'a> AgentRegistry<'a> {
         let entries = self.catalog.list(&params)?;
         let mut out = Vec::new();
         for entry in entries {
-            let (manifest, parse_err) = self.load_manifest_degraded(&entry.name);
+            let (manifest, parse_err) =
+                self.load_manifest_degraded_version(&entry.name, &entry.version);
+            let retired = manifest_retired(&manifest);
+            if retired && !filter.include_superseded {
+                continue;
+            }
             let cost_class = manifest.as_ref().map(|m| m.cost_class);
             let provenance_kind = manifest.as_ref().and_then(|m| {
                 m.provenance.as_ref().map(|p| match p {
@@ -179,7 +189,8 @@ impl<'a> AgentRegistry<'a> {
             out.push(AgentSummary {
                 name: entry.name,
                 version: entry.version,
-                active: entry.active,
+                active: entry.active && !retired,
+                retired,
                 description,
                 cost_class,
                 provenance_kind,
@@ -205,7 +216,8 @@ impl<'a> AgentRegistry<'a> {
             return Ok(Some(AgentRecord {
                 name: meta.name,
                 version: meta.version,
-                active: meta.active,
+                active: meta.active && !manifest_retired(&manifest),
+                retired: manifest_retired(&manifest),
                 installed_at: meta.installed_at,
                 source: meta.source,
                 metadata: ArtifactRecordMeta {
@@ -240,7 +252,8 @@ impl<'a> AgentRegistry<'a> {
         Ok(Some(AgentRecord {
             name: entry.name,
             version: entry.version,
-            active: entry.active,
+            active: entry.active && !manifest_retired(&manifest),
+            retired: manifest_retired(&manifest),
             installed_at: entry.installed_at,
             source: entry.source,
             metadata: ArtifactRecordMeta {
@@ -289,6 +302,12 @@ impl<'a> AgentRegistry<'a> {
     ) -> Result<Vec<AgentSearchResult>> {
         self.search_inner(query, limit, filter, exclude_anti_pattern_matches, None)
     }
+}
+
+fn manifest_retired(manifest: &Option<AgentManifest>) -> bool {
+    manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.dispatch_adapter.is_some())
 }
 
 fn load_manifest_degraded_value(
@@ -344,6 +363,10 @@ impl<'a> AgentRegistry<'a> {
             let Some(manifest) = manifest else {
                 continue;
             };
+
+            if manifest.dispatch_adapter.is_some() {
+                continue;
+            }
 
             let cost_class = manifest.cost_class;
             let provenance_kind = manifest.provenance.as_ref().map(|p| match p {
@@ -776,11 +799,64 @@ mod tests {
     }
 
     #[test]
+    fn retired_adapters_remain_readable_but_never_advertise_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = setup_catalog(&dir);
+        catalog.install_value(ArtifactKind::Agent, "historical.json".into(), &serde_json::json!({
+            "name": "historical", "version": 1, "manifest": {
+                "description": "Historical review adapter", "when_to_use": ["review"],
+                "dispatch_adapter": "removed-adapter", "brofile_inline": {"provider": "brodex"}
+            }
+        }), None, None, None).unwrap();
+        let registry = AgentRegistry::new(&catalog);
+        assert!(
+            !registry
+                .list(&ListFilter::default())
+                .unwrap()
+                .iter()
+                .any(|row| row.name == "historical")
+        );
+        assert!(
+            !registry
+                .search("review", 20, &SearchFilter::default(), false)
+                .unwrap()
+                .iter()
+                .any(|row| row.name == "historical")
+        );
+        let history = registry
+            .list(&ListFilter {
+                include_superseded: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let row = history.iter().find(|row| row.name == "historical").unwrap();
+        assert!(!row.active && row.retired);
+        assert_eq!(row.response_view(false)["retired"], true);
+        for selector in ["historical", "historical@v1"] {
+            let record = registry.get(selector).unwrap().unwrap();
+            assert!(!record.active && record.retired);
+            assert_eq!(
+                record.manifest.unwrap().dispatch_adapter.as_deref(),
+                Some("removed-adapter")
+            );
+        }
+        // Projection does not rewrite historical installation receipts.
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "historical")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
     fn agents_catalog_bounds_unicode_descriptions_and_expands_diagnostics() {
         let summary = AgentSummary {
             name: "example".into(),
             version: "1".into(),
             active: true,
+            retired: false,
             description: Some("界\n\"".repeat(3000)),
             cost_class: None,
             provenance_kind: Some("hand_authored".into()),
