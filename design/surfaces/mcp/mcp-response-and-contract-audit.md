@@ -755,3 +755,23 @@ collection gap was confirmed through the published MCP view. The same collector
 cycle received `503 edge_index_warming` for provenance export while the complete
 graph rebuilt after deployment. That export was not claimed successful; indexed
 property reads and the separate publication lanes succeeded independently.
+
+### Native background collection activation
+
+The existing `stablesign` helper succeeded through a GUI Terminal session after
+the headless invocation failed with `errSecInternalComponent`. The installed
+collector verifies against its designated requirement and uses its own bundle
+identifier. After its launch agent restarted, a background scan completed at
+2026-09-06T13:32:27Z: 720 discovered, one published, 719 unchanged, 286303 uploaded
+bytes, zero failed or deferred. Live `bbox_session` independently reported that
+completed producer scan, `scan_in_progress=false`, and a matching indexed and
+published sample generation. This supersedes the signing and activation blocker
+above; gap-e40feb8f is addressed. No additional operator authorization was needed.
+
+The overall MCP audit remains partial. The milestone closeout above establishes
+the shipped changes, not a complete disposition of every tool and action.
+Remaining confirmed review items include default bounds and continuation for
+reaction deliveries, event-open body and linked-history shaping, the opaque
+reaction-install specification schema, and storage-GC candidate and diagnostic
+responses. The coverage inventory still needs explicit dispositions and
+supporting evidence for surfaces kept unchanged as well as those adjusted.

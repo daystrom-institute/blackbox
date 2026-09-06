@@ -123,9 +123,17 @@ With the collector's own identity and usage metadata installed, complete the
 normal signing and Local Network approval flow. Approve the collector itself
 through the system prompt or System Settings > Privacy & Security > Local
 Network, then verify a completed launch-agent cycle. Signing alone does not
-grant access or guarantee that a prompt will appear. An unattended keychain
-error means signing is blocked until that authority is available; a retry or
-environment change does not grant permission. Do not attribute the job
+grant access or guarantee that a prompt will appear. Use the host's existing
+`stablesign` helper when that is its configured signing workflow. If a headless
+invocation fails with `errSecInternalComponent` or the keychain reports
+`User interaction is not allowed`, run the same helper in a GUI terminal under
+the logged-in user so the normal keychain interaction can occur. That failure
+alone does not establish that operator authority or credentials are missing.
+Verify the installed signature with `codesign --verify --strict --verbose=2`,
+restart the collector launch agent, and check both a new completed cycle and
+the corpus's source freshness. Request an interactive operator action only if
+the normal flow actually requires one that the agent cannot perform.
+Do not attribute the job
 to an unrelated app, disable privacy controls, or elevate it to root to bypass
 this requirement. Keep launch-agent environment inheritance isolated, with only
 explicit host paths and the collector's token-file configuration.

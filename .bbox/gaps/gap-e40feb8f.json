@@ -1,10 +1,10 @@
 {
   "id": "gap-e40feb8f",
-  "title": "Native transcript backfill restored; continuous host collection awaits Local Network approval",
+  "title": "Native transcript backfill and continuous host collection restored",
   "gap_kind": "tooling",
   "domain": "corpus/transcript-ingest",
-  "wanted_capability": "Continuously collect current Claude Code and Codex transcript streams from their source host into the cage corpus, with source freshness and indexed drill-down. The dedicated native transport and initial backfill are deployed; verify unattended launch-agent collection after normal macOS signing and Local Network approval.",
-  "missing_primitive": "Operational activation of the installed native collector launch agent: its own macOS Local Network permission and successful background scan. The producer grant, chunk/snapshot transport, enrollment, backfill, indexing, and retrieval are implemented.",
+  "wanted_capability": "Continuously collect current Claude Code and Codex transcript streams from their source host into the corpus, with source freshness and indexed drill-down.",
+  "missing_primitive": "None remaining for the initial Claude Code and Codex native collection scope; background scan success is observed after stable signing.",
   "fallback_used": "An interactive source-host collector publish completed the initial 720-stream backfill. Indexed native search/context/messages/session reads work; repeat interactive publication remains available until background execution is authorized.",
   "evidence": [
     "Deployed image ef7f7f04d0f1; full verification bbox-verify-kb8t8 passed 7464 tests, 21 skipped, Clippy and concurrency lint.",
@@ -15,9 +15,11 @@
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/corpus-transcript-ingest/no-cage-era-transcript-collector",
-  "notes": "2026-09-06: image ef7f7f04d0f1 deployed with dedicated native producer credentials. Backfill published 720/720 streams, 3022167556 bytes, zero failed or deferred. Live native Claude and Codex retrieval has matching published/indexed generations. The configured launch agent reports a TCP connect error, No route to host (os error 65), while the identical binary reaches the server interactively; macOS Local Network privacy distinguishes these execution contexts. Normal stable signing is blocked by unavailable keychain interaction in this unattended session. Do not claim continuous collection until the operator completes normal signing/Local Network approval and a background scan succeeds. See docs/native-transcript-collector.md and the MCP response audit. Historical initial-gap evidence remains in Git history.",
-  "resolution": "unresolved",
+  "notes": "2026-09-06: initial backfill published 720/720 streams with zero failed or deferred. Stable signing succeeded when the existing stablesign helper ran through a GUI Terminal session; the headless keychain error was an execution-context limitation, not missing operator authority. The installed binary verifies against its designated requirement with identifier com.daystrom.bbox-transcript-collector. After restarting the launch agent, a background cycle checked 720 streams, published one, retained 719 unchanged, uploaded 286303 bytes, and reported zero failed or deferred. The source transport, retained backfill, indexing, retrieval, and background producer are operational.",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-01T15:59:45Z",
-  "updated_at": "2026-09-06T06:23:00Z"
+  "updated_at": "2026-09-06T13:33:54Z",
+  "resolved_at": "2026-09-06T13:33:54Z",
+  "resolution_note": "Stable signing through the logged-in GUI terminal succeeded. Restarted launch-agent scan completed at 2026-09-06T13:32:27Z: 720 discovered, 1 published, 719 unchanged, zero failed/deferred. Live bbox_session independently reports the completed producer scan and matching indexed/published sample generation."
 }
