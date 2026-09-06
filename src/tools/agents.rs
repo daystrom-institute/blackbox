@@ -3243,7 +3243,8 @@ mod tests {
             "description": format!("Agent with a large inline brofile {long_text}"),
             "when_to_use": ["when testing paging"],
             "brofile_inline": {
-                "provider": "claude",
+                "provider": "glm",
+                "description": long_text,
                 "runtime": {"env": {"CLI_TOKEN": "sk-live-test-secret-do-not-ship"}},
             },
         });

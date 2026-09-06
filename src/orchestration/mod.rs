@@ -6083,11 +6083,11 @@ mod tests {
             .filter(|row| row.get("resultOmitted") == Some(&json!(true)))
             .count();
         assert!(compacted > 0);
-        assert!(
-            bounded
-                .iter()
-                .any(|row| row["resultHint"].as_str().unwrap().contains("bro_status"))
-        );
+        assert!(bounded.iter().any(|row| {
+            row["resultHint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("bro_status"))
+        }));
     }
 
     #[test]

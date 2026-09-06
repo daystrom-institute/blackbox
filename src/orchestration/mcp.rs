@@ -1643,7 +1643,7 @@ mod tests {
         let text = format!("{error:#}");
 
         assert!(text.contains("error.mcp_sync_retired"), "{text}");
-        assert!(text.contains("not synchronized"), "{text}");
+        assert!(text.contains("Nothing was synchronized"), "{text}");
         assert!(
             text.contains("secret references were not read, resolved, or changed"),
             "{text}"
@@ -1701,7 +1701,7 @@ mod tests {
         .unwrap();
         let reply = action_add(&add).unwrap();
         assert!(
-            reply.contains("project MCP store (daemon-owned)"),
+            reply.contains("project MCP store (daemon-owned;"),
             "{reply}"
         );
         assert!(!reply.contains(".json"), "{reply}");
