@@ -3969,7 +3969,7 @@ mod tests {
                 kind: artifacts::ArtifactKind::Cron,
                 source: "https://example.invalid/cron.json".into(),
                 name: None,
-                version: None,
+                version: Some("1".into()),
                 supersedes: None,
             },
             value,
