@@ -9,6 +9,58 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct ArtifactCatalogListParams {
+    #[serde(flatten)]
+    pub filters: ArtifactListParams,
+    /// Maximum summaries, default 20, maximum 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue with next_offset, ordered by kind, name, newest installation, version.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Include installation time and supersession history. Storage paths are never returned.
+    #[serde(default)]
+    pub detail: bool,
+}
+
+fn artifact_list_page(
+    mut rows: Vec<crate::artifacts::ArtifactListEntry>,
+    p: &ArtifactCatalogListParams,
+) -> serde_json::Value {
+    rows.sort_by(|a, b| {
+        a.kind
+            .as_str()
+            .cmp(b.kind.as_str())
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| b.installed_at.cmp(&a.installed_at))
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    let total = rows.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let artifacts: Vec<_> = rows.into_iter().skip(offset).take(limit).map(|entry| {
+        let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active});
+        if let Some(description) = entry.description {
+            let preview: String = description.chars().take(200).collect();
+            if preview.len() < description.len() { row["description_truncated"] = serde_json::json!(true); }
+            row["description"] = serde_json::json!(preview);
+        }
+        if let Some(replacement) = entry.superseded_by { row["superseded_by"] = serde_json::json!(replacement); }
+        if p.detail {
+            row["installed_at"] = serde_json::json!(entry.installed_at);
+            row["supersedes_chain"] = serde_json::json!(entry.supersedes_chain);
+        }
+        row
+    }).collect();
+    let next_offset = offset.saturating_add(artifacts.len());
+    serde_json::json!({"artifacts": artifacts, "total": total, "limit": limit, "offset": offset,
+        "next_offset": (next_offset < total).then_some(next_offset),
+        "order": "kind_asc,name_asc,installed_at_desc,version_asc",
+        "detail_hint": "bbox_artifact_list(kind=<kind>,name=<name>,detail=true)",
+    })
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::artifacts_tools()
 }
@@ -31,17 +83,15 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed workflow, packet, brofile, agent, atom, team, and cron artifacts with version, source, active status, and supersession metadata."
+        description = "List installed artifact summary pages (default 20, maximum 100). Continue with next_offset; filter by kind/name and set detail=true for installation and supersession metadata. Storage paths and source credentials are omitted."
     )]
     pub(crate) fn bbox_artifact_list(
         &self,
-        Parameters(p): Parameters<ArtifactListParams>,
+        Parameters(p): Parameters<ArtifactCatalogListParams>,
     ) -> CallToolResult {
         Self::run("bbox_artifact_list", || {
-            let rows = self.state.artifacts.read().list(&p)?;
-            Ok(serde_json::to_string_pretty(
-                &serde_json::json!({ "artifacts": rows }),
-            )?)
+            let rows = self.state.artifacts.read().list(&p.filters)?;
+            Ok(serde_json::to_string(&artifact_list_page(rows, &p))?)
         })
     }
 
@@ -113,6 +163,46 @@ mod tests {
     use crate::{packets, workflow};
     use serde_json::{Value, json};
     use std::sync::Arc;
+
+    #[test]
+    fn artifact_summary_pages_omit_storage_paths_and_bound_descriptions() {
+        let rows: Vec<_> = (0..105)
+            .rev()
+            .map(|i| artifacts::ArtifactListEntry {
+                kind: artifacts::ArtifactKind::Agent,
+                name: format!("agent-{i:03}"),
+                version: "1".into(),
+                source: "https://example.test/?token=synthetic-secret".into(),
+                installed_at: "2026-01-01T00:00:00Z".into(),
+                active: true,
+                supersedes_chain: vec!["previous".into()],
+                path: "/private/daemon/artifact.json".into(),
+                superseded_by: None,
+                description: Some("界".repeat(300)),
+            })
+            .collect();
+        let mut p: ArtifactCatalogListParams =
+            serde_json::from_value(json!({"limit": 1000})).unwrap();
+        let first = artifact_list_page(rows.clone(), &p);
+        assert_eq!(first["artifacts"].as_array().unwrap().len(), 100);
+        assert_eq!(first["next_offset"], 100);
+        assert_eq!(first["artifacts"][0]["name"], "agent-000");
+        assert_eq!(first["artifacts"][0]["description_truncated"], true);
+        assert!(first["artifacts"][0].get("supersedes_chain").is_none());
+        p.offset = Some(100);
+        p.detail = true;
+        let last = artifact_list_page(rows, &p);
+        assert_eq!(last["artifacts"].as_array().unwrap().len(), 5);
+        assert!(last["next_offset"].is_null());
+        assert_eq!(
+            last["artifacts"][0]["supersedes_chain"],
+            json!(["previous"])
+        );
+        for response in [first, last] {
+            assert!(!response.to_string().contains("synthetic-secret"));
+            assert!(!response.to_string().contains("/private/daemon"));
+        }
+    }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))

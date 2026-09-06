@@ -9,6 +9,70 @@ use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde_json::Value;
 
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct PacketListToolParams {
+    #[serde(flatten)]
+    pub filters: PacketListParams,
+    /// Exact packet id, for selecting one revision.
+    #[serde(default)]
+    pub packet_id: Option<String>,
+    /// Continue with next_offset; newest-created first, then id ascending.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Include classification histogram and rule id preview (default false).
+    #[serde(default)]
+    pub detail: bool,
+}
+
+fn packet_list_page(
+    mut packets: Vec<crate::packets::Packet>,
+    params: &PacketListToolParams,
+) -> Value {
+    let p = &params.filters;
+    packets.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(id) = &params.packet_id {
+        packets.retain(|packet| &packet.id == id);
+    }
+    if let Some(domain) = &p.domain {
+        packets.retain(|packet| &packet.domain == domain);
+    }
+    if let Some(scope) = &p.scope {
+        packets.retain(|packet| &packet.scope == scope);
+    }
+    if let Some(query) = p.query.as_deref().filter(|q| !q.is_empty()) {
+        packets.retain(|packet| packet_matches_query(packet, query));
+    }
+    if p.latest_per_domain.unwrap_or(false) {
+        let mut seen = std::collections::HashSet::new();
+        packets.retain(|packet| seen.insert(packet.domain.clone()));
+    }
+    let total = packets.len();
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0);
+    let packets: Vec<_> = packets
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|packet| {
+            if params.detail {
+                packet_summary(&packet)
+            } else {
+                serde_json::json!({"id": packet.id, "domain": packet.domain, "scope": packet.scope,
+                "rules_count": packet.rules.len(), "created_at": packet.created_at})
+            }
+        })
+        .collect();
+    let next_offset = offset.saturating_add(packets.len());
+    serde_json::json!({"count": packets.len(), "packets": packets, "total": total, "offset": offset, "limit": limit,
+        "next_offset": (next_offset < total).then_some(next_offset), "order": "created_at_desc,id_asc",
+        "detail_hint": "bbox_packet_list(packet_id=<id>,detail=true)",
+    })
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::packets_tools()
 }
@@ -81,40 +145,17 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_packet_list",
-        description = "Discover compiled rule-packets before authoring a new one. Filter by `domain` (exact), `scope` (global/project), or `query` (case-insensitive substring across id, domain, rule ids, classification values). Pass `latest_per_domain=true` to collapse multiple revisions of the same domain. Each summary includes a classification histogram and the first few rule ids so you can judge relevance without calling bbox_apply. If a packet already covers your domain, compose it via `Apply{packet_id, expect}` or reuse via `bbox_apply`. See sm-rule-packets via bbox_knowledge."
+        description = "Discover compiled rule-packet summary pages (default 20, maximum 100), newest first then id. Filter by domain, scope, or query before paging; continue with next_offset. Select packet_id and detail=true for classification histograms and rule previews. latest_per_domain=true keeps the newest revision of each domain."
     )]
     pub(crate) async fn bbox_packet_list(
         &self,
-        Parameters(p): Parameters<PacketListParams>,
+        Parameters(p): Parameters<PacketListToolParams>,
     ) -> CallToolResult {
         // list_all re-reads the packet store from disk.
         let server = self.clone();
         Self::run_blocking("bbox_packet_list", move || {
-            let mut packets = server.state.packets.read().list_all()?;
-            if let Some(domain) = &p.domain {
-                packets.retain(|pkt| pkt.domain == *domain);
-            }
-            if let Some(scope) = &p.scope {
-                packets.retain(|pkt| &pkt.scope == scope);
-            }
-            if let Some(q) = p.query.as_deref().filter(|q| !q.is_empty()) {
-                packets.retain(|pkt| packet_matches_query(pkt, q));
-            }
-            if p.latest_per_domain.unwrap_or(false) {
-                // list_all returns newest-first; keep the first occurrence of each domain.
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                packets.retain(|pkt| seen.insert(pkt.domain.clone()));
-            }
-            let limit = p.limit.unwrap_or(50).min(500);
-            packets.truncate(limit);
-
-            let summaries: Vec<_> = packets.iter().map(packet_summary).collect();
-
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "count": summaries.len(),
-                "limit": limit,
-                "packets": summaries,
-            }))?)
+            let packets = server.state.packets.read().list_all()?;
+            Ok(serde_json::to_string(&packet_list_page(packets, &p))?)
         })
         .await
     }
@@ -201,5 +242,46 @@ impl BlackboxServer {
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
         Self::ok_text(&text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn packet_summary_pages_filter_before_paging_and_expand_histograms() {
+        let packets: Vec<crate::packets::Packet> = (0..105).rev().map(|i| serde_json::from_value(json!({
+            "id": format!("packet-{i:08x}"), "domain": format!("domain-{}", i % 2), "scope": "global",
+            "rules": [], "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        })).unwrap()).collect();
+        let mut p: PacketListToolParams = serde_json::from_value(json!({"limit": 1000})).unwrap();
+        let first = packet_list_page(packets.clone(), &p);
+        assert_eq!(first["packets"].as_array().unwrap().len(), 100);
+        assert_eq!(first["next_offset"], 100);
+        assert_eq!(first["packets"][0]["id"], "packet-00000000");
+        assert!(
+            first["packets"][0]
+                .get("classification_histogram")
+                .is_none()
+        );
+        p.offset = Some(100);
+        let last = packet_list_page(packets.clone(), &p);
+        assert_eq!(last["packets"].as_array().unwrap().len(), 5);
+        assert!(last["next_offset"].is_null());
+        p.offset = Some(0);
+        p.filters.domain = Some("domain-1".into());
+        let filtered = packet_list_page(packets.clone(), &p);
+        assert_eq!(filtered["total"], 52);
+        p.packet_id = Some("packet-00000001".into());
+        p.detail = true;
+        let detail = packet_list_page(packets, &p);
+        assert_eq!(detail["total"], 1);
+        assert!(
+            detail["packets"][0]
+                .get("classification_histogram")
+                .is_some()
+        );
     }
 }

@@ -1091,8 +1091,15 @@ impl Threads {
 
     // ── blackbox_thread_list (query) ───────────────────────────────
 
-    pub fn thread_list(&self, p: &ThreadListParams) -> Result<String> {
-        let status_filter = p.status.as_deref();
+    fn matching_threads(&self, p: &ThreadListParams) -> Result<Vec<&Thread>> {
+        let status_filter = p
+            .status
+            .as_deref()
+            .map(ThreadStatus::from_str)
+            .transpose()
+            .map_err(|_| {
+                anyhow::anyhow!("Unknown thread status. Use: open, active, resolved, promoted")
+            })?;
         let project_filter = p.project.as_deref();
         let project_id_filter = p.project_id.as_deref();
         let ledger_lower: Vec<String> = p
@@ -1120,15 +1127,9 @@ impl Threads {
 
         for thread in &self.store.threads {
             // Status filter
-            if let Some(sf) = status_filter {
-                if let Ok(target) = ThreadStatus::from_str(sf) {
-                    if thread.status != target {
-                        continue;
-                    }
-                } else {
-                    anyhow::bail!(
-                        "Unknown thread status: {sf}. Use: open, active, resolved, promoted"
-                    );
+            if let Some(target) = &status_filter {
+                if thread.status != *target {
+                    continue;
                 }
             } else if !include_resolved {
                 // Default: exclude resolved and promoted
@@ -1144,10 +1145,11 @@ impl Threads {
             // predicate. The ledger arm is catalog-mode only and matches a
             // path-only row still keyed under a historical path of this
             // project.
-            if let Some(pf) = project_filter
+            if (project_filter.is_some() || project_id_filter.is_some())
                 && !project_scope_matches(thread.project_id.as_deref(), project_id_filter, || {
                     let row_project = thread.project.to_lowercase();
-                    row_project.contains(&pf.to_lowercase())
+                    project_filter
+                        .is_some_and(|filter| row_project.contains(&filter.to_lowercase()))
                         || ledger_lower
                             .iter()
                             .any(|historical| row_project.contains(historical.as_str()))
@@ -1194,6 +1196,69 @@ impl Threads {
             results.push(thread);
         }
 
+        results.sort_by(|a, b| {
+            b.last_activity
+                .cmp(&a.last_activity)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(results)
+    }
+
+    /// Bounded MCP discovery view. Full thread context stays on the exact get.
+    pub fn thread_list_page(
+        &self,
+        p: &ThreadListParams,
+        limit: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value> {
+        let results = self.matching_threads(p)?;
+        let total = results.len();
+        let limit = limit.clamp(1, 100);
+        let threads: Vec<_> = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|thread| {
+                let topic: String = thread.topic.chars().take(200).collect();
+                let mut row = serde_json::json!({
+                    "id": thread.id, "topic": topic, "status": thread.status,
+                    "last_activity": thread.last_activity,
+                });
+                if topic.len() < thread.topic.len() {
+                    row["topic_truncated"] = serde_json::json!(true);
+                }
+                if let Some(name) = &thread.name {
+                    row["name"] = serde_json::json!(name);
+                }
+                if let Some(kind) = thread.kind {
+                    row["kind"] = serde_json::json!(kind);
+                }
+                if let Some(origin) = thread.origin {
+                    row["origin"] = serde_json::json!(origin);
+                }
+                if let Some(id) = &thread.project_id {
+                    row["project_id"] = serde_json::json!(id);
+                } else if !thread.project.is_empty() {
+                    row["project_selector"] = serde_json::json!(thread.project);
+                }
+                row
+            })
+            .collect();
+        let next_offset = offset.saturating_add(threads.len());
+        Ok(serde_json::json!({
+            "threads": threads, "total": total, "offset": offset, "limit": limit,
+            "next_offset": (next_offset < total).then_some(next_offset),
+            "order": "last_activity_desc,id_asc",
+            "detail_hint": "bbox_thread(action=get,id=<id>)",
+        }))
+    }
+
+    pub fn thread_list(&self, p: &ThreadListParams) -> Result<String> {
+        let mut results = self.matching_threads(p)?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if results.is_empty() {
             // Differentiate filter-miss from empty store: a caller staring at
             // an unexpected empty listing needs to know whether their filters
@@ -1357,6 +1422,85 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn thread_summary_pages_are_bounded_and_do_not_expand_history() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = Threads::open(&root.join("threads.json")).unwrap();
+        for i in (0..105).rev() {
+            store.store.threads.push(serde_json::from_value(serde_json::json!({
+                "id": format!("thread-{i:08x}"), "topic": "界".repeat(300), "project": "",
+                "status": "open", "sessions": [], "notes": ["internal detail".repeat(1000)],
+                "handoff_doc": "/private/owner/handoff.md", "created_at": "2026-01-01T00:00:00Z",
+                "last_activity": "2026-01-01T00:00:00Z",
+            })).unwrap());
+        }
+        let p = ThreadListParams::default();
+        let first = store.thread_list_page(&p, 1000, 0).unwrap();
+        assert_eq!(first["threads"].as_array().unwrap().len(), 100);
+        assert_eq!(first["next_offset"], 100);
+        assert_eq!(first["total"], 105);
+        assert_eq!(first["threads"][0]["id"], "thread-00000000");
+        assert_eq!(
+            first["threads"][0]["topic"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            200
+        );
+        assert_eq!(first["threads"][0]["topic_truncated"], true);
+        assert!(!first.to_string().contains("handoff.md"));
+        assert!(!first.to_string().contains("internal detail"));
+        let last = store.thread_list_page(&p, 100, 100).unwrap();
+        assert_eq!(last["threads"].as_array().unwrap().len(), 5);
+        assert_eq!(last["threads"][0]["id"], "thread-00000064");
+        assert!(last["next_offset"].is_null());
+        let empty = store.thread_list_page(&p, 20, usize::MAX).unwrap();
+        assert_eq!(empty["threads"], serde_json::json!([]));
+        assert_eq!(empty["total"], 105);
+    }
+
+    #[test]
+    fn thread_summary_pages_apply_id_only_scope_and_legacy_ledger() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = Threads::open(&root.join("threads.json")).unwrap();
+        for (i, (project_id, project)) in [
+            (Some("11111111"), "/repo/relocated"),
+            (Some("22222222"), "/repo/old-target"),
+            (None, "/repo/old-target"),
+            (None, "/repo/other"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.store.threads.push(serde_json::from_value(serde_json::json!({
+                "id": format!("thread-{i:08x}"), "topic": "scoped", "project": project, "project_id": project_id,
+                "status": "open", "sessions": [], "created_at": "2026-01-01T00:00:00Z",
+                "last_activity": "2026-01-01T00:00:00Z",
+            })).unwrap());
+        }
+        let mut p = ThreadListParams {
+            project_id: Some("11111111".into()),
+            project_ledger_paths: vec!["/repo/old-target".into()],
+            ..Default::default()
+        };
+        let by_id = store.thread_list_page(&p, 20, 0).unwrap();
+        assert_eq!(by_id["total"], 2);
+        assert_eq!(by_id["threads"][0]["id"], "thread-00000000");
+        assert_eq!(by_id["threads"][1]["id"], "thread-00000002");
+        p.project = Some("/repo/current".into());
+        assert_eq!(
+            store.thread_list_page(&p, 20, 0).unwrap()["threads"],
+            by_id["threads"]
+        );
+        p.project = None;
+        p.project_id = Some("33333333".into());
+        p.project_ledger_paths.clear();
+        assert_eq!(store.thread_list_page(&p, 20, 0).unwrap()["total"], 0);
+    }
 
     fn params(action: &str) -> ThreadParams {
         ThreadParams {

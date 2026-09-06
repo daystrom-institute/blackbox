@@ -50,7 +50,7 @@ pub struct PacketListParams {
     /// multiple compile iterations — `list_all` returns every revision.
     #[serde(default)]
     pub latest_per_domain: Option<bool>,
-    /// Max packets to return (default: 50, max: 500).
+    /// Maximum packets returned by MCP discovery (default 20, maximum 100).
     #[serde(default)]
     pub limit: Option<usize>,
 }

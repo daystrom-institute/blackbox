@@ -5,6 +5,24 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 
+#[derive(Debug, Default, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct NoteListToolParams {
+    #[serde(flatten)]
+    pub filters: NoteListParams,
+    /// Continue using next_offset; rows order by created_at descending, id ascending.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+impl From<NoteListParams> for NoteListToolParams {
+    fn from(filters: NoteListParams) -> Self {
+        Self {
+            filters,
+            offset: None,
+        }
+    }
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::notes_tools()
 }
@@ -60,13 +78,17 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_notes",
-        description = "List / filter notes by exact id, kind, project, session, thread, resolution."
+        description = "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies. Filter by kind, project, session, thread, or resolution."
     )]
-    pub(crate) fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
+    pub(crate) fn bbox_notes(
+        &self,
+        Parameters(p): Parameters<NoteListToolParams>,
+    ) -> CallToolResult {
         Self::run("bbox_notes", || {
             // Worktree filter paths map to the registered base (where notes
             // are keyed); substring filters pass through untouched.
-            let mut p = p;
+            let offset = p.offset.unwrap_or(0);
+            let mut p = p.filters;
             if let Some(raw) = p.project.clone() {
                 // Catalog-mode ledger arm (plan §8.2): path-only notes still
                 // keyed under one of this project's historical paths stay
@@ -94,7 +116,9 @@ impl BlackboxServer {
                     p.project_ledger_paths = self.ledger_historical_paths(resolved);
                 }
             }
-            self.state.notes.read().list(&p)
+            Ok(serde_json::to_string(
+                &self.state.notes.read().list_page(&p, offset)?,
+            )?)
         })
     }
 

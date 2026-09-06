@@ -45,6 +45,61 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::project_catalog_tools()
 }
 
+fn project_catalog_list_page(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    attachments: &bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+    epoch: u64,
+    p: &CatalogListParams,
+) -> anyhow::Result<serde_json::Value> {
+    if p.expected_catalog_epoch
+        .is_some_and(|expected| expected != epoch)
+    {
+        anyhow::bail!(
+            "error.catalog_page_changed: catalog changed; restart at offset=0 without expected_catalog_epoch"
+        );
+    }
+    let query = p.query.as_deref().map(str::to_lowercase);
+    let mut projects: Vec<_> = catalog
+        .projects
+        .values()
+        .filter(|project| {
+            query.as_ref().is_none_or(|query| {
+                project.project_id.as_str().to_lowercase().contains(query)
+                    || project.display_name.to_lowercase().contains(query)
+            })
+        })
+        .collect();
+    projects.sort_by(|a, b| a.project_id.as_str().cmp(b.project_id.as_str()));
+    let total = projects.len();
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let offset = p.offset.unwrap_or(0);
+    let mut active_counts = std::collections::HashMap::<_, usize>::new();
+    for row in attachments
+        .attachments
+        .values()
+        .filter(|row| row.status == AttachmentStatus::Attached)
+    {
+        *active_counts.entry(&row.project_id).or_default() += 1;
+    }
+    let projects: Vec<_> = projects
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|project| {
+            json!({"project_id": project.project_id.as_str(), "display_name": project.display_name,
+                "scope": scope_json(&project.scope),
+                "active_attachments": active_counts.get(&project.project_id).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let next_offset = offset.saturating_add(projects.len());
+    Ok(json!({
+        "epoch": epoch, "projects": projects, "total": total, "offset": offset, "limit": limit,
+        "next_offset": (next_offset < total).then_some(next_offset), "order": "project_id_asc",
+        "detail_hint": "bbox_project_catalog_get(project=<project_id>)",
+    }))
+}
+
 /// Longest accepted `audit_reason`, matching the catalog's own bounded
 /// audit-text limit so a refusal happens here rather than deep in a
 /// transaction closure.
@@ -52,8 +107,21 @@ const MAX_AUDIT_REASON_BYTES: usize = 1024;
 
 // ── Parameters ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct CatalogListParams {}
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CatalogListParams {
+    /// Maximum project summaries (default 20, maximum 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue using next_offset; projects are ordered by project_id ascending.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Case-insensitive substring of project_id or display_name.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Pass the previous page epoch to reject catalog changes between pages.
+    #[serde(default)]
+    pub expected_catalog_epoch: Option<u64>,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CatalogGetParams {
@@ -614,11 +682,11 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_catalog_list",
-        description = "List every project in the durable catalog, including remote-only projects with no attachment on this host. Path-free rows: project_id, display_name, scope (published repo_id + bbox_root_relpath, legacy_local, or connector connector_source_id + connector_kind), connector_observations (a connector producer's observed vendor coordinates, null for every other scope family; observations are replaceable claims, never identity), operator and nominated aliases, and the count of active attachments. Returns the catalog epoch to pass as expected_catalog_epoch on a following administration call. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "List project summary pages (default 20, maximum 100), ordered by project_id. Continue with next_offset and expected_catalog_epoch from the previous page to reject catalog changes. Filter by query; use bbox_project_catalog_get for aliases, connector observations, and attachment details. Returns error.project_catalog_inactive on the version-1 registry."
     )]
     pub(crate) async fn bbox_project_catalog_list(
         &self,
-        Parameters(_p): Parameters<CatalogListParams>,
+        Parameters(p): Parameters<CatalogListParams>,
     ) -> CallToolResult {
         let Some(store) = self.catalog_store() else {
             return Self::err_text(&catalog_inactive());
@@ -627,36 +695,12 @@ impl BlackboxServer {
             let state = store
                 .snapshot()
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let projects: Vec<serde_json::Value> = state
-                .catalog()
-                .projects
-                .values()
-                .map(|project| {
-                    let active = state
-                        .attachments()
-                        .attachments
-                        .values()
-                        .filter(|row| {
-                            row.project_id == project.project_id
-                                && row.status == AttachmentStatus::Attached
-                        })
-                        .count();
-                    json!({
-                        "project_id": project.project_id.as_str(),
-                        "display_name": project.display_name,
-                        "scope": scope_json(&project.scope),
-                        "connector_observations":
-                            connector_observations_json(state.catalog(), project),
-                        "operator_aliases": project.operator_aliases,
-                        "nominated_aliases": project.nominated_aliases,
-                        "active_attachments": active,
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string_pretty(&json!({
-                "epoch": state.epoch(),
-                "projects": projects,
-            }))?)
+            Ok(serde_json::to_string(&project_catalog_list_page(
+                state.catalog(),
+                state.attachments(),
+                state.epoch(),
+                &p,
+            )?)?)
         })
         .await
     }
@@ -2295,6 +2339,50 @@ mod tests {
     use super::*;
     use crate::server::state::SharedState;
 
+    #[test]
+    fn project_catalog_summary_pages_are_bounded_and_guard_epoch() {
+        use bbox_corpus_core::project_catalog::{
+            AttachmentSnapshotV1, CatalogSnapshotV2, CorpusProject,
+        };
+        let mut catalog = CatalogSnapshotV2::empty(7).unwrap();
+        let attachments = AttachmentSnapshotV1::empty(7).unwrap();
+        for i in (0..105).rev() {
+            let project_id = ProjectId::parse(format!("p_{i:032x}")).unwrap();
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id,
+                    display_name: format!("Project {i:03}"),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: ["alias".into()].into(),
+                    nominated_aliases: Default::default(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+        }
+        let mut p = CatalogListParams {
+            limit: Some(1000),
+            ..Default::default()
+        };
+        let first = project_catalog_list_page(&catalog, &attachments, 7, &p).unwrap();
+        assert_eq!(first["projects"].as_array().unwrap().len(), 100);
+        assert_eq!(first["next_offset"], 100);
+        assert!(first["projects"][0].get("operator_aliases").is_none());
+        p.offset = Some(100);
+        p.expected_catalog_epoch = Some(7);
+        let last = project_catalog_list_page(&catalog, &attachments, 7, &p).unwrap();
+        assert_eq!(last["projects"].as_array().unwrap().len(), 5);
+        assert!(last["next_offset"].is_null());
+        assert!(project_catalog_list_page(&catalog, &attachments, 8, &p).is_err());
+        p.offset = Some(0);
+        p.query = Some("Project 104".into());
+        let filtered = project_catalog_list_page(&catalog, &attachments, 7, &p).unwrap();
+        assert_eq!(filtered["total"], 1);
+    }
+
     fn bridge_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(tmp.path())))
     }
@@ -2414,7 +2502,7 @@ mod tests {
 
         let results = vec![
             server
-                .bbox_project_catalog_list(Parameters(CatalogListParams {}))
+                .bbox_project_catalog_list(Parameters(CatalogListParams::default()))
                 .await,
             server
                 .bbox_project_catalog_get(Parameters(CatalogGetParams {
