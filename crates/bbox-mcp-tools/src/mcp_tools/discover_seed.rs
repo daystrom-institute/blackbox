@@ -100,6 +100,7 @@ pub fn discover_seed_entities(
         ctx,
         &HybridSearchParams {
             query: p.query.clone(),
+            debug: false,
             limit: Some(limit),
             doc_type: p.doc_type.clone(),
             include_vectors: p.include_vectors,
