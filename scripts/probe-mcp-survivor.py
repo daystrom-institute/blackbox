@@ -52,7 +52,7 @@ try:
  rpc('initialize',{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'mcp-audit-isolated','version':'1'}})
  rpc('notifications/initialized',{},True)
  catalog=rpc('tools/list',{})['result']['tools']; names={t['name'] for t in catalog}; (root/'catalog.json').write_text(json.dumps(catalog,indent=2)); print('catalog',len(names),flush=True)
- providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; print('Flash catalog PASS',flush=True)
+ providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; assert isinstance(providers['glm']['peak_usage'],bool); print('Flash catalog and peak advisory PASS',flush=True)
  for name in ['bro_when_any','bro_when_all']:
   call(name,{'task_ids':['00000000-0000-0000-0000-000000000000'],'timeout_seconds':0},True)
  for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'}),('bbox_packet',{'action':'typo'})]:
@@ -124,9 +124,11 @@ try:
  preview_args={'pin_provider':'glm','pin_model':'glm-5.3-flash','pin_effort':'low','detail':'preview'}
  call('bro_allocator_probe',{'provider':'glm','credential_status':'present','quota_status':'exhausted','quota_confidence':'runtime_rate_limit','cooldown_ms':3600000,'five_hour_utilization':1.0,'raw_summary':'Synthetic runtime 429'})
  preview=exact('bro_allocator_status',preview_args)
+ assert all(isinstance(row['peak_usage'],bool) for row in preview['candidates'])
  assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
  call('bro_allocator_probe',{'provider':'glm','cooldown_until':1})
  preview=exact('bro_allocator_status',preview_args)
+ assert all(isinstance(row['peak_usage'],bool) for row in preview['candidates'])
  candidate=preview['candidates'][0]
  assert candidate['eligible'] and preview['selected']['model']=='glm-5.3-flash',preview
  assert candidate['score_components']['quota_capacity']==0.5,preview
@@ -134,6 +136,7 @@ try:
  assert 'five_hour_utilization' not in candidate['probe'],preview
  call('bro_allocator_probe',{'provider':'glm','quota_confidence':'quota_probe'})
  preview=exact('bro_allocator_status',preview_args)
+ assert all(isinstance(row['peak_usage'],bool) for row in preview['candidates'])
  assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
  print('runtime quota cooldown expiry and authoritative quota refusal PASS',flush=True)
  call('bbox_packet_list',{})

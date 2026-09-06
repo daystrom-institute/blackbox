@@ -349,10 +349,12 @@ impl BlackboxServer {
         let task = self.state.task_store.read().get(&record.identity.task_id);
         if let Some(task) = task {
             let inner = task.inner.lock();
-            return Self::ok_json(&json!({
+            let mut response = json!({
                 "taskId": inner.id, "sessionId": inner.session_id,
                 "provider": inner.provider, "status": inner.status, "replayed": replayed,
-            }));
+            });
+            annotate_peak_usage(&mut response, inner.provider, inner.started_at);
+            return Self::ok_json(&response);
         }
         match &record.outcome {
             Some(orch::admission::Outcome::TaskRecorded {
@@ -780,6 +782,7 @@ impl BlackboxServer {
             response["tier"] = json!(allocation.lane.tier);
             response["selectionTraceId"] = json!(allocation.trace.id);
         }
+        annotate_peak_usage(&mut response, inner.provider, inner.started_at);
         Self::ok_json(&response)
     }
 
@@ -961,11 +964,23 @@ impl BlackboxServer {
         }
 
         let inner = task.inner.lock();
-        Self::ok_json(&json!({
+        let mut response = json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
             "status": inner.status,
-        }))
+        });
+        annotate_peak_usage(&mut response, inner.provider, inner.started_at);
+        Self::ok_json(&response)
+    }
+}
+
+pub(super) fn annotate_peak_usage(
+    response: &mut serde_json::Value,
+    provider: Provider,
+    at_ms: u64,
+) {
+    if let Some(peak) = orchestration::usage_schedule::peak_usage(provider, at_ms) {
+        response["peak_usage"] = json!(peak);
     }
 }
 
@@ -1081,7 +1096,7 @@ impl BlackboxServer {
                             .chain(probe.last_runtime_observation_at)
                             .max()
                     });
-                    json!({
+                    let mut row = json!({
                         "lane": &candidate.lane,
                         "lane_key": lane_key,
                         "eligible": candidate.eligible,
@@ -1092,7 +1107,11 @@ impl BlackboxServer {
                         "probe": probe.map(|probe| probe.summary_view(now)),
                         "probe_observed_at": probe_observed_at,
                         "probe_staleness_ms": probe_observed_at.map(|observed| now.saturating_sub(observed)),
-                    })
+                    });
+                    if let Some(peak) = candidate.peak_usage {
+                        row["peak_usage"] = json!(peak);
+                    }
+                    row
                 })
                 .collect();
             json!({
@@ -4153,8 +4172,9 @@ mod tests {
                     let task = orch::test_task(
                         &attempt.identity.task_id,
                         orch::TaskStatus::Completed,
-                        Provider::Brodex,
+                        Provider::Glm,
                     );
+                    task.inner.lock().started_at = 1788760800000; // Monday 06:00 UTC, peak.
                     server
                         .state
                         .task_store
@@ -4178,6 +4198,7 @@ mod tests {
         let replay: Value = serde_json::from_str(&call_result_text(&replay)).unwrap();
         assert_eq!(replay["taskId"], first_id);
         assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["peak_usage"], true);
         assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
     }
 
@@ -4971,6 +4992,7 @@ mod tests {
             candidate_tiers: vec!["standard".into()],
             required_capabilities: vec![],
             candidates: vec![orchestration::allocator::CandidateTrace {
+                peak_usage: None,
                 lane: orchestration::allocator::RuntimeLane {
                     provider: Provider::Brodex,
                     account: Some("acct".into()),

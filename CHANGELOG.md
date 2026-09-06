@@ -19,6 +19,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- GLM and DeepSeek peak-hour advisories appear as `peak_usage` on provider
+  discovery, allocator candidates, and dispatch/resume receipts. These use
+  provider-local weekday schedules without changing automatic selection.
+
 - Expired runtime rate-limit cooldowns permit a fresh allocation attempt with
   unknown quota capacity. Historical 429 receipts remain visible; authoritative
   quota exhaustion and credential failures still exclude the account.

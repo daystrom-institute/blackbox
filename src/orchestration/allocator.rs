@@ -329,6 +329,9 @@ pub struct RuntimeLane {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateTrace {
     pub lane: RuntimeLane,
+    /// Advisory at selection time; never changes eligibility or scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_usage: Option<bool>,
     pub eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusion_reason: Option<String>,
@@ -878,6 +881,7 @@ fn score_candidate(
 ) -> CandidateTrace {
     let mut candidate = CandidateTrace {
         lane: lane.clone(),
+        peak_usage: super::usage_schedule::peak_usage(lane.provider, super::now_ms()),
         eligible: false,
         exclusion_reason: None,
         score_components: BTreeMap::new(),

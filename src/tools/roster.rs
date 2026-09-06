@@ -301,7 +301,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_providers",
-        description = "List provider summaries; pass provider to list its model slugs and reasoning efforts."
+        description = "List provider summaries with current peak_usage advisories; pass provider to list its model slugs and reasoning efforts."
     )]
     pub(crate) fn bro_providers(
         &self,
@@ -324,6 +324,7 @@ impl BlackboxServer {
             }
         };
         let mut info = serde_json::Map::new();
+        let now = orch::now_ms();
         for p in Provider::ALL {
             if selected.is_some_and(|selected| selected != *p) {
                 continue;
@@ -332,6 +333,7 @@ impl BlackboxServer {
                 "promptCache": p.prompt_cache(),
                 "supportsResume": p.supports_resume(),
             });
+            super::dispatch::annotate_peak_usage(&mut entry, *p, now);
             entry["modelCount"] = json!(p.models().len());
             entry["defaultModel"] = json!(p.models().iter().find(|m| m.default).map(|m| m.id));
             if selected.is_some() && !p.models().is_empty() {
@@ -2055,6 +2057,9 @@ mod tests {
             assert!(entry.get("models").is_none());
             assert!(entry.get("efforts").is_none());
         }
+        assert!(summary["glm"]["peak_usage"].is_boolean());
+        assert!(summary["deepseek"]["peak_usage"].is_boolean());
+        assert!(summary["brodex"].get("peak_usage").is_none());
         let detail = server.bro_providers(Parameters(ProvidersParams {
             provider: Some("brodex".into()),
         }));

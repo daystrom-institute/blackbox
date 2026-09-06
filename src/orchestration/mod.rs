@@ -11,6 +11,7 @@ pub mod resume_lease;
 pub mod supervision;
 pub mod tail;
 pub mod team;
+pub mod usage_schedule;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
