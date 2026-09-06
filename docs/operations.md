@@ -465,6 +465,11 @@ binary using its platform runbook, then restarts that instance. Operator
 hosts using a remote daemon run collectors and fleet clients; the corpus
 daemon remains on its deployment host.
 
+Keep the offline administration CLI installed on maintenance hosts too:
+install the verified `target/release/blackbox` as `~/.local/bin/blackbox`,
+using the same backup and platform-signing procedure. It remains the entry
+point for offline catalog and transport maintenance.
+
 Update affected native `bro` and `bro-harness` binaries with a retained backup
 and platform signing. After the daemon is healthy, refresh generated guidance
 on each operator host that consumes it:
