@@ -194,9 +194,11 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   blackbox.daystrom.app serves everything. Satellites that read nothing
   local (the Slack conversation-source collector) run IN the cage from the
   same runtime image as their own Deployments; converge.sh deploys them
-  too. Native provider transcript ingestion still needs its replacement
-  collector/source lane after the cage move; indexed drill-down alone does
-  not collect missing history (gap-e40feb8f).
+  too. Native provider history is collected on its source host by
+  `bbox-transcript-collector`, using a dedicated producer grant and the native
+  transcript transport. See `docs/native-transcript-collector.md` for enrollment,
+  backfill, and macOS signing/Local Network requirements. Indexed drill-down
+  alone does not prove a current background scan; inspect source freshness.
 - **Interactive heavy worktrees are lanes, not local disk**: claim a warm
   standby lane in seconds (`~/repos/bbox-cage/build/lanes/lane-pool.sh
   claim` prints the checkout path), or create a named one from the
