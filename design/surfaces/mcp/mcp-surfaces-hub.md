@@ -20,6 +20,8 @@ clients.
 - [Context Clipboard Tools](context-clipboard-tools.md)
 - [MCP 2026-07-28 Target Surface](mcp-2026-07-28-target-surface.md)
 - [rmcp 3.0 Migration Plan](rmcp-3-migration-plan.md)
+- [MCP Response and Contract Audit](mcp-response-and-contract-audit.md)
+- [MCP Audit Coverage](mcp-audit-coverage.md)
 
 ## Crosscuts
 
