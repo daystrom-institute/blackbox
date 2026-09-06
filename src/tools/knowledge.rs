@@ -14,9 +14,17 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 const DEFAULT_PACKET_SIDECAR_LIMIT: usize = 8;
 const DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT: usize = 6;
+const KNOWLEDGE_DETAIL_PAGE_BYTES: usize = 4096;
+const KNOWLEDGE_DETAIL_MIN_PAGE_BYTES: usize = 256;
+const STRUCTURED_KNOWLEDGE_CONTENT_BYTES: usize = 512;
+const STRUCTURED_KNOWLEDGE_METADATA_BYTES: usize = 256;
+const STRUCTURED_KNOWLEDGE_COLLECTION_BYTES: usize = 512;
+const DIAGNOSTIC_PREVIEW_BYTES: usize = 160;
+const DIAGNOSTIC_PREVIEW_COUNT: usize = 2;
 
 #[derive(Clone, Copy)]
 pub(crate) enum KnowledgeMutationOwner {
@@ -1347,21 +1355,494 @@ fn format_system_memory_catalog(query: Option<&str>) -> String {
     system_memory::format_catalog_summary(query)
 }
 
-fn exact_system_memory_response(p: &KnowledgeListParams) -> Option<String> {
+fn system_memory_catalog_response(p: &KnowledgeListParams) -> Option<String> {
     if has_runtime_knowledge_filter(p) {
         return None;
     }
     if matches_system_memory_catalog(p.category.as_deref()) {
         return Some(format_system_memory_catalog(p.query.as_deref()));
     }
-    if p.category.is_some() {
+    None
+}
+
+fn exact_system_memory_target(
+    p: &KnowledgeListParams,
+) -> Option<&'static system_memory::SystemMemory> {
+    if has_runtime_knowledge_filter(p) || p.category.is_some() {
         return None;
     }
-    let memory = system_memory::exact_query(p.query.as_deref())?;
-    let mut out = String::new();
-    out.push_str("── System memories ──────────────────────────\n");
-    out.push_str(&system_memory::format_for_listing(memory));
-    Some(out)
+    system_memory::exact_query(p.query.as_deref())
+}
+
+fn exact_system_memory_response(p: &KnowledgeListParams) -> Option<String> {
+    if let Some(memory) = exact_system_memory_target(p) {
+        let mut out = String::new();
+        out.push_str("── System memories ──────────────────────────\n");
+        out.push_str(&system_memory::format_for_listing(memory));
+        return Some(out);
+    }
+    system_memory_catalog_response(p)
+}
+
+fn knowledge_detail_page_limit(requested: Option<u64>) -> usize {
+    requested
+        .map(|limit| limit as usize)
+        .unwrap_or(KNOWLEDGE_DETAIL_PAGE_BYTES)
+        .clamp(KNOWLEDGE_DETAIL_MIN_PAGE_BYTES, KNOWLEDGE_DETAIL_PAGE_BYTES)
+}
+
+fn projection_revision(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn parse_projection_cursor(cursor: &str, revision: &str) -> anyhow::Result<usize> {
+    let (cursor_revision, offset) = cursor.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("invalid detail cursor: expected <content_sha256>:<offset>")
+    })?;
+    anyhow::ensure!(
+        cursor_revision == revision,
+        "stale detail cursor: the underlying content changed; restart the same detail read without detail_cursor"
+    );
+    offset
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid detail cursor offset"))
+}
+
+fn projection_body_page(
+    subject: &str,
+    scope_seed: &str,
+    body: &str,
+    format: &str,
+    cursor: Option<&str>,
+    requested_limit: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    let revision = projection_revision(&[subject, scope_seed, body]);
+    let offset = match cursor {
+        Some(cursor) => parse_projection_cursor(cursor, &revision)?,
+        None => 0,
+    };
+    anyhow::ensure!(
+        offset <= body.len(),
+        "stale detail cursor: page offset {offset} is past the {} byte body; restart without detail_cursor",
+        body.len()
+    );
+    anyhow::ensure!(
+        body.is_char_boundary(offset),
+        "invalid detail cursor: offset splits a Unicode character"
+    );
+    let limit = knowledge_detail_page_limit(requested_limit);
+    let mut end = (offset + limit).min(body.len());
+    while end > offset && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut page = json!({
+        "text": &body[offset..end],
+        "format": format,
+        "offset": offset,
+        "end": end,
+        "total_bytes": body.len(),
+        "complete": end == body.len(),
+        "content_sha256": revision,
+    });
+    if end < body.len() {
+        page["next_cursor"] = json!(format!("{revision}:{end}"));
+    }
+    Ok(page)
+}
+
+fn detail_text_marker(kind: &str, page: &serde_json::Value) -> String {
+    let offset = page["offset"].as_u64().unwrap_or_default();
+    let end = page["end"].as_u64().unwrap_or_default();
+    let total = page["total_bytes"].as_u64().unwrap_or_default();
+    let mut out = format!(
+        "Exact {kind} body page {offset}..{end} of {total} bytes is in structuredContent.body; "
+    );
+    if page["complete"].as_bool() == Some(true) {
+        out.push_str("this page is complete.");
+    } else {
+        out.push_str("continue with the returned body.next_cursor in detail_cursor.");
+    }
+    out
+}
+
+fn knowledge_query_scope(p: &KnowledgeListParams) -> serde_json::Value {
+    json!({
+        "category": p.category,
+        "scope": p.scope,
+        "project": p.project,
+        "provider": p.provider,
+        "status": p.status,
+        "approval": p.approval,
+        "query": p.query,
+        "mode": p.mode,
+        "provisional": p.provisional,
+    })
+}
+
+fn knowledge_recovery_arguments(
+    p: &KnowledgeListParams,
+    entity_ref: &str,
+) -> serde_json::Value {
+    let mut arguments = knowledge_query_scope(p);
+    arguments["entry_detail"] = json!(entity_ref);
+    if let Some(limit) = p.detail_limit {
+        arguments["detail_limit"] = json!(limit);
+    }
+    arguments
+}
+
+fn resolve_knowledge_item<'a>(
+    items: &'a [crate::server::knowledge_view::KnowledgeViewItem],
+    selector: &str,
+) -> anyhow::Result<&'a crate::server::knowledge_view::KnowledgeViewItem> {
+    let selector = selector.trim();
+    anyhow::ensure!(!selector.is_empty(), "entry_detail must name a knowledge entry");
+    if selector.starts_with("knowledge:") || selector.starts_with("provisional_knowledge:") {
+        return items
+            .iter()
+            .find(|item| item.entity_ref == selector)
+            .with_context(|| format!("knowledge variant {selector} is not visible in this view"));
+    }
+    let matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.entry.id == selector || item.entity_ref == selector)
+        .collect();
+    match matches.as_slice() {
+        [item] => Ok(item),
+        [] => anyhow::bail!("knowledge entry {selector} is not visible in this view"),
+        _ => {
+            let refs = matches
+                .iter()
+                .map(|item| item.entity_ref.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "knowledge id {selector} is ambiguous across variants; pass one canonical entity_ref: {refs}"
+            );
+        }
+    }
+}
+
+fn knowledge_row_ref(item: &crate::server::knowledge_view::KnowledgeViewItem) -> String {
+    item.entity_ref.clone()
+}
+
+fn diagnostic_recovery_arguments(p: &KnowledgeListParams) -> serde_json::Value {
+    let mut arguments = knowledge_query_scope(p);
+    arguments["diagnostics_detail"] = json!(true);
+    if let Some(limit) = p.detail_limit {
+        arguments["detail_limit"] = json!(limit);
+    }
+    arguments
+}
+
+fn compact_text_fragment(text: &str, limit: usize) -> String {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let fragment = &text[..end];
+    if fragment.len() == text.len() {
+        fragment.to_string()
+    } else {
+        format!("{fragment}...")
+    }
+}
+
+fn diagnostic_state(diagnostic: &str) -> &'static str {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    if diagnostic.contains("unavailable") || diagnostic.contains("missing") {
+        "unavailable"
+    } else if diagnostic.contains("stale") || diagnostic.contains("changed") {
+        "stale"
+    } else if diagnostic.contains("queued") || diagnostic.contains("pending") {
+        "queued"
+    } else if diagnostic.contains("partial") || diagnostic.contains("incomplete") {
+        "partial"
+    } else if diagnostic.contains("degraded") || diagnostic.contains("skipped") {
+        "degraded"
+    } else if diagnostic.contains("filter") || diagnostic.contains("registered project") {
+        "filter"
+    } else {
+        "other"
+    }
+}
+
+fn diagnostic_summary(diagnostics: &[String], p: &KnowledgeListParams) -> serde_json::Value {
+    let mut states = BTreeMap::<&str, usize>::new();
+    for diagnostic in diagnostics {
+        *states.entry(diagnostic_state(diagnostic)).or_default() += 1;
+    }
+    json!({
+        "count": diagnostics.len(),
+        "states": states,
+        "previews": diagnostics
+            .iter()
+            .take(DIAGNOSTIC_PREVIEW_COUNT)
+            .map(|diagnostic| compact_text_fragment(diagnostic, DIAGNOSTIC_PREVIEW_BYTES))
+            .collect::<Vec<_>>(),
+        "preview_count": DIAGNOSTIC_PREVIEW_COUNT.min(diagnostics.len()),
+        "omitted_bytes": diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.len())
+            .sum::<usize>(),
+        "recovery": (!diagnostics.is_empty()).then(|| json!({
+            "tool": "bbox_knowledge",
+            "arguments": diagnostic_recovery_arguments(p),
+            "preserves_query_scope": true,
+            "live_view": true,
+            "changed_behavior": "Diagnostics are recomputed for the same filters; changed content invalidates detail_cursor.",
+        })),
+    })
+}
+
+fn diagnostic_summary_text(summary: &serde_json::Value) -> String {
+    let count = summary["count"].as_u64().unwrap_or_default();
+    if count == 0 {
+        return String::new();
+    }
+    let states = summary["states"]
+        .as_object()
+        .map(|states| {
+            states
+                .iter()
+                .map(|(state, count)| format!("{state}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!(
+        "[knowledge visibility: {count} diagnostics ({states}); compact previews and exact recovery are in structuredContent.diagnostics]"
+    )
+}
+
+fn exact_diagnostics_response(
+    diagnostics: &[String],
+    p: &KnowledgeListParams,
+) -> anyhow::Result<(String, serde_json::Value)> {
+    let body = serde_json::to_string(diagnostics)?;
+    let scope = knowledge_query_scope(p).to_string();
+    let page = projection_body_page(
+        "bbox_knowledge diagnostics",
+        &scope,
+        &body,
+        "json",
+        p.detail_cursor.as_deref(),
+        p.detail_limit,
+    )?;
+    let text = detail_text_marker("diagnostics", &page);
+    let structured = json!({
+        "detail": "diagnostics",
+        "scope": knowledge_query_scope(p),
+        "diagnostic_count": diagnostics.len(),
+        "body": page,
+        "provenance": {
+            "source": "session knowledge visibility for the request scope",
+            "format": "json",
+            "live_view": true,
+        },
+    });
+    Ok((text, structured))
+}
+
+fn exact_system_memory_detail_response(
+    memory: &system_memory::SystemMemory,
+    p: &KnowledgeListParams,
+) -> anyhow::Result<(String, serde_json::Value)> {
+    let body = serde_json::to_string(memory)?;
+    let page = projection_body_page(
+        "system memory record",
+        &memory.id,
+        &body,
+        "json",
+        p.detail_cursor.as_deref(),
+        p.detail_limit,
+    )?;
+    let text = detail_text_marker("system memory", &page);
+    let structured = json!({
+        "detail": "system_memory",
+        "entity_ref": format!("system_memory:{}", memory.id),
+        "body": page,
+        "provenance": {
+            "source": "file-loaded system memory catalog",
+            "format": "json",
+            "content_sha256": page["content_sha256"],
+            "live_view": false,
+        },
+    });
+    Ok((text, structured))
+}
+
+fn exact_entry_detail_response(
+    view: &crate::server::knowledge_view::SessionKnowledgeView,
+    p: &KnowledgeListParams,
+    visible_refs: &[String],
+) -> anyhow::Result<(String, serde_json::Value)> {
+    let selector = p.entry_detail.as_deref().unwrap_or_default();
+    let item = resolve_knowledge_item(&view.items, selector)?;
+    let row_ref = knowledge_row_ref(item);
+    anyhow::ensure!(
+        visible_refs.contains(&row_ref),
+        "knowledge variant {} is not in the requested filter scope",
+        item.entity_ref
+    );
+    let mut canonical_entry = item.entry.clone();
+    if item.entity_ref.starts_with("provisional_knowledge:") {
+        canonical_entry.id = item.entity_ref.clone();
+    }
+    let body = serde_json::to_string(&canonical_entry)?;
+    let scope_seed = format!(
+        "{}\0{}",
+        item.entity_ref,
+        knowledge_query_scope(p).to_string()
+    );
+    let page = projection_body_page(
+        "knowledge entry record",
+        &scope_seed,
+        &body,
+        "json",
+        p.detail_cursor.as_deref(),
+        p.detail_limit,
+    )?;
+    let text = detail_text_marker("knowledge entry", &page);
+    let structured = json!({
+        "detail": "knowledge_entry",
+        "entity_ref": item.entity_ref,
+        "scope": knowledge_query_scope(p),
+        "record": {
+            "id": item.entry.id,
+            "entity_ref": item.entity_ref,
+            "category": format!("{:?}", item.entry.category),
+            "content_preview": compact_text_fragment(&item.entry.content, DIAGNOSTIC_PREVIEW_BYTES),
+            "content_bytes": item.entry.content.len(),
+        },
+        "body": page,
+        "provenance": {
+            "source": "session knowledge view",
+            "format": "json",
+            "content_sha256": page["content_sha256"],
+            "live_view": true,
+        },
+    });
+    Ok((text, structured))
+}
+
+fn bound_entry_metadata(entry: &mut serde_json::Value) -> bool {
+    let mut truncated = false;
+    for field in [
+        "title",
+        "cluster",
+        "project",
+        "project_id",
+        "supersedes",
+        "rationale",
+        "expires_at",
+        "source",
+    ] {
+        let Some(value) = entry[field].as_str().map(str::to_string) else {
+            continue;
+        };
+        if value.len() > STRUCTURED_KNOWLEDGE_METADATA_BYTES {
+            let bytes_field = format!("{field}_bytes");
+            entry[field] = json!(compact_text_fragment(
+                &value,
+                STRUCTURED_KNOWLEDGE_METADATA_BYTES
+            ));
+            entry[bytes_field.as_str()] = json!(value.len());
+            truncated = true;
+        }
+    }
+    for field in ["variants", "providers", "links"] {
+        let Some(value) = entry[field].clone() else {
+            continue;
+        };
+        let serialized = serde_json::to_string(&value).unwrap_or_default();
+        if serialized.len() > STRUCTURED_KNOWLEDGE_COLLECTION_BYTES {
+            let count = match &value {
+                serde_json::Value::Object(map) => map.len(),
+                serde_json::Value::Array(rows) => rows.len(),
+                _ => 0,
+            };
+            entry[field] = json!({
+                "count": count,
+                "bytes": serialized.len(),
+                "truncated": true,
+            });
+            truncated = true;
+        }
+    }
+    truncated
+}
+
+fn bound_structured_knowledge_rows(structured: &mut serde_json::Value, p: &KnowledgeListParams) {
+    let Some(rows) = structured["rows"].as_array_mut() else {
+        return;
+    };
+    for row in rows {
+        let Some(entry) = row["entry"].as_object_mut() else {
+            continue;
+        };
+        let mut truncated = false;
+        if let Some(content) = entry["content"].as_str().map(str::to_string)
+            && content.len() > STRUCTURED_KNOWLEDGE_CONTENT_BYTES
+        {
+            entry["content"] = json!(compact_text_fragment(
+                &content,
+                STRUCTURED_KNOWLEDGE_CONTENT_BYTES
+            ));
+            entry["content_bytes"] = json!(content.len());
+            entry["content_truncated"] = json!(true);
+            truncated = true;
+        }
+        truncated |= bound_entry_metadata(entry);
+        let Some(entity_ref) = row["entity_ref"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if !truncated {
+            continue;
+        }
+        let arguments = knowledge_recovery_arguments(p, &entity_ref);
+        row["detail"] = json!({
+            "tool": "bbox_knowledge",
+            "arguments": arguments,
+            "live_view": true,
+            "changed_behavior": "A changed entry or filter scope invalidates detail_cursor.",
+        });
+    }
+}
+
+fn validate_knowledge_detail_selection(
+    p: &KnowledgeListParams,
+    exact_memory_requested: bool,
+) -> anyhow::Result<()> {
+    let diagnostics = p.diagnostics_detail == Some(true);
+    let entry = p
+        .entry_detail
+        .as_deref()
+        .is_some_and(|selector| !selector.trim().is_empty());
+    let selected =
+        usize::from(diagnostics) + usize::from(entry) + usize::from(exact_memory_requested);
+    anyhow::ensure!(
+        selected <= 1,
+        "choose only one detail mode: diagnostics_detail, entry_detail, or an exact sm-* query"
+    );
+    if p.entry_detail
+        .as_deref()
+        .is_some_and(|selector| selector.trim().is_empty())
+    {
+        anyhow::bail!("entry_detail must not be empty");
+    }
+    if (p.detail_cursor.is_some() || p.detail_limit.is_some()) && selected == 0 {
+        anyhow::bail!(
+            "detail_cursor and detail_limit require diagnostics_detail, entry_detail, or an exact sm-* query"
+        );
+    }
+    Ok(())
 }
 
 #[tool_router(router = knowledge_tools)]
@@ -1745,8 +2226,13 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_knowledge", move || {
-            if let Some(out) = exact_system_memory_response(&p) {
+            let exact_memory = exact_system_memory_target(&p);
+            validate_knowledge_detail_selection(&p, exact_memory.is_some())?;
+            if let Some(out) = system_memory_catalog_response(&p) {
                 return Ok((out.clone(), json!({ "text": out })));
+            }
+            if let Some(memory) = exact_memory {
+                return exact_system_memory_detail_response(memory, &p);
             }
 
             let mut p = p;
@@ -1771,6 +2257,16 @@ impl BlackboxServer {
                 p.project.as_deref(),
                 p.provisional.as_deref(),
             )?;
+            if p.entry_detail.is_some() {
+                let mut scope_params = p.clone();
+                scope_params.limit = Some(u64::MAX);
+                let scoped = view.knowledge.list(&scope_params)?;
+                let visible_refs = returned_entry_ids(&scoped)
+                    .iter()
+                    .map(|id| knowledge_entity_ref(id))
+                    .collect::<Vec<_>>();
+                return exact_entry_detail_response(&view, &p, &visible_refs);
+            }
             let mut combined = view.knowledge.list(&p)?;
             let returned_ids = returned_entry_ids(&combined);
             // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
@@ -1779,10 +2275,8 @@ impl BlackboxServer {
             // itself.
             let returned_legacy_rows = view.returned_rows_include_legacy_lane(&returned_ids);
             view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
-            if let Some(diagnostics) = view.diagnostics_text() {
-                combined.push_str("\n\n");
-                combined.push_str(&diagnostics);
-                combined.push('\n');
+            if p.diagnostics_detail == Some(true) {
+                return exact_diagnostics_response(&view.diagnostics, &p);
             }
             // Captured before packets/memories are appended, so it reflects the
             // top knowledge entry (not a packet/memory line).
@@ -1868,9 +2362,8 @@ impl BlackboxServer {
             //
             // The broad query path renders compact signposts, not full bodies:
             // a fuzzy multi-term query matches many runbooks, and full bodies
-            // (~40KB each) overflow the token budget. The agent pulls a full
-            // body via the exact-id short-circuit (`bbox_knowledge(query="sm-…")`,
-            // handled above by exact_system_memory_response).
+            // (~40KB each) overflow the token budget. The agent recovers a
+            // body through bounded pages by querying its exact sm-* id.
             let memories = system_memory::search(p.query.as_deref());
             if !memories.is_empty() {
                 if !combined.ends_with('\n') {
@@ -1893,7 +2386,7 @@ impl BlackboxServer {
                     ));
                 }
                 combined.push_str(
-                    "  (signposts only — query an exact sm-* id for the full runbook body)\n",
+                    "  (signposts only; query an exact sm-* id for bounded full-body pages)\n",
                 );
             }
 
@@ -1913,7 +2406,17 @@ impl BlackboxServer {
                     "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"{entity_ref}\"])\n"
                 ));
             }
-            let structured = view.structured_response(&returned_ids);
+            let mut structured = view.structured_response(&returned_ids);
+            structured["diagnostics"] = diagnostic_summary(&view.diagnostics, &p);
+            bound_structured_knowledge_rows(&mut structured, &p);
+            let diagnostic_text = diagnostic_summary_text(&structured["diagnostics"]);
+            if !diagnostic_text.is_empty() {
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&diagnostic_text);
+                combined.push('\n');
+            }
             combined = view.append_built_from_for_ids(combined, &returned_ids);
             Ok((combined, structured))
         })
@@ -2652,12 +3155,419 @@ mod tests {
     }
 
     fn knowledge_diagnostics(structured: &serde_json::Value) -> Vec<String> {
-        structured["diagnostics"]
+        structured["diagnostics"]["previews"]
             .as_array()
-            .expect("diagnostics array")
+            .expect("diagnostic preview array")
             .iter()
-            .map(|line| line.as_str().expect("diagnostic string").to_string())
+            .map(|line| {
+                line.as_str()
+                    .expect("diagnostic preview string")
+                    .to_string()
+            })
             .collect()
+    }
+
+    #[test]
+    fn diagnostic_summary_keeps_many_warnings_compact_and_recoverable() {
+        let p = KnowledgeListParams {
+            query: Some("no such marker".into()),
+            project: Some("global-lane-selector".into()),
+            ..Default::default()
+        };
+        let diagnostics: Vec<String> = (0..24)
+            .map(|index| match index % 4 {
+                0 => format!("catalog index unavailable for shard {index}"),
+                1 => format!("accepted publication is stale for shard {index}"),
+                2 => format!("checkout mutation queued for shard {index}"),
+                _ => format!("overlay partially loaded for shard {index}"),
+            })
+            .collect();
+        let summary = diagnostic_summary(&diagnostics, &p);
+        assert_eq!(summary["count"], 24);
+        assert_eq!(summary["states"]["unavailable"], 6);
+        assert_eq!(summary["states"]["stale"], 6);
+        assert_eq!(summary["states"]["queued"], 6);
+        assert_eq!(summary["states"]["partial"], 6);
+        assert_eq!(summary["previews"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            summary["recovery"]["arguments"]["project"],
+            "global-lane-selector"
+        );
+        assert_eq!(summary["recovery"]["arguments"]["query"], "no such marker");
+        assert_eq!(summary["recovery"]["arguments"]["diagnostics_detail"], true);
+        let text = diagnostic_summary_text(&summary);
+        assert!(text.contains("24 diagnostics"));
+        assert!(text.contains("unavailable=6"));
+        assert!(!text.contains("shard 23"));
+    }
+
+    #[test]
+    fn exact_diagnostics_pages_preserve_scope_and_reconstruct_unicode() {
+        let p = KnowledgeListParams {
+            query: Some("unicode diagnostics".into()),
+            project: Some("unregistered-global-lane".into()),
+            detail_limit: Some(257),
+            ..Default::default()
+        };
+        let diagnostics: Vec<String> = (0..12)
+            .map(|index| format!("diagnostic {index}: {}", "警告".repeat(80)))
+            .collect();
+        let expected = serde_json::to_string(&diagnostics).unwrap();
+        let (_, first) = exact_diagnostics_response(&diagnostics, &p).unwrap();
+        assert_eq!(first["scope"]["project"], "unregistered-global-lane");
+        assert_eq!(first["scope"]["query"], "unicode diagnostics");
+
+        let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
+        let mut calls = 1;
+        while let Some(active_cursor) = cursor {
+            let mut next_params = p.clone();
+            next_params.detail_cursor = Some(active_cursor.clone());
+            let (_, page) = exact_diagnostics_response(&diagnostics, &next_params).unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+            calls += 1;
+        }
+        assert!(calls > 1);
+        assert_eq!(reconstructed, expected);
+
+        let mut stale_params = p.clone();
+        stale_params.detail_cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        let mut changed = diagnostics;
+        changed[0].push_str(" changed");
+        let error = exact_diagnostics_response(&changed, &stale_params)
+            .expect_err("changed diagnostics must invalidate cursor");
+        assert!(error.to_string().contains("stale detail cursor"));
+    }
+
+    #[test]
+    fn projection_body_pages_reconstruct_unicode_and_reject_changed_content() {
+        let body = "境界".repeat(1_000);
+        let first = projection_body_page("test body", "test scope", &body, "text", None, Some(257))
+            .unwrap();
+        assert_eq!(first["total_bytes"], body.len());
+        let mut reconstructed = first["text"].as_str().unwrap().to_string();
+        let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        while let Some(active_cursor) = cursor {
+            let page = projection_body_page(
+                "test body",
+                "test scope",
+                &body,
+                "text",
+                Some(&active_cursor),
+                Some(257),
+            )
+            .unwrap();
+            reconstructed.push_str(page["text"].as_str().unwrap());
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+        }
+        assert_eq!(reconstructed, body);
+        let stale = projection_body_page(
+            "test body",
+            "test scope",
+            "changed",
+            "text",
+            first["next_cursor"].as_str(),
+            Some(257),
+        )
+        .expect_err("changed body must invalidate cursor");
+        assert!(stale.to_string().contains("stale detail cursor"));
+    }
+
+    #[test]
+    fn exact_system_memory_read_pages_oversized_record() {
+        init_system_memory();
+        let memory =
+            system_memory::exact_query(Some("sm-rule-packets")).expect("canonical system memory");
+        assert!(memory.content.len() > KNOWLEDGE_DETAIL_PAGE_BYTES);
+        let p = KnowledgeListParams {
+            query: Some(memory.id.clone()),
+            detail_limit: Some(257),
+            ..Default::default()
+        };
+        let (text, first) = exact_system_memory_detail_response(memory, &p).unwrap();
+        assert!(text.contains("structuredContent.body"));
+        assert!(first["body"]["text"].as_str().unwrap().len() <= 257);
+        let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
+        let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        while let Some(active_cursor) = cursor {
+            let mut next = p.clone();
+            next.detail_cursor = Some(active_cursor);
+            let (_, page) = exact_system_memory_detail_response(memory, &next).unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+        }
+        let recovered: system_memory::SystemMemory = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered.id, memory.id);
+        assert_eq!(recovered.title, memory.title);
+        assert_eq!(&recovered.tags, &memory.tags);
+        assert_eq!(recovered.content, memory.content);
+    }
+
+    #[test]
+    fn structured_knowledge_rows_replace_oversized_content_with_detail() {
+        let content = "知".repeat(2_000);
+        let mut structured = json!({
+            "rows": [{
+                "entity_ref": "knowledge:big00001",
+                "entry": {"id": "big00001", "content": content},
+            }]
+        });
+        let p = KnowledgeListParams {
+            project: Some("/registered/project".into()),
+            query: Some("escaped \"metadata\"".into()),
+            provisional: Some("all".into()),
+            ..Default::default()
+        };
+        bound_structured_knowledge_rows(&mut structured, &p);
+        let entry = &structured["rows"][0]["entry"];
+        assert!(entry["content"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_CONTENT_BYTES);
+        assert_eq!(entry["content_bytes"], content.len());
+        assert_eq!(entry["content_truncated"], true);
+        let arguments = &structured["rows"][0]["detail"]["arguments"];
+        assert_eq!(arguments["entry_detail"], "knowledge:big00001");
+        assert_eq!(arguments["project"], "/registered/project");
+        assert_eq!(arguments["query"], "escaped \"metadata\"");
+        assert_eq!(arguments["provisional"], "all");
+    }
+
+    #[test]
+    fn structured_knowledge_rows_bound_oversized_metadata_and_collections() {
+        let title = "\"metadata\"\t".repeat(256);
+        let rationale = "decision ".repeat(128);
+        let mut structured = json!({
+            "rows": [{
+                "entity_ref": "provisional_knowledge:project:checkout:metadata",
+                "entry": {
+                    "id": "metadata",
+                    "title": title,
+                    "content": "compact",
+                    "rationale": rationale,
+                    "variants": {"provider": "\"variant\" ".repeat(128)},
+                    "providers": ["a", "b"],
+                },
+            }]
+        });
+        let p = KnowledgeListParams {
+            category: Some("convention".into()),
+            ..Default::default()
+        };
+        bound_structured_knowledge_rows(&mut structured, &p);
+        let entry = &structured["rows"][0]["entry"];
+        assert!(entry["title"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32);
+        assert_eq!(entry["title_bytes"], title.len());
+        assert!(entry["rationale"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32);
+        assert_eq!(entry["rationale_bytes"], rationale.len());
+        assert_eq!(entry["variants"]["count"], 1);
+        assert_eq!(entry["variants"]["truncated"], true);
+        let arguments = &structured["rows"][0]["detail"]["arguments"];
+        assert_eq!(
+            arguments["entry_detail"],
+            "provisional_knowledge:project:checkout:metadata"
+        );
+        assert_eq!(arguments["category"], "convention");
+    }
+
+    #[test]
+    fn exact_entry_detail_binds_canonical_provisional_variant_and_scope() {
+        use crate::server::knowledge_view::{KnowledgeViewItem, SessionKnowledgeView};
+
+        let own_ref = "provisional_knowledge:project:own-checkout:shared".to_string();
+        let peer_ref = "provisional_knowledge:project:peer-checkout:shared".to_string();
+        let published_ref = "knowledge:shared".to_string();
+        let mut published = stamped_entry("shared", "published variant", "project");
+        let mut own = stamped_entry("shared", "own variant", "project");
+        own.content = "own ".repeat(256);
+        let mut peer = stamped_entry("shared", "peer variant", "project");
+        peer.content = "peer ".repeat(256);
+
+        let mut store_entries = Vec::new();
+        let mut items = Vec::new();
+        for (entity_ref, entry) in [
+            (published_ref.clone(), published.clone()),
+            (own_ref.clone(), own.clone()),
+            (peer_ref.clone(), peer.clone()),
+        ] {
+            let item_entry = entry.clone();
+            store_entries.push(entry);
+            items.push(KnowledgeViewItem {
+                entity_ref,
+                entry: item_entry,
+                metadata: Default::default(),
+            });
+        }
+        let view = SessionKnowledgeView {
+            knowledge: bbox_knowledge::knowledge::Knowledge::detached_view(
+                store_entries,
+                BTreeMap::new(),
+            ),
+            items,
+            built_from: Default::default(),
+            diagnostics: Vec::new(),
+            degraded_overlays: Vec::new(),
+        };
+        let visible_refs = [published_ref, own_ref.clone(), peer_ref];
+        let p = KnowledgeListParams {
+            entry_detail: Some(own_ref.clone()),
+            provisional: Some("all".into()),
+            detail_limit: Some(257),
+            ..Default::default()
+        };
+
+        let (_, first) = exact_entry_detail_response(&view, &p, &visible_refs).unwrap();
+        assert_eq!(first["entity_ref"], own_ref);
+        assert_eq!(first["scope"]["provisional"], "all");
+        let cursor = first["body"]["next_cursor"].as_str().unwrap().to_string();
+        let mut changed_scope = p.clone();
+        changed_scope.query = Some("changed scope".into());
+        changed_scope.detail_cursor = Some(cursor);
+        let stale = exact_entry_detail_response(&view, &changed_scope, &visible_refs)
+            .expect_err("changed filter scope must invalidate cursor");
+        assert!(stale.to_string().contains("stale detail cursor"));
+
+        let mut bare = p.clone();
+        bare.entry_detail = Some("shared".into());
+        let ambiguous = exact_entry_detail_response(&view, &bare, &visible_refs)
+            .expect_err("duplicate bare id must reject");
+        assert!(ambiguous.to_string().contains("ambiguous across variants"));
+        assert!(ambiguous.to_string().contains(&own_ref));
+
+        let mut hidden = p.clone();
+        hidden.entry_detail = Some(peer_ref);
+        let out_of_scope = exact_entry_detail_response(&view, &hidden, &[own_ref])
+            .expect_err("filter scope must reject a hidden variant");
+        assert!(out_of_scope.to_string().contains("not in the requested filter scope"));
+    }
+
+    #[tokio::test]
+    async fn bbox_knowledge_exact_entry_pages_bound_and_reconstruct_unicode() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        let content = "體".repeat(4_000);
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry("unicode-entry", &content, &record.project_id))
+            .unwrap();
+
+        let default = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                query: Some(content[..6].into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(default.is_error, Some(true), "{default:?}");
+        let default = default.structured_content.expect("structured rows");
+        let row = &default["rows"][0];
+        assert!(
+            row["entry"]["content"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_CONTENT_BYTES
+        );
+        assert_eq!(row["entry"]["content_bytes"], content.len());
+        assert_eq!(row["detail"]["arguments"]["entry_detail"], "knowledge:unicode-entry");
+
+        let first = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                entry_detail: Some("knowledge:unicode-entry".into()),
+                detail_limit: Some(257),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(first.is_error, Some(true), "{first:?}");
+        let first = first.structured_content.expect("structured detail");
+        assert_eq!(first["entity_ref"], "knowledge:unicode-entry");
+        let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
+        let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        while let Some(active_cursor) = cursor {
+            let page = server
+                .bbox_knowledge(Parameters(KnowledgeListParams {
+                    entry_detail: Some("knowledge:unicode-entry".into()),
+                    detail_cursor: Some(active_cursor.clone()),
+                    detail_limit: Some(257),
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(page.is_error, Some(true), "{page:?}");
+            let page = page.structured_content.expect("structured detail page");
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+        }
+        let recovered: crate::knowledge::KnowledgeEntry =
+            serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered.content, content);
+
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "unicode-entry",
+                "changed body",
+                &record.project_id,
+            ))
+            .unwrap();
+        let stale = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                entry_detail: Some("knowledge:unicode-entry".into()),
+                detail_cursor: first["body"]["next_cursor"].as_str().map(str::to_string),
+                detail_limit: Some(257),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(stale.is_error, Some(true), "{stale:?}");
+        assert!(format!("{stale:?}").contains("stale detail cursor"));
+    }
+
+    #[tokio::test]
+    async fn bbox_knowledge_exact_metadata_pages_stay_inside_serialized_envelope() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        let mut entry = stamped_entry(
+            "metadata-entry",
+            "small content",
+            &record.project_id,
+        );
+        entry.title = "\"metadata title\"\t".repeat(2_000);
+        entry.rationale = Some("\"rationale\"\n".repeat(2_000));
+        server.state.kb.write().upsert_generated(entry.clone()).unwrap();
+
+        let mut params = KnowledgeListParams {
+            entry_detail: Some("knowledge:metadata-entry".into()),
+            detail_limit: Some(257),
+            ..Default::default()
+        };
+        let first = server.bbox_knowledge(Parameters(params.clone())).await;
+        assert_ne!(first.is_error, Some(true), "{first:?}");
+        let wire = serde_json::to_vec(&first).unwrap();
+        assert!(
+            wire.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+            "serialized envelope was {} bytes",
+            wire.len()
+        );
+        let first = first.structured_content.expect("structured detail");
+        assert_eq!(first["scope"]["entry_detail"], "knowledge:metadata-entry");
+        let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
+        let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        while let Some(active_cursor) = cursor {
+            params.detail_cursor = Some(active_cursor);
+            let page = server.bbox_knowledge(Parameters(params.clone())).await;
+            assert_ne!(page.is_error, Some(true), "{page:?}");
+            let wire = serde_json::to_vec(&page).unwrap();
+            assert!(wire.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+            let page = page.structured_content.expect("structured detail page");
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+        }
+        let recovered: crate::knowledge::KnowledgeEntry =
+            serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered.title, entry.title);
+        assert_eq!(recovered.rationale, entry.rationale);
     }
 
     /// gap-40ab1102 (1): a `project` filter must match rows by their stamped
@@ -2750,11 +3660,17 @@ mod tests {
         let diagnostics = knowledge_diagnostics(&structured).join("\n");
         assert!(
             diagnostics.contains("no-such-project-selector"),
-            "the diagnostic must name the unresolvable value: {diagnostics}"
+            "the diagnostic preview must name the unresolvable value: {diagnostics}"
         );
         assert!(
             diagnostics.contains("resolved to no registered project"),
             "{diagnostics}"
+        );
+        assert_eq!(structured["diagnostics"]["count"], 1);
+        assert_eq!(structured["diagnostics"]["states"]["filter"], 1);
+        assert_eq!(
+            structured["diagnostics"]["recovery"]["arguments"]["diagnostics_detail"],
+            true
         );
     }
 

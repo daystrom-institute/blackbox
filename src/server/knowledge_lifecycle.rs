@@ -2009,6 +2009,7 @@ mod tests {
                     project: None,
                     action: Some("approve".into()),
                     id: Some(review.id),
+                    ..Default::default()
                 },
                 None,
                 review.seed.as_ref(),

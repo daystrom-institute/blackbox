@@ -106,7 +106,7 @@ pub struct RememberParams {
     pub project_id: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct KnowledgeListParams {
     #[serde(default)]
     pub category: Option<String>,
@@ -136,6 +136,20 @@ pub struct KnowledgeListParams {
     /// Max rows to return.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Return the exact diagnostics for this same query scope as bounded
+    /// body pages instead of the compact diagnostic summary.
+    #[serde(default)]
+    pub diagnostics_detail: Option<bool>,
+    /// Return one visible knowledge record as an exact, bounded JSON body.
+    /// Takes precedence over listing rows.
+    #[serde(default)]
+    pub entry_detail: Option<String>,
+    /// Continuation cursor returned by a previous detail body page.
+    #[serde(default)]
+    pub detail_cursor: Option<String>,
+    /// Maximum bytes per detail body page. Values are clamped to 256..4096.
+    #[serde(default)]
+    pub detail_limit: Option<u64>,
     /// Published knowledge only, the authoritative session checkout's view,
     /// or every valid provisional variant. Defaults to own when the session
     /// has checkout authority, otherwise published.
@@ -770,14 +784,21 @@ pub struct AbsorbParams {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewParams {
-    /// list, approve, or reject (default: list)
+    /// Closed action set: list, get, approve, or reject (default: list).
     #[serde(default)]
     pub action: Option<String>,
-    /// Entry ID (required for approve/reject)
+    /// Entry ID. Required for get, approve, and reject.
     #[serde(default)]
     pub id: Option<String>,
+    /// Content-bound continuation cursor returned by a previous list or get.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// List rows per page (1..100) or exact-record body bytes per page
+    /// (256..4096).
+    #[serde(default)]
+    pub limit: Option<u64>,
     #[serde(default)]
     #[schemars(
         description = "Project selector for checkout-owner approve/reject mutations. Omit for global or local-store entries."
@@ -4382,6 +4403,141 @@ impl Knowledge {
         self.review_locked(p, write_dir, checkout_entry)
     }
 
+    pub fn validate_review_params(p: &ReviewParams) -> Result<()> {
+        let action = p.action.as_deref().unwrap_or("list");
+        match action {
+            "list" => {
+                anyhow::ensure!(p.id.is_none(), "review list does not accept id");
+                anyhow::ensure!(
+                    p.project.is_none(),
+                    "project selects a mutation owner and applies only to approve/reject"
+                );
+            }
+            "get" => {
+                let entry_id = p.id.as_deref().context("'id' required for get")?;
+                anyhow::ensure!(!entry_id.trim().is_empty(), "'id' must not be empty for get");
+                anyhow::ensure!(
+                    p.project.is_none(),
+                    "project selects a mutation owner and applies only to approve/reject"
+                );
+            }
+            "approve" | "reject" => {
+                anyhow::ensure!(
+                    p.cursor.is_none() && p.limit.is_none(),
+                    "cursor and limit apply only to review list/get reads"
+                );
+                let entry_id = p.id.as_deref().context(format!("'id' required for {action}"))?;
+                anyhow::ensure!(!entry_id.trim().is_empty(), "'id' must not be empty");
+            }
+            other => anyhow::bail!(
+                "invalid review action {other:?}: use list, get, approve, or reject"
+            ),
+        }
+        Ok(())
+    }
+
+    fn review_list_response(&self, cursor: Option<&str>, requested_limit: Option<u64>) -> Result<String> {
+        let unverified = self.unverified_review_entries();
+        let revision = review_snapshot_revision(&unverified);
+        let offset = match cursor {
+            Some(cursor) => parse_review_cursor(cursor, &revision)?,
+            None => 0,
+        };
+        let total = unverified.len();
+        anyhow::ensure!(
+            offset <= total,
+            "stale review cursor: page offset {offset} is past {total} rows; restart with action=\"list\" and no cursor"
+        );
+        let limit = review_list_limit(requested_limit);
+        let end = (offset + limit).min(total);
+        let mut envelope = serde_json::json!({
+            "action": "list",
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "rows": unverified[offset..end].iter().map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "entity_ref": format!("knowledge:{}", entry.id),
+                    "title_preview": review_content_preview(&entry.title),
+                    "category": format!("{:?}", entry.category),
+                    "approval": format!("{:?}", entry.approval),
+                    "content_preview": review_content_preview(&entry.content),
+                    "content_bytes": entry.content.len(),
+                    "detail": {"action": "get", "id": entry.id},
+                })
+            }).collect::<Vec<_>>(),
+            "continuation": {
+                "kind": "content_sha256_row_offset",
+                "content_sha256": revision,
+                "live_view": true,
+                "changed_behavior": "A changed queue invalidates cursor; restart with action=\"list\" and no cursor.",
+            },
+        });
+        if end < total {
+            envelope["next_cursor"] = serde_json::json!(format!("{revision}:{end}"));
+        }
+        Ok(serde_json::to_string_pretty(&envelope)?)
+    }
+
+    fn review_record_response(
+        &self,
+        entry_id: &str,
+        cursor: Option<&str>,
+        requested_limit: Option<u64>,
+    ) -> Result<String> {
+        let entry = self
+            .unverified_review_entries()
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .with_context(|| format!("entry {entry_id} is not pending review"))?;
+        let body = serde_json::to_string(entry)?;
+        let revision = content_review_hash(["review-record", entry_id, body.as_str()]);
+        let page = review_body_page(&body, &revision, cursor, requested_limit)?;
+        let mut envelope = serde_json::json!({
+            "action": "get",
+            "id": entry_id,
+            "record": {
+                "id": entry.id,
+                "entity_ref": format!("knowledge:{}", entry.id),
+                "title_preview": review_content_preview(&entry.title),
+                "category": format!("{:?}", entry.category),
+                "approval": format!("{:?}", entry.approval),
+                "content_preview": review_content_preview(&entry.content),
+                "content_bytes": entry.content.len(),
+            },
+            "body": page,
+            "provenance": {
+                "source": "bbox-knowledge review queue",
+                "format": "json",
+                "content_sha256": revision,
+                "live_view": true,
+            },
+            "continuation": {
+                "changed_behavior": "A changed record invalidates cursor; restart with action=\"get\", the same id, and no cursor.",
+            },
+        });
+        if let Some(next_cursor) = page["next_cursor"].as_str() {
+            envelope["next_cursor"] = serde_json::json!(next_cursor);
+        }
+        Ok(serde_json::to_string_pretty(&envelope)?)
+    }
+
+    fn unverified_review_entries(&self) -> Vec<&KnowledgeEntry> {
+        let mut entries: Vec<&KnowledgeEntry> = self
+            .store
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.status == Status::Active
+                    && (entry.approval == Approval::AgentInferred
+                        || entry.approval == Approval::Imported)
+            })
+            .collect();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries
+    }
+
     fn review_locked(
         &mut self,
         p: &ReviewParams,
@@ -4390,77 +4546,146 @@ impl Knowledge {
     ) -> Result<String> {
         let action = p.action.as_deref().unwrap_or("list");
         let id = p.id.as_deref();
-
+        Self::validate_review_params(p)?;
         match action {
-            "list" => {
-                let unverified: Vec<&KnowledgeEntry> = self
-                    .store
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        e.status == Status::Active
-                            && (e.approval == Approval::AgentInferred
-                                || e.approval == Approval::Imported)
-                    })
-                    .collect();
-
-                if unverified.is_empty() {
-                    return Ok("No entries pending review.".to_string());
-                }
-
-                let lines: Vec<String> = unverified
-                    .iter()
-                    .map(|e| {
-                        format!(
-                            "[{}] {:?} | {:?} | {}\n  {}",
-                            e.id, e.approval, e.category, e.title, e.content
-                        )
-                    })
-                    .collect();
-
-                Ok(format!(
-                    "{} entries pending review:\n\n{}",
-                    unverified.len(),
-                    lines.join("\n\n")
-                ))
+            "list" => self.review_list_response(p.cursor.as_deref(), p.limit),
+            "get" => {
+                let entry_id = id.context("'id' required for get")?;
+                self.review_record_response(entry_id, p.cursor.as_deref(), p.limit)
             }
-            "approve" => {
-                let id = id.context("'id' required for approve")?;
-                self.ensure_existing_write_authority(&[id], write_dir)?;
-                let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
-                if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
-                    entry.approval = Approval::UserConfirmed;
+            "approve" | "reject" => {
+                let entry_id = id.context(format!("'id' required for {action}"))?;
+                self.ensure_existing_write_authority(&[entry_id], write_dir)?;
+                let restore =
+                    self.install_checkout_mutation_seed(entry_id, checkout_entry, write_dir)?;
+                if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == entry_id) {
+                    if action == "approve" {
+                        entry.approval = Approval::UserConfirmed;
+                    } else {
+                        entry.status = Status::Deleted;
+                    }
                     entry.updated_at = Self::now_iso();
-                    let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+                    let persisted = self.persist_repo_owned_mutation_at(&[entry_id], write_dir);
                     self.restore_checkout_mutation_seed(restore);
                     persisted?;
-                    Ok(format!("Approved entry {}", id))
+                    let outcome = if action == "approve" { "Approved" } else { "Rejected" };
+                    Ok(format!("{outcome} entry {entry_id}"))
                 } else {
                     self.restore_checkout_mutation_seed(restore);
-                    Ok(format!("Entry {} not found", id))
+                    Ok(format!("Entry {entry_id} not found"))
                 }
             }
-            "reject" => {
-                let id = id.context("'id' required for reject")?;
-                self.ensure_existing_write_authority(&[id], write_dir)?;
-                let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
-                if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
-                    entry.status = Status::Deleted;
-                    entry.updated_at = Self::now_iso();
-                    let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
-                    self.restore_checkout_mutation_seed(restore);
-                    persisted?;
-                    Ok(format!("Rejected entry {}", id))
-                } else {
-                    self.restore_checkout_mutation_seed(restore);
-                    Ok(format!("Entry {} not found", id))
-                }
-            }
-            other => Ok(format!(
-                "Unknown action: {}. Use list, approve, or reject.",
-                other
-            )),
+            other => anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject"),
         }
+    }
+}
+
+const DEFAULT_REVIEW_LIST_LIMIT: usize = 20;
+const MAX_REVIEW_LIST_LIMIT: usize = 100;
+const REVIEW_PREVIEW_BYTES: usize = 128;
+const REVIEW_DETAIL_PAGE_BYTES: usize = 4096;
+const MIN_REVIEW_DETAIL_PAGE_BYTES: usize = 256;
+
+fn review_list_limit(requested: Option<u64>) -> usize {
+    requested
+        .map(|limit| limit as usize)
+        .unwrap_or(DEFAULT_REVIEW_LIST_LIMIT)
+        .clamp(1, MAX_REVIEW_LIST_LIMIT)
+}
+
+fn review_body_limit(requested: Option<u64>) -> usize {
+    requested
+        .map(|limit| limit as usize)
+        .unwrap_or(REVIEW_DETAIL_PAGE_BYTES)
+        .clamp(MIN_REVIEW_DETAIL_PAGE_BYTES, REVIEW_DETAIL_PAGE_BYTES)
+}
+
+fn content_review_hash<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn review_snapshot_revision(entries: &[&KnowledgeEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update(entry.id.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(entry).expect("review entries serialize"));
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn parse_review_cursor(cursor: &str, expected_revision: &str) -> Result<usize> {
+    let (revision, offset) = cursor
+        .split_once(':')
+        .with_context(|| "invalid review cursor: expected <content_sha256>:<offset>")?;
+    anyhow::ensure!(
+        revision == expected_revision,
+        "stale review cursor: the queued content changed; restart the same read without a cursor"
+    );
+    let offset = offset
+        .parse::<usize>()
+        .with_context(|| "invalid review cursor offset")?;
+    Ok(offset)
+}
+
+fn review_body_page(
+    body: &str,
+    revision: &str,
+    cursor: Option<&str>,
+    requested_limit: Option<u64>,
+) -> Result<serde_json::Value> {
+    let offset = match cursor {
+        Some(cursor) if !cursor.is_empty() => parse_review_cursor(cursor, revision)?,
+        Some(_) | None => 0,
+    };
+    anyhow::ensure!(
+        offset <= body.len(),
+        "stale review cursor: page offset {offset} is past the {} byte record; restart with action=\"get\" and no cursor",
+        body.len()
+    );
+    anyhow::ensure!(
+        body.is_char_boundary(offset),
+        "invalid review cursor: offset splits a Unicode character"
+    );
+    let limit = review_body_limit(requested_limit);
+    let mut end = (offset + limit).min(body.len());
+    while end > offset && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut page = serde_json::json!({
+        "text": &body[offset..end],
+        "format": "json",
+        "offset": offset,
+        "end": end,
+        "total_bytes": body.len(),
+        "complete": end == body.len(),
+        "content_sha256": revision,
+    });
+    if end < body.len() {
+        page["next_cursor"] = serde_json::json!(format!("{revision}:{end}"));
+    }
+    Ok(page)
+}
+
+fn review_content_preview(content: &str) -> String {
+    let mut end = REVIEW_PREVIEW_BYTES.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let preview = &content[..end];
+    if content.len() == preview.len() {
+        preview.to_string()
+    } else {
+        format!(
+            "{preview}... [{} more chars]",
+            content.len() - preview.len()
+        )
     }
 }
 
@@ -6170,6 +6395,162 @@ mod tests {
     }
 
     #[test]
+    fn review_list_pages_bounded_previews_with_content_bound_cursor() {
+        let (_tmp, mut kb) = mk_kb();
+        for index in 0..25 {
+            let id = format!("entry{index:02}");
+            push_entry(&mut kb, &id, &format!("Review {index}"), &"x".repeat(500));
+            kb.store.entries[index].approval = Approval::AgentInferred;
+        }
+
+        let first = kb
+            .review(&ReviewParams::default())
+            .expect("first review page");
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["total"], 25);
+        assert_eq!(first["rows"].as_array().unwrap().len(), 20);
+        assert!(first["rows"][0]["content_preview"].as_str().unwrap().len() < 500);
+        let next_cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+        let second = kb
+            .review(&ReviewParams {
+                cursor: Some(next_cursor.clone()),
+                ..Default::default()
+            })
+            .expect("second review page");
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["offset"], 20);
+        assert_eq!(second["rows"].as_array().unwrap().len(), 5);
+        assert!(second.get("next_cursor").is_none());
+
+        let mut extra = kb.store.entries[0].clone();
+        extra.id = "entry99".into();
+        extra.status = Status::Active;
+        extra.approval = Approval::Imported;
+        kb.store.entries.push(extra);
+        let stale = kb.review(&ReviewParams {
+            cursor: Some(next_cursor),
+            ..Default::default()
+        });
+        assert!(
+            stale
+                .expect_err("queue cursor must invalidate")
+                .to_string()
+                .contains("stale review cursor")
+        );
+    }
+
+    #[test]
+    fn review_exact_record_pages_reconstruct_unicode_and_reject_stale_cursor() {
+        let (_tmp, mut kb) = mk_kb();
+        let content = "边界".repeat(3_000);
+        push_entry(&mut kb, "unicode1", "Unicode record", &content);
+        kb.store.entries[0].approval = Approval::AgentInferred;
+
+        let listed = kb.review(&ReviewParams::default()).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        let entry_id = listed["rows"][0]["detail"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut cursor = None;
+        let mut reconstructed = String::new();
+        for _ in 0..8 {
+            let page = kb
+                .review(&ReviewParams {
+                    action: Some("get".into()),
+                    id: Some(entry_id.clone()),
+                    cursor,
+                    limit: Some(257),
+                    ..Default::default()
+                })
+                .expect("record page");
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            match page["next_cursor"].as_str() {
+                Some(next_cursor) => cursor = Some(next_cursor.to_string()),
+                None => break,
+            }
+        }
+        let recovered: KnowledgeEntry = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered.content, content);
+        assert_eq!(recovered.id, "unicode1");
+
+        let first_page = kb
+            .review(&ReviewParams {
+                action: Some("get".into()),
+                id: Some(entry_id),
+                limit: Some(257),
+                ..Default::default()
+            })
+            .unwrap();
+        let first_page: serde_json::Value = serde_json::from_str(&first_page).unwrap();
+        let continuation = first_page["next_cursor"].as_str().unwrap().to_string();
+        kb.store.entries[0].content = "changed".into();
+        let stale = kb.review(&ReviewParams {
+            action: Some("get".into()),
+            id: Some("unicode1".into()),
+            cursor: Some(continuation),
+            limit: Some(257),
+            ..Default::default()
+        });
+        assert!(
+            stale
+                .expect_err("record cursor must invalidate")
+                .to_string()
+                .contains("stale review cursor")
+        );
+    }
+
+    #[test]
+    fn review_rejects_invalid_actions_and_parameter_combinations() {
+        let (_tmp, mut kb) = mk_kb();
+        push_entry(&mut kb, "entry01", "Pending", "content");
+        kb.store.entries[0].approval = Approval::AgentInferred;
+
+        let cases = [
+            ReviewParams {
+                action: Some("list:get".into()),
+                ..Default::default()
+            },
+            ReviewParams {
+                action: Some("list".into()),
+                id: Some("entry01".into()),
+                ..Default::default()
+            },
+            ReviewParams {
+                action: Some("list".into()),
+                project: Some("/project".into()),
+                ..Default::default()
+            },
+            ReviewParams {
+                action: Some("get".into()),
+                project: Some("/project".into()),
+                ..Default::default()
+            },
+            ReviewParams {
+                action: Some("approve".into()),
+                cursor: Some("cursor".into()),
+                id: Some("entry01".into()),
+                ..Default::default()
+            },
+            ReviewParams {
+                action: Some("reject".into()),
+                limit: Some(20),
+                id: Some("entry01".into()),
+                ..Default::default()
+            },
+        ];
+        for params in cases {
+            assert!(
+                kb.review(&params).is_err(),
+                "review must reject invalid combination {params:?}"
+            );
+        }
+        assert_eq!(kb.store.entries[0].approval, Approval::AgentInferred);
+    }
+
+    #[test]
     fn absorb_global_extracts_only_managed_region() {
         let _env = bbox_util::util::test_env_lock();
         let _env_guard = global_env_lock();
@@ -6702,6 +7083,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 project: None,
                 action: Some("approve".into()),
                 id: Some(id.into()),
+                ..Default::default()
             },
             Some(&checkout_path),
             Some(&linked),
