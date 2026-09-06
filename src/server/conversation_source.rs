@@ -1208,6 +1208,17 @@ mod tests {
                 "initial ingest failed: {}",
                 response.status()
             );
+            if endpoint == "catalog/onboard" {
+                // The test records provider is a fixed snapshot. Refresh the
+                // auth table from the newly written catalog as production does.
+                let pinned = state
+                    .project_authority
+                    .catalog_store()
+                    .unwrap()
+                    .snapshot()
+                    .unwrap();
+                install_conversation_connectors(&state, &root, Some(pinned.catalog()));
+            }
         }
         let catalog = state
             .project_authority
