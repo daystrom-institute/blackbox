@@ -71,7 +71,7 @@ impl AgentDashboardMetrics {
 impl BlackboxServer {
     #[tool(
         name = "bro_dashboard",
-        description = "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard."
+        description = "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status. Context occupancy is not remaining work capacity."
     )]
     pub(crate) fn bro_dashboard(
         &self,

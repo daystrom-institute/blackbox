@@ -775,7 +775,8 @@ impl BlackboxServer {
                 rows.iter().filter_map(|row| row["id"].as_str()),
             );
             view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
-            let built_from = view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
+            let mut built_from =
+                view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
             structured["built_from"] = serde_json::to_value(&built_from)?;
             structured["diagnostics"] = serde_json::to_value(&view.diagnostics)?;
             // Bounded structured degradation for `all` (plan §10.5): each
@@ -785,6 +786,17 @@ impl BlackboxServer {
             // same facts as human text.
             if !view.degraded_overlays.is_empty() {
                 structured["degraded"] = serde_json::json!({ "overlays": &view.degraded_overlays });
+            }
+            structured = bbox_corpus_core::response_page::bound_page(structured, "rows")?;
+            if structured.get("byte_limited").is_some() {
+                let used_refs = structured["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|row| row["built_from_ref"].as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                built_from.retain(|key, _| used_refs.contains(key.as_str()));
+                structured["built_from"] = serde_json::to_value(&built_from)?;
             }
             let mut rendered = if p.json.unwrap_or(false) {
                 serde_json::to_string_pretty(&structured)?

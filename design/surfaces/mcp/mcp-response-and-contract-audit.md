@@ -535,3 +535,42 @@ Its MCP renderer now returns content and accepts inline templates; explicit
 local paths refuse and implicit server-configured destinations are removed.
 Badgey's question alias remains because two shipped eval workflows call it;
 Badgey tools already belong outside ordinary default/interactive discovery.
+
+
+### Deployed retrieval milestone, 2026-09-06 UTC
+
+Image `4ffe9430f0e3`, immutable digest
+`1397786cc6253fa33d6d174765c26c6c4434459f591e382c39ce5a06021af2fe`,
+was deployed through cage converge to blackboxd and the Slack collector.
+Build workflow `build-bbox-image-rfglp` succeeded. Verification workflow
+`bbox-verify-lcrbz` passed full nextest (7400 passed, 21 explicitly skipped),
+Clippy, and concurrency lint on `a4fc0fdc`; its only difference from the built
+revision is three test assertions recognizing canonical MCP error flags.
+The earlier verification failure was those outdated assertions, not a waived
+gate. The bridge fixture amendment was reviewed row by row.
+
+Remote MCP probes measured the complete compact-JSON result envelope, counting
+both text and structured representations and UTF-8 bytes. Before/after calls
+used the same selectors; source contents and vector availability remain live.
+
+| Probe | Before bytes | After bytes |
+| --- | ---: | ---: |
+| Provider discovery | 14787 | 854 |
+| Brodex model catalog (explicit provider) | not compared | 3885 |
+| Brofile summaries, limit 3 | old unbounded list spilled | 638 |
+| Hybrid search, limit 3 | 22444 | 3897 |
+| Hybrid search with ranking debug, limit 3 | not compared | 7367 |
+| Gap summaries, limit 3 | 19390 | 6795 |
+| Exact gap detail | not compared | 4274 |
+| Deliberately oversized invalid entity ref | not compared | 897, MCP error |
+
+The old brofile spill incorrectly had `isError=false`. The new guard emits
+`isError=true`, a typed response_too_large error, no spill path, and a retry
+warning appropriate for potentially completed mutations. Invalid dashboard
+provider/status/team filters all refused. Brodex discovery included GPT-6
+Astra; a real narrowly scoped Astra dispatch with no account pin selected
+native credentials (`account=null`) and completed with the expected synthetic
+reply. Configuration redaction was covered with synthetic tests, without
+probing live credential values. Native ingestion is a subsequent milestone;
+this deployment's indexed transcript reads do not claim missing history was
+collected. Subsequent source commits are not covered by these deployment claims.

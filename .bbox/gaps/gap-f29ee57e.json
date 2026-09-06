@@ -16,8 +16,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/gap-store/bbox-gaps-over-cap-list-responses",
   "notes": "Filed by the gap manager 2026-08-19 after the operator pointed out the obvious: the gap listing itself is unreadable at backlog scale. Substrate-genuine: any project with a triple-digit gap backlog hits the spill on every full survey. Instance of umbrella gap-ecff3899.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-19T02:29:47Z",
-  "updated_at": "2026-08-19T02:29:47Z"
+  "updated_at": "2026-09-06T05:02:22Z",
+  "resolved_at": "2026-09-06T05:02:22Z",
+  "resolution_note": "Gap listings now default to summary pages (20 rows, max100), deterministic created-time/id ordering, total/offset/next_offset, and exact-id full detail. Scoped degradation excludes unrelated carriers. Deployed image 4ffe9430f0e3; live three-row summary measured6795 total response bytes, with exact-id expansion verified. Broader nested/body byte budgets remain part of continued MCP scrutiny."
 }

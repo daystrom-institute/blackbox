@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/response-cap/spill-unreachable-remote-clients",
   "notes": "Filed at operator direction mid-session. The spill mechanism's losslessness claim silently depends on filesystem colocation; every remote-client over-cap response is a hard data loss today. Producer-side shaping (gap-ecff3899) reduces frequency but the dereference primitive is still missing for the residual cases.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-20T07:24:21Z",
-  "updated_at": "2026-08-20T07:24:21Z"
+  "updated_at": "2026-09-06T05:02:22Z",
+  "resolved_at": "2026-09-06T05:02:22Z",
+  "resolution_note": "Replaced accidental server spill with an 80KiB whole-envelope guard in 8ccdcd06; server creates no dump files or filesystem recovery hints. Oversized responses now carry typed error.response_too_large and MCP isError=true, with producer-specific narrowing advice. Deployed image 4ffe9430f0e3; live oversized invalid inspection produced an 897-byte error without spilled_to. Producer shaping and intentional continuations continue under the broader MCP audit."
 }

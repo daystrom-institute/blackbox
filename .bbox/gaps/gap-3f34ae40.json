@@ -14,8 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/runtime-allocation/cross-provider-account-candidates",
   "notes": "Reported by operator during MCP contract remediation. Investigate the execution environment separately from the displayed account; no assumption that OpenRouter actually served the request.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-06T04:25:59Z",
-  "updated_at": "2026-09-06T04:25:59Z"
+  "updated_at": "2026-09-06T05:02:22Z",
+  "resolved_at": "2026-09-06T05:02:22Z",
+  "resolution_note": "Provider-scoped implicit account candidates shipped in 8ccdcd06 and deployed in image 4ffe9430f0e3. Full cluster gate passed 7400 tests. Live Brodex GPT-6 Astra dispatch without account pin returned account=null and completed with MCP_ACCOUNT_SMOKE_OK; provider catalog includes the Astra slug. Explicit account overrides remain supported."
 }

@@ -1076,6 +1076,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-transcript-source"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "bbox-transcript-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-transcript-source",
+ "fs2",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "bbox-util"
 version = "0.0.1"
 dependencies = [

@@ -566,7 +566,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_absorb",
         category: ToolCategory::Knowledge,
         summary: "Compatibility no-op for the old rendered-file import path.",
-        when_to_use: "Rendered provider files are unidirectional projections now. Use `bbox_bootstrap` to import hand-authored instruction files before rendering. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Rendered provider files are unidirectional projections now. Use indexed instruction refs or the checkout owner to inspect hand-authored content; knowledge imports use the explicit knowledge write tools. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: None,
     },
     ToolDoc {
@@ -586,8 +586,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_bootstrap",
         category: ToolCategory::Knowledge,
-        summary: "Onboard a new repo into the blackbox knowledge system.",
-        when_to_use: "First-time setup for a project — seeds PROJECT.md, scaffolds knowledge structure.",
+        summary: "Retired compatibility operation. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation does not import knowledge or read caller files.",
+        when_to_use: "Retained only as a migration refusal. It performs no import or onboarding. Use bbox_hybrid_search(project=..., doc_type=project_file) to discover indexed instructions and bbox_inspect_entity to expand exact refs. Missing indexed files require producer enrollment or checkout-owner inspection; daemon paths cannot substitute for either.",
         example: None,
     },
     // ── Threads ──────────────────────────────────────────────────────
@@ -680,7 +680,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a workflow, packet, brofile, agent, atom, team, or cron artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        summary: "Install a typed artifact from an inline artifact object or explicit HTTP(S) source URL. Supply exactly one; caller filesystem paths are rejected. The selected kind controls validation. Returns activation state and actionable warnings without source credentials or storage paths.",
         when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog. Team artifacts are teamplate-shaped and materialize on install: the teamplate store is written and the team instantiated under the teamplate's name (member brofiles must already be installed; re-install never clobbers a live team's sessions; advisor-carrying teamplates are rejected — use bro_team create).",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/schema-migration-arc.json")"#,
@@ -897,21 +897,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_wait",
         category: ToolCategory::Orchestration,
         summary: "Block until one task completes; timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success.",
-        when_to_use: "After `bro_exec` or `bro_resume` when you need the result. USE MAXIMUM TIMEOUT for provider work. On timeout, or when a completed result is empty/suspicious, call `bro_status(tail=N)` before deciding the task is stuck, treating it as success, cancelling it, or dispatching replacement work.",
+        when_to_use: "After `bro_exec` or `bro_resume` when you need the result. USE MAXIMUM TIMEOUT for provider work. On timeout, or when a completed result is empty/suspicious, call `bro_status(tail=N)` before deciding the task is stuck, treating it as success, cancelling it, or dispatching replacement work. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
         example: None,
     },
     ToolDoc {
         name: "bro_when_all",
         category: ToolCategory::Orchestration,
         summary: "Block until ALL tasks / team members complete; use for fan-out/fan-in instead of hand-rolled sequential waits.",
-        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. On timeout, inspect member status before cancelling or redispatching.",
+        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. On timeout, inspect member status before cancelling or redispatching. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
         example: None,
     },
     ToolDoc {
         name: "bro_when_any",
         category: ToolCategory::Orchestration,
         summary: "Block until the FIRST task completes; use for races instead of polling each task yourself.",
-        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. Before cancelling laggards, check status and cancel only if the remaining work is truly no longer useful.",
+        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. Before cancelling laggards, check status and cancel only if the remaining work is truly no longer useful. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
         example: None,
     },
     ToolDoc {
@@ -924,15 +924,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_status",
         category: ToolCategory::Orchestration,
-        summary: "Non-blocking progress check on a task; call before declaring a timeout dead or cancelling.",
-        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result. The `context` block is a last-model-request observation, not a remaining session work budget. `last_turn_input_tokens` is cache-inclusive prompt size; `context_window` and `utilization` are null when unknown. Compaction can reclaim context and continue the same session. Do not stop assigning work or rotate solely because occupancy is high; use task status, actual errors, and reported blockers.",
+        summary: "Read task progress. detail=result, report, or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics.",
+        when_to_use: "Default summary includes state, progress, blockers and result availability. Result, report and structured_exit detail returns body.text with format, offset and total_bytes; pages contain at most 4096 UTF-8 bytes. Replay body.next_cursor unchanged with the same task and detail. A changed body rejects the cursor; restart from its first page. Reassemble JSON report/structured_exit pages before parsing. tail applies only to summary, capped at 50 events and 8192 serialized bytes. debug adds accounting and worker-owned transcript coordinates; those coordinates are not caller file paths. Context occupancy is telemetry, never remaining work capacity.",
         example: None,
     },
     ToolDoc {
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
-        summary: "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard.",
-        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks. Rows carry the same `context` block `bro_status` returns when a task has reported a turn, so a fleet-wide scan shows last-request occupancy without treating it as a session work limit; a row with no measurement omits the block rather than reporting a zero.",
+        summary: "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status. Context occupancy is not remaining work capacity.",
+        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Agent metrics cover only returned tasks, and reports are bounded previews with detail hints. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results or reports, and coordination wait tools when awaiting completion.",
         example: None,
     },
     ToolDoc {
@@ -1863,10 +1863,9 @@ pub fn render_markdown() -> String {
         } else {
             out.push_str(cat.intro());
             out.push_str("\n\n");
-            for doc in TOOL_DOCS
-                .iter()
-                .filter(|d| d.category == *cat && d.name != "bbox_absorb")
-            {
+            for doc in TOOL_DOCS.iter().filter(|d| {
+                d.category == *cat && !matches!(d.name, "bbox_absorb" | "bbox_bootstrap")
+            }) {
                 out.push_str(&format!(
                     "- **`{}`** — {}\n",
                     doc.name,
@@ -1990,7 +1989,9 @@ mod tests {
     fn render_contains_hot_tool_names() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
-            if !HOT_RENDER_CATEGORIES.contains(&doc.category) || doc.name == "bbox_absorb" {
+            if !HOT_RENDER_CATEGORIES.contains(&doc.category)
+                || matches!(doc.name, "bbox_absorb" | "bbox_bootstrap")
+            {
                 continue;
             }
             if deferred_system_memory(doc.category).is_some() {
