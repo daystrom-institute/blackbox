@@ -21,6 +21,7 @@ pub mod instance_lock;
 mod knowledge_lifecycle;
 mod knowledge_merge_gate;
 pub(crate) mod knowledge_source;
+pub(crate) mod transcript_source;
 // The published-view install gate lives here and is exercised from the
 // catalog tool's acceptance tests, which is why this module is crate
 // visible while its knowledge/gap siblings are not.

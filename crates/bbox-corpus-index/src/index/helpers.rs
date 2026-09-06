@@ -47,6 +47,8 @@ pub fn find_session_file(
         // A per-request session lookup never reaches the conversation lane:
         // it has no session files and no runtime handles.
         conversation_source_root: None,
+        native_source_root: None,
+        native_sources: Vec::new(),
         conversation_sources: Vec::new(),
         roots: roots.to_vec(),
         codex_root: codex_root.map(Path::to_path_buf),

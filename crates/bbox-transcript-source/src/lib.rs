@@ -137,3 +137,18 @@ pub struct PublishReceipt {
     pub byte_length: u64,
     pub durable: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamQuery {
+    pub scope: ConnectorScope,
+    pub stream_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnboardRequest {
+    pub scope: ConnectorScope,
+    /// Stable producer installation identity, matched to the operator grant.
+    pub remote_authority: String,
+    pub display_name: String,
+}

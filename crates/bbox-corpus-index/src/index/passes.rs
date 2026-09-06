@@ -424,12 +424,17 @@ pub fn index_adapter_location(
     // registered project owning the session cwd, including any worktree of
     // it. Stamped on every doc so a base-project filter matches work from
     // all checkouts while `project` keeps the literal cwd.
-    let base_project_id = snapshot
-        .events
-        .iter()
-        .find_map(|event| event.cwd.as_deref())
-        .or((!project_fallback.is_empty()).then_some(project_fallback))
-        .and_then(|cwd| tool_edges.base_project_id_for_cwd(cwd));
+    let native_landed = location.locator().starts_with("native:");
+    let base_project_id = (!native_landed)
+        .then(|| {
+            snapshot
+                .events
+                .iter()
+                .find_map(|event| event.cwd.as_deref())
+                .or((!project_fallback.is_empty()).then_some(project_fallback))
+                .and_then(|cwd| tool_edges.base_project_id_for_cwd(cwd))
+        })
+        .flatten();
 
     for event in &snapshot.events {
         let Some(parsed) = event.to_parsed_event() else {
@@ -437,7 +442,9 @@ pub fn index_adapter_location(
         };
         let line_offset = event.raw.byte_offset.unwrap_or(0);
         let event_idx = event.raw.event_idx.unwrap_or(0);
-        if let Err(err) = tool_edges.emit_event_edges(&parsed, account, line_offset, event_idx) {
+        if !native_landed
+            && let Err(err) = tool_edges.emit_event_edges(&parsed, account, line_offset, event_idx)
+        {
             tracing::debug!(
                 error = %err,
                 source = %location.source,

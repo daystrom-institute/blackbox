@@ -834,6 +834,14 @@ pub(crate) async fn authenticate_conversation_source_request(
     authenticate_connector_request(state, request, next).await
 }
 
+pub(crate) async fn authenticate_transcript_source_request(
+    State(state): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_connector_request(state, request, next).await
+}
+
 async fn authenticate_connector_request(
     state: Arc<SharedState>,
     mut request: Request,

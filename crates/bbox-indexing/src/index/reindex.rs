@@ -1414,6 +1414,8 @@ mod tests {
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
             conversation_source_root: None,
+            native_source_root: None,
+            native_sources: Vec::new(),
             conversation_sources: Vec::new(),
         };
 
@@ -1515,6 +1517,8 @@ mod tests {
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
             conversation_source_root: None,
+            native_source_root: None,
+            native_sources: Vec::new(),
             conversation_sources: Vec::new(),
         };
 

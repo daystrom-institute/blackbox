@@ -831,6 +831,8 @@ pub enum ConnectorProfile {
     /// `/internal/conversation-source/v1/*`: an append-only message stream with
     /// server-owned per-channel cursors.
     Conversation,
+    /// Native transcript chunked snapshots and CAS publication.
+    Transcript,
 }
 
 impl ConnectorScopeGrant {

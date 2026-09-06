@@ -7,7 +7,7 @@ use bbox_transcript_source::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -88,7 +88,7 @@ impl TranscriptSourceStore {
         let root = self.stream_root(scope, stream)?.join("chunks");
         fs::create_dir_all(&root)?;
         let path = root.join(hash);
-        if !path.exists() {
+        if !chunk_matches(&path, hash, bytes.len() as u64) {
             atomic_write(&path, bytes)?;
         }
         Ok(())
@@ -101,7 +101,7 @@ impl TranscriptSourceStore {
         Ok(snapshot
             .chunks
             .iter()
-            .filter(|chunk| !root.join(&chunk.sha256).is_file())
+            .filter(|chunk| !chunk_matches(&root.join(&chunk.sha256), &chunk.sha256, chunk.size))
             .map(|chunk| chunk.sha256.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -166,7 +166,9 @@ impl TranscriptSourceStore {
         File::open(&root)?.sync_all()?;
         // The current pointer is the admission boundary, installed last.
         atomic_write(&root.join("current.json"), &serde_json::to_vec(&published)?)?;
-        // Retain one previous materialization so a pinned index pass can finish.
+        // Keep the immediately previous materialization for recovery. This is
+        // retention, not a reader lease: a discovery snapshot overtaken twice
+        // before opening its file must retry discovery.
         // Unreferenced chunks from failed uploads are intentionally untouched:
         // another collector may be assembling its next CAS publication.
         for entry in fs::read_dir(&root)? {
@@ -202,6 +204,28 @@ impl TranscriptSourceStore {
         Ok(rows)
     }
 }
+fn chunk_matches(path: &Path, hash: &str, size: u64) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    if size > CHUNK_BYTES as u64
+        || file
+            .metadata()
+            .map_or(true, |metadata| metadata.len() != size)
+    {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    if file
+        .take(CHUNK_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    bytes.len() as u64 == size && sha256(&bytes) == hash
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -221,7 +245,7 @@ mod tests {
     fn scope() -> ConnectorScope {
         ConnectorScope::new(
             ConnectorSourceId::parse("csrc_0123456789abcdef").unwrap(),
-            ConnectorKind::parse("native-transcript").unwrap(),
+            ConnectorKind::parse("native_transcript").unwrap(),
         )
     }
     fn snapshot(bytes: &[u8]) -> StreamSnapshot {
@@ -350,6 +374,38 @@ mod tests {
         );
         assert!(store.current(&scope(), &torn.stream_id).unwrap().is_none());
     }
+    #[test]
+    fn a_corrupted_cached_chunk_is_reported_missing_and_can_be_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = TranscriptSourceStore::open(root).unwrap();
+        let snapshot = stage(&store, b"complete\n");
+        let chunk = &snapshot.chunks[0];
+        let path = store
+            .stream_root(&scope(), &snapshot.stream_id)
+            .unwrap()
+            .join("chunks")
+            .join(&chunk.sha256);
+        fs::write(path, b"corrupt!\n").unwrap();
+        assert_eq!(
+            store.missing_chunks(&snapshot).unwrap(),
+            vec![chunk.sha256.clone()]
+        );
+        store
+            .install_chunk(&scope(), &snapshot.stream_id, &chunk.sha256, b"complete\n")
+            .unwrap();
+        assert!(store.missing_chunks(&snapshot).unwrap().is_empty());
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot,
+                    expected_generation: None,
+                },
+                "now",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn chunk_boundaries_can_cross_a_large_jsonl_event_and_resume_after_restart() {
         let dir = tempfile::tempdir().unwrap();

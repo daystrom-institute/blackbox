@@ -33,6 +33,8 @@ bbox-code-source = { path = "../bbox-code-source" }
 bbox-code-source-store = { path = "../bbox-code-source-store" }
 # The conversation landing lane. Read-only from here: this crate projects
 # landed records into transcript documents and never lands one.
+bbox-transcript-source = { path = "../bbox-transcript-source" }
+bbox-transcript-source-store = { path = "../bbox-transcript-source-store" }
 bbox-conversation-source = { path = "../bbox-conversation-source" }
 bbox-conversation-source-store = { path = "../bbox-conversation-source-store" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
