@@ -1,4 +1,4 @@
-# bbox-system-events — event journal, outbox, routing
+# bbox-system-events: durable bro observation journal
 
 Invariants from the line-10902 journal-corruption incident (a foreign
 event's bytes spliced mid-string into another record, which emptied the
@@ -18,3 +18,9 @@ its retention cap).
 - `EventStore::build` swallows load errors (`if let Ok`) — any new load
   failure mode silently empties the in-memory index. Keep failures
   per-line, not per-file.
+
+Recording an event only appends the journal and broadcasts the observation.
+There is no reaction matching, outbox, identity provisioning or execution.
+Historical reaction/outbox/identity directories remain untouched archives;
+opening the observation hub must neither parse them nor create replacements.
+Journal retention is mechanical service maintenance, independent of workflows.

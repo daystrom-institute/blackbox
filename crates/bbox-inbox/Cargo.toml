@@ -28,7 +28,6 @@ rmcp = { version = "1.4", features = [
     "reqwest-tls-no-provider",
 ] }
 tempfile = "3"
-bbox-whiteboards = { path = "../bbox-whiteboards" }
 bbox-artifacts = { path = "../bbox-artifacts" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }

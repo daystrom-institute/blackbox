@@ -7,7 +7,6 @@ use bbox_gaps::gaps::{GapImpact, GapNote, GapResolution, GapStore};
 use bbox_knowledge::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use bbox_threads::notes::{Note, NoteKind, NoteResolution, Notes};
 use bbox_threads::threads::{Thread, ThreadStatus, Threads};
-use bbox_whiteboards::whiteboards::{Phase, WhiteboardRegistry};
 
 // ── MCP parameter struct ──────────────────────────────────────────
 
@@ -63,23 +62,6 @@ pub enum VectorConnectivityAlert {
     },
 }
 
-/// Cron scheduling gap — the silent-maintenance class (gap-f268badd).
-/// A cron-routing packet declares "a cron drives this workflow"; when no
-/// live cron references it, the maintenance behind it never runs and
-/// nothing says so. The inverse — a live cron whose routing packet is
-/// missing — fires ticks that dispatch nowhere. Plain rows like
-/// `failed_task_rows`: the packet and cron stores sit outside this
-/// crate's DAG, so the daemon's attention tool builds these.
-#[derive(Debug, Clone)]
-pub enum CronScheduleAlert {
-    /// A packet with a `cron-routing` path segment in its domain is
-    /// installed, but no live cron's `routing_packet` resolves to it.
-    UnscheduledRoutingPacket { domain: String },
-    /// A live cron references `domain:<domain>` but no packet with that
-    /// domain is installed.
-    CronMissingPacket { cron_name: String, domain: String },
-}
-
 /// Conversation producer silence: the "satellite quietly died" class. A
 /// granted conversation scope is supposed to have a live producer polling it,
 /// and one that stops calling lands nothing further while every durable
@@ -105,9 +87,7 @@ pub fn compute_inbox(
     gaps: &GapStore,
     failed_task_rows: &[(String, String, u64)],
     vector_alerts: &[VectorConnectivityAlert],
-    cron_alerts: &[CronScheduleAlert],
     conversation_silence: &[ConversationProducerSilence],
-    whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(10).max(1) as usize;
@@ -154,37 +134,12 @@ pub fn compute_inbox(
                     zero_in_degree_nodes,
                     risk_ratio,
                 } => out.push_str(&format!(
-                    "  {route} — {:.2}% of {active_nodes} active vectors unreachable ({zero_in_degree_nodes} zero-in-degree); schedule a rebuild via embed-compaction-arc\n",
+                    "  {route} — {:.2}% of {active_nodes} active vectors unreachable ({zero_in_degree_nodes} zero-in-degree); daily connectivity maintenance will attempt repair; use bbox_embed_status for current diagnostics\n",
                     risk_ratio * 100.0,
                 )),
                 VectorConnectivityAlert::DiagnosticsUnavailable { route, reason } => {
                     out.push_str(&format!(
                         "  {route} — connectivity diagnostics unavailable ({reason}); health is unknown, not healthy\n"
-                    ));
-                }
-            }
-        }
-        out.push('\n');
-    }
-
-    // 1c. Cron scheduling gaps — maintenance that exists but silently
-    // never runs (gap-f268badd). Not project-filtered: unscheduled
-    // daemon maintenance degrades the whole host.
-    if !cron_alerts.is_empty() {
-        out.push_str(&format!(
-            "## Cron scheduling gaps ({})\n",
-            cron_alerts.len()
-        ));
-        for alert in cron_alerts {
-            match alert {
-                CronScheduleAlert::UnscheduledRoutingPacket { domain } => {
-                    out.push_str(&format!(
-                        "  {domain} — cron-routing packet installed but no cron schedules it; its workflow never runs (install the matching cron spec: bbox_artifact_install kind=cron)\n"
-                    ));
-                }
-                CronScheduleAlert::CronMissingPacket { cron_name, domain } => {
-                    out.push_str(&format!(
-                        "  cron '{cron_name}' — routing packet domain '{domain}' is not installed; ticks dispatch nowhere (install the packet: bbox_artifact_install kind=packet)\n"
                     ));
                 }
             }
@@ -308,23 +263,6 @@ pub fn compute_inbox(
         out.push_str(&format!("## Eval drift alerts ({})\n", eval_drift.len()));
         for n in &eval_drift {
             out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
-        }
-        out.push('\n');
-    }
-
-    let boards = contradiction_boards_waiting(whiteboards, project_filter.as_deref(), limit);
-    if !boards.is_empty() {
-        out.push_str(&format!(
-            "## Contradiction-review boards waiting on synthesis ({})\n",
-            boards.len()
-        ));
-        for (id, topic, phase) in &boards {
-            out.push_str(&format!(
-                "  {} [{}] — {}\n",
-                id,
-                phase,
-                truncate(topic, 120)
-            ));
         }
         out.push('\n');
     }
@@ -722,39 +660,6 @@ fn unresolved_notes_matching(
     rows.into_iter().take(limit).map(|(_, r)| r).collect()
 }
 
-fn contradiction_boards_waiting(
-    whiteboards: &WhiteboardRegistry,
-    project_filter: Option<&str>,
-    limit: usize,
-) -> Vec<(String, String, String)> {
-    let mut rows = Vec::new();
-    for id in whiteboards.list_ids() {
-        let Some(board) = whiteboards.get(&id) else {
-            continue;
-        };
-        let board = board.read();
-        if board.phase != Phase::Resolve {
-            continue;
-        }
-        if !board.topic.to_lowercase().contains("contradiction review") {
-            continue;
-        }
-        if let Some(pf) = project_filter {
-            if !board.project.to_lowercase().contains(pf) {
-                continue;
-            }
-        }
-        rows.push((
-            board.id.clone(),
-            board.topic.clone(),
-            board.phase.as_str().to_string(),
-        ));
-    }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows.truncate(limit);
-    rows
-}
-
 fn stale_threads<'a>(
     threads: &'a Threads,
     stale_days: u64,
@@ -884,14 +789,12 @@ mod tests {
     use bbox_knowledge::knowledge::LearnParams;
     use bbox_threads::notes::{NoteParams, NoteStore};
     use bbox_threads::threads::ThreadParams;
-    use bbox_whiteboards::whiteboards::Role;
     use tempfile::tempdir;
 
-    fn empty_context(dir: &tempfile::TempDir) -> (Knowledge, Threads, WhiteboardRegistry) {
+    fn empty_context(dir: &tempfile::TempDir) -> (Knowledge, Threads) {
         (
             Knowledge::open(&dir.path().join("kb.json")).unwrap(),
             Threads::open(&dir.path().join("th.json")).unwrap(),
-            WhiteboardRegistry::new(),
         )
     }
 
@@ -1006,7 +909,6 @@ mod tests {
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let whiteboards = WhiteboardRegistry::new();
 
         let out = compute_inbox(
             &kb,
@@ -1016,8 +918,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: None,
                 provisional: None,
@@ -1043,7 +943,6 @@ mod tests {
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let whiteboards = WhiteboardRegistry::new();
         let alerts = vec![VectorConnectivityAlert::Breach {
             route: "voyage-1024".into(),
             active_nodes: 399_000,
@@ -1059,8 +958,6 @@ mod tests {
             &[],
             &alerts,
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
                 provisional: None,
@@ -1101,8 +998,6 @@ mod tests {
             &[],
             &alerts,
             &[],
-            &[],
-            &WhiteboardRegistry::new(),
             &InboxParams {
                 project: None,
                 provisional: None,
@@ -1120,58 +1015,6 @@ mod tests {
         assert!(out.contains("health is unknown, not healthy"));
     }
 
-    /// Cron scheduling gaps are host-level silent-maintenance risk: both
-    /// variants render their own section, survive a project filter, and
-    /// defeat the clean plate (gap-f268badd).
-    #[test]
-    fn inbox_surfaces_cron_schedule_alerts() {
-        let dir = tempdir().unwrap();
-        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
-        let threads = Threads::open(&dir.path().join("th.json")).unwrap();
-        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
-        let gaps = empty_gaps(&dir);
-        let whiteboards = WhiteboardRegistry::new();
-        let alerts = vec![
-            CronScheduleAlert::UnscheduledRoutingPacket {
-                domain: "cron-routing/daily-compaction".into(),
-            },
-            CronScheduleAlert::CronMissingPacket {
-                cron_name: "embed-compaction-nightly".into(),
-                domain: "cron-routing/embed-compaction".into(),
-            },
-        ];
-
-        let out = compute_inbox(
-            &kb,
-            &threads,
-            &notes,
-            &gaps,
-            &[],
-            &[],
-            &alerts,
-            &[],
-            &whiteboards,
-            &InboxParams {
-                project: Some("/repo/unrelated-project".into()),
-                provisional: None,
-                limit: None,
-                stale_days: None,
-                include_tasks: None,
-                import_gap_spool: None,
-                aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
-            },
-        )
-        .unwrap();
-        assert!(out.contains("## Cron scheduling gaps (2)"));
-        assert!(out.contains(
-            "cron-routing/daily-compaction — cron-routing packet installed but no cron schedules it"
-        ));
-        assert!(out.contains("cron 'embed-compaction-nightly' — routing packet domain 'cron-routing/embed-compaction' is not installed"));
-        assert!(!out.contains("clean plate"));
-    }
-
     /// Silence rows are host-level ingestion risk: they render their own
     /// section, survive a project filter, and defeat the clean plate, because
     /// a satellite that stopped calling lands nothing further anywhere.
@@ -1182,7 +1025,6 @@ mod tests {
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let whiteboards = WhiteboardRegistry::new();
         let silence = vec![
             ConversationProducerSilence::Stale {
                 scope: "slack/csrc_fixture01".into(),
@@ -1201,9 +1043,7 @@ mod tests {
             &gaps,
             &[],
             &[],
-            &[],
             &silence,
-            &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
                 provisional: None,
@@ -1231,7 +1071,6 @@ mod tests {
         let mut threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let whiteboards = WhiteboardRegistry::new();
 
         // Agent-inferred knowledge → should appear in "Unverified"
         kb.learn(
@@ -1343,29 +1182,6 @@ mod tests {
                 bro: None,
             })
             .unwrap();
-        whiteboards
-            .open(
-                "board-1",
-                "Contradiction review: knowledge:a vs knowledge:b",
-                "/repo/x",
-                None,
-                None,
-                "operator",
-            )
-            .unwrap();
-        whiteboards
-            .register("board-1", "operator", Role::Operator, "operator")
-            .unwrap();
-        whiteboards
-            .transition("board-1", "operator", Phase::Read, None)
-            .unwrap();
-        whiteboards
-            .transition("board-1", "operator", Phase::Debate, None)
-            .unwrap();
-        whiteboards
-            .transition("board-1", "operator", Phase::Resolve, None)
-            .unwrap();
-
         let out = compute_inbox(
             &kb,
             &threads,
@@ -1374,8 +1190,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: None,
                 provisional: None,
@@ -1406,7 +1220,7 @@ mod tests {
     #[test]
     fn inbox_surfaces_gap_notes_before_followups() {
         let dir = tempdir().unwrap();
-        let (kb, threads, whiteboards) = empty_context(&dir);
+        let (kb, threads) = empty_context(&dir);
         let notes = open_notes_with(
             &dir,
             vec![note(
@@ -1441,8 +1255,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: Some("transcript-search".into()),
                 provisional: None,
@@ -1469,7 +1281,7 @@ mod tests {
     fn inbox_gap_notes_honor_resolution_project_filter_and_ordering() {
         use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, whiteboards) = empty_context(&dir);
+        let (kb, threads) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1540,8 +1352,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
                 provisional: None,
@@ -1569,7 +1379,7 @@ mod tests {
     fn inbox_reports_stale_high_impact_gap_notes() {
         use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, whiteboards) = empty_context(&dir);
+        let (kb, threads) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1607,8 +1417,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
                 provisional: None,
@@ -1632,7 +1440,7 @@ mod tests {
     fn inbox_can_render_gap_aggregates() {
         use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, whiteboards) = empty_context(&dir);
+        let (kb, threads) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1681,8 +1489,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
-            &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
                 provisional: None,

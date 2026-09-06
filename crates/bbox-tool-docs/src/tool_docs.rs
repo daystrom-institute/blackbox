@@ -689,7 +689,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed artifact summary pages (default 20, maximum 100). Continue with next_offset; filter by kind/name and set detail=true for installation and supersession metadata. Storage paths and source credentials are omitted.",
+        summary: "List installed artifact summaries (default 20, maximum 100); continue with next_offset. Retired kinds are omitted unless explicitly selected with kind. Historical receipts are marked retired and inactive. detail=true adds installation and supersession metadata.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },

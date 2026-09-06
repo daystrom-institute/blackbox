@@ -4,4 +4,3 @@
 
 pub mod slack_channel_bindings;
 pub mod slack_proposal_links;
-pub mod slack_thread_store;

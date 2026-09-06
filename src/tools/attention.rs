@@ -199,7 +199,6 @@ impl BlackboxServer {
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
-            let cron_alerts: Vec<crate::inbox::CronScheduleAlert> = Vec::new();
             let conversation_silence = collect_conversation_producer_silence(&server.state);
             let inbox = append_overlay_diagnostics(
                 inbox::compute_inbox(
@@ -209,9 +208,9 @@ impl BlackboxServer {
                     &gap_view.gaps,
                     &failed_rows,
                     &vector_alerts,
-                    &cron_alerts,
+
                     &conversation_silence,
-                    &server.state.whiteboards,
+
                     &p,
                 )?,
                 &overlay_diagnostics,

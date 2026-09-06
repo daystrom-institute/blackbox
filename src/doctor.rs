@@ -1472,7 +1472,7 @@ fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport 
                                     metrics.route,
                                     hnsw.connectivity_risk_ratio() * 100.0
                                 ),
-                                "run the embed-compaction-arc workflow to rebuild the partition",
+                                "daily connectivity maintenance will attempt repair; inspect bbox_embed_status for current diagnostics",
                             ));
                         }
                     }

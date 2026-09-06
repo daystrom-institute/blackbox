@@ -112,6 +112,15 @@ fn artifact_list_page(
     mut rows: Vec<crate::artifacts::ArtifactListEntry>,
     p: &ArtifactCatalogListParams,
 ) -> anyhow::Result<serde_json::Value> {
+    let retired = |kind| {
+        matches!(
+            kind,
+            crate::artifacts::ArtifactKind::Workflow
+                | crate::artifacts::ArtifactKind::Atom
+                | crate::artifacts::ArtifactKind::Cron
+        )
+    };
+    rows.retain(|entry| p.filters.kind.is_some() || !retired(entry.kind));
     rows.sort_by(|a, b| {
         a.kind
             .as_str()
@@ -124,7 +133,8 @@ fn artifact_list_page(
     let offset = p.offset.unwrap_or(0);
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
     let artifacts: Vec<_> = rows.into_iter().skip(offset).take(limit).map(|entry| {
-        let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active});
+        let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active && !retired(entry.kind)});
+        if retired(entry.kind) { row["retired"] = serde_json::json!(true); }
         if let Some(description) = entry.description {
             let preview: String = if p.detail { description.clone() } else { description.chars().take(200).collect() };
             if preview.len() < description.len() { row["description_truncated"] = serde_json::json!(true); }
@@ -141,8 +151,6 @@ fn artifact_list_page(
     bbox_corpus_core::response_page::bound_page(
         serde_json::json!({"artifacts": artifacts, "total": total, "limit": limit, "offset": offset,
             "next_offset": (next_offset < total).then_some(next_offset),
-            "order": "kind_asc,name_asc,installed_at_desc,version_asc",
-            "detail_hint": "bbox_artifact_list(kind=<kind>,name=<name>,detail=true)",
         }),
         "artifacts",
     )
@@ -197,7 +205,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed artifact summary pages (default 20, maximum 100). Continue with next_offset; filter by kind/name and set detail=true for installation and supersession metadata. Storage paths and source credentials are omitted."
+        description = "List installed artifact summaries (default 20, maximum 100); continue with next_offset. Retired kinds are omitted unless explicitly selected with kind. Historical receipts are marked retired and inactive. detail=true adds installation and supersession metadata."
     )]
     pub(crate) fn bbox_artifact_list(
         &self,

@@ -938,9 +938,6 @@ impl SharedState {
             ),
             system_events: Arc::new(system_events::EventHub::new(
                 system_events::EventStore::new_at(store_dir.join("events").join("journal")),
-                system_events::OutboxStore::new(store_dir.join("events").join("outbox")).unwrap(),
-                store_dir.join("reactions"),
-                store_dir.join("identities"),
             )),
         }
     }

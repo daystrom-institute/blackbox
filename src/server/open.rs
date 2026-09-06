@@ -1050,10 +1050,6 @@ pub(super) fn open_shared_state(
         ),
         system_events: Arc::new(system_events::EventHub::new(
             system_events::EventStore::new(&store_dir),
-            system_events::OutboxStore::new(store_dir.join("events").join("outbox"))
-                .unwrap_or_else(|e| panic!("opening outbox store at {store_dir:?}: {e}")),
-            store_dir.join("reactions"),
-            store_dir.join("identities"),
         )),
     });
     shared.install_code_read_view_commit_hook();
