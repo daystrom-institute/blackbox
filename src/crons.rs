@@ -78,9 +78,10 @@ pub struct CronSpec {
 impl CronSpec {
     /// Match the scheduler's supported timezone modes, including UTC fallback.
     pub fn effective_timezone(&self) -> &'static str {
-        match self.tz.as_deref() {
-            Some("Local" | "local") => "Local",
-            _ => "UTC",
+        if timezone_is_local(self.tz.as_deref()).unwrap_or(false) {
+            "Local"
+        } else {
+            "UTC"
         }
     }
 
@@ -90,7 +91,7 @@ impl CronSpec {
             "tz": self.effective_timezone(), "concurrency": self.concurrency,
             "routing_packet": self.routing_packet});
         if let Some(tz) = self.tz.as_deref() {
-            if !matches!(tz, "Local" | "local" | "UTC" | "utc") {
+            if timezone_is_local(Some(tz)).is_err() {
                 row["configured_tz"] = serde_json::json!(tz);
             }
         }
@@ -554,6 +555,8 @@ mod tests {
             (Some("utc"), "UTC", false),
             (Some("Local"), "Local", false),
             (Some("local"), "Local", false),
+            (Some("LOCAL"), "Local", false),
+            (Some("uTc"), "UTC", false),
             (Some("America/Toronto"), "UTC", true),
         ] {
             let spec: CronSpec = serde_json::from_value(json!({

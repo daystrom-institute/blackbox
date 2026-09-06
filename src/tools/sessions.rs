@@ -147,7 +147,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_status",
-        description = "Return compact route health, current-process embedding successes, queue depth, and actionable errors. debug adds configuration and routine counters without extra scans. include_coverage requests a source-corpus scan; include_diagnostics requests bounded HNSW diagnostics; recall_probe_route runs a sampled probe. Those scans and probes can be expensive."
+        description = "Read embedding health. Scan and probe opt-ins can be expensive."
     )]
     pub(crate) async fn bbox_embed_status(
         &self,
