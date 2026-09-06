@@ -1333,7 +1333,7 @@ impl BlackboxServer {
                 ));
             }
             return Self::allocator_probe_response(
-                record,
+                &probes.records[&lane_key],
                 &lane_key,
                 p.cursor.as_deref(),
                 p.body_limit,
@@ -3307,7 +3307,8 @@ mod tests {
         // All-missing selections reject instead of becoming empty success.
         let err = server
             .resolve_when_tasks(None, when_ids(&["missing-a"]).as_deref())
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("Unknown task IDs"), "{err}");
         assert!(err.contains("missing-a"), "{err}");
 
@@ -3315,7 +3316,8 @@ mod tests {
         let long_id = "m".repeat(300);
         let err = server
             .resolve_when_tasks(None, Some(&[long_id.clone()]))
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains(&"m".repeat(64)), "{err}");
         assert!(!err.contains(&long_id), "{err}");
 
@@ -3326,13 +3328,15 @@ mod tests {
         seed_when_task(&server.state, &huge_id, orch::TaskStatus::Completed);
         let err = server
             .resolve_when_tasks(None, Some(&[huge_id]))
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("cannot fit minimal reply receipts"), "{err}");
 
         // Mixed known/missing rejects the whole selection, naming the gap.
         let err = server
             .resolve_when_tasks(None, when_ids(&["known-done", "missing-b"]).as_deref())
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("missing-b"), "{err}");
         assert!(!err.contains("known-done"), "{err}");
 
@@ -3346,7 +3350,8 @@ mod tests {
         // Competing selectors are ambiguous and reject.
         let err = server
             .resolve_when_tasks(Some("panel"), when_ids(&["known-done"]).as_deref())
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("not both"), "{err}");
 
         // Empty selections reject, including the missing-selector case.
@@ -3359,7 +3364,8 @@ mod tests {
             .collect();
         let err = server
             .resolve_when_tasks(None, Some(&oversized))
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("exceeds the aggregate wait limit"), "{err}");
     }
 
@@ -3370,14 +3376,16 @@ mod tests {
 
         let err = server
             .resolve_when_tasks(Some("ghost-team"), None)
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("Unknown team"), "{err}");
 
         // An empty team rejects instead of an empty all-true aggregate.
         save_when_team(&server, "empty-team", json!([]));
         let err = server
             .resolve_when_tasks(Some("empty-team"), None)
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("no members"), "{err}");
 
         // Members without dispatch history reject with guidance.
@@ -3391,7 +3399,8 @@ mod tests {
         );
         let err = server
             .resolve_when_tasks(Some("fresh-team"), None)
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("no task history"), "{err}");
         assert!(err.contains("alpha") && err.contains("beta"), "{err}");
 
@@ -3407,7 +3416,8 @@ mod tests {
         );
         let err = server
             .resolve_when_tasks(Some("stale-team"), None)
-            .unwrap_err();
+            .err()
+            .expect("selection must reject");
         assert!(err.contains("pruned-task"), "{err}");
 
         // A healthy team resolves each member's latest task.

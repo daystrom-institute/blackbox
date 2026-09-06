@@ -5801,7 +5801,7 @@ mod tests {
                 &catalog.projects[&project_id],
             ),
             "publication_lanes": vec!["file_source"],
-            "file_source": connector_publication_json(store, &connector_scope),
+            "file_source": connector_publication_json(&store, &connector_scope),
         });
         assert_eq!(reconstructed, expected);
 

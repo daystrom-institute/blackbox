@@ -73,7 +73,7 @@ pub(crate) fn manifest_summary(
                 summary["input_schema_bytes"] = serde_json::json!(bytes.len());
             }
         }
-        summary["has_prompt_template"] = inputs.prompt_template.is_some();
+        summary["has_prompt_template"] = serde_json::json!(inputs.prompt_template.is_some());
     }
     summary
 }
@@ -145,7 +145,7 @@ impl BlackboxServer {
         match reg.get(&p.name) {
             Ok(Some(rec)) => {
                 let mut m = serde_json::Map::from_iter([
-                    ("name".into(), serde_json::Value::String(rec.name)),
+                    ("name".into(), serde_json::Value::String(rec.name.clone())),
                     ("version".into(), serde_json::Value::String(rec.version)),
                     ("active".into(), serde_json::Value::Bool(rec.active)),
                     (

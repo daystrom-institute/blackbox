@@ -1451,8 +1451,8 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .as_ref()
             .filter(|_| !inner.session_id.is_empty() && inner.session_id != "pending")
             .map(|location| location.path.to_string_lossy().into_owned()),
-        // Same signal bro_status carries, projected onto the roster plane so
-        // the dashboard can render it without re-locking per-task state.
+        // Internal roster consumers retain diagnostics independently of the
+        // ordinary MCP dashboard projection, which omits context telemetry.
         context: context_pressure_for_inner(&inner),
     }
 }
@@ -5929,7 +5929,7 @@ const BROADCAST_COMPACT_ERROR_CHARS: usize = 64;
 /// bytes after the budget is exhausted. Dispatch mechanics are untouched;
 /// only the serialized reply is shaped.
 pub(crate) fn bound_broadcast_receipts(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
-    let mut truncated: Vec<Value> = rows
+    let truncated: Vec<Value> = rows
         .into_iter()
         .map(|mut row| {
             if let Some(error) = row.get("error").and_then(Value::as_str).map(str::to_string)
