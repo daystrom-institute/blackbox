@@ -193,6 +193,17 @@ The arc is reconstructable from the thread alone. Observers (you, other sessions
 
 ## Debugging arcs at runtime
 
+`bro_arc_status` returns bounded summaries by default; omit `arc_id` to list
+arcs and continue with `offset=next_offset`. Use an `arcId` or its distinct
+`arc_thread_id` to select one arc. If waits or correlations are omitted, read
+`detail="full"` before diagnosing signal matching. `bro_arc_result` returns
+small selected results inline and explicitly previews large selections; `keys`
+selects vars and `include_node_outputs=true` requests node prose. Its default
+vars omit the duplicate `_structured_exit`, which is exposed as `structuredExit`.
+For either tool, `detail="full"` returns exact selected JSON in `body.text`:
+continue with `cursor=body.next_cursor` using the same selectors, concatenate
+all pages, then parse JSON. Changed evidence rejects the cursor; restart.
+
 When an arc parks unexpectedly or a webhook seems not to route, the canonical loop walks the chain backward from the arc to the inlet:
 
 1. **`bro_arc_status(arc_id=…)`** — confirm the arc is parked, see which node, see the registered wait correlations (typed `Number(24)` vs string `"24"` is a classic mismatch).

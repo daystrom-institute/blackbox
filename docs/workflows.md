@@ -1005,6 +1005,32 @@ template ships at `0.0.0.0`; prod stays at loopback.
 
 ## Audit and observability
 
+`bro_arc_status` defaults to an arc-id-sorted summary list (10 arcs, maximum 20).
+Continue list pages with `offset=next_offset`, or select one arc by `arc_id` using
+either its `arcId` or distinct `arc_thread_id`. Unknown ids fail explicitly.
+Summary rows keep current position, verdict, admission key, and completed-node
+count; full node history and visit-count maps are omitted. Pending waits are
+scoped to the selected arcs, with an exact count and up to ten previews. Small
+wait correlations retain their JSON types. A large correlation is explicitly
+omitted, requiring full detail before diagnosing signal matching.
+
+`bro_arc_result` accepts an arc id or workflow task id for task-backed arcs.
+It selects final vars with `keys` and includes node prose only when
+`include_node_outputs=true`. Default vars omit `_structured_exit` because the
+same value is returned as `structuredExit`; an explicit request for that var
+keeps it. Small selected results remain inline. Large selected results return
+`preview=true`, `omittedFields`, and bounded key previews, never a partial value
+disguised as the complete result.
+
+Both tools accept `detail="full"` for exact selected JSON in `body.text` pages.
+Continue with `cursor=body.next_cursor` on the same tool and selectors,
+concatenate all text, then parse JSON. `body_limit` requests 4 to 4096 UTF-8 bytes;
+JSON escaping can reduce page size. Cursors reject changed selected evidence,
+so restart without a cursor if a live arc advances. Status list `limit` and
+`offset` apply only to summary lists, not selected arcs or full-detail reads.
+These projections do not change the workflow engine's internal state or results.
+
+
 Every `bro orchestrate run` opens a workflow-origin
 `bbox_thread(kind=work_item)`. The returned `arc_thread_id` is the audit handle.
 Normal `bbox_thread_list` calls hide workflow-origin threads by default; pass

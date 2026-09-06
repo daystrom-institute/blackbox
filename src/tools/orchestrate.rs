@@ -1,3 +1,4 @@
+use super::body_page::{json_body_page, validate_detail};
 use std::sync::Arc;
 
 use crate::crons;
@@ -59,6 +60,144 @@ fn runtime_catalog_page(
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::orchestrate_tools()
+}
+
+fn arc_snapshot_summary(value: &Value) -> Value {
+    let mut out = value.clone();
+    let object = out.as_object_mut().unwrap();
+    if let Some(completed) = object.remove("completed_nodes") {
+        object.insert(
+            "completed_node_count".into(),
+            serde_json::json!(completed.as_array().map(Vec::len).unwrap_or(0)),
+        );
+    }
+    object.remove("visit_counts");
+    if let Some(Value::Array(nodes)) = object.get_mut("in_flight_nodes") {
+        let total = nodes.len();
+        nodes.truncate(10);
+        if total > 10 {
+            object.insert("in_flight_node_count".into(), serde_json::json!(total));
+        }
+    }
+    out
+}
+
+fn arc_status_projection(
+    mut snapshots: Vec<Value>,
+    mut waits: Vec<Value>,
+    p: &ArcStatusParams,
+) -> anyhow::Result<Value> {
+    let full = validate_detail(p.detail.as_deref(), p.cursor.as_deref(), p.body_limit)?;
+    if (full || p.arc_id.is_some()) && (p.limit.is_some() || p.offset.is_some()) {
+        anyhow::bail!("limit and offset are only valid for summary arc lists without arc_id");
+    }
+    snapshots.sort_by(|a, b| a["arc_id"].as_str().cmp(&b["arc_id"].as_str()));
+    waits.sort_by_cached_key(Value::to_string);
+    if let Some(wanted) = p.arc_id.as_deref() {
+        let snapshot = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot["arc_id"] == wanted || snapshot["arc_thread_id"] == wanted)
+            .ok_or_else(|| anyhow::anyhow!("no active or recent arc found for {wanted}"))?;
+        waits.retain(|wait| wait["arc_id"] == snapshot["arc_id"]);
+        let exact = serde_json::json!({"snapshot":snapshot, "pending_waits":waits});
+        if full {
+            return Ok(
+                serde_json::json!({"arc_id":exact["snapshot"]["arc_id"], "body":json_body_page("arc-status", &exact, p.cursor.as_deref(), p.body_limit)?}),
+            );
+        }
+        let mut out = serde_json::json!({"snapshot":arc_snapshot_summary(&exact["snapshot"])});
+        project_wait_preview(&mut out, &waits);
+        out["preview"] = serde_json::json!(true);
+        out["detail_hint"] = serde_json::json!(
+            "Read bro_arc_status with the same arc_id, detail=full; concatenate body.text pages via cursor=body.next_cursor, then parse JSON. Full detail includes node history, visit counts, and exact typed wait correlations."
+        );
+        return Ok(out);
+    }
+    if full {
+        let exact = serde_json::json!({"snapshots":snapshots, "pending_waits":waits});
+        return Ok(
+            serde_json::json!({"body":json_body_page("arc-status-all", &exact, p.cursor.as_deref(), p.body_limit)?}),
+        );
+    }
+    let total = snapshots.len();
+    let offset = p.offset.unwrap_or(0);
+    let selected = snapshots
+        .iter()
+        .skip(offset)
+        .take(p.limit.unwrap_or(10).clamp(1, 20))
+        .collect::<Vec<_>>();
+    waits.retain(|wait| {
+        selected
+            .iter()
+            .any(|snapshot| snapshot["arc_id"] == wait["arc_id"])
+    });
+    let mut out = serde_json::json!({"snapshots":selected.iter().map(|snapshot| arc_snapshot_summary(snapshot)).collect::<Vec<_>>(), "total":total, "offset":offset, "returned":selected.len(), "preview":true});
+    let next = offset.saturating_add(selected.len());
+    if next < total {
+        out["next_offset"] = serde_json::json!(next);
+    }
+    project_wait_preview(&mut out, &waits);
+    out["detail_hint"] = serde_json::json!(
+        "Use next_offset to continue the summary list. Select arc_id for one arc; detail=full returns exact snapshots and waits as body.text JSON pages, continued via cursor=body.next_cursor."
+    );
+    Ok(out)
+}
+
+fn project_wait_preview(out: &mut Value, waits: &[Value]) {
+    out["pending_wait_count"] = serde_json::json!(waits.len());
+    out["pending_waits"] = serde_json::json!(
+        waits
+            .iter()
+            .take(10)
+            .map(|wait| {
+                let mut preview = wait.clone();
+                if serde_json::to_vec(&preview["correlation"])
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                    > 1024
+                {
+                    preview.as_object_mut().unwrap().remove("correlation");
+                    preview["correlation_omitted"] = serde_json::json!(true);
+                }
+                preview
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+fn arc_result_projection(exact: Value, p: &ArcResultParams) -> anyhow::Result<Value> {
+    let full = validate_detail(p.detail.as_deref(), p.cursor.as_deref(), p.body_limit)?;
+    if full {
+        return Ok(
+            serde_json::json!({"taskId":exact["taskId"], "arcId":exact["arcId"], "status":exact["status"],
+            "body":json_body_page("arc-result", &exact, p.cursor.as_deref(), p.body_limit)?}),
+        );
+    }
+    if serde_json::to_vec(&exact)?.len() <= 12 * 1024 {
+        return Ok(exact);
+    }
+    let mut preview = serde_json::json!({"taskId":exact["taskId"], "arcId":exact["arcId"], "status":exact["status"], "workflowStatus":exact["workflowStatus"], "arcThreadId":exact["arcThreadId"], "preview":true});
+    let mut omitted = Vec::new();
+    for key in ["structuredExit", "vars", "actorSessions", "nodeOutputs"] {
+        let Some(value) = exact.get(key) else {
+            continue;
+        };
+        if serde_json::to_vec(value)?.len() <= 2048 {
+            preview[key] = value.clone();
+        } else {
+            omitted.push(key);
+            if let Some(object) = value.as_object() {
+                preview[format!("{key}Count")] = serde_json::json!(object.len());
+                preview[format!("{key}KeysPreview")] =
+                    serde_json::json!(object.keys().take(20).collect::<Vec<_>>());
+            }
+        }
+    }
+    preview["omittedFields"] = serde_json::json!(omitted);
+    preview["detailHint"] = serde_json::json!(
+        "Read bro_arc_result with the same arc_id, keys, and include_node_outputs, detail=full; concatenate body.text pages via cursor=body.next_cursor, then parse JSON. The preview is not the complete selected result."
+    );
+    Ok(preview)
 }
 
 #[tool_router(router = orchestrate_tools)]
@@ -432,53 +571,51 @@ Constraints:\n\
 
     #[tool(
         name = "bro_arc_status",
-        description = "Read-only structured query against active and recently-finished arcs. Returns the current ArcSnapshot (current_node, completed_nodes, in_flight_nodes, last_verdict, visit_counts, started_at) plus pending-wait registrations for the arc."
+        description = "Inspect active/recent workflow positions and typed wait correlations. Select arc_id (arcId or arc_thread_id), or list deterministic summaries with limit (default 10, max 20), offset and next_offset. Summary omits completed-node history and visit-count maps and bounds waits. detail=full returns exact selected snapshots and waits as JSON body pages; continue cursor=body.next_cursor. Unknown arc ids and invalid detail/selectors are errors."
     )]
     pub(crate) async fn bro_arc_status(
         &self,
         Parameters(p): Parameters<ArcStatusParams>,
     ) -> CallToolResult {
-        if p.arc_id.is_none() {
-            // Default: all running.
-            let map = self.state.running_arcs.read();
-            return Self::ok_json(&serde_json::json!({
-                "snapshots": map.values().collect::<Vec<_>>(),
-                "pending_waits": self.state.wait_store.snapshot(),
-            }));
-        }
-        let map = self.state.running_arcs.read();
-        let wanted = p.arc_id.unwrap_or_default();
-        let snap = map
+        let snapshots = self
+            .state
+            .running_arcs
+            .read()
             .values()
-            .find(|s| s.arc_id == wanted || s.arc_thread_id == wanted)
-            .cloned();
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>();
+        let snapshots = match snapshots {
+            Ok(snapshots) => snapshots,
+            Err(error) => return Self::err_text(&error.to_string()),
+        };
         let waits = self
             .state
             .wait_store
             .snapshot()
-            .into_iter()
-            .filter(|w| {
-                w.arc_id == wanted
-                    || snap
-                        .as_ref()
-                        .map(|snapshot| w.arc_id == snapshot.arc_id)
-                        .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        Self::ok_json(&serde_json::json!({
-            "snapshot": snap,
-            "pending_waits": waits,
-        }))
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>();
+        match waits {
+            Ok(waits) => match arc_status_projection(snapshots, waits, &p) {
+                Ok(value) => Self::ok_json(&value),
+                Err(error) => Self::err_text(&error.to_string()),
+            },
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
         name = "bro_arc_result",
-        description = "Read a completed workflow arc's structured result without the event-log bulk: `structuredExit` (vars._structured_exit), final `vars` (optionally filtered by `keys`), `arcThreadId`, and `actorSessions`. Accepts the arcId from bro_orchestrate_run or the workflow task id. `include_node_outputs=true` adds per-node prose. Covers task-backed arcs (bro_orchestrate_run); webhook/SSE-ingress arcs are not task-backed."
+        description = "Read a task-backed workflow result: structuredExit, selected vars, arcThreadId and actorSessions; include_node_outputs=true adds node prose. Accepts arcId or workflow task id. keys selects vars; default vars omit duplicate _structured_exit. Small selected results stay inline; large selections explicitly return a preview. detail=full returns exact selected JSON body pages; continue cursor=body.next_cursor with the same selectors and parse concatenated body.text. Webhook/SSE-ingress arcs are not task-backed."
     )]
     pub(crate) async fn bro_arc_result(
         &self,
         Parameters(p): Parameters<ArcResultParams>,
     ) -> CallToolResult {
+        if let Err(error) = validate_detail(p.detail.as_deref(), p.cursor.as_deref(), p.body_limit)
+        {
+            return Self::err_text(&error.to_string());
+        }
         let task = {
             let store = self.state.task_store.read();
             store.all_tasks().into_iter().find(|t| {
@@ -537,7 +674,11 @@ Constraints:\n\
                     .filter(|(k, _)| keys.iter().any(|w| w == *k))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                None => vars.clone(),
+                None => vars
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "_structured_exit")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             };
             out["vars"] = Value::Object(filtered);
         }
@@ -546,7 +687,10 @@ Constraints:\n\
         {
             out["nodeOutputs"] = node_outputs.clone();
         }
-        Self::ok_json(&out)
+        match arc_result_projection(out, &p) {
+            Ok(value) => Self::ok_json(&value),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
@@ -1115,6 +1259,125 @@ mod tests {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
     }
 
+    fn status_params() -> ArcStatusParams {
+        ArcStatusParams {
+            arc_id: None,
+            limit: None,
+            offset: None,
+            detail: None,
+            cursor: None,
+            body_limit: None,
+        }
+    }
+
+    #[test]
+    fn arc_status_pages_scope_waits_and_preserve_exact_typed_correlation() {
+        let snapshots = (0..23).rev().map(|index| serde_json::json!({"arc_id":format!("arc-{index:02}"), "arc_thread_id":format!("thread-{index:02}"), "status":"running", "current_node":"Wait", "completed_nodes":["Start"], "in_flight_nodes":["Wait"], "visit_counts":{"Wait":3}})).collect::<Vec<_>>();
+        let waits = (0..23).map(|index| serde_json::json!({"arc_id":format!("arc-{index:02}"), "wait_id":"Wait#0", "signal":"ready", "correlation":{"number":24, "string":"24"}})).collect::<Vec<_>>();
+        let mut params = status_params();
+        let first = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+        assert_eq!(first["total"], 23);
+        assert_eq!(first["returned"], 10);
+        assert_eq!(first["snapshots"][0]["arc_id"], "arc-00");
+        assert_eq!(first["pending_wait_count"], 10);
+        assert!(first["snapshots"][0].get("visit_counts").is_none());
+        assert_eq!(first["pending_waits"][0]["correlation"]["number"], 24);
+        assert_eq!(first["pending_waits"][0]["correlation"]["string"], "24");
+        params.offset = first["next_offset"].as_u64().map(|offset| offset as usize);
+        let second = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+        assert_eq!(second["snapshots"][0]["arc_id"], "arc-10");
+        assert_eq!(second["pending_waits"][0]["arc_id"], "arc-10");
+        params.offset = None;
+        params.arc_id = Some("thread-22".into());
+        let selected = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+        assert_eq!(selected["snapshot"]["arc_id"], "arc-22");
+        assert_eq!(selected["pending_wait_count"], 1);
+        params.detail = Some("full".into());
+        let page = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+        let exact: Value = serde_json::from_str(page["body"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(exact["snapshot"]["visit_counts"]["Wait"], 3);
+        assert_eq!(exact["pending_waits"][0]["correlation"]["number"], 24);
+        params.arc_id = Some("absent".into());
+        assert!(arc_status_projection(snapshots, waits, &params).is_err());
+    }
+
+    #[test]
+    fn arc_status_large_wait_correlations_have_complete_continuation() {
+        let snapshots = vec![
+            serde_json::json!({"arc_id":"arc-one", "arc_thread_id":"thread-one", "status":"running", "completed_nodes":(0..500).map(|n| format!("node-{n}")).collect::<Vec<_>>(), "visit_counts":{"Wait":500}}),
+        ];
+        let waits = vec![
+            serde_json::json!({"arc_id":"arc-one", "wait_id":"Wait#0", "signal":"ready", "correlation":{"evidence":"語".repeat(9000)}}),
+        ];
+        let mut params = status_params();
+        params.arc_id = Some("arc-one".into());
+        let preview = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+        assert_eq!(preview["snapshot"]["completed_node_count"], 500);
+        assert_eq!(preview["pending_waits"][0]["correlation_omitted"], true);
+        assert!(preview["pending_waits"][0].get("correlation").is_none());
+        params.detail = Some("full".into());
+        let mut text = String::new();
+        loop {
+            let page = arc_status_projection(snapshots.clone(), waits.clone(), &params).unwrap();
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            params.cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+            if params.cursor.is_none() {
+                break;
+            }
+        }
+        let exact: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(exact["pending_waits"], serde_json::json!(waits));
+        assert_eq!(
+            exact["snapshot"]["completed_nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            500
+        );
+    }
+
+    #[test]
+    fn arc_result_large_selected_evidence_is_explicit_and_exactly_retrievable() {
+        let exact = serde_json::json!({"taskId":"task-one", "arcId":"arc-one", "status":"completed", "workflowStatus":"completed", "structuredExit":{"verdict":"ok", "evidence":"\u{0001}🦀".repeat(9000)}, "vars":{"selected":"語".repeat(9000)}, "nodeOutputs":{"Review":"complete prose".repeat(9000)}});
+        let mut params = ArcResultParams {
+            arc_id: "arc-one".into(),
+            keys: Some(vec!["selected".into()]),
+            include_node_outputs: Some(true),
+            detail: None,
+            cursor: None,
+            body_limit: None,
+        };
+        let preview = arc_result_projection(exact.clone(), &params).unwrap();
+        assert_eq!(preview["preview"], true);
+        assert!(preview.get("structuredExit").is_none());
+        assert!(
+            preview["omittedFields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "nodeOutputs")
+        );
+        let envelope = serde_json::json!({"content":[{"type":"text", "text":serde_json::to_string_pretty(&preview).unwrap()}], "structuredContent":preview});
+        assert!(serde_json::to_vec(&envelope).unwrap().len() < 80 * 1024);
+        params.detail = Some("full".into());
+        let first = arc_result_projection(exact.clone(), &params).unwrap();
+        let first_cursor = first["body"]["next_cursor"].as_str().unwrap().to_string();
+        let mut text = String::new();
+        loop {
+            let page = arc_result_projection(exact.clone(), &params).unwrap();
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            params.cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+            if params.cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), exact);
+        params.cursor = Some(first_cursor);
+        let mut changed = exact;
+        changed["vars"] = serde_json::json!({});
+        assert!(arc_result_projection(changed, &params).is_err());
+    }
+
     #[tokio::test]
     async fn runtime_catalog_pages_filter_sort_and_redact_even_with_detail() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1288,6 +1551,9 @@ mod tests {
         // node outputs withheld unless asked for.
         let r = server
             .bro_arc_result(Parameters(ArcResultParams {
+                detail: None,
+                cursor: None,
+                body_limit: None,
                 arc_id: arc_id.clone(),
                 keys: Some(vec!["sieve".into()]),
                 include_node_outputs: None,
@@ -1305,6 +1571,9 @@ mod tests {
         // Task-id lookup works too; unknown ids fail with guidance.
         let by_task = server
             .bro_arc_result(Parameters(ArcResultParams {
+                detail: None,
+                cursor: None,
+                body_limit: None,
                 arc_id: status["taskId"].as_str().unwrap().to_string(),
                 keys: None,
                 include_node_outputs: Some(true),
@@ -1313,10 +1582,15 @@ mod tests {
         let text = by_task.content[0].as_text().unwrap().text.clone();
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["vars"]["noise"], "dropped");
+        assert!(v["vars"].get("_structured_exit").is_none());
+        assert_eq!(v["structuredExit"]["verdict"], "ok");
         assert!(v.get("nodeOutputs").is_some());
 
         let missing = server
             .bro_arc_result(Parameters(ArcResultParams {
+                detail: None,
+                cursor: None,
+                body_limit: None,
                 arc_id: "arc-doesnotexist".into(),
                 keys: None,
                 include_node_outputs: None,
