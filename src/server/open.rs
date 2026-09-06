@@ -548,7 +548,7 @@ pub(super) fn open_shared_state(
         &cfg.source_connectors,
         conversation_catalog
             .as_ref()
-            .map(|snapshot| snapshot.catalog()),
+            .map(|snapshot| snapshot.catalog().as_ref()),
         &conversation_root,
     )?;
     idx.set_conversation_sources(conversation_root, conversation_enrollments);
