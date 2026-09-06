@@ -7,6 +7,7 @@ use super::Provider;
 #[derive(Debug, Default)]
 pub struct EventSink {
     pub last_assistant_message: Option<String>,
+    pub latest_assistant_preview: AssistantPreview,
     pub usage: Option<Usage>,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
@@ -27,6 +28,89 @@ pub struct EventSink {
     /// harness, which the daemon does not link, and a locally-guessed window
     /// would drift from the one actually driving compaction.
     pub context_window: Option<u64>,
+}
+
+/// Bounded text from the latest assistant message, separate from accumulated output.
+/// Empty text/tool/thinking events leave the prior preview visible until new text arrives.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantPreview {
+    text: Option<String>,
+    #[serde(default)]
+    replace_on_text: bool,
+}
+
+impl AssistantPreview {
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    pub fn set(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.text = Some(text.chars().take(256).collect());
+        }
+    }
+
+    fn append(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.replace_on_text {
+            self.text = None;
+            self.replace_on_text = false;
+        }
+        let current = self.text.get_or_insert_with(String::new);
+        let remaining = 256usize.saturating_sub(current.chars().count());
+        current.extend(text.chars().take(remaining));
+    }
+
+    pub fn observe(&mut self, evt: &Value) {
+        match evt["type"].as_str() {
+            Some("stream_event") => {
+                let event = &evt["event"];
+                match event["type"].as_str() {
+                    Some("message_start") => self.replace_on_text = true,
+                    Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                        self.replace_on_text = true;
+                        if let Some(text) = event["content_block"]["text"].as_str() {
+                            self.append(text);
+                        }
+                    }
+                    Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
+                        if let Some(text) = event["delta"]["text"].as_str() {
+                            self.append(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("assistant") => {
+                if let Some(blocks) = evt["message"]["content"].as_array() {
+                    let mut preview = Self::default();
+                    for text in blocks
+                        .iter()
+                        .filter(|b| b["type"] == "text")
+                        .filter_map(|b| b["text"].as_str())
+                        .filter(|text| !text.is_empty())
+                    {
+                        if preview.text.is_some() {
+                            preview.append("\n\n");
+                        }
+                        preview.append(text);
+                    }
+                    if preview.text.is_some() {
+                        self.text = preview.text;
+                    }
+                }
+                self.replace_on_text = true;
+            }
+            Some("result") if self.text.is_none() && evt["is_error"] != true => {
+                if let Some(text) = evt["result"].as_str() {
+                    self.set(text);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Normalized per-task token usage.
@@ -167,6 +251,7 @@ fn append_block_separator(buf: &mut Option<String>) {
 }
 
 fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
+    sink.latest_assistant_preview.observe(evt);
     if evt["type"].as_str() == Some("system") {
         let subtype = evt["subtype"].as_str();
         if matches!(subtype, Some("hook_started") | Some("hook_response")) {
@@ -350,5 +435,26 @@ mod disruption_tests {
         // A successful result with no error text.
         let ok = json!({"type": "result", "is_error": false, "result": "done"});
         assert_eq!(Provider::Glm.detect_disruption(&ok), None);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn preview_is_bounded_and_empty_or_non_text_events_do_not_erase_it() {
+        let mut preview = AssistantPreview::default();
+        preview.set("opening");
+        preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}));
+        assert_eq!(preview.text(), Some("opening"));
+        preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_delta", "delta":{"type":"text_delta", "text":"🦀".repeat(300)}}}));
+        assert_eq!(preview.text().unwrap(), "🦀".repeat(256));
+        preview.observe(&json!({"type":"assistant", "message":{"content":[{"type":"thinking", "thinking":"hidden"}]}}));
+        preview.observe(&json!({"type":"result", "is_error":true, "result":"error diagnostic"}));
+        assert_eq!(preview.text().unwrap(), "🦀".repeat(256));
+        preview.observe(&json!({"type":"assistant", "message":{"content":[{"type":"text", "text":"Final"}, {"type":"text", "text":"findings"}]}}));
+        assert_eq!(preview.text(), Some("Final\n\nfindings"));
     }
 }

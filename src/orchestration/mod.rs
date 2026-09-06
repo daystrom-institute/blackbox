@@ -691,6 +691,7 @@ pub struct TaskInner {
     pub events: EventRing,
     pub model: Option<String>,
     pub last_assistant_message: Option<String>,
+    pub latest_assistant_preview: providers::AssistantPreview,
     pub usage: Option<Usage>,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
@@ -1090,6 +1091,7 @@ mod roster_view_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: Some(0.42),
                 num_turns: Some(7),
@@ -1401,8 +1403,8 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
         last_message_snippet: inner
-            .last_assistant_message
-            .as_deref()
+            .latest_assistant_preview
+            .text()
             .map(|s| s.chars().take(200).collect::<String>()),
         model: inner.model.clone(),
         report: inner.report.as_ref().and_then(roster_report_teaser),
@@ -1587,6 +1589,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             events: EventRing::new(),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: Some(3),
@@ -1759,6 +1762,8 @@ struct PersistedTask {
     #[serde(default)]
     model: Option<String>,
     last_assistant_message: Option<String>,
+    #[serde(default)]
+    latest_assistant_preview: providers::AssistantPreview,
     usage: Option<Usage>,
     cost_usd: Option<f64>,
     num_turns: Option<u64>,
@@ -1914,6 +1919,7 @@ impl TaskStore {
                         .collect(),
                     model: inner.model.clone(),
                     last_assistant_message: inner.last_assistant_message.clone(),
+                    latest_assistant_preview: inner.latest_assistant_preview.clone(),
                     usage: inner.usage.clone(),
                     cost_usd: inner.cost_usd,
                     num_turns: inner.num_turns,
@@ -2084,6 +2090,13 @@ impl TaskStore {
             if workflow_owned {
                 rec.recoverable = false;
             }
+            // Old snapshots have only accumulated output. Recover a proven latest
+            // message from retained events; omit the preview if no evidence remains.
+            if rec.latest_assistant_preview.text().is_none() {
+                for event in &rec.events {
+                    rec.latest_assistant_preview.observe(event);
+                }
+            }
             let events = EventRing::from_loaded(rec.events);
             let live_cursor = rec.live_cursor.max(events.len() as u64);
             let task = Arc::new(Task {
@@ -2094,6 +2107,7 @@ impl TaskStore {
                     events,
                     model,
                     last_assistant_message: rec.last_assistant_message,
+                    latest_assistant_preview: rec.latest_assistant_preview,
                     usage: rec.usage,
                     cost_usd: rec.cost_usd,
                     num_turns: rec.num_turns,
@@ -2762,6 +2776,7 @@ fn failed_duplicate_task(
             events: EventRing::new(),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -2844,6 +2859,7 @@ pub fn spawn_in_process_task(
             events: EventRing::new(),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -2978,6 +2994,7 @@ pub fn finish_in_process_task(
     populate_transcript_handle(task);
     let mut inner = task.inner.lock();
     if let Some(result) = result {
+        inner.latest_assistant_preview.set(&result);
         inner.last_assistant_message = Some(result);
     }
     if let Some(stderr) = stderr {
@@ -3600,6 +3617,7 @@ async fn spawn_harness_child_task(
             events: EventRing::new(),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -4350,6 +4368,7 @@ fn ingest_harness_event(
                 // appends are amortized O(chunk). apply_sink_updates below
                 // (unconditional on this path) writes it back.
                 last_assistant_message: inner.last_assistant_message.take(),
+                latest_assistant_preview: std::mem::take(&mut inner.latest_assistant_preview),
                 usage: inner.usage.clone(),
                 cost_usd: inner.cost_usd,
                 num_turns: inner.num_turns,
@@ -4779,6 +4798,7 @@ pub fn now_ms() -> u64 {
 }
 
 fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
+    inner.latest_assistant_preview = sink.latest_assistant_preview;
     // Merge — never CLEAR fields that were already captured during the
     // streaming run by overwriting with None from a partial update.
     if sink.last_assistant_message.is_some() {
@@ -4969,7 +4989,9 @@ fn task_view_json_from_inner(
         }
     }
     if !deliverable && let Some(message) = inner.last_assistant_message.as_deref() {
-        obj["lastAssistantSnippet"] = json!(message.chars().take(256).collect::<String>());
+        if let Some(preview) = inner.latest_assistant_preview.text() {
+            obj["lastAssistantSnippet"] = json!(preview);
+        }
         obj["resultBytes"] = json!(message.len());
         obj["resultHint"] = json!(
             "Read the deliverable with bro_status(task_id=..., detail=result); follow body.next_cursor for additional pages."
@@ -5671,7 +5693,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
     let inner = task.inner.lock();
     let elapsed = format_elapsed(inner.started_at, None);
     let event_count = observed_event_count(&inner);
-    let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
+    let last_activity = inner.latest_assistant_preview.text().map(|msg| {
         let clean = msg.replace('\n', " ");
         let teaser: String = clean.chars().take(80).collect();
         if teaser.len() < clean.len() {
@@ -7199,6 +7221,7 @@ mod tests {
                 events: EventRing::from_loaded(events),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -7772,8 +7795,11 @@ mod tests {
             "",
             vec![serde_json::json!({"type": "assistant", "idx": 1})],
         );
-        running.inner.lock().last_assistant_message =
-            Some(format!("{}’{}", "x".repeat(79), "tail"));
+        running.inner.lock().latest_assistant_preview.set(&format!(
+            "{}’{}",
+            "x".repeat(79),
+            "tail"
+        ));
 
         let json = timeout_snapshot_json(&running);
 
@@ -7898,6 +7924,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -7938,6 +7965,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -7995,6 +8023,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -8051,6 +8080,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -8083,6 +8113,81 @@ mod tests {
             child_id: Mutex::new(None),
             roster_events: None,
         })
+    }
+
+    #[test]
+    fn latest_assistant_preview_tracks_streams_without_replacing_the_result() {
+        let task = mk_ingest_task("preview", "session-preview");
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let feed = |evt| ingest_harness_event(&task, Provider::Brodex, evt, &tx, "preview", None);
+        for text in ["Opening plan", "Latest findings"] {
+            feed(
+                json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}),
+            );
+            feed(
+                json!({"type":"stream_event", "event":{"type":"content_block_delta", "delta":{"type":"text_delta", "text":text}}}),
+            );
+            let status = mcp_task_status_json(&task, "summary", None, None, 0, false).unwrap();
+            assert_eq!(status["lastAssistantSnippet"], text);
+            feed(json!({"type":"assistant", "message":{"content":[{"type":"text", "text":text}]}}));
+        }
+        feed(
+            json!({"type":"assistant", "message":{"content":[{"type":"tool_use", "name":"read"}]}}),
+        );
+        assert_eq!(
+            task.inner.lock().last_assistant_message.as_deref(),
+            Some("Opening plan\n\nLatest findings")
+        );
+        assert_eq!(
+            timeout_snapshot_json(&task)["lastAssistantSnippet"],
+            "Latest findings"
+        );
+        assert_eq!(
+            roster_summary_from_task(&task)
+                .last_message_snippet
+                .as_deref(),
+            Some("Latest findings")
+        );
+    }
+
+    #[test]
+    fn latest_assistant_preview_survives_restart_and_recovers_old_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let task = mk_ingest_task("preview-persist", "session-preview");
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        for text in ["Opening plan", "Final findings"] {
+            ingest_harness_event(
+                &task,
+                Provider::Brodex,
+                json!({"type":"assistant", "message":{"content":[{"type":"text", "text":text}]}}),
+                &tx,
+                "preview-persist",
+                None,
+            );
+        }
+        task.inner.lock().status = TaskStatus::Completed;
+        let mut store = TaskStore::new();
+        store.insert("preview-persist".into(), task).unwrap();
+        store.persist(&root);
+        for legacy in [false, true] {
+            if legacy {
+                let path = root.join("tasks.json");
+                let mut records: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                records[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("latest_assistant_preview");
+                std::fs::write(path, serde_json::to_vec(&records).unwrap()).unwrap();
+            }
+            let loaded = TaskStore::load(&root, u64::MAX);
+            let restored = loaded.get("preview-persist").unwrap();
+            assert_eq!(
+                mcp_task_status_json(&restored, "summary", None, None, 0, false).unwrap()["lastAssistantSnippet"],
+                "Final findings"
+            );
+        }
     }
 
     #[test]
@@ -8288,6 +8393,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -9106,6 +9212,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: Some("Done!".into()),
+                latest_assistant_preview: Default::default(),
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -9340,6 +9447,7 @@ mod tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -9398,6 +9506,7 @@ mod tests {
                 ]),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -9452,6 +9561,7 @@ mod tests {
             events: EventRing::new(),
             model: None,
             last_assistant_message: Some("trusted prior result".into()),
+            latest_assistant_preview: Default::default(),
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -9516,6 +9626,7 @@ mod tests {
             events: EventRing::new(),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -9547,6 +9658,7 @@ mod tests {
 
         let sink = EventSink {
             last_assistant_message: Some("fresh output".into()),
+            latest_assistant_preview: Default::default(),
             usage: Some(Usage {
                 input_tokens: 12,
                 output_tokens: 8,
@@ -9590,6 +9702,7 @@ mod tests {
             })]),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -9650,6 +9763,7 @@ mod tests {
             })]),
             model: None,
             last_assistant_message: None,
+            latest_assistant_preview: Default::default(),
             usage: None,
             cost_usd: None,
             num_turns: None,
@@ -9753,6 +9867,7 @@ mod tests {
         let text = "🦀 café\n\"quoted\"".repeat(12);
         let task = task_with(TaskStatus::Completed, "", vec![]);
         task.inner.lock().last_assistant_message = Some(text.clone());
+        task.inner.lock().latest_assistant_preview.set(&text);
         let mut cursor: Option<String> = None;
         let mut result = String::new();
         loop {
@@ -10076,6 +10191,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -10122,6 +10238,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -10174,6 +10291,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -10222,6 +10340,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -10282,6 +10401,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
@@ -10335,6 +10455,7 @@ mod async_tests {
                 events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
+                latest_assistant_preview: Default::default(),
                 usage: None,
                 cost_usd: None,
                 num_turns: None,

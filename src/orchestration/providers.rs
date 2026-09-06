@@ -19,7 +19,7 @@ mod tests;
 
 pub use bro_core::{Capability, Provider};
 
-pub use events::{Disruption, EventSink, Usage};
+pub use events::{AssistantPreview, Disruption, EventSink, Usage};
 pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
 #[cfg(test)]
 use mcp_args::MatchState;

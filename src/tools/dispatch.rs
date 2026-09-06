@@ -1724,7 +1724,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_status",
-        description = "Read task progress. detail=result, report, or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics."
+        description = "Read task progress. lastAssistantSnippet previews the latest assistant text (up to 256 characters), when known. detail=result, report, or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics."
     )]
     pub(crate) fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
