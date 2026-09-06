@@ -19,6 +19,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Expired runtime rate-limit cooldowns permit a fresh allocation attempt with
+  unknown quota capacity. Historical 429 receipts remain visible; authoritative
+  quota exhaustion and credential failures still exclude the account.
+
 - Tools loaded with `tool_search` retain their schemas after a harness process
   resume. Older sessions recover successful activation receipts from the event
   log; current permissions and tool availability still govern restoration.

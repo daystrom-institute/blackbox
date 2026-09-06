@@ -977,7 +977,11 @@ fn score_candidate(
         candidate.exclusion_reason = Some("credential_unavailable".into());
         return candidate;
     }
-    if probe.is_some_and(|probe| matches!(probe.quota_status, QuotaStatus::Exhausted)) {
+    let now = super::now_ms();
+    if probe.is_some_and(|probe| {
+        matches!(probe.quota_status, QuotaStatus::Exhausted)
+            && !runtime_quota_observation_expired(probe, now)
+    }) {
         candidate.exclusion_reason = Some("quota_exhausted".into());
         return candidate;
     }
@@ -1000,10 +1004,10 @@ fn score_candidate(
         1.0 - (in_flight as f64 / max_concurrent as f64)
     }
     .clamp(0.0, 1.0);
-    let quota_capacity = probe.map(quota_capacity).unwrap_or(0.5);
+    let quota_capacity = probe.map(|probe| quota_capacity(probe, now)).unwrap_or(0.5);
     let cooldown_capacity = probe
         .and_then(|probe| probe.cooldown_until)
-        .map(|until| if until > super::now_ms() { 0.0 } else { 1.0 })
+        .map(|until| if until > now { 0.0 } else { 1.0 })
         .unwrap_or(1.0);
     if cooldown_capacity == 0.0 {
         candidate.exclusion_reason = Some("cooldown_active".into());
@@ -1052,7 +1056,18 @@ fn score_candidate(
     candidate
 }
 
-fn quota_capacity(probe: &ProbeRecord) -> f64 {
+fn runtime_quota_observation_expired(probe: &ProbeRecord, now: u64) -> bool {
+    matches!(probe.quota_confidence, QuotaConfidence::RuntimeRateLimit)
+        && probe.cooldown_until.is_some_and(|until| until <= now)
+}
+
+fn quota_capacity(probe: &ProbeRecord, now: u64) -> f64 {
+    // A runtime 429 is evidence for its cooldown, not permanent exhaustion.
+    // Once expired, allow a new observation with unknown capacity. Preserve the
+    // stored receipt and do not reinterpret it as successful provider admission.
+    if runtime_quota_observation_expired(probe, now) {
+        return 0.5;
+    }
     match probe.quota_confidence {
         QuotaConfidence::QuotaProbe | QuotaConfidence::RuntimeRateLimit => {
             let utilization = probe
@@ -2362,6 +2377,86 @@ mod tests {
                     .is_some_and(|score| *score < 0.1)
             }));
         });
+    }
+
+    #[test]
+    fn runtime_rate_limit_expires_without_erasing_authoritative_quota_or_credentials() {
+        let now = super::super::now_ms();
+        let request = RuntimeRequest {
+            pin: Some(RuntimePin {
+                provider: Some(Provider::Glm),
+                model: Some("glm-5.3-flash".into()),
+                authority: PinAuthority::Operator,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut probe = ProbeRecord {
+            provider: Provider::Glm,
+            account: None,
+            credential_status: CredentialStatus::Present,
+            quota_status: QuotaStatus::Exhausted,
+            quota_confidence: QuotaConfidence::RuntimeRateLimit,
+            five_hour_utilization: Some(1.0),
+            seven_day_utilization: Some(1.0),
+            balance_capacity: None,
+            cooldown_until: Some(now + 3_600_000),
+            last_probe_at: None,
+            last_runtime_observation_at: Some(now - 300_000),
+            raw_summary: Some("historical runtime 429".into()),
+        };
+        let preview = |probe: ProbeRecord| {
+            allocate(
+                request.clone(),
+                &built_in_config(),
+                &BroConfig::default(),
+                &AllocationContext {
+                    provider_binary_location: ProviderBinaryLocation::ExecutorHost,
+                    probes: BTreeMap::from([(lane_key(Provider::Glm, None), probe)]),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            preview(probe.clone()).trace.candidates[0]
+                .exclusion_reason
+                .as_deref(),
+            Some("quota_exhausted")
+        );
+        probe.cooldown_until = Some(now - 1);
+        let recovered = preview(probe.clone());
+        assert!(recovered.trace.error.is_none(), "{:?}", recovered.trace);
+        assert_eq!(
+            recovered.trace.candidates[0].score_components["quota_capacity"],
+            0.5
+        );
+        assert!(matches!(probe.quota_status, QuotaStatus::Exhausted));
+        assert_eq!(probe.raw_summary.as_deref(), Some("historical runtime 429"));
+        assert!(runtime_quota_observation_expired(&probe, now - 1));
+        assert!(!runtime_quota_observation_expired(&probe, now - 2));
+        probe.credential_status = CredentialStatus::Expired;
+        assert_eq!(
+            preview(probe.clone()).trace.candidates[0]
+                .exclusion_reason
+                .as_deref(),
+            Some("credential_unavailable")
+        );
+        probe.credential_status = CredentialStatus::Present;
+        probe.quota_confidence = QuotaConfidence::QuotaProbe;
+        assert_eq!(
+            preview(probe.clone()).trace.candidates[0]
+                .exclusion_reason
+                .as_deref(),
+            Some("quota_exhausted")
+        );
+        probe.quota_confidence = QuotaConfidence::RuntimeRateLimit;
+        probe.cooldown_until = None;
+        assert_eq!(
+            preview(probe).trace.candidates[0]
+                .exclusion_reason
+                .as_deref(),
+            Some("quota_exhausted")
+        );
     }
 
     #[test]
