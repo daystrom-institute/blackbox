@@ -663,11 +663,25 @@ pub(crate) struct AgentVectorPlan {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ProvidersParams {
+    /// Omit for provider summaries; select one provider to list its models and efforts.
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts,
     /// set_provider_default, get_provider_default, list_provider_defaults,
     /// clear_provider_default
     pub(crate) action: String,
+    /// Maximum brofile summaries for action=list (default 20, maximum 100).
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Starting row for action=list, after provider/name filtering.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[serde(default)]

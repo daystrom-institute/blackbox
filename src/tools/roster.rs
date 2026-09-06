@@ -15,7 +15,7 @@ use crate::server::progress::{
 use crate::server::state::BlackboxServer;
 use crate::tools::bro_params::{
     AdvisorCheckpoint, AdvisorMemberCheckpoint, AdvisorNoteSummary, AdvisorSpecParams,
-    BrofileParams, DashboardParams, ReportParams, TeamParams,
+    BrofileParams, DashboardParams, ProvidersParams, ReportParams, TeamParams,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -216,14 +216,10 @@ impl BlackboxServer {
                 if s.interrupted {
                     entry["interrupted"] = Value::Bool(true);
                 }
-                // Same block bro_status returns. The dashboard is the surface
-                // an orchestrator scans across a whole fleet, so it is where a
-                // session approaching its context ceiling most needs to be
-                // visible before it hard-fails.
-                if let Some(pressure) = s.context
-                    && let Ok(value) = serde_json::to_value(pressure)
-                {
-                    entry["context"] = value;
+                // Share the status observation: context occupancy does not
+                // determine whether a session can accept more work.
+                if let Some(pressure) = s.context {
+                    entry["context"] = pressure.observation_json();
                 }
                 // Sort key: legacy used `started_at`. Fall back to
                 // `last_event_at` when `started_at` is somehow
@@ -286,11 +282,28 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_providers",
-        description = "List configured providers, binaries, models."
+        description = "List provider summaries; pass provider to list its model slugs and reasoning efforts."
     )]
-    pub(crate) fn bro_providers(&self) -> CallToolResult {
+    pub(crate) fn bro_providers(
+        &self,
+        Parameters(params): Parameters<ProvidersParams>,
+    ) -> CallToolResult {
+        let selected = match params
+            .provider
+            .as_deref()
+            .map(str::parse::<Provider>)
+            .transpose()
+        {
+            Ok(provider) => provider,
+            Err(_) => {
+                return Self::err_text("Unknown provider; omit provider to list valid providers");
+            }
+        };
         let mut info = serde_json::Map::new();
         for p in Provider::ALL {
+            if selected.is_some_and(|selected| selected != *p) {
+                continue;
+            }
             let bin = p.bin();
             let resolved = orch::providers::resolve_bin(&bin);
             let mut entry = json!({
@@ -302,10 +315,12 @@ impl BlackboxServer {
             if let Some(ref path) = resolved {
                 entry["path"] = json!(path);
             }
-            if !p.models().is_empty() {
+            entry["modelCount"] = json!(p.models().len());
+            entry["defaultModel"] = json!(p.models().iter().find(|m| m.default).map(|m| m.id));
+            if selected.is_some() && !p.models().is_empty() {
                 entry["models"] = serde_json::to_value(p.models()).unwrap_or_default();
             }
-            if !p.efforts().is_empty() {
+            if selected.is_some() && !p.efforts().is_empty() {
                 entry["efforts"] = serde_json::to_value(p.efforts()).unwrap_or_default();
             }
             info.insert(p.as_str().to_string(), entry);
@@ -315,7 +330,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_brofile",
-        description = "Manage brofile templates + accounts (provider+account+lens+context)."
+        description = "Manage brofiles and accounts. list returns paginated summaries; get by name returns the full lens and configuration."
     )]
     pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
@@ -368,7 +383,22 @@ impl BlackboxServer {
             }
             "list" => {
                 let list = brofile::list_brofiles(scope, store_dir, p.project_dir.as_deref());
-                Self::ok_json(&serde_json::to_value(&list).unwrap_or_default())
+                let provider = match p
+                    .provider
+                    .as_deref()
+                    .map(str::parse::<Provider>)
+                    .transpose()
+                {
+                    Ok(provider) => provider,
+                    Err(_) => return Self::err_text("Unknown provider"),
+                };
+                Self::ok_json(&brofile::list_summary_page(
+                    list,
+                    provider,
+                    p.name.as_deref(),
+                    p.offset.unwrap_or(0),
+                    p.limit.unwrap_or(20),
+                ))
             }
             "get" => {
                 let name = match &p.name {
@@ -1491,6 +1521,36 @@ mod tests {
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
 
+    #[test]
+    fn providers_expand_only_the_selected_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let summary = server.bro_providers(Parameters(ProvidersParams { provider: None }));
+        let summary: Value = serde_json::from_str(&extract_text(&summary)).unwrap();
+        assert_eq!(summary.as_object().unwrap().len(), Provider::ALL.len());
+        for entry in summary.as_object().unwrap().values() {
+            assert!(entry.get("models").is_none());
+            assert!(entry.get("efforts").is_none());
+        }
+        let detail = server.bro_providers(Parameters(ProvidersParams {
+            provider: Some("brodex".into()),
+        }));
+        let detail: Value = serde_json::from_str(&extract_text(&detail)).unwrap();
+        assert_eq!(detail.as_object().unwrap().len(), 1);
+        assert!(
+            detail["brodex"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model["id"] == "gpt-6-astra")
+        );
+        assert_eq!(detail["brodex"]["defaultModel"], "gpt-5.6-sol");
+        let invalid = server.bro_providers(Parameters(ProvidersParams {
+            provider: Some("typo".into()),
+        }));
+        assert_eq!(invalid.is_error, Some(true));
+    }
+
     // Wave 7c: bro_dashboard now reads from the materialized
     // RosterView. These tests seed the view (via the sink or via
     // `rebuild_from_store`, matching the wave-6a convention) and
@@ -1806,7 +1866,8 @@ mod tests {
             assert_eq!(row["context"]["last_turn_input_tokens"], 190_000);
             assert_eq!(row["context"]["context_window"], 200_000);
             assert_eq!(row["context"]["utilization"], 0.95);
-            assert_eq!(row["context"]["approaching_ceiling"], true);
+            assert!(row["context"].get("approaching_ceiling").is_none());
+            assert_eq!(row["context"]["measurement"], "last_model_request");
 
             let quiet = by_id.get("quiet").expect("quiet row present");
             assert!(

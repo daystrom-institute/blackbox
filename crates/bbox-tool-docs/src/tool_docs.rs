@@ -925,14 +925,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_status",
         category: ToolCategory::Orchestration,
         summary: "Non-blocking progress check on a task; call before declaring a timeout dead or cancelling.",
-        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result. The `context` block reports context-window pressure for live tasks too (unlike `usage`/`costUsd`/`numTurns`, which appear only once terminal): `last_turn_input_tokens` is the most recent prompt's cache-inclusive size, the real measure of window occupancy; `context_window`, `utilization`, and `approaching_ceiling` are present only when the model's window is known, so an unrecognized model reports occupancy with nulls rather than a guessed fraction. `approaching_ceiling: true` means rotate to a fresh session before the provider rejects a prompt outright; `ceiling_ratio` is the threshold that judged it (default 0.8, `BBOX_CONTEXT_CEILING_RATIO`).",
+        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result. The `context` block is a last-model-request observation, not a remaining session work budget. `last_turn_input_tokens` is cache-inclusive prompt size; `context_window` and `utilization` are null when unknown. Compaction can reclaim context and continue the same session. Do not stop assigning work or rotate solely because occupancy is high; use task status, actual errors, and reported blockers.",
         example: None,
     },
     ToolDoc {
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
         summary: "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard.",
-        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks. Rows carry the same `context` block `bro_status` returns when a task has reported a turn, so a fleet-wide scan shows which long-lived sessions are approaching their context ceiling; a row with no measurement omits the block rather than reporting a zero.",
+        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks. Rows carry the same `context` block `bro_status` returns when a task has reported a turn, so a fleet-wide scan shows last-request occupancy without treating it as a session work limit; a row with no measurement omits the block rather than reporting a zero.",
         example: None,
     },
     ToolDoc {
@@ -984,15 +984,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_providers",
         category: ToolCategory::Orchestration,
-        summary: "List configured providers, binaries, models.",
-        when_to_use: "Check what's available before composing a team or choosing a model.",
+        summary: "List provider summaries; pass provider to list its model slugs and reasoning efforts.",
+        when_to_use: "Discover providers with no arguments. Pass provider=\"brodex\" (or another returned provider id) for that provider's model slugs and model-specific effort support.",
         example: None,
     },
     ToolDoc {
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
-        summary: "Manage brofile templates + accounts (provider+account+lens+context).",
-        when_to_use: "Create, inspect, and manage reusable bro blueprints. `context.provider_defaults` controls provider-default suppression; see `sm-brofile-context` via `bbox_knowledge` before composing minimal probes or strict suppression brofiles. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        summary: "Manage brofiles and accounts. list returns paginated summaries; get by name returns the full lens and configuration.",
+        when_to_use: "Create, inspect, and manage reusable bro blueprints. `action=list` returns sorted summaries (default limit=20, max=100) with total and next_offset; provider and name filter before pagination. Lenses and dispatch policy are omitted: use `action=get` with name for full details. `context.provider_defaults` controls provider-default suppression; see `sm-brofile-context` via `bbox_knowledge` before composing minimal probes or strict suppression brofiles. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(r#"bro_brofile(action="list")"#),
     },
     ToolDoc {

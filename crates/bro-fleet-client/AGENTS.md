@@ -17,11 +17,10 @@
 - `parse_transcript` consumes bare envelope events and skips `stream_event`
   partials by design; assistant text renders at step granularity. The wrapped
   `{ts, event}` log-line shape is unwrapped by the file tail, not here.
-  `TurnFooter` now carries `input_tokens` (cache-inclusive total from
-  `usage.{input_tokens,cache_read_input_tokens,cache_creation_input_tokens}`)
-  and `compaction_threshold` (the current model's compaction threshold,
-  emitted by the harness on the `result` event). Both are `Option<u64>` —
-  absent on older harness builds or interrupted turns.
+  `TurnFooter.input_tokens` is the cache-inclusive last model request from
+  `result.last_turn_input_tokens`. Never derive occupancy from cumulative
+  `result.usage`. A producer without a measurement yields `None`.
+  `compaction_threshold` remains producer-owned and optional.
 - Surface daemon error bodies on non-2xx (`{"error": …}`, or axum's 422 serde
   message) — `error_for_status()`'s opaque status line is considered a bug.
   Remember `/control/exec|resume` handlers return errors INSIDE a 200 tool

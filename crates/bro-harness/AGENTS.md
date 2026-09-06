@@ -52,9 +52,12 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   out to the consumer.
 - The per-step `context_pressure` system event carries occupancy
   (cache-inclusive `last_turn_input_tokens`) plus the window and threshold.
-  It fires every model step on purpose: the terminal `result` event reports
-  window pressure only once the session is already over, which is useless to
-  an orchestrator whose job is to rotate the session before it hits the wall.
+  It fires every model step so observers can follow request occupancy while
+  work runs. Occupancy is not a remaining session work budget: normal
+  compaction can reclaim context and continue the same session.
+- Terminal `result` events carry `last_turn_input_tokens` separately from
+  cumulative `usage`. Context displays must use that measurement, never the
+  sum of usage across model steps. Missing measurements stay unknown.
 
 ## Session + loop model
 

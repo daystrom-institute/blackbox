@@ -595,27 +595,35 @@ static KIMI_EFFORTS: &[EffortInfo] = &[
 // distinguished purely by slug suffix, and introduces two new reasoning levels:
 //   - `max`   ("Maximum reasoning depth for the hardest problems")
 //   - `ultra` ("Maximum reasoning with automatic task delegation")
-// `ultra` is exposed by Sol/Terra but NOT Luna, and neither is exposed by the
+// GPT-6 Astra shares the Sol/Terra effort set (Codex model catalog).
+// `ultra` is exposed by Astra/Sol/Terra but NOT Luna, and neither is exposed by the
 // pre-5.6 models. That per-model divergence is why effort validity is keyed on
 // `ModelInfo::efforts` rather than the flat provider list. Pre-5.6 models keep
 // the established `{minimal,low,medium,high,xhigh}` set (non-regressing).
 const CODEX_PRE_56_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
-const CODEX_56_SOL_TERRA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const CODEX_ULTRA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_56_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        id: "gpt-6-astra",
+        description: "GPT-6 Astra: most capable model for complex, demanding work",
+        default: false,
+        efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
         id: "gpt-5.6-sol",
-        description: "GPT-5.6 Sol: latest frontier agentic coding model (Sol/Terra/Luna tier: frontier)",
+        description: "GPT-5.6 Sol: frontier agentic coding model (Sol/Terra/Luna tier: frontier)",
         default: true,
-        efforts: CODEX_56_SOL_TERRA_EFFORTS,
+        efforts: CODEX_ULTRA_EFFORTS,
         default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.6-terra",
         description: "GPT-5.6 Terra: balanced agentic coding model for everyday work (tier: balanced)",
         default: false,
-        efforts: CODEX_56_SOL_TERRA_EFFORTS,
+        efforts: CODEX_ULTRA_EFFORTS,
         default_effort: Some("medium"),
     },
     ModelInfo {
@@ -729,12 +737,12 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
     },
     EffortInfo {
         id: "max",
-        description: "Maximum reasoning depth for the hardest problems (gpt-5.6)",
+        description: "Maximum reasoning depth for the hardest problems",
         default: false,
     },
     EffortInfo {
         id: "ultra",
-        description: "Maximum reasoning with automatic task delegation (gpt-5.6 Sol/Terra)",
+        description: "Maximum reasoning with automatic task delegation",
         default: false,
     },
 ];
@@ -828,10 +836,15 @@ mod tests {
         // Sol is the default codex model.
         let default_model = models.iter().find(|m| m.default).unwrap();
         assert_eq!(default_model.id, "gpt-5.6-sol");
-        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for slug in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
             assert!(
                 models.iter().any(|m| m.id == slug),
-                "missing gpt-5.6 variant {slug}"
+                "missing Brodex model {slug}"
             );
         }
     }
@@ -839,6 +852,10 @@ mod tests {
     #[test]
     fn ultra_is_model_keyed_sol_terra_yes_luna_no() {
         let p = Provider::Brodex;
+        assert_eq!(
+            p.model_efforts("gpt-6-astra"),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
         assert!(p.model_efforts("gpt-5.6-sol").contains(&"ultra"));
         assert!(p.model_efforts("gpt-5.6-terra").contains(&"ultra"));
         // Luna supports `max` but not `ultra`.
@@ -856,6 +873,7 @@ mod tests {
         assert!(luna.iter().any(|e| e.id == "max"));
         assert!(!luna.iter().any(|e| e.id == "ultra"));
         assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
+        assert_eq!(p.model_default_effort("gpt-6-astra"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-5.3-codex-spark"), Some("high"));
     }
 

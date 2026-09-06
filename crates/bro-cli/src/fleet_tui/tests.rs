@@ -3363,3 +3363,22 @@ fn install_resume_failure_keeps_row_and_restores_turn() {
         app.pending_cockpit_lines
     );
 }
+#[test]
+fn context_readout_is_invalidated_by_compaction_or_an_unmeasured_result() {
+    let footer = |input_tokens| TranscriptItem::TurnFooter {
+        num_turns: None,
+        cost_usd: None,
+        input_tokens,
+        compaction_threshold: Some(204_000),
+    };
+    let mut items = vec![footer(Some(50_000))];
+    assert_eq!(last_token_info(&items), Some((50_000, Some(204_000))));
+    items.push(TranscriptItem::CompactBoundary {
+        trigger: "auto".into(),
+    });
+    assert_eq!(last_token_info(&items), None);
+    items.push(footer(Some(20_000)));
+    assert_eq!(last_token_info(&items), Some((20_000, Some(204_000))));
+    items.push(footer(None));
+    assert_eq!(last_token_info(&items), None);
+}

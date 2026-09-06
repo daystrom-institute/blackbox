@@ -1,0 +1,21 @@
+{
+  "id": "gap-f650c0ce",
+  "title": "Context telemetry conflates cumulative work with prompt occupancy and directs premature session rotation",
+  "gap_kind": "tooling",
+  "domain": "context-telemetry",
+  "wanted_capability": "Fleet should display measured last-request context occupancy rather than cumulative session input usage. Agent-facing status and documentation should describe occupancy as an observation, not a remaining session work budget or an instruction to stop assigning work: the harness can compact and continue. Existing Fleet footer sums result.usage across the session and divides by the compaction threshold; bro_status and bro_dashboard expose approaching_ceiling, and tool docs explicitly instruct rotation when it is true.",
+  "fallback_used": "Use the harness context_pressure measurement and actual task blockers; do not interpret accumulated usage as remaining work capacity.",
+  "evidence": [
+    "crates/bro-fleet-client/src/fleet.rs parse_transcript result handling",
+    "crates/bro-harness/src/agent_loop.rs result emission passes self.total_usage",
+    "crates/bro-protocol/src/lib.rs ContextPressure",
+    "crates/bbox-tool-docs/src/tool_docs.rs bro_status"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/context-telemetry/cumulative-usage-and-rotation-alarm",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-06T03:53:10Z",
+  "updated_at": "2026-09-06T03:53:10Z"
+}

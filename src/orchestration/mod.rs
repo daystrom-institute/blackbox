@@ -4926,15 +4926,10 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
             });
         }
     }
-    // Context-window pressure is deliberately NOT behind the terminal-status
-    // gate the usage/cost/turns block sits behind. A finished task's window
-    // occupancy is a curiosity; a RUNNING task's is the entire point, because
-    // it is the only state in which an orchestrator can still act on it by
-    // rotating to a fresh session.
-    if let Some(pressure) = context_pressure_for_inner(inner)
-        && let Ok(value) = serde_json::to_value(pressure)
-    {
-        obj["context"] = value;
+    // Occupancy remains visible while running, with the same interpretation
+    // as the dashboard. Cumulative usage is a separate accounting measure.
+    if let Some(pressure) = context_pressure_for_inner(inner) {
+        obj["context"] = pressure.observation_json();
     }
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
@@ -8586,7 +8581,7 @@ mod tests {
         assert_eq!(context["last_turn_input_tokens"], 50_000);
         assert_eq!(context["context_window"], 200_000);
         assert_eq!(context["utilization"], 0.25);
-        assert_eq!(context["approaching_ceiling"], false);
+        assert!(context.get("approaching_ceiling").is_none());
         assert!(
             json.get("usage").is_none(),
             "the terminal-only usage gate must stay closed for a running task, \
@@ -8608,24 +8603,22 @@ mod tests {
             context["utilization"].is_null(),
             "utilization must be absent without a denominator: {json}"
         );
-        assert_eq!(
-            context["approaching_ceiling"], false,
-            "an unmeasurable session must never be flagged"
-        );
+        assert!(context.get("approaching_ceiling").is_none());
     }
 
     #[test]
-    fn context_block_flags_a_session_at_its_ceiling() {
-        // Occupancy equal to the window flags under any admissible ratio, so
-        // this assertion holds whatever threshold the host is configured with.
+    fn context_block_reports_occupancy_without_a_rotation_alarm() {
         let task = task_with_context(TaskStatus::Running, Some(200_000), Some(200_000));
         let json = task_result_json(&task);
         assert_eq!(json["context"]["utilization"], 1.0);
-        assert_eq!(json["context"]["approaching_ceiling"], true);
-        assert_eq!(
-            json["context"]["ceiling_ratio"],
-            serde_json::json!(supervision::context_ceiling_ratio()),
-            "the block must publish the threshold it was judged against"
+        assert!(json["context"].get("approaching_ceiling").is_none());
+        assert!(json["context"].get("ceiling_ratio").is_none());
+        assert_eq!(json["context"]["measurement"], "last_model_request");
+        assert!(
+            json["context"]["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("not a remaining work budget")
         );
     }
 
@@ -8654,7 +8647,7 @@ mod tests {
 
         let status = task_result_json(&task);
         assert_eq!(
-            serde_json::to_value(pressure).unwrap(),
+            pressure.observation_json(),
             status["context"],
             "roster and status projections must publish identical blocks"
         );

@@ -1495,6 +1495,7 @@ impl Session {
                         None,
                         None,
                         self.compact_threshold,
+                        (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
                     );
                     // Turn-boundary event-log drain (see end of user_turn).
                     let log = self.event_log.clone();
@@ -1695,6 +1696,7 @@ impl Session {
                 &self.total_usage,
                 self.turns,
                 self.compact_threshold,
+                (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
             );
         } else {
             self.emitter.result(
@@ -1704,6 +1706,7 @@ impl Session {
                 None,
                 suspicious.then_some(&turn_end),
                 self.compact_threshold,
+                (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
             );
         }
         // Drain the sidecar event-log writer at the turn boundary — bounds

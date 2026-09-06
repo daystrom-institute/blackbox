@@ -833,20 +833,10 @@ pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
                 out.push(TranscriptItem::CompactBoundary { trigger });
             }
             "result" => {
-                let usage = e.get("usage");
-                let input_tokens = usage.and_then(|u| {
-                    let raw = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let cache_read = u
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let cache_create = u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let total = raw + cache_read + cache_create;
-                    if total > 0 { Some(total) } else { None }
-                });
+                // `usage` is cumulative across model steps and resumes. It
+                // cannot be used as context occupancy, even as a fallback
+                // for older producers that lack this measurement.
+                let input_tokens = e.get("last_turn_input_tokens").and_then(Value::as_u64);
                 let compaction_threshold = e.get("compaction_threshold").and_then(|v| v.as_u64());
                 out.push(TranscriptItem::TurnFooter {
                     num_turns: e.get("num_turns").and_then(|n| n.as_u64()),
@@ -2441,6 +2431,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn context_footer_never_uses_cumulative_usage_as_occupancy() {
+        for subtype in ["success", "interrupted"] {
+            let mut event = serde_json::json!({
+                "type": "result", "subtype": subtype,
+                "usage": {"input_tokens": 1_000_000, "cache_read_input_tokens": 9_000_000},
+                "last_turn_input_tokens": 50_000,
+                "compaction_threshold": 204_000,
+            });
+            assert!(matches!(
+                parse_transcript(&[event.clone()])[0],
+                TranscriptItem::TurnFooter {
+                    input_tokens: Some(50_000),
+                    compaction_threshold: Some(204_000),
+                    ..
+                }
+            ));
+            event
+                .as_object_mut()
+                .unwrap()
+                .remove("last_turn_input_tokens");
+            assert!(matches!(
+                parse_transcript(&[event])[0],
+                TranscriptItem::TurnFooter {
+                    input_tokens: None,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

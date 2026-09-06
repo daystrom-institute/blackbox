@@ -77,6 +77,46 @@ pub struct Brofile {
     pub service_tier: Option<String>,
 }
 
+/// Bounded discovery view. Full persona and dispatch policy belong to `get`.
+pub fn list_summary_page(
+    mut brofiles: Vec<Brofile>,
+    provider: Option<Provider>,
+    name: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> serde_json::Value {
+    brofiles.retain(|bf| {
+        provider.is_none_or(|provider| bf.provider == provider)
+            && name.is_none_or(|name| bf.name.contains(name))
+    });
+    brofiles.sort_by(|a, b| a.name.cmp(&b.name));
+    let total = brofiles.len();
+    let limit = limit.clamp(1, 100);
+    let rows: Vec<_> = brofiles
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|bf| {
+            serde_json::json!({
+                "name": bf.name,
+                "provider": bf.provider,
+                "account": bf.account,
+                "model": bf.model,
+                "effort": bf.effort,
+                "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
+            })
+        })
+        .collect();
+    let next = offset.saturating_add(rows.len());
+    serde_json::json!({
+        "brofiles": rows,
+        "total": total,
+        "offset": offset,
+        "next_offset": (next < total).then_some(next),
+        "detail_hint": "Use action=get with name for the full lens and dispatch configuration.",
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Context-assembly policy
 // ---------------------------------------------------------------------------
@@ -711,6 +751,37 @@ fn resolve_provider_env_for_locality(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn summary_pages_filter_before_paging_and_elide_large_dispatch_content() {
+        let make = |name: &str, provider: &str| -> Brofile {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "provider": provider,
+                "lens": "persona ".repeat(20_000),
+                "filters": {"allow": ["tool_".repeat(20_000)]},
+                "tool_defaults": {"key": "value".repeat(20_000)},
+            }))
+            .unwrap()
+        };
+        let rows = vec![make("c", "brodex"), make("b", "glm"), make("a", "brodex")];
+        let first = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 0, 1);
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["brofiles"][0]["name"], "a");
+        assert_eq!(first["next_offset"], 1);
+        assert!(serde_json::to_string(&first).unwrap().len() < 1000);
+        for field in ["lens", "filters", "tool_defaults"] {
+            assert!(first["brofiles"][0].get(field).is_none());
+        }
+        let second = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 1, 1);
+        assert_eq!(second["brofiles"][0]["name"], "c");
+        assert!(second["next_offset"].is_null());
+        let beyond = list_summary_page(rows.clone(), None, None, usize::MAX, 0);
+        assert_eq!(beyond["brofiles"], serde_json::json!([]));
+        assert!(beyond["next_offset"].is_null());
+        let named = list_summary_page(rows, None, Some("b"), 0, 20);
+        assert_eq!(named["total"], 1);
+        assert_eq!(named["brofiles"][0]["name"], "b");
+    }
 
     fn temp_store() -> TempDir {
         tempfile::tempdir().unwrap()

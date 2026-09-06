@@ -1331,14 +1331,27 @@ fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
 /// emit it yet — the caller shows the token count alone in that case.
 fn last_focused_token_info(app: &App, idx: usize) -> Option<(u64, Option<u64>)> {
     let items = focused_transcript_items(app, idx);
-    items.iter().rev().find_map(|item| match item {
-        TranscriptItem::TurnFooter {
-            input_tokens,
-            compaction_threshold,
-            ..
-        } => input_tokens.map(|tok| (tok, *compaction_threshold)),
-        _ => None,
-    })
+    last_token_info(&items)
+}
+
+fn last_token_info(items: &[TranscriptItem]) -> Option<(u64, Option<u64>)> {
+    items
+        .iter()
+        .rev()
+        .find(|item| {
+            matches!(
+                item,
+                TranscriptItem::TurnFooter { .. } | TranscriptItem::CompactBoundary { .. }
+            )
+        })
+        .and_then(|item| match item {
+            TranscriptItem::TurnFooter {
+                input_tokens,
+                compaction_threshold,
+                ..
+            } => input_tokens.map(|tok| (tok, *compaction_threshold)),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5314,9 +5327,9 @@ fn format_token_readout(tokens: u64, threshold: Option<u64>) -> String {
     match threshold {
         Some(t) if t > 0 => {
             let pct = ((tokens as f64 / t as f64) * 100.0).round() as u64;
-            format!("{tok} tok ({pct}%)")
+            format!("last prompt {tok} tok ({pct}% of auto-compact)")
         }
-        _ => format!("{tok} tok"),
+        _ => format!("last prompt {tok} tok"),
     }
 }
 

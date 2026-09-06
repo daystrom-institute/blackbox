@@ -119,19 +119,15 @@ verify shapes against code, but do not violate these without explicit design.
 
 ## Composer footer token readout
 
-- The zoomed-in composer footer shows a context-token readout after the
-  thread name: `my-thread  225k tok (50%)`. It reads `TurnFooter.input_tokens`
-  and `TurnFooter.compaction_threshold` from the file-tailed session event log
-  (`last_focused_token_info`).
-- Token data only exists after a turn completes (the harness emits both
-  fields on the `result` event). A fresh dispatch with no completed turn
-  shows nothing.
-- `compaction_threshold` is optional — older harness builds that predate the
-  field emission still show the bare token count (`225k tok`) without the
-  percentage. Never duplicate the harness compaction-policy lookup table in
-  the cockpit; the percentage gap during a harness upgrade is self-healing.
-- If this readout is missing data the TUI needs, add an emit lever in
-  bro-harness — never reconstruct it cockpit-side.
+- The zoomed composer footer labels the last measured prompt size and its
+  fraction of the auto-compaction threshold. This is a request observation,
+  not remaining session work capacity. Compaction can reclaim context.
+- Read `TurnFooter.input_tokens` from `result.last_turn_input_tokens`, never
+  cumulative usage. Older logs without a measurement show no estimate.
+- A compaction boundary invalidates the previous footer measurement until
+  another result arrives. Never carry a pre-compaction reading across it.
+- The harness owns `compaction_threshold`; never duplicate its model table
+  in the cockpit. Missing thresholds show only the measured prompt size.
 
 ## Validation
 

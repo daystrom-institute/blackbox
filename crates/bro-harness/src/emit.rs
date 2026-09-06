@@ -303,12 +303,9 @@ impl Emitter {
     /// Per-step context-window pressure: how much of the model's window the
     /// prompt just processed occupied.
     ///
-    /// Emitted after every model step, not only at session termination. The
-    /// terminal `result` event is far too late for the consumer that needs
-    /// this signal: an orchestrator would learn the session was near its
-    /// ceiling only once the session was over, which is precisely the failure
-    /// this exists to prevent. Consumers get a warning every step instead, and
-    /// can rotate to a fresh session while the current one still answers.
+    /// Emitted after every model step so consumers can report last-request
+    /// occupancy. Compaction can reclaim context; this is not a work budget
+    /// or an instruction to rotate the session.
     ///
     /// `last_turn_input_tokens` is cache-INCLUSIVE
     /// (`Usage::total_input_tokens`), because cached prompt tokens still
@@ -352,6 +349,10 @@ impl Emitter {
     /// suspicious (empty-output stop, outstanding async work) — the session
     /// still ends `subtype: success`, but orchestrators can see the
     /// deliverable may be missing instead of trusting `result` blindly.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The result envelope carries separate usage and context measurements"
+    )]
     pub fn result(
         &self,
         text: &str,
@@ -360,6 +361,7 @@ impl Emitter {
         cost_usd: Option<f64>,
         suspicious_turn_end: Option<&Value>,
         compaction_threshold: Option<u64>,
+        last_turn_input_tokens: Option<u64>,
     ) {
         // Emit the Anthropic-native usage shape (fresh `input_tokens` plus
         // `cache_read_input_tokens` / `cache_creation_input_tokens`) so the
@@ -387,6 +389,9 @@ impl Emitter {
         if let Some(t) = compaction_threshold {
             v["compaction_threshold"] = json!(t);
         }
+        if let Some(tokens) = last_turn_input_tokens {
+            v["last_turn_input_tokens"] = json!(tokens);
+        }
         self.write_line(v);
     }
 
@@ -400,6 +405,7 @@ impl Emitter {
         usage: &Usage,
         num_turns: u64,
         compaction_threshold: Option<u64>,
+        last_turn_input_tokens: Option<u64>,
     ) {
         let mut v = json!({
             "type": "result",
@@ -417,6 +423,9 @@ impl Emitter {
         });
         if let Some(t) = compaction_threshold {
             v["compaction_threshold"] = json!(t);
+        }
+        if let Some(tokens) = last_turn_input_tokens {
+            v["last_turn_input_tokens"] = json!(tokens);
         }
         self.write_line(v);
     }
@@ -451,6 +460,28 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn terminal_events_separate_prompt_occupancy_from_session_usage() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| captured.lock().unwrap().push(event))
+        };
+        let emitter = Emitter::with_callback("isolated-context-test".into(), sink);
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 9_000_000,
+            ..Usage::default()
+        };
+        emitter.result("done", &usage, 10, None, None, Some(204_000), Some(50_000));
+        emitter.result_interrupted("partial", &usage, 10, Some(204_000), Some(50_000));
+        for event in captured.lock().unwrap().iter() {
+            assert_eq!(event["last_turn_input_tokens"], 50_000);
+            assert_eq!(event["usage"]["input_tokens"], 1_000_000);
+            assert_eq!(event["usage"]["cache_read_input_tokens"], 9_000_000);
+        }
+    }
+
+    #[test]
     fn callback_emitter_captures_protocol_events_in_process() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sink = {
@@ -462,7 +493,7 @@ mod tests {
         let emitter = Emitter::with_callback("session-1".into(), sink);
 
         emitter.system_init();
-        emitter.result("done", &Usage::default(), 1, None, None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None, None);
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 2);
@@ -631,7 +662,7 @@ mod tests {
         };
         let emitter = Emitter::with_callback("session-int".into(), sink);
 
-        emitter.result_interrupted("partial answer", &Usage::default(), 0, None);
+        emitter.result_interrupted("partial answer", &Usage::default(), 0, None, None);
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -660,7 +691,7 @@ mod tests {
 
         emitter.system_init();
         emitter.assistant_message(vec![json!({"type": "text", "text": "hi"})], None, None);
-        emitter.result("done", &Usage::default(), 1, None, None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None, None);
 
         let events = captured.lock().unwrap();
         let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
@@ -712,7 +743,7 @@ mod tests {
             Emitter::with_callback("session-resumed".into(), sink).with_seq_counter(seeded);
 
         emitter.system_init();
-        emitter.result("done", &Usage::default(), 1, None, None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None, None);
 
         let events = captured.lock().unwrap();
         let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
@@ -739,7 +770,7 @@ mod tests {
 
         loop_emitter.system_init();
         ctrl_emitter.control_response_success(Some("req-1"));
-        loop_emitter.result("done", &Usage::default(), 1, None, None, None);
+        loop_emitter.result("done", &Usage::default(), 1, None, None, None, None);
 
         let events = captured.lock().unwrap();
         let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
@@ -760,7 +791,7 @@ mod tests {
         // seq values are a (gapped) subsequence of the stdout stream's, not
         // a separately-numbered sequence.
         emitter.stream_event(json!({"type": "content_block_delta"}));
-        emitter.result("done", &Usage::default(), 1, None, None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None, None);
 
         log.flush_blocking();
         let lines: Vec<Value> = std::fs::read_to_string(log.path())

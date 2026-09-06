@@ -10,6 +10,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Agent context status reports last-request occupancy without a session
+  rotation alarm. Fleet context readouts use the last measured prompt size
+  instead of cumulative session usage; older logs without that measurement
+  show no context estimate.
+
 - Runaway embedding re-embeds across code-source snapshot re-mints
   (gap-a7d80bb2): `project_file_v2`/`symbol_v2` entity ids embed the snapshot
   id, so every generation activation re-minted every chunk's identity and the
@@ -28,7 +33,19 @@ out explicitly under `Changed` or `Removed`.
   planned, recorded, and published overlay states already agree; durability
   (publication verification) is checked separately from currency.
 
+### Changed
+
+- `bro_brofile(action="list")` returns paginated summaries with `brofiles`,
+  `total`, `offset`, and `next_offset`, omitting lenses and dispatch policy.
+  Use `action="get"` with `name` for the complete configuration.
+- `bro_providers()` returns provider summaries. Pass `provider="brodex"`
+  (or another provider id) for its model and effort catalog.
+
 ### Added
+
+- Brodex accepts `gpt-6-astra`, with reasoning levels from `low` through
+  `ultra`, default effort `medium`, and a 272,000-token default context
+  window. The existing default model remains `gpt-5.6-sol`.
 
 - Code-source pre-upload currency probe: the collector now POSTs its scanned
   descriptor to `internal/code-source/v1/probe` before beginning an upload

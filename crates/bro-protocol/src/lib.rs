@@ -196,11 +196,9 @@ pub struct RosterSummaryV1 {
 
 /// Per-session context-window pressure.
 ///
-/// A long-lived session dies when the prompt it sends crosses the model's
-/// context window, and that failure is terminal rather than degraded: the
-/// provider rejects the request outright ("context window exceeded ... compact
-/// the conversation and retry"). Orchestrators need to see the wall coming
-/// while the session still answers, so they can rotate to a fresh one.
+/// Occupancy describes the last model request, not a session work budget.
+/// The harness can compact and continue in the same session. A high reading
+/// alone is not a reason to stop dispatching work or rotate the session.
 ///
 /// The measure of occupancy is the input-token count of the MOST RECENT turn,
 /// cache-inclusive: that is literally how many tokens the model had to hold to
@@ -235,10 +233,20 @@ pub struct ContextPressure {
 }
 
 impl ContextPressure {
-    /// Fraction of the window at which a session is called "approaching the
-    /// ceiling". Deliberately below the harness compaction trigger: the point
-    /// is to give an orchestrator room to rotate, not to describe an
-    /// already-lost session.
+    /// Agent-facing observation without the legacy rotation alarm. Keep the
+    /// raw DTO compatible with existing roster consumers.
+    pub fn observation_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "last_turn_input_tokens": self.last_turn_input_tokens,
+            "context_window": self.context_window,
+            "utilization": self.utilization,
+            "measurement": "last_model_request",
+            "guidance": "Context occupancy is not a remaining work budget. Compaction can reclaim context within this session; do not stop assigning work or rotate solely because occupancy is high. Check task status and reported blockers.",
+        })
+    }
+
+    /// Legacy roster threshold retained for wire compatibility. The agent
+    /// observation does not expose this as a scheduling or rotation signal.
     pub const DEFAULT_CEILING_RATIO: f64 = 0.8;
 
     /// Derive the pressure signal from a turn's input-token count and the
