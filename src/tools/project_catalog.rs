@@ -888,7 +888,7 @@ fn publisher_connector_summary(full: &serde_json::Value) -> serde_json::Value {
         });
         let degradation = file_source
             .get("last_cursor_degradation")
-            .and_then(|degradation| {
+            .map(|degradation| {
                 let bounded = |field: &str| {
                     degradation
                         .get(field)
@@ -5389,7 +5389,8 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert!(
             rendered.len() <= 4096,
-            "the compact default must stay inside the body-page budget: {rendered.len()}"
+            "the compact default must stay inside the body-page budget: {}",
+            rendered.len()
         );
 
         assert_eq!(body["accepted_state"], "current");
@@ -5494,6 +5495,8 @@ mod tests {
     /// changed body refuses an old cursor.
     #[tokio::test]
     async fn publisher_status_health_detail_is_exact_and_content_bound() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
         let (fixture, _scope, _installed) = publisher_health_fixture("p_status_detail", 12);
         let server = fixture.server();
 
@@ -5585,6 +5588,7 @@ mod tests {
     /// refuses continuation.
     #[tokio::test]
     async fn publisher_status_connector_detail_is_exact_and_content_bound() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
         use bbox_corpus_core::project_catalog::{
             ConnectorObservationsV1, ConnectorScope, CorpusProject,
         };
@@ -5657,7 +5661,7 @@ mod tests {
             logical_bytes: 30,
         };
         let mut skipped = std::collections::BTreeMap::new();
-        for reason in 0..32u32 {
+        for reason in 0..32u64 {
             skipped.insert(
                 format!("skip-reason-{reason:02}-{}", "r".repeat(40)),
                 reason + 1,
@@ -5735,7 +5739,8 @@ mod tests {
         let rendered = error_text(&result);
         assert!(
             rendered.len() <= 4096,
-            "the connector summary must stay compact: {rendered.len()}"
+            "the connector summary must stay compact: {}",
+            rendered.len()
         );
         let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let file_source = &body["connector"]["file_source"];
@@ -5869,19 +5874,21 @@ mod tests {
                 available: vec!["repo_knowledge"],
             })
             .collect::<Vec<_>>();
-        let overlay =
-            |checkout: char, outcome: &str, generation: Option<&str>, diagnostics: usize| {
-                CheckoutOverlayView {
-                    checkout_id: checkout.to_string(),
-                    lane: "knowledge",
-                    published_scope: published_scope.clone(),
-                    outcome: outcome.into(),
-                    accepted_generation: generation.map(str::to_owned),
-                    diagnostics: (0..diagnostics)
-                        .map(|index| format!("diagnostic-{index}"))
-                        .collect(),
-                }
-            };
+        let overlay = |checkout: char,
+                       outcome: &'static str,
+                       generation: Option<&str>,
+                       diagnostics: usize| {
+            CheckoutOverlayView {
+                checkout_id: checkout.to_string(),
+                lane: "knowledge",
+                published_scope: published_scope.clone(),
+                outcome: outcome.into(),
+                accepted_generation: generation.map(str::to_owned),
+                diagnostics: (0..diagnostics)
+                    .map(|index| format!("diagnostic-{index}"))
+                    .collect(),
+            }
+        };
         let overlays = vec![
             overlay('b', "unavailable", Some("old"), 1),
             overlay('a', "fresh", Some("new"), 0),

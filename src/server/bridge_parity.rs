@@ -1235,6 +1235,7 @@ mod harness {
             .bbox_project_publisher_status(Parameters(
                 crate::tools::project_catalog::ProjectPublisherStatusParams {
                     project_id: "p_00000000000000000000000000000000".into(),
+                    ..Default::default()
                 },
             ))
             .await;
