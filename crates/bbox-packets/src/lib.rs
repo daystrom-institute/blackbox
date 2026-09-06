@@ -617,6 +617,24 @@ fn packet_value_row(value: &ast::Value, detail: bool) -> serde_json::Value {
     row
 }
 
+fn bounded_result_row(mut row: serde_json::Value) -> serde_json::Value {
+    let mut compacted = false;
+    if let Some(fields) = row.as_object_mut() {
+        for value in fields.values_mut() {
+            if serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 2048) {
+                *value = json_preview(value, false);
+                compacted = true;
+            }
+        }
+        if compacted {
+            fields.insert("detail_limited".into(), true.into());
+            fields.insert("exact_reader".into(), serde_json::json!(
+                "repeat this read with the same packet/input and result_body_limit=4096; continue result_cursor=body.next_cursor"));
+        }
+    }
+    row
+}
+
 fn finding_row(finding: &Prediction, detail: bool) -> serde_json::Value {
     let mut row = serde_json::json!({
         "rule_id": finding.rule_id,
@@ -628,7 +646,7 @@ fn finding_row(finding: &Prediction, detail: bool) -> serde_json::Value {
     } else {
         row["consequent_preview"] = packet_value_row(&finding.consequent, false);
     }
-    row
+    bounded_result_row(row)
 }
 
 fn json_preview(value: &serde_json::Value, detail: bool) -> serde_json::Value {
@@ -660,17 +678,17 @@ fn string_list_preview(values: Option<&[String]>, detail: bool) -> serde_json::V
 }
 
 fn first_mismatch_row(mismatch: &Mismatch, detail: bool) -> serde_json::Value {
-    serde_json::json!({
+    bounded_result_row(serde_json::json!({
         "dataset_index": mismatch.dataset_index,
         "entity_preview": json_preview(&mismatch.entity, detail),
         "expected": packet_value_row(&mismatch.expected, detail),
         "predicted": mismatch.predicted.as_ref().map(|value| packet_value_row(value, detail)),
         "rule_id": mismatch.rule_id,
-    })
+    }))
 }
 
 fn all_mismatch_row(mismatch: &AllModeMismatch, detail: bool) -> serde_json::Value {
-    serde_json::json!({
+    bounded_result_row(serde_json::json!({
         "dataset_index": mismatch.dataset_index,
         "entity_preview": json_preview(&mismatch.entity, detail),
         "check": mismatch.check,
@@ -678,7 +696,7 @@ fn all_mismatch_row(mismatch: &AllModeMismatch, detail: bool) -> serde_json::Val
         "actual_verdict": mismatch.actual_verdict,
         "expected_rule_ids": string_list_preview(mismatch.expected_rule_ids.as_deref(), detail),
         "actual_rule_ids": string_list_preview(mismatch.actual_rule_ids.as_deref(), detail),
-    })
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -1635,6 +1653,65 @@ impl Packets {
 
     // ── bbox_apply ─────────────────────────────────────────────────
 
+    /// Exact deterministic result read. Does not append another observation event.
+    pub fn apply_result_body(
+        &self,
+        p: &ApplyParams,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<String> {
+        validate_apply_entity(&p.entity)?;
+        let packet = self.load(&p.packet_id)?;
+        let mut entity = p.entity.clone();
+        unwrap_jsonish(&mut entity);
+        let prediction_value = |prediction: Prediction| {
+            serde_json::json!({
+            "rule_id":prediction.rule_id, "classification":prediction.classification,
+            "consequent":prediction.consequent.to_json(), "confidence":prediction.confidence})
+        };
+        let value = match p.mode.unwrap_or_default() {
+            ApplyMode::First => {
+                serde_json::json!({"prediction":apply_with(&packet, &entity, self).map(prediction_value)})
+            }
+            ApplyMode::All => {
+                let result = apply_all_with(&packet, &entity, self);
+                serde_json::json!({"verdict":result.verdict,
+                    "findings":result.findings.into_iter().map(prediction_value).collect::<Vec<_>>()})
+            }
+        };
+        let body = bbox_corpus_core::response_page::json_body_page(
+            &format!("packet-apply:{}", serde_json::to_string(p)?),
+            &value,
+            cursor,
+            limit,
+        )?;
+        Ok(serde_json::json!({"body":body, "observation_event":"not_requested"}).to_string())
+    }
+
+    /// Exact deterministic audit read, including complete mismatch values.
+    pub fn audit_result_body(
+        &self,
+        p: &AuditParams,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<String> {
+        validate_audit_dataset(&p.dataset)?;
+        let packet = self.load(&p.packet_id)?;
+        let mut dataset = p.dataset.clone();
+        unwrap_jsonish(&mut dataset);
+        let value = match p.mode.unwrap_or_default() {
+            ApplyMode::First => serde_json::to_value(verify_with(&packet, &dataset, self)?)?,
+            ApplyMode::All => serde_json::to_value(verify_all_with(&packet, &dataset, self)?)?,
+        };
+        let body = bbox_corpus_core::response_page::json_body_page(
+            &format!("packet-audit:{}", serde_json::to_string(p)?),
+            &value,
+            cursor,
+            limit,
+        )?;
+        Ok(serde_json::json!({"body":body, "observation_event":"not_requested"}).to_string())
+    }
+
     pub fn apply_tool(&self, p: &ApplyParams) -> Result<String> {
         self.apply_tool_paged(p, 0, MAX_PACKET_RESULT_ROWS, false)
     }
@@ -1677,16 +1754,18 @@ impl Packets {
                                 "classification": prediction.classification,
                             })),
                     );
-                    Ok(serde_json::to_string(&serde_json::json!({
-                        "packet_id": packet.id,
-                        "mode": mode,
-                        "match": true,
-                        "rule_id": prediction.rule_id,
-                        "classification": prediction.classification,
-                        "consequent": prediction.consequent.to_json(),
-                        "confidence": prediction.confidence,
-                        "observation_event": "written",
-                    }))?)
+                    Ok(serde_json::to_string(&bounded_result_row(
+                        serde_json::json!({
+                            "packet_id": packet.id,
+                            "mode": mode,
+                            "match": true,
+                            "rule_id": prediction.rule_id,
+                            "classification": prediction.classification,
+                            "consequent": prediction.consequent.to_json(),
+                            "confidence": prediction.confidence,
+                            "observation_event": "written",
+                        }),
+                    ))?)
                 }
                 None => {
                     self.append_event(
@@ -1695,14 +1774,16 @@ impl Packets {
                             .with_domain(packet.domain.clone())
                             .with_details(serde_json::json!({"mode": "first"})),
                     );
-                    Ok(serde_json::to_string(&serde_json::json!({
-                        "packet_id": packet.id,
-                        "mode": mode,
-                        "match": false,
-                        "consequent": serde_json::Value::Null,
-                        "note": "no rule's antecedent matched the entity",
-                        "observation_event": "written",
-                    }))?)
+                    Ok(serde_json::to_string(&bounded_result_row(
+                        serde_json::json!({
+                            "packet_id": packet.id,
+                            "mode": mode,
+                            "match": false,
+                            "consequent": serde_json::Value::Null,
+                            "note": "no rule's antecedent matched the entity",
+                            "observation_event": "written",
+                        }),
+                    ))?)
                 }
             },
             ApplyMode::All => {
@@ -1753,6 +1834,12 @@ impl Packets {
                 });
                 page["offset"] = serde_json::json!(finding_offset);
                 page["total"] = serde_json::json!(total);
+                if serde_json::to_vec(&page["verdict"])?.len() > 2048 {
+                    page["verdict"] = json_preview(&page["verdict"], false);
+                }
+                page["result_reader"] = serde_json::json!(
+                    "same packet/input with result_body_limit=4096; continue result_cursor=body.next_cursor"
+                );
                 page = bbox_corpus_core::response_page::bound_page(page, "findings")?;
                 let bounded_next_offset =
                     page["next_offset"].as_u64().unwrap_or(next_offset as u64);

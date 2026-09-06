@@ -20,9 +20,16 @@ pub(crate) struct PacketApplyToolParams {
     /// Maximum mode=all findings per page (default 100, maximum 100).
     #[serde(default)]
     pub finding_limit: Option<usize>,
-    /// Include complete finding consequents instead of bounded previews.
+    /// Expand small finding consequents; oversized values use exact result pages.
     #[serde(default)]
     pub finding_detail: bool,
+    /// Exact complete result, without adding another observation event. Re-evaluates
+    /// the same input; changed input or result refuses continuation.
+    #[serde(default)]
+    pub result_cursor: Option<String>,
+    /// Select exact JSON result pages (default/max 4096 bytes).
+    #[serde(default)]
+    pub result_body_limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -35,9 +42,16 @@ pub(crate) struct PacketAuditToolParams {
     /// Maximum mismatches per page (default 100, maximum 100).
     #[serde(default)]
     pub mismatch_limit: Option<usize>,
-    /// Include complete mismatch values instead of bounded previews.
+    /// Expand small mismatch values; oversized values use exact result pages.
     #[serde(default)]
     pub mismatch_detail: bool,
+    /// Exact complete result, without adding another observation event. Re-evaluates
+    /// the same input; changed input or result refuses continuation.
+    #[serde(default)]
+    pub result_cursor: Option<String>,
+    /// Select exact JSON result pages (default/max 4096 bytes).
+    #[serde(default)]
+    pub result_body_limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -158,6 +172,12 @@ impl BlackboxServer {
         // apply_tool loads the packet from disk and appends apply events.
         let server = self.clone();
         Self::run_blocking("bbox_apply", move || {
+            if p.result_cursor.is_some() || p.result_body_limit.is_some() {
+                anyhow::ensure!(p.finding_offset.is_none() && p.finding_limit.is_none() && !p.finding_detail,
+                    "exact result pages use result_cursor/result_body_limit; omit row paging and detail");
+                return server.state.packets.read().apply_result_body(
+                    &p.packet, p.result_cursor.as_deref(), p.result_body_limit);
+            }
             server.state.packets.read().apply_tool_paged(
                 &p.packet,
                 p.finding_offset.unwrap_or(0),
@@ -180,6 +200,12 @@ impl BlackboxServer {
         // audit_tool loads the packet from disk and appends audit events.
         let server = self.clone();
         Self::run_blocking("bbox_audit", move || {
+            if p.result_cursor.is_some() || p.result_body_limit.is_some() {
+                anyhow::ensure!(p.mismatch_offset.is_none() && p.mismatch_limit.is_none() && !p.mismatch_detail,
+                    "exact result pages use result_cursor/result_body_limit; omit row paging and detail");
+                return server.state.packets.read().audit_result_body(
+                    &p.packet, p.result_cursor.as_deref(), p.result_body_limit);
+            }
             server.state.packets.read().audit_tool_paged(
                 &p.packet,
                 p.mismatch_offset.unwrap_or(0),
@@ -286,6 +312,67 @@ impl BlackboxServer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn large_first_consequent_and_audit_values_have_exact_result_pages() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&root),
+        ));
+        let expected = "large \"界\n".repeat(2500);
+        let params: CompileParams = serde_json::from_value(json!({"domain":"result-fixture", "scope":"global",
+            "rules":[{"id":"match", "classification":"pass", "antecedent":{"op":"True"}, "consequent":expected}]})).unwrap();
+        server.state.packets.read().compile(&params).unwrap();
+        let id = server.state.packets.read().list_all().unwrap().remove(0).id;
+        let ordinary = server
+            .bbox_apply(Parameters(
+                serde_json::from_value(json!({"packet_id":id, "entity":{}})).unwrap(),
+            ))
+            .await;
+        assert_ne!(ordinary.is_error, Some(true));
+        assert!(serde_json::to_vec(&ordinary).unwrap().len() < 4096);
+        let mut cursor = None;
+        let mut text = String::new();
+        loop {
+            let response = server
+                .bbox_apply(Parameters(
+                    serde_json::from_value(json!({"packet_id":id, "entity":{},
+                "result_body_limit":1024, "result_cursor":cursor}))
+                    .unwrap(),
+                ))
+                .await;
+            assert_ne!(response.is_error, Some(true));
+            assert!(serde_json::to_vec(&response).unwrap().len() < 8192);
+            let page: Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(page["observation_event"], "not_requested");
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let result: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["prediction"]["consequent"], expected);
+        let audit = server.bbox_audit(Parameters(serde_json::from_value(json!({"packet_id":id,
+            "dataset":[{"entity":{"large":expected},"expected":"different"}], "mismatch_detail":true})).unwrap())).await;
+        assert_ne!(audit.is_error, Some(true));
+        assert!(serde_json::to_vec(&audit).unwrap().len() < 8192);
+        let args = json!({"packet_id":id,"dataset":[{"entity":{},"expected":"different"}],"result_body_limit":512});
+        let first = server
+            .bbox_audit(Parameters(serde_json::from_value(args.clone()).unwrap()))
+            .await;
+        let page: Value = serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        let mut changed = args;
+        changed["result_cursor"] = page["body"]["next_cursor"].clone();
+        assert!(changed["result_cursor"].is_string());
+        changed["dataset"][0]["entity"] = json!({"changed":true});
+        let stale = server
+            .bbox_audit(Parameters(serde_json::from_value(changed).unwrap()))
+            .await;
+        assert_eq!(stale.is_error, Some(true));
+    }
 
     #[tokio::test]
     async fn packet_rules_are_recoverable_through_exact_property_pages() {

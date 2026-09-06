@@ -703,19 +703,19 @@ pub struct McpToolParams {
     /// `?surface=<id>` to the registered URL.
     #[serde(default)]
     pub surface: Option<String>,
-    /// action=list page size: server rows per reply (default 20, max 100).
+    /// action=list page size: server rows per reply (default 20, max 100; bytes may shorten the page).
     #[serde(default)]
     pub limit: Option<usize>,
     /// Continue action=list after the returned next_offset.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// Exact action=get/get_filters only: pass body.next_cursor unchanged. A
+    /// Exact action=list/get/get_filters only: pass body.next_cursor unchanged. A
     /// changed record or selector refuses continuation; restart without
     /// cursor.
     #[serde(default)]
     pub cursor: Option<String>,
-    /// Exact action=get/get_filters JSON body page byte budget; default/max
-    /// 4096, min 4.
+    /// Exact action=list/get/get_filters JSON body page byte budget; default/max
+    /// 4096, min 4. On list, selects the exact redacted inventory including full server names.
     #[serde(default)]
     pub body_limit: Option<usize>,
 }
@@ -739,6 +739,7 @@ pub fn handle(p: &McpToolParams) -> Result<McpToolReply> {
     validate_selection(p)?;
     use McpAction::*;
     match p.action {
+        List if p.body_limit.is_some() || p.cursor.is_some() => action_inventory(p),
         List => action_list(p).map(McpToolReply::Text),
         Get => action_get(p),
         Add => action_add(p).map(McpToolReply::Text),
@@ -761,8 +762,9 @@ fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
         "limit and offset require action=list"
     );
     anyhow::ensure!(
-        matches!(p.action, Get | GetFilters) || (p.cursor.is_none() && p.body_limit.is_none()),
-        "cursor and body_limit require action=get or get_filters"
+        matches!(p.action, List | Get | GetFilters)
+            || (p.cursor.is_none() && p.body_limit.is_none()),
+        "cursor and body_limit require action=list, get, or get_filters"
     );
     anyhow::ensure!(
         matches!(p.action, Add)
@@ -815,6 +817,32 @@ fn resolve_scope_path(p: &McpToolParams) -> Result<PathBuf> {
     }
 }
 
+fn action_inventory(p: &McpToolParams) -> Result<McpToolReply> {
+    anyhow::ensure!(
+        p.limit.is_none() && p.offset.is_none(),
+        "exact list inventory uses cursor/body_limit; omit limit and offset"
+    );
+    let scope = validate_selection(p)?;
+    let path = resolve_scope_path(p)?;
+    let store = McpStore::load(&path)?;
+    let disabled = scope == "project"
+        && crate::config::load_project(Path::new(p.project.as_deref().expect("validated above")))?
+            .mcp
+            .enabled
+            == Some(false);
+    let servers: BTreeMap<_, _> = store
+        .servers
+        .iter()
+        .map(|(name, config)| (name.clone(), config.response_view()))
+        .collect();
+    Ok(McpToolReply::Body {
+        scope,
+        selection: format!("mcp_inventory:{scope}:{}", store_identity(&path)),
+        value: serde_json::json!({"servers": servers, "filters": store.filters,
+            "contributes_to_dispatch": !disabled}),
+    })
+}
+
 fn action_list(p: &McpToolParams) -> Result<String> {
     let scope = validate_selection(p)?;
     let eff = match scope {
@@ -844,7 +872,7 @@ fn action_list(p: &McpToolParams) -> Result<String> {
     ))
 }
 
-const FILTER_DISPLAY_LIMIT: usize = 100;
+const FILTER_DISPLAY_LIMIT: usize = 8;
 
 /// Bound an echoed identity string (server name, filter pattern). Exact
 /// values stay recoverable through the paged detail reads (get, get_filters);
@@ -865,7 +893,7 @@ fn bounded_echo(text: &str) -> String {
 fn render_server_list(
     eff: &EffectiveMcp,
     scope: &str,
-    project: Option<&str>,
+    _project: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> String {
@@ -898,8 +926,9 @@ fn render_server_list(
                     } else {
                         "sse"
                     };
-                    let origin =
-                        endpoint_origin(url).unwrap_or_else(|| "[redacted endpoint]".into());
+                    let origin = bounded_echo(
+                        &endpoint_origin(url).unwrap_or_else(|| "[redacted endpoint]".into()),
+                    );
                     out.push_str(&format!(
                         "  {name}: {transport} {origin} (endpoint details redacted)\n"
                     ));
@@ -913,11 +942,8 @@ fn render_server_list(
             }
         }
         if end < total {
-            let selector = project
-                .map(|project| format!(", project=\"{project}\""))
-                .unwrap_or_default();
             out.push_str(&format!(
-                "Next page: bro_mcp(action=\"list\", scope=\"{scope}\"{selector}, offset={end})\n"
+                "Next page: bro_mcp(action=\"list\", scope=\"{scope}\", offset={end}); preserve the same project selector\n"
             ));
         } else if start > 0 {
             out.push_str("End of server list.\n");
@@ -944,6 +970,12 @@ fn render_server_list(
         }
     }
 
+    out.push_str("\nExact redacted inventory, including full server identities: bro_mcp(action=\"list\", body_limit=4096) in the same scope/project; continue with body.next_cursor.\n");
+    if serde_json::to_vec(&out).map_or(true, |bytes| bytes.len() > 24 * 1024)
+        && limit.clamp(1, 100) > 1
+    {
+        return render_server_list(eff, scope, _project, offset, limit.clamp(1, 100) / 2);
+    }
     out
 }
 
@@ -1231,6 +1263,61 @@ mod tests {
         }
         assert_eq!(endpoint_origin("malformed-secret-endpoint"), None);
         assert_eq!(endpoint_origin("data:text/plain,secret-value"), None);
+    }
+
+    #[test]
+    fn inventory_recovers_full_names_and_bounds_encoded_listing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("fixture");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+        let mut store = McpStore::new();
+        for n in 0..100 {
+            let name = format!("{n:03}-{}", "\u{0001}界".repeat(150));
+            store.servers.insert(
+                name,
+                McpServerConfig::Http {
+                    url: "https://unit.test/secret-path?secret=value".into(),
+                    headers: BTreeMap::from([(
+                        "X-Custom".into(),
+                        SecretString::Plain("fixture-secret".into()),
+                    )]),
+                    exclude_tools: Vec::new(),
+                },
+            );
+        }
+        store.filters.allow = (0..200)
+            .map(|n| format!("{n}:{}", "\u{0001}界".repeat(150)))
+            .collect();
+        store.filters.disallow = store.filters.allow.clone();
+        store.save(&project_store_path(&project)).unwrap();
+        let mut params = list_params(Some("project"), Some(project.to_str().unwrap()), 0);
+        params.limit = Some(100);
+        let listing = action_list(&params).unwrap();
+        assert!(serde_json::to_vec(&listing).unwrap().len() <= 24 * 1024);
+        assert!(listing.contains("body_limit=4096"));
+        let (text, pages) = page_exact_body(&|cursor| {
+            serde_json::from_value(serde_json::json!({
+                "action":"list", "scope":"project", "project":project,
+                "body_limit":4096, "cursor":cursor
+            }))
+            .unwrap()
+        });
+        assert!(pages > 1);
+        assert!(!text.contains("fixture-secret"));
+        assert!(!text.contains("secret-path"));
+        let recovered: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let names: Vec<_> = recovered["servers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(names, store.servers.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            recovered["filters"]["allow"],
+            serde_json::json!(store.filters.allow)
+        );
     }
 
     #[test]
@@ -1915,11 +2002,11 @@ mod tests {
             0,
         ))
         .unwrap();
-        let expected = format!(
-            "Next page: bro_mcp(action=\"list\", scope=\"project\", project=\"{}\", offset=20)",
-            project.to_str().unwrap()
+        assert!(first.contains("scope=\"project\", offset=20"), "{first}");
+        assert!(
+            first.contains("preserve the same project selector"),
+            "{first}"
         );
-        assert!(first.contains(&expected), "{first}\nexpected: {expected}");
         assert!(!first.contains("srv-24"), "{first}");
     }
 

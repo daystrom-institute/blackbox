@@ -34,6 +34,42 @@ pub(crate) fn preview_text(text: &str, max_bytes: usize) -> serde_json::Value {
     })
 }
 
+/// Exact installation metadata, with URL credentials and query strings omitted.
+fn agent_metadata_view(rec: &orchestration::agents::registry::AgentRecord) -> serde_json::Value {
+    let source = reqwest::Url::parse(&rec.source).ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| serde_json::json!({"origin":url.origin().ascii_serialization(), "details_redacted":true}))
+        .unwrap_or_else(|| serde_json::json!(rec.source));
+    serde_json::json!({"name":rec.name, "version":rec.version, "active":rec.active,
+        "retired":rec.retired, "installed_at":rec.installed_at, "source":source,
+        "supersedes":rec.metadata.supersedes, "supersedes_chain":rec.metadata.supersedes_chain,
+        "superseded_by":rec.metadata.superseded_by, "install_warnings":rec.metadata.install_warnings,
+        "manifest_parse_error":rec.manifest_parse_error})
+}
+
+fn compact_agent_plane(value: &serde_json::Value, exact_plane: &str) -> serde_json::Value {
+    let bytes = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    if bytes <= 2048 {
+        return value.clone();
+    }
+    let mut summary = serde_json::json!({"bytes":bytes, "detail_hint":format!(
+        "bro_agent_describe for this agent with detail_plane={exact_plane}; continue body.next_cursor")});
+    if let Some(rows) = value.as_array() {
+        summary["count"] = serde_json::json!(rows.len());
+    }
+    if let Some(fields) = value.as_object() {
+        summary["field_count"] = serde_json::json!(fields.len());
+        for key in ["status", "active", "retired", "rule", "error"] {
+            if let Some(value) = fields.get(key) {
+                if serde_json::to_vec(value).is_ok_and(|value| value.len() <= 256) {
+                    summary[key] = value.clone();
+                }
+            }
+        }
+    }
+    summary
+}
+
 /// Compact manifest identity for summary responses. Exact (redacted) JSON
 /// stays reachable through body pages.
 pub(crate) fn manifest_summary(
@@ -59,7 +95,7 @@ pub(crate) fn manifest_summary(
         "embedding": if manifest.embedding.is_some() { "embedded" } else { "pending" },
     });
     if let Some(name) = &manifest.brofile_ref {
-        summary["brofile_ref"] = serde_json::Value::String(name.clone());
+        summary["brofile_ref"] = preview_text(name, 256);
     }
     if let Some(overlay) = &manifest.filter_overlay {
         summary["filter_overlay"] = serde_json::json!({
@@ -144,43 +180,14 @@ impl BlackboxServer {
         let reg = AgentRegistry::new(&catalog);
         match reg.get(&p.name) {
             Ok(Some(rec)) => {
-                let mut m = serde_json::Map::from_iter([
-                    ("name".into(), serde_json::Value::String(rec.name.clone())),
-                    (
-                        "version".into(),
-                        serde_json::Value::String(rec.version.clone()),
-                    ),
-                    ("active".into(), serde_json::Value::Bool(rec.active)),
-                    (
-                        "installed_at".into(),
-                        serde_json::Value::String(rec.installed_at),
-                    ),
-                    ("source".into(), serde_json::Value::String(rec.source)),
-                ]);
-                if rec.retired {
-                    m.insert("retired".into(), true.into());
+                let mut m = agent_metadata_view(&rec).as_object().unwrap().clone();
+                for (key, value) in &mut m {
+                    if !matches!(key.as_str(), "name" | "version" | "active" | "retired") {
+                        *value = compact_agent_plane(value, "metadata");
+                    }
                 }
-                if let Some(s) = rec.metadata.supersedes {
-                    m.insert("supersedes".into(), serde_json::Value::String(s));
-                }
-                if !rec.metadata.supersedes_chain.is_empty() {
-                    m.insert(
-                        "supersedes_chain".into(),
-                        serde_json::Value::Array(
-                            rec.metadata
-                                .supersedes_chain
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                if let Some(s) = rec.metadata.superseded_by {
-                    m.insert("superseded_by".into(), serde_json::Value::String(s));
-                }
-                if let Some(parse_err) = rec.manifest_parse_error {
-                    m.insert("manifest_parse_error".into(), preview_text(&parse_err, 512));
-                }
+                m.insert("metadata_hint".into(), serde_json::json!(
+                    "bro_agent_describe for this agent with detail_plane=metadata pages exact installation metadata"));
                 if let Some(manifest) = rec.manifest {
                     m.insert("manifest_summary".into(), manifest_summary(&manifest));
                     let stored = match serde_json::to_value(&manifest) {
@@ -360,10 +367,10 @@ impl BlackboxServer {
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::MergedFilters;
         let detail_plane = match p.detail_plane.as_deref() {
-            Some("manifest") | Some("brofile") => p.detail_plane.as_deref(),
+            Some("manifest" | "brofile" | "metadata" | "summary") => p.detail_plane.as_deref(),
             Some(other) => {
                 return Self::err_text(&format!(
-                    "unknown detail_plane: {other} (expected one of: manifest, brofile, or omitted for the compact summary)"
+                    "unknown detail_plane: {other} (expected one of: manifest, brofile, metadata, summary, or omitted for the compact summary)"
                 ));
             }
             None => None,
@@ -375,6 +382,20 @@ impl BlackboxServer {
             Ok(None) => return Self::err_text(&format!("agent not found: {}", p.agent)),
             Err(e) => return Self::err_text(&format!("registry get failed: {e}")),
         };
+        if detail_plane == Some("metadata") {
+            return match super::body_page::json_body_page(
+                &format!("agent-describe:{}@{}:metadata", rec.name, rec.version),
+                &agent_metadata_view(&rec),
+                p.cursor.as_deref(),
+                p.body_limit,
+            ) {
+                Ok(body) => Self::ok_json(&serde_json::json!({"plane":"metadata", "body":body})),
+                Err(error) => Self::err_text(&format!("metadata body page: {error}")),
+            };
+        }
+        if detail_plane.is_none() && (p.cursor.is_some() || p.body_limit.is_some()) {
+            return Self::err_text("cursor and body_limit require detail_plane");
+        }
         let manifest = match rec.manifest {
             Some(m) => m,
             None => {
@@ -646,6 +667,30 @@ impl BlackboxServer {
         }
         if !degraded.is_empty() {
             result.insert("degraded".into(), serde_json::Value::Object(degraded));
+        }
+        if detail_plane == Some("summary") {
+            return match super::body_page::json_body_page(
+                &format!("agent-describe:{}@{}:summary", rec.name, rec.version),
+                &Self::redact_config_credentials(&serde_json::json!(result)),
+                p.cursor.as_deref(),
+                p.body_limit,
+            ) {
+                Ok(body) => Self::ok_json(&serde_json::json!({"plane":"summary", "body":body})),
+                Err(error) => Self::err_text(&format!("summary body page: {error}")),
+            };
+        }
+        if let Some(planes) = result
+            .get_mut("planes")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for value in planes.values_mut() {
+                *value = compact_agent_plane(value, "summary");
+            }
+        }
+        for key in ["warnings", "install_warnings"] {
+            if let Some(value) = result.get_mut(key) {
+                *value = compact_agent_plane(value, "summary");
+            }
         }
         Self::ok_json(&serde_json::Value::Object(result))
     }
@@ -3236,6 +3281,81 @@ mod tests {
         assert!(wire.contains("free text mentioning token"));
         assert!(wire.contains("error: auth failed"));
         assert_eq!(redacted["config"]["flags"][0], "--verbose");
+    }
+
+    #[test]
+    fn agent_summary_pages_large_filters_and_metadata_without_losing_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let filters: Vec<_> = (0..800)
+            .map(|n| format!("tool_{n:04}_{}", "界".repeat(12)))
+            .collect();
+        server.state.artifacts.read().install_value(
+            artifacts::ArtifactKind::Agent, "large-summary.json".into(),
+            &serde_json::json!({"kind":"agent", "name":"large-summary", "version":1,
+                "manifest":{"description":"synthetic", "brofile_inline":{"provider":"glm", "filters":{"allow":filters}},
+                    "filter_overlay":{"allow":filters, "disallow":[]}}}),
+            None, None, None).unwrap();
+        let call = |plane: Option<&str>, cursor: Option<String>| {
+            server.bro_agent_describe(Parameters(AgentDescribeParams {
+                agent: "large-summary".into(),
+                detail_plane: plane.map(str::to_owned),
+                cursor,
+                body_limit: plane.map(|_| 4096),
+            }))
+        };
+        let summary = call(None, None);
+        assert_ne!(summary.is_error, Some(true));
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 16 * 1024);
+        let summary: serde_json::Value = serde_json::from_str(&extract_text(&summary)).unwrap();
+        assert_eq!(summary["planes"]["computed_merge"]["status"], "computed");
+        assert!(summary["planes"]["computed_merge"]["detail_hint"].is_string());
+        let mut cursor = None;
+        let mut text = String::new();
+        loop {
+            let response = call(Some("summary"), cursor);
+            assert_ne!(response.is_error, Some(true));
+            let page: serde_json::Value = serde_json::from_str(&extract_text(&response)).unwrap();
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let full: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            full["planes"]["filter_overlay"]["allow"],
+            serde_json::json!(filters)
+        );
+        assert_eq!(
+            full["planes"]["computed_merge"]["merged"]["allow"],
+            serde_json::json!(filters)
+        );
+        let metadata = call(Some("metadata"), None);
+        assert_ne!(metadata.is_error, Some(true));
+        let record = orchestration::agents::registry::AgentRecord {
+            name: "fixture".into(),
+            version: "1".into(),
+            active: true,
+            retired: false,
+            installed_at: "fixture".into(),
+            source: "https://user:synthetic-secret@unit.test/artifact?token=synthetic-secret"
+                .into(),
+            metadata: orchestration::agents::registry::ArtifactRecordMeta {
+                supersedes: None,
+                supersedes_chain: filters,
+                superseded_by: None,
+                install_warnings: vec![],
+            },
+            manifest: None,
+            manifest_parse_error: None,
+        };
+        let value = agent_metadata_view(&record);
+        assert!(!value.to_string().contains("synthetic-secret"));
+        assert_eq!(value["supersedes_chain"].as_array().unwrap().len(), 800);
+        assert!(
+            compact_agent_plane(&value["supersedes_chain"], "metadata")["detail_hint"].is_string()
+        );
     }
 
     #[test]

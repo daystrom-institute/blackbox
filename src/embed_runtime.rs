@@ -125,6 +125,7 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EmbedPartitionsParams {
     /// "list" (default) reports every partition with its route mapping;
     /// "prune" deletes orphaned partitions older than `older_than_days`;
@@ -139,16 +140,17 @@ pub struct EmbedPartitionsParams {
     #[serde(default)]
     pub older_than_days: Option<u64>,
     /// Prune and scrub are dry-run by default; pass apply=true to delete.
-    /// Ignored by list.
+    /// Rejected by list. Prune apply handles at most eight candidates; select
+    /// one route to narrow a larger inventory before applying.
     #[serde(default)]
     pub apply: bool,
     /// Required for scrub: the mapped partition to sweep for vectors whose
     /// entities now attribute to a different route (e.g. after a bucket
-    /// attribution rule change). Ignored by list and prune.
+    /// attribution rule change). Optional exact route filter for list/prune.
     #[serde(default)]
     pub route: Option<String>,
     /// Partition inventory page size for list and prune. Default 20,
-    /// minimum 1, maximum 100. Ignored by scrub.
+    /// minimum 1, maximum 100. Rejected by scrub and prune apply.
     #[serde(default)]
     pub limit: Option<usize>,
     /// Partitions skipped in route order. The inventory is a live view and
@@ -156,6 +158,13 @@ pub struct EmbedPartitionsParams {
     /// actions.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Exact list/prune preview inventory, including complete route mappings.
+    /// Continue with body.next_cursor; changed evidence or selection refuses.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Select exact JSON inventory pages (default/max 4096 bytes). Not an apply receipt.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
 }
 
 /// A10/A13: validate the closed action vocabulary and per-action fields
@@ -165,6 +174,22 @@ fn validate_partition_params(p: &EmbedPartitionsParams) -> Result<String> {
     if !matches!(action, "list" | "prune" | "scrub") {
         bail!("unknown action `{action}`; expected `list`, `prune`, or `scrub`");
     }
+    if p.route
+        .as_deref()
+        .is_some_and(|route| route.trim().is_empty())
+    {
+        bail!("route must not be blank");
+    }
+    if p.cursor.is_some() || p.body_limit.is_some() {
+        anyhow::ensure!(
+            !p.apply && action != "scrub",
+            "exact inventory pages require list or prune preview"
+        );
+        anyhow::ensure!(
+            p.limit.is_none() && p.offset.is_none(),
+            "exact inventory uses cursor/body_limit; omit limit and offset"
+        );
+    }
     match action {
         "list" => {
             if p.apply {
@@ -173,13 +198,14 @@ fn validate_partition_params(p: &EmbedPartitionsParams) -> Result<String> {
             if p.older_than_days.is_some() {
                 bail!("error.bad_input: older_than_days applies to prune only");
             }
-            if p.route.is_some() {
-                bail!("error.bad_input: route applies to scrub only");
-            }
         }
         "prune" => {
-            if p.route.is_some() {
-                bail!("error.bad_input: route applies to scrub only");
+            let days = p
+                .older_than_days
+                .context("prune requires older_than_days")?;
+            anyhow::ensure!(days <= 365_000, "older_than_days exceeds 1000 years");
+            if p.apply && (p.limit.is_some() || p.offset.is_some()) {
+                bail!("prune apply uses an optional route selector, not inventory pagination");
             }
         }
         "scrub" => {
@@ -321,7 +347,13 @@ fn embed_partitions_scrub(
                     "error": format!("{err:#}"),
                 })),
             }
+            if !errors.is_empty() {
+                break;
+            }
         }
+    }
+    for error in &mut errors {
+        bbox_corpus_core::response_page::preview_field(error, "error", 1024);
     }
     Ok(serde_json::to_string_pretty(&json!({
         "action": "scrub",
@@ -333,6 +365,7 @@ fn embed_partitions_scrub(
         "missing_from_index_kept": missing,
         "foreign_kept": foreign,
         "deleted": deleted,
+        "unattempted_count": if p.apply { mismatched.len() - deleted - errors.len() } else { 0 },
         "errors": errors,
         "mismatched_sample": mismatched.iter().take(10).collect::<Vec<_>>(),
     }))?)
@@ -345,11 +378,14 @@ fn embed_partitions_with(
     now: chrono::DateTime<chrono::Utc>,
     mut remove: impl FnMut(&str) -> Result<bool>,
 ) -> Result<String> {
-    let action = p.action.as_deref().map(str::trim).unwrap_or("list");
-    if !matches!(action, "list" | "prune") {
-        bail!("unknown action `{action}`; expected `list` or `prune`");
+    let action = validate_partition_params(p)?;
+    let infos: Vec<_> = infos
+        .into_iter()
+        .filter(|info| p.route.as_deref().is_none_or(|route| route == info.route))
+        .collect();
+    if p.route.is_some() && infos.is_empty() {
+        bail!("selected partition route was not found");
     }
-
     // Which buckets claim each partition under the CURRENT config —
     // vector_route_id is the join key on both sides.
     #[derive(Clone)]
@@ -402,7 +438,7 @@ fn embed_partitions_with(
             .push(format!("visual:{kind}"));
     }
 
-    let partitions = infos
+    let mut partitions = infos
         .iter()
         .map(|info| {
             let mapping = mapped.get(&info.route);
@@ -424,28 +460,10 @@ fn embed_partitions_with(
         })
         .collect::<Vec<_>>();
 
-    let mut page = bbox_corpus_core::response_page::collection_page(
-        partitions,
-        "partitions",
-        p.limit,
-        p.offset,
-    )?;
-    page["action"] = json!(action);
-    page["continuation"] = json!(
-        "live inventory; the partition set can change between pages; restart at offset 0 after lifecycle actions"
-    );
-
-    if action == "list" {
-        return Ok(serde_json::to_string_pretty(&page)?);
-    }
-
-    let Some(older_than_days) = p.older_than_days else {
-        bail!(
-            "prune requires older_than_days: only partitions unmapped by current route \
-             config AND idle beyond that age are deleted"
-        );
-    };
-    let cutoff = now - chrono::Duration::days(older_than_days as i64);
+    let older_than_days = p.older_than_days.unwrap_or(0);
+    let cutoff = now
+        .checked_sub_signed(chrono::Duration::days(older_than_days as i64))
+        .context("older_than_days is outside the timestamp range")?;
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
     for info in &infos {
@@ -466,6 +484,71 @@ fn embed_partitions_with(
         }
     }
 
+    let candidate_lookup: std::collections::HashSet<_> =
+        candidates.iter().map(String::as_str).collect();
+    for row in &mut partitions {
+        if action == "prune" {
+            row["prune_candidate"] = json!(
+                row["route"]
+                    .as_str()
+                    .is_some_and(|route| candidate_lookup.contains(route))
+            );
+        }
+    }
+    if p.cursor.is_some() || p.body_limit.is_some() {
+        let body = bbox_corpus_core::response_page::json_body_page(
+            &format!(
+                "partition-inventory:{action}:{:?}:{:?}",
+                p.route, p.older_than_days
+            ),
+            &if action == "prune" {
+                json!({"partitions":partitions, "prune_candidates":candidates, "skipped":skipped})
+            } else {
+                json!({"partitions":partitions})
+            },
+            p.cursor.as_deref(),
+            p.body_limit,
+        )?;
+        return Ok(json!({"action":action, "body":body, "dry_run":true}).to_string());
+    }
+    for row in &mut partitions {
+        for (key, value) in row.as_object_mut().unwrap() {
+            if key != "route" && serde_json::to_vec(value)?.len() > 512 {
+                *value = json!({"detail_bytes":serde_json::to_vec(value)?.len(),
+                    "exact_reader":"same list/prune preview with body_limit=4096"});
+            }
+        }
+    }
+    let mut page = bbox_corpus_core::response_page::collection_page(
+        partitions,
+        "partitions",
+        p.limit,
+        p.offset,
+    )?;
+    page["action"] = json!(action);
+    page["continuation"] = json!(
+        "live inventory; restart at offset 0 after lifecycle actions; exact inventory with body_limit=4096"
+    );
+    if action == "list" {
+        return Ok(page.to_string());
+    }
+    if p.apply
+        && (candidates.len() > 8
+            || serde_json::to_vec(&json!(candidates).to_string())?.len() > 4096)
+    {
+        bail!(
+            "error.prune_batch_too_large: {} candidates; no partitions removed. Select route from the preview inventory to apply one route at a time",
+            candidates.len()
+        );
+    }
+    let visible: std::collections::HashSet<_> = page["partitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["route"].as_str().map(str::to_owned))
+        .collect();
+    let candidate_total = candidates.len();
+    let skipped_total = skipped.len();
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
     if p.apply {
@@ -481,16 +564,61 @@ fn embed_partitions_with(
                     "error": format!("{err:#}"),
                 })),
             }
+            if !errors.is_empty() {
+                break;
+            }
         }
     }
 
+    for error in &mut errors {
+        bbox_corpus_core::response_page::preview_field(error, "error", 1024);
+    }
     page["dry_run"] = json!(!p.apply);
     page["older_than_days"] = json!(older_than_days);
-    page["prune_candidates"] = json!(candidates);
+    page["candidate_total"] = json!(candidate_total);
+    page["skipped_total"] = json!(skipped_total);
+    page["unattempted_count"] = json!(if p.apply {
+        candidate_total - pruned.len() - errors.len()
+    } else {
+        0
+    });
+    page["prune_candidates"] = json!(
+        candidates
+            .iter()
+            .filter(|route| p.apply || visible.contains(*route))
+            .collect::<Vec<_>>()
+    );
     page["pruned"] = json!(pruned);
-    page["skipped"] = json!(skipped);
+    page["skipped"] = json!(
+        skipped
+            .into_iter()
+            .filter(|row| row["route"]
+                .as_str()
+                .is_some_and(|route| visible.contains(route)))
+            .collect::<Vec<_>>()
+    );
     page["errors"] = json!(errors);
-    Ok(serde_json::to_string_pretty(&page)?)
+    // Budget the final encoded text after adding outcomes, not only the inventory.
+    while serde_json::to_vec(&page.to_string())?.len() > 24 * 1024 {
+        let rows = page["partitions"].as_array_mut().unwrap();
+        let removed = rows
+            .pop()
+            .context("partition outcome metadata exceeds the response budget")?;
+        let remaining = rows.len();
+        page["count"] = json!(remaining);
+        page["next_offset"] = json!(p.offset.unwrap_or(0) + remaining);
+        page["byte_limited"] = json!(true);
+        for key in ["skipped", "prune_candidates"] {
+            if p.apply && key == "prune_candidates" {
+                continue;
+            }
+            page[key].as_array_mut().unwrap().retain(|row| {
+                let route = if key == "skipped" { &row["route"] } else { row };
+                route != &removed["route"]
+            });
+        }
+    }
+    Ok(page.to_string())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2169,6 +2297,7 @@ mod tests {
             route: None,
             limit: None,
             offset: None,
+            ..Default::default()
         };
         let rendered =
             embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap();
@@ -2214,6 +2343,7 @@ pdf_figure = "voyage_visual"
             route: None,
             limit: None,
             offset: None,
+            ..Default::default()
         };
         let mut removed = Vec::new();
         let rendered = embed_partitions_with(
@@ -2290,6 +2420,7 @@ pdf_figure = "voyage_visual"
             route: None,
             limit: None,
             offset: None,
+            ..Default::default()
         };
         let err = embed_partitions_with(
             &params,
@@ -2314,6 +2445,7 @@ pdf_figure = "voyage_visual"
             route: None,
             limit: None,
             offset: None,
+            ..Default::default()
         };
         let rendered = embed_partitions_with(&params, &router, infos, now, |_| {
             panic!("dry run must not delete")
@@ -2350,6 +2482,7 @@ pdf_figure = "voyage_visual"
             route: None,
             limit: None,
             offset: None,
+            ..Default::default()
         };
         let mut removed = Vec::new();
         let rendered = embed_partitions_with(&params, &router, infos, now, |route| {
@@ -2402,7 +2535,7 @@ pdf_figure = "voyage_visual"
         let prune_route = validate_partition_params(&EmbedPartitionsParams {
             action: Some("prune".into()),
             older_than_days: Some(30),
-            route: Some("voyage-1024".into()),
+            route: Some(" ".into()),
             ..Default::default()
         })
         .unwrap_err();
@@ -2430,6 +2563,117 @@ pdf_figure = "voyage_visual"
             validate_partition_params(&EmbedPartitionsParams::default()).unwrap(),
             "list"
         );
+    }
+
+    #[test]
+    fn partition_prune_pages_all_candidates_and_refuses_oversized_apply_before_effects() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let infos = || {
+            (0..200)
+                .map(|n| partition_info(&format!("orphan-{n:03}"), 90, now))
+                .collect::<Vec<_>>()
+        };
+        let mut offset = 0;
+        let mut recovered = Vec::new();
+        loop {
+            let p = EmbedPartitionsParams {
+                action: Some("prune".into()),
+                older_than_days: Some(30),
+                limit: Some(17),
+                offset: Some(offset),
+                ..Default::default()
+            };
+            let text =
+                embed_partitions_with(&p, &router, infos(), now, |_| unreachable!()).unwrap();
+            assert!(serde_json::to_vec(&text).unwrap().len() <= 24 * 1024);
+            let page: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(page["candidate_total"], 200);
+            recovered.extend(page["prune_candidates"].as_array().unwrap().iter().cloned());
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset as u64);
+                    offset = next as usize;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(recovered.len(), 200);
+        let p = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            apply: true,
+            ..Default::default()
+        };
+        let error = embed_partitions_with(&p, &router, infos(), now, |_| {
+            panic!("must refuse before deletion")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("prune_batch_too_large"));
+        let p = EmbedPartitionsParams {
+            route: Some("orphan-005".into()),
+            ..p
+        };
+        let mut removed = Vec::new();
+        embed_partitions_with(&p, &router, infos(), now, |route| {
+            removed.push(route.to_owned());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(removed, ["orphan-005"]);
+    }
+
+    #[test]
+    fn partition_exact_inventory_recovers_large_fields_and_partial_apply_is_explicit() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let infos = || vec![partition_info(&"route".repeat(8000), 90, now)];
+        let mut cursor = None;
+        let mut text = String::new();
+        loop {
+            let p = EmbedPartitionsParams {
+                body_limit: Some(1024),
+                cursor: cursor.clone(),
+                ..Default::default()
+            };
+            let page: serde_json::Value = serde_json::from_str(
+                &embed_partitions_with(&p, &router, infos(), now, |_| unreachable!()).unwrap(),
+            )
+            .unwrap();
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let exact: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(exact["partitions"][0]["route"], "route".repeat(8000));
+        let p = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            apply: true,
+            ..Default::default()
+        };
+        let infos = (0..3)
+            .map(|n| partition_info(&format!("orphan-{n}"), 90, now))
+            .collect();
+        let mut attempted = 0;
+        let page: serde_json::Value = serde_json::from_str(
+            &embed_partitions_with(&p, &router, infos, now, |_| {
+                attempted += 1;
+                if attempted == 1 {
+                    Ok(true)
+                } else {
+                    anyhow::bail!("synthetic removal failure")
+                }
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempted, 2);
+        assert_eq!(page["unattempted_count"], 1);
+        assert_eq!(page["pruned"].as_array().unwrap().len(), 1);
+        assert_eq!(page["errors"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2481,8 +2725,8 @@ pdf_figure = "voyage_visual"
         assert_eq!(value["next_offset"], 1);
         assert_eq!(
             value["prune_candidates"].as_array().unwrap().len(),
-            2,
-            "prune decisions cover the whole projection even when the inventory is paged"
+            1,
+            "candidate rows follow the inventory page; candidate_total covers all candidates"
         );
     }
 

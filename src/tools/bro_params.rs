@@ -576,7 +576,8 @@ pub(crate) struct AgentGetParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentDescribeParams {
     pub(crate) agent: String,
-    /// Exact body plane to page: manifest or brofile. Omit for the compact
+    /// Exact body plane to page: manifest, brofile, metadata, or summary
+    /// (the complete dispatch summary, including all filters and warnings). Omit for the compact
     /// all-plane summary.
     #[serde(default)]
     pub(crate) detail_plane: Option<String>,
