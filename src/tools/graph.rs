@@ -2974,7 +2974,7 @@ mod tests {
                 }),
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
+        assert_eq!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
         let resolved_text = extract_text(&resolved);
         assert!(resolved_text.contains("error.not_found"));
         let resolved_value: serde_json::Value = serde_json::from_str(&resolved_text).unwrap();
@@ -3114,7 +3114,7 @@ mod tests {
                 locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve { plan, fact }),
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
+        assert_eq!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
         assert!(extract_text(&resolved).contains("error.not_found"));
 
         let fallback = server
