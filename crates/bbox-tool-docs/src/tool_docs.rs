@@ -706,8 +706,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_apply",
         category: ToolCategory::Packets,
-        summary: "Evaluate a packet against one entity — deterministic, no LLM. The receive-side of the packet workflow: a sub-agent that received packet_id from its orchestrator calls this to classify without reinterpreting the rubric. mode=\"first\" returns the first matching rule; mode=\"all\" returns every matching rule plus an aggregate verdict (for review / multi-finding shape). Cheap at arbitrary scale.",
-        when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator — no need to re-read or re-interpret the rubric, just evaluate. Also use yourself after compiling to spot-check on specific entities. If no rule matches, returns `{match: false}` rather than guessing — so missing catchalls surface immediately.",
+        summary: "Evaluate a packet against one entity deterministically, without an LLM. mode=\"first\" returns the first matching rule; mode=\"all\" returns one bounded finding page plus an aggregate verdict. Continue finding pages with next_finding_offset.",
+        when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator: evaluate rather than reinterpret the rubric. mode=all reports finding_count, packet_rule_order, finding_offset, and next_finding_offset. Default rows use bounded consequent previews; packet body pages remain the exact reader.",
         example: Some(
             r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#,
         ),
@@ -715,8 +715,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_audit",
         category: ToolCategory::Packets,
-        summary: "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos.",
-        when_to_use: "ALWAYS run this after `bbox_compile` against the observations you derived the rules from. Catches (a) rules that mis-generalized beyond the anomalies, (b) ordering bugs where a general rule shadows an anomaly, (c) typos in field names. Use `mode=\"all\"` when the packet is for multi-finding review and expected outputs are rule-id sets.",
+        summary: "Run a packet against a mode-specific {entity, expectation}[] dataset and report fidelity plus bounded mismatch pages. Fidelity measures agreement with the supplied dataset, not universal classifier correctness. Continue mismatches with next_mismatch_offset.",
+        when_to_use: "Run after `bbox_compile` against the observations the rules were derived from. mode=first expects {entity, expected}; mode=all expects {entity, expected_verdict?, expected_rule_ids?}. The response preserves per-row outcomes, dataset_index, totals, ordering, and continuation. Oversized batches are rejected before an observation event is written.",
         example: Some(
             r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#,
         ),
@@ -731,8 +731,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_packet_events",
         category: ToolCategory::Packets,
-        summary: "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded, plus `repair_candidate` events emitted by the self-heal scanner when enabled. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps, and packets the scanner has flagged for repair. Filter by op (compile / apply / audit / gap / repair_candidate), packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500).",
-        when_to_use: "Diagnostic surface for the packet subsystem. Use when a packet is behaving unexpectedly, when you want to see which domains have the highest compile error rate, or when aggregating authoring gaps to prioritize new AST primitives.",
+        summary: "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since.",
+        when_to_use: "Diagnostic surface for the packet subsystem. Continue older pages with next_cursor; appends preserve older offsets, while a shrunken log rejects the cursor. Default detail rows use compact projections; detail=true includes complete event details.",
         example: Some(r#"bbox_packet_events(op="gap", limit=20)"#),
     },
     ToolDoc {
@@ -747,8 +747,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_mcp_surface",
         category: ToolCategory::Packets,
-        summary: "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface.",
-        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. 'replay' evaluates a surface selector and shows verdict + visible tools. 'list' enumerates installed surface packets. 'describe' shows packet rules and the verdict for a selected surface.",
+        summary: "Inspect MCP surface routing compactly. Replay pages visible tools and reports policy counts; describe pages rule summaries; list pages installed packets. Use detail=policy for exact allow/disallow patterns.",
+        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. All inventories are paged live views. Replay/describe accept detail=policy for exact pattern pages; action=list rejects replay/describe selectors. Packet body pages are the complete packet reader.",
         example: Some(
             r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
         ),

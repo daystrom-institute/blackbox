@@ -56,25 +56,83 @@ pub struct PacketListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketEventOp {
+    Compile,
+    Apply,
+    Audit,
+    Gap,
+    Gc,
+    RepairCandidate,
+}
+
+impl PacketEventOp {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Apply => "apply",
+            Self::Audit => "audit",
+            Self::Gap => "gap",
+            Self::Gc => "gc",
+            Self::RepairCandidate => "repair_candidate",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketEventOutcome {
+    Ok,
+    Error,
+    NoMatch,
+    LowFidelity,
+    Logged,
+    Flagged,
+    Partial,
+}
+
+impl PacketEventOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::NoMatch => "no_match",
+            Self::LowFidelity => "low_fidelity",
+            Self::Logged => "logged",
+            Self::Flagged => "flagged",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EventsParams {
     /// Filter by operation: `compile`, `apply`, `audit`, `gap`,
-    /// `repair_candidate` (emitted by the self-heal scanner when
-    /// `PACKET_SELF_HEAL_ENABLED=true`).
+    /// `gc`, or `repair_candidate` (emitted by the self-heal scanner
+    /// when `PACKET_SELF_HEAL_ENABLED=true`).
     #[serde(default)]
-    pub op: Option<String>,
+    pub op: Option<PacketEventOp>,
     /// Filter by packet id (canonical `packet-<8hex>` or bare hex).
     #[serde(default)]
     pub packet_id: Option<String>,
     /// Filter by outcome: `ok`, `error`, `no_match`, `low_fidelity`,
-    /// `logged`.
+    /// `logged`, `flagged`, or `partial`.
     #[serde(default)]
-    pub outcome: Option<String>,
-    /// ISO 8601 lower bound; events with earlier timestamps are excluded.
+    pub outcome: Option<PacketEventOutcome>,
+    /// RFC 3339 lower bound; events with earlier timestamps are excluded.
     #[serde(default)]
     pub since: Option<String>,
     /// Hard cap on returned rows (default 50, max 500).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Opaque continuation from `next_cursor`. The event log is a live view;
+    /// a shrunken log rejects the cursor instead of returning an empty page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Include complete `details` objects. Default rows carry compact detail
+    /// projections when their serialized form is too large for a page.
+    #[serde(default)]
+    pub detail: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -491,6 +549,188 @@ pub fn discharge_project_catalog_rows(
     Ok(removals.len())
 }
 
+pub const MAX_PACKET_RULES: usize = 500;
+pub const MAX_AUDIT_DATASET_ROWS: usize = 1_000;
+pub const MAX_PACKET_RESULT_ROWS: usize = 100;
+
+fn validate_packet_rules(rules: &serde_json::Value) -> Result<()> {
+    let mut rules = rules.clone();
+    unwrap_jsonish(&mut rules);
+    let rows = rules.as_array().context(
+        "'rules' must be a JSON array of {id, antecedent, consequent, classification?, emit?, confidence?, provenance?} objects",
+    )?;
+    if rows.len() > MAX_PACKET_RULES {
+        anyhow::bail!(
+            "'rules' has {} entries; reject or partition the batch to at most {MAX_PACKET_RULES} before compiling",
+            rows.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_audit_dataset(dataset: &serde_json::Value) -> Result<()> {
+    let mut dataset = dataset.clone();
+    unwrap_jsonish(&mut dataset);
+    let rows = dataset
+        .as_array()
+        .context("'dataset' must be a JSON array of mode-specific {entity, expectation} objects")?;
+    if rows.len() > MAX_AUDIT_DATASET_ROWS {
+        anyhow::bail!(
+            "'dataset' has {} rows; reject or partition it into batches of at most {MAX_AUDIT_DATASET_ROWS} before auditing",
+            rows.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_apply_entity(entity: &serde_json::Value) -> Result<()> {
+    let mut entity = entity.clone();
+    unwrap_jsonish(&mut entity);
+    if !entity.is_object() {
+        anyhow::bail!("'entity' must be a JSON object mapping field names to values");
+    }
+    Ok(())
+}
+
+fn packet_value_row(value: &ast::Value, detail: bool) -> serde_json::Value {
+    let json = value.to_json();
+    if detail {
+        return json;
+    }
+    let mut row = serde_json::json!({ "value": json });
+    if json.is_string() {
+        bbox_corpus_core::response_page::preview_field(&mut row, "value", 200);
+    } else {
+        let rendered = serde_json::to_string(&json).unwrap_or_default();
+        row["value"] = serde_json::Value::String(rendered);
+        bbox_corpus_core::response_page::preview_field(&mut row, "value", 200);
+    }
+    row
+}
+
+fn finding_row(finding: &Prediction, detail: bool) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "rule_id": finding.rule_id,
+        "classification": finding.classification,
+        "confidence": finding.confidence,
+    });
+    if detail {
+        row["consequent"] = finding.consequent.to_json();
+    } else {
+        row["consequent_preview"] = packet_value_row(&finding.consequent, false);
+    }
+    row
+}
+
+fn json_preview(value: &serde_json::Value, detail: bool) -> serde_json::Value {
+    if detail {
+        return value.clone();
+    }
+    let rendered = match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    let mut row = serde_json::json!({ "value": rendered });
+    bbox_corpus_core::response_page::preview_field(&mut row, "value", 200);
+    row
+}
+
+fn string_list_preview(values: Option<&[String]>, detail: bool) -> serde_json::Value {
+    let Some(values) = values else {
+        return serde_json::Value::Null;
+    };
+    if detail || values.len() <= 20 {
+        return serde_json::json!(values);
+    }
+    serde_json::json!({
+        "values": &values[..20],
+        "count": values.len(),
+        "omitted_count": values.len() - 20,
+        "detail_hint": "set mismatch_detail=true",
+    })
+}
+
+fn first_mismatch_row(mismatch: &Mismatch, detail: bool) -> serde_json::Value {
+    serde_json::json!({
+        "dataset_index": mismatch.dataset_index,
+        "entity_preview": json_preview(&mismatch.entity, detail),
+        "expected": packet_value_row(&mismatch.expected, detail),
+        "predicted": mismatch.predicted.as_ref().map(|value| packet_value_row(value, detail)),
+        "rule_id": mismatch.rule_id,
+    })
+}
+
+fn all_mismatch_row(mismatch: &AllModeMismatch, detail: bool) -> serde_json::Value {
+    serde_json::json!({
+        "dataset_index": mismatch.dataset_index,
+        "entity_preview": json_preview(&mismatch.entity, detail),
+        "check": mismatch.check,
+        "expected_verdict": mismatch.expected_verdict,
+        "actual_verdict": mismatch.actual_verdict,
+        "expected_rule_ids": string_list_preview(mismatch.expected_rule_ids.as_deref(), detail),
+        "actual_rule_ids": string_list_preview(mismatch.actual_rule_ids.as_deref(), detail),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EventCursor {
+    offset: usize,
+    total: usize,
+}
+
+fn encode_event_cursor(offset: usize, total: usize) -> String {
+    format!("v1:{offset}:{total}")
+}
+
+fn parse_event_cursor(raw: &str) -> Result<EventCursor> {
+    let (version, rest) = raw
+        .split_once(':')
+        .context("expected v1:<offset>:<total>")?;
+    if version != "v1" {
+        anyhow::bail!(
+            "unsupported cursor version {version:?}; use next_cursor from the first page"
+        );
+    }
+    let (offset, total) = rest
+        .split_once(':')
+        .context("expected v1:<offset>:<total>")?;
+    let offset = offset
+        .parse::<usize>()
+        .context("offset must be a non-negative integer")?;
+    let total = total
+        .parse::<usize>()
+        .context("total must be a non-negative integer")?;
+    if offset > total {
+        anyhow::bail!("cursor offset {offset} exceeds its snapshot total {total}");
+    }
+    Ok(EventCursor { offset, total })
+}
+
+fn event_page_row(event: &PacketEvent, detail: bool) -> serde_json::Value {
+    if detail {
+        return serde_json::to_value(event).unwrap_or_else(|_| serde_json::Value::Null);
+    }
+    let details = if event.details.is_null() {
+        serde_json::Value::Null
+    } else if serde_json::to_vec(&event.details).map_or(true, |bytes| bytes.len() <= 512) {
+        event.details.clone()
+    } else {
+        serde_json::json!({
+            "omitted": true,
+            "reason": "details exceed the compact row projection",
+            "detail_hint": "bbox_packet_events(detail=true)",
+        })
+    };
+    serde_json::json!({
+        "timestamp": event.timestamp,
+        "op": event.op,
+        "outcome": event.outcome,
+        "packet_id": event.packet_id,
+        "domain": event.domain,
+        "details": details,
+    })
+}
+
 impl Packets {
     pub fn open(packets_dir: &Path) -> Result<Self> {
         let actual_dir = packets_dir.to_path_buf();
@@ -601,6 +841,109 @@ impl Packets {
             events.push(ev);
         }
         Ok(events)
+    }
+
+    /// Query a bounded, ordered page of the live event log.
+    ///
+    /// Offsets point into the current newest-first view. New appends do not
+    /// move older offsets, while removals or rewrites can; a cursor from a
+    /// smaller matching view is therefore rejected instead of masquerading as
+    /// an empty terminal page; same-size rewrites remain cursor-unsafe.
+    pub fn events_page(&self, params: &EventsParams) -> Result<serde_json::Value> {
+        if let Some(since) = &params.since
+            && chrono::DateTime::parse_from_rfc3339(since).is_err()
+        {
+            anyhow::bail!("'since' must be an RFC 3339 timestamp, got {since:?}");
+        }
+        let cursor = params
+            .cursor
+            .as_deref()
+            .map(parse_event_cursor)
+            .transpose()
+            .context("invalid 'cursor'")?;
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+
+        let path = events_log_path(&self.packets_dir);
+        let raw = if path.exists() {
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+        } else {
+            String::new()
+        };
+        let op = params.op.as_ref().map(PacketEventOp::as_str);
+        let outcome = params.outcome.as_ref().map(PacketEventOutcome::as_str);
+        let mut total = 0usize;
+        let mut malformed = 0usize;
+        let mut events = Vec::new();
+        for line in raw.lines().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<PacketEvent>(line) else {
+                malformed += 1;
+                continue;
+            };
+            if op.is_some_and(|wanted| event.op != wanted) {
+                continue;
+            }
+            if let Some(id) = params.packet_id.as_deref() {
+                let wanted = normalize_id(id);
+                if event.packet_id.as_deref() != Some(wanted.as_str()) {
+                    continue;
+                }
+            }
+            if outcome.is_some_and(|wanted| event.outcome != wanted) {
+                continue;
+            }
+            if let Some(since) = &params.since
+                && event.timestamp.as_str() < since.as_str()
+            {
+                continue;
+            }
+            events.push(event);
+            total += 1;
+        }
+
+        if let Some(cursor) = cursor
+            && (cursor.total > total || cursor.offset > total)
+        {
+            anyhow::bail!(
+                "error.stale_event_cursor: log has {total} matching events, cursor came from {} and points at offset {}; restart from the first page",
+                cursor.total,
+                cursor.offset
+            );
+        }
+        let requested_offset = cursor.map(|cursor| cursor.offset).unwrap_or(0);
+        let appended = cursor
+            .map(|cursor| total.saturating_sub(cursor.total))
+            .unwrap_or_default();
+        let offset = requested_offset.saturating_add(appended);
+        let rows: Vec<serde_json::Value> = events
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|event| event_page_row(event, params.detail))
+            .collect();
+        let next_offset = offset.saturating_add(rows.len());
+        let mut page = serde_json::json!({
+            "events": rows,
+            "count": rows.len(),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "order": "timestamp_file_order_desc",
+            "continuation_semantics": "live_offset: appends keep older offsets stable; a smaller matching view rejects its cursor; other rewrites are not cursor-safe",
+            "malformed_lines_omitted": malformed,
+            "detail": params.detail,
+            "detail_hint": "Set detail=true for complete event details; packet:<id> body pages remain the exact packet reader.",
+        });
+        page = bbox_corpus_core::response_page::bound_page(page, "events")?;
+        let bounded_next_offset = page["next_offset"].as_u64().unwrap_or(next_offset as u64);
+        page["next_cursor"] = if bounded_next_offset < total as u64 {
+            serde_json::Value::String(encode_event_cursor(bounded_next_offset as usize, total))
+        } else {
+            serde_json::Value::Null
+        };
+        Ok(page)
     }
 
     pub fn log_gap(
@@ -835,6 +1178,7 @@ impl Packets {
     // ── bbox_compile (create) ──────────────────────────────────────
 
     pub fn compile(&self, p: &CompileParams) -> Result<String> {
+        validate_packet_rules(&p.rules)?;
         let result = self.compile_inner(p);
         // Log the outcome regardless of success/failure. Event-log
         // I/O errors are swallowed inside append_event so they can't
@@ -893,6 +1237,7 @@ impl Packets {
     /// artifacts × N restarts grew the store to thousands of byte-identical
     /// files (see thread-935b467d).
     pub fn compile_idempotent(&self, p: &CompileParams) -> Result<CompileOutcome> {
+        validate_packet_rules(&p.rules)?;
         let packet = self.build_packet(p)?;
         if let Some(existing_id) = self.find_identical(&packet)? {
             return Ok(CompileOutcome::UnchangedExisting(existing_id));
@@ -1226,6 +1571,17 @@ impl Packets {
     // ── bbox_apply ─────────────────────────────────────────────────
 
     pub fn apply_tool(&self, p: &ApplyParams) -> Result<String> {
+        self.apply_tool_paged(p, 0, MAX_PACKET_RESULT_ROWS, false)
+    }
+
+    pub fn apply_tool_paged(
+        &self,
+        p: &ApplyParams,
+        finding_offset: usize,
+        finding_limit: usize,
+        detail: bool,
+    ) -> Result<String> {
+        validate_apply_entity(&p.entity)?;
         let packet = match self.load(&p.packet_id) {
             Ok(pk) => pk,
             Err(e) => {
@@ -1256,14 +1612,15 @@ impl Packets {
                                 "classification": prediction.classification,
                             })),
                     );
-                    Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    Ok(serde_json::to_string(&serde_json::json!({
                         "packet_id": packet.id,
                         "mode": mode,
                         "match": true,
                         "rule_id": prediction.rule_id,
                         "classification": prediction.classification,
-                        "consequent": prediction.consequent,
+                        "consequent": prediction.consequent.to_json(),
                         "confidence": prediction.confidence,
+                        "observation_event": "written",
                     }))?)
                 }
                 None => {
@@ -1273,12 +1630,13 @@ impl Packets {
                             .with_domain(packet.domain.clone())
                             .with_details(serde_json::json!({"mode": "first"})),
                     );
-                    Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    Ok(serde_json::to_string(&serde_json::json!({
                         "packet_id": packet.id,
                         "mode": mode,
                         "match": false,
                         "consequent": serde_json::Value::Null,
                         "note": "no rule's antecedent matched the entity",
+                        "observation_event": "written",
                     }))?)
                 }
             },
@@ -1299,13 +1657,44 @@ impl Packets {
                             "finding_count": result.findings.len(),
                         })),
                 );
-                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                let total = result.findings.len();
+                if finding_offset > total {
+                    anyhow::bail!(
+                        "error.stale_finding_offset: packet has {total} findings, requested offset {finding_offset}"
+                    );
+                }
+                let limit = finding_limit.clamp(1, MAX_PACKET_RESULT_ROWS);
+                let rows: Vec<serde_json::Value> = result
+                    .findings
+                    .iter()
+                    .skip(finding_offset)
+                    .take(limit)
+                    .map(|finding| finding_row(finding, detail))
+                    .collect();
+                let next_offset = finding_offset.saturating_add(rows.len());
+                let mut page = serde_json::json!({
                     "packet_id": result.packet_id,
                     "mode": mode,
-                    "findings": result.findings,
+                    "findings": rows,
                     "verdict": result.verdict,
-                    "finding_count": result.findings.len(),
-                }))?)
+                    "finding_count": total,
+                    "finding_offset": finding_offset,
+                    "finding_limit": limit,
+                    "finding_order": "packet_rule_order",
+                    "finding_detail": detail,
+                    "exact_reader": format!("bbox_inspect_entity(entity_ref=packet:{}, property=body)", packet.id),
+                    "next_finding_offset": (next_offset < total).then_some(next_offset),
+                    "observation_event": "written",
+                });
+                page = bbox_corpus_core::response_page::bound_page(page, "findings")?;
+                let bounded_next_offset =
+                    page["next_offset"].as_u64().unwrap_or(next_offset as u64);
+                page["next_finding_offset"] = if bounded_next_offset < total as u64 {
+                    serde_json::Value::from(bounded_next_offset)
+                } else {
+                    serde_json::Value::Null
+                };
+                Ok(serde_json::to_string(&page)?)
             }
         }
     }
@@ -1313,6 +1702,17 @@ impl Packets {
     // ── bbox_audit ─────────────────────────────────────────────────
 
     pub fn audit_tool(&self, p: &AuditParams) -> Result<String> {
+        self.audit_tool_paged(p, 0, MAX_PACKET_RESULT_ROWS, false)
+    }
+
+    pub fn audit_tool_paged(
+        &self,
+        p: &AuditParams,
+        mismatch_offset: usize,
+        mismatch_limit: usize,
+        detail: bool,
+    ) -> Result<String> {
+        validate_audit_dataset(&p.dataset)?;
         let packet = match self.load(&p.packet_id) {
             Ok(pk) => pk,
             Err(e) => {
@@ -1349,15 +1749,47 @@ impl Packets {
                             "uncovered_count": report.uncovered.len(),
                         })),
                 );
-                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                let mismatch_total = report.mismatches.len();
+                if mismatch_offset > mismatch_total {
+                    anyhow::bail!(
+                        "error.stale_mismatch_offset: audit has {mismatch_total} mismatches, requested offset {mismatch_offset}"
+                    );
+                }
+                let limit = mismatch_limit.clamp(1, MAX_PACKET_RESULT_ROWS);
+                let rows: Vec<serde_json::Value> = report
+                    .mismatches
+                    .iter()
+                    .skip(mismatch_offset)
+                    .take(limit)
+                    .map(|mismatch| first_mismatch_row(mismatch, detail))
+                    .collect();
+                let next_offset = mismatch_offset.saturating_add(rows.len());
+                let mut page = serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
                     "total": report.total,
                     "correct": report.correct,
                     "fidelity": report.fidelity,
-                    "mismatches": report.mismatches,
+                    "mismatches": rows,
+                    "mismatch_count": mismatch_total,
+                    "mismatch_offset": mismatch_offset,
+                    "mismatch_limit": limit,
+                    "mismatch_order": "dataset_order",
+                    "mismatch_detail": detail,
+                    "exact_recovery": "rerun the same packet and dataset; dataset_index identifies the caller-owned row",
                     "uncovered_count": report.uncovered.len(),
-                }))?)
+                    "next_mismatch_offset": (next_offset < mismatch_total).then_some(next_offset),
+                    "observation_event": "written",
+                });
+                page = bbox_corpus_core::response_page::bound_page(page, "mismatches")?;
+                let bounded_next_offset =
+                    page["next_offset"].as_u64().unwrap_or(next_offset as u64);
+                page["next_mismatch_offset"] = if bounded_next_offset < mismatch_total as u64 {
+                    serde_json::Value::from(bounded_next_offset)
+                } else {
+                    serde_json::Value::Null
+                };
+                Ok(serde_json::to_string(&page)?)
             }
             ApplyMode::All => {
                 let report = verify_all_with(&packet, &dataset, self)?;
@@ -1378,14 +1810,46 @@ impl Packets {
                             "mismatch_count": report.mismatches.len(),
                         })),
                 );
-                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                let mismatch_total = report.mismatches.len();
+                if mismatch_offset > mismatch_total {
+                    anyhow::bail!(
+                        "error.stale_mismatch_offset: audit has {mismatch_total} mismatches, requested offset {mismatch_offset}"
+                    );
+                }
+                let limit = mismatch_limit.clamp(1, MAX_PACKET_RESULT_ROWS);
+                let rows: Vec<serde_json::Value> = report
+                    .mismatches
+                    .iter()
+                    .skip(mismatch_offset)
+                    .take(limit)
+                    .map(|mismatch| all_mismatch_row(mismatch, detail))
+                    .collect();
+                let next_offset = mismatch_offset.saturating_add(rows.len());
+                let mut page = serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
                     "total": report.total,
                     "correct": report.correct,
                     "fidelity": report.fidelity,
-                    "mismatches": report.mismatches,
-                }))?)
+                    "mismatches": rows,
+                    "mismatch_count": mismatch_total,
+                    "mismatch_offset": mismatch_offset,
+                    "mismatch_limit": limit,
+                    "mismatch_order": "dataset_order",
+                    "mismatch_detail": detail,
+                    "exact_recovery": "rerun the same packet and dataset; dataset_index identifies the caller-owned row",
+                    "next_mismatch_offset": (next_offset < mismatch_total).then_some(next_offset),
+                    "observation_event": "written",
+                });
+                page = bbox_corpus_core::response_page::bound_page(page, "mismatches")?;
+                let bounded_next_offset =
+                    page["next_offset"].as_u64().unwrap_or(next_offset as u64);
+                page["next_mismatch_offset"] = if bounded_next_offset < mismatch_total as u64 {
+                    serde_json::Value::from(bounded_next_offset)
+                } else {
+                    serde_json::Value::Null
+                };
+                Ok(serde_json::to_string(&page)?)
             }
         }
     }

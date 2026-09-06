@@ -22,25 +22,42 @@ pub enum McpSurfaceAction {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSurfaceDetail {
+    Policy,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpSurfaceParams {
-    /// Action to perform. "replay" evaluates a surface; "list" shows
-    /// installed surface packets; "describe" shows a surface packet's rules.
+    /// Action to perform. "replay" evaluates a surface; "list" pages the
+    /// installed surface-packet catalog; "describe" pages packet rule
+    /// summaries for a selected surface.
     pub action: McpSurfaceAction,
     /// Surface name for replay/describe. Defaults to "default".
     #[serde(default)]
     pub surface: Option<String>,
     /// Project selector (registered ID or alias) for replay/describe policy
-    /// selection. List returns the installed routing-packet catalog.
+    /// selection. List is global and rejects this selector.
     #[serde(default)]
     pub project: Option<String>,
+    /// Exact allow/disallow policy detail for replay/describe. The default
+    /// projection reports counts; complete packet JSON remains available
+    /// through packet body pages.
+    #[serde(default)]
+    pub detail: Option<McpSurfaceDetail>,
+    /// Maximum rows per page (default 20, maximum 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue with next_offset. Inventories are live views, not snapshots.
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
-
 #[tool_router(router = mcp_surface_tools)]
 impl BlackboxServer {
     #[tool(
         name = "bbox_mcp_surface",
-        description = "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface."
+        description = "Inspect MCP surface routing compactly. Replay pages visible tools and reports policy counts; describe pages rule summaries; list pages installed packets. Use detail=policy for exact allow/disallow patterns."
     )]
     pub(crate) async fn bbox_mcp_surface(
         &self,
@@ -54,6 +71,13 @@ impl BlackboxServer {
             // project id for an attachment-less catalog identity); a miss
             // keeps the literal. The resolved id additionally feeds the
             // packet store's dual-read arm.
+            if matches!(p.action, McpSurfaceAction::List)
+                && (p.surface.is_some() || p.project.is_some() || p.detail.is_some())
+            {
+                return Err(anyhow::anyhow!(
+                    "action=list accepts only limit/offset; surface, project, and detail are replay/describe selectors"
+                ));
+            }
             let mut p = p;
             let mut resolved_project_id = None;
             if let Some(raw) = p.project.clone() {
@@ -87,7 +111,10 @@ impl BlackboxServer {
             let resolved_project_id = resolved_project_id.as_deref();
             match p.action {
                 McpSurfaceAction::Replay => server.handle_mcp_surface_replay(&p, resolved_project_id),
-                McpSurfaceAction::List => server.handle_mcp_surface_list(),
+                McpSurfaceAction::List => server.handle_mcp_surface_list(
+                    p.limit.unwrap_or(20).clamp(1, 100),
+                    p.offset.unwrap_or(0),
+                ),
                 McpSurfaceAction::Describe => server.handle_mcp_surface_describe(&p, resolved_project_id),
             }
         })
@@ -96,6 +123,100 @@ impl BlackboxServer {
 }
 
 impl BlackboxServer {
+    fn surface_policy_rows(verdict: &surface::ToolSurfaceVerdict) -> Vec<serde_json::Value> {
+        match verdict {
+            surface::ToolSurfaceVerdict::ToolSurface {
+                allow, disallow, ..
+            } => allow
+                .iter()
+                .map(|pattern| serde_json::json!({"kind": "allow", "pattern": pattern}))
+                .chain(
+                    disallow
+                        .iter()
+                        .map(|pattern| serde_json::json!({"kind": "disallow", "pattern": pattern})),
+                )
+                .collect(),
+            surface::ToolSurfaceVerdict::Deny { .. } => Vec::new(),
+        }
+    }
+
+    fn surface_verdict_summary(verdict: &surface::ToolSurfaceVerdict) -> serde_json::Value {
+        match verdict {
+            surface::ToolSurfaceVerdict::ToolSurface {
+                allow,
+                disallow,
+                instructions,
+            } => {
+                let mut summary = serde_json::json!({
+                    "route": "tool_surface",
+                    "allow_count": allow.len(),
+                    "disallow_count": disallow.len(),
+                });
+                if let Some(instructions) = instructions {
+                    summary["instructions_preview"] =
+                        serde_json::Value::String(instructions.clone());
+                    bbox_corpus_core::response_page::preview_field(
+                        &mut summary,
+                        "instructions_preview",
+                        200,
+                    );
+                }
+                summary
+            }
+            surface::ToolSurfaceVerdict::Deny { reason } => {
+                let mut summary = serde_json::json!({
+                    "route": "deny",
+                    "reason": reason.clone().unwrap_or_default(),
+                });
+                bbox_corpus_core::response_page::preview_field(&mut summary, "reason", 200);
+                summary
+            }
+        }
+    }
+
+    fn surface_page(
+        &self,
+        mut page: serde_json::Value,
+        field: &str,
+        rows: Vec<serde_json::Value>,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<String> {
+        if offset > rows.len() {
+            anyhow::bail!(
+                "error.stale_surface_offset: inventory has {} rows, requested offset {offset}",
+                rows.len()
+            );
+        }
+        let total = rows.len();
+        let selected: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
+        let next_offset = offset.saturating_add(selected.len());
+        let returned = selected.len();
+        page[field] = serde_json::Value::Array(selected);
+        page["count"] = serde_json::Value::from(returned);
+        page["total"] = serde_json::Value::from(total);
+        page["offset"] = serde_json::Value::from(offset);
+        page["limit"] = serde_json::Value::from(limit);
+        page["next_offset"] = if next_offset < total {
+            serde_json::Value::from(next_offset)
+        } else {
+            serde_json::Value::Null
+        };
+        page["continuation_semantics"] = serde_json::Value::String(
+            "live_offset: packet writes can change rows between pages; restart from offset 0 after a write".to_string(),
+        );
+        let mut bounded = bbox_corpus_core::response_page::bound_page(page, field)?;
+        let bounded_next_offset = bounded["next_offset"]
+            .as_u64()
+            .unwrap_or(next_offset as u64);
+        bounded["next_offset"] = if bounded_next_offset < total as u64 {
+            serde_json::Value::from(bounded_next_offset)
+        } else {
+            serde_json::Value::Null
+        };
+        Ok(serde_json::to_string(&bounded)?)
+    }
+
     fn handle_mcp_surface_replay(
         &self,
         p: &McpSurfaceParams,
@@ -105,6 +226,15 @@ impl BlackboxServer {
         let entity = surface::build_surface_entity(surface, p.project.as_deref());
 
         let packets = self.state.packets.read();
+        let packet_id = packets
+            .load_latest_by_domain(
+                surface::SURFACE_ROUTING_DOMAIN,
+                p.project.as_deref(),
+                resolved_project_id,
+            )
+            .ok()
+            .flatten()
+            .map(|packet| packet.id);
         let decision = surface::evaluate_tool_surface(
             &packets,
             entity.clone(),
@@ -113,74 +243,76 @@ impl BlackboxServer {
         );
         drop(packets);
 
+        let limit = p.limit.unwrap_or(20).clamp(1, 100);
+        let offset = p.offset.unwrap_or(0);
+        let verdict = surface_verdict_summary(&decision.verdict);
+        if matches!(p.detail, Some(McpSurfaceDetail::Policy)) {
+            let rows = Self::surface_policy_rows(&decision.verdict);
+            let page = serde_json::json!({
+                "entity": entity,
+                "detail": "policy",
+                "policy_order": "allow_patterns_then_disallow_patterns",
+                "verdict": verdict,
+                "packet_id": packet_id,
+                "exact_reader": packet_id.as_deref().map_or_else(
+                    || "unavailable: no routing packet was selected".to_string(),
+                    |id| format!("bbox_inspect_entity(entity_ref=packet:{id}, property=body)"),
+                ),
+            });
+            return self.surface_page(page, "policy", rows, offset, limit);
+        }
+
         let tool_universe: Vec<String> = self
             .tool_router
             .list_all()
             .iter()
             .map(|t| t.name.to_string())
             .collect();
-
-        let visible_tools: Vec<String> = self
+        let rows: Vec<_> = self
             .tool_router
             .list_all()
             .iter()
-            .filter(|t| surface::tool_visible(&t.name, &decision, &tool_universe))
-            .map(|t| t.name.to_string())
+            .filter(|tool| surface::tool_visible(&tool.name, &decision, &tool_universe))
+            .map(|tool| serde_json::json!({"name": tool.name.to_string()}))
             .collect();
-
-        let consequent_json = match &decision.verdict {
-            surface::ToolSurfaceVerdict::ToolSurface {
-                allow,
-                disallow,
-                instructions,
-            } => serde_json::json!({
-                "route": "tool_surface",
-                "allow": allow,
-                "disallow": disallow,
-                "instructions": instructions,
-            }),
-            surface::ToolSurfaceVerdict::Deny { reason } => serde_json::json!({
-                "route": "deny",
-                "reason": reason,
-            }),
-        };
-
-        let verdict_classification = match &decision.verdict {
-            surface::ToolSurfaceVerdict::ToolSurface { .. } => "tool_surface",
-            surface::ToolSurfaceVerdict::Deny { .. } => "deny",
-        };
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        let page = serde_json::json!({
             "entity": entity,
-            "verdict_classification": verdict_classification,
-            "verdict_consequent": consequent_json,
-            "visible_tools": visible_tools,
-            "visible_tool_count": visible_tools.len(),
-        }))?)
+            "verdict_classification": if decision.is_deny() { "deny" } else { "tool_surface" },
+            "verdict": verdict,
+            "visible_tool_count": rows.len(),
+            "tool_order": "router_registration_order",
+            "policy_detail_hint": "detail=policy pages exact allow/disallow patterns",
+        });
+        self.surface_page(page, "visible_tools", rows, offset, limit)
     }
 
-    fn handle_mcp_surface_list(&self) -> anyhow::Result<String> {
+    fn handle_mcp_surface_list(&self, limit: usize, offset: usize) -> anyhow::Result<String> {
         let packets = self.state.packets.read();
-        let all = packets.list_all()?;
-        let surface_packets: Vec<serde_json::Value> = all
+        let mut all = packets.list_all()?;
+        all.retain(|packet| packet.domain == surface::SURFACE_ROUTING_DOMAIN);
+        all.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let rows: Vec<_> = all
             .into_iter()
-            .filter(|p| p.domain == surface::SURFACE_ROUTING_DOMAIN)
-            .map(|p| {
+            .map(|packet| {
                 serde_json::json!({
-                    "id": p.id,
-                    "scope": p.scope,
-                    "project": p.project,
-                    "created_at": p.created_at,
-                    "rule_count": p.rules.len(),
+                    "id": packet.id,
+                    "scope": packet.scope,
+                    "project": packet.project,
+                    "created_at": packet.created_at,
+                    "rule_count": packet.rules.len(),
                 })
             })
             .collect();
         drop(packets);
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "surface_packets": surface_packets,
-            "count": surface_packets.len(),
-        }))?)
+        let page = serde_json::json!({
+            "order": "created_at_desc,id_asc",
+            "exact_reader": "bbox_inspect_entity(entity_ref=packet:<id>, property=body)",
+        });
+        self.surface_page(page, "surface_packets", rows, offset, limit)
     }
 
     fn handle_mcp_surface_describe(
@@ -203,27 +335,7 @@ impl BlackboxServer {
                     .unwrap_or_default()
             )
         })?;
-
-        let rules: Vec<serde_json::Value> = packet
-            .rules
-            .iter()
-            .map(|r| {
-                let classification = r.classification.as_str();
-                let matching_surface = match &r.antecedent {
-                    packets::Predicate::Eq { field, value } if field == "surface" => match value {
-                        packets::Value::String(s) => s.clone(),
-                        other => format!("{:?}", other),
-                    },
-                    _ => "*".to_string(),
-                };
-                serde_json::json!({
-                    "id": r.id,
-                    "classification": classification,
-                    "matches_surface": matching_surface,
-                })
-            })
-            .collect();
-
+        let packet_id = packet.id.clone();
         let packet_meta = serde_json::json!({
             "id": packet.id,
             "domain": packet.domain,
@@ -231,42 +343,62 @@ impl BlackboxServer {
             "project": packet.project,
             "rule_count": packet.rules.len(),
         });
-        drop(packets);
 
         let selected = p.surface.as_deref().unwrap_or("default");
         let entity = surface::build_surface_entity(selected, p.project.as_deref());
-        let packets_guard = self.state.packets.read();
         let decision = surface::evaluate_tool_surface(
-            &packets_guard,
+            &packets,
             entity,
             p.project.as_deref(),
             resolved_project_id,
         );
-        drop(packets_guard);
+        drop(packets);
 
-        let verdict_summary = match &decision.verdict {
-            surface::ToolSurfaceVerdict::ToolSurface {
-                allow, disallow, ..
-            } => serde_json::json!({
-                "route": "tool_surface",
-                "allow": allow,
-                "disallow": disallow,
-            }),
-            surface::ToolSurfaceVerdict::Deny { reason } => serde_json::json!({
-                "route": "deny",
-                "reason": reason,
-            }),
-        };
+        let verdict = surface_verdict_summary(&decision.verdict);
+        let limit = p.limit.unwrap_or(20).clamp(1, 100);
+        let offset = p.offset.unwrap_or(0);
+        if matches!(p.detail, Some(McpSurfaceDetail::Policy)) {
+            let rows = Self::surface_policy_rows(&decision.verdict);
+            let page = serde_json::json!({
+                "packet": packet_meta,
+                "selected_surface": selected,
+                "detail": "policy",
+                "policy_order": "allow_patterns_then_disallow_patterns",
+                "verdict_for_selected": verdict,
+                "exact_reader": format!("bbox_inspect_entity(entity_ref=packet:{packet_id}, property=body)"),
+            });
+            return self.surface_page(page, "policy", rows, offset, limit);
+        }
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
+        let rows: Vec<_> = packet
+            .rules
+            .iter()
+            .map(|rule| {
+                let matching_surface = match &rule.antecedent {
+                    packets::Predicate::Eq { field, value } if field == "surface" => match value {
+                        packets::Value::String(value) => value.clone(),
+                        other => format!("{other:?}"),
+                    },
+                    _ => "*".to_string(),
+                };
+                serde_json::json!({
+                    "id": rule.id,
+                    "classification": rule.classification,
+                    "matches_surface": matching_surface,
+                })
+            })
+            .collect();
+        let page = serde_json::json!({
             "packet": packet_meta,
-            "rules": rules,
             "selected_surface": selected,
-            "verdict_for_selected": verdict_summary,
-        }))?)
+            "rule_order": "packet_rule_order",
+            "verdict_for_selected": verdict,
+            "exact_reader": format!("bbox_inspect_entity(entity_ref=packet:{packet_id}, property=body)"),
+            "policy_detail_hint": "detail=policy pages exact allow/disallow patterns",
+        });
+        self.surface_page(page, "rules", rows, offset, limit)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,18 +492,23 @@ mod tests {
                 action: McpSurfaceAction::Replay,
                 surface: Some("readonly".to_string()),
                 project: None,
+                detail: None,
+                limit: None,
+                offset: None,
             }))
             .await;
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
         let parsed: serde_json::Value =
             serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
-        assert!(!parsed["visible_tools"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["verdict"]["allow_count"], 1);
+        assert_eq!(parsed["verdict"]["disallow_count"], 0);
+        assert!(parsed.get("policy").is_none());
         let visible: Vec<&str> = parsed["visible_tools"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["name"].as_str().unwrap())
             .collect();
         assert!(visible.contains(&"bbox_search"));
         assert!(visible.contains(&"bbox_stats"));
@@ -406,6 +543,9 @@ mod tests {
                     action: McpSurfaceAction::Replay,
                     surface: Some("unknown".to_string()),
                     project: None,
+                    detail: None,
+                    limit: None,
+                    offset: None,
                 },
                 None,
             )
@@ -454,6 +594,9 @@ mod tests {
                     action: McpSurfaceAction::Replay,
                     surface: Some("default".to_string()),
                     project: Some(project_path.to_string()),
+                    detail: None,
+                    limit: None,
+                    offset: None,
                 },
                 None,
             )
@@ -465,7 +608,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["name"].as_str().unwrap())
             .collect();
         assert!(
             visible.contains(&"bbox_stats"),
@@ -479,6 +622,9 @@ mod tests {
                     action: McpSurfaceAction::Replay,
                     surface: Some("default".to_string()),
                     project: None,
+                    detail: None,
+                    limit: None,
+                    offset: None,
                 },
                 None,
             )
@@ -489,7 +635,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v["name"].as_str().unwrap())
             .collect();
         assert!(
             !visible_global.contains(&"bbox_stats"),
@@ -520,9 +666,19 @@ mod tests {
         );
         drop(packets);
 
-        let result = server.handle_mcp_surface_list().unwrap();
+        let result = server.handle_mcp_surface_list(20, 0).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["offset"], 0);
+        assert_eq!(parsed["limit"], 20);
+        assert_eq!(parsed["next_offset"], serde_json::Value::Null);
+        assert!(
+            parsed["continuation_semantics"]
+                .as_str()
+                .unwrap()
+                .starts_with("live_offset")
+        );
         let arr = parsed["surface_packets"].as_array().unwrap();
         assert_eq!(arr[0]["rule_count"], 2);
     }
@@ -531,7 +687,7 @@ mod tests {
     fn test_list_empty_when_no_packets() {
         let (_tmp, server) = make_server();
 
-        let result = server.handle_mcp_surface_list().unwrap();
+        let result = server.handle_mcp_surface_list(20, 0).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["count"], 0);
     }
@@ -564,6 +720,9 @@ mod tests {
                     action: McpSurfaceAction::Describe,
                     surface: Some("readonly".to_string()),
                     project: None,
+                    detail: None,
+                    limit: None,
+                    offset: None,
                 },
                 None,
             )
@@ -583,6 +742,170 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_policy_detail_pages_exact_patterns() {
+        let (_tmp, server) = make_server();
+        let packets = server.state.packets.read();
+        compile_surface_packet(
+            &packets,
+            vec![surface_rule(
+                "readonly",
+                "readonly",
+                &["bbox_search", "bbox_stats"],
+                &["bbox_secret_*"],
+                "tool_surface",
+            )],
+            "global",
+            None,
+        );
+        drop(packets);
+
+        let mut params = McpSurfaceParams {
+            action: McpSurfaceAction::Replay,
+            surface: Some("readonly".to_string()),
+            project: None,
+            detail: Some(McpSurfaceDetail::Policy),
+            limit: Some(1),
+            offset: None,
+        };
+        let result = server.handle_mcp_surface_replay(&params, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["detail"], "policy");
+        assert_eq!(
+            parsed["policy_order"],
+            "allow_patterns_then_disallow_patterns"
+        );
+        assert_eq!(parsed["total"], 3);
+        assert_eq!(parsed["offset"], 0);
+        assert_eq!(parsed["next_offset"], 1);
+        assert_eq!(parsed["policy"][0]["kind"], "allow");
+        assert_eq!(parsed["policy"][0]["pattern"], "bbox_search");
+
+        params.offset = Some(1);
+        let result = server.handle_mcp_surface_replay(&params, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["policy"][0]["pattern"], "bbox_stats");
+        assert_eq!(parsed["next_offset"], 2);
+
+        params.offset = Some(2);
+        let result = server.handle_mcp_surface_replay(&params, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["policy"][0]["kind"], "disallow");
+        assert_eq!(parsed["policy"][0]["pattern"], "bbox_secret_*");
+        assert_eq!(parsed["next_offset"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_describe_policy_detail_reports_exact_reader() {
+        let (_tmp, server) = make_server();
+        let packets = server.state.packets.read();
+        let packet_id = compile_surface_packet(
+            &packets,
+            vec![surface_rule(
+                "readonly",
+                "readonly",
+                &["bbox_search"],
+                &["bbox_secret_*"],
+                "tool_surface",
+            )],
+            "global",
+            None,
+        );
+        drop(packets);
+
+        let result = server
+            .handle_mcp_surface_describe(
+                &McpSurfaceParams {
+                    action: McpSurfaceAction::Describe,
+                    surface: Some("readonly".to_string()),
+                    project: None,
+                    detail: Some(McpSurfaceDetail::Policy),
+                    limit: Some(20),
+                    offset: Some(0),
+                },
+                None,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["selected_surface"], "readonly");
+        assert_eq!(parsed["total"], 2);
+        assert_eq!(parsed["policy"][0]["pattern"], "bbox_search");
+        assert_eq!(parsed["policy"][1]["pattern"], "bbox_secret_*");
+        assert!(
+            parsed["exact_reader"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("packet:{packet_id}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_rejects_replay_and_describe_selectors() {
+        let (_tmp, server) = make_server();
+
+        let result = server
+            .bbox_mcp_surface(Parameters(McpSurfaceParams {
+                action: McpSurfaceAction::List,
+                surface: Some("readonly".to_string()),
+                project: None,
+                detail: Some(McpSurfaceDetail::Policy),
+                limit: Some(20),
+                offset: Some(0),
+            }))
+            .await;
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        let error = result.content[0].as_text().unwrap().text;
+        assert!(error.contains("action=list"), "{error}");
+    }
+
+    #[test]
+    fn test_list_stale_offset_is_rejected() {
+        let (_tmp, server) = make_server();
+
+        let error = server
+            .handle_mcp_surface_list(20, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("error.stale_surface_offset"), "{error}");
+    }
+
+    #[test]
+    fn test_surface_page_byte_limit_recomputes_next_offset() {
+        let (_tmp, server) = make_server();
+        let rows: Vec<_> = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "payload": "p".repeat(1024),
+                })
+            })
+            .collect();
+
+        let mut offset = 0;
+        let mut indexes = Vec::new();
+        loop {
+            let page = server
+                .surface_page(serde_json::Value::Null, "rows", rows.clone(), offset, 100)
+                .unwrap();
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            let returned = page["rows"].as_array().unwrap();
+            assert!(!returned.is_empty());
+            indexes.extend(returned.iter().map(|row| row["index"].as_u64().unwrap()));
+            offset = match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(page["byte_limited"], true);
+                    usize::try_from(next).unwrap()
+                }
+                None => {
+                    assert_eq!(page["byte_limited"], serde_json::Value::Null);
+                    break;
+                }
+            };
+        }
+
+        assert_eq!(indexes, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_describe_no_packet_returns_error() {
         let (_tmp, server) = make_server();
 
@@ -591,6 +914,9 @@ mod tests {
                 action: McpSurfaceAction::Describe,
                 surface: Some("readonly".to_string()),
                 project: None,
+                detail: None,
+                limit: None,
+                offset: None,
             },
             None,
         );

@@ -298,3 +298,110 @@ fn list_events_filters_and_newest_first() {
     let limited = packets.list_events(None, None, None, None, 1).unwrap();
     assert_eq!(limited.len(), 1);
 }
+#[test]
+fn events_page_continues_with_cursors_and_reports_live_semantics() {
+    let (_d, packets) = tmp_packets();
+    packets.log_gap("gap A", None, None, None, None).unwrap();
+    packets.log_gap("gap B", None, None, None, None).unwrap();
+
+    let params: EventsParams = serde_json::from_value(json!({"op": "gap", "limit": 1})).unwrap();
+    let first = packets.events_page(&params).unwrap();
+    assert_eq!(first["count"], 1);
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["offset"], 0);
+    assert_eq!(first["order"], "timestamp_file_order_desc");
+    assert_eq!(
+        first["events"][0]["details"]["description"], "gap B",
+        "newest event must come first"
+    );
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    packets
+        .log_gap("appended gap C", None, None, None, None)
+        .unwrap();
+
+    let mut continuation: EventsParams =
+        serde_json::from_value(json!({"op": "gap", "limit": 1})).unwrap();
+    continuation.cursor = Some(cursor);
+    let second = packets.events_page(&continuation).unwrap();
+    assert_eq!(second["total"], 3);
+    assert_eq!(second["offset"], 2);
+    assert_eq!(
+        second["events"][0]["details"]["description"], "gap A",
+        "continuation must advance without overlap"
+    );
+    assert_eq!(second["next_cursor"], serde_json::Value::Null);
+}
+
+#[test]
+fn events_page_counts_malformed_lines_and_rejects_shrunk_cursor() {
+    let (directory, packets) = tmp_packets();
+    packets.log_gap("gap A", None, None, None, None).unwrap();
+    packets.log_gap("gap B", None, None, None, None).unwrap();
+
+    let params: EventsParams = serde_json::from_value(json!({"op": "gap", "limit": 1})).unwrap();
+    let first = packets.events_page(&params).unwrap();
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+
+    let event_log = directory.path().join("events.jsonl");
+    let raw = std::fs::read_to_string(&event_log).unwrap();
+    std::fs::write(&event_log, format!("{raw}not-json\n")).unwrap();
+    let malformed = packets.events_page(&params).unwrap();
+    assert_eq!(malformed["malformed_lines_omitted"], 1);
+    assert_eq!(malformed["total"], 2);
+
+    let mut continuation: EventsParams =
+        serde_json::from_value(json!({"op": "gap", "limit": 1})).unwrap();
+    continuation.cursor = Some(cursor);
+    let shrunk = format!("{}\n", raw.lines().next().unwrap());
+    std::fs::write(&event_log, shrunk).unwrap();
+    let error = packets.events_page(&continuation).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("error.stale_event_cursor"), "{message}");
+}
+#[test]
+fn large_event_pages_remain_bounded_and_recover_the_tail() {
+    let (directory, packets) = tmp_packets();
+    let event_log = directory.path().join("events.jsonl");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&event_log).unwrap();
+        for sequence in 0..501 {
+            let event =
+                PacketEvent::now("gap", "logged").with_details(json!({"sequence": sequence}));
+            writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+        }
+    }
+
+    let params: EventsParams = serde_json::from_value(json!({"op": "gap", "limit": 1000})).unwrap();
+    let first = packets.events_page(&params).unwrap();
+    assert_eq!(first["limit"], 500);
+    assert_eq!(first["total"], 501);
+    assert_eq!(first["events"][0]["details"]["sequence"], 500);
+    let mut first_count = first["count"].as_u64().unwrap();
+    assert!(
+        first_count > 0 && first_count < 500,
+        "byte budget must bound the requested 500 rows"
+    );
+    assert_eq!(first["next_offset"], first_count);
+    let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let mut newest_remaining = 500u64;
+
+    let mut continuation: EventsParams =
+        serde_json::from_value(json!({"op": "gap", "limit": 1000})).unwrap();
+    while let Some(next_cursor) = cursor.clone() {
+        continuation.cursor = Some(next_cursor);
+        let tail = packets.events_page(&continuation).unwrap();
+        let count = tail["count"].as_u64().unwrap();
+        assert!(count > 0);
+        let sequence = tail["events"][0]["details"]["sequence"].as_u64().unwrap();
+        assert!(sequence < newest_remaining);
+        newest_remaining = sequence;
+        first_count += count;
+        cursor = tail["next_cursor"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_default();
+    }
+    assert_eq!(first_count, 501);
+    assert_eq!(newest_remaining, 0);
+}

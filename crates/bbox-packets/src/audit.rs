@@ -38,6 +38,7 @@ pub struct FidelityReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mismatch {
+    pub dataset_index: usize,
     pub entity: serde_json::Value,
     pub expected: Value,
     pub predicted: Option<Value>,
@@ -58,6 +59,7 @@ pub struct AllModeFidelityReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllModeMismatch {
+    pub dataset_index: usize,
     pub entity: serde_json::Value,
     /// `"verdict"` when aggregate verdict diverged; `"rule_ids"` when
     /// fired-rule-id set diverged; `"both"` when both diverged.
@@ -95,7 +97,7 @@ pub fn verify_all_with(
     let mut correct = 0usize;
     let mut mismatches = Vec::new();
 
-    for row in rows {
+    for (dataset_index, row) in rows.iter().enumerate() {
         let entity = row
             .get("entity")
             .cloned()
@@ -149,6 +151,7 @@ pub fn verify_all_with(
                 _ => unreachable!(),
             };
             mismatches.push(AllModeMismatch {
+                dataset_index,
                 entity: entity.clone(),
                 check: check.to_string(),
                 expected_verdict: if !verdict_ok {
@@ -199,7 +202,7 @@ pub fn verify_with(
     let mut mismatches = Vec::new();
     let mut uncovered = Vec::new();
 
-    for row in rows {
+    for (dataset_index, row) in rows.iter().enumerate() {
         let entity = row
             .get("entity")
             .cloned()
@@ -220,6 +223,7 @@ pub fn verify_with(
             }
             Some(prediction) => {
                 mismatches.push(Mismatch {
+                    dataset_index,
                     entity: entity.clone(),
                     expected,
                     predicted: Some(prediction.consequent),
