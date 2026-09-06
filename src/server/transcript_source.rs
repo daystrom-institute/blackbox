@@ -199,7 +199,7 @@ async fn onboard(
         return reply::<()>(Err(anyhow!("catalog unavailable")));
     };
     let grants = connectors.grants().to_vec();
-    let result = blocking(move || {
+    let mut result = blocking(move || {
         let onboard = bbox_indexing::project_catalog_admin::ConnectorOnboardRequest {
             producer_id: grant.producer_id, scope: request.scope.clone(),
             probed_connector_kind: request.scope.connector_kind().as_str().into(),
@@ -210,13 +210,19 @@ async fn onboard(
         };
         let epoch = catalog.snapshot().map_err(|e| anyhow!("{e}"))?.epoch();
         let receipt = bbox_indexing::project_catalog_admin::connector_onboard(&catalog, epoch, &grants, &onboard).map_err(|e| anyhow!("{e}"))?;
-        Ok(serde_json::json!({"project_id": receipt.project_id.as_str(), "created": receipt.created, "epoch": receipt.catalog_epoch}))
+        Ok(serde_json::json!({"project_id": receipt.project_id.as_str(), "created": receipt.created, "epoch": receipt.catalog_epoch, "catalog_admitted": true, "reload_pending": false}))
     }).await;
     if result.is_ok() {
         let config = state.config.read().clone();
         let records = state.records_provider.records_snapshot().records;
         if let Err(error) = state.code_sources.reload(&config, &records) {
-            return reply::<()>(Err(error));
+            tracing::warn!(%error, "native transcript catalog admission succeeded but grant reload is pending");
+            if let Ok(receipt) = result.as_mut() {
+                receipt["catalog_admitted"] = serde_json::Value::Bool(true);
+                receipt["reload_pending"] = serde_json::Value::Bool(true);
+                receipt["next_step"] = serde_json::Value::String("Retry onboard idempotently to reload publication authority; the catalog project already exists.".into());
+            }
+            return reply(result);
         }
         state.nudge_edge_index_rebuild();
     }
