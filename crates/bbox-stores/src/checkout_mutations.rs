@@ -247,6 +247,9 @@ impl CheckoutMutations {
                     && row.status != CheckoutMutationStatus::Failed
                     && (published.is_some()
                         || (row.status == CheckoutMutationStatus::Applied
+                            && row.publication.as_ref().is_some_and(|publication| {
+                                publication.base_content_json.is_some()
+                            })
                             && !self.store.mutations[..index].iter().any(|previous| {
                                 &previous.mutation.scope == scope
                                     && previous.mutation.relative_path == relative_path
@@ -513,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn tracked_delete_waits_for_delivery_of_the_entire_path_prefix() {
+    fn tracked_delete_requires_published_presence_and_settled_delivery_prefix() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let path = root.join("mutations.json");
@@ -551,6 +554,9 @@ mod tests {
         assert_eq!(store.write_base(&scope(), file, None).unwrap(), None);
         assert_eq!(store.outstanding_intents().count(), 2);
         store.ack(&write, "applied", None, None, "now").unwrap();
+        assert!(!store.observe_publication(&scope(), file, None));
+        assert_eq!(store.write_base(&scope(), file, Some("{}")).unwrap(), None);
+        assert_eq!(store.outstanding_intents().count(), 1);
         assert!(store.observe_publication(&scope(), file, None));
         assert_eq!(store.outstanding_intents().count(), 0);
     }

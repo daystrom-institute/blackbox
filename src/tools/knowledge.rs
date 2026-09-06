@@ -650,7 +650,9 @@ impl BlackboxServer {
                 }
                 Err(error) if error.code() == ERROR_ACCEPTED_PUBLICATION_MISSING => false,
                 Err(_) if known_local => false,
-                Err(error) => return Err(error.into()),
+                Err(error) => anyhow::bail!(
+                    "cannot establish a unique knowledge owner while a project publication is unavailable; pass project to select the mutation owner: {error}"
+                ),
             };
             let path = format!(".bbox/knowledge/{id}.json");
             let queued = self
@@ -674,6 +676,23 @@ impl BlackboxServer {
             );
         }
         Ok(owners.into_iter().next())
+    }
+
+    fn covered_knowledge_mutation_scope(
+        &self,
+        id: &str,
+        project: Option<&str>,
+    ) -> anyhow::Result<Option<(String, bbox_corpus_core::identity::PublishedScope)>> {
+        let Some(project) = project.filter(|project| !project.trim().is_empty()) else {
+            return self.covered_knowledge_entry_scope(id);
+        };
+        let project_id = self.validate_project_selection(project)?;
+        let scope = self.covered_scope_for_project_id(&project_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "project does not have checkout-owner mutation authority; omit project for global or local-store entries"
+            )
+        })?;
+        Ok(Some((project_id, scope)))
     }
 
     /// Apply a learn write's field patch to a served entry (the store's
@@ -733,8 +752,9 @@ impl BlackboxServer {
         &self,
         action: &str,
         id: &str,
+        project: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
+        let Some((project_id, scope)) = self.covered_knowledge_mutation_scope(id, project)? else {
             return Ok(None);
         };
         self.mutate_queued_knowledge(&project_id, scope, "bbox_review", |transaction| {
@@ -765,7 +785,9 @@ impl BlackboxServer {
             Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
             Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
         };
-        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(&source_id)? else {
+        let Some((project_id, scope)) =
+            self.covered_knowledge_mutation_scope(&source_id, p.project.as_deref())?
+        else {
             return Ok(None);
         };
         bbox_corpus_core::entity_ref::EntityRef::parse(&p.target)
@@ -1015,7 +1037,9 @@ impl BlackboxServer {
         p: &crate::knowledge::ForgetParams,
     ) -> anyhow::Result<Option<String>> {
         let id = p.id.strip_prefix("knowledge:").unwrap_or(&p.id);
-        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
+        let Some((project_id, scope)) =
+            self.covered_knowledge_mutation_scope(id, p.project.as_deref())?
+        else {
             return Ok(None);
         };
         self.mutate_queued_knowledge(&project_id, scope, "bbox_forget", |transaction| {

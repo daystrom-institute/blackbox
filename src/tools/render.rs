@@ -362,11 +362,16 @@ impl BlackboxServer {
         let result = Self::run_blocking("bbox_review", move || {
             let mut p = p;
             if !matches!(p.action.as_deref().unwrap_or("list"), "approve" | "reject") {
+                anyhow::ensure!(
+                    p.project.is_none(),
+                    "project selects a mutation owner and applies only to approve/reject"
+                );
                 return server.review_session_knowledge(&p);
             }
             if let Some(text) = server.enqueue_review_via_checkout_owner(
                 p.action.as_deref().unwrap_or("list"),
                 p.id.as_deref().unwrap_or_default(),
+                p.project.as_deref(),
             )? {
                 *worker_owner.lock() =
                     Some(super::knowledge::KnowledgeMutationOwner::CheckoutQueue);
@@ -829,6 +834,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = visibility_fixture(&temp);
         let list = ReviewParams {
+            project: None,
             action: Some("list".into()),
             id: None,
         };
@@ -896,6 +902,7 @@ mod tests {
             fixture
                 .server
                 .review_session_knowledge(&ReviewParams {
+                    project: None,
                     action: Some("list".into()),
                     id: None,
                 })

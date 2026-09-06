@@ -169,6 +169,11 @@ pub struct ForgetParams {
     /// Mark as superseded instead of deleted
     #[serde(default)]
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Project selector for checkout-owner mutations. Omit for global or local-store entries."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -773,6 +778,11 @@ pub struct ReviewParams {
     /// Entry ID (required for approve/reject)
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Project selector for checkout-owner approve/reject mutations. Omit for global or local-store entries."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -828,6 +838,11 @@ pub struct KnowledgeLinkParams {
     pub source_arc: Option<String>,
     #[serde(default)]
     pub confidence: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Project selector for the source entry's checkout-owner mutation. Omit for global or local-store entries."
+    )]
+    pub project: Option<String>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -6667,6 +6682,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert_eq!(updated.content, "updated only in the checkout generation");
         kb.append_link_with_write_dir(
             &KnowledgeLinkParams {
+                project: None,
                 source: format!("knowledge:{id}"),
                 target: "knowledge:related".into(),
                 kind: "related".into(),
@@ -6683,6 +6699,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert_eq!(linked.links.len(), 1);
         kb.review_with_write_dir(
             &ReviewParams {
+                project: None,
                 action: Some("approve".into()),
                 id: Some(id.into()),
             },
@@ -6694,6 +6711,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert_eq!(approved.approval, Approval::UserConfirmed);
         kb.forget_with_write_dir(
             &ForgetParams {
+                project: None,
                 id: id.into(),
                 superseded_by: None,
             },
