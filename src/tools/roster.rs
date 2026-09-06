@@ -349,7 +349,18 @@ impl BlackboxServer {
         name = "bro_brofile",
         description = "Manage brofiles and accounts. list/list_accounts return bounded summary pages; get/get_account return exact redaction-safe JSON body pages."
     )]
-    pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
+    pub(crate) async fn bro_brofile(
+        &self,
+        Parameters(p): Parameters<BrofileParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        match tokio::task::spawn_blocking(move || server.bro_brofile_sync(Parameters(p))).await {
+            Ok(result) => result,
+            Err(error) => Self::err_text(&format!("brofile task failed: {error}")),
+        }
+    }
+
+    fn bro_brofile_sync(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
         let exact = matches!(p.action.as_str(), "get" | "get_account" | "list_accounts");
         if !exact && (p.cursor.is_some() || p.body_limit.is_some()) {
@@ -887,12 +898,14 @@ impl BlackboxServer {
     }
 }
 
-/// Team project association is worker context. Only bridge mode also grants
-/// local template/brofile lookup authority; apply this on dispatch as on create.
 /// Canonical store identity for content-bound cursors. The digest inside a
 /// cursor never discloses the path; canonicalization keeps two distinct
 /// aliases of one store from splitting identity, falling back to the raw
 /// path when the store is not resolvable.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bro_brofile runs its store operations on spawn_blocking; tests use isolated fixture directories"
+)]
 fn store_identity(dir: &Path) -> String {
     std::fs::canonicalize(dir)
         .map(|path| path.to_string_lossy().into_owned())
@@ -1669,7 +1682,7 @@ mod tests {
                 "action": action, "name": "synthetic", "provider": "brodex", "account": "synthetic",
             }))
             .unwrap();
-            let result = server.bro_brofile(Parameters(params));
+            let result = server.bro_brofile_sync(Parameters(params));
             assert_eq!(
                 result.is_error,
                 Some(true),
@@ -1684,7 +1697,7 @@ mod tests {
         std::fs::write(path.join("retained"), "existing-data").unwrap();
         let params: BrofileParams =
             serde_json::from_value(json!({"action": "set_account", "name": "synthetic"})).unwrap();
-        let result = server.bro_brofile(Parameters(params));
+        let result = server.bro_brofile_sync(Parameters(params));
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
             std::fs::read_to_string(path.join("retained")).unwrap(),
@@ -1712,7 +1725,7 @@ mod tests {
             "action": "set_account", "name": "synthetic", "env": {"TOKEN": "new-secret"},
         }))
         .unwrap();
-        let result = server.bro_brofile(Parameters(params));
+        let result = server.bro_brofile_sync(Parameters(params));
         assert_ne!(result.is_error, Some(true));
         let updated =
             orchestration::brofile::load_account("synthetic", &server.state.store_dir).unwrap();
@@ -1744,7 +1757,7 @@ mod tests {
                 "account": "synthetic", "env": {"TOKEN": "synthetic-secret"},
             }))
             .unwrap();
-            let result = server.bro_brofile(Parameters(params));
+            let result = server.bro_brofile_sync(Parameters(params));
             assert_eq!(result.is_error, Some(true), "{action} claimed success");
             let response = extract_text(&result);
             assert!(response.contains("not saved"));
@@ -1763,12 +1776,12 @@ mod tests {
             "env": {"TOKEN": "synthetic-secret", "CUSTOM": "opaque-secret"},
         }))
         .unwrap();
-        let result = server.bro_brofile(Parameters(params));
+        let result = server.bro_brofile_sync(Parameters(params));
         assert_ne!(result.is_error, Some(true));
         let set_reply = extract_text(&result);
         let params: BrofileParams =
             serde_json::from_value(json!({"action": "list_accounts"})).unwrap();
-        let list_reply = extract_text(&server.bro_brofile(Parameters(params)));
+        let list_reply = extract_text(&server.bro_brofile_sync(Parameters(params)));
         for reply in [&set_reply, &list_reply] {
             assert!(!reply.contains("synthetic-secret"));
             assert!(!reply.contains("opaque-secret"));
@@ -1800,7 +1813,7 @@ mod tests {
                 "action": "list", "scope": scope, "project_dir": project_dir,
             }))
             .unwrap();
-            let result = server.bro_brofile(Parameters(params));
+            let result = server.bro_brofile_sync(Parameters(params));
             assert_eq!(result.is_error, Some(true), "{scope:?} {project_dir:?}");
             let text = extract_text(&result);
             assert!(text.contains(expected), "{scope:?}: {text}");
@@ -1837,7 +1850,7 @@ mod tests {
             "project_dir": project.to_str().unwrap(),
         }))
         .unwrap();
-        let reply = extract_text(&server.bro_brofile(Parameters(project_get)));
+        let reply = extract_text(&server.bro_brofile_sync(Parameters(project_get)));
         assert!(reply.contains("project lens"), "{reply}");
         assert!(!reply.contains("global lens"), "{reply}");
 
@@ -1845,7 +1858,7 @@ mod tests {
             "action": "get", "name": "override-missing", "scope": "global",
         }))
         .unwrap();
-        let reply = extract_text(&server.bro_brofile(Parameters(global_only)));
+        let reply = extract_text(&server.bro_brofile_sync(Parameters(global_only)));
         assert!(reply.contains("not found in global scope"), "{reply}");
     }
 
@@ -1883,7 +1896,7 @@ mod tests {
             "project_dir": project_a.to_str().unwrap(),
         }))
         .unwrap();
-        let first = extract_text(&server.bro_brofile(Parameters(page)));
+        let first = extract_text(&server.bro_brofile_sync(Parameters(page)));
         let first: Value = serde_json::from_str(&first).unwrap();
         assert!(first["body"]["text"].as_str().unwrap().len() <= 4096);
         let cursor = first["body"]["next_cursor"].as_str().unwrap().to_owned();
@@ -1895,7 +1908,7 @@ mod tests {
             "project_dir": project_b.to_str().unwrap(), "cursor": cursor,
         }))
         .unwrap();
-        let result = server.bro_brofile(Parameters(cross_store));
+        let result = server.bro_brofile_sync(Parameters(cross_store));
         assert_eq!(result.is_error, Some(true));
 
         let mut reconstructed = first["body"]["text"].as_str().unwrap().to_owned();
@@ -1907,7 +1920,7 @@ mod tests {
             }))
             .unwrap();
             let page: Value =
-                serde_json::from_str(&extract_text(&server.bro_brofile(Parameters(params))))
+                serde_json::from_str(&extract_text(&server.bro_brofile_sync(Parameters(params))))
                     .unwrap();
             reconstructed.push_str(page["body"]["text"].as_str().unwrap());
             cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
@@ -1937,7 +1950,7 @@ mod tests {
             },
         );
         orchestration::brofile::save_config(&config, &server.state.store_dir).unwrap();
-        let response = server.bro_brofile(Parameters(
+        let response = server.bro_brofile_sync(Parameters(
             serde_json::from_value(json!({"action":"list_accounts"})).unwrap(),
         ));
         assert_ne!(response.is_error, Some(true));
@@ -1948,7 +1961,7 @@ mod tests {
         let mut joined = String::new();
         let mut cursor = None;
         loop {
-            let response = server.bro_brofile(Parameters(
+            let response = server.bro_brofile_sync(Parameters(
                 serde_json::from_value(
                     json!({"action":"list_accounts", "body_limit":512,"cursor":cursor}),
                 )
@@ -1990,7 +2003,7 @@ mod tests {
 
         let params: BrofileParams =
             serde_json::from_value(json!({"action": "list_accounts"})).unwrap();
-        let reply = extract_text(&server.bro_brofile(Parameters(params)));
+        let reply = extract_text(&server.bro_brofile_sync(Parameters(params)));
         assert!(!reply.contains("value-synthetic"), "{reply}");
         let page: Value = serde_json::from_str(&reply).unwrap();
         let row = &page["accounts"][0];
@@ -2012,7 +2025,7 @@ mod tests {
             }
             let params: BrofileParams = serde_json::from_value(request).unwrap();
             let page: Value =
-                serde_json::from_str(&extract_text(&server.bro_brofile(Parameters(params))))
+                serde_json::from_str(&extract_text(&server.bro_brofile_sync(Parameters(params))))
                     .unwrap();
             reconstructed.push_str(page["body"]["text"].as_str().unwrap());
             cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
