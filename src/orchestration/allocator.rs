@@ -244,6 +244,68 @@ pub struct ProbeStore {
     pub records: BTreeMap<String, ProbeRecord>,
 }
 
+/// Number of `raw_summary` bytes kept in compact inventory/preview rows. The
+/// exact record stays reachable through the per-lane probe read.
+const RAW_SUMMARY_PREVIEW_BYTES: usize = 256;
+
+fn preview_raw_summary(summary: &str) -> Value {
+    let mut end = RAW_SUMMARY_PREVIEW_BYTES.min(summary.len());
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut row = serde_json::json!({"text": &summary[..end]});
+    if end < summary.len() {
+        row["text_truncated"] = Value::Bool(true);
+    }
+    row
+}
+
+impl ProbeRecord {
+    /// Compact caller-facing lane status. `raw_summary` is opaque audit text,
+    /// not a credential sink: inventories preview it with an explicit
+    /// truncation marker, and the exact per-lane record stays reachable
+    /// through the probe read's bounded body pages.
+    pub fn summary_view(&self, now: u64) -> Value {
+        let mut view = serde_json::json!({
+            "provider": self.provider.as_str(),
+            "credential_status": self.credential_status,
+            "quota_status": self.quota_status,
+            "quota_confidence": self.quota_confidence,
+        });
+        if let Some(account) = &self.account {
+            view["account"] = Value::String(account.clone());
+        }
+        for (field, value) in [
+            ("five_hour_utilization", self.five_hour_utilization),
+            ("seven_day_utilization", self.seven_day_utilization),
+            ("balance_capacity", self.balance_capacity),
+        ] {
+            if let Some(value) = value {
+                view[field] = serde_json::json!(value);
+            }
+        }
+        for (field, value) in [
+            ("cooldown_until", self.cooldown_until),
+            ("last_probe_at", self.last_probe_at),
+            (
+                "last_runtime_observation_at",
+                self.last_runtime_observation_at,
+            ),
+        ] {
+            if let Some(value) = value {
+                view[field] = serde_json::json!(value);
+            }
+        }
+        if let Some(until) = self.cooldown_until {
+            view["cooldown_active"] = Value::Bool(until > now);
+        }
+        if let Some(summary) = &self.raw_summary {
+            view["raw_summary_preview"] = preview_raw_summary(summary);
+        }
+        view
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLane {
     pub provider: Provider,
@@ -1331,7 +1393,9 @@ pub fn lease_store_load(store_dir: &Path) -> RuntimeLeaseStore {
 }
 
 pub fn lease_store_save(store_dir: &Path, store: &RuntimeLeaseStore) {
-    write_json_atomic(&leases_file(store_dir), store);
+    if let Err(error) = write_json_atomic(&leases_file(store_dir), store) {
+        tracing::warn!(target: "blackbox::allocator", %error, "lease store save failed");
+    }
 }
 
 pub fn probe_store_load(store_dir: &Path) -> ProbeStore {
@@ -1341,8 +1405,11 @@ pub fn probe_store_load(store_dir: &Path) -> ProbeStore {
         .unwrap_or_default()
 }
 
-pub fn probe_store_save(store_dir: &Path, store: &ProbeStore) {
-    write_json_atomic(&probes_file(store_dir), store);
+/// Persist the probe store. Errors are real: the previous file (if any) is
+/// untouched because publication is an atomic rename, so callers must
+/// propagate the failure instead of reporting a durable update.
+pub fn probe_store_save(store_dir: &Path, store: &ProbeStore) -> std::io::Result<()> {
+    write_json_atomic(&probes_file(store_dir), store)
 }
 
 pub fn record_lease(store_dir: &Path, lease: RuntimeLease) {
@@ -1419,7 +1486,9 @@ pub fn lookup_lease_for_task(store_dir: &Path, task_id: &str) -> Option<RuntimeL
 
 pub fn save_trace(store_dir: &Path, trace: &SelectionTrace) {
     let path = traces_dir(store_dir).join(format!("{}.json", trace.id));
-    write_json_atomic(&path, trace);
+    if let Err(error) = write_json_atomic(&path, trace) {
+        tracing::warn!(target: "blackbox::allocator", %error, "selection trace save failed");
+    }
 }
 
 pub fn load_trace(store_dir: &Path, selection_trace_id: &str) -> Option<SelectionTrace> {
@@ -1438,18 +1507,18 @@ fn valid_trace_id(selection_trace_id: &str) -> bool {
         .is_some_and(|suffix| suffix.len() == 32 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) {
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    if let Ok(data) = serde_json::to_string_pretty(value) {
-        if let Ok(mut file) = fs::File::create(&tmp) {
-            let _ = file.write_all(data.as_bytes());
-            let _ = file.sync_all();
-            let _ = fs::rename(tmp, path);
-        }
-    }
+    let data = serde_json::to_string_pretty(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn lease_from_allocation(

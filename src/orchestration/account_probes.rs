@@ -325,7 +325,9 @@ pub async fn refresh_account_probes(store_dir: &Path, home: &Path, now: u64) -> 
         );
         store.records.insert(key.clone(), rec.clone());
     }
-    probe_store_save(store_dir, &store);
+    if let Err(error) = probe_store_save(store_dir, &store) {
+        tracing::warn!(target: "blackbox::allocator", %error, "probe store save failed after account refresh");
+    }
     probed.len()
 }
 
@@ -357,7 +359,9 @@ pub fn record_disruption_cooldown(
         rec.quota_status = QuotaStatus::Exhausted;
     }
     tracing::info!(%provider, ?account, ?disruption, "runtime disruption → lane cooldown");
-    probe_store_save(store_dir, &store);
+    if let Err(error) = probe_store_save(store_dir, &store) {
+        tracing::warn!(target: "blackbox::allocator", %error, "probe store save failed after runtime disruption");
+    }
 }
 
 #[cfg(test)]
@@ -462,7 +466,7 @@ mod tests {
         let mut seed = base_record(Provider::Glm, None, 100);
         seed.five_hour_utilization = Some(0.4);
         store.records.insert(lane_key(Provider::Glm, None), seed);
-        probe_store_save(store_dir, &store);
+        probe_store_save(store_dir, &store).unwrap();
 
         // A 429 lands on a real dispatch.
         record_disruption_cooldown(

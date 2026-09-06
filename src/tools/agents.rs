@@ -17,6 +17,67 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::agents_tools()
 }
 
+/// Bounded preview of a free-text diagnostic field. Not a redaction: this
+/// only bounds transport size and marks truncation.
+pub(crate) fn preview_text(text: &str, max_bytes: usize) -> serde_json::Value {
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == text.len() {
+        return serde_json::Value::String(text.to_string());
+    }
+    serde_json::json!({
+        "text": &text[..end],
+        "text_truncated": true,
+        "total_bytes": text.len(),
+    })
+}
+
+/// Compact manifest identity for summary responses. Exact (redacted) JSON
+/// stays reachable through body pages.
+pub(crate) fn manifest_summary(
+    manifest: &orchestration::agents::types::AgentManifest,
+) -> serde_json::Value {
+    let brofile_kind = if manifest.brofile_ref.is_some() {
+        "ref"
+    } else if manifest.brofile_inline.is_some() {
+        "inline"
+    } else {
+        "none"
+    };
+    let mut summary = serde_json::json!({
+        "brofile_kind": brofile_kind,
+        "cost_class": manifest.cost_class,
+        "allow_recursion": manifest.allow_recursion,
+        "description": preview_text(&manifest.description, 256),
+        "when_to_use_count": manifest.when_to_use.len(),
+        "anti_patterns_count": manifest.anti_patterns.len(),
+        "has_inputs": manifest.inputs.is_some(),
+        "has_outputs": manifest.outputs.is_some(),
+        "has_composition": manifest.composition.is_some(),
+        "embedding": if manifest.embedding.is_some() { "embedded" } else { "pending" },
+    });
+    if let Some(name) = &manifest.brofile_ref {
+        summary["brofile_ref"] = serde_json::Value::String(name.clone());
+    }
+    if let Some(overlay) = &manifest.filter_overlay {
+        summary["filter_overlay"] = serde_json::json!({
+            "allow_count": overlay.allow.len(),
+            "disallow_count": overlay.disallow.len(),
+        });
+    }
+    if let Some(inputs) = &manifest.inputs {
+        if let Some(schema) = &inputs.schema {
+            if let Ok(bytes) = serde_json::to_vec(schema) {
+                summary["input_schema_bytes"] = serde_json::json!(bytes.len());
+            }
+        }
+        summary["has_prompt_template"] = inputs.prompt_template.is_some();
+    }
+    summary
+}
+
 #[tool_router(router = agents_tools)]
 impl BlackboxServer {
     #[tool(
@@ -72,7 +133,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_agent_get",
-        description = "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state."
+        description = "Read one agent by name or agent-ref (name@vN or agent:name@vN). Returns identity, lifecycle state, a compact manifest summary, and exact manifest JSON body pages (credential env values redacted) continued via body.next_cursor."
     )]
     pub(crate) fn bro_agent_get(
         &self,
@@ -115,23 +176,77 @@ impl BlackboxServer {
                     m.insert("superseded_by".into(), serde_json::Value::String(s));
                 }
                 if let Some(parse_err) = rec.manifest_parse_error {
-                    m.insert(
-                        "manifest_parse_error".into(),
-                        serde_json::Value::String(parse_err),
-                    );
+                    m.insert("manifest_parse_error".into(), preview_text(&parse_err, 512));
                 }
                 if let Some(manifest) = rec.manifest {
-                    m.insert(
-                        "manifest".into(),
-                        serde_json::to_value(manifest).unwrap_or_else(|e| {
-                            serde_json::Value::String(format!("<serialize error: {e}>"))
-                        }),
-                    );
+                    m.insert("manifest_summary".into(), manifest_summary(&manifest));
+                    let stored = match serde_json::to_value(&manifest) {
+                        Ok(value) => Self::redact_config_credentials(&value),
+                        Err(error) => {
+                            return Self::err_text(&format!(
+                                "manifest serialization failed: {error}"
+                            ));
+                        }
+                    };
+                    let selection = format!("agent-get:{}", rec.name);
+                    match super::body_page::json_body_page(
+                        &selection,
+                        &stored,
+                        p.cursor.as_deref(),
+                        p.body_limit,
+                    ) {
+                        Ok(body) => {
+                            m.insert("manifest_body".into(), body);
+                        }
+                        Err(error) => {
+                            return Self::err_text(&format!(
+                                "error.manifest_body_page: {error}; restart without cursor"
+                            ));
+                        }
+                    }
                 }
                 Self::ok_json(&serde_json::Value::Object(m))
             }
             Ok(None) => Self::err_text(&format!("agent not found: {}", p.name)),
             Err(e) => Self::err_text(&format!("registry get failed: {e}")),
+        }
+    }
+
+    /// Redact credential values from configuration-shaped JSON before it
+    /// enters a caller-facing view. Only maps keyed `env` are treated as
+    /// credential carriers (the same contract as `Account::response_view`):
+    /// keys stay as identity, string values become `<redacted>`, and nested
+    /// non-string values recurse. Arbitrary free-text fields are not guessed
+    /// to be secrets.
+    pub(crate) fn redact_config_credentials(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (key, inner) in map {
+                    if key == "env" {
+                        if let serde_json::Value::Object(env) = inner {
+                            let mut redacted = serde_json::Map::new();
+                            for (env_key, env_value) in env {
+                                let replacement = match env_value {
+                                    serde_json::Value::String(_) => {
+                                        serde_json::Value::String("<redacted>".into())
+                                    }
+                                    other => Self::redact_config_credentials(other),
+                                };
+                                redacted.insert(env_key.clone(), replacement);
+                            }
+                            out.insert(key.clone(), serde_json::Value::Object(redacted));
+                            continue;
+                        }
+                    }
+                    out.insert(key.clone(), Self::redact_config_credentials(inner));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items.iter().map(Self::redact_config_credentials).collect(),
+            ),
+            other => other.clone(),
         }
     }
 
@@ -239,7 +354,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_agent_describe",
-        description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
+        description = "Compact per-plane dispatch surface for one agent: stored manifest, resolved brofile (global ref or inline), manifest filter overlay, the computed deny-wins merge, and the runtime filter planes describe does not compute. detail_plane=manifest|brofile pages the exact redacted JSON via body.next_cursor."
     )]
     pub(crate) fn bro_agent_describe(
         &self,
@@ -247,6 +362,15 @@ impl BlackboxServer {
     ) -> CallToolResult {
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::MergedFilters;
+        let detail_plane = match p.detail_plane.as_deref() {
+            Some("manifest") | Some("brofile") => p.detail_plane.as_deref(),
+            Some(other) => {
+                return Self::err_text(&format!(
+                    "unknown detail_plane: {other} (expected one of: manifest, brofile, or omitted for the compact summary)"
+                ));
+            }
+            None => None,
+        };
         let catalog = self.state.artifacts.read();
         let reg = AgentRegistry::new(&catalog);
         let rec = match reg.get(&p.agent) {
@@ -261,7 +385,16 @@ impl BlackboxServer {
                     "name": rec.name,
                     "version": rec.version,
                     "active": rec.active,
-                    "error": format!("manifest parse failed: {}", rec.manifest_parse_error.unwrap_or_default()),
+                    "planes": {
+                        "stored_manifest": {
+                            "status": "parse_failed",
+                            "error": preview_text(
+                                &rec.manifest_parse_error.unwrap_or_default(),
+                                512
+                            ),
+                            "action": "reinstall or upgrade this agent so the manifest parses; bro_agent_get(name) previews the stored parse error",
+                        }
+                    },
                 }));
             }
         };
@@ -269,59 +402,135 @@ impl BlackboxServer {
         let mut warnings: Vec<String> = Vec::new();
         let mut degraded = serde_json::Map::new();
 
-        let (brofile_kind, brofile_name, brofile_provider, brofile_body, base_allow, base_disallow) =
-            if let Some(ref br) = manifest.brofile_ref {
-                if let Ok(Some(meta)) = catalog.metadata_for(artifacts::ArtifactKind::Brofile, br) {
-                    if !meta.active {
-                        degraded.insert("manifest_stale".into(), serde_json::Value::Bool(true));
-                        warnings.push(format!(
-                            "brofile_ref '{br}' is superseded by {}; reinstall or upgrade the agent manifest",
-                            meta.superseded_by.unwrap_or_else(|| "unknown".into())
-                        ));
-                    }
+        enum ResolvedBrofile {
+            Ref(String, Box<orchestration::brofile::Brofile>),
+            Inline(serde_json::Value),
+            MissingRef(String),
+            Absent,
+        }
+        let resolved = if let Some(ref br) = manifest.brofile_ref {
+            if let Ok(Some(meta)) = catalog.metadata_for(artifacts::ArtifactKind::Brofile, br) {
+                if !meta.active {
+                    degraded.insert("manifest_stale".into(), serde_json::Value::Bool(true));
+                    warnings.push(format!(
+                        "brofile_ref '{br}' is superseded by {}; reinstall or upgrade the agent manifest",
+                        meta.superseded_by.unwrap_or_else(|| "unknown".into())
+                    ));
                 }
-                let resolved =
-                    orchestration::brofile::resolve_brofile(br, &self.state.store_dir, None);
-                match resolved {
-                    Some(bf) => {
-                        let (ba, bd) = match &bf.filters {
-                            Some(f) => (f.allow.clone(), f.disallow.clone()),
-                            None => (Vec::new(), Vec::new()),
-                        };
-                        (
-                            "ref",
-                            br.clone(),
-                            Some(bf.provider.as_str().to_string()),
-                            Some(serde_json::to_value(&bf).unwrap_or(serde_json::Value::Null)),
-                            ba,
-                            bd,
-                        )
-                    }
-                    None => {
-                        warnings.push(format!(
-                            "brofile_ref '{br}' not found (global scope only; project-scoped brofiles not yet supported by describe)"
-                        ));
-                        ("ref", br.clone(), None, None, Vec::new(), Vec::new())
-                    }
+            }
+            match orchestration::brofile::resolve_brofile(br, &self.state.store_dir, None) {
+                Some(bf) => ResolvedBrofile::Ref(br.clone(), Box::new(bf)),
+                None => {
+                    warnings.push(format!(
+                        "brofile_ref '{br}' not found (global scope only; project-scoped brofiles not yet supported by describe)"
+                    ));
+                    ResolvedBrofile::MissingRef(br.clone())
                 }
-            } else if let Some(ref inline) = manifest.brofile_inline {
-                let prov = inline
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let (ba, bd) = Self::extract_inline_filters(inline);
-                (
-                    "inline",
-                    String::new(),
-                    Some(prov.to_string()),
-                    Some(inline.clone()),
-                    ba,
-                    bd,
-                )
-            } else {
-                warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
-                ("none", String::new(), None, None, Vec::new(), Vec::new())
+            }
+        } else if let Some(ref inline) = manifest.brofile_inline {
+            ResolvedBrofile::Inline(inline.clone())
+        } else {
+            warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
+            ResolvedBrofile::Absent
+        };
+
+        let (base_allow, base_disallow, brofile_status, brofile_name, brofile_provider) =
+            match &resolved {
+                ResolvedBrofile::Ref(name, bf) => {
+                    let (allow, disallow) = match &bf.filters {
+                        Some(f) => (f.allow.clone(), f.disallow.clone()),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    (
+                        allow,
+                        disallow,
+                        "resolved_ref",
+                        Some(name.clone()),
+                        Some(bf.provider.as_str().to_string()),
+                    )
+                }
+                ResolvedBrofile::Inline(inline) => {
+                    let (allow, disallow) = Self::extract_inline_filters(inline);
+                    let provider = inline
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (allow, disallow, "resolved_inline", None, Some(provider))
+                }
+                ResolvedBrofile::MissingRef(name) => (
+                    Vec::new(),
+                    Vec::new(),
+                    "missing_ref",
+                    Some(name.clone()),
+                    None,
+                ),
+                ResolvedBrofile::Absent => (Vec::new(), Vec::new(), "absent", None, None),
             };
+
+        if detail_plane == Some("manifest") {
+            let stored = match serde_json::to_value(&manifest) {
+                Ok(value) => Self::redact_config_credentials(&value),
+                Err(error) => {
+                    return Self::err_text(&format!("manifest serialization failed: {error}"));
+                }
+            };
+            let selection = format!("agent-describe:{}:manifest", rec.name);
+            return match super::body_page::json_body_page(
+                &selection,
+                &stored,
+                p.cursor.as_deref(),
+                p.body_limit,
+            ) {
+                Ok(body) => Self::ok_json(&serde_json::json!({
+                    "name": rec.name,
+                    "version": rec.version,
+                    "plane": "manifest",
+                    "body": body,
+                })),
+                Err(error) => Self::err_text(&format!(
+                    "error.manifest_body_page: {error}; restart without cursor"
+                )),
+            };
+        }
+        if detail_plane == Some("brofile") {
+            let plane_value = match &resolved {
+                ResolvedBrofile::Ref(_, bf) => match serde_json::to_value(bf.as_ref()) {
+                    Ok(value) => Self::redact_config_credentials(&value),
+                    Err(error) => {
+                        return Self::err_text(&format!("brofile serialization failed: {error}"));
+                    }
+                },
+                ResolvedBrofile::Inline(inline) => Self::redact_config_credentials(inline),
+                ResolvedBrofile::MissingRef(name) => {
+                    return Self::err_text(&format!(
+                        "brofile plane unavailable: brofile_ref '{name}' did not resolve from the global brofile store; describe does not read project-scoped brofiles. Fix the stored brofile or reinstall the agent manifest"
+                    ));
+                }
+                ResolvedBrofile::Absent => {
+                    return Self::err_text(
+                        "brofile plane unavailable: the stored manifest has neither brofile_ref nor brofile_inline; reinstall the agent with a brofile before dispatching",
+                    );
+                }
+            };
+            let selection = format!("agent-describe:{}:brofile", rec.name);
+            return match super::body_page::json_body_page(
+                &selection,
+                &plane_value,
+                p.cursor.as_deref(),
+                p.body_limit,
+            ) {
+                Ok(body) => Self::ok_json(&serde_json::json!({
+                    "name": rec.name,
+                    "version": rec.version,
+                    "plane": "brofile",
+                    "body": body,
+                })),
+                Err(error) => Self::err_text(&format!(
+                    "error.brofile_body_page: {error}; restart without cursor"
+                )),
+            };
+        }
 
         let merged = MergedFilters::merge(
             &base_allow,
@@ -341,44 +550,88 @@ impl BlackboxServer {
             .map(serde_json::Value::String)
             .collect::<Vec<_>>();
 
+        let mut stored_manifest = serde_json::Map::from_iter([
+            ("status".into(), serde_json::Value::String("parsed".into())),
+            (
+                "brofile_kind".into(),
+                serde_json::Value::String(
+                    if manifest.brofile_ref.is_some() {
+                        "ref"
+                    } else if manifest.brofile_inline.is_some() {
+                        "inline"
+                    } else {
+                        "none"
+                    }
+                    .into(),
+                ),
+            ),
+        ]);
+        if let Some(name) = &manifest.brofile_ref {
+            stored_manifest.insert(
+                "brofile_ref".into(),
+                serde_json::Value::String(name.clone()),
+            );
+        }
+        let mut resolved_brofile = serde_json::Map::from_iter([(
+            "status".into(),
+            serde_json::Value::String(brofile_status.into()),
+        )]);
+        if let Some(name) = brofile_name {
+            resolved_brofile.insert("name".into(), serde_json::Value::String(name));
+        }
+        if let Some(provider) = brofile_provider {
+            resolved_brofile.insert("provider".into(), serde_json::Value::String(provider));
+        }
+        resolved_brofile.insert(
+            "detail_hint".into(),
+            serde_json::Value::String(format!(
+                "bro_agent_describe(agent=\"{}\", detail_plane=\"brofile\") pages the exact redacted brofile JSON",
+                rec.name
+            )),
+        );
+
         let mut result = serde_json::Map::from_iter([
-            ("name".into(), serde_json::Value::String(rec.name)),
+            ("name".into(), serde_json::Value::String(rec.name.clone())),
             ("version".into(), serde_json::Value::String(rec.version)),
             ("active".into(), serde_json::Value::Bool(rec.active)),
             (
                 "embedding_status".into(),
-                serde_json::Value::String(embedding_status.to_string()),
+                serde_json::Value::String(embedding_status.into()),
             ),
             (
-                "brofile_kind".into(),
-                serde_json::Value::String(brofile_kind.to_string()),
-            ),
-            (
-                "merged_filters".into(),
-                serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null),
+                "planes".into(),
+                serde_json::json!({
+                    "stored_manifest": stored_manifest,
+                    "resolved_brofile": resolved_brofile,
+                    "filter_overlay": serde_json::to_value(&manifest.filter_overlay).unwrap_or(serde_json::Value::Null),
+                    "computed_merge": {
+                        "status": "computed",
+                        "inputs": ["brofile_filters", "manifest_overlay"],
+                        "rule": "deny wins",
+                        "merged": serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null),
+                    },
+                    "runtime_planes_not_computed": {
+                        "project_mcp_filters": "resolved from the dispatch cwd/project at dispatch time; not read by describe",
+                        "surface_packet": "the brofile surface selector is folded through evaluate_tool_surface at dispatch time",
+                        "per_dispatch_overrides": "ExecParams allow/disallow filters apply after the brofile and overlay merge",
+                        "recursion_guard": "the mechanical bro_* orchestration guard applies unless the manifest declares allow_recursion",
+                    },
+                }),
             ),
             (
                 "install_warnings".into(),
                 serde_json::Value::Array(install_warnings),
             ),
+            (
+                "detail_hint".into(),
+                serde_json::Value::String(format!(
+                    "Exact redacted JSON planes: bro_agent_describe(agent=\"{}\", detail_plane=\"manifest\"|\"brofile\"); continue with body.next_cursor",
+                    rec.name
+                )),
+            ),
         ]);
         if rec.retired {
             result.insert("retired".into(), true.into());
-        }
-        if !brofile_name.is_empty() {
-            result.insert(
-                "brofile_name".into(),
-                serde_json::Value::String(brofile_name),
-            );
-        }
-        if let Some(provider) = brofile_provider {
-            result.insert(
-                "brofile_provider".into(),
-                serde_json::Value::String(provider),
-            );
-        }
-        if let Some(body) = brofile_body {
-            result.insert("brofile".into(), body);
         }
         if !warnings.is_empty() {
             result.insert(
@@ -394,10 +647,6 @@ impl BlackboxServer {
         if !degraded.is_empty() {
             result.insert("degraded".into(), serde_json::Value::Object(degraded));
         }
-        result.insert(
-            "manifest".into(),
-            serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
-        );
         Self::ok_json(&serde_json::Value::Object(result))
     }
 
@@ -1030,6 +1279,8 @@ mod tests {
 
         let result = server.bro_agent_get(Parameters(AgentGetParams {
             name: "reviewer".into(),
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
 
@@ -1037,7 +1288,9 @@ mod tests {
         assert_eq!(body["name"], "reviewer");
         assert_eq!(body["version"], "3");
         assert_eq!(body["active"], true);
-        assert!(body["manifest"].is_object());
+        assert!(body["manifest_summary"].is_object());
+        let stored_manifest = body["manifest_body"]["text"].as_str().unwrap();
+        assert!(stored_manifest.contains("Test agent reviewer."));
     }
 
     #[test]
@@ -1047,6 +1300,8 @@ mod tests {
 
         let result = server.bro_agent_get(Parameters(AgentGetParams {
             name: "nonexistent".into(),
+            cursor: None,
+            body_limit: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -1067,6 +1322,8 @@ mod tests {
 
         let result = server.bro_agent_get(Parameters(AgentGetParams {
             name: "reviewer@v5".into(),
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
 
@@ -1079,7 +1336,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
 
-        let result = server.bro_agent_get(Parameters(AgentGetParams { name: "@v2".into() }));
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "@v2".into(),
+            cursor: None,
+            body_limit: None,
+        }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(text.contains("requires a name"), "got: {text}");
@@ -1180,6 +1441,8 @@ mod tests {
 
         let result = server.bro_agent_get(Parameters(AgentGetParams {
             name: "reviewer@v4".into(),
+            cursor: None,
+            body_limit: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -1277,20 +1540,35 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "reviewer".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "reviewer");
         assert_eq!(body["version"], "1");
         assert_eq!(body["active"], true);
-        assert_eq!(body["brofile_kind"], "inline");
-        assert_eq!(body["brofile_provider"], "claude");
+        let planes = &body["planes"];
+        assert_eq!(planes["stored_manifest"]["brofile_kind"], "inline");
+        assert_eq!(planes["resolved_brofile"]["status"], "resolved_inline");
+        assert_eq!(planes["resolved_brofile"]["provider"], "claude");
         assert_eq!(body["embedding_status"], "pending");
-        assert!(body["manifest"].is_object());
-        assert!(body["merged_filters"].is_object());
-        assert!(body["brofile"].is_object());
-        assert_eq!(body["brofile"]["provider"], "claude");
+        assert!(planes["computed_merge"]["merged"].is_object());
+        assert_eq!(planes["computed_merge"]["status"], "computed");
+        assert!(
+            planes["runtime_planes_not_computed"]
+                .as_object()
+                .unwrap()
+                .contains_key("project_mcp_filters")
+        );
         assert!(body["install_warnings"].as_array().unwrap().is_empty());
+        assert!(
+            body["detail_hint"]
+                .as_str()
+                .unwrap()
+                .contains("detail_plane")
+        );
     }
 
     #[test]
@@ -1326,11 +1604,15 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "inline-filtered".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let allow = body["merged_filters"]["allow"].as_array().unwrap();
-        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        let merged = &body["planes"]["computed_merge"]["merged"];
+        let allow = merged["allow"].as_array().unwrap();
+        let disallow = merged["disallow"].as_array().unwrap();
         assert!(
             allow
                 .iter()
@@ -1352,6 +1634,9 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "nonexistent".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -1395,16 +1680,20 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "conflict".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let allow = body["merged_filters"]["allow"]
+        let merged = &body["planes"]["computed_merge"]["merged"];
+        let allow = merged["allow"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
-        let disallow = body["merged_filters"]["disallow"]
+        let disallow = merged["disallow"]
             .as_array()
             .unwrap()
             .iter()
@@ -1471,6 +1760,9 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "warning-agent".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1543,19 +1835,22 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "auditor-agent".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(body["brofile_kind"], "ref");
-        assert_eq!(body["brofile_name"], "auditor");
+        assert_eq!(body["planes"]["stored_manifest"]["brofile_kind"], "ref");
+        assert_eq!(body["planes"]["stored_manifest"]["brofile_ref"], "auditor");
+        assert_eq!(body["planes"]["resolved_brofile"]["status"], "resolved_ref");
+        assert_eq!(body["planes"]["resolved_brofile"]["name"], "auditor");
         // The saved brofile is Provider::Glm; serde serializes it lowercase.
         // (`claude` is only a deserialize alias for Glm, not a serialized form.)
-        assert_eq!(body["brofile_provider"], "glm");
-        assert!(body["brofile"].is_object());
-        assert_eq!(body["brofile"]["name"], "auditor");
-        assert_eq!(body["brofile"]["provider"], "glm");
-        let allow = body["merged_filters"]["allow"].as_array().unwrap();
-        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert_eq!(body["planes"]["resolved_brofile"]["provider"], "glm");
+        let merged = &body["planes"]["computed_merge"]["merged"];
+        let allow = merged["allow"].as_array().unwrap();
+        let disallow = merged["disallow"].as_array().unwrap();
         assert!(
             allow
                 .iter()
@@ -1636,6 +1931,9 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "stale-agent".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1674,15 +1972,25 @@ mod tests {
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
             agent: "broken".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "broken");
+        assert_eq!(body["planes"]["stored_manifest"]["status"], "parse_failed");
         assert!(
-            body["error"]
+            body["planes"]["stored_manifest"]["error"]
                 .as_str()
                 .unwrap()
                 .contains("manifest parse failed")
+        );
+        assert!(
+            body["planes"]["stored_manifest"]["action"]
+                .as_str()
+                .unwrap()
+                .contains("reinstall")
         );
     }
     #[test]
@@ -2894,6 +3202,223 @@ mod tests {
             agent_lbl.as_deref(),
             Some("agent:bro-dispatch-agent@v2"),
             "agent_label should preserve agent attribution: {agent_lbl:?}"
+        );
+    }
+
+    #[test]
+    fn redact_config_credentials_redacts_only_env_carriers() {
+        let input = serde_json::json!({
+            "runtime": {
+                "env": {
+                    "PATH": "/usr/bin",
+                    "SECRET_KEY": "sk-ant-test-secret-do-not-ship"
+                }
+            },
+            "note": "free text mentioning token sk-ant-test-secret-do-not-ship stays",
+            "debug": {
+                "env": {"CLI_TOKEN": "sk-live-test-secret-do-not-ship"},
+                "message": "error: auth failed for sk-live-test-secret-do-not-ship"
+            },
+            "config": {"flags": ["--verbose"]}
+        });
+        let redacted = BlackboxServer::redact_config_credentials(&input);
+        assert_eq!(redacted["runtime"]["env"]["PATH"], "<redacted>");
+        assert_eq!(redacted["runtime"]["env"]["SECRET_KEY"], "<redacted>");
+        assert_eq!(redacted["debug"]["env"]["CLI_TOKEN"], "<redacted>");
+        let wire = redacted.to_string();
+        // env VALUES are credential carriers; env KEYS stay as identity, and
+        // free-text fields are not blindly treated as credentials.
+        assert!(wire.contains("SECRET_KEY"));
+        assert!(wire.contains("free text mentioning token"));
+        assert!(wire.contains("error: auth failed"));
+        assert_eq!(redacted["config"]["flags"][0], "--verbose");
+    }
+
+    #[test]
+    fn bro_agent_describe_brofile_plane_redacts_and_pages_oversized_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let long_text = "x".repeat(9_000);
+        let manifest = serde_json::json!({
+            "description": format!("Agent with a large inline brofile {long_text}"),
+            "when_to_use": ["when testing paging"],
+            "brofile_inline": {
+                "provider": "claude",
+                "runtime": {"env": {"CLI_TOKEN": "sk-live-test-secret-do-not-ship"}},
+            },
+        });
+        server
+            .state
+            .artifacts
+            .read()
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                "big-inline.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "big-inline",
+                    "version": 1,
+                    "manifest": manifest,
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let first = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "big-inline".into(),
+            detail_plane: Some("brofile".into()),
+            cursor: None,
+            body_limit: Some(512),
+        }));
+        assert_ne!(first.is_error, Some(true));
+        let text = extract_text(&first);
+        assert!(!text.contains("sk-live-test-secret-do-not-ship"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["plane"], "brofile");
+        assert!(body["body"]["next_cursor"].is_string());
+        let next_cursor = body["body"]["next_cursor"].as_str().unwrap().to_string();
+        assert!(!next_cursor.is_empty());
+
+        // Stale cursor: change the stored manifest, then reuse the old cursor.
+        server
+            .state
+            .artifacts
+            .read()
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                "big-inline-v2.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "big-inline",
+                    "version": 2,
+                    "manifest": {
+                        "description": "changed".to_string(),
+                        "when_to_use": ["changed"],
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let stale = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "big-inline".into(),
+            detail_plane: Some("brofile".into()),
+            cursor: Some(next_cursor),
+            body_limit: Some(512),
+        }));
+        assert_eq!(stale.is_error, Some(true));
+        let stale_text = extract_text(&stale);
+        assert!(
+            stale_text.contains("restart without cursor"),
+            "got: {stale_text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_manifest_plane_pages_and_missing_brofile_is_actionable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "no-brofile.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "no-brofile",
+                "version": 1,
+                "manifest": {
+                    "description": format!("Agent with no brofile at all. {}", "m".repeat(6_000)),
+                    "when_to_use": ["when testing"],
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let manifest_plane = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "no-brofile".into(),
+            detail_plane: Some("manifest".into()),
+            cursor: None,
+            body_limit: None,
+        }));
+        assert_ne!(manifest_plane.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&manifest_plane)).unwrap();
+        assert_eq!(body["plane"], "manifest");
+        // Oversized manifests page instead of blowing the response budget.
+        assert!(body["body"]["next_cursor"].is_string());
+        let stored = body["body"]["text"].as_str().unwrap();
+        assert!(stored.contains("no brofile at all"));
+        assert!(body["body"]["total_bytes"].as_u64().unwrap() > 6_000);
+        assert!(stored.len() <= 4_096);
+
+        let brofile_plane = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "no-brofile".into(),
+            detail_plane: Some("brofile".into()),
+            cursor: None,
+            body_limit: None,
+        }));
+        assert_eq!(brofile_plane.is_error, Some(true));
+        let error_text = extract_text(&brofile_plane);
+        assert!(
+            error_text.contains("neither brofile_ref nor brofile_inline")
+                && error_text.contains("reinstall"),
+            "got: {error_text}"
+        );
+
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "missing-ref.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "missing-ref",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent referencing a missing brofile.".to_string(),
+                    "when_to_use": ["when testing"],
+                    "brofile_ref": "definitely-missing-brofile-for-test",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let compact = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "missing-ref".into(),
+            detail_plane: None,
+            cursor: None,
+            body_limit: None,
+        }));
+        assert_ne!(compact.is_error, Some(true));
+        let compact_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&compact)).unwrap();
+        assert_eq!(
+            compact_body["planes"]["resolved_brofile"]["status"],
+            "missing_ref"
+        );
+        assert_eq!(
+            compact_body["planes"]["resolved_brofile"]["name"],
+            "definitely-missing-brofile-for-test"
+        );
+        let missing_plane = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "missing-ref".into(),
+            detail_plane: Some("brofile".into()),
+            cursor: None,
+            body_limit: None,
+        }));
+        assert_eq!(missing_plane.is_error, Some(true));
+        let missing_text = extract_text(&missing_plane);
+        assert!(
+            missing_text.contains("did not resolve from the global brofile store")
+                && missing_text.contains("reinstall"),
+            "got: {missing_text}"
         );
     }
 }

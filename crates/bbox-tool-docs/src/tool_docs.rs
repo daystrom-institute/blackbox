@@ -777,8 +777,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_allocator_status",
         category: ToolCategory::Orchestration,
-        summary: "Read pool-backed runtime allocation config, active leases, in-flight lane counts, and optional candidate preview.",
-        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, active runtime leases, probe state, and current in-flight lane counts. Pass tier/pool/capability/pin fields to preview the candidate table without spawning a task or writing a lease.",
+        summary: "Read pool-backed runtime allocation config plus bounded in-flight, probe, lease, and preview-candidate pages.",
+        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, and current runtime state. in_flight, probes, leases, and preview.candidates are paged (default 20, maximum 100 rows); continue each section from its next_offset. Probe rows are compact lane status; read one exact lane record with bro_allocator_probe body paging. Pass tier/pool/capability/pin fields to preview the candidate table without spawning a task or writing a lease.",
         example: Some(
             r#"bro_allocator_status(project_dir="/repo/x", tier="standard", pool_name="coding")"#,
         ),
@@ -786,15 +786,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_allocator_trace",
         category: ToolCategory::Orchestration,
-        summary: "Read a previous runtime allocation selection trace by id.",
-        when_to_use: "Use when bro_exec returned selectionTraceId and you need to explain why the allocator selected or rejected provider/account/model lanes.",
+        summary: "Read one exact allocation trace body, page by page.",
+        when_to_use: "Use when bro_exec returned selectionTraceId and you need to explain why the allocator selected or rejected provider/account/model lanes. The response carries a compact summary (first 20 candidates) plus the exact redacted trace body paged with body.next_cursor (4096-byte default budget, cursor=offset:0 to resume, SHA256 revision bound restarts safely when the trace changes).",
         example: Some(r#"bro_allocator_trace(selection_trace_id="alloc-0123abcd")"#),
     },
     ToolDoc {
         name: "bro_allocator_probe",
         category: ToolCategory::Orchestration,
         summary: "Read, update, or clear allocator probe state for a provider/account lane.",
-        when_to_use: "Use to record credential, quota, cooldown, and probe-confidence observations consumed by allocator scoring and bro_allocator_status previews. This mutates allocator/probes.json; use bro_allocator_status for read-only inspection.",
+        when_to_use: "Use to record credential, quota, cooldown, and probe-confidence observations consumed by allocator scoring and bro_allocator_status previews. This mutates allocator/probes.json; write failures return error.probe_persistence_failed and leave the stored record unchanged, so success means persisted. Read-only inspection returns a compact probe status plus the exact redacted record paged with body.next_cursor. Use bro_allocator_status for multi-lane overviews.",
         example: Some(
             r#"bro_allocator_probe(provider="codex", quota_status="exhausted", quota_confidence="runtime_rate_limit", cooldown_ms=300000)"#,
         ),
@@ -939,8 +939,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_agent_describe",
         category: ToolCategory::Orchestration,
-        summary: "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings.",
-        when_to_use: "Pre-dispatch inspection: understand the full computed tool surface an agent will have at runtime, including which brofile it resolves to and whether filters from the brofile and manifest overlay conflict. Use before bro_agent_dispatch to preview the dispatch plan.",
+        summary: "Compact per-plane dispatch surface for one agent.",
+        when_to_use: "Pre-dispatch inspection: see the stored manifest, resolved brofile, filter overlay, the computed deny-wins merge, and the runtime planes describe does not compute (project filters, surface packet, per-dispatch overrides, recursion guard). detail_plane=manifest|brofile pages the exact redacted JSON with body.next_cursor; a missing brofile returns an actionable readiness error. Use before bro_agent_dispatch to preview the dispatch plan.",
         example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
     },
     ToolDoc {

@@ -350,6 +350,19 @@ pub(crate) struct AllocatorStatusParams {
     /// Named policy or inline policy object for preview scoring.
     #[serde(default)]
     pub(crate) selection_policy: Option<serde_json::Value>,
+    /// Row cap shared by the in-flight, probe, lease, and preview-candidate
+    /// pages (default 20, maximum 100).
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Continue the in-flight lane page from its next_offset.
+    #[serde(default)]
+    pub(crate) in_flight_offset: Option<usize>,
+    /// Continue the probe inventory page from its next_offset.
+    #[serde(default)]
+    pub(crate) probe_offset: Option<usize>,
+    /// Continue the lease inventory page from its next_offset.
+    #[serde(default)]
+    pub(crate) lease_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -357,6 +370,12 @@ pub(crate) struct AllocatorStatusParams {
 pub(crate) struct AllocatorTraceParams {
     /// Selection trace id returned by allocated bro_exec responses.
     pub(crate) selection_trace_id: String,
+    /// Continue exact trace body pages from body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per exact body page (default 4096, capped at 4096).
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -398,6 +417,12 @@ pub(crate) struct AllocatorProbeParams {
     /// Short raw probe or observation summary for audit/debugging.
     #[serde(default)]
     pub(crate) raw_summary: Option<String>,
+    /// Continue exact raw-summary/probe body pages from body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per exact body page (default 4096, capped at 4096).
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -521,12 +546,28 @@ pub(crate) struct AgentListParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentGetParams {
     pub(crate) name: String,
+    /// Continue exact manifest body pages from body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per exact body page (default 4096, capped at 4096).
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentDescribeParams {
     pub(crate) agent: String,
+    /// Exact body plane to page: manifest or brofile. Omit for the compact
+    /// all-plane summary.
+    #[serde(default)]
+    pub(crate) detail_plane: Option<String>,
+    /// Continue the selected plane's body pages from body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per exact body page (default 4096, capped at 4096).
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
