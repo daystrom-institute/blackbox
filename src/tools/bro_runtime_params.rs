@@ -22,11 +22,28 @@ pub(crate) struct ArcSignalParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArcStatusParams {
-    /// Optional arc id (== arc_thread_id from a WorkflowRunResult).
-    /// When omitted, returns all running arcs + pending waits.
+    /// Optional arcId or arc_thread_id. These are distinct accepted identities.
+    /// Omit to list active/recent arcs in deterministic arc-id order.
     #[serde(default)]
     pub(crate) arc_id: Option<String>,
+    /// Summary arc list size: default 10, maximum 20. Not used with arc_id.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Summary list offset; continue with next_offset. Not used with arc_id.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// summary (default) returns current position and bounded wait previews;
+    /// full returns exact selected snapshots and waits as JSON body pages.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque body.next_cursor from detail=full, with the same arc selector.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body bytes per page, 4..4096; JSON escaping may reduce the page.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -36,16 +53,30 @@ pub(crate) struct ArcCancelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArcResultParams {
     /// Arc id (`arcId` from bro_orchestrate_run) or the workflow task id.
     pub(crate) arc_id: String,
     /// Optional var names to return. When omitted, all final vars are
-    /// included. `_structured_exit` is always surfaced separately.
+    /// selected. `_structured_exit` is surfaced separately and omitted from
+    /// default vars to avoid duplication; an explicit key request retains it.
+    /// Large selections require detail=full to retrieve exact JSON pages.
     #[serde(default)]
     pub(crate) keys: Option<Vec<String>>,
     /// Include per-node prose outputs (can be large). Default false.
     #[serde(default)]
     pub(crate) include_node_outputs: Option<bool>,
+    /// summary (default) returns small selected results inline; large results
+    /// explicitly preview available fields. full returns exact selected JSON
+    /// in body.text pages; concatenate pages before parsing.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque body.next_cursor; keep arc_id, keys and include_node_outputs.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body bytes per page, 4..4096; JSON escaping may reduce the page.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
