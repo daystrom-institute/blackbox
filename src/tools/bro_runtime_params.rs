@@ -555,11 +555,11 @@ mod trigger_schema_tests {
             assert!(
                 root["properties"]["spec"]
                     .to_string()
-                    .contains(&format!("#/definitions/{definition}"))
+                    .contains(&format!("#/$defs/{definition}"))
             );
-            required(&root["definitions"][definition], &fields);
+            required(&root["$defs"][definition], &fields);
         }
-        let definitions = &poller["definitions"];
+        let definitions = &poller["$defs"];
         required(&definitions["HttpFetchSpec"], &["url"]);
         assert_eq!(
             definitions["HttpFetchSpec"]["properties"]["method"]["default"],
@@ -569,33 +569,40 @@ mod trigger_schema_tests {
             definitions["RetrySpec"]["properties"]["attempts"]["default"],
             3
         );
-        assert_eq!(
-            definitions["ResponseKind"]["enum"],
-            json!(["json", "text", "auto"])
-        );
+        let response_kinds = definitions["ResponseKind"]["oneOf"]
+            .as_array()
+            .expect("documented response-kind variants");
+        assert_eq!(response_kinds.len(), 3);
+        for kind in ["json", "text", "auto"] {
+            assert!(
+                response_kinds
+                    .iter()
+                    .any(|variant| { variant["type"] == "string" && variant["const"] == kind })
+            );
+        }
         required(&definitions["Extractor"], &["outputs"]);
         let selectors = definitions["Selector"]["oneOf"].as_array().unwrap();
         for kind in ["json_path", "const", "default", "concat", "coalesce"] {
             assert!(
                 selectors
                     .iter()
-                    .any(|variant| variant["properties"]["kind"]["enum"] == json!([kind]))
+                    .any(|variant| variant["properties"]["kind"]["const"] == kind)
             );
         }
         let path = selectors
             .iter()
-            .find(|variant| variant["properties"]["kind"]["enum"] == json!(["json_path"]))
+            .find(|variant| variant["properties"]["kind"]["const"] == "json_path")
             .unwrap();
         required(path, &["kind", "path"]);
-        let signatures = webhook["definitions"]["SignatureScheme"]["oneOf"]
+        let signatures = webhook["$defs"]["SignatureScheme"]["oneOf"]
             .as_array()
             .unwrap();
         let hmac = signatures
             .iter()
-            .find(|variant| variant["properties"]["kind"]["enum"] == json!(["hmac_sha256"]))
+            .find(|variant| variant["properties"]["kind"]["const"] == "hmac_sha256")
             .unwrap();
         required(hmac, &["kind", "secret_env", "header"]);
-        let timezone = &cron["definitions"]["CronSpec"]["properties"]["tz"];
+        let timezone = &cron["$defs"]["CronSpec"]["properties"]["tz"];
         assert!(timezone.to_string().contains("[Uu][Tt][Cc]"));
     }
 
