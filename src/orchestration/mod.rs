@@ -1146,6 +1146,7 @@ mod roster_view_tests {
             label: None,
             name: None,
             session_id: None,
+            has_last_message: None,
             last_message_snippet: None,
             model: None,
             report: None,
@@ -1182,6 +1183,7 @@ mod roster_view_tests {
                 label: None,
                 name: None,
                 session_id: None,
+                has_last_message: None,
                 last_message_snippet: None,
                 model: None,
                 report: None,
@@ -1307,6 +1309,7 @@ mod roster_view_tests {
                 label: None,
                 name: None,
                 session_id: None,
+                has_last_message: None,
                 last_message_snippet: None,
                 model: None,
                 report: None,
@@ -1403,6 +1406,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .or_else(|| inner.agent_label.clone()),
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
+        has_last_message: Some(inner.last_assistant_message.is_some()),
         last_message_snippet: inner
             .latest_assistant_preview
             .text()

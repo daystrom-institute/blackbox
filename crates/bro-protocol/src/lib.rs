@@ -128,6 +128,10 @@ pub struct RosterSummaryV1 {
     pub name: Option<String>,
     pub session_id: Option<SessionId>,
     pub last_message_snippet: Option<String>,
+    /// Output availability is independent of whether a latest preview survived.
+    /// Older producers omit this field; consumers may fall back to the snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_last_message: Option<bool>,
     pub model: Option<String>,
     #[serde(default)]
     pub report: Option<String>,
@@ -384,6 +388,7 @@ mod tests {
             label: Some("team-x::member-y".to_string()),
             name: Some("Inspect the failing roster columns".to_string()),
             session_id: Some(SessionId::new("sess-1")),
+            has_last_message: None,
             last_message_snippet: Some("Looking at the file…".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             report: Some("Reading roster state".to_string()),
@@ -649,7 +654,13 @@ mod tests {
             "model": null,
             "last_event_at": null,
         });
-        let summary: RosterSummaryV1 = serde_json::from_value(value).unwrap();
+        let mut summary: RosterSummaryV1 = serde_json::from_value(value).unwrap();
         assert_eq!(summary.context, None);
+        assert_eq!(summary.has_last_message, None);
+        summary.has_last_message = Some(true);
+        let restored: RosterSummaryV1 =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
+        assert_eq!(restored.has_last_message, Some(true));
+        assert_eq!(restored.last_message_snippet, None);
     }
 }

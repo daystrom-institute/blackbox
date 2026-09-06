@@ -215,6 +215,9 @@ impl BlackboxServer {
                     _ => "0s".to_string(),
                 };
 
+                let has_last_message = s
+                    .has_last_message
+                    .unwrap_or(s.last_message_snippet.is_some());
                 let session_id_str = s.session_id.as_ref().map(|s| s.as_str().to_string());
                 let mut entry = json!({
                     "taskId": task_id_str,
@@ -222,8 +225,8 @@ impl BlackboxServer {
                     "sessionId": session_id_str,
                     "status": s.status,
                     "elapsed": elapsed,
-                    "hasResult": s.status.is_terminal() && s.last_message_snippet.is_some(),
-                    "hasLastMessage": s.last_message_snippet.is_some(),
+                    "hasResult": s.status.is_terminal() && has_last_message,
+                    "hasLastMessage": has_last_message,
                 });
                 if let Some(name) = bro_name {
                     entry["bro"] = Value::String(name);
@@ -1688,6 +1691,7 @@ mod tests {
                 label: Some("team::executor".to_string()),
                 name: Some("Inspect the failing roster columns".to_string()),
                 session_id: Some(SessionId::new(format!("sess-{id}"))),
+                has_last_message: None,
                 last_message_snippet: Some("hello".to_string()),
                 model: Some("glm-pro".to_string()),
                 report: Some("teaser".to_string()),
@@ -1727,6 +1731,7 @@ mod tests {
                 label: Some("team::reviewer".to_string()),
                 name: Some(format!("Prompt teaser {id}")),
                 session_id: Some(SessionId::new(format!("sess-{id}"))),
+                has_last_message: None,
                 last_message_snippet: None,
                 model: None,
                 report: None,
@@ -2200,6 +2205,9 @@ mod tests {
                     inner.num_turns = Some(2);
                     inner.bro_label = Some("team::reviewer".into());
                     inner.agent_label = Some("agent-done-1@v1".into());
+                    inner.last_assistant_message =
+                        Some("retained output without a recoverable preview".into());
+                    assert!(inner.latest_assistant_preview.text().is_none());
                 }
                 store.insert("done-1".into(), done).expect("insert done-1");
             }
@@ -2244,6 +2252,8 @@ mod tests {
             assert_eq!(done["broLabel"], "team::reviewer");
             assert_eq!(done["agentLabel"], "agent-done-1@v1");
             assert_eq!(done["elapsed"], "1s");
+            assert_eq!(done["hasResult"], true);
+            assert_eq!(done["hasLastMessage"], true);
         }
     }
 

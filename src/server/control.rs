@@ -1202,6 +1202,7 @@ mod tests {
         {
             let mut inner = task_a.inner.lock();
             inner.last_assistant_message = Some("running update".to_string());
+            inner.latest_assistant_preview.set("running update");
         }
         sink.emit_updated(&task_a);
 

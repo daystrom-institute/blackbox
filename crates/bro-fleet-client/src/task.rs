@@ -287,6 +287,7 @@ mod tests {
             label: Some(format!("agent-{id}")),
             name: Some(format!("Prompt teaser {id}")),
             session_id: None,
+            has_last_message: None,
             last_message_snippet: Some("hello".to_string()),
             model: Some("gpt-test".to_string()),
             report: Some("checking roster".to_string()),
