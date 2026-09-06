@@ -30,7 +30,7 @@ impl BlackboxServer {
             || (text.len() <= Self::MCP_RESPONSE_CAP_BYTES
                 && serde_json::from_str::<Value>(text)
                     .is_ok_and(|value| Self::is_invocation_error(&value)));
-        let mut response = CallToolResult::success(text.into_contents());
+        let mut response = CallToolResult::success(text.to_string().into_contents());
         response.structured_content = structured;
         response.is_error = Some(is_error || typed_error);
         let bytes = Self::response_bytes(&response);
