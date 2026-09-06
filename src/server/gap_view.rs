@@ -1204,10 +1204,22 @@ impl BlackboxServer {
         // A collector ack only proves checkout delivery. Retire queued write
         // overlays when this accepted publication actually contains them.
         let mut queue = self.state.checkout_mutations.write();
+        // A slower read may still carry an older verified generation. Its
+        // content remains readable, but cannot retire a newer mutation chain.
+        let is_current = self
+            .state
+            .accepted_publications
+            .as_ref()
+            .is_some_and(|runtime| {
+                runtime
+                    .load_verified(project_id)
+                    .is_ok_and(|current| current.content_stamp() == content_stamp)
+            });
         let paths = queue
             .outstanding_writes()
             .filter(|row| {
-                row.mutation.scope == snapshot.published_scope
+                is_current
+                    && row.mutation.scope == snapshot.published_scope
                     && row.mutation.relative_path.starts_with(".bbox/gaps/")
             })
             .map(|row| row.mutation.relative_path.clone())
