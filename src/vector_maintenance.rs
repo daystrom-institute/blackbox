@@ -20,7 +20,8 @@ fn diagnostic_timeout(args: &Value) -> Duration {
 
 pub(crate) fn read_status(args: &Value) -> Result<Value> {
     let route_filter = args.get("route").and_then(|value| value.as_str());
-    let mut partitions = crate::vectors::metrics_nonblocking();
+    let mut partitions = crate::vectors::metrics_nonblocking()
+        .ok_or_else(|| anyhow!("vector store is warming; retry maintenance later"))?;
     if let Some(route) = route_filter {
         partitions.retain(|name, _| name == route);
     }
@@ -89,7 +90,8 @@ pub(crate) fn compact(args: &Value) -> Result<Value> {
     // or graph orphaning (connectivity_risk_ratio, gap-1168b0bd). Severity
     // for ordering is the worse of the two so a badly orphaned partition
     // is not starved behind moderately deleted ones.
-    let cheap_metrics = crate::vectors::metrics_nonblocking();
+    let cheap_metrics = crate::vectors::metrics_nonblocking()
+        .ok_or_else(|| anyhow!("vector store is warming; retry maintenance later"))?;
     let diagnostic_routes = cheap_metrics.keys().cloned().collect::<Vec<_>>();
     let mut diagnostics =
         crate::vectors::diagnostics_bounded(&diagnostic_routes, diagnostic_timeout(args))?;
@@ -123,6 +125,7 @@ pub(crate) fn compact(args: &Value) -> Result<Value> {
         let started = std::time::Instant::now();
         crate::vectors::rebuild(&route)?;
         let after = crate::vectors::metrics_nonblocking()
+            .ok_or_else(|| anyhow!("vector store is warming; retry maintenance later"))?
             .remove(&route)
             .unwrap_or(before.clone());
         let after_diagnostics = crate::vectors::diagnostics_bounded(
