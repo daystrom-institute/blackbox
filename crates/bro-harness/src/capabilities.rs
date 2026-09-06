@@ -31,7 +31,7 @@ impl HostTools {
     /// Build the host-tool seam from a pre-filtered built-in set + the session
     /// context. `filtered_builtins` MUST already have had the session's
     /// `ToolFilter` applied by the caller; capability/control tools
-    /// (`exec`, `wait`, `atom_invoke`, `report`, …) are intentionally NOT
+    /// (`exec`, `wait`, `report`, …) are intentionally NOT
     /// included — they are model-facing controls, not nested cell tools.
     pub fn new(filtered_builtins: Vec<Arc<dyn Tool>>, cx: ToolCx) -> Self {
         let tools = filtered_builtins

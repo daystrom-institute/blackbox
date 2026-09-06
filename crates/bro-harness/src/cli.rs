@@ -91,10 +91,8 @@ pub struct Cli {
     #[arg(long = "mcp-config")]
     pub mcp_config: Option<String>,
 
-    /// Name of the daemon-owned MCP server whose canonical capability methods
-    /// should also be exposed under their compatibility flat names
-    /// (`corpus_search`, `atom_invoke`). The qualified MCP tools remain
-    /// available, so this is an alias projection rather than a reduced catalog.
+    /// Name of the daemon-owned MCP server whose corpus search capability
+    /// is also exposed as `corpus_search`. Qualified MCP tools remain available.
     #[arg(long = "capability-mcp-server", hide = true)]
     pub capability_mcp_server: Option<String>,
 
