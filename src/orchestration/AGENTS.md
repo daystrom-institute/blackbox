@@ -59,9 +59,10 @@ Domain home for the dispatch plane. Boundary contract:
   bytes in a content-addressed `tasks.quarantine.<sha256>.json` beside
   `tasks.json`, with restricted permissions and durable file/directory sync.
 - Whole-file parse/read failures or a failed quarantine block every normal
-  snapshot path and emit an error. Runtime tasks may still be visible in memory,
-  but new changes cannot become durable until an operator repairs the configured
-  task store and restarts. Preserve the original and quarantine files during
+  snapshot path and emit an error. New task reservation/insertion refuses with
+  `TaskStoreUnavailable` before executor admission. Existing readable tasks stay
+  visible in memory, but their changes cannot become durable until an operator
+  repairs the configured task store and restarts. Preserve the original and quarantine files during
   repair; never treat an empty in-memory store as authority to discard them.
   Quarantine backups require explicit operator cleanup after repair.
 - Workflow/atom origin, workflow provider, or an explicit `workflow_owned` flag
