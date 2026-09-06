@@ -162,9 +162,15 @@ impl BlackboxServer {
                         network.status()
                     ));
                 }
-                Self::err_text(&format!(
-                    "Artifact install failed: {error:#}. Activation may be partial; inspect the named artifact and runtime before retrying"
-                ))
+                if let Some(failure) =
+                    error.downcast_ref::<crate::server::routes::ArtifactInstallFailure>()
+                {
+                    return Self::err_text(&failure.response().to_string());
+                }
+                Self::err_text(&json!({
+                    "error": "error.artifact_source_read_failed", "completed": [],
+                    "reason": "The source could not be loaded or decoded; no installation steps ran"
+                }).to_string())
             }
         }
     }
@@ -400,6 +406,120 @@ mod tests {
                 None
             )
             .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_install_override_matches_persisted_runtime_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let p = serde_json::from_value(json!({"kind": "brofile", "name": "renamed", "version": "1", "artifact": {"name": "original", "provider": "glm"}})).unwrap();
+        let response = server.bbox_artifact_install(Parameters(p)).await;
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        assert!(
+            orchestration::brofile::resolve_brofile("renamed", &server.state.store_dir, None)
+                .is_some()
+        );
+        assert!(
+            orchestration::brofile::resolve_brofile("original", &server.state.store_dir, None)
+                .is_none()
+        );
+        let value = server
+            .state
+            .artifacts
+            .read()
+            .load_artifact_value(artifacts::ArtifactKind::Brofile, "renamed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["name"], "renamed");
+    }
+
+    #[tokio::test]
+    async fn artifact_install_missing_version_has_no_runtime_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let p = serde_json::from_value(
+            json!({"kind": "brofile", "artifact": {"name": "example", "provider": "glm"}}),
+        )
+        .unwrap();
+        let response = server.bbox_artifact_install(Parameters(p)).await;
+        assert_eq!(response.is_error, Some(true));
+        let failure: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(failure["completed"], json!([]));
+        assert_eq!(failure["failed"], "validation");
+        assert!(
+            orchestration::brofile::resolve_brofile("example", &server.state.store_dir, None)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_install_team_write_failure_reports_completed_effects() {
+        for blocked_stage in ["teamplates", "teams"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let server = test_server(&tmp);
+            std::fs::create_dir_all(&server.state.store_dir).unwrap();
+            std::fs::write(server.state.store_dir.join(blocked_stage), "blocked").unwrap();
+            let p = serde_json::from_value(json!({"kind": "team", "version": "1", "artifact": {"name": "example", "members": []}})).unwrap();
+            let response = server.bbox_artifact_install(Parameters(p)).await;
+            assert_eq!(response.is_error, Some(true), "{response:?}");
+            let failure: Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert!(!failure.to_string().contains(root.to_str().unwrap()));
+            let completed = failure["completed"].as_array().unwrap();
+            assert_eq!(
+                completed.contains(&json!("teamplate_file")),
+                blocked_stage == "teams"
+            );
+            assert_eq!(
+                failure["failed"],
+                if blocked_stage == "teams" {
+                    "team_instance"
+                } else {
+                    "teamplate_file"
+                }
+            );
+            assert!(
+                failure["not_attempted"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("catalog_persistence"))
+            );
+            assert!(
+                server
+                    .state
+                    .artifacts
+                    .read()
+                    .metadata_for(artifacts::ArtifactKind::Team, "example")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_install_catalog_failure_reports_persisted_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let catalog_root = server.state.artifacts.read().root().to_owned();
+        std::fs::write(catalog_root.join("brofile"), "blocked").unwrap();
+        let p = serde_json::from_value(json!({"kind": "brofile", "version": "1", "artifact": {"name": "example", "provider": "glm"}})).unwrap();
+        let response = server.bbox_artifact_install(Parameters(p)).await;
+        assert_eq!(response.is_error, Some(true));
+        let failure: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(failure["failed"], "artifact_content");
+        assert!(
+            failure["completed"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("brofile_file"))
+        );
+        assert!(
+            orchestration::brofile::resolve_brofile("example", &server.state.store_dir, None)
+                .is_some()
         );
     }
 

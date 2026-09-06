@@ -590,7 +590,11 @@ impl BlackboxServer {
                     advisor,
                     diversity_floor: None,
                 };
-                team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref());
+                if let Err(error) =
+                    team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref())
+                {
+                    return Self::err_text(&format!("Teamplate was not saved: {error}"));
+                }
                 Self::ok_json(&json!({"saved": name, "scope": scope}))
             }
             "list_templates" => {
@@ -660,8 +664,15 @@ impl BlackboxServer {
                 if advisor_override.is_some() {
                     tp.advisor = advisor_override;
                 }
-                let mut t =
-                    team::instantiate_team(&tp, &team_name, p.project_dir.as_deref(), store_dir);
+                let mut t = match team::instantiate_team(
+                    &tp,
+                    &team_name,
+                    p.project_dir.as_deref(),
+                    store_dir,
+                ) {
+                    Ok(team) => team,
+                    Err(error) => return Self::err_text(&format!("Team was not saved: {error}")),
+                };
                 if let Err(e) = self.initialize_team_advisor(&mut t).await {
                     return Self::err_text(&e);
                 }

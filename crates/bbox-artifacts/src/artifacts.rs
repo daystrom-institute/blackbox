@@ -1713,6 +1713,45 @@ impl AnchoredArtifactRoot {
     }
 }
 
+/// Observable catalog effects when installation fails between durable writes.
+#[derive(Debug)]
+pub struct ArtifactPersistenceFailure {
+    pub completed: Vec<&'static str>,
+    pub failed: &'static str,
+    cause: anyhow::Error,
+}
+
+impl std::fmt::Display for ArtifactPersistenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "artifact catalog {} failed: {}", self.failed, self.cause)
+    }
+}
+impl std::error::Error for ArtifactPersistenceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+/// Validate the effective catalog identity before runtime activation writes.
+pub fn validate_install_identity(
+    kind: ArtifactKind,
+    value: &Value,
+    name: Option<&str>,
+    version: Option<&str>,
+) -> Result<(String, String)> {
+    let name = name
+        .map(str::to_owned)
+        .or_else(|| artifact_name(kind, value))
+        .ok_or_else(|| anyhow!("artifact name missing for {}", kind.as_str()))?;
+    validate_artifact_name(&name)?;
+    let version = version
+        .map(str::to_owned)
+        .or_else(|| artifact_version(value))
+        .ok_or_else(|| anyhow!("artifact `{name}` missing required version"))?;
+    validate_version_component(&version)?;
+    Ok((name, version))
+}
+
 impl ArtifactCatalog {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -1830,28 +1869,62 @@ impl ArtifactCatalog {
         version_override: Option<String>,
         supersedes_override: Option<String>,
     ) -> Result<ArtifactMetadata> {
-        let name = name_override
-            .or_else(|| artifact_name(kind, value))
-            .ok_or_else(|| anyhow!("artifact name missing for {}", kind.as_str()))?;
-        validate_artifact_name(&name)?;
-        let version = version_override
-            .or_else(|| artifact_version(value))
-            .ok_or_else(|| anyhow!("artifact `{name}` missing required version"))?;
+        let (name, version) = validate_install_identity(
+            kind,
+            value,
+            name_override.as_deref(),
+            version_override.as_deref(),
+        )?;
 
         // Compute hash before supersession logic so idempotency check can use it.
         let hash = artifact_content_sha256(value)?;
 
-        // Idempotency: if active metadata for same scope/kind/name/hash exists, no-op.
+        // An interrupted snapshot/supersession is not an idempotent success.
+        // Verify those durable stages before returning an existing installation.
         let (project_id, project_path, local) = scope.id_path_local();
-        let existing = self.load_metadata_scoped(&scope, kind, &name);
-        if let Ok(existing_meta) = existing {
-            if existing_meta.active
-                && existing_meta.content_sha256.as_deref() == Some(&hash)
-                && existing_meta.project_id == project_id
+        let existing = self
+            .load_metadata_scoped(&scope, kind, &name)
+            .ok()
+            .filter(|meta| {
+                meta.active
+                    && meta.version == version
+                    && meta.content_sha256.as_deref() == Some(&hash)
+                    && meta.project_id == project_id
+            });
+        if let Some(meta) = existing.as_ref() {
+            let snapshot = self.version_artifact_path_scoped(&scope, kind, &name, &version)?;
+            let snapshot_meta = self.version_metadata_path_scoped(&scope, kind, &name, &version)?;
+            let content_complete = fs::read(snapshot)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|snapshot| snapshot == *value);
+            let metadata_complete = fs::read(snapshot_meta)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ArtifactMetadata>(&bytes).ok())
+                .is_some_and(|snapshot| {
+                    snapshot.content_sha256 == meta.content_sha256 && snapshot.version == version
+                });
+            let supersedes = supersedes_override
+                .as_deref()
+                .or_else(|| value.get("supersedes").and_then(Value::as_str));
+            let predecessor_complete =
+                match supersedes.filter(|previous| *previous != name.as_str()) {
+                    Some(previous) => self.metadata_for(kind, previous)?.is_none_or(|previous| {
+                        !previous.active && previous.superseded_by.as_deref() == Some(name.as_str())
+                    }),
+                    None => true,
+                };
+            if content_complete
+                && metadata_complete
+                && predecessor_complete
+                && meta.supersedes.as_deref() == supersedes
             {
-                return Ok(existing_meta);
+                return Ok(meta.clone());
             }
         }
+        let installed_at = existing
+            .map(|meta| meta.installed_at)
+            .unwrap_or_else(util::now_iso);
 
         let supersedes = supersedes_override.or_else(|| artifact_supersedes(value));
         let mut chain = Vec::new();
@@ -1860,34 +1933,61 @@ impl ArtifactCatalog {
                 chain.extend(prev_meta.supersedes_chain.clone());
             }
             chain.push(prev.to_string());
-            let _ = self.mark_superseded(kind, prev, &name);
         }
 
-        let artifact_path = self.artifact_path_scoped(&scope, kind, &name)?;
-        if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        atomic_write_json(&artifact_path, value)?;
+        let mut completed = Vec::new();
+        let mut failed = "artifact_content";
+        let result: Result<ArtifactMetadata> = (|| {
+            let artifact_path = self.artifact_path_scoped(&scope, kind, &name)?;
+            if let Some(parent) = artifact_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write_json(&artifact_path, value)?;
+            completed.push("catalog_artifact_content");
 
-        let metadata = ArtifactMetadata {
-            kind,
-            name,
-            version,
-            source,
-            installed_at: util::now_iso(),
-            content_sha256: Some(hash),
-            project_id,
-            project_path,
-            local,
-            supersedes,
-            supersedes_chain: chain,
-            superseded_by: None,
-            active: true,
-            install_warnings: Vec::new(),
-        };
-        self.save_metadata_scoped(&scope, &metadata)?;
-        self.save_version_snapshot_scoped(&scope, &metadata, value)?;
-        Ok(metadata)
+            let metadata = ArtifactMetadata {
+                kind,
+                name,
+                version,
+                source,
+                installed_at,
+                content_sha256: Some(hash),
+                project_id,
+                project_path,
+                local,
+                supersedes,
+                supersedes_chain: chain,
+                superseded_by: None,
+                active: true,
+                install_warnings: Vec::new(),
+            };
+            failed = "catalog_metadata";
+            self.save_metadata_scoped(&scope, &metadata)?;
+            completed.push("catalog_metadata");
+            failed = "catalog_version_snapshot";
+            self.save_version_snapshot_scoped(&scope, &metadata, value)?;
+            completed.push("catalog_version_snapshot");
+            if let Some(previous) = metadata
+                .supersedes
+                .as_deref()
+                .filter(|previous| *previous != metadata.name.as_str())
+            {
+                failed = "previous_catalog_supersession";
+                if self.metadata_for(kind, previous)?.is_some() {
+                    self.mark_superseded(kind, previous, &metadata.name)?;
+                    completed.push("previous_catalog_supersession");
+                }
+            }
+            Ok(metadata)
+        })();
+        result.map_err(|cause| {
+            ArtifactPersistenceFailure {
+                completed,
+                failed,
+                cause,
+            }
+            .into()
+        })
     }
 
     pub fn list(&self, p: &ArtifactListParams) -> Result<Vec<ArtifactListEntry>> {
@@ -3687,6 +3787,111 @@ mod tests {
         assert_eq!(back.project_id.as_deref(), Some("proj-123"));
         assert_eq!(back.project_path.as_deref(), Some("/home/user/myproject"));
         assert!(back.local);
+    }
+
+    #[test]
+    fn failed_catalog_write_reports_effects_and_preserves_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let catalog = ArtifactCatalog::open(root.join("catalog")).unwrap();
+        let previous = serde_json::json!({"name": "previous", "version": "1"});
+        catalog
+            .install_value(
+                ArtifactKind::Brofile,
+                "inline".into(),
+                &previous,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let replacement =
+            serde_json::json!({"name": "replacement", "version": "1", "supersedes": "previous"});
+        let blocked = catalog
+            .metadata_path(ArtifactKind::Brofile, "replacement")
+            .unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let error = catalog
+            .install_value(
+                ArtifactKind::Brofile,
+                "inline".into(),
+                &replacement,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        let failure = error.downcast_ref::<ArtifactPersistenceFailure>().unwrap();
+        assert_eq!(failure.completed, vec!["catalog_artifact_content"]);
+        assert_eq!(failure.failed, "catalog_metadata");
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Brofile, "previous")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Brofile,
+                "inline".into(),
+                &replacement,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !catalog
+                .metadata_for(ArtifactKind::Brofile, "previous")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
+    fn retry_repairs_snapshot_after_partial_catalog_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let catalog = ArtifactCatalog::open(root.join("catalog")).unwrap();
+        let artifact = serde_json::json!({"name": "example", "version": "1"});
+        let blocked = catalog
+            .version_artifact_path(ArtifactKind::Brofile, "example", "1")
+            .unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let error = catalog
+            .install_value(
+                ArtifactKind::Brofile,
+                "inline".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        let failure = error.downcast_ref::<ArtifactPersistenceFailure>().unwrap();
+        assert_eq!(failure.failed, "catalog_version_snapshot");
+        assert!(failure.completed.contains(&"catalog_metadata"));
+        std::fs::remove_dir(&blocked).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Brofile,
+                "inline".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(blocked.is_file());
+        assert!(
+            catalog
+                .metadata_for_version(ArtifactKind::Brofile, "example", "1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

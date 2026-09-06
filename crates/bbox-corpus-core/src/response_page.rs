@@ -48,7 +48,7 @@ pub fn bound_page(mut page: Value, field: &str) -> Result<Value> {
         if bytes.saturating_add(additional) > PAGE_BUDGET_BYTES {
             if selected.is_empty() {
                 anyhow::bail!(
-                    "error.collection_row_too_large: one {field} row exceeds the response budget; request summaries with detail=false or full=false, then use the exact-read hint"
+                    "error.collection_row_too_large: one {field} row exceeds the response budget; use this tool's documented summary projection or exact-read options"
                 );
             }
             limited = true;
