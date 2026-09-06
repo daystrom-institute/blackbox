@@ -975,8 +975,10 @@ pub(crate) struct TeamParams {
     pub(crate) scope: Option<String>,
     #[serde(default)]
     pub(crate) cancel_running: Option<bool>,
+    /// Retired input: rejected when supplied. Legacy stored advisor settings
+    /// remain readable but team create/wait operations never execute them.
     #[serde(default)]
-    pub(crate) advisor: Option<AdvisorSpecParams>,
+    pub(crate) advisor: Option<serde_json::Value>,
     /// Summary list/list_templates/roster page size; default 20, clamp 1..100.
     #[serde(default)]
     pub(crate) limit: Option<usize>,
@@ -1002,82 +1004,6 @@ pub(crate) struct TeamMemberSlot {
     /// Instances of this member (default 1, minimum 1); the sum of all slots
     /// must not exceed 256. Save/create refuse before expansion or persistence.
     pub(crate) count: Option<u32>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AdvisorSpecParams {
-    /// Special brofile designated as the advisor for this team.
-    pub(crate) brofile: String,
-    /// Optional advisor alias; defaults to the brofile name.
-    #[serde(default)]
-    pub(crate) alias: Option<String>,
-    /// One-sentence or short-paragraph charter for the advisor.
-    pub(crate) charter: String,
-    /// Optional extra context that should stay hot across advisor rounds.
-    #[serde(default)]
-    pub(crate) context: Option<String>,
-    /// Halt / escalate conditions the advisor should watch for.
-    #[serde(default)]
-    pub(crate) halt_conditions: Option<Vec<String>>,
-    /// Exit conditions the advisor should watch for.
-    #[serde(default)]
-    pub(crate) exit_conditions: Option<Vec<String>>,
-    /// Optional compiled packet ID the advisor can use mechanically.
-    #[serde(default)]
-    pub(crate) packet_id: Option<String>,
-    /// Wait behavior for internal advisor rounds.
-    #[serde(default)]
-    pub(crate) mode: Option<orchestration::team::AdvisorMode>,
-    /// Optional timeout for internal advisor init/resume waits.
-    #[serde(default)]
-    pub(crate) timeout_seconds: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct AdvisorMemberCheckpoint {
-    pub(crate) bro: Option<String>,
-    pub(crate) task_id: String,
-    pub(crate) status: String,
-    pub(crate) timed_out: bool,
-    pub(crate) keep_going: Option<String>,
-    pub(crate) result_snippet: Option<String>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub(crate) struct AdvisorNoteSummary {
-    pub(crate) dispute_count: usize,
-    pub(crate) assumption_count: usize,
-    pub(crate) surprise_count: usize,
-    pub(crate) followup_count: usize,
-    pub(crate) blocked_count: usize,
-    pub(crate) learned_count: usize,
-    pub(crate) done_count: usize,
-    pub(crate) recent_unresolved: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct AdvisorCheckpoint {
-    pub(crate) wait_kind: String,
-    pub(crate) team_name: String,
-    pub(crate) teamplate: String,
-    pub(crate) monitored_task_ids: Vec<String>,
-    pub(crate) packet_id: Option<String>,
-    pub(crate) total_count: usize,
-    pub(crate) completed_count: usize,
-    pub(crate) failed_count: usize,
-    pub(crate) cancelled_count: usize,
-    pub(crate) timed_out_count: usize,
-    pub(crate) running_count: usize,
-    pub(crate) dispute_count: usize,
-    pub(crate) assumption_count: usize,
-    pub(crate) surprise_count: usize,
-    pub(crate) followup_count: usize,
-    pub(crate) blocked_count: usize,
-    pub(crate) learned_count: usize,
-    pub(crate) done_count: usize,
-    pub(crate) members: Vec<AdvisorMemberCheckpoint>,
-    pub(crate) notes: AdvisorNoteSummary,
 }
 
 // ---------------------------------------------------------------------------

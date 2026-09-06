@@ -147,17 +147,24 @@ daemon-owned global catalogs. `project_dir` remains the worker/team association;
 it does not select project template or brofile overrides on the daemon. A
 missing global dependency refuses before a team is instantiated. Successful
 creation returns `memberCount`, `templateScope="global"`, and roster/get hints
-instead of repeating every member. Advisor initialization uses the same global
-brofile authority while preserving the worker context.
+instead of repeating every member. Creation starts no advisor tasks. Existing
+advisor settings and history remain readable; summaries mark them
+`execution="retired"`, and creation receipts carry `advisorExecution="retired"`
+only when the template contains those legacy settings. New `advisor` arguments
+are rejected. Legacy advisor brofiles are not resolved or executed.
+
+`bro_wait`, `bro_when_all`, and `bro_when_any` only observe existing tasks.
+Neither completion nor timeout launches an advisor or continuation. Dispatch a
+review explicitly with `bro_exec` or `bro_resume` when the caller needs one.
 Templates require at least one member, every slot count must be positive, and
-expanded members must total at most 256 (plus an optional advisor). Saving or
+expanded members must total at most 256. Saving or
 creating an invalid template refuses before allocation or persistence; counts
 are never truncated. Existing invalid templates remain inspectable and their
 summary includes an admission error until corrected.
 
 Use teams for ensemble review, blind comparison, provider races, or repeated
-panels. If the control flow has gates, retries, waits, or cleanup, write a
-workflow instead of hand-driving the team.
+panels. The caller owns gates, retries, subsequent work, and cleanup in ordinary
+code, using explicit bro control operations.
 
 ## Provider Catalog
 

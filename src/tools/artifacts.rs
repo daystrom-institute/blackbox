@@ -723,8 +723,9 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("advisor"),
-            "advisor teamplates need bro_team create (live dispatch): {err:#}"
+            err.to_string()
+                .contains("automatic team advisors are retired"),
+            "retired automatic advisors must be rejected by artifact install: {err:#}"
         );
     }
 
