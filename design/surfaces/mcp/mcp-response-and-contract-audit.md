@@ -841,3 +841,19 @@ knowledge-write reconciliation
 ([gap-e2f4b76e](../../../.bbox/gaps/gap-e2f4b76e.json)) and exact packet body
 reads ([gap-3bbc041f](../../../.bbox/gaps/gap-3bbc041f.json)). Collector delivery
 preconditions and paired-file atomicity remain separate transport work.
+
+
+### Native checkout-delivery cadence milestone
+
+Source `78fef2f6` separates lightweight mutation polling from source scanning.
+All 22 collector tests and the dependency-ceiling check passed. The macOS
+collector was rebuilt, stablesigned and installed; launchd registration was
+refreshed after the binary swap. The running service delivered a new queued
+edit in 8.12 seconds with `mutation_interval_secs=10`, while source collection
+retained its existing 600-second interval. See
+[gap-3e7cc5a9](../../../.bbox/gaps/gap-3e7cc5a9.json).
+
+The earlier gap resolution also reached the checkout with both prior edits
+intact, completing the delivered-before-publication smoke check. Packet exact
+body reads and their authoring documentation are pushed at `2420c025`; 47
+focused tests passed. Those daemon changes await the next verified image.

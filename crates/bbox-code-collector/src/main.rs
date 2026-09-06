@@ -295,8 +295,8 @@ async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
 /// Checkout-mutation delivery lane: poll the daemon for pending repo-owned
 /// file mutations (gap/knowledge writes it validated but cannot apply with
 /// zero checkout authority), write the bytes into the matching configured
-/// checkout, and ack each outcome. Runs ahead of the knowledge lane so a
-/// freshly applied record rides the same cycle's publication candidate.
+/// checkout, and ack each outcome. Runs independently of source scanning;
+/// publication still reads only the configured committed ref.
 async fn run_checkout_mutation_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.mutation_interval_secs.max(1));
     let mut backoff = interval;

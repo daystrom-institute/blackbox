@@ -19,6 +19,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Exact packet inspection returns complete installed JSON through bounded
+  property pages, including rules and evaluation configuration. Packet
+  authoring docs state scalar result types and show predicate JSON.
+- Checkout mutation delivery polls independently every 10 seconds by default.
+  Expensive source scans retain their configured interval.
+
 - Storage GC returns a compact outcome summary and immutable receipt pages.
   Partial deletion results survive later-stage failures; receipt reads never
   rerun collection.

@@ -1,0 +1,21 @@
+{
+  "id": "gap-3e7cc5a9",
+  "title": "Queued edit delivery inherits the slow source scan interval",
+  "gap_kind": "tooling",
+  "domain": "checkout-mutations",
+  "wanted_capability": "Poll lightweight admitted gap and knowledge edits promptly without increasing expensive source scans or publication frequency.",
+  "evidence": [
+    "crates/bbox-code-collector/src/main.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/checkout-mutations/delivery-poll-tied-to-source-scan",
+  "notes": "Queued edit delivery now polls independently every 10 seconds; source scans retain their configured cadence.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T17:30:08Z",
+  "updated_at": "2026-09-06T17:35:13Z",
+  "resolved_at": "2026-09-06T17:35:13Z",
+  "resolution_note": "Native collector source 78fef2f6 passed 22 lane tests and dependency ceiling check, was stablesigned and deployed. A live admitted update reached the checkout in 8.12 seconds while source scans remained at 600 seconds."
+}
