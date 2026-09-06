@@ -1,0 +1,18 @@
+{
+  "id": "gap-42829be9",
+  "title": "Provider discovery and dispatch omit peak-hour usage advisories",
+  "gap_kind": "mcp_surface",
+  "domain": "orchestration",
+  "wanted_capability": "Expose a consistent schedule-based peak_usage field before provider selection and on dispatch/resume receipts and allocator candidates.",
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/orchestration/provider-peak-usage",
+  "notes": "Operator requested weekday GLM and DeepSeek schedules. Implemented advisory metadata in 2f11b9fa; validation underway. Numerical multipliers omitted because supplied Z.AI rules and current public credit documentation disagree.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T22:27:00Z",
+  "updated_at": "2026-09-06T22:33:15Z",
+  "resolved_at": "2026-09-06T22:33:15Z",
+  "resolution_note": "Implemented in 2f11b9fa; synthetic HTTP probe extended in 27046e0c. GLM and DeepSeek provider discovery, allocator candidates/traces, exec/resume receipts, and request-key replays expose advisory peak_usage. UTC-derived weekday windows include starts and exclude ends. Unsupported schedules omit the field; no scoring or numerical rate changes. Full workspace gate: 6690 passed, 19 skipped, with the existing lane-only exclusive scheduling override for two lock-contention tests. Clippy, pinned formatting, concurrency lint passed. 173 isolated HTTP checks passed, including inert-worker exec/resume/replay. Deployed image 27046e0c2dfc, digest sha256:15e1a9c0619d5b8e5f62e22d97d5e0c82ceea443e75a4a7f1f8b36b22858b359; rollout healthy and live provider/preview fields verified."
+}
