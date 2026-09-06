@@ -1,4 +1,5 @@
 use crate::config;
+use crate::server::control::*;
 use crate::server::routes::*;
 use crate::server::tail::{roster_stream_handler, tail_handler};
 use crate::server::{BlackboxServer, SharedState};
