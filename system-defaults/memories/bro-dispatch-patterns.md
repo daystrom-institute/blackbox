@@ -16,6 +16,11 @@ The orchestration surface is small, but the workflow shapes are different enough
 
 If you want continuity, do not call `bro_exec` again.
 
+`bro_wait`, `bro_when_all`, and `bro_when_any` observe existing tasks without
+launching advisors or follow-up work. Team creation also starts no advisor.
+Legacy team advisor settings remain readable but inert; request any review
+explicitly with `bro_exec` or `bro_resume`.
+
 Record the `{taskId, sessionId}` returned by every `bro_exec` and
 `bro_resume`. Use those explicit handles for later waits and resumes whenever
 there is any chance of sibling sessions, dashboard clutter, or another

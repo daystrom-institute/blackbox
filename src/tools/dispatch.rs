@@ -1056,7 +1056,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_wait",
-        description = "Block until one task completes; timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success."
+        description = "Observe one task until completion; never launches follow-up work. Timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success."
     )]
     pub(crate) async fn bro_wait(
         &self,
@@ -1097,29 +1097,13 @@ impl BlackboxServer {
             orchestration::team::find_bro_ref_for_task(&p.task_id, &self.state.store_dir)
         {
             out["bro"] = Value::String(team_ref.member_name.clone());
-            // Advisor checkpoints consume complete internal deliverables.
-            // Only the MCP-facing copy is paged.
-            let mut advisor_result = if completed {
-                orch::task_result_json(&task)
-            } else {
-                out.clone()
-            };
-            advisor_result["bro"] = json!(team_ref.member_name);
-            match self
-                .maybe_resume_team_advisor(&team_ref.team_name, "wait", &[advisor_result])
-                .await
-            {
-                Ok(Some(value)) => out["advisor"] = value,
-                Ok(None) => {}
-                Err(err) => out["advisor"] = json!({"error": err}),
-            }
         }
         Self::ok_json(&out)
     }
 
     #[tool(
         name = "bro_when_all",
-        description = "Block until ALL tasks / team members complete; use for fan-out/fan-in instead of hand-rolled sequential waits."
+        description = "Observe ALL selected tasks or team members until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch."
     )]
     pub(crate) async fn bro_when_all(
         &self,
@@ -1181,33 +1165,7 @@ impl BlackboxServer {
             h.abort();
         }
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
-        let advisor = match p.team.as_deref() {
-            Some(team_name) => {
-                let advisor_results: Vec<Value> = tasks
-                    .iter()
-                    .zip(&results)
-                    .map(|(task, result)| {
-                        if result.get("timed_out").is_some() {
-                            return result.clone();
-                        }
-                        let mut full = orch::task_result_json(task);
-                        if let Some(bro) = result.get("bro") {
-                            full["bro"] = bro.clone();
-                        }
-                        full
-                    })
-                    .collect();
-                self.maybe_resume_team_advisor(team_name, "when_all", &advisor_results)
-                    .await
-            }
-            None => Ok(None),
-        };
-        let mut out = json!({ "all_completed": all_done, "results": results });
-        match advisor {
-            Ok(Some(value)) => out["advisor"] = value,
-            Ok(None) => {}
-            Err(err) => out["advisor"] = json!({"error": err}),
-        }
+        let out = json!({ "all_completed": all_done, "results": results });
         Self::ok_json(&out)
     }
 
@@ -2730,6 +2688,100 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let server = test_server(&tmp);
         assert_team_dispatch_source(&server, &root, false);
+    }
+
+    #[tokio::test]
+    async fn legacy_advisor_team_waits_observe_without_launching_or_mutating() {
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::{ClientHandler, ServiceExt};
+        struct WaitClient;
+        impl ClientHandler for WaitClient {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
+        let state = server.state.clone();
+        let team: orchestration::team::Team = serde_json::from_value(json!({
+            "name": "legacy-panel", "teamplate": "legacy-template", "created_at": 0,
+            "members": [{"name":"reviewer", "brofile":"unused-member", "session_id": "member-session", "task_history":["observed-task"]}],
+            "advisor": {"name":"old-advisor", "config": {
+                "brofile":"missing-advisor", "charter":"Legacy charter",
+                "mode":"blocking"
+            }, "session_id":"old-advisor-session", "task_history":["old-advisor-task"]}
+        })).unwrap();
+        orchestration::team::save_team(&team, &state.store_dir);
+        let team_path = state.store_dir.join("teams/legacy-panel.json");
+        assert!(team_path.starts_with(&root));
+        let before = std::fs::read(&team_path).unwrap();
+        let task = orch::test_task("observed-task", orch::TaskStatus::Completed, Provider::Glm);
+        state
+            .task_store
+            .write()
+            .insert("observed-task".into(), task.clone())
+            .unwrap();
+
+        // In-memory MCP transport only. The deliberately missing advisor brofile
+        // also prevents outbound execution if the retired path ever regresses.
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = WaitClient.serve(client_io).await.unwrap();
+        for status in [orch::TaskStatus::Completed, orch::TaskStatus::Running] {
+            task.inner.lock().status = status;
+            for (tool, args) in [
+                (
+                    "bro_wait",
+                    json!({"task_id":"observed-task", "timeout_seconds":0}),
+                ),
+                (
+                    "bro_when_all",
+                    json!({"team":"legacy-panel", "timeout_seconds":0}),
+                ),
+                (
+                    "bro_when_all",
+                    json!({"task_ids":["observed-task"], "timeout_seconds":0}),
+                ),
+            ] {
+                let response = client
+                    .call_tool(
+                        CallToolRequestParams::new(tool)
+                            .with_arguments(args.as_object().unwrap().clone()),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(response.is_error, Some(true), "{response:?}");
+                let value: Value =
+                    serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+                assert!(
+                    value.get("advisor").is_none(),
+                    "wait attempted retired advisor execution: {value}"
+                );
+                if tool == "bro_wait" {
+                    assert_eq!(value["bro"], "reviewer");
+                    assert_eq!(
+                        value.get("timed_out").is_some(),
+                        status == orch::TaskStatus::Running
+                    );
+                } else {
+                    assert_eq!(
+                        value["all_completed"],
+                        status == orch::TaskStatus::Completed
+                    );
+                    assert_eq!(value["results"].as_array().unwrap().len(), 1);
+                }
+                assert_eq!(state.task_store.read().all_tasks().len(), 1);
+                assert_eq!(std::fs::read(&team_path).unwrap(), before);
+            }
+        }
+        client.cancel().await.unwrap();
+        serving.await.unwrap();
     }
 
     #[test]

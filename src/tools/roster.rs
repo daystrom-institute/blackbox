@@ -2,19 +2,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::notes;
 use crate::orchestration;
 use crate::orchestration as orch;
-use crate::orchestration::providers::dispatch_prelude::*;
-use crate::orchestration::providers::{ExecOpts, Provider};
-use crate::packets::apply_with as apply_packet_with;
-use crate::server::progress::{
-    cleanup_policy_file_when_done, extra_filters_from_params, release_resume_lease_when_done,
-    resolve_dispatch_filters, try_acquire_resume_lease,
-};
+use crate::orchestration::providers::Provider;
+use crate::server::progress::extra_filters_from_params;
 use crate::server::state::BlackboxServer;
 use crate::tools::bro_params::{
-    AdvisorCheckpoint, AdvisorMemberCheckpoint, AdvisorNoteSummary, AdvisorSpecParams,
     BrofileParams, DashboardParams, ProvidersParams, ReportParams, TeamParams,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -558,7 +551,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_team",
-        description = "Manage teamplates and teams. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
+        description = "Manage teamplates and teams without automatic advisor execution. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
     )]
     pub(crate) async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
         if let Err(error) =
@@ -607,14 +600,6 @@ impl BlackboxServer {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
-                let advisor = match self.resolve_team_advisor_config(
-                    p.advisor.as_ref(),
-                    store_dir,
-                    source_project_dir,
-                ) {
-                    Ok(cfg) => cfg,
-                    Err(e) => return Self::err_text(&e),
-                };
                 let tp = team::Teamplate {
                     name: name.clone(),
                     members: members
@@ -625,7 +610,7 @@ impl BlackboxServer {
                             count: m.count.unwrap_or(1),
                         })
                         .collect(),
-                    advisor,
+                    advisor: None,
                     diversity_floor: None,
                 };
                 if let Err(error) =
@@ -681,40 +666,11 @@ impl BlackboxServer {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
-                let advisor_override = match self.resolve_team_advisor_config(
-                    p.advisor.as_ref(),
-                    store_dir,
-                    source_project_dir,
-                ) {
-                    Ok(cfg) => cfg,
-                    Err(e) => return Self::err_text(&e),
-                };
-                if let Some(advisor) = advisor_override.as_ref().or(tp.advisor.as_ref()) {
-                    if let Err(error) = validate_team_object_name(&advisor.brofile) {
-                        return Self::err_text(&error.to_string());
-                    }
-                    if orchestration::brofile::resolve_brofile(
-                        &advisor.brofile,
-                        store_dir,
-                        source_project_dir,
-                    )
-                    .is_none()
-                    {
-                        return Self::err_text(&format!(
-                            "Advisor brofile not found in the available source: {}; catalog teams require a daemon-owned global brofile",
-                            advisor.brofile
-                        ));
-                    }
-                }
                 let team_name = p
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{template}-{}", orch::now_ms()));
-                let mut tp = tp;
-                if advisor_override.is_some() {
-                    tp.advisor = advisor_override;
-                }
-                let mut t = match team::instantiate_team(
+                let t = match team::instantiate_team(
                     &tp,
                     &team_name,
                     p.project_dir.as_deref(),
@@ -723,9 +679,6 @@ impl BlackboxServer {
                     Ok(team) => team,
                     Err(error) => return Self::err_text(&format!("Team was not saved: {error}")),
                 };
-                if let Err(e) = self.initialize_team_advisor(&mut t).await {
-                    return Self::err_text(&e);
-                }
                 Self::ok_json(&team_create_receipt(
                     &t,
                     !self.state.project_authority.is_bridge(),
@@ -759,625 +712,6 @@ impl BlackboxServer {
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
-    }
-
-    pub(crate) fn resolve_team_advisor_config(
-        &self,
-        advisor: Option<&AdvisorSpecParams>,
-        store_dir: &Path,
-        project_dir: Option<&str>,
-    ) -> Result<Option<orchestration::team::TeamAdvisorConfig>, String> {
-        let Some(advisor) = advisor else {
-            return Ok(None);
-        };
-        if advisor.charter.trim().is_empty() {
-            return Err("advisor.charter is required and cannot be empty".into());
-        }
-        let brofile =
-            orchestration::brofile::resolve_brofile(&advisor.brofile, store_dir, project_dir)
-                .ok_or_else(|| format!("Brofile not found: {}", advisor.brofile))?;
-        if !brofile.provider.supports_resume() {
-            return Err(format!(
-                "Advisor brofile {} uses provider {} which does not support resume",
-                advisor.brofile, brofile.provider
-            ));
-        }
-        Ok(Some(orchestration::team::TeamAdvisorConfig {
-            brofile: advisor.brofile.clone(),
-            alias: advisor.alias.clone(),
-            charter: advisor.charter.clone(),
-            context: advisor.context.clone(),
-            halt_conditions: advisor.halt_conditions.clone().unwrap_or_default(),
-            exit_conditions: advisor.exit_conditions.clone().unwrap_or_default(),
-            packet_id: advisor.packet_id.clone(),
-            timeout_seconds: advisor.timeout_seconds,
-            mode: advisor.mode.unwrap_or_default(),
-        }))
-    }
-
-    pub(crate) fn build_team_advisor_init_prompt(
-        &self,
-        team: &orchestration::team::Team,
-        advisor: &orchestration::team::TeamAdvisor,
-    ) -> String {
-        let member_list = team
-            .members
-            .iter()
-            .map(|m| format!("- {} ({})", m.name, m.brofile))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let halt_list = if advisor.config.halt_conditions.is_empty() {
-            "- none declared".to_string()
-        } else {
-            advisor
-                .config
-                .halt_conditions
-                .iter()
-                .map(|c| format!("- {c}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let exit_list = if advisor.config.exit_conditions.is_empty() {
-            "- none declared".to_string()
-        } else {
-            advisor
-                .config
-                .exit_conditions
-                .iter()
-                .map(|c| format!("- {c}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let context = advisor.config.context.as_deref().unwrap_or("(none)");
-        let packet_id = advisor.config.packet_id.as_deref().unwrap_or("(none)");
-        format!(
-            "You are the advisor for team \"{team_name}\".\n\n\
-Role:\n\
-- monitor big-picture progression only\n\
-- stay out of code-level execution unless explicitly asked\n\
-- use the charter, halt conditions, exit conditions, and packet result to steer\n\
-- when the checkpoint indicates drift/blockage/exit, say so plainly\n\n\
-Team members:\n{member_list}\n\n\
-Charter:\n{charter}\n\n\
-Context:\n{context}\n\n\
-Halt conditions:\n{halt_list}\n\n\
-Exit conditions:\n{exit_list}\n\n\
-Compiled packet for mechanical evaluation:\n- {packet_id}\n\n\
-From now on, you will receive structured checkpoint updates after wait boundaries.\n\
-Respond tersely with:\n\
-Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO\n\
-Rationale: <1-3 sentences>\n\
-Next step: <one concrete steering suggestion>\n",
-            team_name = team.name,
-            member_list = member_list,
-            charter = advisor.config.charter,
-            context = context,
-            halt_list = halt_list,
-            exit_list = exit_list,
-            packet_id = packet_id,
-        )
-    }
-
-    pub(crate) async fn dispatch_team_advisor_prompt(
-        &self,
-        team: &mut orchestration::team::Team,
-        prompt: String,
-    ) -> Result<(Arc<orch::Task>, Option<f64>), String> {
-        let advisor = match team.advisor.as_mut() {
-            Some(a) => a,
-            None => return Err("team has no advisor configured".into()),
-        };
-        validate_team_object_name(&advisor.config.brofile).map_err(|error| error.to_string())?;
-        let store_dir = self.state.store_dir.clone();
-        let brofile = orchestration::brofile::resolve_brofile(
-            &advisor.config.brofile,
-            &store_dir,
-            team_source_project_dir(self, team.project_dir.as_deref()),
-        )
-        .ok_or_else(|| format!("Brofile not found: {}", advisor.config.brofile))?;
-        let provider = brofile.provider;
-        // For an advisor resume, prefer the lease-captured policy from
-        // the original dispatch over the current brofile — resume must
-        // honor dispatch-time suppression intent.
-        let advisor_lease = advisor
-            .session_id
-            .as_deref()
-            .filter(|s| !s.is_empty() && *s != "pending")
-            .and_then(|sid| {
-                orchestration::allocator::lookup_lease_for_session_any_provider(
-                    &store_dir,
-                    &self.state.task_store.read(),
-                    sid,
-                )
-            });
-        let effective_provider = advisor_lease
-            .as_ref()
-            .map(|lease| lease.provider)
-            .unwrap_or(provider);
-        let effective_context = advisor_lease
-            .as_ref()
-            .and_then(|l| l.brofile_context.as_ref())
-            .or(brofile.context.as_ref());
-        orchestration::brofile::enforce_provider_defaults(effective_provider, effective_context)?;
-        let env_overrides = orchestration::brofile::resolve_provider_env(
-            effective_provider,
-            advisor_lease
-                .as_ref()
-                .and_then(|l| l.account.as_deref())
-                .or(brofile.account.as_deref()),
-            advisor_lease
-                .as_ref()
-                .and_then(|l| l.model.as_deref())
-                .or(brofile.model.as_deref()),
-            &store_dir,
-            effective_context,
-        );
-        let exec_opts = if let Some(lease) = advisor_lease.as_ref() {
-            orchestration::allocator::exec_opts_for_lane(&orchestration::allocator::RuntimeLane {
-                provider: lease.provider,
-                account: lease.account.clone(),
-                tier: lease.tier.clone(),
-                model: lease.model.clone(),
-                effort: lease.effort.clone(),
-                capabilities: lease.capabilities.clone(),
-            })
-        } else if brofile.model.is_some()
-            || brofile.effort.is_some()
-            || brofile.code_mode.is_some()
-            || brofile.service_tier.is_some()
-        {
-            Some(ExecOpts {
-                model: brofile.model.clone(),
-                effort: brofile.effort.clone(),
-                provider_defaults: None,
-                code_mode: brofile.code_mode,
-                service_tier: brofile.service_tier.clone(),
-                output_schema: None,
-            })
-        } else {
-            None
-        };
-        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
-            exec_opts,
-            effective_context,
-        );
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let timeout = advisor.config.timeout_seconds;
-        let cwd = team.project_dir.clone();
-        let task = match advisor.session_id.as_deref() {
-            Some("pending") => {
-                return Err(format!(
-                    "Advisor {} is still waiting for session discovery; refusing to launch a second session",
-                    advisor.name
-                ));
-            }
-            Some(session_id) => {
-                let resume_lease = try_acquire_resume_lease(
-                    &self.state.task_store,
-                    self.state.resume_leases.as_ref(),
-                    effective_provider,
-                    session_id,
-                )?;
-                let ambient_ctx = orch::AmbientContext {
-                    task_id: Some(task_id.clone()),
-                    session_id: Some(session_id.to_string()),
-                    project_dir: cwd.clone(),
-                    bro_name: Some(advisor.name.clone()),
-                    thread_id: None,
-                    work_item_id: None,
-                    pin_block: self.ambient_pin_block(
-                        cwd.as_deref(),
-                        Some(advisor.name.as_str()),
-                        Some(session_id),
-                        None,
-                        None,
-                    ),
-                    completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
-                    allow_recursion: false,
-                    provider: Some(effective_provider),
-                    coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
-                };
-                // Resume passes the full dispatch context, persona included
-                // (dispatch-prompt-slots.md §6).
-                let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
-                let mut args = effective_provider.build_resume_args(
-                    session_id,
-                    &prompt,
-                    Some(&dispatch_context),
-                    exec_opts.as_ref(),
-                );
-                let dispatch_filters = match resolve_dispatch_filters(
-                    effective_provider,
-                    cwd.as_deref(),
-                    false,
-                    &task_id,
-                    brofile.filters.as_ref(),
-                ) {
-                    Ok(df) => df,
-                    Err(e) => return Err(e),
-                };
-                args.extend(dispatch_filters.args);
-                let task = orch::spawn_task(
-                    task_id.clone(),
-                    effective_provider,
-                    args,
-                    session_id.to_string(),
-                    cwd.clone(),
-                    env_overrides,
-                    store_dir.clone(),
-                    self.state.task_store.clone(),
-                    self.state.tail_tx.clone(),
-                    Some(self.state.roster_events()),
-                    None,
-                    None,
-                    Some(self.state.system_events.clone()),
-                    // dispatch_team_advisor_prompt — team advisor
-                    // resume branch, workflow origin (advisor
-                    // runtime is team-orchestration traffic).
-                    bro_core::Origin::Workflow,
-                )
-                .await;
-                cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-                release_resume_lease_when_done(task.clone(), resume_lease);
-                task
-            }
-            None => {
-                let session_id = "pending".to_string();
-                let ambient_ctx = orch::AmbientContext {
-                    task_id: Some(task_id.clone()),
-                    session_id: Some(session_id.clone()),
-                    project_dir: cwd.clone(),
-                    bro_name: Some(advisor.name.clone()),
-                    thread_id: None,
-                    work_item_id: None,
-                    pin_block: self.ambient_pin_block(
-                        cwd.as_deref(),
-                        Some(advisor.name.as_str()),
-                        Some(session_id.as_str()),
-                        None,
-                        None,
-                    ),
-                    completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
-                    allow_recursion: false,
-                    provider: Some(provider),
-                    coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
-                };
-                let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
-                let mut args = provider.build_exec_args(
-                    &prompt,
-                    Some(&dispatch_context),
-                    &session_id,
-                    cwd.as_deref(),
-                    exec_opts.as_ref(),
-                );
-                let dispatch_filters = match resolve_dispatch_filters(
-                    provider,
-                    cwd.as_deref(),
-                    false,
-                    &task_id,
-                    brofile.filters.as_ref(),
-                ) {
-                    Ok(df) => df,
-                    Err(e) => return Err(e),
-                };
-                args.extend(dispatch_filters.args);
-                let task = orch::spawn_task(
-                    task_id.clone(),
-                    provider,
-                    args,
-                    session_id,
-                    cwd.clone(),
-                    env_overrides,
-                    store_dir.clone(),
-                    self.state.task_store.clone(),
-                    self.state.tail_tx.clone(),
-                    Some(self.state.roster_events()),
-                    None,
-                    None,
-                    Some(self.state.system_events.clone()),
-                    // dispatch_team_advisor_prompt — team advisor
-                    // fresh branch, workflow origin.
-                    bro_core::Origin::Workflow,
-                )
-                .await;
-                cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-                task
-            }
-        };
-
-        advisor.task_history.push(task_id);
-        advisor.session_id = Some(task.inner.lock().session_id.clone());
-        orchestration::team::save_team(team, &self.state.store_dir);
-        Ok((task, timeout))
-    }
-
-    pub(crate) fn persist_advisor_session_to_team(&self, team_name: &str, task: &Arc<orch::Task>) {
-        let Some(mut team) = orchestration::team::load_team(team_name, &self.state.store_dir)
-        else {
-            return;
-        };
-        let Some(advisor) = team.advisor.as_mut() else {
-            return;
-        };
-        let session_id = task.inner.lock().session_id.clone();
-        if session_id != "pending" {
-            advisor.session_id = Some(session_id);
-            orchestration::team::save_team(&team, &self.state.store_dir);
-        }
-    }
-
-    pub(crate) async fn await_team_advisor_task(
-        &self,
-        team_name: &str,
-        task: Arc<orch::Task>,
-        timeout: Option<f64>,
-    ) -> Result<Value, String> {
-        let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
-        self.persist_advisor_session_to_team(team_name, &task);
-        Ok(if completed {
-            orch::task_result_json(&task)
-        } else {
-            orch::timeout_snapshot_json(&task)
-        })
-    }
-
-    pub(crate) async fn initialize_team_advisor(
-        &self,
-        team: &mut orchestration::team::Team,
-    ) -> Result<(), String> {
-        let Some(advisor) = team.advisor.as_ref() else {
-            return Ok(());
-        };
-        if advisor
-            .session_id
-            .as_deref()
-            .filter(|s| *s != "pending")
-            .is_some()
-        {
-            return Ok(());
-        }
-        let prompt = self.build_team_advisor_init_prompt(team, advisor);
-        let team_name = team.name.clone();
-        let (task, timeout) = self.dispatch_team_advisor_prompt(team, prompt).await?;
-        let _ = self
-            .await_team_advisor_task(&team_name, task, timeout)
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) fn summarize_notes_for_tasks(&self, task_ids: &[String]) -> AdvisorNoteSummary {
-        use notes::{NoteKind, NoteResolution};
-
-        let mut summary = AdvisorNoteSummary::default();
-        let task_set: std::collections::HashSet<&str> =
-            task_ids.iter().map(String::as_str).collect();
-        let mut recent_unresolved = Vec::new();
-
-        for note in self.state.notes.read().all().iter().rev() {
-            let Some(task_id) = note.task_id.as_deref() else {
-                continue;
-            };
-            if !task_set.contains(task_id) {
-                continue;
-            }
-            match note.kind {
-                NoteKind::Dispute => summary.dispute_count += 1,
-                NoteKind::Assumption => summary.assumption_count += 1,
-                NoteKind::Surprise => summary.surprise_count += 1,
-                NoteKind::Followup => summary.followup_count += 1,
-                NoteKind::Blocked => summary.blocked_count += 1,
-                NoteKind::Learned => summary.learned_count += 1,
-                NoteKind::Done => summary.done_count += 1,
-            }
-            if note.resolution == NoteResolution::Unresolved && recent_unresolved.len() < 5 {
-                recent_unresolved.push(format!("{}: {}", note.kind.as_ref(), note.body));
-            }
-        }
-        summary.recent_unresolved = recent_unresolved;
-        summary
-    }
-
-    pub(crate) fn build_advisor_checkpoint(
-        &self,
-        team: &orchestration::team::Team,
-        wait_kind: &str,
-        results: &[Value],
-    ) -> AdvisorCheckpoint {
-        let monitored_task_ids: Vec<String> = results
-            .iter()
-            .filter_map(|r| {
-                r.get("taskId")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .collect();
-        let notes = self.summarize_notes_for_tasks(&monitored_task_ids);
-        let mut members = Vec::new();
-        let mut completed_count = 0usize;
-        let mut failed_count = 0usize;
-        let mut cancelled_count = 0usize;
-        let mut timed_out_count = 0usize;
-        let mut running_count = 0usize;
-
-        for result in results {
-            let status = result
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            let timed_out = result.get("timed_out").is_some();
-            if timed_out {
-                timed_out_count += 1;
-                running_count += 1;
-            } else {
-                match status.as_str() {
-                    "completed" | "Completed" => completed_count += 1,
-                    "failed" | "Failed" => failed_count += 1,
-                    "cancelled" | "Cancelled" => cancelled_count += 1,
-                    _ => running_count += 1,
-                }
-            }
-            let result_snippet = result
-                .get("result")
-                .and_then(Value::as_str)
-                .map(|s| s.trim().replace('\n', " "))
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    if s.len() > 160 {
-                        format!("{}…", &s[..160])
-                    } else {
-                        s
-                    }
-                })
-                .or_else(|| {
-                    result
-                        .get("lastAssistantSnippet")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                });
-            members.push(AdvisorMemberCheckpoint {
-                bro: result
-                    .get("bro")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                task_id: result
-                    .get("taskId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                status,
-                timed_out,
-                keep_going: result
-                    .get("keep_going")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                result_snippet,
-            });
-        }
-
-        AdvisorCheckpoint {
-            wait_kind: wait_kind.to_string(),
-            team_name: team.name.clone(),
-            teamplate: team.teamplate.clone(),
-            packet_id: team
-                .advisor
-                .as_ref()
-                .and_then(|a| a.config.packet_id.clone()),
-            monitored_task_ids,
-            total_count: results.len(),
-            completed_count,
-            failed_count,
-            cancelled_count,
-            timed_out_count,
-            running_count,
-            dispute_count: notes.dispute_count,
-            assumption_count: notes.assumption_count,
-            surprise_count: notes.surprise_count,
-            followup_count: notes.followup_count,
-            blocked_count: notes.blocked_count,
-            learned_count: notes.learned_count,
-            done_count: notes.done_count,
-            members,
-            notes,
-        }
-    }
-
-    pub(crate) fn apply_advisor_packet(
-        &self,
-        packet_id: &str,
-        checkpoint: &AdvisorCheckpoint,
-    ) -> Result<Value, String> {
-        let packet_store = self.state.packets.read();
-        let packet = packet_store.load(packet_id).map_err(|e| format!("{e:#}"))?;
-        let entity = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
-        let prediction = apply_packet_with(&packet, &entity, &*packet_store);
-        Ok(match prediction {
-            Some(prediction) => json!({
-                "packetId": packet.id,
-                "match": true,
-                "ruleId": prediction.rule_id,
-                "classification": prediction.classification,
-                "consequent": prediction.consequent,
-                "confidence": prediction.confidence,
-            }),
-            None => json!({
-                "packetId": packet.id,
-                "match": false,
-            }),
-        })
-    }
-
-    pub(crate) async fn maybe_resume_team_advisor(
-        &self,
-        team_name: &str,
-        wait_kind: &str,
-        results: &[Value],
-    ) -> Result<Option<Value>, String> {
-        let mut team = match orchestration::team::load_team(team_name, &self.state.store_dir) {
-            Some(team) => team,
-            None => return Ok(None),
-        };
-        let Some(advisor) = team.advisor.as_ref() else {
-            return Ok(None);
-        };
-        let checkpoint = self.build_advisor_checkpoint(&team, wait_kind, results);
-        let packet_eval = match advisor.config.packet_id.as_deref() {
-            Some(packet_id) => Some(self.apply_advisor_packet(packet_id, &checkpoint)?),
-            None => None,
-        };
-        let checkpoint_json =
-            serde_json::to_string_pretty(&checkpoint).map_err(|e| e.to_string())?;
-        let packet_section = packet_eval
-            .as_ref()
-            .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
-            .unwrap_or_else(|| "{\n  \"configured\": false\n}".to_string());
-        let prompt = format!(
-            "Team wait checkpoint.\n\n\
-Checkpoint entity:\n{checkpoint_json}\n\n\
-Mechanical packet evaluation:\n{packet_section}\n\n\
-Interpret the checkpoint against the charter and respond with:\n\
-Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO\n\
-Rationale: <1-3 sentences>\n\
-Next step: <one concrete steering suggestion>\n"
-        );
-        let advisor_mode = advisor.config.mode;
-        let team_name_owned = team.name.clone();
-        let (task, timeout) = self.dispatch_team_advisor_prompt(&mut team, prompt).await?;
-        let advisor_result = match advisor_mode {
-            orchestration::team::AdvisorMode::Blocking => {
-                let result = self
-                    .await_team_advisor_task(&team_name_owned, task.clone(), timeout)
-                    .await?;
-                json!({
-                    "mode": "blocking",
-                    "taskId": task.id(),
-                    "result": result,
-                })
-            }
-            orchestration::team::AdvisorMode::Background => {
-                let server = self.clone();
-                let team_name = team_name_owned.clone();
-                let task_clone = task.clone();
-                tokio::spawn(async move {
-                    let _ = server
-                        .await_team_advisor_task(&team_name, task_clone, timeout)
-                        .await;
-                });
-                let inner = task.inner.lock();
-                json!({
-                    "mode": "background",
-                    "scheduled": true,
-                    "taskId": inner.id,
-                    "sessionId": inner.session_id,
-                    "status": "running",
-                })
-            }
-        };
-        Ok(Some(json!({
-            "checkpoint": checkpoint,
-            "packet": packet_eval,
-            "advisor": advisor_result,
-        })))
     }
 
     pub(crate) fn record_task_to_bro(&self, bro_name: &str, task: &Arc<orch::Task>) {
@@ -1465,6 +799,7 @@ fn team_create_receipt(team: &orchestration::team::Team, global_source: bool) ->
     }
     if team.advisor.is_some() {
         receipt["hasAdvisor"] = json!(true);
+        receipt["advisorExecution"] = json!("retired");
     }
     receipt
 }
@@ -1472,6 +807,10 @@ fn team_create_receipt(team: &orchestration::team::Team, global_source: bool) ->
 /// Validate action-specific selectors before any store access. A missing
 /// project selector must never become the daemon's current directory.
 fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        p.advisor.is_none(),
+        "error.team_advisor_retired: automatic team advisors are retired; omit advisor and dispatch any review explicitly with bro_exec/bro_resume. Existing advisor configuration remains readable but is never executed"
+    );
     let template_action = matches!(
         p.action.as_str(),
         "save_template" | "list_templates" | "get_template" | "delete_template"
@@ -1518,24 +857,18 @@ fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
             validate_team_object_name(&member.brofile)?;
         }
     }
-    if let Some(advisor) = &p.advisor {
-        validate_team_object_name(&advisor.brofile)?;
-    }
     if (list || exact)
-        && (p.members.is_some()
-            || p.template.is_some()
-            || p.cancel_running.is_some()
-            || p.advisor.is_some())
+        && (p.members.is_some() || p.template.is_some() || p.cancel_running.is_some())
     {
         anyhow::bail!(
-            "members, template, cancel_running, and advisor are mutation parameters, not discovery filters"
+            "members, template, and cancel_running are mutation parameters, not discovery filters"
         );
     }
     Ok(())
 }
 
 fn team_advisor_summary(advisor: &orchestration::team::TeamAdvisor) -> Value {
-    let mut row = json!({"name": advisor.name, "brofile": advisor.config.brofile, "mode": advisor.config.mode});
+    let mut row = json!({"name": advisor.name, "brofile": advisor.config.brofile, "mode": advisor.config.mode, "execution": "retired"});
     if let Some(session) = &advisor.session_id {
         row["sessionId"] = json!(session);
     }
@@ -1568,7 +901,7 @@ fn team_template_summary(template: &orchestration::team::Teamplate) -> Value {
         row["diversityFloor"] = json!(floor);
     }
     if let Some(advisor) = &template.advisor {
-        row["advisor"] = json!({"name": advisor.display_name(), "brofile": advisor.brofile, "mode": advisor.mode});
+        row["advisor"] = json!({"name": advisor.display_name(), "brofile": advisor.brofile, "mode": advisor.mode, "execution": "retired"});
     }
     row
 }
@@ -1723,8 +1056,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::artifacts;
-    use crate::notes::NoteParams;
-    use crate::packets::CompileParams;
     use crate::server::state::SharedState;
     use crate::tools::bro_params::{AgentDispatchParams, StatusParams};
 
@@ -1748,6 +1079,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn team_create_preserves_inert_legacy_advisor_without_resolving_or_launching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let member = serde_json::from_value(json!({"name":"reviewer", "provider":"glm"})).unwrap();
+        orchestration::brofile::save_brofile(&member, "global", &server.state.store_dir, None)
+            .unwrap();
+        let template: orchestration::team::Teamplate = serde_json::from_value(json!({
+            "name":"legacy-template", "members":[{"brofile":"reviewer", "count":1}],
+            "advisor":{"brofile":"missing-advisor", "charter":"Keep this legacy charter", "context":"historical context"}
+        })).unwrap();
+        orchestration::team::save_teamplate(&template, "global", &server.state.store_dir, None)
+            .unwrap();
+        let result = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create", "name":"legacy-panel", "template":"legacy-template"
+            }))))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        let receipt: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(receipt["advisorExecution"], "retired");
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 0);
+        let team = orchestration::team::load_team_checked("legacy-panel", &server.state.store_dir)
+            .unwrap()
+            .unwrap();
+        let advisor = team.advisor.unwrap();
+        assert_eq!(advisor.config.charter, "Keep this legacy charter");
+        assert_eq!(
+            advisor.config.context.as_deref(),
+            Some("historical context")
+        );
+        assert!(advisor.session_id.is_none());
+        assert!(advisor.task_history.is_empty());
+        let roster = team_discovery(
+            &server,
+            &team_params(json!({"action":"roster", "name":"legacy-panel"})),
+        )
+        .unwrap();
+        assert_eq!(roster["advisor"]["execution"], "retired");
+    }
+
+    #[tokio::test]
+    async fn team_new_advisor_input_is_rejected_before_store_mutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        for action in ["save_template", "create"] {
+            let result = server
+                .bro_team(Parameters(team_params(json!({
+                    "action":action, "name":"rejected", "template":"irrelevant",
+                    "members":[{"brofile":"unread-member"}],
+                    "advisor":{"brofile":"unread-advisor", "charter":"New automatic work"}
+                }))))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(extract_text(&result).contains("error.team_advisor_retired"));
+            assert!(!server.state.store_dir.join("teams/rejected.json").exists());
+            assert!(
+                !server
+                    .state
+                    .store_dir
+                    .join("teamplates/rejected.json")
+                    .exists()
+            );
+            assert!(server.state.task_store.read().all_tasks().is_empty());
+        }
+    }
+
     #[test]
     fn team_create_receipt_omits_unbounded_member_configuration() {
         let mut team = fixture_team("large", "worker-context");
@@ -1763,6 +1161,7 @@ mod tests {
         assert_eq!(receipt["memberCount"], 10000);
         assert_eq!(receipt["templateScope"], "global");
         assert!(receipt.get("members").is_none());
+        assert!(receipt.get("advisorExecution").is_none());
         assert!(serde_json::to_vec(&receipt).unwrap().len() < 1000);
         assert!(receipt["detail_hint"].as_str().unwrap().contains("roster"));
     }
@@ -2848,299 +2247,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_team_advisor_init_prompt_includes_charter_halt_exit_and_status_schema() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let team = orchestration::team::Team {
-            name: "migration-team".into(),
-            teamplate: "tp".into(),
-            members: vec![
-                orchestration::team::TeamMember {
-                    name: "executor".into(),
-                    brofile: "codex-exec".into(),
-                    session_id: None,
-                    task_history: vec![],
-                },
-                orchestration::team::TeamMember {
-                    name: "reviewer".into(),
-                    brofile: "claude-review".into(),
-                    session_id: None,
-                    task_history: vec![],
-                },
-            ],
-            advisor: None,
-            project_dir: None,
-            created_at: 0,
-            diversity_floor: None,
-        };
-        let advisor = orchestration::team::TeamAdvisor {
-            name: "lead-advisor".into(),
-            config: orchestration::team::TeamAdvisorConfig {
-                brofile: "advisor-brofile".into(),
-                alias: Some("lead-advisor".into()),
-                charter: "keep the migration honest; reject fake phase boundaries".into(),
-                context: Some("phase 2 of 3".into()),
-                halt_conditions: vec![
-                    "executor invents a phase boundary that masks coupling".into(),
-                    "reviewer rubber-stamps a phase without adversarial read".into(),
-                ],
-                exit_conditions: vec!["all three phases land and are reviewed".into()],
-                packet_id: Some("packet-abcdef12".into()),
-                timeout_seconds: None,
-                mode: orchestration::team::AdvisorMode::Blocking,
-            },
-            session_id: None,
-            task_history: vec![],
-        };
-
-        let prompt = server.build_team_advisor_init_prompt(&team, &advisor);
-
-        // Status schema — load-bearing for orchestrator parsing of advisor output.
-        assert!(
-            prompt.contains("Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO"),
-            "advisor init prompt missing canonical status schema: {prompt}"
-        );
-        assert!(prompt.contains("Rationale:"), "missing Rationale line");
-        assert!(prompt.contains("Next step:"), "missing Next step line");
-
-        // Charter, context, packet_id round-tripped verbatim.
-        assert!(prompt.contains("keep the migration honest"));
-        assert!(prompt.contains("phase 2 of 3"));
-        assert!(prompt.contains("packet-abcdef12"));
-
-        // Every halt and exit condition must survive as its own bullet.
-        assert!(prompt.contains("- executor invents a phase boundary that masks coupling"));
-        assert!(prompt.contains("- reviewer rubber-stamps a phase without adversarial read"));
-        assert!(prompt.contains("- all three phases land and are reviewed"));
-
-        // Team roster surfaces so the advisor knows who it is steering.
-        assert!(prompt.contains("executor (codex-exec)"));
-        assert!(prompt.contains("reviewer (claude-review)"));
-        assert!(prompt.contains("migration-team"));
-    }
-
-    #[test]
-    fn advisor_checkpoint_serializes_with_packet_entity_shape() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let team = orchestration::team::Team {
-            name: "demo".into(),
-            teamplate: "tp".into(),
-            members: vec![],
-            advisor: None,
-            project_dir: None,
-            created_at: 0,
-            diversity_floor: None,
-        };
-        let checkpoint = server.build_advisor_checkpoint(
-            &team,
-            "wait",
-            &[
-                json!({
-                    "taskId": "task-a",
-                    "status": "completed",
-                    "bro": "exec",
-                    "result": "ok"
-                }),
-                json!({
-                    "taskId": "task-b",
-                    "status": "running",
-                    "bro": "reviewer",
-                    "timed_out": true
-                }),
-            ],
-        );
-        let serialized = serde_json::to_value(&checkpoint).unwrap();
-
-        // Fields the packet evaluator uses as predicate operands. If any of
-        // these drift, every advisor packet in the wild breaks silently.
-        for key in [
-            "wait_kind",
-            "team_name",
-            "total_count",
-            "completed_count",
-            "failed_count",
-            "running_count",
-            "timed_out_count",
-            "blocked_count",
-            "dispute_count",
-            "done_count",
-            "members",
-            "notes",
-        ] {
-            assert!(
-                serialized.get(key).is_some(),
-                "advisor checkpoint missing packet-facing field '{key}': {serialized}"
-            );
-        }
-
-        assert_eq!(serialized["total_count"], 2);
-        assert_eq!(serialized["completed_count"], 1);
-        assert_eq!(serialized["running_count"], 1);
-        assert_eq!(serialized["timed_out_count"], 1);
-    }
-
-    #[test]
-    fn apply_advisor_packet_returns_rule_hit_for_checkpoint_entity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-
-        let packet_id = {
-            let store = server.state.packets.read();
-            let result = store
-                .compile(&CompileParams {
-                    domain: "advisor/demo-escalate".into(),
-                    classification_lattice: Some(vec!["escalate".into(), "continue".into()]),
-                    prefix_inference: Some(
-                        [
-                            ("escalate_".into(), "escalate".into()),
-                            ("continue_".into(), "continue".into()),
-                        ]
-                        .into(),
-                    ),
-                    rules: json!([
-                        {
-                            "id": "escalate_any_blocked",
-                            "antecedent": {"op": "Gt", "field": "blocked_count", "value": 0},
-                            "consequent": "ESCALATE"
-                        },
-                        {
-                            "id": "continue_default",
-                            "classification": "continue",
-                            "emit": "fallback",
-                            "antecedent": {"op": "True"},
-                            "consequent": "CONTINUE"
-                        }
-                    ]),
-                    scope: Some("global".into()),
-                    project: None,
-                    project_id: None,
-                    source_ids: None,
-                    rank_table: None,
-                    rank_lookup_key: None,
-                    threshold_table: None,
-                    threshold_lookup_key: None,
-                })
-                .unwrap();
-            // compile() returns "Packet packet-<id> compiled (...)" — extract id.
-            result
-                .split_whitespace()
-                .find(|tok| tok.starts_with("packet-"))
-                .unwrap()
-                .to_string()
-        };
-
-        let team = orchestration::team::Team {
-            name: "t".into(),
-            teamplate: "tp".into(),
-            members: vec![],
-            advisor: None,
-            project_dir: None,
-            created_at: 0,
-            diversity_floor: None,
-        };
-        {
-            let mut notes = server.state.notes.write();
-            notes
-                .create(&NoteParams {
-                    kind: "blocked".into(),
-                    body: "exec is stuck".into(),
-                    task_id: Some("task-x".into()),
-                    session_id: None,
-                    project: None,
-                    project_id: None,
-                    thread_id: None,
-                    provider: None,
-                    bro: Some("exec".into()),
-                })
-                .unwrap();
-        }
-        let checkpoint = server.build_advisor_checkpoint(
-            &team,
-            "wait",
-            &[json!({"taskId": "task-x", "status": "running"})],
-        );
-
-        let verdict = server
-            .apply_advisor_packet(&packet_id, &checkpoint)
-            .unwrap();
-        assert_eq!(verdict["match"], true);
-        assert_eq!(verdict["ruleId"], "escalate_any_blocked");
-        assert_eq!(verdict["classification"], "escalate");
-    }
-
-    #[test]
-    fn build_advisor_checkpoint_flattens_note_counts_for_packets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        {
-            let mut notes = server.state.notes.write();
-            notes
-                .create(&NoteParams {
-                    kind: "blocked".into(),
-                    body: "worker is blocked".into(),
-                    task_id: Some("task-1".into()),
-                    session_id: None,
-                    project: None,
-                    project_id: None,
-                    thread_id: None,
-                    provider: None,
-                    bro: Some("worker".into()),
-                })
-                .unwrap();
-            notes
-                .create(&NoteParams {
-                    kind: "dispute".into(),
-                    body: "worker disputes premise".into(),
-                    task_id: Some("task-1".into()),
-                    session_id: None,
-                    project: None,
-                    project_id: None,
-                    thread_id: None,
-                    provider: None,
-                    bro: Some("worker".into()),
-                })
-                .unwrap();
-        }
-        let team = orchestration::team::Team {
-            name: "demo".into(),
-            teamplate: "tp".into(),
-            members: vec![],
-            advisor: Some(orchestration::team::TeamAdvisor {
-                name: "advisor".into(),
-                config: orchestration::team::TeamAdvisorConfig {
-                    brofile: "advisor".into(),
-                    alias: Some("advisor".into()),
-                    charter: "demo".into(),
-                    context: None,
-                    halt_conditions: vec![],
-                    exit_conditions: vec![],
-                    packet_id: Some("packet-demo".into()),
-                    timeout_seconds: None,
-                    mode: orchestration::team::AdvisorMode::Blocking,
-                },
-                session_id: None,
-                task_history: vec![],
-            }),
-            project_dir: None,
-            created_at: 0,
-            diversity_floor: None,
-        };
-        let checkpoint = server.build_advisor_checkpoint(
-            &team,
-            "when_all",
-            &[json!({
-                "taskId": "task-1",
-                "status": "running",
-                "timed_out": true
-            })],
-        );
-        assert_eq!(checkpoint.blocked_count, 1);
-        assert_eq!(checkpoint.dispute_count, 1);
-        assert_eq!(checkpoint.notes.blocked_count, 1);
-        assert_eq!(checkpoint.notes.dispute_count, 1);
-    }
     // Real agent dispatch in-process: contends on shared dispatch/provider
     // state under the full parallel suite (flaky). Opt-in via `--ignored`.
     #[test]
