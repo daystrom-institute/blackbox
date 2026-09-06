@@ -347,7 +347,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_brofile",
-        description = "Manage brofiles and accounts. list returns paginated summaries; get returns the exact brofile as bounded JSON body pages; list_accounts pages redacted account rows."
+        description = "Manage brofiles and accounts. list/list_accounts return bounded summary pages; get/get_account return exact redaction-safe JSON body pages."
     )]
     pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;

@@ -1004,7 +1004,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_allocator_status",
-        description = "Read pool-backed runtime allocation config plus bounded in-flight, probe, lease, and preview-candidate pages (default 20, maximum 100 rows; continue each section from its next_offset). Probe rows are compact lane status; read one exact lane with bro_allocator_probe."
+        description = "Read pool-backed runtime allocation config plus bounded in-flight, probe, lease, and preview-candidate pages."
     )]
     pub(crate) fn bro_allocator_status(
         &self,
@@ -1144,7 +1144,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_allocator_trace",
-        description = "Read one exact allocation trace body, page by page (4096-byte default body budget; SHA256-revision-bound cursor restarts safely when the stored trace changes)."
+        description = "Read one exact allocation trace body, page by page."
     )]
     pub(crate) fn bro_allocator_trace(
         &self,

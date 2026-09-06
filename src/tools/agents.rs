@@ -133,7 +133,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_agent_get",
-        description = "Read one agent by name or agent-ref (name@vN or agent:name@vN). Returns identity, lifecycle state, a compact manifest summary, and exact manifest JSON body pages (credential env values redacted) continued via body.next_cursor."
+        description = "Read one agent by name or agent-ref with lifecycle state, a manifest summary, and exact redacted manifest body pages."
     )]
     pub(crate) fn bro_agent_get(
         &self,
@@ -354,7 +354,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_agent_describe",
-        description = "Compact per-plane dispatch surface for one agent: stored manifest, resolved brofile (global ref or inline), manifest filter overlay, the computed deny-wins merge, and the runtime filter planes describe does not compute. detail_plane=manifest|brofile pages the exact redacted JSON via body.next_cursor."
+        description = "Compact per-plane dispatch surface for one agent."
     )]
     pub(crate) fn bro_agent_describe(
         &self,
