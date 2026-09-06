@@ -12,13 +12,33 @@ brief: "Accepted responsibility boundary, complete MCP disposition map, extracti
 
 The operator accepted this direction on 2026-09-06: Blackbox owns reliable bro
 execution and corpus capabilities. Callers own higher-order orchestration in
-ordinary code. This document prepares implementation; no runtime removal has
-landed. Tracking thread: `thread-d7cd3385`.
+ordinary code. Implementation is underway. The milestone record below distinguishes pushed
+source changes from deployed behavior. Tracking thread: `thread-d7cd3385`.
 
 The map is grounded in source `8031e3d5`, the matching 190-name live ops catalog,
 and read-only deployed consumer checks. The deployed daemon image was built from
 `b049caa8572c`; subsequent commits record verification and native collection
 activation. Counts describe this snapshot, not a permanent product budget.
+
+## Implementation record
+
+- S1 source at `a3139da9` separates `/control/*` handlers, removes automatic
+  team advisors, preserves readable rows in mixed legacy task snapshots, refuses
+  unsafe new admission when snapshot recovery fails, and guards ordinary resume
+  and re-adoption against workflow/atom ownership. Native/corpus harness fixtures
+  run without atom/workflow capabilities. Selected bpool checks passed (14 and
+  56 tests); full cluster verification and image build are pending.
+- E4 operations now live in `src/vector_maintenance.rs`; workflow wrappers only
+  translate their results. Scheduling has not changed. Storage GC already has a
+  six-hour service loop, embedding residue a five-minute sweeper, and ordinary
+  vector tombstone/WAL compaction a five-minute loop. Connectivity repair still
+  needs an explicit replacement for its workflow-owned cadence and lock behavior.
+- S2 source at `284547c1` removes the three Slack binding/link MCP tools. This
+  partial S2 change is not a standalone deployment milestone: Badgey admission,
+  runtime/default cleanup and retained conversation enrollment must land together.
+- E1 uncertain-admission deduplication remains in progress. The proposed narrow
+  request key retains an admission identity and refuses automatic retry after an
+  unresolved durable claim; it does not promise exactly-once worker execution.
 
 ## Responsibility boundary
 

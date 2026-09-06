@@ -10,6 +10,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Task snapshots retain readable tasks when individual legacy records are
+  malformed. Unreadable records are quarantined; unsafe snapshot recovery
+  refuses new task admission. Ordinary resume and worker re-adoption preserve
+  workflow/atom ownership.
+
 - Whiteboard summary and detail reads preserve blind-phase and role visibility.
   Artifact installation reports partial effects and retires replaced agent
   snapshots only after the replacement is durable.
@@ -54,6 +59,10 @@ out explicitly under `Changed` or `Removed`.
   (publication verification) is checked separately from currency.
 
 ### Changed
+
+- Team creation and waits no longer launch or resume automatic advisors.
+  Legacy advisor configuration remains readable; new advisor input is rejected.
+  Dispatch reviewers explicitly with bro_exec or bro_resume.
 
 - Breaking MCP response changes: catalog, thread, note, artifact, packet,
   workflow, trigger, event, and team discovery use bounded summary pages.
