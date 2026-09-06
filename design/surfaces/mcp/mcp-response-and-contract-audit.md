@@ -857,3 +857,20 @@ The earlier gap resolution also reached the checkout with both prior edits
 intact, completing the delivered-before-publication smoke check. Packet exact
 body reads and their authoring documentation are pushed at `2420c025`; 47
 focused tests passed. Those daemon changes await the next verified image.
+
+
+### Latest assistant preview correction
+
+The `lastAssistantSnippet` field was the first 256 characters of accumulated
+assistant output. A live completed review reproduced the mismatch: the exact
+body contained final findings, while the preview still showed its opening
+plan. Source `cfaf1162` tracks a separate bounded preview through streamed and
+complete assistant events, persists it, and recovers older snapshots from
+retained assistant events. If no message evidence remains, an old task omits
+its preview instead of claiming the accumulated prefix is current.
+
+Status summaries, roster summaries and wait timeouts use this preview; exact
+result pages retain accumulated output. Empty text, tools and thinking events
+preserve the preceding text until new assistant text arrives. Follow-up
+verification and deployment are tracked in
+[gap-dbac4f82](../../../.bbox/gaps/gap-dbac4f82.json).

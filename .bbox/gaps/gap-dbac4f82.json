@@ -1,0 +1,21 @@
+{
+  "id": "gap-dbac4f82",
+  "title": "Bro status previews the opening assistant text instead of the latest message",
+  "gap_kind": "mcp_surface",
+  "domain": "orchestration",
+  "wanted_capability": "Reliable latest assistant text in progress summaries, independently of accumulated result pagination.",
+  "evidence": [
+    "src/orchestration/mod.rs",
+    "src/orchestration/providers/events.rs",
+    "thread-d7cd3385"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/orchestration/latest-assistant-preview",
+  "notes": "Confirmed by source inspection and live review task: body contains final findings but lastAssistantSnippet starts with the opening plan. Source fix cfaf1162 adds a bounded independently persisted preview and recovery from retained assistant events; awaiting cluster verification and deployed proof.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T17:59:13Z",
+  "updated_at": "2026-09-06T17:59:13Z"
+}

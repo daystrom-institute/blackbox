@@ -46,6 +46,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Bro status, roster summaries and wait timeouts preview the latest assistant
+  text instead of the opening of accumulated output. Preview state survives
+  restart; full result pagination remains independent.
+
 - Queued project-gap edits compose across concurrent calls and delivery before
   publication. Admission is durable, overlays stay project-scoped, conflicting
   publications are rejected, and covered projects can file and update gaps
