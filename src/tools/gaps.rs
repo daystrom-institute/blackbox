@@ -29,6 +29,49 @@ fn carrier_matches_filter(
     })
 }
 
+fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
+    let preview = |text: &str| {
+        let mut value: String = text.chars().take(256).collect();
+        if text.chars().count() > 256 {
+            value.push_str(" [truncated]");
+        }
+        value
+    };
+    if debug {
+        let mut rows = diagnostics
+            .iter()
+            .take(10)
+            .map(|line| preview(line))
+            .collect::<Vec<_>>();
+        if diagnostics.len() > 10 {
+            rows.push(format!(
+                "{} additional diagnostics omitted; narrow project",
+                diagnostics.len() - 10
+            ));
+        }
+        return rows;
+    }
+    let mut rows = Vec::new();
+    let mut availability = 0;
+    for line in diagnostics {
+        if line.contains("legacy_compatibility")
+            || line.contains("resolved to no registered project")
+        {
+            if rows.len() < 2 {
+                rows.push(preview(line));
+            } else {
+                availability += 1;
+            }
+        } else {
+            availability += 1;
+        }
+    }
+    if availability > 0 {
+        rows.push(format!("{availability} source visibility warnings; results may be incomplete. Narrow project or use debug=true for bounded diagnostics."));
+    }
+    rows
+}
+
 impl BlackboxServer {
     /// A skipped carrier is relevant only if its rows could match this read.
     /// Resolve carrier identity before the path fallback, just as row filters do.
@@ -885,7 +928,8 @@ impl BlackboxServer {
             let mut built_from =
                 view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
             structured["built_from"] = serde_json::to_value(&built_from)?;
-            structured["diagnostics"] = serde_json::to_value(&view.diagnostics)?;
+            let diagnostics = gap_diagnostic_preview(&view.diagnostics, p.debug);
+            structured["diagnostics"] = serde_json::to_value(&diagnostics)?;
             // Bounded structured degradation for `all` (plan §10.5): each
             // checkout the survey omitted, as a typed row. Omitted entirely
             // when nothing degraded, so bridge responses and healthy catalog
@@ -911,10 +955,9 @@ impl BlackboxServer {
                 crate::gaps::GapStore::render_page(&structured, false)?
             };
             if !p.json.unwrap_or(false) {
-                if !view.diagnostics.is_empty() {
-                    // Header wording is frozen by the bridge parity capture.
+                if !diagnostics.is_empty() {
                     rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
-                    rendered.push_str(&view.diagnostics.join("\n- "));
+                    rendered.push_str(&diagnostics.join("\n- "));
                 }
                 rendered = view.append_built_from_table(rendered, &built_from);
             }
@@ -1048,6 +1091,26 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    #[test]
+    fn gap_diagnostics_default_to_visibility_signal_with_bounded_debug() {
+        let raw = (0..100)
+            .map(|i| format!("project {i}: {}", "unavailable ".repeat(1000)))
+            .collect::<Vec<_>>();
+        let summary = gap_diagnostic_preview(&raw, false);
+        assert_eq!(summary.len(), 1);
+        assert!(summary[0].contains("100 source visibility warnings"));
+        assert!(summary[0].contains("results may be incomplete"));
+        let debug = gap_diagnostic_preview(&raw, true);
+        assert_eq!(debug.len(), 11);
+        assert!(
+            debug
+                .last()
+                .unwrap()
+                .contains("90 additional diagnostics omitted")
+        );
+        assert!(debug.iter().all(|line| line.len() < 512));
+    }
 
     #[tokio::test]
     async fn a_publication_between_capture_and_queue_lock_retries_the_gap_edit() {

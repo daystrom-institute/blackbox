@@ -508,6 +508,10 @@ pub struct GapListParams {
     /// Include addressed gaps (default: false for lists, true for exact id).
     #[serde(default)]
     pub include_addressed: Option<bool>,
+    /// Include bounded source diagnostics (up to 10 previews). Default false
+    /// summarizes availability warnings; narrow project to inspect a scope.
+    #[serde(default)]
+    pub debug: bool,
     /// Emit machine-readable JSON records instead of the rendered text view.
     #[serde(default)]
     pub json: Option<bool>,
