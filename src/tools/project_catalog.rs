@@ -4454,17 +4454,31 @@ mod tests {
             .bbox_project_graph_list(Parameters(crate::tools::graph::ProjectGraphListParams {
                 project: Some("p_candidate_tool".into()),
                 provisional: Some("published".into()),
+                limit: None,
+                offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         let listed_text = error_text(&listed);
         assert!(listed_text.contains("governance-record"), "{listed_text}");
 
         let described = server
-            .bbox_project_graph_describe(Parameters(crate::tools::graph::ProjectGraphExactParams {
-                project: "p_candidate_tool".into(),
-                graph_id: "governance-record".into(),
-                provisional: Some("published".into()),
-            }))
+            .bbox_project_graph_describe(Parameters(
+                crate::tools::graph::ProjectGraphDescribeParams {
+                    project: "p_candidate_tool".into(),
+                    graph_id: "governance-record".into(),
+                    provisional: Some("published".into()),
+                    source: None,
+                    checkout_id: None,
+                    expected_content_hash: None,
+                    detail: None,
+                    cursor: None,
+                    body_limit: None,
+                    variant_limit: None,
+                    variant_offset: None,
+                    expected_view_stamp: None,
+                },
+            ))
             .await;
         let described_text = error_text(&described);
         assert!(
@@ -4846,6 +4860,7 @@ mod tests {
                 .unwrap();
             serde_json::to_value(
                 described
+                    .0
                     .first()
                     .expect("the published view carries the accepted graph")
                     .generation
