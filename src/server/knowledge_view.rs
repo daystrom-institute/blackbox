@@ -22,7 +22,7 @@ use bbox_indexing::checkout_access::{
 };
 use bbox_knowledge::knowledge::{
     Approval, Category, Knowledge, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry,
-    KnowledgeViewMetadata, Priority, Scope, Status,
+    KnowledgeViewMetadata, Priority, Scope, Status, committed_knowledge_entry_bytes,
 };
 use bbox_knowledge::overlay::{
     AcceptedPublishedDigests, CatalogOverlayPublished, OverlayKey, OverlayRecomputeError,
@@ -1448,10 +1448,46 @@ impl BlackboxServer {
             .get(project_id)
             .filter(|entry| &entry.content_stamp == content_stamp)
             .map(|entry| entry.snapshot.clone());
-        if let Some(cached) = cached {
-            return cached;
+        let snapshot = cached.unwrap_or_else(|| published_knowledge_from_accepted(verified));
+        let mut queue = self.state.checkout_mutations.write();
+        let is_current = self
+            .state
+            .accepted_publications
+            .as_ref()
+            .is_some_and(|runtime| {
+                runtime
+                    .load_verified(project_id)
+                    .is_ok_and(|current| current.content_stamp() == content_stamp)
+            });
+        let paths = queue
+            .outstanding_intents()
+            .filter(|row| {
+                is_current
+                    && row.mutation.scope == snapshot.published_scope
+                    && row.mutation.relative_path.starts_with(".bbox/knowledge/")
+            })
+            .map(|row| row.mutation.relative_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+        for path in paths {
+            let id = path
+                .trim_start_matches(".bbox/knowledge/")
+                .trim_end_matches(".json");
+            let content = snapshot
+                .entries
+                .get(id)
+                .map(|entry| committed_knowledge_entry_bytes(&entry.entry))
+                .transpose()
+                .and_then(|bytes| bytes.map(String::from_utf8).transpose().map_err(Into::into));
+            if let Ok(content) = content {
+                changed |=
+                    queue.observe_publication(&snapshot.published_scope, &path, content.as_deref());
+            }
         }
-        let snapshot = published_knowledge_from_accepted(verified);
+        drop(queue);
+        if changed {
+            self.state.checkout_mutations_persister.request();
+        }
         self.state.catalog_knowledge_published_cache.write().insert(
             project_id.clone(),
             CatalogPublishedKnowledgeCacheEntry {
@@ -2427,7 +2463,7 @@ pub(crate) fn catalog_publication_degradations(
 /// `source_content_sha256` is the digest of the exact committed bytes, so a
 /// catalog row carries the same content hash the publisher-root read would
 /// have produced for the same commit.
-fn published_knowledge_from_accepted(
+pub(crate) fn published_knowledge_from_accepted(
     verified: &VerifiedAcceptedPublication,
 ) -> PublishedKnowledgeSnapshot {
     let content_stamp = verified.content_stamp();
@@ -3246,6 +3282,65 @@ mod catalog_view_tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn stale_knowledge_publication_read_cannot_retire_a_current_mutation() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_queue_stale", &scope);
+        let project = ProjectId::parse("p_queue_stale").unwrap();
+        let mut first = knowledge_entry("1234567890abcdef", "first");
+        first.project_id = Some(project.as_str().into());
+        fixture.install_publication(project.as_str(), &scope, COMMIT_ONE, &[first.clone()], &[]);
+        let server = fixture.server();
+        let runtime = server.state.accepted_publications.as_ref().unwrap();
+        let stale = runtime.load_verified(&project).unwrap();
+        let mut second = first.clone();
+        second.content = "second".into();
+        fixture.install_publication(project.as_str(), &scope, COMMIT_TWO, &[second.clone()], &[]);
+        let canonical = |entry: &KnowledgeEntry| {
+            String::from_utf8(committed_knowledge_entry_bytes(entry).unwrap()).unwrap()
+        };
+        server
+            .state
+            .checkout_mutations
+            .write()
+            .enqueue_tracked_writes(
+                scope.clone(),
+                vec![(
+                    format!(".bbox/knowledge/{}.json", first.id),
+                    canonical(&first),
+                    Some(canonical(&second)),
+                )],
+                "restore first".into(),
+                "2026-09-06T00:00:00Z".into(),
+            )
+            .unwrap();
+        server.cached_catalog_published_knowledge(&project, &stale);
+        server.cached_catalog_published_knowledge(&project, &stale);
+        assert_eq!(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_intents()
+                .count(),
+            1
+        );
+        fixture.install_publication(project.as_str(), &scope, &"3".repeat(40), &[first], &[]);
+        server
+            .session_knowledge_view(Some(project.as_str()), Some("published"))
+            .unwrap();
+        assert_eq!(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_intents()
+                .count(),
+            0
+        );
+    }
 
     fn published_stamp(view: &SessionKnowledgeView, entry_id: &str) -> BuiltFromStamp {
         let reference = view

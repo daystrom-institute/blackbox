@@ -8,6 +8,7 @@ use crate::packets::packet_matches_query;
 use crate::server::BlackboxServer;
 use crate::system_memory;
 
+use bbox_indexing::accepted_publication_runtime::ERROR_ACCEPTED_PUBLICATION_MISSING;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -16,6 +17,99 @@ use serde_json::json;
 
 const DEFAULT_PACKET_SIDECAR_LIMIT: usize = 8;
 const DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT: usize = 6;
+
+#[derive(Clone, Copy)]
+pub(crate) enum KnowledgeMutationOwner {
+    Local,
+    CheckoutQueue,
+}
+
+struct QueuedKnowledgeEdit<'a> {
+    project_id: &'a str,
+    scope: &'a bbox_corpus_core::identity::PublishedScope,
+    published: BTreeMap<String, crate::knowledge::KnowledgeEntry>,
+    queue: &'a mut crate::checkout_mutations::CheckoutMutations,
+    changes: BTreeMap<String, Option<String>>,
+}
+
+impl QueuedKnowledgeEdit<'_> {
+    fn published_content(&self, id: &str) -> anyhow::Result<Option<String>> {
+        self.published
+            .get(id)
+            .map(crate::knowledge::committed_knowledge_entry_bytes)
+            .transpose()?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn entry(&mut self, id: &str) -> anyhow::Result<crate::knowledge::KnowledgeEntry> {
+        let id = id.strip_prefix("knowledge:").unwrap_or(id);
+        let base = self.published_content(id)?;
+        let content = self
+            .queue
+            .write_base(
+                self.scope,
+                &format!(".bbox/knowledge/{id}.json"),
+                base.as_deref(),
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!("knowledge entry not found in the mutation scope: {id}")
+            })?;
+        let entry: crate::knowledge::KnowledgeEntry = serde_json::from_str(&content)?;
+        anyhow::ensure!(
+            entry.id == id
+                && entry.scope == crate::knowledge::Scope::Project
+                && entry.project_id.as_deref() == Some(self.project_id),
+            "knowledge entry {id} does not belong to the mutation scope"
+        );
+        anyhow::ensure!(
+            entry.status != crate::knowledge::Status::Deleted,
+            "knowledge entry has been deleted: {id}"
+        );
+        Ok(entry)
+    }
+
+    fn stage(
+        &mut self,
+        entry: &crate::knowledge::KnowledgeEntry,
+        delete: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            entry.scope == crate::knowledge::Scope::Project
+                && entry.project_id.as_deref() == Some(self.project_id),
+            "knowledge entry does not belong to the mutation scope"
+        );
+        let content = if delete {
+            None
+        } else {
+            Some(String::from_utf8(
+                crate::knowledge::committed_knowledge_entry_bytes(entry)?,
+            )?)
+        };
+        anyhow::ensure!(
+            !self.changes.contains_key(&entry.id),
+            "a knowledge edit cannot target the same record twice"
+        );
+        self.changes.insert(entry.id.clone(), content);
+        Ok(())
+    }
+
+    fn mint_id(&self) -> String {
+        loop {
+            let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+            let path = format!(".bbox/knowledge/{id}.json");
+            if !self.published.contains_key(&id)
+                && !self.changes.contains_key(&id)
+                && !self.queue.outstanding_intents().any(|row| {
+                    &row.mutation.scope == self.scope && row.mutation.relative_path == path
+                })
+            {
+                return id;
+            }
+        }
+    }
+}
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::knowledge_tools()
@@ -358,70 +452,137 @@ impl BlackboxServer {
         Ok((write_carrier, checkout))
     }
 
-    /// Enqueue the exact committed-file bytes for a knowledge entry,
-    /// delivered to the checkout by the collector. Mirrors
-    /// enqueue_gap_file; the observation lane is the knowledge one.
-    fn enqueue_knowledge_entry(
+    fn mutate_queued_knowledge(
         &self,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
-        entry: &crate::knowledge::KnowledgeEntry,
-        mode: &str,
         reason: &str,
+        edit: impl FnOnce(&mut QueuedKnowledgeEdit<'_>) -> anyhow::Result<String>,
     ) -> anyhow::Result<String> {
-        let relative_path = format!(".bbox/knowledge/{}.json", entry.id);
-        let content = match mode {
-            "write" => Some(String::from_utf8(
-                crate::knowledge::committed_knowledge_entry_bytes(entry)?,
-            )?),
-            "delete" => None,
-            other => anyhow::bail!("unknown knowledge mutation mode {other}"),
-        };
-        let mutation_id = self
+        self.mutate_queued_knowledge_with_snapshot_hook(project_id, scope, reason, || {}, edit)
+    }
+
+    fn mutate_queued_knowledge_with_snapshot_hook(
+        &self,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        reason: &str,
+        mut after_snapshot: impl FnMut(),
+        edit: impl FnOnce(&mut QueuedKnowledgeEdit<'_>) -> anyhow::Result<String>,
+    ) -> anyhow::Result<String> {
+        let project = bbox_corpus_core::project_catalog::ProjectId::parse(project_id)?;
+        let runtime = self
             .state
-            .checkout_mutations
-            .write()
-            .enqueue_file_mutation(
-                scope,
-                relative_path.clone(),
-                mode,
-                content,
-                reason.to_string(),
-                bbox_util::util::now_iso(),
-            )?;
+            .accepted_publications
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("accepted publication runtime is unavailable"))?;
+        let load = || match runtime.load_verified(&project) {
+            Ok(current) => Ok(Some(current)),
+            Err(error) if error.code() == ERROR_ACCEPTED_PUBLICATION_MISSING => Ok(None),
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        let mut captured = None;
+        for _ in 0..4 {
+            let verified = load()?;
+            let published = verified
+                .as_ref()
+                .map(crate::server::knowledge_view::published_knowledge_from_accepted)
+                .map(|snapshot| {
+                    snapshot
+                        .entries
+                        .into_iter()
+                        .map(|(id, entry)| (id, entry.entry))
+                        .collect()
+                })
+                .unwrap_or_default();
+            after_snapshot();
+            let queue = self.state.checkout_mutations.write();
+            anyhow::ensure!(
+                self.covered_scope_for_project_id(project_id).as_ref() == Some(&scope),
+                "project mutation scope changed; retry after scope reconciliation"
+            );
+            let current = load()?;
+            if let Some(current) = &current {
+                anyhow::ensure!(
+                    current.content_stamp().accepted_scope() == &scope,
+                    "project publication scope differs from the mutation target; retry after scope reconciliation"
+                );
+            }
+            if verified.as_ref().map(|value| value.content_stamp())
+                == current.as_ref().map(|value| value.content_stamp())
+            {
+                captured = Some((published, queue));
+                break;
+            }
+        }
+        let (published, mut queue) = captured.ok_or_else(|| {
+            anyhow::anyhow!(
+                "error.checkout_publication_busy: accepted publication changed repeatedly; retry the knowledge mutation"
+            )
+        })?;
+        let mut transaction = QueuedKnowledgeEdit {
+            project_id,
+            scope: &scope,
+            published,
+            queue: &mut queue,
+            changes: BTreeMap::new(),
+        };
+        let message = edit(&mut transaction)?;
+        let mutations = transaction
+            .changes
+            .iter()
+            .map(|(id, content)| {
+                Ok((
+                    format!(".bbox/knowledge/{id}.json"),
+                    content.clone(),
+                    transaction.published_content(id)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mutation_ids = queue.enqueue_tracked_mutations(
+            scope,
+            mutations,
+            reason.into(),
+            bbox_util::util::now_iso(),
+        )?;
+        drop(queue);
         self.state.checkout_mutations_persister.request();
         self.observe_knowledge_transport_operation(
             project_id,
             bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
             bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
         );
-        Ok(format!(
-            "queued {mutation_id} -> {relative_path}; it lands in the checkout within one collector cycle and publishes when committed"
-        ))
+        if mutation_ids.is_empty() {
+            Ok(message)
+        } else {
+            Ok(format!(
+                "{message}; queued {}; delivery and publication are asynchronous",
+                mutation_ids.join(", ")
+            ))
+        }
     }
 
-    /// Load one entry for a selector-scoped covered mutation: published
-    /// view first, then the pending-delivery overlay.
-    fn served_knowledge_entry(
+    pub(crate) async fn persist_knowledge_mutation(
         &self,
-        raw: &str,
-        id: &str,
-    ) -> anyhow::Result<crate::knowledge::KnowledgeEntry> {
-        let view = self.session_knowledge_view(Some(raw), None)?;
-        if let Some(entry) = view
-            .knowledge
-            .all_entries()
-            .iter()
-            .find(|entry| entry.id == id)
-        {
-            return Ok(entry.clone());
+        owner: KnowledgeMutationOwner,
+    ) -> anyhow::Result<()> {
+        match owner {
+            KnowledgeMutationOwner::Local => self.state.kb_persister.request_durable().await,
+            KnowledgeMutationOwner::CheckoutQueue => {
+                self.state.persist_checkout_mutations_durable().await
+            }
         }
-        if let Some(content) = self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
-            && let Ok(entry) = serde_json::from_str::<crate::knowledge::KnowledgeEntry>(&content)
+    }
+
+    pub(crate) async fn finish_knowledge_mutation(&self, result: CallToolResult) -> CallToolResult {
+        if result.is_error != Some(true)
+            && let Err(error) = self.state.persist_checkout_mutations_durable().await
         {
-            return Ok(entry);
+            return Self::err_text(&format!(
+                "Error: knowledge changes were accepted, but checkout-queue durability failed: {error:#}"
+            ));
         }
-        anyhow::bail!("knowledge entry not found in the served view: {id}")
+        result
     }
 
     /// Cosmetic title derivation for the checkout-owner lane (the store's
@@ -453,45 +614,66 @@ impl BlackboxServer {
         }
     }
 
-    /// Id-addressed coverage lookup for knowledge mutations that carry no
-    /// project selector (forget, review, link, learn-by-id): the served
-    /// entry's stamped project id decides, with the pending-delivery
-    /// overlay standing in for records not yet published. Entries neither
-    /// published nor pending fall through to the store path unchanged.
     fn covered_knowledge_entry_scope(
         &self,
         id: &str,
-    ) -> anyhow::Result<
-        Option<(
-            crate::knowledge::KnowledgeEntry,
-            String,
-            bbox_corpus_core::identity::PublishedScope,
-        )>,
-    > {
+    ) -> anyhow::Result<Option<(String, bbox_corpus_core::identity::PublishedScope)>> {
         let id = id.strip_prefix("knowledge:").unwrap_or(id);
-        let view = self.session_knowledge_view(None, None)?;
-        let entry = view
-            .knowledge
-            .all_entries()
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .or_else(|| {
-                self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
-                    .and_then(|content| {
-                        serde_json::from_str::<crate::knowledge::KnowledgeEntry>(&content).ok()
-                    })
-            });
-        let Some(entry) = entry else {
+        if self.state.project_authority.catalog_store().is_none() {
             return Ok(None);
-        };
-        let Some(project_id) = entry.project_id.clone() else {
-            return Ok(None);
-        };
-        let Some(scope) = self.covered_scope_for_project_id(&project_id) else {
-            return Ok(None);
-        };
-        Ok(Some((entry, project_id, scope)))
+        }
+        let known_local = self.state.kb.read().all_entries().iter().any(|entry| {
+            entry.id == id
+                && (entry.scope == crate::knowledge::Scope::Global
+                    || entry.project_id.as_deref().is_none_or(|project_id| {
+                        !self
+                            .state
+                            .knowledge_transport_cutover
+                            .covers_project_str(project_id)
+                    }))
+        });
+        let mut owners = BTreeMap::new();
+        for target in self.catalog_published_targets(None)? {
+            let project_id = target.project_id.as_str();
+            let Some(scope) = self.covered_scope_for_project_id(project_id) else {
+                continue;
+            };
+            let runtime =
+                self.state.accepted_publications.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("accepted publication runtime is unavailable")
+                })?;
+            let published = match runtime.load_verified(&target.project_id) {
+                Ok(verified) => {
+                    crate::server::knowledge_view::published_knowledge_from_accepted(&verified)
+                        .entries
+                        .contains_key(id)
+                }
+                Err(error) if error.code() == ERROR_ACCEPTED_PUBLICATION_MISSING => false,
+                Err(_) if known_local => false,
+                Err(error) => return Err(error.into()),
+            };
+            let path = format!(".bbox/knowledge/{id}.json");
+            let queued = self
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_intents()
+                .any(|row| row.mutation.scope == scope && row.mutation.relative_path == path);
+            if published || queued {
+                owners.insert(project_id.to_string(), scope);
+            }
+        }
+        anyhow::ensure!(
+            owners.len() <= 1,
+            "knowledge entry {id} exists in multiple projects; use a project-scoped mutation"
+        );
+        if !owners.is_empty() {
+            anyhow::ensure!(
+                !known_local,
+                "knowledge entry {id} has multiple scope owners; use a project-scoped mutation"
+            );
+        }
+        Ok(owners.into_iter().next())
     }
 
     /// Apply a learn write's field patch to a served entry (the store's
@@ -531,24 +713,19 @@ impl BlackboxServer {
         p: &LearnParams,
         id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
-        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
+        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
             return Ok(None);
         };
-        self.patch_entry_from_learn(&mut entry, p)?;
-        let delivery = self.enqueue_knowledge_entry(
-            &project_id,
-            scope,
-            &entry,
-            "write",
-            &format!("bbox_learn update (project_id={project_id})"),
-        )?;
-        Ok(Some((
-            format!(
-                "Updated entry {} via the checkout-owner lane ({delivery})",
-                entry.id
-            ),
-            entry.id.clone(),
-        )))
+        let mut entry_id = String::new();
+        let message =
+            self.mutate_queued_knowledge(&project_id, scope, "bbox_learn update", |transaction| {
+                let mut entry = transaction.entry(id)?;
+                self.patch_entry_from_learn(&mut entry, p)?;
+                transaction.stage(&entry, false)?;
+                entry_id = entry.id.clone();
+                Ok(format!("Updated entry {}", entry.id))
+            })?;
+        Ok(Some((message, entry_id)))
     }
 
     /// Covered-project review (approve/reject), id-addressed.
@@ -557,41 +734,24 @@ impl BlackboxServer {
         action: &str,
         id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
+        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
             return Ok(None);
         };
-        entry.updated_at = bbox_util::util::now_iso();
-        match action {
-            "approve" => {
-                entry.approval = crate::knowledge::Approval::UserConfirmed;
-                let delivery = self.enqueue_knowledge_entry(
-                    &project_id,
-                    scope,
-                    &entry,
-                    "write",
-                    &format!("bbox_review approve (project_id={project_id})"),
-                )?;
-                Ok(Some(format!(
-                    "Approved entry {} via the checkout-owner lane ({delivery})",
-                    entry.id
-                )))
-            }
-            "reject" => {
-                entry.status = crate::knowledge::Status::Deleted;
-                let delivery = self.enqueue_knowledge_entry(
-                    &project_id,
-                    scope,
-                    &entry,
-                    "delete",
-                    &format!("bbox_review reject (project_id={project_id})"),
-                )?;
-                Ok(Some(format!(
-                    "Rejected entry {} via the checkout-owner lane ({delivery})",
-                    entry.id
-                )))
-            }
-            other => anyhow::bail!("unknown review action {other}"),
-        }
+        self.mutate_queued_knowledge(&project_id, scope, "bbox_review", |transaction| {
+            let mut entry = transaction.entry(id)?;
+            entry.updated_at = bbox_util::util::now_iso();
+            let verb = match action {
+                "approve" => {
+                    entry.approval = crate::knowledge::Approval::UserConfirmed;
+                    "Approved"
+                }
+                "reject" => "Rejected",
+                other => anyhow::bail!("unknown review action {other}"),
+            };
+            transaction.stage(&entry, action == "reject")?;
+            Ok(format!("{verb} entry {}", entry.id))
+        })
+        .map(Some)
     }
 
     /// Covered-project knowledge link: append the edge to the served
@@ -605,9 +765,7 @@ impl BlackboxServer {
             Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
             Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
         };
-        let Some((mut entry, project_id, scope)) =
-            self.covered_knowledge_entry_scope(&source_id)?
-        else {
+        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(&source_id)? else {
             return Ok(None);
         };
         bbox_corpus_core::entity_ref::EntityRef::parse(&p.target)
@@ -628,30 +786,25 @@ impl BlackboxServer {
             source_arc: p.source_arc.clone(),
             confidence,
         };
-        let duplicate = entry.links.iter().any(|existing| {
-            existing.target == edge.target
-                && existing.kind == edge.kind
-                && existing.source_arc == edge.source_arc
-        });
-        if duplicate {
-            return Ok(Some(format!(
-                "Link already present on {} (same target, kind, and arc)",
-                entry.id
-            )));
-        }
-        entry.links.push(edge);
-        entry.updated_at = bbox_util::util::now_iso();
-        let delivery = self.enqueue_knowledge_entry(
-            &project_id,
-            scope,
-            &entry,
-            "write",
-            &format!("bbox_knowledge_link (project_id={project_id})"),
-        )?;
-        Ok(Some(format!(
-            "Linked {} -> {} via the checkout-owner lane ({delivery})",
-            entry.id, p.target
-        )))
+        self.mutate_queued_knowledge(&project_id, scope, "bbox_knowledge_link", |transaction| {
+            let mut entry = transaction.entry(&source_id)?;
+            let duplicate = entry.links.iter().any(|existing| {
+                existing.target == edge.target
+                    && existing.kind == edge.kind
+                    && existing.source_arc == edge.source_arc
+            });
+            if duplicate {
+                return Ok(format!(
+                    "Link already present on {} (same target, kind, and arc)",
+                    entry.id
+                ));
+            }
+            entry.links.push(edge);
+            entry.updated_at = bbox_util::util::now_iso();
+            transaction.stage(&entry, false)?;
+            Ok(format!("Linked {} -> {}", entry.id, p.target))
+        })
+        .map(Some)
     }
 
     /// Covered-project learn: create or update through the checkout-owner
@@ -659,7 +812,7 @@ impl BlackboxServer {
     fn enqueue_learn_via_checkout_owner(
         &self,
         p: &LearnParams,
-        raw: &str,
+        _raw: &str,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
     ) -> anyhow::Result<String> {
@@ -679,19 +832,17 @@ impl BlackboxServer {
         let providers = p.providers.clone().unwrap_or_default();
         let now = bbox_util::util::now_iso();
         if let Some(id) = p.id.as_deref() {
-            let mut entry = self.served_knowledge_entry(raw, id)?;
-            self.patch_entry_from_learn(&mut entry, p)?;
-            let delivery = self.enqueue_knowledge_entry(
+            return self.mutate_queued_knowledge(
                 project_id,
                 scope,
-                &entry,
-                "write",
-                &format!("bbox_learn update (project_id={project_id})"),
-            )?;
-            return Ok(format!(
-                "Updated entry {} via the checkout-owner lane ({delivery})",
-                entry.id
-            ));
+                "bbox_learn update",
+                |transaction| {
+                    let mut entry = transaction.entry(id)?;
+                    self.patch_entry_from_learn(&mut entry, p)?;
+                    transaction.stage(&entry, false)?;
+                    Ok(format!("Updated entry {}", entry.id))
+                },
+            );
         }
         let entry = crate::knowledge::KnowledgeEntry {
             id: String::new(),
@@ -721,51 +872,14 @@ impl BlackboxServer {
             recall_count: 0,
             last_recalled: None,
         };
-        let id = self.mint_knowledge_id(raw)?;
-        let entry = crate::knowledge::KnowledgeEntry { id, ..entry };
-        let delivery = self.enqueue_knowledge_entry(
-            project_id,
-            scope,
-            &entry,
-            "write",
-            &format!("bbox_learn create (project_id={project_id})"),
-        )?;
-        Ok(format!(
-            "Created entry {} via the checkout-owner lane [render_pending=true] ({delivery})",
-            entry.id
-        ))
-    }
-
-    /// Mint a knowledge id colliding with nothing in the served view.
-    fn mint_knowledge_id(&self, raw: &str) -> anyhow::Result<String> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let view = self.session_knowledge_view(Some(raw), None)?;
-        loop {
-            let mut h = DefaultHasher::new();
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .hash(&mut h);
-            std::process::id().hash(&mut h);
-            std::thread::current().id().hash(&mut h);
-            let id = format!("{:016x}", h.finish());
-            let taken_by_view = view
-                .knowledge
-                .all_entries()
-                .iter()
-                .any(|entry| entry.id == id);
-            let taken_by_pending = self
-                .state
-                .checkout_mutations
-                .read()
-                .pending_for_path(&format!(".bbox/knowledge/{id}.json"))
-                .is_some();
-            if !taken_by_view && !taken_by_pending {
-                return Ok(id);
-            }
-        }
+        self.mutate_queued_knowledge(project_id, scope, "bbox_learn create", |transaction| {
+            let entry = crate::knowledge::KnowledgeEntry {
+                id: transaction.mint_id(),
+                ..entry
+            };
+            transaction.stage(&entry, false)?;
+            Ok(format!("Created entry {} [render_pending=true]", entry.id))
+        })
     }
 
     /// Covered-project remember: create an indexed-only entry through the
@@ -773,7 +887,7 @@ impl BlackboxServer {
     fn enqueue_remember_via_checkout_owner(
         &self,
         p: &RememberParams,
-        raw: &str,
+        _raw: &str,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
     ) -> anyhow::Result<String> {
@@ -785,7 +899,7 @@ impl BlackboxServer {
         };
         let now = bbox_util::util::now_iso();
         let entry = crate::knowledge::KnowledgeEntry {
-            id: self.mint_knowledge_id(raw)?,
+            id: String::new(),
             title: Self::checkout_lane_title(&p.content, &p.title),
             content: p.content.clone(),
             cluster: None,
@@ -812,17 +926,17 @@ impl BlackboxServer {
             recall_count: 0,
             last_recalled: None,
         };
-        let delivery = self.enqueue_knowledge_entry(
-            project_id,
-            scope,
-            &entry,
-            "write",
-            &format!("bbox_remember (project_id={project_id})"),
-        )?;
-        Ok(format!(
-            "Remembered entry {} via the checkout-owner lane (indexed only, not rendered) ({delivery})",
-            entry.id
-        ))
+        self.mutate_queued_knowledge(project_id, scope, "bbox_remember", |transaction| {
+            let entry = crate::knowledge::KnowledgeEntry {
+                id: transaction.mint_id(),
+                ..entry
+            };
+            transaction.stage(&entry, false)?;
+            Ok(format!(
+                "Remembered entry {} (indexed only, not rendered)",
+                entry.id
+            ))
+        })
     }
 
     /// Covered-project decide: create the decision and, when superseding,
@@ -830,7 +944,7 @@ impl BlackboxServer {
     fn enqueue_decide_via_checkout_owner(
         &self,
         p: &DecideParams,
-        raw: &str,
+        _raw: &str,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
     ) -> anyhow::Result<String> {
@@ -839,14 +953,13 @@ impl BlackboxServer {
         }
         if p.rationale.trim().is_empty() {
             anyhow::bail!(
-                "'rationale' is required — a decision without justification is just a command"
+                "'rationale' is required: a decision without justification is just a command"
             );
         }
         let priority = Self::checkout_lane_priority(p.priority.as_deref())?;
         let now = bbox_util::util::now_iso();
-        let id = self.mint_knowledge_id(raw)?;
         let entry = crate::knowledge::KnowledgeEntry {
-            id: id.clone(),
+            id: String::new(),
             title: Self::checkout_lane_title(&p.content, &p.title),
             content: p.content.clone(),
             cluster: None,
@@ -873,29 +986,23 @@ impl BlackboxServer {
             recall_count: 0,
             last_recalled: None,
         };
-        let delivery = self.enqueue_knowledge_entry(
-            project_id,
-            scope.clone(),
-            &entry,
-            "write",
-            &format!("bbox_decide (project_id={project_id})"),
-        )?;
-        let mut message = format!("Decided entry {id} via the checkout-owner lane ({delivery})");
-        if let Some(old_id) = p.supersedes.as_deref() {
-            let mut old = self.served_knowledge_entry(raw, old_id)?;
-            old.status = crate::knowledge::Status::Superseded;
-            old.supersedes = Some(id.clone());
-            old.updated_at = now;
-            let old_delivery = self.enqueue_knowledge_entry(
-                project_id,
-                scope,
-                &old,
-                "write",
-                &format!("bbox_decide supersession (project_id={project_id})"),
-            )?;
-            message.push_str(&format!("; superseded {} ({old_delivery})", old.id));
-        }
-        Ok(message)
+        self.mutate_queued_knowledge(project_id, scope, "bbox_decide", |transaction| {
+            let entry = crate::knowledge::KnowledgeEntry {
+                id: transaction.mint_id(),
+                ..entry
+            };
+            let mut message = format!("Decided entry {}", entry.id);
+            if let Some(old_id) = p.supersedes.as_deref() {
+                let mut old = transaction.entry(old_id)?;
+                old.status = crate::knowledge::Status::Superseded;
+                old.supersedes = Some(entry.id.clone());
+                old.updated_at = now;
+                transaction.stage(&old, false)?;
+                message.push_str(&format!("; superseded {}", old.id));
+            }
+            transaction.stage(&entry, false)?;
+            Ok(message)
+        })
     }
 
     /// Covered-project forget, id-addressed: coverage comes from the
@@ -908,53 +1015,22 @@ impl BlackboxServer {
         p: &crate::knowledge::ForgetParams,
     ) -> anyhow::Result<Option<String>> {
         let id = p.id.strip_prefix("knowledge:").unwrap_or(&p.id);
-        let view = self.session_knowledge_view(None, None)?;
-        let Some(entry) = view
-            .knowledge
-            .all_entries()
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-        else {
+        let Some((project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
             return Ok(None);
         };
-        let Some(project_id) = entry.project_id.clone() else {
-            return Ok(None);
-        };
-        let Some(scope) = self.covered_scope_for_project_id(&project_id) else {
-            return Ok(None);
-        };
-        if let Some(by) = p.superseded_by.as_deref() {
-            let mut entry = entry;
-            entry.status = crate::knowledge::Status::Superseded;
-            entry.supersedes = Some(by.to_string());
+        self.mutate_queued_knowledge(&project_id, scope, "bbox_forget", |transaction| {
+            let mut entry = transaction.entry(id)?;
             entry.updated_at = bbox_util::util::now_iso();
-            let delivery = self.enqueue_knowledge_entry(
-                &project_id,
-                scope,
-                &entry,
-                "write",
-                &format!("bbox_forget supersede (project_id={project_id})"),
-            )?;
-            return Ok(Some(format!(
-                "Superseded entry {} via the checkout-owner lane ({delivery})",
-                entry.id
-            )));
-        }
-        let mut entry = entry;
-        entry.status = crate::knowledge::Status::Deleted;
-        entry.updated_at = bbox_util::util::now_iso();
-        let delivery = self.enqueue_knowledge_entry(
-            &project_id,
-            scope,
-            &entry,
-            "delete",
-            &format!("bbox_forget (project_id={project_id})"),
-        )?;
-        Ok(Some(format!(
-            "Removed entry {} via the checkout-owner lane ({delivery})",
-            entry.id
-        )))
+            if let Some(by) = p.superseded_by.as_deref() {
+                entry.status = crate::knowledge::Status::Superseded;
+                entry.supersedes = Some(by.to_string());
+                transaction.stage(&entry, false)?;
+                return Ok(format!("Superseded entry {}", entry.id));
+            }
+            transaction.stage(&entry, true)?;
+            Ok(format!("Removed entry {}", entry.id))
+        })
+        .map(Some)
     }
 
     pub(crate) fn register_dark_knowledge_checkout(
@@ -1303,10 +1379,12 @@ impl BlackboxServer {
             .await
             .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
             .and_then(std::convert::identity);
-            return match delivered {
-                Ok(message) => Self::ok_text(&message),
-                Err(e) => Self::err_text(&format!("Error: {e:#}")),
-            };
+            return self
+                .finish_knowledge_mutation(match delivered {
+                    Ok(message) => Self::ok_text(&message),
+                    Err(e) => Self::err_text(&format!("Error: {e:#}")),
+                })
+                .await;
         }
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -1329,6 +1407,7 @@ impl BlackboxServer {
                     },
                     None,
                     true,
+                    KnowledgeMutationOwner::CheckoutQueue,
                 ));
             }
             let update = match p.id.as_deref() {
@@ -1374,15 +1453,20 @@ impl BlackboxServer {
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_knowledge_overlay(checkout);
             }
-            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
+            Ok::<_, anyhow::Error>((
+                result,
+                rider,
+                overlay_refreshed,
+                KnowledgeMutationOwner::Local,
+            ))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((result, rider, overlay_refreshed)) => {
-                if let Err(e) = self.state.kb_persister.request_durable().await {
+            Ok((result, rider, overlay_refreshed, owner)) => {
+                if let Err(e) = self.persist_knowledge_mutation(owner).await {
                     log_tool_err("bbox_learn", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
@@ -1464,10 +1548,12 @@ impl BlackboxServer {
             .await
             .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
             .and_then(std::convert::identity);
-            return match delivered {
-                Ok(message) => Self::ok_text(&message),
-                Err(e) => Self::err_text(&format!("Error: {e:#}")),
-            };
+            return self
+                .finish_knowledge_mutation(match delivered {
+                    Ok(message) => Self::ok_text(&message),
+                    Err(e) => Self::err_text(&format!("Error: {e:#}")),
+                })
+                .await;
         }
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -1547,10 +1633,12 @@ impl BlackboxServer {
             .await
             .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
             .and_then(std::convert::identity);
-            return match delivered {
-                Ok(message) => Self::ok_text(&message),
-                Err(e) => Self::err_text(&format!("Error: {e:#}")),
-            };
+            return self
+                .finish_knowledge_mutation(match delivered {
+                    Ok(message) => Self::ok_text(&message),
+                    Err(e) => Self::err_text(&format!("Error: {e:#}")),
+                })
+                .await;
         }
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -1818,7 +1906,7 @@ impl BlackboxServer {
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
             if let Some(text) = server.enqueue_link_via_checkout_owner(&p)? {
-                return Ok::<_, anyhow::Error>((text, false));
+                return Ok::<_, anyhow::Error>((text, KnowledgeMutationOwner::CheckoutQueue));
             }
             let target = server.prepare_existing_knowledge_mutation(&p.source)?;
             p.source = format!("knowledge:{}", target.id);
@@ -1839,7 +1927,7 @@ impl BlackboxServer {
                     "kind": edge.kind.edge_kind(),
                     "confidence": edge.confidence,
                 }))?,
-                target.checkout.is_some(),
+                KnowledgeMutationOwner::Local,
             ))
         })
         .await
@@ -1847,8 +1935,8 @@ impl BlackboxServer {
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((text, _provisional)) => {
-                if let Err(e) = self.state.kb_persister.request_durable().await {
+            Ok((text, owner)) => {
+                if let Err(e) = self.persist_knowledge_mutation(owner).await {
                     log_tool_err("bbox_knowledge_link", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
@@ -1872,7 +1960,12 @@ impl BlackboxServer {
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
             if let Some(message) = server.enqueue_forget_via_checkout_owner(&p)? {
-                return Ok::<_, anyhow::Error>((message, p.id.clone(), false));
+                return Ok::<_, anyhow::Error>((
+                    message,
+                    p.id.clone(),
+                    true,
+                    KnowledgeMutationOwner::CheckoutQueue,
+                ));
             }
             let target = server.prepare_existing_knowledge_mutation(&p.id)?;
             p.id = target.id.clone();
@@ -1885,15 +1978,20 @@ impl BlackboxServer {
                 target.seed.as_ref(),
             )?;
             server.finish_existing_knowledge_mutation(target.checkout.as_ref());
-            Ok::<_, anyhow::Error>((message, target.id, target.checkout.is_some()))
+            Ok::<_, anyhow::Error>((
+                message,
+                target.id,
+                target.checkout.is_some(),
+                KnowledgeMutationOwner::Local,
+            ))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge forget task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((message, id, provisional)) => {
-                if let Err(e) = self.state.kb_persister.request_durable().await {
+            Ok((message, id, provisional, owner)) => {
+                if let Err(e) = self.persist_knowledge_mutation(owner).await {
                     log_tool_err("bbox_forget", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
@@ -1910,6 +2008,10 @@ impl BlackboxServer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "knowledge_queue_tests.rs"]
+mod queue_tests;
 
 #[cfg(test)]
 mod tests {
