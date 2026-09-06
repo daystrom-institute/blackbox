@@ -91,3 +91,20 @@
   so they cannot disagree. The embed projection is NOT stored in the word
   index (documents carry label + `index: text` values only): never try to
   rebuild graph vectors from a tantivy scan.
+
+## Transcript read authority
+
+- Native context/messages/session/topics reads use exact stored transcript
+  locators or session ids. A locator may resemble a host path, but read APIs
+  never open it or reconstruct source files from it. Source discovery and
+  ingestion belong to adapters with explicit roots or enrolled transport.
+- Native message bodies are retained index projections and may already have
+  parser truncation. Response-preview truncation is a separate fact; neither
+  a successful lookup nor the last indexed timestamp establishes complete or
+  current source ingestion. Keep this limitation visible in read responses.
+- Slack context/messages reads retain their scoped landing-store authority.
+  Do not send Slack locators through native index fallback when that authority
+  refuses them.
+- Native message pagination is ordered by locator and source byte offset.
+  A byte-limited page advances by returned rows, including from_end pages;
+  never advance by the requested count when fewer rows fit.
