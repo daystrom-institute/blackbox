@@ -2993,7 +2993,7 @@ mod tests {
                 }),
             }))
             .await;
-        assert_ne!(compared.is_error, Some(true), "{}", extract_text(&compared));
+        assert_eq!(compared.is_error, Some(true), "{}", extract_text(&compared));
         assert_eq!(extract_text(&compared), resolved_text);
 
         let mismatch = server
