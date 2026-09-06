@@ -16,9 +16,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/deferred-tool-activation-lost-on-resume",
   "notes": "Concrete resume contract defect; correlation with native search incidents does not prove the cause of provider query selection. Keep native search enabled.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T21:51:02Z",
-  "updated_at": "2026-09-06T21:51:02Z"
+  "updated_at": "2026-09-06T22:15:24Z",
+  "resolved_at": "2026-09-06T22:15:24Z",
+  "resolution_note": "Fixed in a9825318, integrated through b015e051. Deferred activations persist in existing session side-state; legacy successful paired tool_search receipts recover from durable events against the current filtered catalog. Native installed process probe passes six requests covering resume, compaction-era legacy state, denied tools and explicit empty state, with native search present throughout. Full workspace gate at b015e051 passed 6687 tests. Signed native harness installed and cage image b015e051 deployed. This resolves activation persistence only; native query-selection causality remains open in gap-900d052c."
 }

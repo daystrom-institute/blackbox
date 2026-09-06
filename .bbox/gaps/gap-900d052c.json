@@ -16,15 +16,16 @@
     "crates/bro-harness/src/agent_loop.rs native block observation regression",
     "a9825318: native process reproduction proves deferred tool schema loss on resume; fixed persistence and legacy receipt recovery pass six-request probe",
     "gap-ff52b07c: bro_report activation was lost across process resumes preceding both native search incidents",
-    "gap-6451641a: independent runtime-rate-limit admission latch survives cooldown expiry"
+    "gap-6451641a: independent runtime-rate-limit admission latch survives cooldown expiry",
+    "b015e051 deployed: full workspace 6687 passed, 165 isolated MCP checks passed; normal Flash dispatch d52fa41b reached provider and logged fresh429/code1308 at2026-09-06T22:14:50.299Z"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/glm-server-builtin-suppression",
-  "notes": "Confirmed replay and durable-observation defects are repaired in commits 624c8603 and 8c01614d; native input_schema is limited to the MiniMax protocol variation. Full workspace verification at e7985322 passed 6684 tests. Canonical and GLM server blocks have replay and log regressions. The cause of placeholder search initiation remains unproven; neither a query deny list nor capability disablement is the repair. Fresh provider probes on 2026-09-06 at 20:49:11 UTC (glm-5.3) and 20:57:24 UTC (glm-5.3-flash) returned HTTP 429 code 1308, explicitly a five-hour quota cap. The reset timestamp did not carry a timezone. Successful provider-level confirmation remains outstanding. Follow-up at 2026-09-06T21:46:50Z again directly observed Flash HTTP429/code1308. Native-search scrutiny found and reproduced lost tool_search activation on process resume; this is correlated with both saved incidents, but provider query-selection causality remains unproven. No query deny list or default search disablement was added. Live allocator preview separately attributed no_candidates to an expired runtime-rate-limit exclusion.",
+  "notes": "Confirmed replay and durable-observation defects are repaired in commits 624c8603 and 8c01614d; native input_schema is limited to the MiniMax protocol variation. Full workspace verification at e7985322 passed 6684 tests. Canonical and GLM server blocks have replay and log regressions. The cause of placeholder search initiation remains unproven; neither a query deny list nor capability disablement is the repair. Fresh provider probes on 2026-09-06 at 20:49:11 UTC (glm-5.3) and 20:57:24 UTC (glm-5.3-flash) returned HTTP 429 code 1308, explicitly a five-hour quota cap. The reset timestamp did not carry a timezone. Successful provider-level confirmation remains outstanding. Follow-up at 2026-09-06T21:46:50Z again directly observed Flash HTTP429/code1308. Native-search scrutiny found and reproduced lost tool_search activation on process resume; this is correlated with both saved incidents, but provider query-selection causality remains unproven. No query deny list or default search disablement was added. Live allocator preview separately attributed no_candidates to an expired runtime-rate-limit exclusion. Final follow-up deployed b015e051; native activation recovery and runtime cooldown expiry gaps are addressed. Normal Flash bro_exec now passes allocation and reaches the provider. Its terminal event at 2026-09-06T22:14:50.299Z contains a fresh HTTP429/code1308 five-hour quota cap, and a new active cooldown was recorded. Placeholder search causality remains open pending successful provider experiments.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T20:12:05Z",
-  "updated_at": "2026-09-06T22:02:52.539655Z"
+  "updated_at": "2026-09-06T22:16:30.589624Z"
 }

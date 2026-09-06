@@ -15,9 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/runtime-allocator/expired-rate-limit-still-hard-excludes",
   "notes": "A fresh direct Flash request still returned 429/code1308 at 21:46:50Z. This gap describes the independent stale admission latch, not evidence that upstream quota has reset.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T21:58:28Z",
-  "updated_at": "2026-09-06T21:58:28Z"
+  "updated_at": "2026-09-06T22:15:24Z",
+  "resolved_at": "2026-09-06T22:15:24Z",
+  "resolution_note": "Fixed in ffa5c8c8/b4f47d43, integrated and deployed at b015e051. Expired runtime cooldown permits fresh allocation with unknown capacity; historical receipt retained and summary marks expiry. Authoritative quota-probe exhaustion and credential failures still gate. Full suite 6687 passed; 165 isolated MCP checks include expiry and authoritative refusal. Live deployed preview selected glm-5.3-flash from previously stuck lane. Real bro_exec d52fa41b-fe00-48ab-9991-0ddf37a4b922 reached provider and failed in 5s with fresh HTTP429/code1308 at approximately22:14:49Z, proving admission recovery while upstream quota remains capped."
 }

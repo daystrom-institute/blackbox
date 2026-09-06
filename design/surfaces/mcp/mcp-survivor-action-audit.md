@@ -842,6 +842,25 @@ establishes successful live GLM admission. `gap-900d052c` remains open for
 provider query-selection attribution; `gap-ff52b07c` tracks activation recovery
 and `gap-6451641a` tracks the allocator expiry defect.
 
+At `b015e051`, all 6,687 full-profile workspace tests passed (19 skipped),
+along with workspace clippy, pinned formatting and the concurrency lint.
+Two existing migration lock-contention tests hit their three-second completion
+deadline under parallel suite load. The final full run used a temporary copy of
+the repository's nextest configuration with those two tests assigned
+`threads-required = "num-test-threads"`; both passed with their assertions and
+timeouts unchanged. Nextest documents this [exclusive scheduling setting](https://nexte.st/docs/configuration/threads-required/).
+All 165 isolated HTTP/MCP checks passed, including active cooldown refusal,
+expired runtime quota admission, unknown current quota summaries, and continued
+authoritative-quota refusal. The largest MCP result remained 15,245 bytes.
+
+The signed native harness is installed. Cage image `b015e051edf2` deployed as
+digest `061b334e04815801cbe146b7285cee7ca29a01730fa07ac83974e5a4c5f084a1`;
+only the blackboxd deployment changed. Live allocation then admitted Flash, and
+task `d52fa41b-fe00-48ab-9991-0ddf37a4b922` reached the provider and failed in
+five seconds with a fresh HTTP 429/code 1308. That observation installed a new
+active cooldown. This proves the expired-exclusion recovery path, not successful
+provider execution or resolution of placeholder-search initiation.
+
 Callable retirement and locality restrictions retain their explicit dispositions
 in the action matrix. That matrix records the original audit; the integration
 checkpoints above record subsequent fixes and their actual verification scope.
