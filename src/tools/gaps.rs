@@ -278,6 +278,17 @@ impl BlackboxServer {
         ))
     }
 
+    async fn finish_gap_mutation(&self, result: CallToolResult) -> CallToolResult {
+        if result.is_error != Some(true)
+            && let Err(error) = self.state.persist_checkout_mutations_durable().await
+        {
+            return Self::err_text(&format!(
+                "Error: gap changes were accepted, but checkout-queue durability failed: {error:#}"
+            ));
+        }
+        result
+    }
+
     fn observe_gap_delivery(&self, project_id: &str) {
         self.observe_knowledge_transport_operation(
             project_id,
@@ -710,7 +721,7 @@ impl BlackboxServer {
         // Gap mutations are disk-authoritative: reload + full-store rewrite
         // under a flock. Run on the blocking pool, not a tokio worker.
         let server = self.clone();
-        Self::run_blocking("bbox_gap", move || {
+        let result = Self::run_blocking("bbox_gap", move || {
             let mut checkout = None;
             let raw_project = p
                 .project
@@ -745,7 +756,8 @@ impl BlackboxServer {
                 ))
             }
         })
-        .await
+        .await;
+        self.finish_gap_mutation(result).await
     }
 
     #[tool(
@@ -873,7 +885,7 @@ impl BlackboxServer {
             return Self::err_text(&format!("Error: {error:#}"));
         }
         let server = self.clone();
-        Self::run_blocking("bbox_gap_resolve", move || {
+        let result = Self::run_blocking("bbox_gap_resolve", move || {
             // `project` is write-targeting only: resolve it through the same
             // path as filing so a recognized worktree redirects the rewritten
             // repo-owned file into the session's checkout. The gap's durable
@@ -920,7 +932,8 @@ impl BlackboxServer {
             }
             Ok(result)
         })
-        .await
+        .await;
+        self.finish_gap_mutation(result).await
     }
 
     #[tool(
@@ -935,7 +948,7 @@ impl BlackboxServer {
             return Self::err_text(&format!("Error: {error:#}"));
         }
         let server = self.clone();
-        Self::run_blocking("bbox_gap_update", move || {
+        let result = Self::run_blocking("bbox_gap_update", move || {
             // Same write-targeting resolution as bbox_gap_resolve.
             let mut checkout = None;
             let raw_project = p
@@ -974,7 +987,8 @@ impl BlackboxServer {
             }
             Ok(result)
         })
-        .await
+        .await;
+        self.finish_gap_mutation(result).await
     }
 }
 

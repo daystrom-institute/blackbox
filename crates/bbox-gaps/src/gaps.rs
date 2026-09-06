@@ -540,13 +540,11 @@ pub struct GapResolveParams {
     #[serde(default)]
     #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
     pub superseded_by: Option<String>,
-    /// Session cwd / worktree path for WRITE-TARGETING only: when this
-    /// resolves to a recognized worktree of the gap's own project, the
-    /// rewritten repo-owned gap file lands in that worktree (the session
-    /// commits it; the branch carries it). The gap's durable project scope
-    /// never changes. Absent → the file is rewritten where it lives today
-    /// (the base checkout), and the owning project is resolved from the gap
-    /// id itself, which is globally unique. Ignored for global-scope gaps.
+    /// Owning project selector (registered id or alias; registered paths are
+    /// also accepted). Omit to resolve the owner by gap id. The checkout-owner
+    /// transport queues delivery; the owner must commit and publish it before
+    /// the published view changes. Does not change the gap's durable scope.
+    /// Ignored for global gaps. A local bridge may target a recognized worktree.
     #[serde(default)]
     pub project: Option<String>,
     /// Internal logical write-carrier id resolved by the MCP adapter from
@@ -581,13 +579,11 @@ pub struct GapUpdateParams {
     pub suggested_owner: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
-    /// Session cwd / worktree path for WRITE-TARGETING only: when this
-    /// resolves to a recognized worktree of the gap's own project, the
-    /// rewritten repo-owned gap file lands in that worktree (the session
-    /// commits it; the branch carries it). The gap's durable project scope
-    /// never changes. Absent → the file is rewritten where it lives today
-    /// (the base checkout), and the owning project is resolved from the gap
-    /// id itself, which is globally unique. Ignored for global-scope gaps.
+    /// Owning project selector (registered id or alias; registered paths are
+    /// also accepted). Omit to resolve the owner by gap id. The checkout-owner
+    /// transport queues delivery; the owner must commit and publish it before
+    /// the published view changes. Does not change the gap's durable scope.
+    /// Ignored for global gaps. A local bridge may target a recognized worktree.
     #[serde(default)]
     pub project: Option<String>,
     /// Internal logical write-carrier id resolved by the MCP adapter from
