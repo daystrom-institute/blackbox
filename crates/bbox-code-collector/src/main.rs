@@ -80,6 +80,10 @@ struct CollectorConfig {
     trusted_encrypted_network: bool,
     #[serde(default = "default_interval_secs")]
     interval_secs: u64,
+    /// Lightweight queued-edit delivery has its own cadence, independent of
+    /// source scanning and publication.
+    #[serde(default = "default_mutation_interval_secs")]
+    mutation_interval_secs: u64,
     #[serde(default = "default_status_timeout_secs")]
     status_timeout_secs: u64,
     projects: Vec<ProjectConfig>,
@@ -161,6 +165,10 @@ struct CapturedPublicationCandidate {
 
 fn default_interval_secs() -> u64 {
     120
+}
+
+fn default_mutation_interval_secs() -> u64 {
+    10
 }
 
 fn default_status_timeout_secs() -> u64 {
@@ -290,7 +298,7 @@ async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
 /// checkout, and ack each outcome. Runs ahead of the knowledge lane so a
 /// freshly applied record rides the same cycle's publication candidate.
 async fn run_checkout_mutation_lane(runtime: &Runtime, config: &CollectorConfig) {
-    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let interval = Duration::from_secs(config.mutation_interval_secs.max(1));
     let mut backoff = interval;
     loop {
         match apply_checkout_mutations(runtime, config).await {
@@ -302,7 +310,7 @@ async fn run_checkout_mutation_lane(runtime: &Runtime, config: &CollectorConfig)
             }
             Err(error) => {
                 tracing::error!(error = %error, "checkout mutation lane failed");
-                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+                backoff = (backoff * 2).min(interval.max(Duration::from_secs(60)));
             }
         }
         tokio::time::sleep(jittered(backoff)).await;
@@ -2821,6 +2829,7 @@ mod tests {
             token_file: root.join("token"),
             trusted_encrypted_network: false,
             interval_secs: 1,
+            mutation_interval_secs: 1,
             status_timeout_secs: 1,
             projects: vec![ProjectConfig {
                 root: root.to_path_buf(),
@@ -3164,6 +3173,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.status_timeout_secs, default_status_timeout_secs());
+        assert_eq!(config.mutation_interval_secs, 10);
+        let slow_scan = "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\nprojects = []\ninterval_secs = 600\n";
+        let config = toml::from_str::<CollectorConfig>(slow_scan).unwrap();
+        assert_eq!(config.interval_secs, 600);
+        assert_eq!(config.mutation_interval_secs, 10);
+        let config =
+            toml::from_str::<CollectorConfig>(&format!("{slow_scan}mutation_interval_secs = 30\n"))
+                .unwrap();
+        assert_eq!(config.interval_secs, 600);
+        assert_eq!(config.mutation_interval_secs, 30);
         assert!(
             toml::from_str::<CollectorConfig>(
                 "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\nprojects = []\nunknown = true\n"

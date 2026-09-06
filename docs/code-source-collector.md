@@ -105,6 +105,7 @@ configuration such as:
 server_url = "https://corpus.example.invalid/"
 token_file = "/home/operator/.config/blackbox/code-collectors/checkout-host-a.token"
 interval_secs = 120
+mutation_interval_secs = 10
 
 [[projects]]
 root = "/home/operator/repos/project"
@@ -113,6 +114,13 @@ git_history = true
 provenance = true
 published_knowledge = { full_ref = "refs/heads/main" }
 ```
+
+`interval_secs` controls source collection. Queued gap and knowledge edits
+poll independently at `mutation_interval_secs` (default 10 seconds, minimum
+1 second), so a long source-scan interval does not delay admitted edits.
+Delivery errors back off to at most 60 seconds, or the configured mutation
+interval when larger. Delivery changes the checkout; publication still waits
+for the configured committed ref and its publication cycle.
 
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
