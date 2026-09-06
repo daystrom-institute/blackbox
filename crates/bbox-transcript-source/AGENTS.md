@@ -10,3 +10,7 @@
   and shrinks are new generations, not exceptional append-cursor resets.
 - Publication uses expected-generation CAS. Only a durable receipt confirms
   publication; it does not claim the index has processed that generation.
+
+- Scan contact is producer evidence, separate from publication receipts and index
+  completeness. A completed scan includes failures and deferred files; scan ids
+  fence stale completions from overwriting a newer walk.

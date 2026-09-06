@@ -65,7 +65,14 @@ instruction.
 Source publication and index freshness are separate. A durable publish receipt
 confirms stored source bytes; the index writer subsequently projects them.
 Native `bbox_context`, `bbox_messages`, `bbox_session`, and `bbox_topics` read
-indexed projections and disclose their limitations. Search locators have the
+indexed projections and disclose their limitations. Context, messages, and session
+responses include bounded source observations: whether the indexed generation
+matches the published generation, publication time, producer contact time,
+and completed-scan failures/deferred files. Publication time is not a liveness
+claim. Authenticated scan contact is separate from status reads, and an
+interrupted walk remains marked in progress with its last contact timestamp.
+A completed walk with failed or deferred streams does not establish completeness.
+Search locators have the
 shape `native:<source-id>/<stream-id>/<generation>`, and are opaque read keys,
 not file paths. Native source cwd remains display metadata and never licenses
 filesystem/git probing on the daemon.

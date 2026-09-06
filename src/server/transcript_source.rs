@@ -1,7 +1,7 @@
 //! Native transcript source ingress. Authentication is shared with connector
 //! producers; each operation additionally proves the native profile and scope.
 use super::{SharedState, producer_auth::ConnectorGrant};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,7 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
     Router::new()
         .route("/internal/transcript-source/v1/onboard", post(onboard))
         .route("/internal/transcript-source/v1/status", post(status))
+        .route("/internal/transcript-source/v1/contact", post(contact))
         .route("/internal/transcript-source/v1/missing", post(missing))
         .route("/internal/transcript-source/v1/publish", post(publish))
         .route(
@@ -72,43 +73,67 @@ fn reply<T: serde::Serialize>(result: Result<T>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
+            tracing::warn!(error = %error, "native transcript source request failed");
             let text = error.to_string();
-            let (status, code) =
-                if text.contains("scope_forbidden") || text.contains("scope_wrong_lane") {
-                    (StatusCode::FORBIDDEN, text.as_str())
-                } else if text.contains("scope_pending_onboarding") {
-                    (StatusCode::CONFLICT, "scope_pending_onboarding")
-                } else if text.contains("transcript_generation_conflict") {
-                    (StatusCode::CONFLICT, "transcript_generation_conflict")
-                } else if error.downcast_ref::<std::io::Error>().is_some()
-                    || error.downcast_ref::<serde_json::Error>().is_some()
-                {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "transcript_source_unavailable",
-                    )
-                } else if [
-                    "invalid",
-                    "mismatch",
-                    "incomplete",
-                    "exceeds",
-                    "unsupported",
-                    "missing transcript chunk",
-                ]
-                .iter()
-                .any(|marker| text.contains(marker))
-                {
-                    (StatusCode::BAD_REQUEST, "invalid_transcript_snapshot")
-                } else {
-                    tracing::warn!(error = %error, "native transcript source request failed");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "transcript_source_unavailable",
-                    )
-                };
-            (status, Json(serde_json::json!({"code": code, "message": "Transcript publication was not accepted; verify the grant, current generation, snapshot digest, and required chunks."}))).into_response()
+            let (status, code) = if let Some(catalog_error) =
+                error
+                    .downcast_ref::<bbox_indexing::project_catalog_store::ProjectCatalogStoreError>(
+                    ) {
+                (StatusCode::CONFLICT, catalog_error.code())
+            } else if text.contains("scope_forbidden") || text.contains("scope_wrong_lane") {
+                (StatusCode::FORBIDDEN, text.as_str())
+            } else if text.contains("scope_pending_onboarding") {
+                (StatusCode::CONFLICT, "scope_pending_onboarding")
+            } else if text.contains("transcript_scan_conflict") {
+                (StatusCode::CONFLICT, "transcript_scan_conflict")
+            } else if text.contains("transcript_generation_conflict") {
+                (StatusCode::CONFLICT, "transcript_generation_conflict")
+            } else if error.downcast_ref::<std::io::Error>().is_some()
+                || error.downcast_ref::<serde_json::Error>().is_some()
+            {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "transcript_source_unavailable",
+                )
+            } else if [
+                "invalid",
+                "mismatch",
+                "incomplete",
+                "exceeds",
+                "unsupported",
+                "missing transcript chunk",
+            ]
+            .iter()
+            .any(|marker| text.contains(marker))
+            {
+                (StatusCode::BAD_REQUEST, "invalid_transcript_snapshot")
+            } else {
+                tracing::warn!(error = %error, "native transcript source request failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "transcript_source_unavailable",
+                )
+            };
+            (status, Json(serde_json::json!({"code": code, "message": "The transcript source operation failed; use the code to check authority, current generation, or source health."}))).into_response()
         }
     }
+}
+async fn contact(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ConnectorGrant>,
+    Json(request): Json<ContactRequest>,
+) -> Response {
+    if let Err(error) = authorize(&state, &grant, &request.scope, false) {
+        return reply::<()>(Err(error));
+    }
+    let root = store_root(&state);
+    reply(
+        blocking(move || {
+            TranscriptSourceStore::open(root)?
+                .record_contact(&request, &chrono::Utc::now().to_rfc3339())
+        })
+        .await,
+    )
 }
 async fn status(
     State(state): State<Arc<SharedState>>,
@@ -208,8 +233,8 @@ async fn onboard(
             probed_remote_display_name: Some(request.display_name.clone()),
             display_name: request.display_name, observed_at: chrono::Utc::now().to_rfc3339(),
         };
-        let epoch = catalog.snapshot().map_err(|e| anyhow!("{e}"))?.epoch();
-        let receipt = bbox_indexing::project_catalog_admin::connector_onboard(&catalog, epoch, &grants, &onboard).map_err(|e| anyhow!("{e}"))?;
+        let epoch = catalog.snapshot().context("reading native transcript onboarding catalog")?.epoch();
+        let receipt = bbox_indexing::project_catalog_admin::connector_onboard(&catalog, epoch, &grants, &onboard).context("admitting native transcript connector scope")?;
         Ok(serde_json::json!({"project_id": receipt.project_id.as_str(), "created": receipt.created, "epoch": receipt.catalog_epoch, "catalog_admitted": true, "reload_pending": false}))
     }).await;
     if result.is_ok() {
@@ -232,8 +257,6 @@ async fn onboard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::connector_grants::ConnectorGrantRuntime;
-    use crate::server::producer_auth::ProducerAuthRuntime;
     use bbox_corpus_core::project_catalog::{ConnectorKind, ConnectorSourceId};
 
     fn scope() -> ConnectorScope {
@@ -244,7 +267,7 @@ mod tests {
         std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
         bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(&catalog_path)
             .unwrap();
-        let state = Arc::new(SharedState::for_test_catalog(root, &catalog_path));
+        let mut state = SharedState::for_test_catalog(root, &catalog_path);
         let token_path = root.join("producer.token");
         std::fs::write(&token_path, "a".repeat(64)).unwrap();
         #[cfg(unix)]
@@ -266,18 +289,20 @@ mod tests {
                 }],
             }],
         };
-        state.config.write().source_connectors = config.clone();
-        let pinned = state
-            .project_authority
-            .catalog_store()
-            .unwrap()
-            .snapshot()
-            .unwrap();
-        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
-        state.code_sources.install_auth_for_test(Arc::new(
-            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
-        ));
-        (state, token_path)
+        state.config.write().source_connectors = config;
+        state.config.write().paths.state_dir = root.join("native-runtime");
+        let runtime_config = state.config.read().clone();
+        state.code_sources = Arc::new(
+            super::super::code_source::CodeSourceRuntime::open(
+                &runtime_config,
+                &[],
+                state.project_authority.catalog_store().cloned(),
+                state.checkout_access.clone(),
+                state.code_source_locality_cutover.clone(),
+            )
+            .unwrap(),
+        );
+        (Arc::new(state), token_path)
     }
 
     #[tokio::test]
@@ -319,8 +344,17 @@ mod tests {
                 },
             )
             .await;
-        assert!(pending.is_err(), "pending scope must not enter publication");
-        client.onboard(&config).await.unwrap();
+        let pending = pending.unwrap_err();
+        assert_eq!(
+            pending
+                .downcast_ref::<bbox_transcript_collector::TransportError>()
+                .unwrap()
+                .code,
+            "scope_pending_onboarding"
+        );
+        let admission = client.onboard(&config).await.unwrap();
+        assert_eq!(admission["catalog_admitted"], true);
+        assert_eq!(admission["reload_pending"], false);
         let cycle = bbox_transcript_collector::publish_cycle(&config, &client)
             .await
             .unwrap();
@@ -356,6 +390,19 @@ mod tests {
         let body = index.messages(&params).unwrap();
         assert!(body.contains("native landed marker"), "{body}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["source_freshness"]["streams"][0]["index_matches_published"],
+            true
+        );
+        assert_eq!(
+            body["source_freshness"]["producers"][0]["scan_in_progress"],
+            false
+        );
+        assert_eq!(
+            body["source_freshness"]["producers"][0]["last_completed_scan"]["failed"],
+            0
+        );
+        assert!(body["source_freshness"]["producers"][0]["last_contact_at"].is_string());
         let locator = body["messages"][0]["locator"].as_str().unwrap();
         assert!(locator.starts_with("native:csrc_"));
         assert!(
@@ -369,9 +416,46 @@ mod tests {
                 .contains("native landed marker")
         );
 
+        // A newer admitted source does not make the existing index current.
+        let store = TranscriptSourceStore::open(store_root(&state)).unwrap();
+        let current = store.snapshots(&scope()).unwrap().pop().unwrap();
+        let bytes = b"{\"type\":\"user\",\"sessionId\":\"session-fixture\",\"message\":{\"content\":\"new generation\"}}\n";
+        let mut snapshot = current.snapshot;
+        snapshot.byte_length = bytes.len() as u64;
+        snapshot.content_sha256 = sha256(bytes);
+        snapshot.chunks = vec![ChunkRef {
+            sha256: sha256(bytes),
+            size: bytes.len() as u64,
+        }];
+        store
+            .install_chunk(&scope(), &snapshot.stream_id, &sha256(bytes), bytes)
+            .unwrap();
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot,
+                    expected_generation: Some(current.generation),
+                },
+                "later",
+            )
+            .unwrap();
+        let stale: serde_json::Value =
+            serde_json::from_str(&index.messages(&params).unwrap()).unwrap();
+        assert_eq!(
+            stale["source_freshness"]["streams"][0]["index_matches_published"],
+            false
+        );
+        assert!(
+            stale["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("native landed marker")
+        );
+
         // Revocation removes the source from both wire authority and the
         // index enrollment. Old source bytes cannot keep reappearing in scans.
         state.config.write().source_connectors.producers.clear();
+        state.config.write().source_connectors.enabled = false;
         let config_state = state.config.read().clone();
         let records = state.records_provider.records_snapshot().records;
         state.code_sources.reload(&config_state, &records).unwrap();

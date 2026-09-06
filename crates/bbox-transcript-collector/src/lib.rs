@@ -133,12 +133,50 @@ impl Client {
         .await
     }
 }
-async fn decode<R: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<R> {
+#[derive(Debug)]
+pub struct TransportError {
+    pub status: u16,
+    pub code: String,
+}
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "native transcript transport returned HTTP {} ({})",
+            self.status, self.code
+        )
+    }
+}
+impl std::error::Error for TransportError {}
+
+async fn decode<R: serde::de::DeserializeOwned>(mut response: reqwest::Response) -> Result<R> {
     let status = response.status();
     if !status.is_success() {
-        bail!(
-            "native transcript transport returned HTTP {status}; verify grant, current generation and server source health"
-        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > 4096 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        // Only expose a bounded machine code. Server/proxy bodies may carry
+        // paths or credentials and never belong in collector diagnostics.
+        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value["code"].as_str().map(str::to_owned))
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 128
+                    && code
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            })
+            .unwrap_or_else(|| "unclassified_transport_error".into());
+        return Err(TransportError {
+            status: status.as_u16(),
+            code,
+        }
+        .into());
     }
     Ok(response.json().await?)
 }
@@ -276,18 +314,22 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
         modified: after.modified()?,
     }))
 }
-#[derive(Debug, Default, Serialize)]
-pub struct CycleReport {
-    pub discovered: u64,
-    pub published: u64,
-    pub unchanged: u64,
-    pub deferred: u64,
-    pub failed: u64,
-    pub uploaded_bytes: u64,
-}
+pub type CycleReport = ScanSummary;
 /// No mtime checkpoint or local cursor can suppress server reconciliation:
 /// every discovered stream compares with the durable server generation.
 pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleReport> {
+    let scan_id =
+        sha256(format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes());
+    let _: SourceContact = client
+        .post(
+            "contact",
+            &ContactRequest {
+                scope: config.scope.clone(),
+                scan_id: scan_id.clone(),
+                completed: None,
+            },
+        )
+        .await?;
     let mut report = CycleReport::default();
     for root in &config.roots {
         ensure!(
@@ -335,6 +377,21 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
             }
         }
     }
+    let _: SourceContact = client
+        .post(
+            "contact",
+            &ContactRequest {
+                scope: config.scope.clone(),
+                scan_id,
+                completed: Some(report.clone()),
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Source snapshots may be admitted, but recording the completed scan failed: {error}"
+            )
+        })?;
     Ok(report)
 }
 async fn publish_captured(client: &Client, captured: &Captured) -> Result<(bool, u64)> {

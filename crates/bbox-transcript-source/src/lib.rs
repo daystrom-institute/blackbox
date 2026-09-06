@@ -152,3 +152,33 @@ pub struct OnboardRequest {
     pub remote_authority: String,
     pub display_name: String,
 }
+
+/// Producer-reported counts for one completed walk of the configured roots.
+/// Completion does not imply that every stream succeeded or reached the index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScanSummary {
+    pub discovered: u64,
+    pub published: u64,
+    pub unchanged: u64,
+    pub deferred: u64,
+    pub failed: u64,
+    pub uploaded_bytes: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContactRequest {
+    pub scope: ConnectorScope,
+    pub scan_id: String,
+    /// None starts a scan; Some records its completed walk, including failures.
+    pub completed: Option<ScanSummary>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceContact {
+    pub last_contact_at: String,
+    pub scan_id: String,
+    pub scan_started_at: String,
+    pub scan_in_progress: bool,
+    pub last_completed_scan_at: Option<String>,
+    pub last_completed_scan: Option<ScanSummary>,
+}
