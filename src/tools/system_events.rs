@@ -43,6 +43,9 @@ pub(crate) struct SystemEventListParams {
     pub producer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Continue from next_before returned by the previous page. New appends do not shift continuation.
+    #[serde(default)]
+    pub before: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -65,7 +68,84 @@ pub(crate) struct ReactionInstallParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub(crate) struct ReactionListParams {}
+pub(crate) struct ReactionListParams {
+    /// Exact installed reaction/source name filter.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Default 20, maximum 100 rows.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue from next_offset.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Policy diagnostics only; action arguments and credentials stay omitted.
+    #[serde(default)]
+    pub detail: bool,
+    /// reactions (default) or warnings, each independently paginated.
+    #[serde(default)]
+    pub view: ReactionListView,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReactionListView {
+    #[default]
+    Reactions,
+    Warnings,
+}
+
+fn reaction_catalog_page(
+    result: system_events::hub::ReactionListResult,
+    p: &ReactionListParams,
+) -> anyhow::Result<serde_json::Value> {
+    let warning_count = result.warnings.len();
+    let (field, mut rows): (&str, Vec<serde_json::Value>) = match p.view {
+        ReactionListView::Reactions => (
+            "reactions",
+            result
+                .reactions
+                .iter()
+                .map(|spec| spec.response_view(p.detail))
+                .collect(),
+        ),
+        ReactionListView::Warnings => (
+            "warnings",
+            result
+                .warnings
+                .iter()
+                .map(|warning| {
+                    // A source basename identifies the installed configuration without
+                    // asking callers to read a file on the daemon host.
+                    let name = std::path::Path::new(&warning.source)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("unknown");
+                    let reason = if warning.reason.starts_with("parse error") {
+                        "invalid_json"
+                    } else if warning.reason.starts_with("validation failed") {
+                        "invalid_reaction"
+                    } else {
+                        "load_error"
+                    };
+                    serde_json::json!({"name": name, "reason": reason})
+                })
+                .collect(),
+        ),
+    };
+    rows.retain(|row| {
+        p.name
+            .as_deref()
+            .is_none_or(|name| row["name"].as_str() == Some(name))
+    });
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let total = rows.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let rows: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
+    let mut page = serde_json::json!({"total": total, "offset": offset, "limit": limit, "count": rows.len(), "warning_count": warning_count});
+    page[field] = serde_json::json!(rows);
+    bbox_corpus_core::response_page::bound_page(page, field)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReactionReplayParams {
@@ -176,15 +256,16 @@ impl BlackboxServer {
 
     #[tool(
         name = "system_event_list",
-        description = "List recent system events with optional filters. Readonly."
+        description = "List journal event summaries newest first (default 20, maximum 100). Continue with next_before as before; keep filters unchanged. A missing/compacted cursor errors. Filters match recorded kind/producer/project tags exactly. Payload, correlation, principals, and host project paths are omitted; system_event_open(event_id) expands one event."
     )]
     pub(crate) fn tool_system_event_list(
         &self,
         Parameters(p): Parameters<SystemEventListParams>,
     ) -> CallToolResult {
         Self::run("system_event_list", || {
-            let events = self.state.system_events.list_events(
+            let events = self.state.system_events.list_event_page(
                 p.limit,
+                p.before.as_deref(),
                 p.kind.as_deref(),
                 p.producer.as_deref(),
                 p.project.as_deref(),
@@ -257,10 +338,13 @@ impl BlackboxServer {
         .await
     }
 
-    #[tool(name = "reaction_list", description = "List installed reactions.")]
+    #[tool(
+        name = "reaction_list",
+        description = "List reactions in name order as summary pages (default 20, maximum 100). Filter exact name; continue with next_offset. detail=true expands event kinds and retry/failure policies, never action arguments or credentials. warning_count reports invalid stored specs; view=warnings pages safe warning names and categories without host paths."
+    )]
     pub(crate) async fn tool_reaction_list(
         &self,
-        Parameters(_p): Parameters<ReactionListParams>,
+        Parameters(p): Parameters<ReactionListParams>,
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("reaction_list", move || {
@@ -270,7 +354,9 @@ impl BlackboxServer {
                     .system_events
                     .list_reactions_with_warnings()
                     .await;
-                Ok(serde_json::to_string_pretty(&result)?)
+                Ok(serde_json::to_string_pretty(&reaction_catalog_page(
+                    result, &p,
+                )?)?)
             })
         })
         .await
@@ -457,6 +543,105 @@ mod tests {
             )),
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn event_catalog_cursor_survives_new_appends_and_omits_large_payloads() {
+        let (hub, _dir) = test_hub();
+        let mut ids = Vec::new();
+        for _ in 0..25 {
+            let outcome = hub
+                .emit(system_events::SystemEventDraft {
+                    kind: system_events::types::SystemEventKind::TaskStarted,
+                    producer: "catalog-test".into(),
+                    project: Some("/private/daemon/project".into()),
+                    principal: None,
+                    subject: None,
+                    correlation: serde_json::Map::new(),
+                    causation_id: None,
+                    payload: json!({"secret": "synthetic-secret", "body": "界".repeat(10000)}),
+                })
+                .await
+                .unwrap();
+            ids.push(outcome.event.id);
+        }
+        let first = hub
+            .list_event_page(None, None, None, Some("catalog-test"), None)
+            .unwrap();
+        assert_eq!(first["count"], 20);
+        assert_eq!(first["events"][0]["id"], ids[24]);
+        assert!(!first.to_string().contains("synthetic-secret"));
+        assert!(!first.to_string().contains("/private/daemon"));
+        let cursor = first["next_before"].as_str().unwrap();
+        hub.emit(system_events::SystemEventDraft {
+            kind: system_events::types::SystemEventKind::TaskStarted,
+            producer: "catalog-test".into(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation: serde_json::Map::new(),
+            causation_id: None,
+            payload: json!({}),
+        })
+        .await
+        .unwrap();
+        let next = hub
+            .list_event_page(None, Some(cursor), None, Some("catalog-test"), None)
+            .unwrap();
+        assert_eq!(next["count"], 5);
+        assert_eq!(next["events"][0]["id"], ids[4]);
+        assert_eq!(next["events"][4]["id"], ids[0]);
+        assert!(next["next_before"].is_null());
+        assert!(
+            hub.list_event_page(None, Some("missing"), None, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("event_cursor_unavailable")
+        );
+        let opened = hub.open_event(&ids[0]).unwrap().unwrap();
+        assert_eq!(opened.payload["secret"], "synthetic-secret");
+    }
+
+    #[test]
+    fn reaction_catalog_pages_separate_safe_warnings_and_never_expand_arguments() {
+        let mut spec = valid_reaction_spec("example");
+        spec.action = system_events::types::ReactionAction::HttpJson {
+            args: json!({"url": "https://example.test/synthetic-secret", "headers": {"Authorization": "synthetic-secret"}}),
+        };
+        spec.idempotency_key = Some("synthetic-secret".into());
+        spec.when = Some("synthetic-secret".into());
+        let result = system_events::hub::ReactionListResult {
+            reactions: vec![spec],
+            warnings: (0..30)
+                .map(|i| system_events::hub::ReactionLoadWarning {
+                    source: format!("/private/daemon/reactions/example-{i:02}.json"),
+                    reason: "parse error: synthetic-secret".into(),
+                })
+                .collect(),
+        };
+        for detail in [false, true] {
+            let p: ReactionListParams = serde_json::from_value(json!({"detail": detail})).unwrap();
+            let page = reaction_catalog_page(result.clone(), &p).unwrap();
+            assert_eq!(page["warning_count"], 30);
+            assert!(page.get("warnings").is_none());
+            assert_eq!(page["reactions"][0]["action"], "http_json");
+            assert!(!page.to_string().contains("synthetic-secret"));
+            assert!(!page.to_string().contains("/private/daemon"));
+        }
+        let p: ReactionListParams = serde_json::from_value(json!({"view": "warnings"})).unwrap();
+        let page = reaction_catalog_page(result.clone(), &p).unwrap();
+        assert_eq!(page["count"], 20);
+        assert_eq!(page["next_offset"], 20);
+        assert_eq!(page["warnings"][0]["name"], "example-00");
+        assert_eq!(page["warnings"][0]["reason"], "invalid_json");
+        assert!(!page.to_string().contains("synthetic-secret"));
+        assert!(!page.to_string().contains("/private/daemon"));
+        let p: ReactionListParams =
+            serde_json::from_value(json!({"view": "warnings", "offset": 20})).unwrap();
+        let next = reaction_catalog_page(result, &p).unwrap();
+        assert_eq!(next["count"], 10);
+        assert_eq!(next["warnings"][0]["name"], "example-20");
+        assert!(next["next_offset"].is_null());
     }
 
     #[tokio::test]

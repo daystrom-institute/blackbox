@@ -136,6 +136,22 @@ pub struct SystemEvent {
     pub payload: serde_json::Value,
 }
 
+impl SystemEvent {
+    /// Journal discovery excludes arbitrary payload/correlation and host project paths.
+    /// Open the stable event id when the event body is needed.
+    pub fn summary(&self) -> serde_json::Value {
+        let mut row = serde_json::json!({"id": self.id, "kind": self.kind,
+            "occurred_at": self.occurred_at, "producer": self.producer});
+        if let Some(subject) = &self.subject {
+            row["subject"] = serde_json::json!(subject);
+        }
+        if self.project.is_some() {
+            row["project_scoped"] = serde_json::json!(true);
+        }
+        row
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalEnvelope {
     pub schema: String,
@@ -337,6 +353,30 @@ pub struct ReactionSpec {
     pub retry: RetryPolicy,
     #[serde(default)]
     pub on_failure: FailurePolicy,
+}
+
+impl ReactionSpec {
+    /// Action arguments can contain credentials, prompts, and arbitrary payloads.
+    /// Detail deliberately expands policy metadata only, never execution arguments.
+    pub fn response_view(&self, detail: bool) -> serde_json::Value {
+        let mut row = serde_json::json!({"name": self.name, "version": self.version,
+            "enabled": self.enabled, "action": self.action.op_name()});
+        if detail {
+            row["event_kinds"] = serde_json::json!(self.event_kinds);
+            row["gate_configured"] = serde_json::json!(self.when.is_some());
+            row["idempotency_configured"] = serde_json::json!(self.idempotency_key.is_some());
+            row["retry"] = serde_json::json!(self.retry);
+            row["on_failure"] = serde_json::json!(self.on_failure);
+        } else {
+            row["event_kinds"] =
+                serde_json::json!(self.event_kinds.iter().take(8).collect::<Vec<_>>());
+            if self.event_kinds.len() > 8 {
+                row["event_kinds_count"] = serde_json::json!(self.event_kinds.len());
+                row["event_kinds_truncated"] = serde_json::json!(true);
+            }
+        }
+        row
+    }
 }
 
 #[cfg(test)]
