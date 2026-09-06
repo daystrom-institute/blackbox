@@ -143,10 +143,11 @@ pub struct NoteResolveParams {
     #[serde(default)]
     #[schemars(regex(pattern = r"^(note-)?[0-9a-f]{8}$"))]
     pub id: Option<String>,
-    /// Batch note IDs to resolve in one mutation and one durable persist. Use
-    /// this when closing multiple notes from an inbox/round cleanup.
+    /// Batch note IDs to resolve in one mutation and one durable persist.
+    /// At most 100 supplied IDs across id/ids/notes and 65536 serialized input
+    /// bytes are accepted; split larger requests before retrying.
     #[serde(default)]
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 100))]
     pub ids: Vec<String>,
     /// One of: unresolved, acknowledged, addressed
     pub resolution: String,
@@ -162,6 +163,16 @@ pub struct NoteResolveParams {
 
 impl NoteResolveParams {
     fn requested_ids(&self) -> Result<Vec<String>> {
+        const MAX_BATCH_NOTES: usize = 100;
+        const MAX_INPUT_BYTES: usize = 64 * 1024;
+        anyhow::ensure!(
+            self.ids.len().saturating_add(self.notes.len()).saturating_add(usize::from(self.id.is_some())) <= MAX_BATCH_NOTES,
+            "note resolution accepts at most 100 supplied IDs across id, ids and notes; split the batch before retrying"
+        );
+        anyhow::ensure!(
+            serde_json::to_vec(self)?.len() <= MAX_INPUT_BYTES,
+            "note resolution input exceeds 65536 bytes; split the batch or shorten resolution notes"
+        );
         let mut ids = Vec::new();
         if let Some(id) = self.id.as_deref().filter(|id| !id.trim().is_empty()) {
             ids.push(id.to_string());
@@ -1494,6 +1505,24 @@ mod tests {
             notes.store.notes[1].resolution_note.as_deref(),
             Some("batch cleanup")
         );
+    }
+
+    #[test]
+    fn resolve_refuses_oversized_selection_and_notes_before_mutation() {
+        let (_tmp, mut notes) = mk_store();
+        notes.create(&serde_json::from_value(serde_json::json!({
+            "kind":"done", "body":"remain unresolved"
+        })).unwrap()).unwrap();
+        let id = notes.store.notes[0].id.clone();
+        let before = serde_json::to_value(&notes.store).unwrap();
+        for value in [
+            serde_json::json!({"ids":vec![id.clone();101],"resolution":"addressed"}),
+            serde_json::json!({"id":id,"resolution":"addressed","note":"界\n\"".repeat(20000)}),
+        ] {
+            let params = serde_json::from_value(value).unwrap();
+            assert!(notes.resolve(&params).is_err());
+            assert_eq!(serde_json::to_value(&notes.store).unwrap(), before);
+        }
     }
 
     #[test]

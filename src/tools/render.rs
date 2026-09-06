@@ -361,6 +361,9 @@ impl BlackboxServer {
         let worker_owner = owner.clone();
         let result = Self::run_blocking("bbox_review", move || {
             let mut p = p;
+            // Both local and checkout-owner mutations share the read/write
+            // shape contract. Validate before admitting a queued mutation.
+            crate::knowledge::Knowledge::validate_review_params(&p)?;
             if !matches!(p.action.as_deref().unwrap_or("list"), "approve" | "reject") {
                 anyhow::ensure!(
                     p.project.is_none(),
