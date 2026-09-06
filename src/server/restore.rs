@@ -17,7 +17,7 @@ fn restore_whiteboards(shared: &Arc<SharedState>) {
     } else {
         let restored = shared.whiteboards.list_ids().len();
         if restored > 0 {
-            tracing::info!("restored {restored} active whiteboard(s)");
+            tracing::info!("restored {restored} historical whiteboard(s)");
         }
     }
 }

@@ -1669,22 +1669,16 @@ mod tests {
             .unwrap();
         server.state.persist_projects_durable().await.unwrap();
         let boards = root.join("board-storage");
+        std::fs::create_dir_all(&boards).unwrap();
+        std::fs::write(boards.join("fixture-board.json"), serde_json::to_vec(&serde_json::json!({
+            "id":"fixture-board", "topic":"fixture", "project":old.to_str().unwrap(),
+            "project_id":record.project_id, "created_at":"2026-01-01T00:00:00Z",
+            "phase":"blind", "phase_history":[], "agents":{}, "posts":[], "annotations":[], "votes":[]
+        })).unwrap()).unwrap();
         server
             .state
             .whiteboards
             .set_storage_dir(boards.clone())
-            .unwrap();
-        server
-            .state
-            .whiteboards
-            .open(
-                "fixture-board",
-                "fixture",
-                old.to_str().unwrap(),
-                Some(&record.project_id),
-                None,
-                "fixture",
-            )
             .unwrap();
         std::fs::remove_dir_all(&boards).unwrap();
         std::fs::write(&boards, b"not a directory").unwrap();

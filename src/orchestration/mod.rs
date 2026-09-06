@@ -5,7 +5,6 @@ pub mod allocator;
 pub mod brofile;
 pub mod executor;
 pub mod fleetd_client;
-pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
 pub mod resume_lease;

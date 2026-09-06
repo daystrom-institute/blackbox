@@ -676,7 +676,6 @@ name = "bbox-inbox"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "bbox-artifacts",
  "bbox-gaps",
  "bbox-knowledge",
  "bbox-threads",
@@ -1149,7 +1148,6 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-corpus-core",
- "chrono",
  "parking_lot",
  "serde",
  "serde_json",

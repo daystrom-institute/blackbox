@@ -35,7 +35,9 @@ impl InspectableEntityProvider for WhiteboardProvider {
             let board = board.read();
             properties.insert("topic".into(), board.topic.clone());
             properties.insert("project".into(), board.project.clone());
-            properties.insert("phase".into(), format!("{:?}", board.phase));
+            properties.insert("phase".into(), board.phase.as_str().into());
+            properties.insert("status".into(), "historical".into());
+            properties.insert("body".into(), public_history(&board)?.to_string());
         }
         Ok(empty_neighborhood_view(r, properties))
     }
@@ -43,7 +45,7 @@ impl InspectableEntityProvider for WhiteboardProvider {
     fn schema(&self) -> EntitySchemaView {
         schema(
             self.entity_type(),
-            &["board_id", "topic", "project", "phase"],
+            &["board_id", "topic", "project", "phase", "status", "body"],
             &["BOARD_FROM_ARC", "BOARD_REGISTERED_AGENT"],
             &["project", "phase"],
         )
@@ -77,5 +79,73 @@ impl InspectableEntityProvider for WhiteboardProvider {
             }
         }
         Some(truncate_label(board_id))
+    }
+}
+
+// Corpus inspection has no authenticated board role. Expose only evidence
+// visible to every registered participant at the stored phase, never invent
+// facilitator authority or advance a blind board because its runtime retired.
+fn public_history(board: &bbox_whiteboards::whiteboards::Board) -> Result<serde_json::Value> {
+    use bbox_whiteboards::whiteboards::Phase;
+    let posts = if board.phase == Phase::Blind {
+        vec![]
+    } else {
+        board.posts.clone()
+    };
+    let annotations = if matches!(
+        board.phase,
+        Phase::Validate | Phase::Resolve | Phase::Archived
+    ) {
+        board.annotations.clone()
+    } else {
+        vec![]
+    };
+    let votes = if matches!(board.phase, Phase::Resolve | Phase::Archived) {
+        board.votes.clone()
+    } else {
+        vec![]
+    };
+    Ok(serde_json::json!({"posts":posts,"annotations":annotations,"votes":votes}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn historical_board_reads_preserve_phase_visibility() {
+        let mut board: bbox_whiteboards::whiteboards::Board = serde_json::from_value(serde_json::json!({
+            "id":"archive", "topic":"Review", "project":"fixture", "created_at":"2026-01-01T00:00:00Z",
+            "phase":"blind", "phase_history":[], "agents":{},
+            "posts":[{"id":"p1","agent":"alice","type":"claim","title":"Evidence","body":"private until shared","posted_at":"2026-01-01T00:00:00Z"}],
+            "annotations":[{"id":"a1","post_id":"p1","agent":"bob","type":"challenge","body":"review","posted_at":"2026-01-01T00:00:00Z"}],
+            "votes":[{"post_id":"p1","agent":"bob","vote":"accept","at":"2026-01-01T00:00:00Z"}]
+        })).unwrap();
+        use bbox_whiteboards::whiteboards::Phase;
+        for phase in [
+            Phase::Blind,
+            Phase::Read,
+            Phase::Validate,
+            Phase::Debate,
+            Phase::Resolve,
+            Phase::Archived,
+        ] {
+            board.phase = phase;
+            let value = public_history(&board).unwrap();
+            assert_eq!(
+                value["posts"].as_array().unwrap().len(),
+                usize::from(phase != Phase::Blind)
+            );
+            assert_eq!(
+                value["annotations"].as_array().unwrap().len(),
+                usize::from(matches!(
+                    phase,
+                    Phase::Validate | Phase::Resolve | Phase::Archived
+                ))
+            );
+            assert_eq!(
+                value["votes"].as_array().unwrap().len(),
+                usize::from(matches!(phase, Phase::Resolve | Phase::Archived))
+            );
+        }
     }
 }

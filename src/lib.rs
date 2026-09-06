@@ -101,7 +101,6 @@ pub use bbox_util::util;
 // call sites resolve unchanged.
 use bbox_artifacts::watcher;
 use bbox_vectors as vectors;
-mod vector_maintenance;
 use bbox_whiteboards::whiteboards;
 
 /// Initialize the process-wide system-memory catalog for tests. The

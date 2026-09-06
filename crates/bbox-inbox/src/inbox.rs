@@ -2,7 +2,6 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use bbox_artifacts::artifacts;
 use bbox_gaps::gaps::{GapImpact, GapNote, GapResolution, GapStore};
 use bbox_knowledge::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use bbox_threads::notes::{Note, NoteKind, NoteResolution, Notes};
@@ -265,20 +264,6 @@ pub fn compute_inbox(
             out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
         }
         out.push('\n');
-    }
-
-    if let Some(project) = p.project.as_deref() {
-        let discovered = artifacts::discover_project_artifacts(std::path::Path::new(project))?;
-        if !discovered.is_empty() {
-            out.push_str(&format!(
-                "## Discovered .bbox artifacts ({})\n",
-                discovered.len()
-            ));
-            for a in discovered.iter().take(limit) {
-                out.push_str(&format!("  [{}] {}\n", a.kind.as_str(), a.path));
-            }
-            out.push('\n');
-        }
     }
 
     // 4. Stale threads — still open/active past threshold
@@ -974,7 +959,8 @@ mod tests {
         assert!(out.contains("## Vector connectivity risk (1)"));
         assert!(out.contains("voyage-1024"));
         assert!(out.contains("3.01%"));
-        assert!(out.contains("embed-compaction-arc"));
+        assert!(out.contains("daily connectivity maintenance"));
+        assert!(!out.contains("embed-compaction-arc"));
         assert!(!out.contains("clean plate"));
     }
 
@@ -1211,7 +1197,7 @@ mod tests {
         assert!(out.contains("## Auto-digest entries held for review"));
         assert!(out.contains("## Tier-0 contradictions"));
         assert!(out.contains("## Eval drift alerts"));
-        assert!(out.contains("## Contradiction-review boards waiting on synthesis"));
+        assert!(!out.contains("Contradiction-review boards"));
         assert!(out.contains("## Stale threads"));
         assert!(out.contains("reviewing ingestion"));
         assert!(out.contains("## Unverified knowledge"));
