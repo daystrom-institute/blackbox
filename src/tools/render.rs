@@ -390,18 +390,48 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_bootstrap",
-        description = "Onboard a new repo into the blackbox knowledge system."
+        description = "Retired compatibility operation. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation does not import knowledge or read caller files."
     )]
     pub(crate) async fn bbox_bootstrap(
         &self,
         Parameters(p): Parameters<BootstrapParams>,
     ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_bootstrap", move || {
-            server.bootstrap_session_knowledge(&p)
-        })
-        .await
+        Self::err_text(&serde_json::json!({
+            "error": "error.bootstrap_retired",
+            "message": "Bootstrap never imported knowledge; its instruction scan required a local checkout. Discover indexed instruction refs or read files through the checkout owner's file tools, then review proposed knowledge entries before saving them.",
+            "replacement": {"tool": "bbox_hybrid_search", "arguments": {
+                "project": p.project, "query": "AGENTS.md CLAUDE.md GEMINI.md PROJECT.md instructions",
+                "doc_type": "project_file", "limit": 5,
+            }},
+            "expand": {"tool": "bbox_inspect_entity", "arguments": {"entity_ref": "<returned ref>", "property_mode": "full", "per_type_limit": 0}},
+            "coverage": "Search reflects the collected index. Missing instruction refs do not establish that the checkout has no instructions.",
+        }).to_string())
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn bootstrap_mcp_refuses_without_reading_instruction_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let server = BlackboxServer::new(std::sync::Arc::new(
+        crate::server::state::SharedState::for_test(&root),
+    ));
+    let result = server
+        .bbox_bootstrap(Parameters(BootstrapParams {
+            project: root
+                .join("unavailable-checkout")
+                .to_string_lossy()
+                .into_owned(),
+        }))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let response: serde_json::Value =
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(response["error"], "error.bootstrap_retired");
+    assert_eq!(response["replacement"]["tool"], "bbox_hybrid_search");
+    assert_eq!(response["expand"]["tool"], "bbox_inspect_entity");
+    assert!(!root.join("unavailable-checkout").exists());
 }
 
 #[cfg(test)]
