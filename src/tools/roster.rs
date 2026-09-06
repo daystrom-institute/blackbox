@@ -1422,7 +1422,9 @@ Next step: <one concrete steering suggestion>\n"
     }
 }
 
-fn team_source_project_dir<'a>(
+/// Team project association is worker context. Only bridge mode also grants
+/// local template/brofile lookup authority; apply this on dispatch as on create.
+pub(crate) fn team_source_project_dir<'a>(
     server: &BlackboxServer,
     project: Option<&'a str>,
 ) -> Option<&'a str> {
