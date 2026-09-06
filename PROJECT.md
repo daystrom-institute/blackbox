@@ -9,8 +9,10 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
 - `blackboxd` (`src/main.rs`) - daemon entry point; real startup lives in
   `blackbox::server::run()`.
-- `bro` (`src/cli.rs`) - terminal client for tailing orchestration and workflows.
-- `bro-slack` (`src/slack_bridge.rs`) - Slack Socket Mode bridge sidecar.
+- `bro` (`crates/bro-cli/src/main.rs`) - Fleet and bro execution client.
+- `bro-harness` (`crates/bro-harness`) - standalone model-turn runtime.
+- `blackbox` (`src/bin/blackbox.rs`) - offline administration.
+- Source collectors publish checkout files and native transcripts from their owning hosts.
 
 Core MCP namespaces:
 
@@ -19,10 +21,10 @@ Core MCP namespaces:
   harness-native via the bro-harness isolate bindings (see
   `docs/refactor.md`).
 - `bro_*` - orchestration and dispatch primitives.
-- `work_*` - restricted workspace-tool namespace for agents operating inside
-  atoms/workflows. Only add tools here when the operator explicitly asks for an
-  atom/workflow-internal surface; do not use `work_*` as the default home for
-  general MCP tool families.
+
+Application workflows, atoms, Slack/Badgey integration, reactions and whiteboard
+execution are retired. External callers compose bro operations and use their
+harness for file, shell and Git work. `bbox_tool_calls` reads indexed history.
 
 ## Fast Orientation
 
@@ -32,10 +34,10 @@ thin wrapper only.
 Major code ownership boundaries:
 
 - `server/` - daemon bootstrap, shared state, HTTP routes, MCP transport,
-  shutdown/reload, workflow runtime plumbing, and storage maintenance.
+  shutdown/reload, bro admission and storage maintenance.
 - `tools/` - MCP tool adapters. Tool behavior usually delegates into domain
   modules rather than living entirely in the adapter.
-- `tool_docs.rs` - source of truth for rendered tool docs. Adding a `#[tool]`
+- `crates/bbox-tool-docs/src/tool_docs.rs` - source of truth for rendered tool docs. Adding a `#[tool]`
   without a matching stanza should fail tests.
 - `index/`, `providers/`, `chunker/`, `vectors/`, `embed/` - corpus indexing,
   entity providers, chunking, vector storage, and embedding routes.
@@ -46,9 +48,9 @@ Major code ownership boundaries:
 - `threads.rs`, `notes.rs`, `inbox.rs`, `pins.rs`, `roadmap.rs`,
   `whiteboards.rs` - coordination stores.
 - `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
-  injection, recursion guard, atoms, Badgey, and supervision.
-- `workflow/`, `pollers.rs`, `crons.rs`, `webhooks.rs`, `system_events/` -
-  deterministic orchestration, ingress, scheduling, and external event routing.
+  injection and recursion guard.
+- `crates/bbox-system-events/` - observation journal and broadcast, without reactions.
+- `crates/bbox-whiteboards/` - historical records and project ownership adapters.
 - `config.rs` - config loader and env override allowlist.
 
 The `bbox-refactor` and `bbox-lsp` crates survive as libraries linked by the
@@ -111,9 +113,8 @@ Targeted recipes:
   `cargo nextest run --workspace -E 'package(bbox-refactor) |
   package(bro-harness)'`; for LSP-backed paths also validate the language
   server availability/failure mode.
-- Workflow, webhook, poller, cron, or system-event routing: run the targeted
-  unit tests and exercise the relevant HTTP/tool path when behavior is runtime
-  shaped.
+- Bro admission or event observation changes: run targeted tests and exercise
+  the affected HTTP/tool path when behavior depends on runtime state.
 - Provider dispatch changes: verify arg construction for the affected provider
   and confirm recursion guard/MCP injection semantics.
 - Frontend/site/docs-only changes: run the docs/site build only when that surface
@@ -191,10 +192,7 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   operator-local stack env, and runs `pulumi up`; `--preview` dry-runs).
   There is NO local corpus daemon to restart: this host runs only the
   checkout-bound code collectors plus fleetd, and
-  blackbox.daystrom.app serves everything. Satellites that read nothing
-  local (the Slack conversation-source collector) run IN the cage from the
-  same runtime image as their own Deployments; converge.sh deploys them
-  too. Native provider history is collected on its source host by
+  blackbox.daystrom.app serves everything. Native provider history is collected on its source host by
   `bbox-transcript-collector`, using a dedicated producer grant and the native
   transcript transport. See `docs/native-transcript-collector.md` for enrollment,
   backfill, and macOS signing/Local Network requirements. Indexed drill-down
@@ -236,8 +234,7 @@ cluster.
 
 `blackboxd` is a single long-lived user service, not a per-session stdio child.
 It listens on `127.0.0.1:${BBOX_PORT:-7264}/mcp` by default and also serves
-operator HTTP routes such as `/tail`, `/roster`, `/orchestrate`, `/webhook`,
-`/control/*`, and `/admin/*`. `/control/*` is the neutral
+operator HTTP routes such as `/tail`, `/roster`, `/control/*`, and `/admin/*`. `/control/*` is the neutral
 orchestration control plane (thin HTTP adapters over the `bro_*` dispatch/control
 tools) shared by every external driver — the fleet client, future bridges.
 
@@ -273,8 +270,7 @@ Important state/config env vars:
   `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
   `BLACKBOX_REINDEX_INTERVAL_SECS`, `BLACKBOX_EDGE_INDEX_BOOT_REBUILD`
   `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
-- Ingress/provenance: `BBOX_POLLER_MIN_INTERVAL_SECS`,
-  `BBOX_GIT_NOTES_NAMESPACE`
+- Provenance: `BBOX_GIT_NOTES_NAMESPACE`
 
 Legacy aliases should not be revived unless the code explicitly still accepts
 them.
@@ -318,10 +314,9 @@ Provider MCP registration is no longer implicitly rewritten on daemon startup.
 `BLACKBOX_MCP_NAME` for dispatch-time injection; persistent MCP config changes
 are user-owned or explicit through `bro_mcp`.
 
-Installed agents, atoms, packets, workflows, and brofiles are catalog data, not
-PROJECT.md content. Discover them through their tools (`bbox_describe_schema`,
-artifact/atom/agent list/describe surfaces) rather than mirroring inventories
-here.
+Installed simple agents, packets, brofiles and teams are catalog data. Discover
+them through artifact and agent list/describe tools. Explicit retired-kind
+artifact filters expose historical receipts without activating them.
 
 ## Knowledge & Render Invariants
 
@@ -385,10 +380,10 @@ or system memories and link/pointer from here.
   surface (now harness-native isolate bindings);
   `system-defaults/memories/refactor*.md` - language-specific protocols.
 - `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
-  `docs/rule-packets.md` - orchestration and event routing.
+  `docs/rule-packets.md` - caller composition, observation and classification.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/consultant-runtime.md`,
-  `docs/whiteboards.md` - agentic coordination surfaces.
+  `docs/whiteboards.md` - simple agents and retirement/history contracts.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
 - `research/research-corpus.md` - map for the research corpus: a point-in-time,
   evidence-graded study of the external problem space (reference harnesses,

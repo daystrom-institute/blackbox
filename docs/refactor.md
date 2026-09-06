@@ -21,8 +21,7 @@ directly, with no daemon reach-back. See the isolate validation recipes in
 
 Agents that only speak MCP (interactive operator sessions, external clients)
 direct refactoring by dispatching a harness worker via `bro_exec` /
-`bro_resume`, or by consuming a canned atom whose implementation drives the
-cell path.
+`bro_resume`. The caller composes the refactor protocol.
 
 The `bbox-refactor` and `bbox-lsp` crates remain in the workspace as libraries
 consumed by the harness bindings; their plan kinds, hash guards, rollback, and

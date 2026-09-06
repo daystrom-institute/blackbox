@@ -1,10 +1,11 @@
-# Badgey retirement
+# Retired Badgey integration
 
-Badgey execution and its stateful consultant runtime are retired. The daemon
-no longer exposes `badgey_*` or `consultant_*` tools or registers a Badgey agent
-or atom adapter. Use `bro_exec` or an ordinary named bro agent for explicit work.
+Badgey instances, proposals and consultant automation are retired. Use corpus retrieval directly, or dispatch a focused worker and compose review in the caller. Retained indexed conversation evidence remains searchable.
 
-Historical notes, threads, knowledge, proposals, and action journals are
-preserved. See [the retention contract](consultant-runtime.md) for the inactive
-archive boundary. Installed automation and deployment cleanup are separate
-from deleting runtime source; retirement does not authorize deleting data.
+Blackbox retains bro execution, resume, cancellation, status and waits. The
+caller owns sequencing, gates, retries, schedules and integrations, using its
+own code and harness tools. No daemon workflow is needed to compose bro calls.
+
+See [bro runtime](bro-runtime.md) for the surviving execution primitives and
+[the retirement contract](../design/orchestration/bro-execution-boundary-and-retirement.md)
+for history and ownership guarantees.

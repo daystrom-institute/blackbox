@@ -2,7 +2,7 @@ use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, reso
 use super::{SharedState, is_loopback_bind};
 use anyhow::Context;
 use parking_lot::RwLock;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;

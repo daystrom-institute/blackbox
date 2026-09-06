@@ -11,24 +11,15 @@ template = false
 +++
 # Java Refactor Mechanization Runbook
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory before operating on Java files with blackbox refactor tools.
 
-## Atom signposts
-
-For recurring Java refactor patterns, check `atom_search(query="<intent>")`
-before re-deriving the whole tool sequence. Use atoms as contextual shortcuts
-for patterns such as class dependency inventory, public-API preflight,
-project-wide usage enumeration, cohesive-class extraction, inner-class
-promotion, interface extraction, lightweight method moves, source-local caller
-rewrites, low-level field/constructor/delegate wiring, visibility rewrites,
-type-use migration, import organization, or Java symbol rename. (POJO → Lombok
-conversion is the `builtin.java.lombok` macro, not a refactor atom.) The atom
-manifest is the source of truth for version, inputs, cost,
-and prompt text; this memory keeps the primitive plan-kind map and safety
-invariants.
-
-When no atom fits the exact shape, the manual plan-kind sequence below is the
-canonical path.
 
 ## Current Capability
 
@@ -37,12 +28,6 @@ field/constructor wiring, caller delegation, interface extraction, visibility
 rewriting, type migration, and import organization. POJO-boilerplate →
 Lombok conversion is the separate `builtin.java.lombok` macro.
 
-Every Java refactor plan kind has at least one shipped refactor atom wrapper
-under `system-defaults/atoms/refactor/`. The coverage guard
-`java_refactor_plan_kinds_have_atom_coverage` fails if a new Java plan kind is
-added without corresponding atom coverage. Use `atom_search(query="<intent>",
-subcontract="refactor/v1")` for the current catalog instead of relying on this
-memory as an atom ledger.
 
 - Inspect: supported with `bbox_refactor_status`; syntax grounding also uses
   `bbox_code_symbols`, `bbox_code_node_describe`, `bbox_code_query`, and
@@ -562,12 +547,7 @@ already wired the injection. The conversion of the production-side
 holder/util/Vaadin patterns to actual `@Singleton` services is still a
 separate operator-driven workflow.
 
-For Vaadin Flow view decomposition, route/view synthesis, route-access
-registration, dialog/grid/component extraction, and UI/session lifecycle audit
-patterns, prefer discovering the current Vaadin refactor atom surface with
-`atom_search(query="vaadin flow view component route lifecycle", subcontract="refactor/v1")`;
-the archived design record is
-`design/refactor-tools/java/vaadin-refactor-tools-proposal.md`.
+For Vaadin patterns, inspect the current native Java binding catalog. Historical intent is recorded in `design/refactor-tools/java/vaadin-refactor-tools-proposal.md`.
 
 14b8. Split a Provider<Big> across call sites:
 

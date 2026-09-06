@@ -11,6 +11,13 @@ template = false
 +++
 # Rust Refactor Mechanization Runbook
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory before moving, extracting, renaming, splitting, or migrating
 Rust code with the harness-native isolate bindings.
 
@@ -20,15 +27,6 @@ call `bbox_refactor_status`, `bbox_refactor_plan`, `bbox_refactor_apply`,
 inside code-mode cells through `code.*`, `analysis.*`, `rust.*`, `lsp.*`,
 `edits.*`, and `build.gate`.
 
-## Atom signposts
-
-For a recurring Rust refactor pattern, check
-`atom_search(query="<intent>")` before assembling the primitive sequence.
-Installed atoms are shortcuts over the same isolate bindings described here.
-The atom manifest remains the source of truth for its inputs and output shape.
-
-Use the primitives directly when no atom fits the exact shape, when inspecting
-a refusal, or when composing a one-off migration.
 
 ## Trust model
 

@@ -1,15 +1,11 @@
-# Consultant runtime retirement
+# Retired consultant runtime
 
-The daemon no longer serves stateful consultant or Badgey tools, adapter
-execution, queued turns, proposal application, or startup recovery. Use
-`bro_exec` or an ordinary named bro agent for explicit work.
+Persistent consultant instances, action journals and automatic proposals no longer execute. The caller can keep its own application state and use ordinary bro sessions for model turns.
 
-Existing proposal and action-journal files under the configured bro store's
-`badgey/proposals` and `badgey/action_journal` remain inactive archives in place.
-Runtime removal does not delete, move, or reconcile those records. Historical
-notes, threads, knowledge, task results, and project-catalog proposal inventory
-remain available through their retained owners. Consultant atom records remain
-decodable but cannot be installed or executed.
+Blackbox retains bro execution, resume, cancellation, status and waits. The
+caller owns sequencing, gates, retries, schedules and integrations, using its
+own code and harness tools. No daemon workflow is needed to compose bro calls.
 
-The [original design](../design/orchestration/agents/consultant-runtime.md) is
-historical context. It is not a current setup or dispatch guide.
+See [bro runtime](bro-runtime.md) for the surviving execution primitives and
+[the retirement contract](../design/orchestration/bro-execution-boundary-and-retirement.md)
+for history and ownership guarantees.

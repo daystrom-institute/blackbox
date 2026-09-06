@@ -2735,6 +2735,7 @@ pub struct SpawnTaskParams {
 /// finds it taken has a real bug rather than a retry. Everything downstream,
 /// including the choice of executor seam, is identical: harness workers become
 /// fleetd children on this path exactly as on every other.
+#[cfg(test)]
 pub async fn spawn_with_pre_minted_id(
     task_id: String,
     params: SpawnTaskParams,
@@ -2802,6 +2803,7 @@ fn failed_duplicate_task(
 /// `origin` (Slice 1b) is propagated so the daemon-internal harness
 /// tasks (workflow executor / atom) carry the same origin label as
 /// the spawn site that called them.
+#[cfg(test)]
 pub fn spawn_in_process_task(
     task_id: String,
     provider: Provider,
@@ -2945,6 +2947,7 @@ fn append_task_event(inner: &mut TaskInner, event: Value) -> tail::TailEvent {
     }
 }
 
+#[cfg(test)]
 pub fn push_in_process_event(
     task: &Task,
     event: Value,
@@ -2958,6 +2961,7 @@ pub fn push_in_process_event(
     task.emit_roster_updated();
 }
 
+#[cfg(test)]
 pub fn finish_in_process_task(
     task: &Task,
     status: TaskStatus,
@@ -5318,6 +5322,7 @@ fn mcp_task_result_json_from_inner(inner: &TaskInner) -> Value {
     out
 }
 
+#[cfg(test)]
 fn populate_transcript_handle(task: &Task) {
     let (provider, session_id, already_located) = {
         let inner = task.inner.lock();
@@ -5346,6 +5351,7 @@ fn populate_transcript_handle(task: &Task) {
 /// Current Fleet clients use roster snapshots and SSE for live task state.
 /// (A free fn, not `From`, because the orphan rule forbids
 /// `impl From<&TaskInner> for bro_protocol::TaskSnapshot` — both are foreign.)
+#[cfg(test)]
 pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
     protocol_task_snapshot_projection(inner, true)
 }

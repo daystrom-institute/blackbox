@@ -2,10 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blackbox.local/schema/agent.schema.json",
   "title": "Blackbox Agent Artifact",
-  "description": "Legacy registered-agent artifact schema. New reusable capabilities should use atom.schema.json with kind=atom and _contract=atom/v1.",
+  "description": "Simple registered-agent artifact: a brofile-bound model turn with validated input and output contracts. Application sequencing belongs to the caller.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["kind", "name", "version", "manifest"],
+  "required": [
+    "kind",
+    "name",
+    "version",
+    "manifest"
+  ],
   "properties": {
     "kind": {
       "const": "agent"
@@ -28,7 +33,10 @@
     "manifest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["description", "when_to_use"],
+      "required": [
+        "description",
+        "when_to_use"
+      ],
       "properties": {
         "description": {
           "type": "string",
@@ -95,7 +103,11 @@
           "properties": {
             "schema": {},
             "evidence_density": {
-              "enum": ["low", "medium", "high"]
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
             }
           }
         },
@@ -120,7 +132,11 @@
           }
         },
         "cost_class": {
-          "enum": ["cheap", "normal", "expensive"]
+          "enum": [
+            "cheap",
+            "normal",
+            "expensive"
+          ]
         },
         "dispatch_adapter": {
           "type": "string",
@@ -131,40 +147,78 @@
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "author"],
+              "required": [
+                "kind",
+                "author"
+              ],
               "properties": {
-                "kind": { "const": "hand_authored" },
-                "author": { "type": "string", "minLength": 1 },
-                "created_at": { "type": "string" }
+                "kind": {
+                  "const": "hand_authored"
+                },
+                "author": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "created_at": {
+                  "type": "string"
+                }
               }
             },
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "distilled_by"],
+              "required": [
+                "kind",
+                "distilled_by"
+              ],
               "properties": {
-                "kind": { "const": "distilled" },
-                "distilled_by": { "type": "string", "minLength": 1 },
+                "kind": {
+                  "const": "distilled"
+                },
+                "distilled_by": {
+                  "type": "string",
+                  "minLength": 1
+                },
                 "evidence_session_ids": {
                   "type": "array",
-                  "items": { "type": "string" }
+                  "items": {
+                    "type": "string"
+                  }
                 },
                 "created_from_threads": {
                   "type": "array",
-                  "items": { "type": "string" }
+                  "items": {
+                    "type": "string"
+                  }
                 },
-                "accept_count": { "type": "integer", "minimum": 0 },
-                "reject_count": { "type": "integer", "minimum": 0 }
+                "accept_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "reject_count": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               }
             },
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "source"],
+              "required": [
+                "kind",
+                "source"
+              ],
               "properties": {
-                "kind": { "const": "imported" },
-                "source": { "type": "string", "minLength": 1 },
-                "import_at": { "type": "string" }
+                "kind": {
+                  "const": "imported"
+                },
+                "source": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "import_at": {
+                  "type": "string"
+                }
               }
             }
           ]
@@ -175,12 +229,24 @@
       },
       "oneOf": [
         {
-          "required": ["brofile_ref"],
-          "not": { "required": ["brofile_inline"] }
+          "required": [
+            "brofile_ref"
+          ],
+          "not": {
+            "required": [
+              "brofile_inline"
+            ]
+          }
         },
         {
-          "required": ["brofile_inline"],
-          "not": { "required": ["brofile_ref"] }
+          "required": [
+            "brofile_inline"
+          ],
+          "not": {
+            "required": [
+              "brofile_ref"
+            ]
+          }
         }
       ]
     }

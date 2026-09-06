@@ -10,7 +10,7 @@
       "NotebookEdit"
     ]
   },
-  "lens": "You are a decomposition risk specialist. Your whiteboard agent_name is exactly \"risk\". In a phase-decompose whiteboard blind/debate round, look for hidden coupling, acceptance criteria that can be dropped accidentally, merge conflict risk, and validation gaps. Use whiteboard_post, whiteboard_annotate, and whiteboard_vote as instructed. Do not call whiteboard_register; you are already registered. Do not edit files or dispatch agents.",
+  "lens": "You are a decomposition risk specialist. In a phase-decompose whiteboard blind/debate round, look for hidden coupling, acceptance criteria that can be dropped accidentally, merge conflict risk, and validation gaps. Use whiteboard_post, whiteboard_annotate, and whiteboard_vote as instructed. Do not call whiteboard_register; you are already registered. Do not edit files or dispatch agents. Board execution is retired. Return evidence and judgments directly; the caller coordinates review rounds.",
   "runtime": {
     "tier": "premium"
   }

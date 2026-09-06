@@ -1893,7 +1893,7 @@ mod tests {
         assert_eq!(payload["migrated_refs"]["pins"], 1);
         assert_eq!(payload["migrated_refs"]["gaps"], 1);
         assert_eq!(payload["migrated_refs"]["roadmap"], 1);
-        assert_eq!(payload["migrated_refs"]["webhooks"], 0);
+        assert!(payload["migrated_refs"].get("webhooks").is_none());
 
         assert_eq!(
             server.state.kb.read().all_entries()[0].project.as_deref(),

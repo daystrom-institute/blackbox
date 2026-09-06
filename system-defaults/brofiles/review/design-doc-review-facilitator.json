@@ -7,7 +7,7 @@
   "context": {
     "provider_defaults": "suppress_when_supported"
   },
-  "lens": "You are the FACILITATOR of a design-document review. Your whiteboard agent_name is \"facilitator\". You are the orchestrator, you distribute context to the lens panel, synthesize the final review, and write the output document. You are NOT a lens and NOT a debate participant. You own the workflow steps outside the blind/validate/debate phases: distributing the design document and grounding context to the panel (via the BlindPost prompt), and synthesizing the surviving findings into a review verdict (SynthesizeReview). In the SynthesizeReview step: read the full board state with whiteboard_state. Build the review from SURVIVING posts only (those not refuted by the validator). Organize findings by dimension. Carry unresolved challenges (contradictions between lenses that were not resolved in debate) into a \"Contradictions Requiring Human Judgment\" section, do NOT force-resolve them. List refuted findings in a \"Refuted Claims\" appendix. Produce an actionable verdict: one of approve / approve-with-concerns / revise / reject. The review document must contain: frontmatter (kind: design-review, lifecycle: proposed, generated_by: design-doc-review-ensemble), Summary, Findings by Dimension, Contradictions Requiring Human Judgment, Refuted Claims, Verdict, and Actionable Next Steps. Return strict JSON only: {review_document: \"<full markdown>\", verdict: \"<verdict>\", finding_count: <N>, contradiction_count: <N>, refuted_count: <N>}. First byte {, final byte }.",
+  "lens": "Synthesize the supplied design review findings and validation results. The caller owns dispatch and review rounds. Organize supported findings by dimension; preserve unresolved disagreements instead of forcing consensus. Separate refuted claims with their counterevidence. Return strict JSON with review_document (Markdown), verdict (approve, approve-with-concerns, revise, reject), finding_count, contradiction_count and refuted_count. The document should contain Summary, Findings by Dimension, Contradictions Requiring Human Judgment, Refuted Claims, Verdict and Actionable Next Steps. Use corpus retrieval to clarify evidence when needed. Return the document directly to the caller.",
   "filters": {
     "allow": [
       "mcp__blackbox__bbox_hybrid_search",
@@ -20,12 +20,6 @@
       "mcp__blackbox__bbox_thread_list",
       "mcp__blackbox__bbox_blame",
       "mcp__blackbox__bbox_note",
-      "mcp__blackbox__whiteboard_state",
-      "mcp__blackbox__whiteboard_summarize",
-      "mcp__blackbox__whiteboard_transition",
-      "mcp__blackbox__work_bash",
-      "mcp__blackbox__work_git_status",
-      "mcp__blackbox__work_smart_read",
       "Read",
       "Grep",
       "Glob"

@@ -1,33 +1,21 @@
-# System Defaults
+# System defaults
 
-Installable artifacts shipped with blackbox. These are not tutorial examples;
-they are the reference catalog the daemon and operators can install, supersede,
-or copy into a project-local catalog.
+Blackbox ships optional packets, brofiles, simple agents, teams and deferred
+system memories. The daemon does not install this whole tree automatically.
+Workflow, atom and cron manifests are retired.
 
-The daemon does not auto-install this tree. Install only the defaults you want:
+List before installing. Read a chosen JSON file in the caller harness, then pass
+its object as `artifact` to `bbox_artifact_install(kind=..., artifact=...)`.
+An explicit HTTP(S) JSON URL is also accepted. Caller file paths are rejected.
+Install member brofiles before a team; team installation preserves live sessions.
 
-```text
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
-bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
-bbox_artifact_install(kind="workflow", source="system-defaults/workflows/atoms/echo-review.json")
-bbox_artifact_install(kind="cron", source="system-defaults/maintenance/crons/daily-compaction.json")
-bbox_compile(path="system-defaults/mcp-surfaces/routing.json", scope="global")
-```
+| Path | Purpose |
+| --- | --- |
+| `brofiles/`, `agentic-corpus/brofiles/` | Role prompts for explicitly dispatched workers. |
+| `agents/` | Simple agent input/output contracts. |
+| `agentic-corpus/packets/` | Portable classification examples; no scheduling or automatic execution. |
+| `mcp-surfaces/routing.json` | MCP permissions. Retain this packet when removing application defaults; missing policy must never be treated as permission to widen a restricted caller. |
+| `memories/` | Deferred runbooks, loaded by the daemon. |
 
-## Layout
-
-| Path | Contents |
-|---|---|
-| [`atoms/`](atoms/atom-defaults.md) | First-class atom artifacts. Includes utility smoke atoms, workflow-backed examples, adapter smoke atoms, and refactor atoms. |
-| `workflows/` | Workflow artifacts used by atoms or daemon-owned workflows. |
-| `agents/` | Legacy registered-agent manifests and agent-composition workflows kept for compatibility. Prefer atoms for new public capabilities. |
-| `brofiles/` | Personas used by default atoms and legacy agents. |
-| `badgey/` | Badgey manifests, brofiles, workflows, packets, and crons. |
-| [`memories/`](memories/system-memory-catalog.md) | System-level memories and runbooks. Files use bare slugs such as `rule-packets.md`; runtime IDs use the `sm-` prefix. `system-memory-catalog.md` is an Obsidian navigation map and is not loaded as a runtime memory. The remaining memories are loaded by the daemon at runtime to provide specialized expert guidance. |
-| [`agentic-corpus/`](agentic-corpus/agentic-corpus-defaults.md) | Producer-side knowledge/index maintenance workflows, packets, brofiles, and crons. |
-| [`maintenance/`](maintenance/maintenance-defaults.md) | Cross-store maintenance workflows, packets, and crons such as daily compaction. |
-| [`mcp-surfaces/`](mcp-surfaces/mcp-surface-defaults.md) | Default MCP surface routing packet. |
-
-`examples/` is now reserved for tutorial specs, skills, and full integration
-demos that users copy to learn a pattern. `system-defaults/` is for blackbox-owned
-artifacts that can be installed into the artifact catalog.
+Bro orchestration keeps execution, resume, status and waits. The caller composes
+reviews, gates, schedules and external integrations. See [artifact catalog](../docs/artifact-catalog.md).

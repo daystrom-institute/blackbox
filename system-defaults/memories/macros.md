@@ -57,8 +57,8 @@ advisory.
 - A **refactor tool** is a single guarded structural edit.
 - A **macro** is a data-only recipe composing refactor operations for a
   recurring pattern — often framework-shaped (annotation or binding codemods).
-- An **atom** is a typed capability contract; a macro may sit behind such a
-  contract, but a macro is invoked through `macro_*`, not `atom_*`.
+- Atom wrappers and daemon macro MCP tools are retired. Inspect the current
+  native harness catalog for available transformations and compose them in the caller.
 
 Reach for a macro when a transformation recurs with the same shape and you want a
 reviewable plan before any bytes change.

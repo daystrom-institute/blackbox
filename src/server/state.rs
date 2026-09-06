@@ -432,10 +432,6 @@ fn git_overlay_visible_under_cutover(
     !coverage.transport_governed() || coverage.current()
 }
 
-pub(crate) const SIGNAL_LOG_CAP: usize = 200;
-
-pub(crate) const WEBHOOK_LOG_CAP: usize = 200;
-
 impl SharedState {
     /// The COMPLETE catalog project-id set, as a `HashSet` for the sidecar
     /// registered-project gate and the storage-GC liveness seed.

@@ -11,35 +11,17 @@ template = false
 +++
 # C# Refactor Mechanization Runbook
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory before moving, extracting, renaming, or migrating C# code with
 blackbox refactor tools. The design surface is
 `design/refactor-tools/csharp/refactor-csharp-expansion.md`.
 
-## Atom signposts
-
-For recurring C# refactor patterns, check `atom_search(query="<intent>")`
-before re-deriving the whole tool sequence. The active catalog lives in
-the installable manifests; use atoms as contextual shortcuts:
-
-- `csharp-using-organize` — single-file Roslyn `source.organizeImports`.
-- `csharp-filescoped-batch` — block-scoped → file-scoped namespace
-  conversion; idempotent, single-namespace files only.
-- `csharp-unseal-strangler` — strangler-fig unseal of ONE class; requires
-  operator-set `acknowledge_subclass_surface_change=true`.
-- `csharp-partial-sg-guard` — RX-V4 analysis: enumerate
-  `IIncrementalGenerator` implementations (in-repo + AnalyzerReference +
-  package), fingerprint generator inputs, surface protected partial sets.
-- `csharp-awaited-query-audit` — IOperation walk: classify awaited calls
-  inside `for` / `foreach` bodies as `per_iteration_await` (N+1 risk) vs
-  `loop_collection_await` (benign single-call).
-- `csharp-nullable-coverage-fix` — single-round CS8618 / CS8625 repair:
-  insert `required` on offending property declarations.
-
-Atom manifests bind through `brofile:csharp-refactor-persona@v1`. The
-persona allow list mirrors the Rust and Java personas (refactor +
-grounding tool surface only); `Bash`/`Write`/`Edit` are denied, so
-toolchain commands flow exclusively through `bbox_refactor_run` command
-steps.
 
 ## Plan kind catalog (v1)
 

@@ -10,7 +10,7 @@
       "answering one where, what, why, who_when, trace, impact, or currentness question that needs graph traversal and evidence bundling"
     ],
     "anti_patterns": [
-      "do not use as a general consultant or synthesis panel; use badgey for long-lived corpus consulting",
+      "do not use for an open-ended synthesis panel; the caller should compose focused scouts and reviewers",
       "do not use for one-line lookups that a direct bbox_hybrid_search or bbox_inspect_entity call can answer",
       "do not use when the caller needs edits, refactors, artifact installation, note writes, or sub-agent dispatch",
       "do not emit bbox_note done records; phase-decomposer aggregates the returned JSON directly"
@@ -18,11 +18,7 @@
     "brofile_ref": "corpus-pathfinder",
     "filter_overlay": {
       "allow": [
-        "mcp__blackbox__bbox_*",
-        "mcp__blackbox__atom_list",
-        "mcp__blackbox__atom_get",
-        "mcp__blackbox__atom_describe",
-        "mcp__blackbox__atom_search"
+        "mcp__blackbox__bbox_*"
       ],
       "disallow": [
         "Edit",
@@ -31,7 +27,6 @@
         "NotebookEdit",
         "Agent",
         "mcp__blackbox__bro_*",
-        "mcp__blackbox__badgey_*",
         "mcp__blackbox__bbox_learn",
         "mcp__blackbox__bbox_remember",
         "mcp__blackbox__bbox_decide",
@@ -45,10 +40,7 @@
         "mcp__blackbox__bbox_reindex",
         "mcp__blackbox__bbox_reembed",
         "mcp__blackbox__bbox_artifact_install",
-        "mcp__blackbox__bbox_artifact_supersede",
-        "mcp__blackbox__system_event_emit",
-        "mcp__blackbox__reaction_install",
-        "mcp__blackbox__reaction_execute"
+        "mcp__blackbox__bbox_artifact_supersede"
       ]
     },
     "inputs": {
@@ -56,7 +48,16 @@
         "type": "object",
         "properties": {
           "question_shape": {
-            "enum": ["where", "what", "why", "who_when", "trace", "impact", "currentness", "generic"],
+            "enum": [
+              "where",
+              "what",
+              "why",
+              "who_when",
+              "trace",
+              "impact",
+              "currentness",
+              "generic"
+            ],
             "description": "Discovery shape the inlet extracted from the phase doc."
           },
           "query": {
@@ -73,11 +74,16 @@
           },
           "known_evidence": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Optional entity refs or path ids already known by the inlet."
           }
         },
-        "required": ["question_shape", "query"],
+        "required": [
+          "question_shape",
+          "query"
+        ],
         "additionalProperties": false
       },
       "prompt_template": "Question shape: {{question_shape}}\nProject: {{project_dir}}\nScope hint: {{scope_hint}}\nKnown evidence: {{known_evidence}}\n\nInvestigation question:\n{{query}}\n\nReturn strict JSON only. Your first byte must be { and your final byte must be }. Do not include markdown fences, preamble text, task-tracker text, or a final note."
@@ -86,18 +92,31 @@
       "schema": {
         "type": "object",
         "properties": {
-          "tldr": { "type": "string" },
+          "tldr": {
+            "type": "string"
+          },
           "leads_symbols_files": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "path": { "type": "string" },
-                "symbol": { "type": "string" },
-                "entity_ref": { "type": "string" },
-                "why_relevant": { "type": "string" }
+                "path": {
+                  "type": "string"
+                },
+                "symbol": {
+                  "type": "string"
+                },
+                "entity_ref": {
+                  "type": "string"
+                },
+                "why_relevant": {
+                  "type": "string"
+                }
               },
-              "required": ["entity_ref", "why_relevant"],
+              "required": [
+                "entity_ref",
+                "why_relevant"
+              ],
               "additionalProperties": false
             }
           },
@@ -106,11 +125,20 @@
             "items": {
               "type": "object",
               "properties": {
-                "ref": { "type": "string" },
-                "label": { "type": "string" },
-                "why_relevant": { "type": "string" }
+                "ref": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "why_relevant": {
+                  "type": "string"
+                }
               },
-              "required": ["ref", "why_relevant"],
+              "required": [
+                "ref",
+                "why_relevant"
+              ],
               "additionalProperties": false
             }
           },
@@ -119,16 +147,25 @@
             "items": {
               "type": "object",
               "properties": {
-                "path_id": { "type": "string" },
-                "claim": { "type": "string" }
+                "path_id": {
+                  "type": "string"
+                },
+                "claim": {
+                  "type": "string"
+                }
               },
-              "required": ["path_id", "claim"],
+              "required": [
+                "path_id",
+                "claim"
+              ],
               "additionalProperties": false
             }
           },
           "next_hops": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "bundle_handle": {
             "type": "string",
@@ -136,7 +173,9 @@
           },
           "limits": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "gap_check": {
             "type": "string",

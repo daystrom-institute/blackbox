@@ -10,6 +10,13 @@ template = false
 +++
 # Refactor Mechanization Catalog
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory first when you know the task is restructuring but have not yet
 picked a language-specific runbook.
 
@@ -333,109 +340,3 @@ small files only; status defaults to at most 200 returned items and reports
    validation-only unless `touches` declares paths they may mutate. Declared
    touches are snapshotted before the command and are rolled back with prior
    plan writes on required command failure.
-
-## Refactor-atom personas
-
-The refactor atom layer ships JSON manifests installed via
-`bbox_artifact_install(kind="atom", …)`. Every refactor atom uses
-`subcontract: "refactor/v1"` and binds to a **narrow persona brofile** through
-`manifest.implementation.brofile_ref`. The persona's allow list is the
-mechanical boundary: profile-backed atom execution dispatches through that
-brofile, so the atom inherits the refactor + grounding tool surface rather
-than a general-purpose operator surface.
-
-Four personas ship as reference artifacts; all four share the same
-allow/disallow shape (refactor + grounding tool surface; `Bash` /
-`Write` / `Edit` / `bro_*` / knowledge-mutation tools denied). Only the
-lens prose differs per language. The persona allow list is verified by
-tests in `src/orchestration/brofile.rs`; allow/disallow drift fails the
-test.
-
-- **`rust-refactor-persona`** at `system-defaults/brofiles/refactor/rust-refactor-persona.json`.
-  Cargo validation runs through `bbox_refactor_run` command steps, never via
-  `Bash`. Spec verified by `rust_refactor_persona_matches_design_spec`.
-
-- **`java-refactor-persona`** at `system-defaults/brofiles/refactor/java-refactor-persona.json`.
-  Lens calls out `mvn` / `gradle` validation and the
-  annotation-processor-invisibility caveat (Lombok `@Slf4j` / `@Data`
-  generate members invisible to dependency analysis).
-
-- **`csharp-refactor-persona`** at `system-defaults/brofiles/refactor/csharp-refactor-persona.json`.
-  Lens calls out `dotnet build` (capture=binlog) validation, the
-  Roslyn-LSP vs Roslyn-sidecar split, and RX-V3 fail-closed semantics on
-  unavailability of either backend.
-
-- **`elixir-refactor-persona`** at `system-defaults/brofiles/refactor/elixir-refactor-persona.json`.
-  Lens calls out the mix-only command allowlist
-  (`mix compile`/`test`/`credo`/`dialyzer`/`format`/`xref`) and the
-  EX-V6 round-trip preservation requirement for writable lanes.
-
-Cross-language symmetry between Rust and Java is verified by
-`rust_and_java_refactor_personas_share_tool_surface` in
-`src/orchestration/brofile.rs`; equivalent drift tests for the C# and
-Elixir personas are not yet in place.
-
-Refactor-atom manifests under `system-defaults/atoms/refactor/*.json` MUST
-bind to one of these personas via a typed ref such as
-`brofile:rust-refactor-persona@v1`. Authoring an atom that binds to a
-different brofile (e.g., `code-reviewer-persona`) means the atom's tool
-surface is not actually narrowed; the `refactor/v1` atom subcontract rejects
-such manifests on install.
-
-## Refactor atom discovery
-
-System memory is not the atom catalog. Do not mirror shipped atom names,
-versions, status, costs, eval fixtures, or release lineage here. The active
-catalog lives in installable manifests and the artifact tools:
-
-```text
-atom_search(query="<intent phrase>")
-atom_describe(atom="atom:<name>@latest")
-bbox_artifact_list(kind="atom", name="<optional name>")
-```
-
-Mention atoms in system memory only as contextual signposts: when a documented
-tool sequence has a reusable atom boundary, say "for this pattern, consider the
-matching refactor atom via `atom_search(...)`" and keep the primitive sequence
-as the canonical fallback. The manifest is the source of truth for an atom's
-version, cost class, input schema, prompt, implementation brofile, and
-operator-authority flags. Pull `sm-atoms` only when you need the deeper atom
-contract: backend kinds, invocation handles, effect limits, child composition,
-workflow bindings, or manifest authoring rules.
-
-Workflow composition is also a catalog concern. Use workflow artifacts when a
-refactor needs multiple atom boundaries with gates or operator review between
-them; do not paste a workflow inventory into resident memory.
-
-## Refactor-atom install validation
-
-A manifest is treated as a refactor atom when it declares
-`subcontract: "refactor/v1"`. The atom install validator hard-rejects:
-
-- `manifest.implementation.kind` other than `profile`.
-- `manifest.implementation.brofile_ref` not in the
-  `ALLOWED_PERSONAS` list in `src/orchestration/atoms/validate.rs`:
-  `brofile:rust-refactor-persona@vN`, `brofile:java-refactor-persona@vN`,
-  `brofile:csharp-refactor-persona@vN`, or
-  `brofile:elixir-refactor-persona@vN`.
-- `inputs.schema` declaring any `acknowledge_*` field with a `default` value.
-  Operator-authority opt-outs must be operator-explicit.
-
-## Shared atom contract
-
-Every refactor atom embeds the same five-step protocol
-(ground → plan with `deep_analysis=true` → decide → apply-or-block →
-done-note) and the same base outputs.schema (status / plan_path /
-files_touched / fixme_count / deep_analysis_summary / cargo_result /
-block_reason / done_note_id). Reference files:
-
-- `system-defaults/atoms/refactor/_template.prompt.md` — the prompt template
-  with `{{...}}` placeholders. Atom manifests inline the filled-in form
-  under `inputs.prompt_template`.
-- `system-defaults/atoms/refactor/_base.outputs.schema.json` — the base
-  outputs.schema every atom unions with atom-specific fields.
-
-`fixme_count` is split into `plan_only` (FIXMEs the plan emitted with
-no associated edit) and `warning` (FIXMEs emitted alongside an applied
-edit, flagging operator follow-up) per the two-prefix FIXME grammar in
-`sm-refactor-rust`.

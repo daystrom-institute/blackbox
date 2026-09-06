@@ -11,30 +11,17 @@ template = false
 +++
 # Elixir Refactor Mechanization Runbook
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory before moving, extracting, renaming, or splitting Elixir code
 with blackbox refactor tools. The design surface is
 `design/refactor-tools/elixir/refactor-elixir-expansion.md`.
 
-## Atom signposts
-
-For recurring Elixir refactor patterns, check `atom_search(query="<intent>")`
-before re-deriving the whole tool sequence. Use atoms as contextual shortcuts:
-
-- `elixir-shatter-dispatch-table` ★ keystone — decompose a multi-clause
-  atom-tag-dispatch function (def foo(:tag1, ...)) into per-tag submodules
-  with a router (`op_runtime.ex` shape).
-- `elixir-split-genserver` — carve a GenServer into per-concern child
-  GenServers (`admin_endpoint.ex` shape; both single_dispatch_fn and
-  per_message_handle_call dispatch patterns).
-- `elixir-facade-wire` — regenerate `defdelegate` blocks on a facade
-  module (`substrate.ex`-style facades).
-- `elixir-extract-behaviour` — lift function set → `@behaviour` + `@callback`.
-- `elixir-organize-aliases` — sort/dedupe/collapse alias/import/require/use.
-- `elixir-public-api-guard` — pre-flight before refactors touching public
-  surface. Advisory only.
-- `elixir-module-dependency-graph` — Tier-1 static call graph for a dir.
-- `elixir-genserver-state-audit` — per-callback state-field reads/writes;
-  precondition for `elixir-split-genserver`.
 
 ## Plan kind catalog (v1)
 

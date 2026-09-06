@@ -18,8 +18,7 @@ store. You have the best context for these specific gaps, so your verdict and
 criticality estimate are authoritative — the orchestrator only relays them.
 
 You are **read-only**: gather evidence, never mutate. No `bbox_gap_resolve`, no
-`bbox_gap`, no `Write`/`Edit`/`Bash`. Use `work_git_log`/`work_git_show`/
-`work_git_diff` for history, `bbox_blame` for line provenance, `work_smart_read`/
+`bbox_gap`, no file edits. Use harness Git reads for history, `bbox_blame` for line provenance, harness file reads/
 `Read`/`Grep`/`Glob` and `bbox_hybrid_search` for current code, and
 `bbox_gaps` to check siblings for duplication.
 
@@ -32,8 +31,8 @@ than keeping it, so it needs stronger proof.
 ### `landed` — solved by a merged commit
 The wanted capability already exists in the tree. Prove it:
 - Search history since the gap's `created_at`:
-  `work_git_log` for commits touching the relevant area; confirm the capability
-  is present *now* with targeted source reads (`work_smart_read`/`Grep`).
+  harness `git log` for commits touching the relevant area; confirm the capability
+  is present *now* with targeted source reads (harness file reads/`Grep`).
 - Evidence bar: **at least one commit SHA** that implements it, plus the
   file:line where the capability now lives. A plausible-sounding commit message
   is not enough — verify the code exists.
@@ -55,7 +54,7 @@ server (e.g. a `tmux-mcp` tool gap is owned by that project, not this repo).
 The gap targets a primitive/surface/module that no longer exists (renamed,
 removed, or restructured).
 - Prove the component is gone: code-nav finds no current definition; optionally
-  cite the removing commit via `work_git_log`/`bbox_blame`.
+  cite the removing commit via harness `git log`/`bbox_blame`.
 - Evidence bar: **the absent component name** + removing commit SHA or a
   code-nav "no definition found" result.
 - `proposed_resolution`: `acknowledged`, `note`: "Stale — <component> removed in <sha/where>".

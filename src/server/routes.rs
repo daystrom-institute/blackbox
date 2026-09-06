@@ -1744,17 +1744,6 @@ pub(crate) fn migrate_project_refs(
     }))
 }
 
-pub(crate) fn persist_named_json<T: Serialize>(
-    dir: &Path,
-    name: &str,
-    value: &T,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{name}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(value)?)?;
-    Ok(())
-}
-
 pub(crate) async fn admin_artifact_install(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<ArtifactInstallParams>,

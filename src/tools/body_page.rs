@@ -51,19 +51,6 @@ pub(super) fn json_body_page(
     }
 }
 
-pub(super) fn validate_detail(
-    detail: Option<&str>,
-    cursor: Option<&str>,
-    limit: Option<usize>,
-) -> Result<bool> {
-    match detail.unwrap_or("summary") {
-        "full" => Ok(true),
-        "summary" if cursor.is_none() && limit.is_none() => Ok(false),
-        "summary" => bail!("cursor and body_limit require detail=full"),
-        _ => bail!("detail must be summary or full"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,13 @@ template = false
 +++
 # C and C++ Refactor Mechanization Runbook
 
+The daemon refactor MCP surface is retired. `bbox_refactor_*` and `bbox_code_*`
+spellings below identify historical engine operations, not callable MCP tools.
+Use the current harness catalog (`isolate --list`, then `isolate --describe <tool>`)
+for exact native names and schemas. Compose operations in the caller; atom and
+workflow wrappers are retired. Plan kinds and safety invariants below remain
+reference material where the native binding uses that engine.
+
 Use this memory before operating on C or C++ files with blackbox refactor tools.
 
 ## Current Capability

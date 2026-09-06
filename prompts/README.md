@@ -21,7 +21,7 @@ human reader. Two species live here:
   brofile that references it.
 
 This is **not** [`system-defaults/`](../system-defaults/system-defaults.md)
-(installable JSON artifacts — brofiles, workflows, packets, teams) and it is
+(installable JSON artifacts — brofiles, simple agents, packets, teams) and it is
 **not** a `.claude` skill (harness-native slash commands). It is plain Markdown
 an agent is told to read.
 
@@ -34,7 +34,7 @@ an agent is told to read.
 | [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall prod daemon/bro/bro-harness, restart prod service (gated). |
 | [daily-cleaning-beta.md](daily-cleaning-beta.md) | Beta-line sibling of daily-cleaning.md: same reset, but tracks `beta/blackbox-v2` as the integration branch (sync + landing checks against beta) instead of `main`. Linux/systemd hosts. |
 | [daily-cleaning-beta-mac.md](daily-cleaning-beta-mac.md) | macOS sibling of daily-cleaning-beta.md: same beta reset, but F4 restarts the prod daemon via `launchctl kickstart -k` against `~/Library/LaunchAgents/com.daystrom.blackbox.plist` (LaunchAgent, not systemd unit). |
-| [gap-processing.md](gap-processing.md) | Launch the gap-processing **workflow** (`bro_orchestrate_run`): Cluster (codex) → foreach `atom_invoke` validators (deepseek) → Sieve (codex). Present grouped/sorted action lists; resolve operator-gated one at a time. |
+| [gap-processing.md](gap-processing.md) | Caller-owned grouping, bro validation and synthesis of gap records; preserve evidence and resolve only with operator authority. |
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |
 | [CLOSEOUT-beta.md](CLOSEOUT-beta.md) | Beta-line sibling of CLOSEOUT.md: fold a worktree into `beta/blackbox-v2` instead of `main`. |
 | [DESIGN_PANEL.md](DESIGN_PANEL.md) | Produce a reviewed implementation plan for **one phase or slice**: author-critic default, three-author panel escalation, adjudicated repair loop, independent review bookend to exact PASS. Prototype-stage orchestration runbook; fan-out is operator-directed via child orchestrators. |
