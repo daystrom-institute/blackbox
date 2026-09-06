@@ -115,30 +115,41 @@ use `bbox_thread_list`.
 
 ## Render
 
-Render publishes approved standing memory into provider files:
+Project render publishes approved standing memory through the checkout owner.
+In a managed bro-harness session bound to that checkout:
 
 ```text
-bbox_render(scope="global")
-bbox_render(scope="project", project="/repo/x")
-bbox_render(scope="both", project="/repo/x")
+bbox_render(scope="project", project="<project-selector>")
 ```
 
-Global render patches host-level files. Project render writes project-local
-provider files. Content outside managed markers is preserved, but the managed
-region belongs to blackbox.
+The locality client applies the daemon's plan to project provider files. Direct
+remote MCP cannot apply files in the caller's checkout. For global provider
+files, run `bro render global` on the operator host (`--check` previews changes).
+`bbox_render(scope="global")` instead targets the daemon host and refuses when
+that host lacks global render authority.
 
-Do not use render to keep active-work guidance hot. Use pins for that.
+Content outside managed markers is preserved. Do not use render to keep
+active-work guidance hot; use pins for that.
 
-## Bootstrap And Review
+## Discover Instructions And Review Entries
 
-First-time repo setup:
+`bbox_bootstrap` is retired and never imported knowledge. To inspect existing
+instructions, discover indexed project-file references:
 
 ```text
-bbox_bootstrap(project="/repo/x")
+bbox_hybrid_search(
+  query="AGENTS.md CLAUDE.md GEMINI.md PROJECT.md instructions",
+  project="<project-selector>", doc_type="project_file", limit=5
+)
 ```
 
-Bootstrap imports hand-authored instruction files into the store before render.
-Absorbed or imported entries may need review:
+Expand returned references with `bbox_inspect_entity`. Missing indexed references
+do not prove a file is absent: use the checkout owner's file tools when source
+coverage is missing. Propose the resulting knowledge entries for operator
+approval before saving them through `bbox_learn`, `bbox_decide`, or
+`bbox_remember`. There is no automatic instruction-file import lane.
+
+Review accepts or rejects entries already awaiting approval in the store:
 
 ```text
 bbox_review(action="list")
@@ -146,7 +157,7 @@ bbox_review(action="approve", id="abcd1234")
 bbox_lint()
 ```
 
-`bbox_absorb` is now a compatibility no-op for the old rendered-file import path.
+`bbox_absorb` is a compatibility no-op for the old rendered-file import path.
 Rendered files are one-way projections.
 
 ## Notes And Inbox

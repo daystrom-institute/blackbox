@@ -217,7 +217,7 @@ impl BlackboxServer {
                     && server.authoritative_session_workspace_binding().is_some() =>
                 {
                     anyhow::bail!(
-                        "error.render_locality_required: a workspace-bound project render must execute in its checkout owner"
+                        "error.render_locality_required: a workspace-bound project render must execute in its checkout owner; call bbox_render(scope=project, project=<selector>) from a managed bro-harness session bound to that checkout so its locality client applies the plan"
                     );
                 }
                 None => {}
@@ -241,7 +241,7 @@ impl BlackboxServer {
                         .transport_governed(&project_id)
                     {
                         anyhow::bail!(
-                            "error.render_locality_required: this project's render authority is checkout-local"
+                            "error.render_locality_required: this project's render authority is checkout-local; call bbox_render(scope=project, project=<selector>) from a managed bro-harness session bound to the owning checkout so its locality client applies the plan"
                         );
                     }
                     let view = server

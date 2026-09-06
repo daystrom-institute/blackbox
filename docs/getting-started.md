@@ -100,29 +100,53 @@ url = "http://127.0.0.1:7264/mcp?surface=interactive"
 
 **Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp?surface=interactive`
 
-## 4. Bootstrap a project
+## 4. Enroll a project from its owning checkout
 
-```bash
-bbox_bootstrap(project="/absolute/path/to/your/repo")
+Check `bbox_project_list()` before adding a project. For a remote corpus daemon,
+configure the [Code Source Collector](code-source-collector.md) on the checkout
+host with an operator-authorized producer and exact published scope. Initialize
+missing project scaffolding on that host:
+
+```sh
+bbox-code-collector --config /path/to/code-collector.toml init /absolute/path/to/repo
 ```
 
-This onboards the repo into the knowledge system, registers it with the agentic
-corpus, and emits structural edges such as file to function and file to class.
+Initialization writes `.bbox` locally. Commit the project identity, then run the
+configured collector's `once` or `run` command to onboard and publish the source.
+Catalog admission, source publication, and index activation are separate steps;
+use `bbox_project_list()` and `bbox_doctor()` to inspect progress.
 
-## 5. Render the knowledge store
+`bbox_bootstrap` is retired. It does not import instructions or enroll remote
+checkouts. See [Projects And Code Indexing](projects-code-indexing.md) for local
+compatibility and catalog administration limits. Native session history has its
+own [transcript collector](native-transcript-collector.md); code collection does
+not collect Claude/Codex session files.
 
-```bash
-bbox_render(scope="both", project="/path/to/repo")
+## 5. Render approved knowledge on the target host
+
+For project files, call this from a managed bro-harness session bound to the
+owning checkout, where the locality client applies the daemon's render plan:
+
+```text
+bbox_render(scope="project", project="<project-selector>")
 ```
 
-This writes a unified layered markdown file for each provider:
-`~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`,
-and per-project `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`.
+For global provider files, run on the operator host that should receive them:
 
-Rendering is a projection. The durable source of truth is the blackbox knowledge
-store, not the rendered markdown.
+```sh
+bro render global --check
+bro render global
+```
+
+Direct remote MCP calls cannot write the caller's checkout or home directory.
+`bbox_render(scope="global")` targets the daemon host and refuses when that host
+has no global render authority. Rendering projects approved knowledge into
+managed provider markdown; the knowledge store remains its durable source.
 
 ## Environment Variables
+
+Transcript root overrides below configure daemon-local discovery only. They do
+not enroll roots on another host; use the native transcript collector there.
 
 | Variable | Purpose | Default |
 |---|---|---|

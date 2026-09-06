@@ -966,11 +966,9 @@ impl TranscriptIndex {
                 excerpt
             };
 
-            // A conversation hit is only useful if the reader can open the
-            // message it names, and the archive URL is the only coordinate
-            // that reaches it: `file_path` is a record key and `bbox_context`
-            // has no file to read. Rendered per hit rather than in the trailing
-            // breadcrumb for that reason.
+            // Preserve external conversation provenance alongside the opaque
+            // locator used by context/messages. Neither native nor Slack
+            // locators authorize opening a caller file on the daemon.
             let mut provenance = String::new();
             let permalink = self.doc_text(&doc, self.fields.permalink);
             let author = self.doc_text(&doc, self.fields.author_id);
@@ -995,7 +993,7 @@ impl TranscriptIndex {
                  Session: {session_id}\n\
                  Project: {project}\n\
                  Time: {ts}\n\
-                 File: {file_path}{provenance}\n\
+                 Locator: {file_path}{provenance}\n\
                  Excerpt: {excerpt}",
                 match mode {
                     TranscriptSearchMode::Smart => "smart",

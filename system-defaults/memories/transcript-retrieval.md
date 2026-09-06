@@ -54,7 +54,7 @@ Once search or cite gives you a byte offset, pull the surrounding turns instead 
 
 Use `bbox_messages`.
 
-This is the right step when context is still too sparse and you need the actual chronological exchange.
+This is the right step when context is still too sparse and you need the retained chronological exchange.
 
 ### Inspect session metadata
 
@@ -119,7 +119,7 @@ The search breadcrumb on a slack top hit already fills these in for you:
 
 1. `bbox_cite(claim="...")`
 2. `bbox_context(...)` if you want nearby turns
-3. `bbox_messages(...)` if the origin needs full replay
+3. `bbox_messages(...)` if the origin needs more retained messages
 
 ### "What was this session about?"
 
@@ -139,7 +139,7 @@ Keep cold here:
 
 - multi-step retrieval ladders
 - common query workflows
-- how to escalate from coarse search to full replay
+- how to escalate from coarse search to retained message pages
 
 
 ## Native source limits and continuation
@@ -147,8 +147,14 @@ Keep cold here:
 Pass the search hit's `file_path` unchanged: it is an opaque stored locator,
 including when it looks like a path. Context and messages never open it on the
 daemon. Native replies describe retained indexed projections, which may already
-be parser-truncated; they explicitly report unknown source freshness. Reindexing
-cannot recover history that no producer has delivered.
+be parser-truncated. For enrolled native sources, `source_freshness` includes
+bounded publication and producer observations: `index_matches_published`,
+`published_at`, last contact, and completed-scan failure/deferred counts.
+Publication time does not establish producer liveness, and a completed scan with
+failed or deferred streams does not establish completeness. Untracked legacy
+locators report `not_established`. Reindexing cannot recover history that no
+producer has delivered; the source owner must publish/backfill retained files
+through the configured native transcript collector.
 
 `bbox_context` selects indexed events around an exact offset (default five on
 each side, maximum 25), with short previews. Expand with `bbox_messages` using
