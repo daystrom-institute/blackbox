@@ -701,3 +701,49 @@ other provider preview fields cannot reconstruct content they never retained.
 Team discovery moves full charters and templates behind exact JSON body pages,
 uses bounded summary pages, and reports malformed store records visibly.
 These follow-up source changes require their own gates and deployed probes.
+
+
+### Deployed final scrutiny milestone, 2026-09-06 UTC
+
+Image `b049caa8572c`, digest
+`07ee88c45e6926492fb67f6b94836ab1499aae571c2fa0b2fc8f8828e36d987b`,
+passed image build `build-bbox-image-qzjzz` and full verification
+`bbox-verify-6wd9q` on that same source revision: 7497 tests passed, 21 explicitly
+skipped, Clippy and concurrency lint passed. Converge updated both runtime
+Deployments; both were ready with zero restarts. Subsequent source edits only
+record release and verification evidence.
+
+Live MCP checks passed after deployment:
+
+- Embedding health fell from 7554 to 1080 bytes for the default reply. Explicit
+  debug detail was 6211 bytes and classified each indexed counter's meaning.
+- All 11 teams and 7 global templates were reachable exactly once through
+  summary pages. Exact template JSON reconstructed across three 128-byte pages.
+  Project-template discovery refused an unsupported remote checkout instead of
+  probing its path. Team creation caps expanded membership at 256; synthetic
+  tests verify refusal before writes and consistent global configuration across
+  later broadcast, exec, resume, allocator, and advisor consumers.
+- Commit inspection marked its shortened content and recovered all 706 stored
+  bytes through three property pages, beyond the old 300-byte preview.
+- Corpus stats returned 198 bytes and no longer inferred source absence or zero
+  edges from daemon-local files. Counts are indexed metadata, cached up to 60s;
+  source coverage and freshness are explicitly unassessed by that tool.
+- Cron upcoming results declared UTC, and all three upgraded proposal runtime
+  artifacts retained their expected active versions across the restart.
+
+The macOS collector built with its own embedded identity and Local Network usage
+metadata and was installed on the source host. A subsequent interactive publish
+reported 720 discovered streams, 4 changed and published, 716 unchanged, zero
+failed or deferred, and 9873357 uploaded bytes. Live session freshness recorded
+the completed scan with `scan_in_progress=false` and matching published/indexed
+generations. The launch agent still refuses TCP with errno 65. Its linker ad-hoc
+signature does not bind the embedded Info.plist; normal signing and the user's
+Local Network approval remain required. Metadata alone does not grant access.
+
+The audit therefore closes the deployed MCP shape/size/locality changes while
+leaving continuous host collection activation explicit in gap-e40feb8f. Exact
+reads recover retained provider data, not source content discarded at ingestion.
+No claim is made that every action of all 190 registered tools was exercised
+against production state; the coverage inventory distinguishes source review,
+synthetic contract tests, live reads, and the limited authorized deployments and
+artifact upgrades.
