@@ -314,6 +314,21 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
         modified: after.modified()?,
     }))
 }
+/// Preserve transport causes (including OS errors) in host diagnostics without
+/// letting a long chain dominate the watch log. HTTP failures have already
+/// been reduced to a validated machine code by `decode`; never log bodies,
+/// request headers, or credentials here.
+pub fn error_diagnostic(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 4096;
+    let chain = format!("{error:#}");
+    let mut chars = chain.chars();
+    let mut bounded: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        bounded.push_str(" [diagnostic truncated]");
+    }
+    bounded
+}
+
 pub type CycleReport = ScanSummary;
 /// No mtime checkpoint or local cursor can suppress server reconciliation:
 /// every discovered stream compares with the durable server generation.
@@ -329,7 +344,8 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                 completed: None,
             },
         )
-        .await?;
+        .await
+        .context("recording native transcript scan start failed")?;
     let mut report = CycleReport::default();
     for root in &config.roots {
         ensure!(
@@ -359,7 +375,10 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                 }
                 Err(error) => {
                     report.failed += 1;
-                    eprintln!("native transcript capture failed: {error}");
+                    eprintln!(
+                        "native transcript capture failed: {}",
+                        error_diagnostic(&error)
+                    );
                     continue;
                 }
             };
@@ -372,7 +391,10 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                 }
                 Err(error) => {
                     report.failed += 1;
-                    eprintln!("native transcript publication failed: {error}");
+                    eprintln!(
+                        "native transcript publication failed: {}",
+                        error_diagnostic(&error)
+                    );
                 }
             }
         }
@@ -387,11 +409,7 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
             },
         )
         .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "Source snapshots may be admitted, but recording the completed scan failed: {error}"
-            )
-        })?;
+        .context("Source snapshots may be admitted, but recording the completed scan failed")?;
     Ok(report)
 }
 async fn publish_captured(client: &Client, captured: &Captured) -> Result<(bool, u64)> {
@@ -527,5 +545,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::error_diagnostic;
+
+    #[test]
+    fn watch_diagnostic_preserves_context_and_os_cause() {
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+            .context("connection failed")
+            .context("recording native transcript scan start failed");
+        let diagnostic = error_diagnostic(&error);
+        assert!(diagnostic.contains("recording native transcript scan start failed"));
+        assert!(diagnostic.contains("connection failed"));
+        assert!(diagnostic.contains("os error 13"));
+    }
+
+    #[test]
+    fn watch_diagnostic_bounds_multibyte_messages() {
+        let error = anyhow::anyhow!("界".repeat(5000));
+        let diagnostic = error_diagnostic(&error);
+        assert_eq!(
+            diagnostic.chars().count(),
+            4096 + " [diagnostic truncated]".len()
+        );
+        assert!(diagnostic.ends_with(" [diagnostic truncated]"));
     }
 }
