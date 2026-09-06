@@ -266,12 +266,20 @@ impl BlackboxServer {
             let view = self.session_gap_view(Some(project_id), Some("published"))?;
             after_snapshot();
             let queue = self.state.checkout_mutations.write();
-            let current = runtime.load_verified(&project)?;
-            anyhow::ensure!(
-                current.content_stamp().accepted_scope() == expected_scope,
-                "project publication scope differs from the mutation target; retry after scope reconciliation"
-            );
-            if view.accepted_content.get(&project) == Some(current.content_stamp()) {
+            let current = match runtime.load_verified(&project) {
+                Ok(current) => Some(current),
+                Err(error) if error.code() == bbox_indexing::accepted_publication_runtime::ERROR_ACCEPTED_PUBLICATION_MISSING => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(current) = &current {
+                anyhow::ensure!(
+                    current.content_stamp().accepted_scope() == expected_scope,
+                    "project publication scope differs from the mutation target; retry after scope reconciliation"
+                );
+            }
+            if view.accepted_content.get(&project)
+                == current.as_ref().map(|current| current.content_stamp())
+            {
                 return Ok((
                     view.gaps
                         .all()

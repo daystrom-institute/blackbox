@@ -2492,6 +2492,7 @@ mod catalog_gap_overlay_tests {
         let server = fixture.catalog.server_with_checkout_authority();
         let response = server.bbox_gaps(Parameters(GapListParams {
             provisional: Some("all".into()),
+            debug: true,
             include_addressed: Some(true),
             json: Some(true),
             ..Default::default()

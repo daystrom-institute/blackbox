@@ -3662,7 +3662,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert!(body.get("agents_omitted").is_none());
         let agents = body["agents"].as_array().expect("agents array");
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 1);
         let schema_tester = agents
             .iter()
             .find(|a| a["name"] == "schema-tester")
@@ -3673,22 +3673,7 @@ mod tests {
         assert_eq!(schema_tester["anti_patterns"].as_array().unwrap().len(), 1);
         assert!(schema_tester["dispatch_adapter"].is_null());
 
-        let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
-        assert_eq!(badgey["dispatch_adapter"].as_str(), Some("badgey"));
-        assert_eq!(
-            badgey["when_to_use"]
-                .as_array()
-                .expect("when_to_use always present"),
-            &Vec::<serde_json::Value>::new(),
-            "badgey-agent has empty when_to_use but field must be present"
-        );
-        assert_eq!(
-            badgey["anti_patterns"]
-                .as_array()
-                .expect("anti_patterns always present"),
-            &Vec::<serde_json::Value>::new(),
-            "badgey-agent has empty anti_patterns but field must be present"
-        );
+        assert!(!agents.iter().any(|agent| agent["name"] == "badgey-agent"));
 
         assert!(body.get("agents_by_dispatch_adapter").is_none());
     }

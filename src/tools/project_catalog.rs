@@ -3750,6 +3750,44 @@ mod tests {
             content.contains("tooling/test-domain/covered-gap"),
             "{content}"
         );
+        let gap: crate::gaps::GapNote = serde_json::from_str(content).unwrap();
+        drop(pending);
+        let updated = server
+            .bbox_gap_update(Parameters(crate::gaps::GapUpdateParams {
+                id: gap.id.clone(),
+                notes: Some("update before initial publication".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!updated.is_error.unwrap_or(false), "{updated:?}");
+        let repeated = server.bbox_gap(Parameters(serde_json::from_value(serde_json::json!({
+            "title":"covered gap", "gap_kind":"tooling", "domain":"test-domain",
+            "wanted_capability":"file through the daemon", "dedupe_key":"tooling/test-domain/covered-gap",
+            "scope":"project", "project":PROJECT_ID
+        })).unwrap())).await;
+        assert!(!repeated.is_error.unwrap_or(false), "{repeated:?}");
+        assert!(format!("{:?}", repeated.content).contains("already open"));
+        let queue = server.state.checkout_mutations.read();
+        assert_eq!(
+            queue.pending_count(),
+            2,
+            "dedupe does not enqueue another filing"
+        );
+        let latest: crate::gaps::GapNote = serde_json::from_str(
+            queue
+                .outstanding_writes()
+                .last()
+                .unwrap()
+                .mutation
+                .content_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            latest.notes.as_deref(),
+            Some("update before initial publication")
+        );
     }
 
     /// Denied publish requests must not touch a repository.

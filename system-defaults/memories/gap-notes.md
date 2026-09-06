@@ -128,8 +128,8 @@ If you are actively authoring a packet and the AST is the missing surface, use `
 
 ## Filing without direct MCP access
 
-A caller without `bbox_gap` should hand the typed gap fields to a caller that
-has it. Daemon-side file-drop import and Git closeout checks are retired from
+A caller without `bbox_gap` should hand a `blackbox.gap_note.v1` envelope
+(the same typed gap fields) to a caller that has it. Daemon-side file-drop import and Git closeout checks are retired from
 `bbox_inbox`, which is a read-only attention preview. Repository checks belong
 in the checkout-owning harness. A queued project-gap reply means delivery was
 accepted durably; the owner still commits and publishes the delivered changes.

@@ -55,7 +55,6 @@ canonical_path_read	src/server/repo_io.rs	fn gap_base_carriers	1	delete with Pro
 canonical_path_read	src/server/repo_io.rs	fn knowledge_base_carriers	1	delete with ProjectRecord
 canonical_path_read	src/server/routes.rs	fn enqueue_project_knowledge_embeds	1	delete with ProjectRecord
 canonical_path_read	src/server/store_helpers.rs	fn sync_knowledge_entry_to_index	1	delete with ProjectRecord
-canonical_path_read	src/tools/attention.rs	fn bbox_inbox	1	delete with ProjectRecord
 canonical_path_read	src/tools/graph.rs	fn acquire_bridge_project_file	1	delete with ProjectRecord
 canonical_path_read	src/tools/graph.rs	fn lexical_absolute_selection	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn prepare_knowledge_write	1	delete with ProjectRecord

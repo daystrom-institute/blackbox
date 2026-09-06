@@ -821,7 +821,7 @@ mod tests {
         // First-class surface: filing is via `bbox_gap`, dedupe via `bbox_gaps`.
         assert!(memory.content.contains("bbox_gap("));
         assert!(memory.content.contains("bbox_gaps"));
-        // The `blackbox.gap_note.v1` type tag survives for the file-drop spool path.
+        // The envelope tag remains searchable for handoff to a caller with bbox_gap.
         assert!(memory.content.contains("blackbox.gap_note.v1"));
     }
 
