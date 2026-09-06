@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use parking_lot::RwLock;
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -41,7 +42,7 @@ use crate::workflow::extractor::{Extractor, Selector};
 
 const DEDUP_RING_CAP: usize = 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PollerSpec {
     pub name: String,
     /// Tick interval in seconds. Minimum enforced is 5s (operator-

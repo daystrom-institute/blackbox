@@ -14,10 +14,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseKind {
     /// Parse body as JSON; non-JSON body is an error.
@@ -29,7 +32,7 @@ pub enum ResponseKind {
     Auto,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HttpFetchSpec {
     #[serde(default = "default_method")]
     pub method: String,
@@ -174,7 +177,7 @@ fn clamp_retry_delay_ms(raw: u64) -> u64 {
 /// (delta-seconds or HTTP-date form) overrides the computed backoff on
 /// 429/503, also clamped to `max_ms`. `base_ms` and `max_ms` are each
 /// clamped to `[1, MAX_TOTAL_DELAY_MS]`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct RetrySpec {
     #[serde(default = "default_retry_attempts")]
     pub attempts: u32,

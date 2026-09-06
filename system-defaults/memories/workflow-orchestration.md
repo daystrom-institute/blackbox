@@ -193,6 +193,13 @@ The arc is reconstructable from the thread alone. Observers (you, other sessions
 
 ## Debugging arcs at runtime
 
+Trigger install tools expose the actual spec and nested selector schemas.
+Cron specs accept `tz="UTC"` (default) or `tz="Local"`, case-insensitively;
+unsupported zones are rejected before new installation or artifact activation.
+Local means the daemon's system timezone. Legacy stored unsupported zones
+retain a warned UTC fallback on restart. Cron `concurrency=0` lifts the cap and
+allows every tick to dispatch; it does not disable the cron.
+
 `bro_arc_status` returns bounded summaries by default; omit `arc_id` to list
 arcs and continue with `offset=next_offset`. Use an `arcId` or its distinct
 `arc_thread_id` to select one arc. If waits or correlations are omitted, read

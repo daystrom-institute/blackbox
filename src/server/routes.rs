@@ -1911,7 +1911,7 @@ pub(crate) async fn install_artifact_value(
             }
             artifacts::ArtifactKind::Cron => {
                 let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
-                crons::validate_schedule(&spec.schedule)?;
+                spec.validate()?;
                 completed.push("validation");
                 failed = "cron_file";
                 let dir = state.store_dir.join("crons");
@@ -3596,10 +3596,10 @@ pub(crate) async fn admin_cron_install(
                 .into_response();
         }
     };
-    if let Err(e) = crons::validate_schedule(&spec.schedule) {
+    if let Err(e) = spec.validate() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("cron schedule invalid: {e}"),
+            format!("cron spec invalid: {e}"),
         )
             .into_response();
     }
@@ -4151,6 +4151,49 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[tokio::test]
+    async fn cron_admin_and_artifact_reject_invalid_timezone_before_activation() {
+        use axum::response::IntoResponse;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let value = json!({"name":"invalid-timezone", "schedule":"0 0 9 * * *", "routing_packet":"example-routing", "tz":"unsupported"});
+        let response = admin_cron_install(
+            AxumState(state.clone()),
+            axum::Json(AdminCronInstallReq {
+                spec: value.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(state.crons.list().is_empty());
+        assert!(!state.store_dir.join("crons/invalid-timezone.json").exists());
+        let error = install_artifact_value(
+            &state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Cron,
+                source: "https://example.invalid/cron.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            value,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("use UTC or Local"));
+        assert!(state.crons.list().is_empty());
+        assert!(!state.store_dir.join("crons/invalid-timezone.json").exists());
+        assert!(
+            state
+                .artifacts
+                .read()
+                .metadata_for(artifacts::ArtifactKind::Cron, "invalid-timezone")
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn git(root: &std::path::Path, args: &[&str]) {

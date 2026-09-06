@@ -129,7 +129,7 @@ pub(crate) struct SignalsParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WebhookInstallParams {
     /// Full WebhookSpec JSON (name, signature, extractor, routing_packet).
-    #[schemars(with = "serde_json::Map<String, Value>")]
+    #[schemars(with = "crate::webhooks::WebhookSpec")]
     pub(crate) spec: Value,
 }
 
@@ -138,7 +138,7 @@ pub(crate) struct PollerInstallParams {
     /// Full PollerSpec JSON (name, every_seconds, source, optional
     /// iterate, extractor, optional dedup_id_path, routing_packet,
     /// optional default_project_dir).
-    #[schemars(with = "serde_json::Map<String, Value>")]
+    #[schemars(with = "crate::pollers::PollerSpec")]
     pub(crate) spec: Value,
 }
 
@@ -157,8 +157,8 @@ pub(crate) struct PollerRemoveParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CronInstallParams {
     /// Full CronSpec JSON (name, schedule, optional payload, optional
-    /// concurrency cap, routing_packet, optional default_project_dir).
-    #[schemars(with = "serde_json::Map<String, Value>")]
+    /// concurrency cap, routing_packet, optional default_project_dir and tz).
+    #[schemars(with = "crate::crons::CronSpec")]
     pub(crate) spec: Value,
 }
 
@@ -504,4 +504,110 @@ pub(crate) struct OrchestrateListEntry {
     pub(crate) latest_anchor: Option<String>,
     pub(crate) final_status: Option<String>,
     pub(crate) note_count: usize,
+}
+
+#[cfg(test)]
+mod trigger_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn required(schema: &Value, names: &[&str]) {
+        let actual = schema["required"].as_array().expect("required fields");
+        for name in names {
+            assert!(
+                actual.iter().any(|value| value.as_str() == Some(*name)),
+                "missing required {name}: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_install_schemas_expose_required_specs_and_nested_selector_contracts() {
+        let cron = serde_json::to_value(schemars::schema_for!(CronInstallParams)).unwrap();
+        let poller = serde_json::to_value(schemars::schema_for!(PollerInstallParams)).unwrap();
+        let webhook = serde_json::to_value(schemars::schema_for!(WebhookInstallParams)).unwrap();
+        for (root, definition, fields) in [
+            (
+                &cron,
+                "CronSpec",
+                vec!["name", "schedule", "routing_packet"],
+            ),
+            (
+                &poller,
+                "PollerSpec",
+                vec![
+                    "name",
+                    "every_seconds",
+                    "source",
+                    "extractor",
+                    "routing_packet",
+                ],
+            ),
+            (
+                &webhook,
+                "WebhookSpec",
+                vec!["name", "signature", "extractor", "routing_packet"],
+            ),
+        ] {
+            required(root, &["spec"]);
+            assert!(
+                root["properties"]["spec"]
+                    .to_string()
+                    .contains(&format!("#/definitions/{definition}"))
+            );
+            required(&root["definitions"][definition], &fields);
+        }
+        let definitions = &poller["definitions"];
+        required(&definitions["HttpFetchSpec"], &["url"]);
+        assert_eq!(
+            definitions["HttpFetchSpec"]["properties"]["method"]["default"],
+            "GET"
+        );
+        assert_eq!(
+            definitions["RetrySpec"]["properties"]["attempts"]["default"],
+            3
+        );
+        assert_eq!(
+            definitions["ResponseKind"]["enum"],
+            json!(["json", "text", "auto"])
+        );
+        required(&definitions["Extractor"], &["outputs"]);
+        let selectors = definitions["Selector"]["oneOf"].as_array().unwrap();
+        for kind in ["json_path", "const", "default", "concat", "coalesce"] {
+            assert!(
+                selectors
+                    .iter()
+                    .any(|variant| variant["properties"]["kind"]["enum"] == json!([kind]))
+            );
+        }
+        let path = selectors
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"] == json!(["json_path"]))
+            .unwrap();
+        required(path, &["kind", "path"]);
+        let signatures = webhook["definitions"]["SignatureScheme"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let hmac = signatures
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"] == json!(["hmac_sha256"]))
+            .unwrap();
+        required(hmac, &["kind", "secret_env", "header"]);
+        let timezone = &cron["definitions"]["CronSpec"]["properties"]["tz"];
+        assert!(timezone.to_string().contains("[Uu][Tt][Cc]"));
+    }
+
+    #[test]
+    fn trigger_schema_annotations_preserve_value_and_stringified_spec_parsing() {
+        let spec = json!({"name":"example", "schedule":"0 0 9 * * *", "routing_packet":"example-routing", "tz":"UTC"});
+        for value in [spec.clone(), Value::String(spec.to_string())] {
+            let params: CronInstallParams = serde_json::from_value(json!({"spec":value})).unwrap();
+            let parsed = crate::server::BlackboxServer::parse_spec::<crate::crons::CronSpec>(
+                params.spec,
+                "cron",
+            )
+            .unwrap();
+            assert!(parsed.validate().is_ok());
+        }
+    }
 }
