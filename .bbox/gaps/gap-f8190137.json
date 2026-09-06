@@ -1,0 +1,20 @@
+{
+  "id": "gap-f8190137",
+  "title": "Surface policy inspection reads files on an async worker",
+  "gap_kind": "tooling",
+  "domain": "mcp-surface",
+  "wanted_capability": "Keep filesystem-backed policy discovery and evaluation on the blocking pool so MCP diagnostics cannot block asynchronous workers.",
+  "evidence": [
+    "src/tools/mcp_surface.rs",
+    "scripts/lint-concurrency.sh"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/mcp-surface/blocking-policy-inspection",
+  "notes": "Source fix 15ad54b0 removes the obsolete synchronous-handler exemption and types the supported action values. Deployment and live regression checks are pending.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T17:42:41Z",
+  "updated_at": "2026-09-06T17:42:41Z"
+}
