@@ -25,3 +25,5 @@ In workflow specs, an ensemble node with a `board` field can post member outputs
 ## Retrieval
 
 Use `whiteboard_state` before acting so you see the current phase and existing posts. Use `whiteboard_post` for new claims or proposals, `whiteboard_annotate` for responses to existing posts, `whiteboard_vote` for verdict signals, and `whiteboard_transition` only when you are explicitly the facilitator or operator.
+
+`whiteboard_state`, `whiteboard_summarize`, and `whiteboard_conflicts` return bounded previews by default. Before validating, voting, or synthesizing, retrieve the needed exact evidence with `detail="full"`: concatenate `body.text` pages, continue with `cursor=body.next_cursor` on the same tool and selectors, then parse the complete JSON. `whiteboard_state(post_id=...)` focuses one visible post and its visible discussion. A cursor rejects changed evidence or reader scope; restart without it. Summary scalar counts cover only the requesting agent's visible evidence. Blind peer posts and specialist debate restrictions apply equally to previews, counts, and exact pages.

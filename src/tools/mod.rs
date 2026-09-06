@@ -15,6 +15,7 @@ pub mod atoms;
 pub mod attention;
 pub mod badgey;
 pub mod badgey_adapter;
+mod body_page;
 pub mod bro_helpers;
 pub mod bro_params;
 pub mod bro_runtime_params;
