@@ -1268,8 +1268,125 @@ mod clause_one_exit_proof {
         serde_json::from_value(value).expect("params deserialize")
     }
 
+    fn gc_summary_without_receipt_metadata(
+        mut summary: serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        let fields = summary.as_object_mut().expect("GC response object");
+        let receipt_id = fields
+            .remove("receipt_id")
+            .expect("GC receipt identity")
+            .as_str()
+            .expect("GC receipt identity is a string")
+            .to_owned();
+        uuid::Uuid::parse_str(&receipt_id).expect("GC receipt identity is a UUID");
+        let ttl = fields
+            .remove("expires_in_seconds")
+            .expect("GC receipt TTL")
+            .as_u64()
+            .expect("GC receipt TTL is unsigned");
+        assert!(
+            ttl <= 15 * 60,
+            "GC receipt TTL exceeds its documented lifetime"
+        );
+        (summary, receipt_id)
+    }
+
+    async fn complete_gc_semantics(server: &BlackboxServer) -> serde_json::Value {
+        use rmcp::handler::server::wrapper::Parameters;
+        use serde_json::json;
+
+        let result = server
+            .bbox_storage_gc(Parameters(params(json!({"dry_run":true}))))
+            .await;
+        let mut response = serde_json::to_value(&result).expect("GC response serializes");
+        if result.is_error == Some(true) {
+            return json!({"response":response});
+        }
+        assert_eq!(result.content.len(), 1);
+        let (summary, receipt_id) = gc_summary_without_receipt_metadata(
+            serde_json::from_str(&result.content[0].as_text().expect("GC summary text").text)
+                .expect("GC summary JSON"),
+        );
+        response["content"][0]["text"] =
+            json!(serde_json::to_string(&summary).expect("GC summary serializes"));
+
+        let mut complete_body = String::new();
+        let mut cursor: Option<String> = None;
+        let mut total_bytes = None;
+        loop {
+            let result = server
+                .bbox_storage_gc(Parameters(params(json!({
+                    "receipt_id":receipt_id,
+                    "detail":"full",
+                    "cursor":cursor,
+                    "limit":128,
+                }))))
+                .await;
+            assert!(!result.is_error.unwrap_or(false), "{result:?}");
+            assert_eq!(result.content.len(), 1);
+            let (page, page_receipt_id) = gc_summary_without_receipt_metadata(
+                serde_json::from_str(&result.content[0].as_text().expect("GC detail text").text)
+                    .expect("GC detail JSON"),
+            );
+            assert_eq!(page_receipt_id, receipt_id);
+            assert_eq!(page["status"], summary["status"]);
+            assert_eq!(page["apply_requested"], summary["apply_requested"]);
+            assert_eq!(page["detail"], "full");
+            let body = &page["body"];
+            assert_eq!(body["format"], "json");
+            assert_eq!(body["offset"].as_u64(), Some(complete_body.len() as u64));
+            let page_total = body["total_bytes"].as_u64().expect("GC body size");
+            assert_eq!(*total_bytes.get_or_insert(page_total), page_total);
+            let fragment = body["text"].as_str().expect("GC body fragment");
+            assert!(!fragment.is_empty(), "GC pagination must advance");
+            complete_body.push_str(fragment);
+            assert!(complete_body.len() as u64 <= page_total);
+            cursor = body["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                assert_eq!(complete_body.len() as u64, page_total);
+                break;
+            }
+        }
+        let receipt_contents: serde_json::Value =
+            serde_json::from_str(&complete_body).expect("complete GC receipt JSON");
+        json!({"response":response,"receipt_contents":receipt_contents})
+    }
+
+    #[test]
+    fn gc_comparison_removes_only_top_level_receipt_identity_and_ttl() {
+        let original = serde_json::json!({
+            "receipt_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "expires_in_seconds":900,
+            "status":"partial",
+            "apply_requested":true,
+            "result":{
+                "deleted_count":1,
+                "delete_error_count":1,
+                "receipt_id":"nested semantic value",
+                "expires_in_seconds":42,
+            },
+            "future_semantic_field":{"errors":["failed"],"protected_roots":["retained"]},
+        });
+        let mut expected = original.clone();
+        expected.as_object_mut().unwrap().remove("receipt_id");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_in_seconds");
+        let (actual, _) = gc_summary_without_receipt_metadata(original.clone());
+        assert_eq!(actual, expected);
+        let mut later = original;
+        later["receipt_id"] = serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        later["expires_in_seconds"] = serde_json::json!(899);
+        assert_eq!(gc_summary_without_receipt_metadata(later.clone()).0, actual);
+        later["result"]["deleted_count"] = serde_json::json!(0);
+        assert_ne!(gc_summary_without_receipt_metadata(later).0, actual);
+    }
+
     /// Clause 1 in full: EVERY section 14.1 operation, run against the
     /// populated server and its recordless twin, compared byte for byte.
+    /// GC compares its complete summary and reconstructed receipt contents,
+    /// excluding only the volatile receipt identity and TTL.
     ///
     /// Equality is the proof, not success. Several of these operations
     /// legitimately refuse under `DenyCheckoutAccess` (the file provider
@@ -1356,9 +1473,13 @@ mod clause_one_exit_proof {
                 serde_json::json!({"refs": ["file:src/lib.rs"]})
             )))
             .await);
-        compare!("storage GC", server => server
-            .bbox_storage_gc(Parameters(params(serde_json::json!({"dry_run": true}))))
-            .await);
+        let expected_gc = complete_gc_semantics(&populated).await;
+        let actual_gc = complete_gc_semantics(&recordless).await;
+        assert_eq!(
+            actual_gc, expected_gc,
+            "storage GC varied with the attached-row view"
+        );
+        executed.push("storage GC");
         compare!("provenance export plan", server => server
             .bbox_provenance_export_plan(Parameters(params(serde_json::json!({}))))
             .await);

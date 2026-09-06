@@ -188,7 +188,7 @@ fn default_orphan_after_days() -> u64 {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_gc",
-        description = "Preview (default) or apply storage GC with bounded counts, bytes, and honest partial outcomes. detail=candidates/deleted/errors/exclusions/packets/full returns exact JSON body pages (limit max 4096 bytes). Read subsequent pages using receipt_id, the same detail, and body.next_cursor only: receipt reads never run GC. Receipts are temporary, not executable plans. Native retention and rollback protections always apply."
+        description = "Preview (default) or apply storage GC. Returns bounded counts, estimated bytes, protection counts, stage outcomes, and a receipt_id; exact detail is opt-in and paged."
     )]
     pub(crate) async fn bbox_storage_gc(
         &self,
