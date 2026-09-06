@@ -5339,7 +5339,11 @@ mod tests {
                 project_id,
                 &scope,
                 &checkout,
-                &format!("att_{index:032x}"),
+                &if index == 0 {
+                    CatalogFixture::attachment().to_string()
+                } else {
+                    format!("att_{index:032x}")
+                },
                 &format!("{index:032x}"),
                 true,
             );
@@ -5455,7 +5459,7 @@ mod tests {
 
         let scope = CatalogFixture::scope(".");
         let fixture = CatalogFixture::new();
-        fixture.add_published_project("p_status_missing", &scope);
+        fixture.add_published_project("p_status_missing", &CatalogFixture::scope("sub/missing"));
         fixture.add_published_project("p_status_stale", &scope);
         let checkout = fixture.root().join("checkout-bound");
         fixture.attach_overlay_checkout(
@@ -5519,6 +5523,7 @@ mod tests {
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_status_detail".into(),
                 detail: Some(ProjectPublisherStatusDetail::Health),
+                detail_limit: Some(128),
                 ..Default::default()
             }))
             .await;
@@ -5527,6 +5532,10 @@ mod tests {
         let cursor = first_body["detail"]["body"]["next_cursor"]
             .as_str()
             .map(str::to_owned);
+        assert!(
+            cursor.is_some(),
+            "fixture must require continuation: {first_body}"
+        );
 
         let text = page_publisher_status_detail(
             &server,
@@ -5790,6 +5799,7 @@ mod tests {
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_connector_status".into(),
                 detail: Some(ProjectPublisherStatusDetail::Connector),
+                detail_limit: Some(128),
                 ..Default::default()
             }))
             .await;
@@ -5798,6 +5808,10 @@ mod tests {
         let cursor = first_body["detail"]["body"]["next_cursor"]
             .as_str()
             .map(str::to_owned);
+        assert!(
+            cursor.is_some(),
+            "fixture must require continuation: {first_body}"
+        );
 
         let text = page_publisher_status_detail(
             &server,
