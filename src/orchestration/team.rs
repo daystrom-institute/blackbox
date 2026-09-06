@@ -23,6 +23,29 @@ pub struct TeamplateMember {
     pub count: u32,
 }
 
+/// Bound expansion before allocating members or persisting a new template/team.
+/// The optional advisor is separate from this member-slot budget.
+pub const MAX_TEAM_MEMBERS: usize = 256;
+
+pub fn validate_teamplate_member_count(template: &Teamplate) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !template.members.is_empty(),
+        "team template requires at least one member"
+    );
+    let mut total = 0usize;
+    for member in &template.members {
+        anyhow::ensure!(member.count > 0, "team member count must be at least 1");
+        total = total
+            .checked_add(usize::try_from(member.count)?)
+            .ok_or_else(|| anyhow::anyhow!("expanded team member count overflow"))?;
+        anyhow::ensure!(
+            total <= MAX_TEAM_MEMBERS,
+            "expanded team member count exceeds maximum {MAX_TEAM_MEMBERS}; reduce slot counts or split the team"
+        );
+    }
+    Ok(total)
+}
+
 fn default_one() -> u32 {
     1
 }
@@ -146,6 +169,7 @@ pub fn save_teamplate(
     store_dir: &Path,
     project_dir: Option<&str>,
 ) -> anyhow::Result<()> {
+    validate_teamplate_member_count(tp)?;
     let dir = if scope == "project" {
         project_teamplates_dir(Path::new(project_dir.unwrap_or(".")))
     } else {
@@ -347,9 +371,10 @@ pub fn instantiate_team(
     project_dir: Option<&str>,
     store_dir: &Path,
 ) -> anyhow::Result<Team> {
-    let mut members = Vec::new();
+    let member_count = validate_teamplate_member_count(tp)?;
+    let mut members = Vec::with_capacity(member_count);
     for slot in &tp.members {
-        let count = slot.count.max(1);
+        let count = slot.count;
         for i in 0..count {
             let name = if let Some(ref alias) = slot.alias {
                 if count > 1 {
@@ -554,6 +579,53 @@ mod tests {
 
     fn temp_store() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn team_member_admission_rejects_zero_large_and_overflowing_counts_before_writes() {
+        let dir = temp_store();
+        let root = dir.path().canonicalize().unwrap();
+        let mut template = Teamplate {
+            name: "bounded".into(),
+            members: vec![],
+            advisor: None,
+            diversity_floor: None,
+        };
+        for counts in [
+            vec![],
+            vec![0],
+            vec![257],
+            vec![128, 129],
+            vec![1, u32::MAX],
+            vec![u32::MAX, u32::MAX],
+        ] {
+            template.members = counts
+                .into_iter()
+                .map(|count| TeamplateMember {
+                    brofile: "reviewer".into(),
+                    alias: None,
+                    count,
+                })
+                .collect();
+            assert!(save_teamplate(&template, "global", &root, None).is_err());
+            assert!(instantiate_team(&template, "rejected", None, &root).is_err());
+            assert!(!root.join("teamplates").exists());
+            assert!(!root.join("teams").exists());
+        }
+        template.members = vec![TeamplateMember {
+            brofile: "reviewer".into(),
+            alias: None,
+            count: MAX_TEAM_MEMBERS as u32,
+        }];
+        save_teamplate(&template, "global", &root, None).unwrap();
+        let team = instantiate_team(&template, "accepted", None, &root).unwrap();
+        assert_eq!(team.members.len(), MAX_TEAM_MEMBERS);
+        template.members[0].count = 0;
+        assert!(save_teamplate(&template, "global", &root, None).is_err());
+        assert_eq!(
+            resolve_teamplate("bounded", &root, None).unwrap().members[0].count,
+            MAX_TEAM_MEMBERS as u32
+        );
     }
 
     #[test]

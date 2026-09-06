@@ -136,11 +136,24 @@ structured content. Malformed stored records report errors instead of disappeari
 
 `scope` applies only to template actions and accepts `global` (default) or
 `project`. Project template discovery requires an explicit absolute owner-host
-`project_dir` in legacy bridge mode. Catalog mode refuses this legacy
-`.bro/teamplates` read because it has no remote source lane. Inspect those files
-with the owning checkout's file tools, or discover daemon-owned templates using
+`project_dir` in legacy bridge mode. Catalog mode refuses reads and writes of legacy
+`.bro/teamplates` because it has no remote source lane. Inspect or edit those
+files with the owning checkout's file tools, or use daemon-owned templates with
 `scope="global"` without `project_dir`. No discovery path falls back to the
 daemon's current directory.
+
+In catalog mode, `create` resolves templates and brofiles only from the
+daemon-owned global catalogs. `project_dir` remains the worker/team association;
+it does not select project template or brofile overrides on the daemon. A
+missing global dependency refuses before a team is instantiated. Successful
+creation returns `memberCount`, `templateScope="global"`, and roster/get hints
+instead of repeating every member. Advisor initialization uses the same global
+brofile authority while preserving the worker context.
+Templates require at least one member, every slot count must be positive, and
+expanded members must total at most 256 (plus an optional advisor). Saving or
+creating an invalid template refuses before allocation or persistence; counts
+are never truncated. Existing invalid templates remain inspectable and their
+summary includes an admission error until corrected.
 
 Use teams for ensemble review, blind comparison, provider races, or repeated
 panels. If the control flow has gates, retries, waits, or cleanup, write a
