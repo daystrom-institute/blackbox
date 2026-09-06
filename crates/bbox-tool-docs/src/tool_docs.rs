@@ -271,8 +271,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_stats",
         category: ToolCategory::Transcripts,
-        summary: "Corpus statistics (doc count, index size, file counts).",
-        when_to_use: "Sanity-check the index; diagnose 'did my new sessions get indexed?'.",
+        summary: "Cheap indexed-corpus document and segment counts, cached up to 60s. Does not assess source coverage, freshness, disk size or edge totals.",
+        when_to_use: "Check whether the index is populated. Use targeted search or source status to verify a particular session or publication.",
         example: None,
     },
     // ── Agentic graph ────────────────────────────────────────────────

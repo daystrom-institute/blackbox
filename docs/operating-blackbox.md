@@ -32,7 +32,7 @@ Healthy output usually means:
 
 | Check | Healthy signal | If not |
 |---|---|---|
-| `bbox_stats` | Non-zero documents, recent sessions visible, index size plausible | Run `bbox_reindex(full=false)` first |
+| `bbox_stats` | Non-zero indexed documents; counts may be cached up to 60 seconds | Check the relevant source publication and search results; totals do not assess source coverage or freshness |
 | `bbox_embed_status` | `available: true`, `last_error: null`; queue drains after churn | Fix provider/API key, then `bbox_reembed(route="...")` if needed |
 | `bbox_project_list` | Expected repos registered with stable `project_id`s | Register missing repos before blaming search |
 | `bbox_describe_schema` | Entity populations are non-zero for transcripts/project files/knowledge | Reindex and watch EdgeIndex rebuild logs |

@@ -237,7 +237,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_stats",
-        description = "Corpus statistics (doc count, index size, file counts)."
+        description = "Cheap indexed-corpus document and segment counts, cached up to 60s. Does not assess source coverage, freshness, disk size or edge totals."
     )]
     pub(crate) async fn bbox_stats(&self) -> CallToolResult {
         let server = self.clone();
