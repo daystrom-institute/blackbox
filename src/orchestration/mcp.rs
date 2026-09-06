@@ -1613,7 +1613,7 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert(
             "X-Secret".to_string(),
-            McpHeaderValue::Secret {
+            SecretString::Secret {
                 name: "SYNTHETIC_MCP_TOKEN".to_string(),
             },
         );
@@ -1706,14 +1706,16 @@ mod tests {
         );
         assert!(!reply.contains(".json"), "{reply}");
 
-        let get_missing = text_reply(action_get(
-            &serde_json::from_value::<McpToolParams>(serde_json::json!({
-                "action": "get", "name": "missing",
-                "scope": "project", "project": project.to_str().unwrap(),
-            }))
+        let get_missing = text_reply(
+            action_get(
+                &serde_json::from_value::<McpToolParams>(serde_json::json!({
+                    "action": "get", "name": "missing",
+                    "scope": "project", "project": project.to_str().unwrap(),
+                }))
+                .unwrap(),
+            )
             .unwrap(),
-        ))
-        .unwrap();
+        );
         assert!(
             get_missing.contains("not registered in the project MCP store"),
             "{get_missing}"
@@ -1756,7 +1758,7 @@ mod tests {
             "scope": "project", "project": project.to_str().unwrap(),
         }))
         .unwrap();
-        let error = action_get(&params).unwrap_err();
+        let error = action_get(&params).err().expect("read must reject");
         let text = format!("{error:#}");
         assert!(!text.contains("secret-credential-value"), "{text}");
         assert!(!text.contains("synthetic-endpoint"), "{text}");
