@@ -795,7 +795,7 @@ impl BlackboxServer {
                     .iter()
                     .filter_map(|row| row["built_from_ref"].as_str())
                     .collect::<std::collections::HashSet<_>>();
-                built_from.retain(|key, _| used_refs.contains(key.as_str()));
+                built_from.retain_ids(used_refs);
                 structured["built_from"] = serde_json::to_value(&built_from)?;
             }
             let mut rendered = if p.json.unwrap_or(false) {

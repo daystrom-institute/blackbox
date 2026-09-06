@@ -471,6 +471,8 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-edge-sidecar",
  "bbox-project-graph",
+ "bbox-transcript-source",
+ "bbox-transcript-source-store",
  "bro-core",
  "bro-transcript",
  "dirs",
@@ -1076,6 +1078,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-transcript-collector"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-transcript-source",
+ "bro-rpc",
+ "clap",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
 name = "bbox-transcript-source"
 version = "0.0.1"
 dependencies = [
@@ -1285,6 +1307,9 @@ dependencies = [
  "bbox-system-memory",
  "bbox-threads",
  "bbox-tool-docs",
+ "bbox-transcript-collector",
+ "bbox-transcript-source",
+ "bbox-transcript-source-store",
  "bbox-util",
  "bbox-vectors",
  "bbox-visual-store",
