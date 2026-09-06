@@ -1,0 +1,2143 @@
+{
+  "source_revision": "004822640975f19f90dc4d50dd16d7fc9efc42e8",
+  "observed_date_utc": "2026-09-06",
+  "thread_id": "thread-c749d06c",
+  "scope": "Read-only catalog/source reconciliation and implementation queue. No runtime code or production data lifecycle changes.",
+  "runtime_revision": "not independently verified; thread handoff reports deployed 27046e0c2dfc",
+  "measurement": "UTF-8 bytes of compact JSON serialization of the complete returned CallToolResult including text escaping and structuredContent when present; excludes HTTP and JSON-RPC framing. These are live sample sizes, not universal bounds.",
+  "catalogs": {
+    "ops": {
+      "tool_count": 109,
+      "pages": 2,
+      "pagination": "live_offset",
+      "tools": [
+        "bbox_absorb",
+        "bbox_apply",
+        "bbox_artifact_install",
+        "bbox_artifact_list",
+        "bbox_artifact_remove",
+        "bbox_artifact_supersede",
+        "bbox_audit",
+        "bbox_blame",
+        "bbox_bootstrap",
+        "bbox_bundle_evidence",
+        "bbox_cite",
+        "bbox_compile",
+        "bbox_context",
+        "bbox_corpus_search",
+        "bbox_decide",
+        "bbox_describe_schema",
+        "bbox_discover_seed_entities",
+        "bbox_doctor",
+        "bbox_edge_compact",
+        "bbox_embed_partitions",
+        "bbox_embed_status",
+        "bbox_find_paths",
+        "bbox_forget",
+        "bbox_gap",
+        "bbox_gap_resolve",
+        "bbox_gap_update",
+        "bbox_gaps",
+        "bbox_hybrid_search",
+        "bbox_inbox",
+        "bbox_inspect_entity",
+        "bbox_knowledge",
+        "bbox_knowledge_link",
+        "bbox_learn",
+        "bbox_lint",
+        "bbox_mcp_surface",
+        "bbox_messages",
+        "bbox_note",
+        "bbox_note_resolve",
+        "bbox_notes",
+        "bbox_packet_events",
+        "bbox_packet_gap",
+        "bbox_packet_list",
+        "bbox_pin",
+        "bbox_project_attach",
+        "bbox_project_catalog_get",
+        "bbox_project_catalog_list",
+        "bbox_project_default_attachment",
+        "bbox_project_detach",
+        "bbox_project_eject",
+        "bbox_project_graph_describe",
+        "bbox_project_graph_list",
+        "bbox_project_graph_validate",
+        "bbox_project_init",
+        "bbox_project_list",
+        "bbox_project_promote",
+        "bbox_project_publisher_advance",
+        "bbox_project_publisher_bind",
+        "bbox_project_publisher_status",
+        "bbox_project_register",
+        "bbox_project_rename",
+        "bbox_project_scope_migrate",
+        "bbox_project_unregister",
+        "bbox_provenance_export",
+        "bbox_provenance_export_plan",
+        "bbox_provenance_import",
+        "bbox_reembed",
+        "bbox_ref_size",
+        "bbox_reindex",
+        "bbox_remember",
+        "bbox_render",
+        "bbox_review",
+        "bbox_roadmap",
+        "bbox_search",
+        "bbox_session",
+        "bbox_sessions_list",
+        "bbox_stats",
+        "bbox_storage_gc",
+        "bbox_storage_health",
+        "bbox_storage_migrate_legacy_edges",
+        "bbox_thread",
+        "bbox_thread_list",
+        "bbox_tool_calls",
+        "bbox_topics",
+        "bro_agent_describe",
+        "bro_agent_dispatch",
+        "bro_agent_get",
+        "bro_agent_list",
+        "bro_agent_search",
+        "bro_allocator_probe",
+        "bro_allocator_status",
+        "bro_allocator_trace",
+        "bro_broadcast",
+        "bro_brofile",
+        "bro_cancel",
+        "bro_dashboard",
+        "bro_exec",
+        "bro_interrupt",
+        "bro_mcp",
+        "bro_providers",
+        "bro_prune",
+        "bro_report",
+        "bro_resume",
+        "bro_retro",
+        "bro_status",
+        "bro_steer",
+        "bro_team",
+        "bro_wait",
+        "bro_when_all",
+        "bro_when_any"
+      ]
+    },
+    "default": {
+      "tool_count": 96,
+      "tools": [
+        "bbox_apply",
+        "bbox_artifact_list",
+        "bbox_artifact_remove",
+        "bbox_audit",
+        "bbox_blame",
+        "bbox_bundle_evidence",
+        "bbox_cite",
+        "bbox_compile",
+        "bbox_context",
+        "bbox_corpus_search",
+        "bbox_decide",
+        "bbox_describe_schema",
+        "bbox_discover_seed_entities",
+        "bbox_doctor",
+        "bbox_edge_compact",
+        "bbox_embed_partitions",
+        "bbox_find_paths",
+        "bbox_forget",
+        "bbox_gap",
+        "bbox_gap_resolve",
+        "bbox_gap_update",
+        "bbox_gaps",
+        "bbox_hybrid_search",
+        "bbox_inbox",
+        "bbox_inspect_entity",
+        "bbox_knowledge",
+        "bbox_knowledge_link",
+        "bbox_learn",
+        "bbox_mcp_surface",
+        "bbox_messages",
+        "bbox_note",
+        "bbox_note_resolve",
+        "bbox_notes",
+        "bbox_packet_events",
+        "bbox_packet_gap",
+        "bbox_packet_list",
+        "bbox_pin",
+        "bbox_project_attach",
+        "bbox_project_catalog_get",
+        "bbox_project_catalog_list",
+        "bbox_project_default_attachment",
+        "bbox_project_detach",
+        "bbox_project_eject",
+        "bbox_project_graph_describe",
+        "bbox_project_graph_list",
+        "bbox_project_graph_validate",
+        "bbox_project_init",
+        "bbox_project_list",
+        "bbox_project_promote",
+        "bbox_project_publisher_advance",
+        "bbox_project_publisher_bind",
+        "bbox_project_publisher_status",
+        "bbox_project_register",
+        "bbox_project_rename",
+        "bbox_project_scope_migrate",
+        "bbox_project_unregister",
+        "bbox_provenance_export_plan",
+        "bbox_ref_size",
+        "bbox_remember",
+        "bbox_roadmap",
+        "bbox_search",
+        "bbox_session",
+        "bbox_sessions_list",
+        "bbox_stats",
+        "bbox_storage_gc",
+        "bbox_storage_health",
+        "bbox_storage_migrate_legacy_edges",
+        "bbox_thread",
+        "bbox_thread_list",
+        "bbox_tool_calls",
+        "bbox_topics",
+        "bro_agent_describe",
+        "bro_agent_dispatch",
+        "bro_agent_get",
+        "bro_agent_list",
+        "bro_agent_search",
+        "bro_allocator_probe",
+        "bro_allocator_status",
+        "bro_allocator_trace",
+        "bro_brofile",
+        "bro_cancel",
+        "bro_dashboard",
+        "bro_exec",
+        "bro_interrupt",
+        "bro_mcp",
+        "bro_providers",
+        "bro_prune",
+        "bro_report",
+        "bro_resume",
+        "bro_retro",
+        "bro_status",
+        "bro_steer",
+        "bro_team",
+        "bro_wait",
+        "bro_when_all",
+        "bro_when_any"
+      ]
+    },
+    "connected_client": {
+      "tool_count": 101,
+      "missing_from_ops": [
+        "bro_agent_describe",
+        "bro_agent_dispatch",
+        "bro_agent_get",
+        "bro_agent_list",
+        "bro_agent_search",
+        "bro_allocator_probe",
+        "bro_allocator_status",
+        "bro_allocator_trace"
+      ]
+    }
+  },
+  "checks": [
+    {
+      "id": "surface_describe",
+      "tool": "bbox_mcp_surface",
+      "arguments": {
+        "action": "describe",
+        "surface": "default",
+        "limit": 2
+      },
+      "result_bytes": 1118,
+      "is_error": false,
+      "observation": "Rule summaries page with next_offset and exact packet reader.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "surface_list_mismatch",
+      "tool": "bbox_mcp_surface",
+      "arguments": {
+        "action": "list",
+        "surface": "ops",
+        "limit": 1
+      },
+      "result_bytes": 158,
+      "is_error": true,
+      "observation": "List rejects a replay/describe-only selector.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "all_unknown",
+      "tool": "bro_when_all",
+      "arguments": {
+        "task_ids": [
+          "00000000-0000-0000-0000-000000000000"
+        ],
+        "timeout_seconds": 0
+      },
+      "result_bytes": 128,
+      "is_error": true,
+      "observation": "Unknown-only selection is an error, never successful aggregate completion.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "any_unknown",
+      "tool": "bro_when_any",
+      "arguments": {
+        "task_ids": [
+          "00000000-0000-0000-0000-000000000000"
+        ],
+        "timeout_seconds": 0
+      },
+      "result_bytes": 128,
+      "is_error": true,
+      "observation": "Unknown-only selection is an error.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "pin_project_filter",
+      "tool": "bbox_pin",
+      "arguments": {
+        "action": "list",
+        "project": "89bd722f",
+        "scope": "thread",
+        "target": "thread-c749d06c",
+        "limit": 1
+      },
+      "result_bytes": 393,
+      "is_error": false,
+      "observation": "A registered project identity filter succeeds without checkout write authority.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "pin_invalid_scope",
+      "tool": "bbox_pin",
+      "arguments": {
+        "action": "list",
+        "scope": "synthetic-invalid",
+        "limit": 1
+      },
+      "result_bytes": 135,
+      "is_error": true,
+      "observation": "Invalid closed scope is rejected.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "knowledge_empty",
+      "tool": "bbox_knowledge",
+      "arguments": {
+        "query": "synthetic-no-match-c749d06c-20260906",
+        "limit": 1
+      },
+      "result_bytes": 1115,
+      "is_error": false,
+      "observation": "Empty result retains compact degraded/unavailable counts and exact diagnostics hint; no diagnostic bodies archived.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "publisher_summary",
+      "tool": "bbox_project_publisher_status",
+      "arguments": {
+        "project_id": "89bd722f"
+      },
+      "result_bytes": 3355,
+      "is_error": false,
+      "observation": "Accepted source commit 00482264 observed with CAS tokens and compact health; this is not a runtime binary revision check.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "audit_search",
+      "tool": "bbox_search",
+      "arguments": {
+        "query": "\"Remaining MCP surface audit\"",
+        "mode": "fulltext",
+        "limit": 2,
+        "exclude_self": true
+      },
+      "result_bytes": 1557,
+      "is_error": false,
+      "observation": "Returned native transcript hits with transcript recovery hints; did not exercise non-transcript hit recovery.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "schema",
+      "tool": "bbox_describe_schema",
+      "arguments": {},
+      "result_bytes": 15282,
+      "is_error": false,
+      "observation": "Default orientation observed; installed agents omitted; byte measurement is one live sample.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "thread_explicit_summary",
+      "tool": "bbox_thread",
+      "arguments": {
+        "action": "get",
+        "id": "thread-c749d06c",
+        "detail": "summary"
+      },
+      "result_bytes": 128,
+      "is_error": true,
+      "observation": "Explicit detail=summary returns unknown-detail error despite adapter acceptance; default summary and note recovery work.",
+      "evidence_class": "production_read_only"
+    },
+    {
+      "id": "thread_note_recovery",
+      "tool": "bbox_thread",
+      "arguments": {
+        "action": "get",
+        "id": "thread-c749d06c",
+        "detail": "note",
+        "note_index": 1,
+        "body_limit": 512
+      },
+      "pages": 14,
+      "max_result_bytes": 811,
+      "recovered_body_bytes": 6889,
+      "complete": true,
+      "parsed_note_index": 1,
+      "evidence_class": "production_read_only",
+      "observation": "Content-bound pages reconstruct the entire stored JSON note; body and opaque cursors not archived."
+    }
+  ],
+  "limits": [
+    "Source review and inspected regressions are not newly executed tests.",
+    "The existing 173-check isolated run is reported by the handoff, not rerun here; the checked-in integration receipt is an earlier checkpoint.",
+    "No destructive probes, durable-memory writes, credential injections, provider dispatches, or shared-service mutations ran; existing knowledge and thread records were read.",
+    "Catalog replay proves policy discovery, not callable access from this client.",
+    "No raw bodies, credential values, other-project identities, or native session locators are archived."
+  ],
+  "source_catalog": {
+    "handler_count": 109,
+    "matches_ops": true,
+    "method": "Exact tool name declarations in src/tools/*.rs at source_revision; compared to all replay pages."
+  },
+  "action_coverage": {
+    "historical_branch_rows": 256,
+    "tool_groups": 109,
+    "new_detail_refinements": 45,
+    "count_semantics": "Historical branch labels are preserved. New refinements subdivide existing rows and are not disjoint action counts or invented action parameter values.",
+    "groups": [
+      {
+        "tool": "bbox_absorb",
+        "owner": "src/tools/render.rs",
+        "historical_branches": [
+          "global",
+          "project"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R07",
+          "R08"
+        ],
+        "contract": "Callable compatibility no-op, now labeled and omitted from hot docs. Still does view/diagnostic work; no successful import outcome. Confirm external consumers before removing discovery."
+      },
+      {
+        "tool": "bbox_apply",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "all",
+          "first"
+        ],
+        "current_refinements": [
+          "findings page",
+          "exact result body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "First/all result summaries, finding pages and exact result JSON implemented. Exact reads suppress observation writes and bind input/result. Opaque entity and consequent validation still needs branch probes."
+      },
+      {
+        "tool": "bbox_artifact_install",
+        "owner": "src/tools/artifacts.rs",
+        "historical_branches": [
+          "HTTP source",
+          "inline"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R03",
+          "R06",
+          "V01"
+        ],
+        "contract": "Typed kind, exactly one inline or HTTP input, inline byte cap and staged failure reporting. Nested artifact shape remains opaque; installation is distinct from catalog activation."
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "owner": "src/tools/artifacts.rs",
+        "historical_branches": [
+          "detail",
+          "retired kind",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05"
+        ],
+        "contract": "Collection pages exist, but a huge description or supersession chain can overflow one receipt row. No exact artifact receipt reader; offset movement is not disclosed in the response."
+      },
+      {
+        "tool": "bbox_artifact_remove",
+        "owner": "src/tools/artifacts.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Operator-directed removal with confirmation guard. Preserve historical receipt versus runtime removal distinctions; no destructive acceptance in this pass."
+      },
+      {
+        "tool": "bbox_artifact_supersede",
+        "owner": "src/tools/artifacts.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R03",
+          "R05"
+        ],
+        "contract": "Useful lifecycle operation, but returns raw ArtifactMetadata including source URL, project path, warnings and chain. Synthetic disclosure/size proof required; no live secret leak asserted."
+      },
+      {
+        "tool": "bbox_audit",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "all",
+          "first"
+        ],
+        "current_refinements": [
+          "mismatches page",
+          "exact result body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Bounded mismatches/findings and complete exact result pages implemented. Changed input/result invalidates cursor; exact reads add no event. Probe malformed expected values and mode-specific skipped rows."
+      },
+      {
+        "tool": "bbox_blame",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "anchor",
+          "git fallback"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Indexed anchor provenance and local Git fallback remain distinct authority lanes; an origin result is evidence of authorship/history, not correctness."
+      },
+      {
+        "tool": "bbox_bootstrap",
+        "owner": "src/tools/render.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "retired",
+        "work": [
+          "R07"
+        ],
+        "contract": "Immediate compatibility refusal with replacement hint. Hidden from default discovery and hot docs, still served on ops; removal requires compatibility decision."
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "full",
+          "none",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05"
+        ],
+        "contract": "Entity/path/edge count caps exist, but full properties, metadata and echoed question are not a producer byte bound. Property readers recover individual values, not every oversized bundle envelope."
+      },
+      {
+        "tool": "bbox_cite",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "claim"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Claim-origin retrieval remains useful. A retrieved statement is not proof of its truth."
+      },
+      {
+        "tool": "bbox_compile",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "compile"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Rules now include usable examples and restrictions, but nested JSON remains opaque and chooser is long. Keep compilation separate from evaluating/classifying entities."
+      },
+      {
+        "tool": "bbox_context",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "native",
+          "retained-conversation"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Native coordinate reads disclose indexed projection/freshness limits; retained conversation reads use scoped landing-store authority. Do not claim current source completeness from indexed retrieval."
+      },
+      {
+        "tool": "bbox_corpus_search",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "query"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R08",
+          "V01"
+        ],
+        "contract": "Real harness id/text consumer requires this compatibility shape. Empty-index path can trigger indexing; overlap in name does not justify retirement."
+      },
+      {
+        "tool": "bbox_decide",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "checkout-owner",
+          "global/local"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Operator-approved durable commitment with rationale and supersession. Owner admission, local persistence and publication remain distinct; transport repair is separately owned."
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "agents",
+          "full",
+          "orientation"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R05"
+        ],
+        "contract": "Default vocabulary is still large; installed-agent expansion is unpaged. Current default measured 15282 complete result bytes, one sample. Make orientation compact and agent inventory recoverable."
+      },
+      {
+        "tool": "bbox_discover_seed_entities",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "query"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Adds notable edges to hybrid retrieval and requires a complete graph read view; not an identical search alias."
+      },
+      {
+        "tool": "bbox_doctor",
+        "owner": "src/tools/doctor.rs",
+        "historical_branches": [
+          "full",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R08"
+        ],
+        "contract": "Section-targeted collection and full JSON pages implemented, but catalog producers cap findings before DoctorReport. Exact pages cannot recover those omitted findings."
+      },
+      {
+        "tool": "bbox_edge_compact",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "apply",
+          "apply with rebuild",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R02",
+          "V01"
+        ],
+        "contract": "Distinct legacy compaction with backup and optional rebuild. A later rebuild error currently loses completed compaction evidence; preserve a partial receipt."
+      },
+      {
+        "tool": "bbox_embed_partitions",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "list",
+          "prune apply",
+          "prune preview",
+          "scrub apply",
+          "scrub preview"
+        ],
+        "current_refinements": [
+          "list exact inventory",
+          "prune exact preview inventory",
+          "prune route selector"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R05",
+          "R08",
+          "V01"
+        ],
+        "contract": "Validated list/prune/scrub choices, paged and exact preview inventory, explicit age/route, pre-effect prune batch refusal and partial deletion counts implemented. Scrub still scans one entire mapped partition; stress arbitrary route/entity fields."
+      },
+      {
+        "tool": "bbox_embed_status",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "coverage",
+          "debug",
+          "diagnostics",
+          "recall probe",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R05",
+          "R08",
+          "V01"
+        ],
+        "contract": "Coverage, graph diagnostics and recall probes remain explicit expensive opt-ins; cheap status preserves failures/losses. Default 64-route diagnostic selection is not a bound on all caller-supplied names or nested reports."
+      },
+      {
+        "tool": "bbox_find_paths",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "to",
+          "to_type"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Bounded traversal and direction-preserving cached paths remain useful. Move runbook-scale chooser prose to cold docs while keeping identity/readiness prerequisites."
+      },
+      {
+        "tool": "bbox_forget",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "checkout-owner",
+          "global/local"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Retirement/supersession differs from creating knowledge. Preserve explicit owner, approval and queued-publication semantics."
+      },
+      {
+        "tool": "bbox_gap",
+        "owner": "src/tools/gaps.rs",
+        "historical_branches": [
+          "global",
+          "project"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "First-class deduplicated substrate record. Project mutation is queued to the checkout owner; this pass observed admission before independently checking delivery."
+      },
+      {
+        "tool": "bbox_gap_resolve",
+        "owner": "src/tools/gaps.rs",
+        "historical_branches": [
+          "resolve",
+          "supersede"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Resolution and paired supersession remain distinct. Paired admission does not imply atomic owner delivery; existing transport dependency owns that guarantee."
+      },
+      {
+        "tool": "bbox_gap_update",
+        "owner": "src/tools/gaps.rs",
+        "historical_branches": [
+          "update"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Existing-record edits compose through the owner queue; do not recreate occurrences to update evidence. This pass uses the existing audit gap and leaves it unresolved."
+      },
+      {
+        "tool": "bbox_gaps",
+        "owner": "src/tools/gaps.rs",
+        "historical_branches": [
+          "debug",
+          "exact id",
+          "full",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05"
+        ],
+        "contract": "Typed filters, summary pages and visibility signals work. Exact ID/full still serialize the whole record, with no body cursor when a single record exceeds the envelope."
+      },
+      {
+        "tool": "bbox_hybrid_search",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "debug",
+          "default"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Default retains identity and degradation, debug adds ranking telemetry. Top-k is selection, not an exhaustive inventory; adversarial metadata/debug bounds remain verification work."
+      },
+      {
+        "tool": "bbox_inbox",
+        "owner": "src/tools/attention.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Section row/preview caps and expansion hints remain; adapter appends visibility/provenance afterward. Prove complete envelope under high diagnostic fanout."
+      },
+      {
+        "tool": "bbox_inspect_entity",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "edge_cursor",
+          "full",
+          "property",
+          "smart",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Summary/smart/full, exact property pages and edge cursors preserve projection/freshness limits. Exact reads cannot expand content omitted during ingestion."
+      },
+      {
+        "tool": "bbox_knowledge",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "exact system memory",
+          "packet category",
+          "query",
+          "system_memory category"
+        ],
+        "current_refinements": [
+          "entry_detail",
+          "diagnostics_detail"
+        ],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05",
+          "R06"
+        ],
+        "contract": "Exact entry/system-memory/diagnostic pages and compact diagnostics implemented. Normal text still emits complete title/provider metadata; limit lacks a maximum, memory category ignores it, packet histograms grow."
+      },
+      {
+        "tool": "bbox_knowledge_link",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "checkout-owner",
+          "global/local"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Durable knowledge relationships preserve owner and publication semantics; no new mutation acceptance claimed."
+      },
+      {
+        "tool": "bbox_learn",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "checkout-owner",
+          "global/local"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Operator-approved rendered rules remain distinct from cold facts and active threads. Owner queue completion is not accepted publication."
+      },
+      {
+        "tool": "bbox_lint",
+        "owner": "src/tools/render.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05",
+          "R06",
+          "R08"
+        ],
+        "contract": "Unpaged issue text and full titles/duplicate groups remain, followed by session diagnostics. Recovery hint uses obsolete blackbox_review; add bounded findings and correct reader."
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "owner": "src/tools/mcp_surface.rs",
+        "historical_branches": [
+          "describe",
+          "list",
+          "replay"
+        ],
+        "current_refinements": [
+          "replay policy page",
+          "describe policy page"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R05",
+          "R06",
+          "R08"
+        ],
+        "contract": "Typed actions, list-selector rejection, live row paging and exact policy/packet hints implemented and partly live checked. Complex predicates still display matches_surface=*; arbitrary policy strings and echoed selectors need growth proof."
+      },
+      {
+        "tool": "bbox_messages",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "native",
+          "retained-conversation"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Exact session/locator reads retain body/count bounds and native projection limitations; they do not read the caller filesystem."
+      },
+      {
+        "tool": "bbox_note",
+        "owner": "src/tools/notes.rs",
+        "historical_branches": [
+          "create"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Host-owned project association uses catalog/filter identity without checkout write authority. Unresolved note projects deliberately preserve literal compatibility, unlike pin mutation; document the distinction."
+      },
+      {
+        "tool": "bbox_note_resolve",
+        "owner": "src/tools/notes.rs",
+        "historical_branches": [
+          "batch",
+          "single"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R02"
+        ],
+        "contract": "Single/batch IDs validate before mutation and output is compact, but no batch cardinality/input-byte cap exists. Add a pre-effect bound without changing atomic selection validation."
+      },
+      {
+        "tool": "bbox_notes",
+        "owner": "src/tools/notes.rs",
+        "historical_branches": [
+          "exact/full",
+          "summary"
+        ],
+        "current_refinements": [
+          "exact JSON body cursor"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Live-offset summaries plus exact content-bound JSON readers implemented; stale and cross-note cursor tests exist. Exact reads preserve complete Unicode records."
+      },
+      {
+        "tool": "bbox_packet_events",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "query"
+        ],
+        "current_refinements": [
+          "exact event body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R08",
+          "V01"
+        ],
+        "contract": "Closed operation/outcome enums, timestamp validation, append-aware cursor pages and exact event body implemented. Whole-log scan cost remains independent of response bounds."
+      },
+      {
+        "tool": "bbox_packet_gap",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "record"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Packet AST expressiveness has a distinct record surface; general MCP deficits use the gap store."
+      },
+      {
+        "tool": "bbox_packet_list",
+        "owner": "src/tools/packets.rs",
+        "historical_branches": [
+          "detail",
+          "exact revision",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R05",
+          "R06"
+        ],
+        "contract": "Row/byte pages and exact packet body exist. Detail classification histograms can overflow a row and require a summary retry; expose explicit live-offset and recovery semantics."
+      },
+      {
+        "tool": "bbox_pin",
+        "owner": "src/tools/attention.rs",
+        "historical_branches": [
+          "delete",
+          "list",
+          "set"
+        ],
+        "current_refinements": [
+          "list exact id/full"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Host-owned identity, early scope/action validation, live summary pages and exact pin JSON implemented. Project-filter read and invalid scope verified live; wrong-action field validation remains incomplete."
+      },
+      {
+        "tool": "bbox_project_attach",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "attach"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Local authority/identity marker required; transport-owned and remote-only attachment refuses. Recorded capabilities are observations. Stress alias nomination result fanout before claiming full bounds."
+      },
+      {
+        "tool": "bbox_project_catalog_get",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "aliases",
+          "attachments",
+          "observations",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Aliases/attachments page with epoch refusal; observations returns one bounded projection and rejects paging controls. Recorded-authority wording is explicit. Nonzero get offset requires epoch; preserve that distinction from catalog list."
+      },
+      {
+        "tool": "bbox_project_catalog_list",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "list"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Authoritative logical-project discovery in catalog mode, bounded rows with optional epoch continuation. Unavailable in bridge mode, so not a universal project_list replacement."
+      },
+      {
+        "tool": "bbox_project_default_attachment",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "clear",
+          "set"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Path-free set/clear with epoch and bounded reason. Catalog choice is not present filesystem authority."
+      },
+      {
+        "tool": "bbox_project_detach",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "detach"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R02",
+          "V01"
+        ],
+        "contract": "Path-free transaction remains useful. census_row_removed=false conflates no row with lifecycle-guard failure; distinguish partial auxiliary cleanup from catalog detach."
+      },
+      {
+        "tool": "bbox_project_eject",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "apply",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Local-only migration of central knowledge into repo-owned files; the project stays registered. Partial repository, central-store and marker outcomes are now explicit; missing-root lifecycle belongs to its existing owner."
+      },
+      {
+        "tool": "bbox_project_graph_describe",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "all",
+          "own",
+          "published"
+        ],
+        "current_refinements": [
+          "schema body",
+          "descriptor body",
+          "variant page/selectors"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Compact descriptor, exact schema/descriptor pages and variant pagination/selectors implemented with content-bound cursors. Preserve source/checkout/hash identity."
+      },
+      {
+        "tool": "bbox_project_graph_list",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "all",
+          "own",
+          "published"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Row/byte pages, deterministic order and nonzero-offset stamp checks implemented. Changed views refuse continuation; do not call the mutable inventory a permanent snapshot."
+      },
+      {
+        "tool": "bbox_project_graph_validate",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "all",
+          "own",
+          "published"
+        ],
+        "current_refinements": [
+          "errors row page",
+          "errors exact body"
+        ],
+        "disposition": "remaining",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Error row and exact error pages implemented. Outer summary still collects every visible variant, unlike describe; high variant fanout needs a producer bound."
+      },
+      {
+        "tool": "bbox_project_init",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "init"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Checkout identity/config initialization remains useful. Lead chooser with the actual owning host/collector prerequisite."
+      },
+      {
+        "tool": "bbox_project_list",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "list"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R04",
+          "R07"
+        ],
+        "contract": "Unpaged compatibility root view still has bridge parity and documentation consumers. Catalog list is unavailable in bridge mode; establish bridge replacement before consolidation."
+      },
+      {
+        "tool": "bbox_project_promote",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "apply"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Existing local/offline authority lane with improved chooser and transport-owned refusal. No remote capability inferred from a truthful refusal."
+      },
+      {
+        "tool": "bbox_project_publisher_advance",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "advance attachment apply",
+          "advance attachment preview",
+          "advance candidate apply",
+          "advance candidate preview",
+          "establish attachment apply",
+          "establish attachment preview",
+          "establish candidate apply",
+          "establish candidate preview"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Source exclusivity, candidate ref, CAS, dry-run and pointer-swap uncertainty implemented across establishment/advance branches. Preserve admission versus accepted publication."
+      },
+      {
+        "tool": "bbox_project_publisher_bind",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "bind"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Useful attachment-only rebinding; covered projects refuse. Put the restriction in chooser before the failing call."
+      },
+      {
+        "tool": "bbox_project_publisher_status",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [
+          "health exact body",
+          "connector exact body"
+        ],
+        "disposition": "remaining",
+        "work": [
+          "R05",
+          "R06",
+          "R08"
+        ],
+        "contract": "Compact health/connector and exact content/epoch-bound pages implemented; CAS identity survives. Raw auto_advance.last_attempt still escapes projection; detail_limit validation and chooser disagree."
+      },
+      {
+        "tool": "bbox_project_register",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "register"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Source-host checkout registration is distinct from logical catalog listing. Clarify owner prerequisite and catalog versus bridge follow-up reader."
+      },
+      {
+        "tool": "bbox_project_rename",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "apply",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Explicit local administrator operation, dry-run and partial failure reporting implemented. Transport-owned refusal is intentional."
+      },
+      {
+        "tool": "bbox_project_scope_migrate",
+        "owner": "src/tools/project_catalog.rs",
+        "historical_branches": [
+          "apply",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R08",
+          "V01"
+        ],
+        "contract": "Local/offline authority and operator-owned acknowledgement remain explicit; transport-owned scope refuses before probes. Planning cost is separate from reply size."
+      },
+      {
+        "tool": "bbox_project_unregister",
+        "owner": "src/tools/projects.rs",
+        "historical_branches": [
+          "apply",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R07",
+          "V01"
+        ],
+        "contract": "Compatibility action has real mode split: bridge unregister versus catalog detach, with offline logical retirement guidance. Preserve useful data/consumers before consolidation."
+      },
+      {
+        "tool": "bbox_provenance_export",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "export"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R02",
+          "R07",
+          "V01"
+        ],
+        "contract": "Legacy all-project Git notes mutation has local CLI overlap. Later note-write failure loses already-completed counts; retain partial receipt and review real legacy consumers before removal."
+      },
+      {
+        "tool": "bbox_provenance_export_plan",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "continuation",
+          "first page"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Bounded session-authoritative generation-bound plan has a real bro CLI consumer that restarts stale generations. Keep distinct from writing notes."
+      },
+      {
+        "tool": "bbox_provenance_import",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "import"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R06",
+          "R07",
+          "V01"
+        ],
+        "contract": "Local Git notes-to-sidecar operation; covered-project refusal precedes leases. Chooser should expose owner requirements; retirement needs legacy consumer/data review."
+      },
+      {
+        "tool": "bbox_reembed",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "start"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R06",
+          "R08",
+          "V01"
+        ],
+        "contract": "Starts convergence rather than pruning. Required bucket route supports all/backfill and explicit transcript guard; receipt says refill started, enqueue result only logged. Expose route vocabulary and observation limits."
+      },
+      {
+        "tool": "bbox_ref_size",
+        "owner": "src/tools/graph.rs",
+        "historical_branches": [
+          "file refs",
+          "indexed refs"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Indexed-ref preflight works remotely; raw file refs need checkout authority. Ref cardinality alone does not bound arbitrary identities or aggregate reply bytes."
+      },
+      {
+        "tool": "bbox_reindex",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "queue",
+          "wait"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Queue admission and explicit wait-for-completion are separate. Empty-project authority stays operator supplied; no collected-source publication claim from a daemon scan."
+      },
+      {
+        "tool": "bbox_remember",
+        "owner": "src/tools/knowledge.rs",
+        "historical_branches": [
+          "checkout-owner",
+          "global/local"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Cold durable recall retains operator approval and owner/publication distinctions, without ambient rendering."
+      },
+      {
+        "tool": "bbox_render",
+        "owner": "src/tools/render.rs",
+        "historical_branches": [
+          "both",
+          "global",
+          "project"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R05",
+          "R06",
+          "V01"
+        ],
+        "contract": "Host/global CLI and managed project owner lanes remain useful. Chooser hides prerequisites; appended diagnostics still need complete-envelope proof."
+      },
+      {
+        "tool": "bbox_review",
+        "owner": "src/tools/render.rs",
+        "historical_branches": [
+          "approve",
+          "list",
+          "reject"
+        ],
+        "current_refinements": [
+          "get exact record"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R02",
+          "R08",
+          "V01"
+        ],
+        "contract": "Bounded live queue and exact record pages implemented. Local mutation validation exists, but queued approve/reject drops forbidden cursor/limit before validation; move validation before enqueue."
+      },
+      {
+        "tool": "bbox_roadmap",
+        "owner": "src/tools/roadmap.rs",
+        "historical_branches": [
+          "create",
+          "default_template",
+          "delete",
+          "get",
+          "link",
+          "list",
+          "next",
+          "promote",
+          "render",
+          "repair_links",
+          "search",
+          "unlink",
+          "update"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R04",
+          "R05",
+          "R06",
+          "R07"
+        ],
+        "contract": "All 13 branches remain executable: state, links, ranking, promotion and rendering. Existing owner gap covers consumer/data decision. List/search lack continuation and exact get/render bodies remain unpaged; ownership of a retirement decision does not discharge those contracts. default_template is missing from action prose; repeated promote hints incorrectly use bro_resume for thread IDs."
+      },
+      {
+        "tool": "bbox_search",
+        "owner": "src/tools/transcripts.rs",
+        "historical_branches": [
+          "fulltext",
+          "smart"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "V01"
+        ],
+        "contract": "Typed SearchRecovery now routes native, retained conversation, thread and generic entity hits to valid readers or explicit unavailability. Current live query only exercised native hits; other types have inspected regressions."
+      },
+      {
+        "tool": "bbox_session",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Exact indexed session metadata has a distinct role from message pages and global session discovery."
+      },
+      {
+        "tool": "bbox_sessions_list",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "list"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Recency list has actual default/max 30/100; chooser lacks limits, project and empty-result semantics. Preserve source freshness caveats."
+      },
+      {
+        "tool": "bbox_stats",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Cached index/segment counts with stated 60-second cache limit; no source-freshness inference."
+      },
+      {
+        "tool": "bbox_storage_gc",
+        "owner": "src/tools/storage_gc.rs",
+        "historical_branches": [
+          "apply",
+          "preview",
+          "receipt candidates",
+          "receipt deleted",
+          "receipt errors",
+          "receipt exclusions",
+          "receipt full",
+          "receipt packets",
+          "receipt summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Preview/apply and immutable summary/candidate/deleted/error/exclusion/full/packet receipt readers stay distinct. Partial stages survive; reading receipts never authorizes or repeats deletion."
+      },
+      {
+        "tool": "bbox_storage_health",
+        "owner": "src/tools/storage_health.rs",
+        "historical_branches": [
+          "files",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R08",
+          "V01"
+        ],
+        "contract": "Relative diagnostic file pages are byte bounded with explicit live offsets. Summary/files still scan before projection; paths identify daemon storage, not caller recovery files."
+      },
+      {
+        "tool": "bbox_storage_migrate_legacy_edges",
+        "owner": "src/tools/storage_migration.rs",
+        "historical_branches": [
+          "apply",
+          "preview"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "R07",
+          "R08",
+          "V01"
+        ],
+        "contract": "One selector resolver now handles preview/apply paths, IDs and aliases. Preview pages; apply refuses page selectors and requires one project. Still plans before slicing; specialist consumer review remains."
+      },
+      {
+        "tool": "bbox_thread",
+        "owner": "src/tools/threads.rs",
+        "historical_branches": [
+          "continue",
+          "get",
+          "link",
+          "open",
+          "promote",
+          "rename",
+          "resolve"
+        ],
+        "current_refinements": [
+          "get summary explicit/default",
+          "get notes",
+          "get sessions",
+          "get edges",
+          "get note",
+          "get handoff"
+        ],
+        "disposition": "remaining",
+        "work": [
+          "R04",
+          "R06",
+          "V01"
+        ],
+        "contract": "Default summary, history and exact note/handoff pages implemented. Explicit summary fails live. Mutation bag ignores get-only fields; truncated topic/session/edge metadata need valid exact recovery breadcrumbs."
+      },
+      {
+        "tool": "bbox_thread_list",
+        "owner": "src/tools/threads.rs",
+        "historical_branches": [
+          "list"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Bounded summaries and catalog/historical-path filters work without checkout leases. Last-activity ordering is a live view; updates can move rows."
+      },
+      {
+        "tool": "bbox_tool_calls",
+        "owner": "src/tools/tool_calls.rs",
+        "historical_branches": [
+          "query"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R05",
+          "V01"
+        ],
+        "contract": "Typed kind/time, candidate-offset continuation and bounded previews exist; empty nonterminal pages are deliberate. Oversized locator reports recovery unavailable; full-envelope escaped-field proof remains."
+      },
+      {
+        "tool": "bbox_topics",
+        "owner": "src/tools/sessions.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Top terms are a distinct session profile; not a substitute for reading evidence."
+      },
+      {
+        "tool": "bro_agent_describe",
+        "owner": "src/tools/agents.rs",
+        "historical_branches": [
+          "describe"
+        ],
+        "current_refinements": [
+          "manifest body",
+          "brofile body",
+          "metadata body",
+          "summary body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R03",
+          "V01"
+        ],
+        "contract": "Stored manifest, resolved brofile, metadata and complete computed-summary pages now recover oversized fields. Actual runtime permission planes are explicitly partial; distinct from stored get."
+      },
+      {
+        "tool": "bro_agent_dispatch",
+        "owner": "src/tools/agents.rs",
+        "historical_branches": [
+          "dispatch"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Manifest validation, custom-adapter refusal, authority checks and attribution add value over raw exec. No new provider execution in this pass."
+      },
+      {
+        "tool": "bro_agent_get",
+        "owner": "src/tools/agents.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [
+          "manifest body",
+          "metadata recovery via bro_agent_describe"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R03",
+          "V01"
+        ],
+        "contract": "Lifecycle/manifest summary and exact redacted manifest pages implemented; complete metadata recovers through bro_agent_describe(detail_plane=metadata). Field-specific redaction is not a claim that arbitrary prose is sanitized."
+      },
+      {
+        "tool": "bro_agent_list",
+        "owner": "src/tools/agents.rs",
+        "historical_branches": [
+          "detail",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Filter-before-paging and sorted identity summaries; expanded list is not exact manifest replacement. Specialist discovery does not mean this client can call it."
+      },
+      {
+        "tool": "bro_agent_search",
+        "owner": "src/tools/agents.rs",
+        "historical_branches": [
+          "query"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R05"
+        ],
+        "contract": "Full descriptions/when-to-use/anti-pattern arrays remain per hit; total_matched is only returned length and vector telemetry is always present. Use existing exact readers for expanded text."
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "clear",
+          "read",
+          "update"
+        ],
+        "current_refinements": [
+          "exact probe body"
+        ],
+        "disposition": "remaining",
+        "work": [
+          "R02",
+          "R03",
+          "V01"
+        ],
+        "contract": "Save errors propagate and exact probe pages exist. Corrupt loads become empty, contradictory clear/update/cooldowns silently choose, and update can persist before invalid cursor rejection."
+      },
+      {
+        "tool": "bro_allocator_status",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "candidate preview",
+          "status"
+        ],
+        "current_refinements": [
+          "config body",
+          "preview body",
+          "in_flight body",
+          "probes body",
+          "leases body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R03",
+          "R08",
+          "V01"
+        ],
+        "contract": "Independent compact inventories and exact config/preview/in-flight/probes/leases planes implemented. Current versus expired runtime quota distinguished; all inventories and allocation preview still computed before paging."
+      },
+      {
+        "tool": "bro_allocator_trace",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "get"
+        ],
+        "current_refinements": [
+          "exact trace body"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R03",
+          "V01"
+        ],
+        "contract": "Compact summary and exact change-bound trace pages implemented. Opaque raw diagnostic prose is not guaranteed credential-sanitized."
+      },
+      {
+        "tool": "bro_broadcast",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "dispatch"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R02",
+          "V01"
+        ],
+        "contract": "Pre-effect member/receipt caps and ordinary-loop per-child outcomes implemented. Later filter resolution can early-return after prior admission; final team save has no durable-result status."
+      },
+      {
+        "tool": "bro_brofile",
+        "owner": "src/tools/roster.rs",
+        "historical_branches": [
+          "clear_provider_default",
+          "create",
+          "delete",
+          "get",
+          "get_provider_default",
+          "list",
+          "list_accounts",
+          "list_provider_defaults",
+          "set_account",
+          "set_provider_default"
+        ],
+        "current_refinements": [
+          "get_account",
+          "list_accounts exact inventory"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R02",
+          "R04",
+          "R05",
+          "R06",
+          "V01"
+        ],
+        "contract": "Exact selected-scope brofile/account pages, redacted inventory and strict config mutation implemented. Read helpers still collapse malformed/unreadable stores to empty/not-found; some summary identities grow and project locality needs clarity."
+      },
+      {
+        "tool": "bro_cancel",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Distinct cancellation control; no peer task controlled in this pass."
+      },
+      {
+        "tool": "bro_dashboard",
+        "owner": "src/tools/roster.rs",
+        "historical_branches": [
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Bounded status/filter projection and early selector validation implemented. Ordinary context telemetry stays omitted."
+      },
+      {
+        "tool": "bro_exec",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "dispatch",
+          "request_key replay"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Fresh dispatch, selector alternatives and request-key replay preserve reservation/admission/unknown outcomes; no fresh provider probe needed for this docs pass."
+      },
+      {
+        "tool": "bro_interrupt",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Interrupt without replacing session continuity remains distinct from cancel and steer."
+      },
+      {
+        "tool": "bro_mcp",
+        "owner": "src/tools/config.rs",
+        "historical_branches": [
+          "add",
+          "allow",
+          "clear_filters",
+          "disallow",
+          "get",
+          "list",
+          "remove",
+          "sync"
+        ],
+        "current_refinements": [
+          "get_filters",
+          "list exact inventory"
+        ],
+        "disposition": "adjusted",
+        "work": [
+          "R06",
+          "R07",
+          "V01"
+        ],
+        "contract": "Scope/action validation, selected-store list/get, exact redacted server/filter inventory and HTTP/SSE add implemented. sync is a callable retired refusal; project configuration remains daemon-owned."
+      },
+      {
+        "tool": "bro_providers",
+        "owner": "src/tools/roster.rs",
+        "historical_branches": [
+          "detail",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Summary versus selected provider detail, invalid-provider refusal and peak advisories implemented. Discovery is not account membership or successful provider admission."
+      },
+      {
+        "tool": "bro_prune",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "apply",
+          "preview",
+          "retro option"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R01",
+          "R02",
+          "R05"
+        ],
+        "contract": "Invalid provider becomes no filter; empty task_ids removes the ID restriction, defaulting to the failed-task sweep when status is omitted; apply is default. Complete IDs are returned after effects and disk persistence is only requested. Lead the queue with pre-effect selector refusal."
+      },
+      {
+        "tool": "bro_report",
+        "owner": "src/tools/roster.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R02",
+          "R05"
+        ],
+        "contract": "Required message still stores and echoes unbounded message/needs/data before global response guard. Bound the admitted payload/receipt and expose exact report recovery."
+      },
+      {
+        "tool": "bro_resume",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "request_key replay",
+          "resume"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "Existing-session continuation with request-key replay and owner refusal remains distinct from fresh exec and thread reads."
+      },
+      {
+        "tool": "bro_retro",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "restricted",
+        "work": [
+          "R06",
+          "V01"
+        ],
+        "contract": "Effectful resumed model turn, not passive detail. Prune retro docs say before dropping, while code drops first; correct ordering and partial outcome language."
+      },
+      {
+        "tool": "bro_status",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "debug",
+          "report",
+          "result",
+          "structured_exit",
+          "summary"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "R03",
+          "V01"
+        ],
+        "contract": "Bounded summary, debug and exact result/report/structured-exit planes implemented. Debug remains field-specific evidence, not a universal redaction guarantee."
+      },
+      {
+        "tool": "bro_steer",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "call"
+        ],
+        "current_refinements": [],
+        "disposition": "retained",
+        "work": [
+          "V01"
+        ],
+        "contract": "In-flight user input preserves current task continuity; distinct from resume after terminal work."
+      },
+      {
+        "tool": "bro_team",
+        "owner": "src/tools/roster.rs",
+        "historical_branches": [
+          "create",
+          "delete_template",
+          "dissolve",
+          "get",
+          "get_template",
+          "list",
+          "list_templates",
+          "roster",
+          "save_template"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "R02",
+          "R06",
+          "V01"
+        ],
+        "contract": "Bounded inventories, exact team/template pages, member caps, inert legacy advisors and project-template refusal implemented. Dissolve ignores cancellation/removal errors; delete failure can look like missing."
+      },
+      {
+        "tool": "bro_wait",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "wait"
+        ],
+        "current_refinements": [],
+        "disposition": "remaining",
+        "work": [
+          "R01",
+          "V01"
+        ],
+        "contract": "Unknown-task refusal and timeout snapshot maintained. Unvalidated negative or unrepresentable timeout reaches Duration conversion; validate before waiting."
+      },
+      {
+        "tool": "bro_when_all",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "task_ids",
+          "team"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "R01",
+          "V01"
+        ],
+        "contract": "Whole selection validated before waiting; 64-target cap, duplicate semantics and bounded mixed-outcome receipts implemented. Unknown-only refusal verified live; shared duration validation remains."
+      },
+      {
+        "tool": "bro_when_any",
+        "owner": "src/tools/dispatch.rs",
+        "historical_branches": [
+          "task_ids",
+          "team"
+        ],
+        "current_refinements": [],
+        "disposition": "adjusted",
+        "work": [
+          "R01",
+          "V01"
+        ],
+        "contract": "Whole selection validated before waiting; bounded terminal/success distinctions implemented. Unknown-only refusal verified live; negative or huge finite duration can panic after valid selection."
+      }
+    ],
+    "review": {
+      "method": "Independent scoped source review of current mappings and evidence; corrections incorporated.",
+      "coverage": "dispatch/config/roster/agents/allocator; read/knowledge/graph/packet/artifact; admin/locality/health/review",
+      "tests_executed": false
+    }
+  }
+}

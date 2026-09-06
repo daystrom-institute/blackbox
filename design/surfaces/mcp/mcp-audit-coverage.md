@@ -12,9 +12,11 @@ brief: "Complete registered-tool inventory grouped by adapter owner and audit fi
 # MCP audit coverage
 
 The current checklist is the [surviving MCP action audit](mcp-survivor-action-audit.md),
-with the [served catalog and probe evidence](mcp-survivor-audit-evidence.json).
+with the [current reconciliation evidence](mcp-survivor-reconciliation-evidence.json).
 It assigns explicit dispositions across all 109 served tools and their action/detail
-branches. The table below is historical family triage, not the completion gate.
+branches. Its initial matrix is preserved in the
+[historical survivor checkpoint](mcp-survivor-action-audit-initial-checkpoint.md).
+The table below is historical family triage, not the completion gate.
 Caller-facing findings drive this audit; backend delivery and readiness gaps are
 separate dependencies, not its implementation sequence.
 

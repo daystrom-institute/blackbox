@@ -1,23 +1,25 @@
 {
   "id": "gap-7a2513c9",
-  "title": "Surviving MCP actions still misreport completion, require checkout access for reads, and return unbounded detail",
+  "title": "Remaining MCP surface audit: mutation selectors, partial outcomes, exact recovery and simplification",
   "gap_kind": "mcp_surface",
   "domain": "survivor-audit",
-  "wanted_capability": "A reviewed per-action MCP contract: unknown task IDs cannot produce all_completed=true; project-filtered pin reads must use catalog filtering; typed filters must reject invalid values; returned detail must be bounded and recoverable; search hints must match the hit entity type; retired no-op actions need a deliberate discovery disposition.",
+  "wanted_capability": "A current per-action closure record for the 109 served MCP tools, with fail-closed mutation selectors, honest partial effects, bounded complete replies and exact recovery, chooser/schema parity, and consumer-backed retirement decisions.",
   "evidence": [
-    "src/tools/dispatch.rs::bro_when_all",
-    "src/tools/attention.rs::bbox_pin",
-    "crates/bbox-corpus-index/src/index/search.rs",
-    "src/tools/graph.rs::bbox_project_graph_describe",
-    "design/surfaces/mcp/mcp-survivor-audit-evidence.json"
+    "thread:thread-c749d06c",
+    "design/surfaces/mcp/mcp-survivor-action-audit.md",
+    "design/surfaces/mcp/mcp-survivor-reconciliation-evidence.json",
+    "design/surfaces/mcp/mcp-survivor-action-audit-initial-checkpoint.md",
+    "src/tools/dispatch.rs::bro_prune",
+    "src/tools/threads.rs::bbox_thread",
+    "src/tools/artifacts.rs::bbox_artifact_supersede"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/survivor-audit/caller-contract-residuals",
-  "notes": "Live audit: unknown-only bro_when_all returns all_completed=true with zero results while bro_wait rejects the same ID. Pin list with a registered project fails attachment_inactive; no project filter succeeds. Invalid brofile/MCP list scope returns normal results, invalid pin scope and packet event operation return empty success. Search of this audit thread recommends bbox_messages with an empty session ID. Graph describe returns 26237 result bytes, thread get 23108, unmatched knowledge recall 6789. Record precise dispositions in the action audit. This gap tracks caller-facing corrections; checkout transaction/replay redesign and edge-index scheduling remain separate existing gaps.",
+  "notes": "Reconciled for thread-c749d06c at source 004822640975 on 2026-09-06. Original pre-fix examples are historical, not current failure claims. Fresh read-only production probes confirm unknown-only aggregate waits refuse, registered-project pin filtering works, invalid pin scopes and surface action-mismatched selectors refuse, and full thread note recovery works across bounded pages. Existing source/tests implement additional MCP/account/agent/allocator/packet/graph/review detail and validation fixes; prior integration gates remain checkpoint evidence, not exhaustive action acceptance. Live-confirmed residual: explicit bbox_thread detail=summary is rejected although default summary works. Source-confirmed priorities: bro_prune drops invalid provider and empty task_ids filters; allocator/review can validate detail fields after admission/effects; broadcast/admin paths can lose completed-effect receipts; artifact supersede exposes raw metadata requiring a synthetic disclosure probe; some exact readers page already-truncated data and remaining default/fanout replies lack complete-envelope recovery. Current dispositions and ordered acceptance work live in design/surfaces/mcp/mcp-survivor-action-audit.md; sanitized fresh observations in mcp-survivor-reconciliation-evidence.json. Keep unresolved. GLM experiments and backend delivery/readiness repair remain separately owned.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T19:05:09Z",
-  "updated_at": "2026-09-06T19:05:09Z"
+  "updated_at": "2026-09-06T23:13:07Z"
 }

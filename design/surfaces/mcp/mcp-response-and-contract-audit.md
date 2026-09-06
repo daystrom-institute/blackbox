@@ -12,9 +12,11 @@ brief: "Source-backed triage of tool usefulness, caller contracts, response brev
 # MCP response and contract audit
 
 Current checklist: [surviving MCP action audit](mcp-survivor-action-audit.md).
-Its [evidence snapshot](mcp-survivor-audit-evidence.json) reconciles the 109-tool
+Its [current evidence snapshot](mcp-survivor-reconciliation-evidence.json) reconciles the 109-tool
 served catalog with source and records new caller-contract probes. This document
-retains the original findings and chronological milestones. Earlier next-step
+retains the original findings and chronological milestones; the
+[initial survivor matrix](mcp-survivor-action-audit-initial-checkpoint.md) is
+also preserved separately. Earlier next-step
 paragraphs are historical; they do not put transaction or index implementation
 ahead of auditing tool usefulness, inputs, responses and recovery.
 
