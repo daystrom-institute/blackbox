@@ -1479,6 +1479,18 @@ impl BlackboxServer {
                 orch::BROADCAST_MEMBER_LIMIT
             ));
         }
+        // Second pre-effect bound: even a member-count-legal team must fit
+        // one minimal receipt per member (exact identity plus bounded error)
+        // inside the reply envelope, or the dispatch is refused before any
+        // member launch or team-file write.
+        let member_names: Vec<&str> = team.members.iter().map(|m| m.name.as_str()).collect();
+        if !orch::broadcast_receipts_fit(&member_names) {
+            return Self::err_text(&format!(
+                "Team {} member receipts cannot fit the response budget of {} bytes. Shorten member names or split the team before broadcasting",
+                orch::truncated_chars(&p.team, 64),
+                orch::BROADCAST_RECEIPTS_BUDGET_BYTES
+            ));
+        }
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let cwd = p.cwd.or(team.project_dir.clone());
         let store_dir = self.state.store_dir.clone();
@@ -1759,7 +1771,7 @@ impl BlackboxServer {
         // aggregate is byte-bounded by compacting later rows, never by
         // dropping members from the reply.
         let (tasks, receipts_truncated) = orch::bound_broadcast_receipts(launched);
-        let mut out = json!({"team": p.team, "tasks": tasks});
+        let mut out = json!({"team": orch::truncated_chars(&p.team, 64), "tasks": tasks});
         if let Some(truncation) = receipts_truncated {
             out["receiptsTruncated"] = truncation;
         }
@@ -2815,6 +2827,15 @@ impl BlackboxServer {
                 summarize_when_ids(&missing)
             ));
         }
+        // Reject selections whose guaranteed minimal receipts cannot fit the
+        // reply envelope before the caller blocks on any wait.
+        if !orch::when_selection_fits(&ids) {
+            return Err(format!(
+                "Selection of {} tasks cannot fit minimal reply receipts within {} bytes. Split the batch",
+                ids.len(),
+                orch::WHEN_ROWS_BUDGET_BYTES
+            ));
+        }
         Ok(tasks)
     }
 }
@@ -3141,6 +3162,16 @@ mod tests {
         assert!(err.contains(&"m".repeat(64)), "{err}");
         assert!(!err.contains(&long_id), "{err}");
 
+        // Selections whose guaranteed minimal receipts cannot fit the
+        // envelope reject before the caller waits, even when every ID is
+        // known to the store.
+        let huge_id = "h".repeat(64 * 1024);
+        seed_when_task(&server.state, &huge_id, orch::TaskStatus::Completed);
+        let err = server
+            .resolve_when_tasks(None, Some(&[huge_id]))
+            .unwrap_err();
+        assert!(err.contains("cannot fit minimal reply receipts"), "{err}");
+
         // Mixed known/missing rejects the whole selection, naming the gap.
         let err = server
             .resolve_when_tasks(None, when_ids(&["known-done", "missing-b"]).as_deref())
@@ -3365,6 +3396,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn when_max_fanout_stays_within_serialized_response_cap() {
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::{ClientHandler, ServiceExt};
+        struct WaitClient;
+        impl ClientHandler for WaitClient {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
+        let state = server.state.clone();
+
+        // Quotes, backslashes, control characters, and non-ASCII all expand
+        // under JSON escaping in both the reply document and the outer
+        // CallToolResult envelope.
+        let hot = "\u{1}\"\\😀\u{2028}\u{7}";
+        let mut ids = Vec::new();
+        for index in 0..orch::WHEN_TARGET_LIMIT {
+            let id = format!("fan-{index:02}");
+            let task = seed_when_task(&state, &id, orch::TaskStatus::Completed);
+            task.inner.lock().last_assistant_message = Some(hot.repeat(192));
+            ids.push(id);
+        }
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = WaitClient.serve(client_io).await.unwrap();
+
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("bro_when_all").with_arguments(
+                    json!({"task_ids": ids, "timeout_seconds": 0})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let wire = serde_json::to_vec(&response).expect("call result serializes");
+        assert!(
+            wire.len() <= crate::server::BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+            "serialized CallToolResult is {} bytes over cap {}",
+            wire.len(),
+            crate::server::BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(
+            value["outcome_counts"]["completed"],
+            json!(orch::WHEN_TARGET_LIMIT as u64),
+            "{value}"
+        );
+        assert_eq!(value["all_completed"], json!(true), "{value}");
+        assert_eq!(value["all_succeeded"], json!(true), "{value}");
+        let rows = value["results"].as_array().unwrap();
+        assert_eq!(rows.len(), orch::WHEN_TARGET_LIMIT, "{value}");
+        for index in 0..orch::WHEN_TARGET_LIMIT {
+            let id = format!("fan-{index:02}");
+            let row = rows
+                .iter()
+                .find(|row| row["taskId"] == json!(id.clone()))
+                .unwrap_or_else(|| panic!("missing {id}: {value}"));
+            assert_eq!(row["status"], json!("completed"), "{value}");
+        }
+        assert!(
+            value["resultsTruncated"]["compacted_rows"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "{value}"
+        );
+
+        client.cancel().await.unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn broadcast_rejects_oversized_team_before_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -3397,6 +3514,89 @@ mod tests {
         assert!(
             server.state.task_store.read().all_tasks().is_empty(),
             "oversized team must not dispatch any tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_rejects_unfittable_receipts_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let members = Value::Array(
+            (0..orch::BROADCAST_MEMBER_LIMIT)
+                .map(|index| {
+                    json!({
+                        "name": "m".repeat(256),
+                        "brofile": format!("missing-{index:03}"),
+                        "task_history": [],
+                    })
+                })
+                .collect(),
+        );
+        save_when_team(&server, "too-wordy", members);
+        let team_path = server.state.store_dir.join("teams").join("too-wordy.json");
+        let before = std::fs::read_to_string(&team_path).expect("team file readable");
+
+        let p: BroadcastParams =
+            serde_json::from_value(json!({"team": "too-wordy", "prompt": "never launch"})).unwrap();
+        let result = server.bro_broadcast(Parameters(p)).await;
+        let err = call_result_text(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(err.contains("cannot fit the response budget"), "{err}");
+        let after = std::fs::read_to_string(&team_path).expect("team file readable");
+        assert_eq!(before, after, "unfittable team must not be rewritten");
+        assert!(
+            server.state.task_store.read().all_tasks().is_empty(),
+            "unfittable team must not dispatch any tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_max_fanout_stays_within_serialized_response_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        // Control characters and non-ASCII in member names expand under
+        // JSON escaping in both the reply and the outer envelope; missing
+        // brofiles keep every receipt deterministic without dispatching.
+        let members = Value::Array(
+            (0..orch::BROADCAST_MEMBER_LIMIT)
+                .map(|index| {
+                    json!({
+                        "name": format!("m\u{1}-{index:03}\u{2028}"),
+                        "brofile": format!("missing-{index:03}"),
+                        "task_history": [],
+                    })
+                })
+                .collect(),
+        );
+        save_when_team(&server, "max-fan", members);
+        let p: BroadcastParams =
+            serde_json::from_value(json!({"team": "max-fan", "prompt": "noop"})).unwrap();
+        let result = server.bro_broadcast(Parameters(p)).await;
+        assert_ne!(result.is_error, Some(true));
+        let wire = serde_json::to_vec(&result).expect("call result serializes");
+        assert!(
+            wire.len() <= crate::server::BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+            "serialized CallToolResult is {} bytes over cap {}",
+            wire.len(),
+            crate::server::BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        let receipts = value["tasks"].as_array().unwrap();
+        assert_eq!(receipts.len(), orch::BROADCAST_MEMBER_LIMIT, "{value}");
+        for index in 0..orch::BROADCAST_MEMBER_LIMIT {
+            let name = format!("m\u{1}-{index:03}\u{2028}");
+            let row = receipts
+                .iter()
+                .find(|row| row["bro"] == json!(name.clone()))
+                .unwrap_or_else(|| panic!("missing {name:?}: {value}"));
+            assert!(
+                row["error"].as_str().unwrap().contains("Brofile not found"),
+                "{value}"
+            );
+        }
+        assert!(
+            server.state.task_store.read().all_tasks().is_empty(),
+            "missing brofiles must not dispatch any tasks"
         );
     }
 

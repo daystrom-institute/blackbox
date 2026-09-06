@@ -824,7 +824,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_broadcast",
         category: ToolCategory::Orchestration,
         summary: "Send the same prompt to every team member. `cwd` (canonical; `project_dir` deprecated alias) overrides the working directory for every member dispatch.",
-        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds. Every member keeps a receipt with identity and admission outcome (taskId/sessionId or a per-member error); over-long error text is truncated, and oversized fan-out compacts later receipts behind receiptsTruncated without dropping any member from the reply.",
+        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds. Every member keeps a receipt with identity and admission outcome (taskId/sessionId or a per-member error); over-long error text is truncated, oversized fan-out or teams whose minimal receipts cannot fit the response budget reject before any dispatch, and large aggregates compact later receipts behind receiptsTruncated without dropping any member from the reply.",
         example: None,
     },
     ToolDoc {
