@@ -1423,7 +1423,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_state",
         category: ToolCategory::Whiteboards,
-        summary: "Read board state filtered for the requesting agent. Phaser-style visibility: blind phase shows only own posts; later phases reveal full board. Includes phase, phase_age_secs, ready_for_transition advisory flag, post / annotation / vote arrays scoped to what this agent should see.",
+        summary: "Read a bounded visible-board preview (up to five posts, annotations, and votes), with truthful visible counts. Blind hides peer posts; debate specialists see only own or related annotations and own votes. Select post_id to focus one visible post. Read detail=full for exact filtered JSON body pages; continue with cursor=body.next_cursor and parse concatenated body.text. Unknown or invisible post ids return not found.",
         when_to_use: "Use to inspect the board before posting / annotating / voting / transitioning. The `ready_for_transition` flag is advisory only — the facilitator still owns the actual decision. External Claudes joining mid-deliberation start here.",
         example: Some(r#"whiteboard_state(board_id="adr-2026-04-27", agent_name="security")"#),
     },
@@ -1457,7 +1457,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_conflicts",
         category: ToolCategory::Whiteboards,
-        summary: "Auto-detect conflicts between posts on a board. Returns three kinds: `direct_overlap` (same target_file + identical target_location), `cascade_collision` (post A cascades to post B's direct target), `severity_disagreement` (same finding_ref, distinct severities). Available in any phase past blind.",
+        summary: "Auto-detect conflicts between posts on a board. Returns three kinds: `direct_overlap` (same target_file + identical target_location), `cascade_collision` (post A cascades to post B's direct target), `severity_disagreement` (same finding_ref, distinct severities). Available in any phase past blind. Default returns at most ten conflict previews and the total count. detail=full returns exact JSON body pages; follow body.next_cursor.",
         when_to_use: "Use during read / validate / debate to surface what specialists disagree on or where their proposed actions collide. The facilitator typically reviews this before transitioning to debate so contested points get explicit annotations.",
         example: Some(
             r#"whiteboard_conflicts(board_id="adr-2026-04-27", agent_name="facilitator")"#,
@@ -1466,7 +1466,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_summarize",
         category: ToolCategory::Whiteboards,
-        summary: "Condensed board summary without full post bodies. Returns counts per type, vote tally per post, conflict count, unresolved-challenge count, agent status (has_posted), phase age, ready_for_transition advisory.",
+        summary: "Summarize only the requesting agent's visible evidence: exact counts and readiness, with bounded post-standing, vote-tally, and agent previews. Gate counts remain numeric and complete for that visible scope. detail=full returns the complete visible summary as JSON body pages; follow body.next_cursor. Hidden peer evidence never contributes counts or ids.",
         when_to_use: "Use for a quick read of board state without paying the full post-body cost. Good for inbox views, gate-packet entity inputs, and long-running observers (e.g. a polling external Claude).",
         example: Some(
             r#"whiteboard_summarize(board_id="adr-2026-04-27", agent_name="facilitator")"#,
@@ -1475,7 +1475,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_archive",
         category: ToolCategory::Whiteboards,
-        summary: "Archive the board (facilitator/operator role, same authority as a phase transition). Resolve phase only, unless force=true, the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics.",
+        summary: "Archive the board (facilitator/operator role, same authority as a phase transition). Resolve phase only, unless force=true, the abandon path for boards stranded mid-phase by a failed arc. Removes the board from active deliberation and returns archive summary statistics.",
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Use force=true from cleanup hooks (e.g. on_arc_exit) when a failed arc stranded the board mid-phase. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
     },
