@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use parking_lot::RwLock;
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::workflow::extractor::Extractor;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WebhookSpec {
     pub name: String,
     pub signature: SignatureScheme,
@@ -43,7 +44,7 @@ pub struct WebhookSpec {
     pub default_project_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignatureScheme {
     /// HMAC-SHA256 over the raw body, hex-encoded. Operator names the

@@ -32,6 +32,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use cron::Schedule;
 use parking_lot::RwLock;
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
@@ -39,7 +40,7 @@ use tokio::task::JoinHandle;
 use crate::server::dispatch::dispatch_routed_event;
 use crate::server::state::SharedState;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CronSpec {
     pub name: String,
     /// Cron expression. The `cron` crate accepts a 6- or 7-field form
@@ -54,7 +55,8 @@ pub struct CronSpec {
     #[serde(default)]
     pub payload: Map<String, Value>,
     /// Max in-flight arcs spawned by this cron. Default 1 (skip ticks
-    /// while the prior arc is still running). Set 0 to disable the cap.
+    /// while the prior arc is still running). Set 0 to lift the cap;
+    /// ticks still dispatch and concurrent arcs are unlimited.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
     /// Routing packet id (same shape as webhook/poller routing).
@@ -66,10 +68,32 @@ pub struct CronSpec {
     pub default_project_dir: Option<String>,
     /// Timezone the cron expression is interpreted in. `"UTC"` (default)
     /// uses UTC; `"Local"` uses the daemon's system-local timezone with
-    /// DST-aware handling (re-evaluated each tick). Other values fall
-    /// back to UTC with a warning.
+    /// DST-aware handling (re-evaluated each tick). Both accept ASCII case
+    /// variants. New installs reject all other values, including IANA names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^([Uu][Tt][Cc]|[Ll][Oo][Cc][Aa][Ll])$"))]
     pub tz: Option<String>,
+}
+
+impl CronSpec {
+    /// Validate before installation or artifact activation performs any write
+    /// or starts a timer. Legacy restoration retains its runtime fallback.
+    pub fn validate(&self) -> Result<()> {
+        validate_schedule(&self.schedule)?;
+        timezone_is_local(self.tz.as_deref())?;
+        Ok(())
+    }
+}
+
+fn timezone_is_local(tz: Option<&str>) -> Result<bool> {
+    match tz {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("UTC") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("Local") => Ok(true),
+        Some(value) => Err(anyhow!(
+            "cron tz '{value}' is unsupported; use UTC or Local (ASCII case-insensitive)"
+        )),
+    }
 }
 
 fn default_concurrency() -> u32 {
@@ -350,15 +374,15 @@ pub fn spawn_loop(state: Arc<SharedState>, spec: CronSpec) -> JoinHandle<()> {
                 return;
             }
         };
-        let tz_local = matches!(spec.tz.as_deref(), Some("Local") | Some("local"));
-        if let Some(tz) = spec.tz.as_deref() {
-            if !matches!(tz, "Local" | "local" | "UTC" | "utc") {
-                tracing::warn!(
-                    "cron '{}': unknown tz '{tz}' — falling back to UTC",
-                    spec.name
-                );
-            }
-        }
+        // Existing persisted specs may predate install-time TZ validation.
+        // Preserve their UTC fallback rather than disabling them at restart.
+        let tz_local = timezone_is_local(spec.tz.as_deref()).unwrap_or_else(|error| {
+            tracing::warn!(
+                "cron '{}': {error}; legacy restore falls back to UTC",
+                spec.name
+            );
+            false
+        });
         loop {
             let now = Utc::now();
             let next = if tz_local {
@@ -435,6 +459,40 @@ mod tests {
     fn schedule_rejects_garbage() {
         assert!(validate_schedule("not a cron").is_err());
         assert!(validate_schedule("").is_err());
+    }
+
+    #[test]
+    fn cron_spec_validation_accepts_supported_zones_and_rejects_runtime_fallbacks() {
+        let mut spec: CronSpec = serde_json::from_value(json!({
+            "name":"timezone-example", "schedule":"0 0 9 * * *", "routing_packet":"example-routing"
+        }))
+        .unwrap();
+        assert!(spec.validate().is_ok());
+        assert!(!timezone_is_local(None).unwrap());
+        for timezone in ["UTC", "utc", "Utc", "uTc"] {
+            spec.tz = Some(timezone.into());
+            assert!(spec.validate().is_ok());
+            assert!(!timezone_is_local(spec.tz.as_deref()).unwrap());
+        }
+        for timezone in ["Local", "local", "LOCAL", "lOcAl"] {
+            spec.tz = Some(timezone.into());
+            assert!(spec.validate().is_ok());
+            assert!(timezone_is_local(spec.tz.as_deref()).unwrap());
+        }
+        for timezone in ["", " UTC ", "America/Edmonton", "Europe/London", "unknown"] {
+            spec.tz = Some(timezone.into());
+            let error = spec.validate().unwrap_err().to_string();
+            assert!(error.contains("cron tz"));
+            assert!(error.contains("use UTC or Local"));
+        }
+        spec.tz = Some("UTC".into());
+        spec.schedule = "invalid".into();
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cron schedule")
+        );
     }
 
     #[test]

@@ -923,7 +923,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_cron_install",
-        description = "Install a calendar-driven cron inlet — sibling of webhook + poller. Same routing pipeline (extractor → routing packet → dispatch_routed_event), different trigger source: wall-clock schedule, no fetch. Spec: name, schedule (6-field cron expr `sec min hour dom mon dow`), optional payload (operator-supplied entity fields), optional concurrency cap (default 1, set 0 to disable), routing_packet, optional default_project_dir. Synthetic entity fields `cron_name` + `tick_at` are merged in at tick time so routing rules can discriminate."
+        description = "Install a calendar-driven cron inlet. The spec schema describes name, seconds-first schedule, routing_packet, and optional payload, concurrency, default_project_dir and tz. Concurrency defaults to 1; 0 lifts the cap and permits unlimited concurrent arcs. tz accepts UTC (default) or Local, case-insensitively; unsupported zones are rejected before installation. Each tick routes the supplied payload with synthetic cron_name and tick_at fields; cron performs no HTTP fetch."
     )]
     // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
     #[allow(clippy::disallowed_methods)]
@@ -935,8 +935,8 @@ Constraints:\n\
             Ok(s) => s,
             Err(r) => return r,
         };
-        if let Err(e) = crons::validate_schedule(&spec.schedule) {
-            return Self::err_text(&format!("cron schedule invalid: {e}"));
+        if let Err(e) = spec.validate() {
+            return Self::err_text(&format!("cron spec invalid: {e}"));
         }
         let dir = self.state.store_dir.join("crons");
         let _ = std::fs::create_dir_all(&dir);
@@ -1166,6 +1166,31 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[tokio::test]
+    async fn cron_install_rejects_unsupported_timezone_before_writes_or_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let response = server.bro_cron_install(Parameters(CronInstallParams {
+            spec: serde_json::json!({"name":"invalid-timezone", "schedule":"0 0 9 * * *", "routing_packet":"example-routing", "tz":"America/Edmonton"}),
+        })).await;
+        assert_eq!(response.is_error, Some(true));
+        assert!(
+            response.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("use UTC or Local")
+        );
+        assert!(server.state.crons.list().is_empty());
+        assert!(
+            !server
+                .state
+                .store_dir
+                .join("crons/invalid-timezone.json")
+                .exists()
+        );
     }
 
     fn status_params() -> ArcStatusParams {

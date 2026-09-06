@@ -24,10 +24,11 @@
 //!                                both into one extracted field).
 
 use anyhow::Result;
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Selector {
     /// `$.user.login` style. Leading `$.` optional.
@@ -87,7 +88,7 @@ impl Selector {
 
 /// Top-level Extractor: a named map of output keys to selectors.
 /// Producing one flat JSON object the packet evaluator consumes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct Extractor {
     pub outputs: std::collections::HashMap<String, Selector>,
 }

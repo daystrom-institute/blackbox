@@ -794,6 +794,11 @@ carries no fetch (entity is operator-supplied `payload` plus synthetic
 `cron_name` + `tick_at` fields). Use cron when the trigger is time-
 based and the dispatched arc itself does the data acquisition.
 
+The `bro_cron_install`, `bro_poller_install`, and `bro_webhook_install` schemas
+describe their actual spec objects and nested selectors, extractors, signature
+schemes, HTTP fetch options, and retry policies. Supply `spec` as an object;
+legacy stringified JSON specs remain accepted by the runtime parser.
+
 ```jsonc
 {
   "name": "sastquatch-daily",
@@ -802,7 +807,7 @@ based and the dispatched arc itself does the data acquisition.
     "owner": "sastquatch-admin",
     "repo": "quat"
   },
-  "concurrency": 1,                 // 0 disables the cap
+  "concurrency": 1,                 // 0 lifts the cap; ticks still dispatch
   "routing_packet": "domain:cron-routing/sastquatch",
   "default_project_dir": "/path/to/local/clone"
 }
@@ -822,6 +827,13 @@ based and the dispatched arc itself does the data acquisition.
   case for daily sweeps). Set 0 to lift the cap. The counter
   decrements when the dispatched arc terminates; failed dispatches
   refund immediately.
+- `tz` accepts `UTC` (default) or `Local`, ASCII case-insensitively. Local
+  schedules use the daemon's system timezone with DST-aware evaluation.
+  Unsupported names, including IANA timezone names, are rejected before MCP
+  installation, HTTP administration, or artifact activation can persist the
+  spec or start a timer. Existing stored specs with unsupported names retain
+  their warned UTC fallback on restart; replace those specs with an explicit
+  supported zone to remove that ambiguity.
 - The routing-packet entity sees `{cron_name, tick_at, ...payload}`.
   Most cron arcs route to `start_arc` unconditionally, but you can
   branch on `cron_name` if multiple crons share a routing packet.
@@ -1096,7 +1108,7 @@ spawn arc
   resolve `${env.X}` in source URL/headers per-tick (no secrets
   persisted to disk). Crons use the `cron` crate's 6-field expression
   form, support a `concurrency` cap (default 1, skip ticks while a
-  prior arc is in flight; set 0 to disable), and decrement the
+  prior arc is in flight; set 0 to lift the cap), and decrement the
   in-flight counter when the dispatched arc terminates.
 - Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
