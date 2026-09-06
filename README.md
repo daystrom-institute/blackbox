@@ -32,7 +32,14 @@ scripts/fmt.sh --check
 cargo nextest run --workspace
 ```
 
-Install the binaries your host runs. A remote corpus deployment keeps source
+Install the binaries your host runs. For the offline administration CLI:
+
+```sh
+install -d ~/.local/bin
+install -m 755 target/release/blackbox ~/.local/bin/blackbox
+```
+
+ A remote corpus deployment keeps source
 collectors on the hosts that own files and transcripts. Follow
 [getting started](docs/getting-started.md), the
 [code collector runbook](docs/code-source-collector.md) and the
