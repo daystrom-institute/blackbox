@@ -39,6 +39,8 @@ pub struct AssistantPreview {
     replace_on_text: bool,
     #[serde(default)]
     separate_on_text: bool,
+    #[serde(default)]
+    last_text_index: Option<u64>,
 }
 
 impl AssistantPreview {
@@ -51,6 +53,7 @@ impl AssistantPreview {
             self.text = Some(text.chars().take(256).collect());
             self.replace_on_text = true;
             self.separate_on_text = false;
+            self.last_text_index = None;
         }
     }
 
@@ -80,8 +83,19 @@ impl AssistantPreview {
                     Some("message_start") => {
                         self.replace_on_text = true;
                         self.separate_on_text = false;
+                        self.last_text_index = None;
                     }
                     Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                        let index = event["index"].as_u64();
+                        // Text block indices increase within an attempt. Responses
+                        // and chat transports reuse their first index on fallback
+                        // without emitting message_start or assistant completion.
+                        if let (Some(index), Some(previous)) = (index, self.last_text_index)
+                            && index <= previous
+                        {
+                            self.replace_on_text = true;
+                        }
+                        self.last_text_index = index;
                         self.separate_on_text = !self.replace_on_text && self.text.is_some();
                         if let Some(text) = event["content_block"]["text"].as_str() {
                             self.append(text);
@@ -115,11 +129,18 @@ impl AssistantPreview {
                 }
                 self.replace_on_text = true;
                 self.separate_on_text = false;
+                self.last_text_index = None;
             }
-            Some("result") if self.text.is_none() && evt["is_error"] != true => {
-                if let Some(text) = evt["result"].as_str() {
+            Some("result") => {
+                if self.text.is_none()
+                    && evt["is_error"] != true
+                    && let Some(text) = evt["result"].as_str()
+                {
                     self.set(text);
                 }
+                self.replace_on_text = true;
+                self.separate_on_text = false;
+                self.last_text_index = None;
             }
             _ => {}
         }
@@ -457,11 +478,31 @@ mod preview_tests {
     use serde_json::json;
 
     #[test]
+    fn restarted_stream_indices_and_interrupted_results_replace_abandoned_text() {
+        for index in [0, 1] {
+            let mut preview = AssistantPreview::default();
+            let start = json!({"type":"stream_event", "event":{"type":"content_block_start", "index":index, "content_block":{"type":"text", "text":""}}});
+            let delta = |text: String| json!({"type":"stream_event", "event":{"type":"content_block_delta", "index":index, "delta":{"type":"text_delta", "text":text}}});
+            preview.observe(&start);
+            preview.observe(&delta("abandoned".repeat(100)));
+            preview.observe(&start);
+            preview.observe(&delta("retry text".into()));
+            assert_eq!(preview.text(), Some("retry text"));
+            preview.observe(
+                &json!({"type":"result", "subtype":"interrupted", "interrupted":true, "result":""}),
+            );
+            assert_eq!(preview.text(), Some("retry text"));
+            preview.observe(&delta("redirected text".into()));
+            assert_eq!(preview.text(), Some("redirected text"));
+        }
+    }
+
+    #[test]
     fn multiple_streamed_text_blocks_belong_to_one_message() {
         let mut preview = AssistantPreview::default();
         preview.set("old message");
-        for text in ["First block", "Second block"] {
-            preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}));
+        for (index, text) in ["First block", "Second block"].into_iter().enumerate() {
+            preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_start", "index":index, "content_block":{"type":"text", "text":""}}}));
             preview.observe(&json!({"type":"stream_event", "event":{"type":"content_block_delta", "delta":{"type":"text_delta", "text":text}}}));
         }
         assert_eq!(preview.text(), Some("First block\n\nSecond block"));
