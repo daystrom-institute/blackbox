@@ -29,6 +29,7 @@ impl InspectableEntityProvider for PacketProvider {
         properties.insert("selector".into(), selector.clone());
         if let Some(stores) = ctx.stores() {
             let packet = stores.packets.read().load(selector)?;
+            properties.insert("body".into(), serde_json::to_string(&packet)?);
             properties.insert("id".into(), packet.id);
             properties.insert("domain".into(), packet.domain);
             properties.insert("scope".into(), packet.scope);
@@ -59,6 +60,7 @@ impl InspectableEntityProvider for PacketProvider {
                 "classification_lattice",
                 "created_at",
                 "updated_at",
+                "body",
             ],
             &["DERIVED_FROM", "SUPERSEDES"],
             &["selector", "id", "domain", "scope"],

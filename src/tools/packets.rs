@@ -73,7 +73,7 @@ fn packet_list_page(
     bbox_corpus_core::response_page::bound_page(
         serde_json::json!({"count": packets.len(), "packets": packets, "total": total, "offset": offset, "limit": limit,
             "next_offset": (next_offset < total).then_some(next_offset), "order": "created_at_desc,id_asc",
-            "detail_hint": "bbox_packet_list(packet_id=<id>,detail=true)",
+            "detail_hint": "Rule previews: bbox_packet_list(packet_id=<id>,detail=true). Complete JSON: bbox_inspect_entity(entity_ref=packet:<id>,property=body); continue with property_cursor=body.next_cursor.",
         }),
         "packets",
     )
@@ -151,7 +151,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_packet_list",
-        description = "Discover compiled rule-packet summary pages (default 20, maximum 100), newest first then id. Filter by domain, scope, or query before paging; continue with next_offset. Select packet_id and detail=true for classification histograms and rule previews. latest_per_domain=true keeps the newest revision of each domain."
+        description = "Discover compiled packet summary pages (default 20, maximum 100). Filter before paging and continue with next_offset. detail=true adds histograms and rule previews. Read complete rules with bbox_inspect_entity(entity_ref=packet:<id>, property=body)."
     )]
     pub(crate) async fn bbox_packet_list(
         &self,
@@ -255,6 +255,80 @@ impl BlackboxServer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn packet_rules_are_recoverable_through_exact_property_pages() {
+        use crate::mcp_tools::inspect::InspectEntityParams;
+        use crate::server::state::SharedState;
+        use std::sync::Arc;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let params: CompileParams = serde_json::from_value(json!({
+            "domain":"inspection-fixture", "scope":"global",
+            "rank_table":{"operator":7}, "threshold_table":{"record":3},
+            "rank_lookup_key":"actor", "threshold_lookup_key":"asset",
+            "classification_lattice":["pass"], "prefix_inference":{"allow_":"pass"},
+            "rules":[{"id":"allow_complete", "antecedent":{"op":"True"},
+                "consequent":{"message":"bounded \"λ🙂\" ".repeat(700)}, "classification":"pass"}],
+            "source_ids":["fixture:packet-inspection"],
+        }))
+        .unwrap();
+        server.state.packets.read().compile(&params).unwrap();
+        let packet = server.state.packets.read().list_all().unwrap().remove(0);
+        let entity_ref = format!("packet:{}", packet.id);
+        let expected = serde_json::to_value(&packet).unwrap();
+        let overview = server
+            .bbox_inspect_entity(Parameters(
+                serde_json::from_value::<InspectEntityParams>(
+                    json!({"entity_ref":entity_ref, "property_mode":"summary", "per_type_limit":0}),
+                )
+                .unwrap(),
+            ))
+            .await;
+        assert!(!overview.is_error.unwrap_or(false), "{overview:?}");
+        let overview: Value =
+            serde_json::from_str(&overview.content[0].as_text().unwrap().text).unwrap();
+        assert!(overview["properties"].get("body").is_none());
+        assert!(
+            overview["property_projection"]["omitted_keys"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("body"))
+        );
+
+        let mut cursor: Option<String> = None;
+        let mut body = String::new();
+        let mut pages = 0;
+        loop {
+            let response = server
+                .bbox_inspect_entity(Parameters(
+                    serde_json::from_value::<InspectEntityParams>(
+                        json!({"entity_ref":entity_ref, "property":"body", "property_cursor":cursor,
+                        "property_limit":1023, "per_type_limit":0}),
+                    )
+                    .unwrap(),
+                ))
+                .await;
+            assert!(!response.is_error.unwrap_or(false), "{response:?}");
+            assert!(serde_json::to_vec(&response).unwrap().len() < 8192);
+            let page: Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(page["body"]["offset"], body.len());
+            let fragment = page["body"]["text"].as_str().unwrap();
+            assert!(!fragment.is_empty() && fragment.len() <= 1023);
+            body.push_str(fragment);
+            pages += 1;
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                assert_eq!(page["body"]["total_bytes"], body.len());
+                break;
+            }
+        }
+        assert!(pages > 2);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), expected);
+    }
 
     #[test]
     fn packet_summary_pages_filter_before_paging_and_expand_histograms() {
