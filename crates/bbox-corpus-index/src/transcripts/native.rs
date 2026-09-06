@@ -15,24 +15,13 @@ pub struct NativeTranscriptAdapter {
     reader_leases: std::sync::Mutex<Vec<std::fs::File>>,
 }
 impl NativeTranscriptAdapter {
-    pub fn open(
-        root: &Path,
-        scopes: Vec<ConnectorScope>,
-        source: TranscriptSource,
-    ) -> Result<Self, TranscriptReadError> {
-        let store = TranscriptSourceStore::open(root).map_err(|error| {
-            TranscriptReadError::io(
-                "open native source store",
-                root,
-                std::io::Error::other(error.to_string()),
-            )
-        })?;
-        Ok(Self {
-            store,
+    pub fn new(root: &Path, scopes: Vec<ConnectorScope>, source: TranscriptSource) -> Self {
+        Self {
+            store: TranscriptSourceStore::for_read(root),
             scopes,
             source,
             reader_leases: std::sync::Mutex::new(Vec::new()),
-        })
+        }
     }
 }
 impl TranscriptReadAdapter for NativeTranscriptAdapter {

@@ -21,6 +21,13 @@ impl TranscriptSourceStore {
             root: root.as_ref().to_owned(),
         })
     }
+    /// Bind an explicitly configured daemon store root without creating it.
+    /// Subsequent reads report missing/corrupt state through their own result.
+    pub fn for_read(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_owned(),
+        }
+    }
     fn scope_root(&self, scope: &ConnectorScope) -> PathBuf {
         self.root.join(scope.connector_source_id().as_str())
     }

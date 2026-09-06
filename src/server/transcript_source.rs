@@ -452,6 +452,36 @@ mod tests {
                 .contains("native landed marker")
         );
 
+        let index_config = index.reindex_config();
+        let meta = crate::index::passes::load_meta(&index_config.meta_path).unwrap();
+        assert!(
+            crate::index::passes::native_purge_exempt_paths(&index_config, &meta).contains(locator)
+        );
+        index.build_index_with_project_access(false, &[]).unwrap();
+        index.reader_reload_for_test();
+        let replaced: serde_json::Value =
+            serde_json::from_str(&index.messages(&params).unwrap()).unwrap();
+        assert_eq!(replaced["total_matching_messages"], 1);
+        assert_eq!(
+            replaced["source_freshness"]["streams"][0]["index_matches_published"],
+            true
+        );
+        assert_eq!(replaced["messages"][0]["content"], "new generation");
+        let meta = crate::index::passes::load_meta(&index_config.meta_path).unwrap();
+        assert!(!meta.contains_key(locator));
+
+        // An unavailable enrolled landing store is an indexing error, not an
+        // empty source set that authorizes dropping existing projections.
+        let landed_root = store_root(&state);
+        let saved_root = root.join("saved-native-sources");
+        std::fs::rename(&landed_root, &saved_root).unwrap();
+        std::fs::write(&landed_root, b"not a directory").unwrap();
+        assert!(index.build_index_with_project_access(true, &[]).is_err());
+        index.reader_reload_for_test();
+        assert!(index.messages(&params).unwrap().contains("new generation"));
+        std::fs::remove_file(&landed_root).unwrap();
+        std::fs::rename(&saved_root, &landed_root).unwrap();
+
         // Revocation removes the source from both wire authority and the
         // index enrollment. Old source bytes cannot keep reappearing in scans.
         state.config.write().source_connectors.producers.clear();
