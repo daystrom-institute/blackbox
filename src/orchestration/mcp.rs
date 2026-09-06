@@ -7,10 +7,10 @@
 //! overlay at `<project>/.bbox/mcp.json`.
 //!
 //! At dispatch time, the effective set is (global entries) merged with
-//! (project entries override), and translated into provider-specific CLI
-//! args. Provider-owned MCP config files are never rewritten on daemon
-//! startup; persistent provider registration happens only as the direct
-//! result of explicit `bro_mcp add/remove/sync` calls.
+//! (project entries override) and injected into each dispatch; no
+//! provider-owned MCP config file is ever rewritten. The retired
+//! `bro_mcp sync` lane is kept only as an honest refusal: there is no
+//! provider CLI destination to synchronize.
 //!
 //! The recursion guard is mechanical: the default filter set disallows
 //! the current blackbox MCP prefix's dispatch-capable `bro_*`
@@ -23,15 +23,12 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink as make_file_symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use rmcp::schemars;
 
-use super::brofile;
-use super::providers::Provider;
 use super::providers::dispatch_prelude::*;
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -650,128 +647,6 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Default timeout for provider CLI invocations. MCP CRUD calls
-/// (`mcp list/add/remove`) are typically <500ms; 15s is generous
-/// while still preventing one hung CLI from blocking the whole
-/// fan-out loop indefinitely.
-const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Provider set used by every fan-out call site (action_add /
-/// action_remove / action_sync). All surviving live providers use
-/// bro-harness transient per-dispatch MCP injection, so no vendor CLI gets
-/// persistent MCP CRUD.
-const FANOUT_PROVIDERS: [Provider; 0] = [];
-
-/// Run a per-provider closure against FANOUT_PROVIDERS in parallel
-/// using a scoped thread pool. Closures return Option<String> — None
-/// drops the provider from the output (e.g. arg builder returned None),
-/// Some(line) appends to the result. Order matches FANOUT_PROVIDERS.
-fn fanout_parallel<F>(work: F) -> Vec<String>
-where
-    F: Fn(Provider) -> Option<String> + Sync,
-{
-    // Capture work by reference so each spawned closure can `move` the
-    // reference (Copy + Send because F: Sync) instead of moving the
-    // closure itself, which would only work for one spawn.
-    let work = &work;
-    let mut results: Vec<Option<String>> = vec![None; FANOUT_PROVIDERS.len()];
-    std::thread::scope(|s| {
-        let handles: Vec<_> = FANOUT_PROVIDERS
-            .iter()
-            .map(|&p| s.spawn(move || work(p)))
-            .collect();
-        for (i, h) in handles.into_iter().enumerate() {
-            results[i] = h.join().unwrap_or(None);
-        }
-    });
-    results.into_iter().flatten().collect()
-}
-
-fn run_cli(provider: &Provider, args: &[String]) -> Result<()> {
-    run_cli_with_timeout(provider, args, None, CLI_TIMEOUT)
-}
-
-fn run_cli_in(provider: &Provider, args: &[String], cwd: Option<&Path>) -> Result<()> {
-    run_cli_with_timeout(provider, args, cwd, CLI_TIMEOUT)
-}
-
-fn run_cli_with_timeout(
-    provider: &Provider,
-    args: &[String],
-    cwd: Option<&Path>,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    let out = capture_cli_with_timeout(provider, args, cwd, timeout)?;
-    if !out.status.success() {
-        // Provider stderr and argv can echo resolved credentials. Expose only
-        // the failure class and exit code, never the raw child output.
-        anyhow::bail!(
-            "{provider} MCP registration command exited {:?}; command arguments and output withheld",
-            out.status.code(),
-        );
-    }
-    Ok(())
-}
-
-/// Spawn a provider CLI invocation with a wall-clock timeout, capturing
-/// stdout + stderr. SIGKILL on timeout. `cwd` sets the child's working
-/// directory — required for project-scope `mcp add` because the CLI
-/// writes to <cwd>/.mcp.json (or equivalent). Returns std::process::Output
-/// so callers needing the stdout (e.g. mcp list parsing) can read it.
-fn capture_cli_with_timeout(
-    provider: &Provider,
-    args: &[String],
-    cwd: Option<&Path>,
-    timeout: std::time::Duration,
-) -> Result<std::process::Output> {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::Instant;
-
-    let raw_bin = provider.bin();
-    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let mut cmd = Command::new(&bin);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(env) = brofile::resolve_provider_env(*provider, None, None, Path::new(""), None) {
-        cmd.envs(env);
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    let mut child = cmd.spawn().with_context(|| format!("spawning {bin}"))?;
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait()? {
-            Some(s) => break s,
-            None => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!(
-                        "{provider} MCP registration command timed out after {timeout:?}"
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-    };
-
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_end(&mut stdout);
-    }
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s.read_to_end(&mut stderr);
-    }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
 // ── MCP tool dispatch ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -784,6 +659,7 @@ pub enum McpAction {
     Allow,
     Disallow,
     ClearFilters,
+    GetFilters,
     Sync,
 }
 
@@ -796,87 +672,194 @@ pub struct McpToolParams {
     /// URL for HTTP/SSE servers (required on add).
     #[serde(default)]
     pub url: Option<String>,
-    /// Transport: http, sse, stdio. Defaults to http.
+    /// Transport: http or sse (default http). stdio is rejected: no stdio
+    /// add lane exists; edit the owning store directly for stdio servers.
     #[serde(default)]
     pub transport: Option<String>,
-    /// global or project (default: global).
+    /// Store to address: global (default) or project. list/get and every
+    /// mutation read or write only the selected store. project requires
+    /// the project selector; global rejects it. Unknown scopes are
+    /// refused before any store access.
     #[serde(default)]
     pub scope: Option<String>,
-    /// Project path — required when scope=project.
+    /// Project selector for scope=project, resolved daemon-side to the
+    /// durable store key. Omit for global scope.
     #[serde(default)]
     pub project: Option<String>,
     /// Filter pattern for allow/disallow (e.g. `mcp__blackbox__bro_*`).
     #[serde(default)]
     pub pattern: Option<String>,
-    /// Persistent per-server exclude list (Gemini only; applied at
-    /// registration time).
+    /// Persistent per-server exclude list stored with the server config.
+    /// Retained for compatibility; no current dispatch lane applies it.
     #[serde(default)]
     pub exclude_tools: Option<Vec<String>>,
-    /// Optional HTTP/SSE headers (e.g. auth tokens) to pass at
-    /// registration time. Persisted into McpServerConfig and replayed
-    /// by `action=sync`.
+    /// Optional HTTP/SSE headers (e.g. auth tokens) persisted into
+    /// McpServerConfig and resolved only at dispatch time. Values are
+    /// redacted in every reply.
     #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
     /// MCP tool surface name. When set on `action=add`, appends
     /// `?surface=<id>` to the registered URL.
     #[serde(default)]
     pub surface: Option<String>,
+    /// action=list page size: server rows per reply (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue action=list after the returned next_offset.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Exact action=get/get_filters only: pass body.next_cursor unchanged. A
+    /// changed record or selector refuses continuation; restart without
+    /// cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Exact action=get/get_filters JSON body page byte budget; default/max
+    /// 4096, min 4.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
 }
 
-/// Dispatch a bro_mcp tool call. Returns a human-readable result string.
-pub fn handle(p: &McpToolParams) -> Result<String> {
+/// `bro_mcp` reply shape. `Text` replies are complete and bounded at the
+/// producer. `Body` replies carry an exact redacted value plus a
+/// cursor-bound selection; the tool layer renders them as bounded JSON body
+/// pages so a single huge accepted record cannot exceed the transport cap.
+pub enum McpToolReply {
+    Text(String),
+    Body {
+        scope: &'static str,
+        selection: String,
+        value: serde_json::Value,
+    },
+}
+
+/// Dispatch a bro_mcp tool call. Text replies are human-readable strings;
+/// Body replies are page-ready exact values (see [`McpToolReply`]).
+pub fn handle(p: &McpToolParams) -> Result<McpToolReply> {
+    validate_selection(p)?;
     use McpAction::*;
     match p.action {
-        List => action_list(p),
+        List => action_list(p).map(McpToolReply::Text),
         Get => action_get(p),
-        Add => action_add(p),
-        Remove => action_remove(p),
-        Allow => action_filter(p, /* disallow */ false),
-        Disallow => action_filter(p, /* disallow */ true),
-        ClearFilters => action_clear_filters(p),
-        Sync => action_sync(p),
+        Add => action_add(p).map(McpToolReply::Text),
+        Remove => action_remove(p).map(McpToolReply::Text),
+        Allow => action_filter(p, /* disallow */ false).map(McpToolReply::Text),
+        Disallow => action_filter(p, /* disallow */ true).map(McpToolReply::Text),
+        ClearFilters => action_clear_filters(p).map(McpToolReply::Text),
+        GetFilters => action_get_filters(p),
+        Sync => action_sync(p).map(McpToolReply::Text),
     }
 }
 
-fn resolve_scope_path(p: &McpToolParams) -> Result<PathBuf> {
+/// Closed scope vocabulary plus scope/project pairing, checked before any
+/// store access so typos cannot widen into global/effective lookup and a
+/// supplied project selector cannot be silently ignored.
+fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
     let scope = p.scope.as_deref().unwrap_or("global");
     match scope {
-        "global" => global_store_path().context("resolving home dir"),
+        "global" => {
+            if p.project.is_some() {
+                anyhow::bail!(
+                    "'project' applies only when scope=project; omit it for global scope"
+                );
+            }
+            Ok("global")
+        }
         "project" => {
-            let pd = p
-                .project
+            p.project
                 .as_deref()
                 .context("'project' is required when scope=project")?;
-            Ok(project_store_path(Path::new(pd)))
+            Ok("project")
         }
         other => anyhow::bail!("Unknown scope: {other}. Use: global, project"),
     }
 }
 
-fn action_list(p: &McpToolParams) -> Result<String> {
-    let global_path = global_store_path().context("home dir")?;
-    let global = McpStore::load(&global_path)?;
-
-    let project = p.project.as_deref().map(|pd| {
-        let cfg = crate::config::load_project(Path::new(pd))?;
-        if cfg.mcp.enabled == Some(false) {
-            return Ok(None);
-        }
-        McpStore::load(&project_store_path(Path::new(pd))).map(Some)
-    });
-    let project = project.transpose()?.flatten();
-
-    let eff = resolve_effective(&global, project.as_ref(), false);
-    Ok(render_server_list(&eff))
+fn resolve_scope_path(p: &McpToolParams) -> Result<PathBuf> {
+    match validate_selection(p)? {
+        "global" => global_store_path().context("resolving home dir"),
+        "project" => Ok(project_store_path(Path::new(
+            p.project.as_deref().expect("validated above"),
+        ))),
+        _ => unreachable!("validate_selection returns a closed vocabulary"),
+    }
 }
 
-fn render_server_list(eff: &EffectiveMcp) -> String {
+fn action_list(p: &McpToolParams) -> Result<String> {
+    let scope = validate_selection(p)?;
+    let eff = match scope {
+        "global" => {
+            let global = McpStore::load(&global_store_path().context("home dir")?)?;
+            resolve_effective(&global, None, false)
+        }
+        "project" => {
+            let pd = p.project.as_deref().expect("validated above");
+            let cfg = crate::config::load_project(Path::new(pd))?;
+            if cfg.mcp.enabled == Some(false) {
+                return Ok(format!(
+                    "Project MCP is disabled in the project config; the selected project store contributes no servers. Dispatch falls back to the global store, which is a separate scope for bro_mcp list.\n"
+                ));
+            }
+            let project = McpStore::load(&project_store_path(Path::new(pd)))?;
+            resolve_effective(&project, None, false)
+        }
+        _ => unreachable!("validate_selection returns a closed vocabulary"),
+    };
+    Ok(render_server_list(
+        &eff,
+        scope,
+        p.project.as_deref(),
+        p.offset.unwrap_or(0),
+        p.limit.unwrap_or(20),
+    ))
+}
+
+const FILTER_DISPLAY_LIMIT: usize = 100;
+
+/// Bound an echoed identity string (server name, filter pattern). Exact
+/// values stay recoverable through the paged detail reads (get, get_filters);
+/// list rows and mutation receipts never carry an unbounded echo.
+const DISPLAY_ECHO_CHARS: usize = 96;
+fn bounded_echo(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= DISPLAY_ECHO_CHARS {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(DISPLAY_ECHO_CHARS).collect();
+    format!(
+        "{kept}…(+{} chars truncated; exact value via the paged detail read)",
+        count - DISPLAY_ECHO_CHARS
+    )
+}
+
+fn render_server_list(
+    eff: &EffectiveMcp,
+    scope: &str,
+    project: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> String {
     let mut out = String::new();
-    if eff.servers.is_empty() {
-        out.push_str("No MCP servers registered.\n");
+    let total = eff.servers.len();
+    if total == 0 {
+        out.push_str(&format!("No MCP servers registered in {scope} scope.\n"));
+    } else if offset >= total {
+        // Past-the-end offsets are honest empty pages, never a repeat of the
+        // final row.
+        out.push_str(&format!(
+            "MCP servers, {scope} scope: no rows at offset {offset} of {total}; the list ends at row {total}.\n"
+        ));
     } else {
-        out.push_str(&format!("{} server(s):\n", eff.servers.len()));
-        for (name, cfg) in &eff.servers {
+        let limit = limit.clamp(1, 100);
+        let start = offset;
+        let end = (start + limit).min(total);
+        let shown = &eff.servers.iter().collect::<Vec<_>>()[start..end];
+        out.push_str(&format!(
+            "MCP servers, {scope} scope: rows {}-{} of {total}\n",
+            start + 1,
+            end,
+        ));
+        for (name, cfg) in shown {
+            let name = bounded_echo(name);
             match cfg {
                 McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => {
                     let transport = if matches!(cfg, McpServerConfig::Http { .. }) {
@@ -898,42 +881,94 @@ fn render_server_list(eff: &EffectiveMcp) -> String {
                 }
             }
         }
-    }
-
-    if !eff.filters.disallow.is_empty() {
-        out.push_str(&format!("\nDisallow ({}):\n", eff.filters.disallow.len()));
-        for p in &eff.filters.disallow {
-            out.push_str(&format!("  {p}\n"));
+        if end < total {
+            let selector = project
+                .map(|project| format!(", project=\"{project}\""))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "Next page: bro_mcp(action=\"list\", scope=\"{scope}\"{selector}, offset={end})\n"
+            ));
+        } else if start > 0 {
+            out.push_str("End of server list.\n");
         }
     }
-    if !eff.filters.allow.is_empty() {
-        out.push_str(&format!("\nAllow ({}):\n", eff.filters.allow.len()));
-        for p in &eff.filters.allow {
-            out.push_str(&format!("  {p}\n"));
+
+    for (label, patterns) in [
+        ("Disallow", &eff.filters.disallow),
+        ("Allow", &eff.filters.allow),
+    ] {
+        if patterns.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{label} patterns ({}):\n", patterns.len()));
+        for p in patterns.iter().take(FILTER_DISPLAY_LIMIT) {
+            out.push_str(&format!("  {}\n", bounded_echo(p)));
+        }
+        if patterns.len() > FILTER_DISPLAY_LIMIT {
+            out.push_str(&format!(
+                "  ... {} more pattern(s) omitted; total {}. get_filters (same scope) pages the exact filter inventory\n",
+                patterns.len() - FILTER_DISPLAY_LIMIT,
+                patterns.len()
+            ));
         }
     }
 
     out
 }
 
-fn action_get(p: &McpToolParams) -> Result<String> {
+/// Canonical store-file identity for content-bound cursors. The digest inside
+/// a cursor never discloses the path; canonicalization keeps two distinct
+/// aliases of one store from splitting identity, falling back to the raw
+/// path when the store is not resolvable.
+fn store_identity(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .map(|canonical| canonical.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn action_get(p: &McpToolParams) -> Result<McpToolReply> {
     let name = p.name.as_deref().context("'name' is required")?;
+    let scope = validate_selection(p)?;
     let path = resolve_scope_path(p)?;
     let store = McpStore::load(&path)?;
     match store.servers.get(name) {
-        Some(cfg) => Ok(format!(
-            "{name}: {}",
-            serde_json::to_string_pretty(&cfg.response_view())?
-        )),
-        None => Ok(format!("{name}: not registered")),
+        Some(cfg) => Ok(McpToolReply::Body {
+            scope,
+            selection: format!("mcp_config:{scope}:{}:{name}", store_identity(&path)),
+            value: serde_json::json!({
+                "name": name,
+                "config": cfg.response_view(),
+            }),
+        }),
+        None => Ok(McpToolReply::Text(format!(
+            "{}: not registered in the {scope} MCP store. The other scope is a separate store; list it explicitly with scope.",
+            bounded_echo(name),
+        ))),
     }
+}
+
+/// Exact filter-inventory read for the selected store. Filter patterns are
+/// identity strings, not credentials; this is the exact recovery lane the
+/// bounded list display points to, and it never suggests a mutating reset.
+fn action_get_filters(p: &McpToolParams) -> Result<McpToolReply> {
+    let scope = validate_selection(p)?;
+    let path = resolve_scope_path(p)?;
+    let store = McpStore::load(&path)?;
+    Ok(McpToolReply::Body {
+        scope,
+        selection: format!("mcp_filters:{scope}:{}", store_identity(&path)),
+        value: serde_json::json!({
+            "disallow": store.filters.disallow,
+            "allow": store.filters.allow,
+        }),
+    })
 }
 
 fn action_add(p: &McpToolParams) -> Result<String> {
     let name = p.name.as_deref().context("'name' is required")?;
     let url = p.url.as_deref().context("'url' is required")?;
     let transport = p.transport.as_deref().unwrap_or("http");
-    let scope = p.scope.as_deref().unwrap_or("global");
+    let scope = validate_selection(p)?;
     let headers: BTreeMap<String, SecretString> = p
         .headers
         .clone()
@@ -955,73 +990,34 @@ fn action_add(p: &McpToolParams) -> Result<String> {
         "http" => McpServerConfig::Http {
             url: url.to_string(),
             headers,
-            exclude_tools: exclude.clone(),
+            exclude_tools: exclude,
         },
         "sse" => McpServerConfig::Sse {
             url: url.to_string(),
             headers,
-            exclude_tools: exclude.clone(),
+            exclude_tools: exclude,
         },
         other => anyhow::bail!(
-            "Transport {other} not supported via bro_mcp add (use provider CLI for stdio)"
+            "Transport '{other}' is not supported by bro_mcp add; supported transports are http and sse. stdio servers have no add lane: the store owner must write them directly."
         ),
     };
 
     let path = resolve_scope_path(p)?;
-    let headers_for_cli = p.headers.clone().unwrap_or_default();
-
-    // Fan out FIRST so we know whether the providers accepted the
-    // add before we persist intent locally. Both global and project
-    // scope fan out — project scope invokes the CLI with cwd =
-    // project_dir so providers that support `-s project` write into
-    // the right per-project config file.
-    let cli_scope = if scope == "global" { "user" } else { "project" };
-    let cwd: Option<&Path> = if scope == "project" {
-        p.project.as_deref().map(Path::new)
-    } else {
-        None
-    };
-    let fanout_lines: Vec<String> = fanout_parallel(|provider| {
-        let args = provider.build_mcp_add_http_args_full(
-            name,
-            &url,
-            &exclude,
-            &headers_for_cli,
-            cli_scope,
-        )?;
-        // Idempotent: best-effort remove (no-op if absent), then add.
-        // The remove error is logged but not surfaced — it's expected
-        // to fail when the server isn't already registered. Genuine
-        // failures (CLI crash, permissions) still surface via the
-        // subsequent add error.
-        if let Some(rm) = provider.build_mcp_remove_args_scoped(name, cli_scope) {
-            if let Err(e) = run_cli_in(&provider, &rm, cwd) {
-                tracing::debug!(target: "blackbox::mcp",
-                    "{provider} idempotent pre-add remove of {name} ({cli_scope}) failed (ok if not registered): {e}");
-            }
-        }
-        Some(match run_cli_in(&provider, &args, cwd) {
-            Ok(()) => format!("  {provider} ({cli_scope}): added"),
-            Err(e) => format!("  {provider} ({cli_scope}): error — {e}"),
-        })
-    });
-
-    // Persist intent regardless of fan-out outcome — `sync` can replay
-    // failed providers later, but only if we recorded the config.
     crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
         store.servers.insert(name.to_string(), config);
         store.save(&path)
     })?;
 
-    let mut lines = vec![format!("Saved {name} to {}", path.display())];
-    lines.extend(fanout_lines);
-    Ok(lines.join("\n"))
+    Ok(format!(
+        "Saved {} to the {scope} MCP store (daemon-owned; values redacted in replies). Dispatched bros receive it through per-dispatch injection; no provider CLI registration exists.",
+        bounded_echo(name)
+    ))
 }
 
 fn action_remove(p: &McpToolParams) -> Result<String> {
     let name = p.name.as_deref().context("'name' is required")?;
-    let scope = p.scope.as_deref().unwrap_or("global");
+    let scope = validate_selection(p)?;
 
     let path = resolve_scope_path(p)?;
     let had = crate::json_store::with_store_lock(&path.clone(), || {
@@ -1031,32 +1027,23 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
         Ok(had)
     })?;
 
-    let mut lines = vec![if had {
-        format!("Removed {name} from {}", path.display())
+    Ok(if had {
+        format!(
+            "Removed {} from the {scope} MCP store (daemon-owned).",
+            bounded_echo(name)
+        )
     } else {
-        format!("{name} not in {}", path.display())
-    }];
-
-    let cli_scope = if scope == "global" { "user" } else { "project" };
-    let cwd: Option<&Path> = if scope == "project" {
-        p.project.as_deref().map(Path::new)
-    } else {
-        None
-    };
-    lines.extend(fanout_parallel(|provider| {
-        let args = provider.build_mcp_remove_args_scoped(name, cli_scope)?;
-        Some(match run_cli_in(&provider, &args, cwd) {
-            Ok(()) => format!("  {provider} ({cli_scope}): removed"),
-            Err(e) => format!("  {provider} ({cli_scope}): {e}"),
-        })
-    }));
-
-    Ok(lines.join("\n"))
+        format!(
+            "{}: not registered in the {scope} MCP store.",
+            bounded_echo(name)
+        )
+    })
 }
 
 fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
     let pattern = p.pattern.as_deref().context("'pattern' is required")?;
     let normalized = normalize_filter_pattern(pattern);
+    let scope = validate_selection(p)?;
     let path = resolve_scope_path(p)?;
     crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
@@ -1078,64 +1065,34 @@ fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
     })?;
 
     Ok(format!(
-        "Added {} pattern {normalized} to {}",
+        "Added {} pattern {} to the {scope} MCP store (daemon-owned).",
         if disallow { "disallow" } else { "allow" },
-        path.display()
+        bounded_echo(&normalized),
     ))
 }
 
 fn action_clear_filters(p: &McpToolParams) -> Result<String> {
+    let scope = validate_selection(p)?;
     let path = resolve_scope_path(p)?;
-    let (had, path) = crate::json_store::with_store_lock(&path.clone(), || {
+    let had = crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
         let had = !store.filters.is_empty();
         store.filters = McpFilters::default();
         store.save(&path)?;
-        Ok((had, path))
+        Ok(had)
     })?;
     Ok(if had {
-        format!("Cleared filters in {}", path.display())
+        format!("Cleared filters in the {scope} MCP store (daemon-owned).")
     } else {
-        format!("{} already had no filters", path.display())
+        format!("The {scope} MCP store already had no filters.")
     })
 }
 
 fn action_sync(p: &McpToolParams) -> Result<String> {
-    let path = resolve_scope_path(p)?;
-    let store = crate::json_store::with_store_lock(&path.clone(), || McpStore::load(&path))?;
-
-    let mut lines = vec![format!("Syncing {} server(s)…", store.servers.len())];
-    for (name, cfg) in &store.servers {
-        let url = match cfg {
-            McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => url.clone(),
-            McpServerConfig::Stdio { .. } => {
-                lines.push(format!("  {name}: stdio not yet supported via sync"));
-                continue;
-            }
-        };
-        let resolved_headers = match cfg.resolve_secrets() {
-            Ok(r) => r.headers,
-            Err(e) => {
-                lines.push(format!("  {name}: secret resolution failed: {e}"));
-                continue;
-            }
-        };
-        let exclude = cfg.exclude_tools();
-        lines.extend(fanout_parallel(|provider| {
-            let add_args = provider.build_mcp_add_http_args_full(name, &url, exclude, &resolved_headers, "user")?;
-            if let Some(rm) = provider.build_mcp_remove_args(name) {
-                if let Err(e) = run_cli(&provider, &rm) {
-                    tracing::debug!(target: "blackbox::mcp",
-                        "{provider} idempotent pre-sync remove of {name} failed (ok if not registered): {e}");
-                }
-            }
-            Some(match run_cli(&provider, &add_args) {
-                Ok(()) => format!("  {name} → {provider}: synced"),
-                Err(e) => format!("  {name} → {provider}: {e}"),
-            })
-        }));
-    }
-    Ok(lines.join("\n"))
+    validate_selection(p)?;
+    anyhow::bail!(
+        "error.mcp_sync_retired: bro_mcp sync has no destination. No dispatch provider consumes persistent provider-CLI MCP registration; dispatched bros receive per-dispatch injection from the selected store. Nothing was synchronized: configuration and secret references were not read, resolved, or changed."
+    )
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1144,6 +1101,13 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn text_reply(reply: McpToolReply) -> String {
+        match reply {
+            McpToolReply::Text(text) => text,
+            McpToolReply::Body { .. } => panic!("expected a complete text reply"),
+        }
+    }
 
     #[test]
     fn mcp_configuration_responses_redact_secrets_without_changing_persistence() {
@@ -1165,8 +1129,14 @@ mod tests {
             "action": "get", "name": "remote", "scope": "project", "project": root,
         }))
         .unwrap();
-        let detail = action_get(&p).unwrap();
-        let listing = render_server_list(&resolve_effective(&store, None, false));
+        let detail = crate::tools::config::page_mcp_reply(action_get(&p).unwrap(), &p).unwrap();
+        let listing = render_server_list(
+            &resolve_effective(&store, None, false),
+            "project",
+            None,
+            0,
+            20,
+        );
         for response in [&detail, &listing] {
             for secret in [
                 "sample-user",
@@ -1199,7 +1169,13 @@ mod tests {
         let view = cfg.response_view();
         let mut store = McpStore::new();
         store.servers.insert("local".into(), cfg);
-        let listing = render_server_list(&resolve_effective(&store, None, false));
+        let listing = render_server_list(
+            &resolve_effective(&store, None, false),
+            "global",
+            None,
+            0,
+            20,
+        );
         assert_eq!(view["argument_count"], 1);
         assert_eq!(view["command_configured"], true);
         assert_eq!(view["env"]["CUSTOM_VALUE"]["redacted"], true);
@@ -1302,9 +1278,13 @@ mod tests {
             exclude_tools: None,
             headers: None,
             surface: Some("readonly".into()),
+            limit: None,
+            offset: None,
+            cursor: None,
+            body_limit: None,
         };
 
-        let result = handle(&params).unwrap();
+        let result = text_reply(handle(&params).unwrap());
         assert!(
             result.contains("Saved test-surface"),
             "add should succeed: {result}"
@@ -1339,9 +1319,13 @@ mod tests {
             exclude_tools: None,
             headers: None,
             surface: None,
+            limit: None,
+            offset: None,
+            cursor: None,
+            body_limit: None,
         };
 
-        let result = handle(&params).unwrap();
+        let result = text_reply(handle(&params).unwrap());
         assert!(
             result.contains("Saved test-no-surface"),
             "add should succeed: {result}"
@@ -1399,14 +1383,15 @@ mod tests {
     }
 
     #[test]
-    fn project_mcp_disabled_ignores_overlay() {
+    fn project_mcp_disabled_reports_selected_store_without_global_leakage() {
         let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
         unsafe {
-            std::env::set_var("HOME", dir.path());
+            std::env::set_var("HOME", &root);
         }
-        let project = dir.path().join("project");
+        let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join(".bbox")).unwrap();
         std::fs::write(
@@ -1445,7 +1430,7 @@ mod tests {
         };
         global.save(&global_store_path().unwrap()).unwrap();
 
-        let result = action_list(&McpToolParams {
+        let selected = action_list(&McpToolParams {
             action: McpAction::List,
             name: None,
             url: None,
@@ -1456,15 +1441,636 @@ mod tests {
             exclude_tools: None,
             headers: None,
             surface: None,
+            limit: None,
+            offset: None,
+            cursor: None,
+            body_limit: None,
         })
         .unwrap();
 
-        assert!(result.contains("1 server(s):"));
-        assert!(result.contains("global"));
+        assert!(selected.contains("Project MCP is disabled"));
+        assert!(!selected.contains("global:"));
+        assert!(!selected.contains("project:"));
+
+        let global_view = action_list(&McpToolParams {
+            action: McpAction::List,
+            name: None,
+            url: None,
+            transport: None,
+            scope: Some("global".into()),
+            project: None,
+            pattern: None,
+            exclude_tools: None,
+            headers: None,
+            surface: None,
+            limit: None,
+            offset: None,
+            cursor: None,
+            body_limit: None,
+        })
+        .unwrap();
+        assert!(global_view.contains("global scope"));
+        assert!(global_view.contains("global:"));
+        assert!(!global_view.contains("project:"));
 
         match prior {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    fn list_params(scope: Option<&str>, project: Option<&str>, offset: usize) -> McpToolParams {
+        serde_json::from_value(serde_json::json!({
+            "action": "list",
+            "scope": scope,
+            "project": project,
+            "offset": offset,
+        }))
+        .unwrap()
+    }
+
+    fn http_config(url: &str) -> McpServerConfig {
+        McpServerConfig::Http {
+            url: url.to_string(),
+            headers: BTreeMap::new(),
+            exclude_tools: Vec::new(),
+        }
+    }
+
+    fn with_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let result = f();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result
+    }
+
+    #[test]
+    fn mcp_list_validates_scope_and_selects_requested_store() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+        let mut project_store = McpStore::new();
+        project_store
+            .servers
+            .insert("beta".into(), http_config("http://beta.test"));
+        project_store.save(&project_store_path(&project)).unwrap();
+
+        with_home(&root, || {
+            let mut global = McpStore::new();
+            global
+                .servers
+                .insert("alpha".into(), http_config("http://alpha.test"));
+            global.save(&global_store_path().unwrap()).unwrap();
+
+            let global_view = action_list(&list_params(Some("global"), None, 0)).unwrap();
+            assert!(global_view.contains("global scope"), "{global_view}");
+            assert!(global_view.contains("alpha:"), "{global_view}");
+            assert!(!global_view.contains("beta"), "{global_view}");
+
+            let project_view = action_list(&list_params(
+                Some("project"),
+                Some(project.to_str().unwrap()),
+                0,
+            ))
+            .unwrap();
+            assert!(project_view.contains("project scope"), "{project_view}");
+            assert!(project_view.contains("beta:"), "{project_view}");
+            assert!(!project_view.contains("alpha"), "{project_view}");
+
+            let unknown = action_list(&list_params(Some("typo"), None, 0)).unwrap_err();
+            let text = format!("{unknown:#}");
+            assert!(text.contains("Unknown scope"), "{text}");
+            assert!(!text.contains("global or project"), "{text}");
+
+            let missing = action_list(&list_params(Some("project"), None, 0)).unwrap_err();
+            let text = format!("{missing:#}");
+            assert!(text.contains("'project' is required"), "{text}");
+
+            let ambiguous = action_list(&list_params(
+                Some("global"),
+                Some(project.to_str().unwrap()),
+                0,
+            ))
+            .unwrap_err();
+            let text = format!("{ambiguous:#}");
+            assert!(text.contains("'project' applies only"), "{text}");
+        });
+    }
+
+    #[test]
+    fn mcp_list_pages_servers_and_bounds_filter_display() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        with_home(&root, || {
+            let mut global = McpStore::new();
+            for i in 0..130 {
+                global
+                    .servers
+                    .insert(format!("srv-{i:03}"), http_config("http://unit.test"));
+            }
+            for i in 0..150 {
+                global.filters.disallow.push(format!("pat-{i:03}"));
+            }
+            global.save(&global_store_path().unwrap()).unwrap();
+
+            let first = action_list(&list_params(Some("global"), None, 0)).unwrap();
+            assert!(first.contains("rows 1-20 of 130"), "{first}");
+            assert!(
+                first.contains("Next page: bro_mcp(action=\"list\", scope=\"global\", offset=20)"),
+                "{first}"
+            );
+            assert!(!first.contains("srv-129"), "{first}");
+
+            let last = action_list(&list_params(Some("global"), None, 120)).unwrap();
+            assert!(last.contains("rows 121-130 of 130"), "{last}");
+            assert!(last.contains("srv-129"), "{last}");
+            assert!(!last.contains("Next page"), "{last}");
+
+            assert!(last.contains("Disallow patterns (150)"), "{last}");
+            assert!(last.contains("more pattern(s) omitted"), "{last}");
+            assert!(
+                last.contains("get_filters (same scope) pages the exact filter inventory"),
+                "{last}"
+            );
+            assert!(!last.contains("clear_filters resets"), "{last}");
+            assert!(first.len() < 8192, "first page len {}", first.len());
+        });
+    }
+
+    #[test]
+    fn mcp_sync_refuses_without_reading_or_resolving_secrets() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+        let mut store = McpStore::new();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "X-Secret".to_string(),
+            McpHeaderValue::Secret {
+                name: "SYNTHETIC_MCP_TOKEN".to_string(),
+            },
+        );
+        store.servers.insert(
+            "remote".to_string(),
+            McpServerConfig::Http {
+                url: "http://remote.test".to_string(),
+                headers,
+                exclude_tools: Vec::new(),
+            },
+        );
+        let store_file = project_store_path(&project);
+        store.save(&store_file).unwrap();
+        let before = fs::read_to_string(&store_file).unwrap();
+
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("SYNTHETIC_MCP_TOKEN");
+        unsafe { std::env::set_var("SYNTHETIC_MCP_TOKEN", "synthetic-secret-value") };
+
+        let params: McpToolParams = serde_json::from_value(serde_json::json!({
+            "action": "sync",
+            "scope": "project",
+            "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let error = action_sync(&params).unwrap_err();
+        let text = format!("{error:#}");
+
+        assert!(text.contains("error.mcp_sync_retired"), "{text}");
+        assert!(text.contains("not synchronized"), "{text}");
+        assert!(
+            text.contains("secret references were not read, resolved, or changed"),
+            "{text}"
+        );
+        assert!(!text.contains("SYNTHETIC_MCP_TOKEN"), "{text}");
+        assert!(!text.contains("synthetic-secret-value"), "{text}");
+        assert_eq!(fs::read_to_string(&store_file).unwrap(), before);
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var("SYNTHETIC_MCP_TOKEN", value) },
+            None => unsafe { std::env::remove_var("SYNTHETIC_MCP_TOKEN") },
+        }
+    }
+
+    #[test]
+    fn mcp_add_rejects_stdio_without_provider_cli_pointer() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+
+        let params: McpToolParams = serde_json::from_value(serde_json::json!({
+            "action": "add",
+            "name": "local",
+            "transport": "stdio",
+            "url": "http://ignored.test",
+            "scope": "project",
+            "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let error = action_add(&params).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("http and sse"), "{text}");
+        assert!(!text.to_lowercase().contains("provider cli"), "{text}");
+
+        let store = McpStore::load(&project_store_path(&project)).unwrap();
+        assert!(store.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_mutation_replies_identify_owner_without_local_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+
+        let add: McpToolParams = serde_json::from_value(serde_json::json!({
+            "action": "add",
+            "name": "custom-mcp",
+            "transport": "http",
+            "url": "http://custom.test",
+            "scope": "project",
+            "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let reply = action_add(&add).unwrap();
+        assert!(
+            reply.contains("project MCP store (daemon-owned)"),
+            "{reply}"
+        );
+        assert!(!reply.contains(".json"), "{reply}");
+
+        let get_missing = text_reply(action_get(
+            &serde_json::from_value::<McpToolParams>(serde_json::json!({
+                "action": "get", "name": "missing",
+                "scope": "project", "project": project.to_str().unwrap(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            get_missing.contains("not registered in the project MCP store"),
+            "{get_missing}"
+        );
+        assert!(
+            !get_missing.contains("missing in project scope"),
+            "{get_missing}"
+        );
+
+        let remove = action_remove(
+            &serde_json::from_value::<McpToolParams>(serde_json::json!({
+                "action": "remove", "name": "custom-mcp",
+                "scope": "project", "project": project.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            remove.contains("Removed custom-mcp from the project MCP store"),
+            "{remove}"
+        );
+        assert!(!remove.contains(".json"), "{remove}");
+    }
+
+    #[test]
+    fn mcp_store_parse_errors_do_not_echo_secrets() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let store_dir = project.join(".bbox");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(
+            store_dir.join("mcp.json"),
+            r#"{"servers":{"x":{"type":"http","url":"https://synthetic-endpoint.example","headers":{"A":"secret-credential-value"}}},}"#,
+        )
+        .unwrap();
+
+        let params = serde_json::from_value::<McpToolParams>(serde_json::json!({
+            "action": "get", "name": "x",
+            "scope": "project", "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let error = action_get(&params).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("secret-credential-value"), "{text}");
+        assert!(!text.contains("synthetic-endpoint"), "{text}");
+    }
+
+    #[test]
+    fn mcp_filter_and_clear_replies_identify_selected_store() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+
+        let filter = serde_json::from_value::<McpToolParams>(serde_json::json!({
+            "action": "allow", "pattern": "mcp__blackbox__bro_exec",
+            "scope": "project", "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let reply = action_filter(&filter, false).unwrap();
+        assert!(
+            reply.contains("Added allow pattern mcp__blackbox__bro_exec to the project MCP store"),
+            "{reply}"
+        );
+
+        let clear = serde_json::from_value::<McpToolParams>(serde_json::json!({
+            "action": "clear_filters",
+            "scope": "project", "project": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let reply = action_clear_filters(&clear).unwrap();
+        assert!(
+            reply.contains("Cleared filters in the project MCP store"),
+            "{reply}"
+        );
+
+        let again = action_clear_filters(&clear).unwrap();
+        assert!(again.contains("already had no filters"), "{again}");
+    }
+
+    fn page_exact_body(make_params: &dyn Fn(Option<String>) -> McpToolParams) -> (String, usize) {
+        let mut reconstructed = String::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let params = make_params(cursor.clone());
+            let reply =
+                crate::tools::config::page_mcp_reply(handle(&params).unwrap(), &params).unwrap();
+            pages += 1;
+            assert!(
+                reply.len() <= 4096 + 512,
+                "serialized page {pages} too large: {} bytes",
+                reply.len()
+            );
+            let page: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        (reconstructed, pages)
+    }
+
+    #[test]
+    fn mcp_list_offset_past_end_is_an_empty_page_not_a_repeat() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+        let mut store = McpStore::new();
+        for i in 0..3 {
+            store
+                .servers
+                .insert(format!("srv-{i}"), http_config("http://unit.test"));
+        }
+        store.save(&project_store_path(&project)).unwrap();
+
+        let empty = action_list(&list_params(
+            Some("project"),
+            Some(project.to_str().unwrap()),
+            10,
+        ))
+        .unwrap();
+        assert!(
+            empty.contains("no rows at offset 10 of 3; the list ends at row 3"),
+            "{empty}"
+        );
+        assert!(!empty.contains("srv-"), "{empty}");
+        assert!(!empty.contains("Next page"), "{empty}");
+        assert!(empty.len() < 4096, "empty page len {}", empty.len());
+    }
+
+    #[test]
+    fn mcp_list_next_page_hint_carries_the_required_project_selector() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+        let mut store = McpStore::new();
+        for i in 0..25 {
+            store
+                .servers
+                .insert(format!("srv-{i:02}"), http_config("http://unit.test"));
+        }
+        store.save(&project_store_path(&project)).unwrap();
+
+        let first = action_list(&list_params(
+            Some("project"),
+            Some(project.to_str().unwrap()),
+            0,
+        ))
+        .unwrap();
+        let expected = format!(
+            "Next page: bro_mcp(action=\"list\", scope=\"project\", project=\"{}\", offset=20)",
+            project.to_str().unwrap()
+        );
+        assert!(first.contains(&expected), "{first}\nexpected: {expected}");
+        assert!(!first.contains("srv-24"), "{first}");
+    }
+
+    #[test]
+    fn mcp_filter_inventory_recovers_exactly_via_get_filters() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project_a = root.join("project-a");
+        let project_b = root.join("project-b");
+        for project in [&project_a, &project_b] {
+            fs::create_dir_all(project.join(".bbox")).unwrap();
+        }
+        let mut disallow: Vec<String> = (0..600).map(|i| format!("pat-{i:03}")).collect();
+        // Escaped-string coverage: quotes, backslashes, newlines, and emoji
+        // exercise JSON escaping across page boundaries.
+        disallow[5] = format!("mcp__unit__{}\"quoted\\path\n🦀pattern", "x".repeat(480));
+        disallow[6] = "mcp__unit__back\\slash \"tool\" *".to_string();
+        let allow = vec!["mcp__unit__allow_*".to_string()];
+
+        let mut store = McpStore::new();
+        store.filters.disallow = disallow.clone();
+        store.filters.allow = allow.clone();
+        store.save(&project_store_path(&project_a)).unwrap();
+        store.save(&project_store_path(&project_b)).unwrap();
+
+        let listing = action_list(&list_params(
+            Some("project"),
+            Some(project_a.to_str().unwrap()),
+            0,
+        ))
+        .unwrap();
+        assert!(listing.contains("Disallow patterns (600)"), "{listing}");
+        assert!(
+            listing.contains("more pattern(s) omitted; total 600"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("get_filters (same scope) pages the exact filter inventory"),
+            "{listing}"
+        );
+        assert!(!listing.contains("clear_filters resets"), "{listing}");
+        assert!(listing.len() < 8192, "listing len {}", listing.len());
+
+        let (reconstructed, pages) = page_exact_body(&|cursor| {
+            serde_json::from_value(serde_json::json!({
+                "action": "get_filters",
+                "scope": "project",
+                "project": project_a.to_str().unwrap(),
+                "cursor": cursor,
+            }))
+            .unwrap()
+        });
+        assert!(pages > 1, "expected multiple pages, got {pages}");
+        let recovered: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered["disallow"], serde_json::json!(disallow));
+        assert_eq!(recovered["allow"], serde_json::json!(allow));
+
+        // Identical filter inventories in distinct project stores must not
+        // accept one another's cursors: the selection binds store identity.
+        let first_page_params = serde_json::from_value::<McpToolParams>(serde_json::json!({
+            "action": "get_filters",
+            "scope": "project",
+            "project": project_a.to_str().unwrap(),
+        }))
+        .unwrap();
+        let first_page = crate::tools::config::page_mcp_reply(
+            handle(&first_page_params).unwrap(),
+            &first_page_params,
+        )
+        .unwrap();
+        let cursor =
+            serde_json::from_str::<serde_json::Value>(&first_page).unwrap()["body"]["next_cursor"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let cross_store_params = serde_json::from_value::<McpToolParams>(serde_json::json!({
+            "action": "get_filters",
+            "scope": "project",
+            "project": project_b.to_str().unwrap(),
+            "cursor": cursor,
+        }))
+        .unwrap();
+        assert!(
+            crate::tools::config::page_mcp_reply(
+                handle(&cross_store_params).unwrap(),
+                &cross_store_params
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_get_pages_single_huge_accepted_record_exactly() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".bbox")).unwrap();
+
+        let huge_name = format!("huge-{}", "n".repeat(3000));
+        let mut headers = BTreeMap::new();
+        for i in 0..4000 {
+            let value = if i % 2 == 0 {
+                SecretString::Plain(format!("synthetic-secret-value-{i}"))
+            } else {
+                SecretString::Secret {
+                    name: format!("SYNTHETIC_HEADER_KEY_{i}"),
+                }
+            };
+            let key = if i % 100 == 7 {
+                format!("weird-\"quote-{}\\path\n🦀", i)
+            } else {
+                format!("X-Header-{i:04}")
+            };
+            headers.insert(key, value);
+        }
+        let exclude_tools: Vec<String> = (0..2000)
+            .map(|i| format!("mcp__unit__tool_{i:04}"))
+            .collect();
+        let http = McpServerConfig::Http {
+            url: "http://unit.test/mcp".to_string(),
+            headers,
+            exclude_tools,
+        };
+        let mut env = BTreeMap::new();
+        for i in 0..3000 {
+            env.insert(
+                format!("ENV_{i:04}"),
+                if i % 2 == 0 {
+                    SecretString::Plain(format!("synthetic-env-value-{i}"))
+                } else {
+                    SecretString::Secret {
+                        name: format!("SYNTHETIC_ENV_KEY_{i}"),
+                    }
+                },
+            );
+        }
+        let args: Vec<String> = (0..5000)
+            .map(|i| format!("--flag-{i}=value-🦀-synthetic-argument"))
+            .collect();
+        let stdio = McpServerConfig::Stdio {
+            command: "secret-command".to_string(),
+            args,
+            env,
+        };
+        let mut store = McpStore::new();
+        store.servers.insert(huge_name.clone(), http.clone());
+        store
+            .servers
+            .insert("stdio-huge".to_string(), stdio.clone());
+        store.save(&project_store_path(&project)).unwrap();
+
+        let listing = action_list(&list_params(
+            Some("project"),
+            Some(project.to_str().unwrap()),
+            0,
+        ))
+        .unwrap();
+        assert!(listing.contains("chars truncated"), "{listing}");
+        assert!(listing.len() < 8192, "listing len {}", listing.len());
+        assert!(!listing.contains("synthetic-secret-value"), "{listing}");
+
+        for (name, cfg) in [(huge_name.clone(), http), ("stdio-huge".to_string(), stdio)] {
+            let expected_view = cfg.response_view();
+            let (reconstructed, pages) = page_exact_body(&|cursor| {
+                serde_json::from_value(serde_json::json!({
+                    "action": "get",
+                    "name": name.clone(),
+                    "scope": "project",
+                    "project": project.to_str().unwrap(),
+                    "cursor": cursor,
+                }))
+                .unwrap()
+            });
+            assert!(pages > 1, "{name}: expected multiple pages, got {pages}");
+            assert!(
+                !reconstructed.contains("synthetic-secret-value"),
+                "{name}: page stream disclosed a header secret"
+            );
+            assert!(
+                !reconstructed.contains("synthetic-env-value"),
+                "{name}: page stream disclosed an env secret"
+            );
+            assert!(
+                !reconstructed.contains("synthetic-argument"),
+                "{name}: page stream disclosed a stdio argument"
+            );
+            assert!(
+                !reconstructed.contains("secret-command"),
+                "{name}: page stream disclosed the stdio command"
+            );
+            let recovered: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
+            assert_eq!(recovered["name"], serde_json::json!(name));
+            assert_eq!(recovered["config"], expected_view);
+            if let Some(reference) =
+                recovered["config"]["headers"]["X-Header-0001"]["$secret"].as_str()
+            {
+                assert_eq!(reference, "SYNTHETIC_HEADER_KEY_1");
+            }
         }
     }
 
@@ -1480,9 +2086,8 @@ mod tests {
 
     #[test]
     fn action_add_project_scope_persists_headers_and_exclude_tools() {
-        // Project-scope add skips provider fan-out (overlay only),
-        // so we can exercise the persistence path end-to-end without
-        // touching real provider CLIs.
+        // Project scope persists into the project store only; no provider
+        // CLI fan-out exists to touch from a test.
         let dir = tempdir().unwrap();
         let project = dir.path().to_string_lossy().to_string();
 
@@ -1500,6 +2105,10 @@ mod tests {
             exclude_tools: Some(vec!["dangerous_tool".into(), "other_tool".into()]),
             headers: Some(headers),
             surface: None,
+            limit: None,
+            offset: None,
+            cursor: None,
+            body_limit: None,
         };
         let result = action_add(&params).unwrap();
         assert!(result.contains("Saved custom-mcp"));
