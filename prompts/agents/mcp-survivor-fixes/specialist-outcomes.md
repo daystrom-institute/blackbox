@@ -11,7 +11,7 @@ brief: "Implement A04, A06, A10, A11, A12 within this assigned MCP caller surfac
 
 Read [the shared execution contract](README.md) first. Audit findings: A04, A06, A10, A11, A12.
 
-Owned implementation: src/tools/agents.rs; src/orchestration/allocator.rs; agent/allocator read projection tests and directly related DTOs. Matching parameter definitions, isolated tests, and named-tool documentation stanzas are included; unrelated branches of shared files are not.
+Owned implementation: src/tools/agents.rs; src/orchestration/allocator.rs; only the three bro_allocator_* adapters and allocator-specific helpers/tests in src/tools/dispatch.rs; agent/allocator read projection tests and directly related DTOs. The wait-contracts worker owns wait/broadcast branches in dispatch.rs. Matching parameter definitions, isolated tests, and named-tool documentation stanzas are included; unrelated branches of shared files are not.
 
 ## Required change and acceptance
 
