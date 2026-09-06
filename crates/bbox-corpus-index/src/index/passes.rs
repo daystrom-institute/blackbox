@@ -184,24 +184,6 @@ pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
     Ok(())
 }
 
-pub fn dir_size(path: &Path) -> u64 {
-    WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
-}
-
-pub fn count_jsonl_files(dir: &Path) -> usize {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .count()
-}
-
 // ── Background auto-reindex ────────────────────────────────────────
 
 /// Collect (path, mtime, size) for all JSONL files in a directory tree.
@@ -546,19 +528,4 @@ pub fn index_adapter_location(
         writer.commit()?;
     }
     Ok(())
-}
-
-pub fn human_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    const GB: u64 = 1024 * 1024 * 1024;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }

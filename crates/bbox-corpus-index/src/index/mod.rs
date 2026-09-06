@@ -1808,6 +1808,49 @@ mod tests {
     }
 
     #[test]
+    fn stats_count_indexed_sources_without_claiming_local_coverage_or_zero_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let legacy_root = root.join("absent-legacy-source");
+        let index = TranscriptIndex::open_or_create_with_records(
+            &root.join("index"),
+            vec![("claude".into(), legacy_root.clone())],
+            Some(root.join("absent-codex-source")),
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut doc = TantivyDocument::new();
+        doc.add_text(fields.doc_type, "transcript");
+        doc.add_text(fields.account, "claude");
+        doc.add_text(fields.session_id, "session-example");
+        doc.add_text(fields.content, "Collected transcript evidence");
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        assert!(!legacy_root.exists());
+        let stats = index.stats().unwrap();
+        assert!(stats.contains("Index documents: 1\n"));
+        assert!(stats.contains(&format!(
+            "Index segments: {}\n",
+            index.searcher().segment_readers().len()
+        )));
+        assert!(stats.contains("cached up to 60s"));
+        assert!(stats.contains("source coverage, freshness and edge totals not assessed"));
+        assert!(!stats.contains("Source files"));
+        assert!(!stats.contains("no projects dir"));
+        assert!(!stats.contains("Tool-call edges: 0"));
+        assert!(!stats.contains(&root.to_string_lossy().to_string()));
+        assert!(stats.len() < 256);
+    }
+
+    #[test]
     fn commit_inspection_recovers_stored_content_without_changing_search_previews() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();

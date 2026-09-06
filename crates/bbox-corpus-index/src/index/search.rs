@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::Result;
@@ -2342,9 +2341,8 @@ impl TranscriptIndex {
     // ── Stats ───────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<String> {
-        // TTL cache: stats is dominated by the projects-dir walk (100+ ms
-        // on warm page cache). The numbers barely move between calls in
-        // normal use, so a minute of staleness is a fair trade.
+        // Keep the existing cache contract, with its age bound visible in
+        // the output. Collection and writer paths invalidate it on changes.
         const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
         if let Some((at, cached)) = self.stats_cache.lock().as_ref() {
@@ -2359,47 +2357,17 @@ impl TranscriptIndex {
     }
 
     fn compute_stats(&self) -> String {
+        // These metadata counts describe the indexed corpus, including
+        // collected sources. Daemon-local roots and legacy edge sidecars do
+        // not establish corpus coverage or the current edge view. Avoid
+        // walking either those trees or the index directory on this read.
         let searcher = self.reader.searcher();
         let total_docs = searcher.num_docs();
-
-        let mut per_account: Vec<String> = Vec::new();
-        for (name, root) in &self.config.roots {
-            let projects_dir = root.join("projects");
-            if !projects_dir.exists() {
-                per_account.push(format!("  {name}: (no projects dir)"));
-                continue;
-            }
-            let count = count_jsonl_files(&projects_dir);
-            per_account.push(format!("  {name}: {count} files"));
-        }
-
-        if let Some(ref codex_root) = self.config.codex_root {
-            let sessions_dir = codex_root.join("sessions");
-            if sessions_dir.exists() {
-                per_account.push(format!(
-                    "  codex: {} files",
-                    count_jsonl_files(&sessions_dir)
-                ));
-            }
-        }
-
-        let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
-        let segments = segment_count(&self.index);
-        let tool_call_edges = count_tool_call_edges(
-            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-                &self.config.projects_path,
-            ),
-        );
-
+        let segments = searcher.segment_readers().len();
         format!(
             "Index documents: {total_docs}\n\
              Index segments: {segments}\n\
-             Index size: {}\n\
-             Tool-call edges: {tool_call_edges}\n\
-             Source files:\n\
-             {}",
-            human_bytes(index_size),
-            per_account.join("\n")
+             Scope: indexed corpus (cached up to 60s); source coverage, freshness and edge totals not assessed."
         )
     }
 
@@ -2683,26 +2651,6 @@ fn parse_source_filter(spec: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (includes, excludes)
-}
-
-fn count_tool_call_edges(edges_dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(edges_dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter_map(|path| fs::File::open(path).ok())
-        .flat_map(|file| std::io::BufReader::new(file).lines().map_while(Result::ok))
-        .filter(|line| {
-            serde_json::from_str::<bbox_edge_sidecar::edge_sidecar::Edge>(line)
-                .ok()
-                .is_some_and(|edge| {
-                    matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH")
-                })
-        })
-        .count() as u64
 }
 
 #[cfg(test)]

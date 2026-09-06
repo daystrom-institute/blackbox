@@ -144,6 +144,12 @@ bbox_reindex(full=false)
 bbox_embed_status()
 ```
 
+`bbox_stats` reports indexed document and segment counts, cached up to 60 seconds.
+These totals include indexed collected sources and do not depend on transcript
+roots being present on the daemon host. The tool does not assess source coverage,
+freshness, disk size, or edge totals. Missing local directories or optional edge
+state are not evidence of missing source data or zero edges.
+
 Use `full=true` only after schema changes, corruption, or an explicit reason to
 throw away incremental assumptions.
 
