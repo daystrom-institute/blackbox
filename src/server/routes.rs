@@ -1666,211 +1666,410 @@ pub(crate) async fn install_artifact_from_params(
     install_artifact_value(state, p, value).await
 }
 
+#[derive(Debug)]
+pub(crate) struct ArtifactInstallFailure {
+    kind: artifacts::ArtifactKind,
+    name: Option<String>,
+    completed: Vec<&'static str>,
+    failed: &'static str,
+    remaining: Vec<&'static str>,
+    cause: anyhow::Error,
+}
+impl ArtifactInstallFailure {
+    pub(crate) fn response(&self) -> Value {
+        let reason = self
+            .cause
+            .chain()
+            .find_map(|error| error.downcast_ref::<std::io::Error>())
+            .map(|error| format!("storage error: {:?}", error.kind()))
+            .unwrap_or_else(|| self.cause.to_string());
+        json!({"error": "error.artifact_install_failed", "kind": self.kind,
+            "name": self.name, "completed": self.completed, "failed": self.failed,
+            "not_attempted": self.remaining, "reason": reason,
+            "failed_step_may_have_partial_effects": self.failed != "validation"})
+    }
+}
+impl std::fmt::Display for ArtifactInstallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "artifact install failed at {}: {}",
+            self.failed, self.cause
+        )
+    }
+}
+impl std::error::Error for ArtifactInstallFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 pub(crate) async fn install_artifact_value(
     state: &Arc<SharedState>,
     p: ArtifactInstallParams,
     mut value: Value,
 ) -> anyhow::Result<artifacts::ArtifactMetadata> {
-    let mut installed_agent: Option<(
-        orchestration::agents::types::AgentRef,
-        orchestration::agents::types::AgentManifest,
-        Vec<String>,
-    )> = None;
-    match p.kind {
-        artifacts::ArtifactKind::Workflow => {
-            let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
-            let compiled = workflow::compile(spec.clone())?;
-            if let Err(e) = validate_workflow_capabilities(&compiled, state) {
-                anyhow::bail!("workflow capability validation failed: {e}");
-            }
-            let id = p.name.clone().unwrap_or_else(|| spec.name.clone());
-            let dir = state.store_dir.join("workflows");
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(
-                dir.join(format!("{id}.json")),
-                serde_json::to_string_pretty(&spec).unwrap_or_default(),
-            )?;
-            state.workflow_registry.write().insert(id, spec);
-        }
-        artifacts::ArtifactKind::Packet => {
-            let params: packets::CompileParams = serde_json::from_value(value.clone())?;
-            state.packets.read().compile(&params)?;
-        }
-        artifacts::ArtifactKind::Brofile => {
-            let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
-            let written =
-                orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None)
-                    .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
-            // Post-install verification — the artifact catalog reports
-            // "active" only when the runtime registry can actually see
-            // the brofile. Prevents silent G11-style desync where the
-            // catalog says installed but bro_brofile list returns
-            // empty.
-            if orchestration::brofile::resolve_brofile(&brofile.name, &state.store_dir, None)
-                .is_none()
-            {
-                anyhow::bail!(
-                    "brofile written to {} but resolve_brofile returned None — runtime registry desync",
-                    written.display()
-                );
-            }
-        }
+    let mut completed = Vec::new();
+    let mut failed = "validation";
+    let kind = p.kind;
+    let requested_name = p.name.clone().or_else(|| {
+        value
+            .get("name")
+            .or_else(|| value.get("domain"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let supersedes = p
+        .supersedes
+        .as_deref()
+        .or_else(|| value.get("supersedes").and_then(Value::as_str));
+    let has_supersession =
+        supersedes.is_some_and(|previous| Some(previous) != requested_name.as_deref());
+    let mut remaining = vec!["validation"];
+    remaining.extend(match kind {
+        artifacts::ArtifactKind::Workflow => vec!["workflow_file", "workflow_registry"],
+        artifacts::ArtifactKind::Packet => vec!["packet_compilation"],
+        artifacts::ArtifactKind::Brofile => vec!["brofile_file", "brofile_verification"],
         artifacts::ArtifactKind::Team => {
-            // A team artifact IS a teamplate. Install materializes it like
-            // its siblings (brofile → brofile store, cron → spec + loop):
-            // write the teamplate store, then instantiate the team under the
-            // teamplate's own name, so ensemble actors — which resolve
-            // instantiated teams only (`load_team`, no teamplate fallback) —
-            // can dispatch it immediately (gap-37a280a6).
-            let tp: orchestration::team::Teamplate = serde_json::from_value(value.clone())?;
-            if tp.advisor.is_some() {
-                anyhow::bail!(
-                    "team artifact '{}' declares an advisor; advisor initialization requires a \
-                     live dispatch, which install never performs — create the team via \
-                     bro_team(action=create, template=\"{}\") instead",
-                    tp.name,
-                    tp.name
-                );
+            vec!["teamplate_file", "team_instance", "team_verification"]
+        }
+        artifacts::ArtifactKind::Cron => vec!["cron_file", "cron_registry", "cron_loop"],
+        _ => vec![],
+    });
+    remaining.push("catalog_persistence");
+    if has_supersession {
+        remaining.push("previous_runtime_deactivation");
+    }
+    if kind == artifacts::ArtifactKind::Agent {
+        remaining.extend([
+            "agent_warnings",
+            "agent_embedding_queue",
+            "agent_provenance",
+        ]);
+    }
+    let result: anyhow::Result<artifacts::ArtifactMetadata> = (|| {
+        if !value.is_object() {
+            anyhow::bail!("{} artifact must be a JSON object", kind.as_str());
+        }
+        let (effective_name, effective_version) = artifacts::validate_install_identity(
+            kind,
+            &value,
+            p.name.as_deref(),
+            p.version.as_deref(),
+        )?;
+        let identity_field = if kind == artifacts::ArtifactKind::Packet {
+            "domain"
+        } else {
+            "name"
+        };
+        value[identity_field] = Value::String(effective_name);
+        // Preserve version's original JSON type unless an override was requested.
+        if p.version.is_some() {
+            value["version"] = if value.get("version").is_some_and(Value::is_number)
+                || matches!(
+                    kind,
+                    artifacts::ArtifactKind::Workflow
+                        | artifacts::ArtifactKind::Agent
+                        | artifacts::ArtifactKind::Atom
+                ) {
+                Value::from(
+                    effective_version
+                        .parse::<u32>()
+                        .map_err(|_| anyhow::anyhow!("artifact version must parse as u32"))?,
+                )
+            } else {
+                Value::String(effective_version)
+            };
+        }
+        let mut installed_agent: Option<(
+            orchestration::agents::types::AgentRef,
+            orchestration::agents::types::AgentManifest,
+            Vec<String>,
+        )> = None;
+        match p.kind {
+            artifacts::ArtifactKind::Workflow => {
+                let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
+                let compiled = workflow::compile(spec.clone())?;
+                if let Err(e) = validate_workflow_capabilities(&compiled, state) {
+                    anyhow::bail!("workflow capability validation failed: {e}");
+                }
+                completed.push("validation");
+                failed = "workflow_file";
+                let id = spec.name.clone();
+                let dir = state.store_dir.join("workflows");
+                std::fs::create_dir_all(&dir)?;
+                crate::json_store::atomic_write_json_locked(
+                    &dir.join(format!("{id}.json")),
+                    &spec,
+                )?;
+                completed.push("workflow_file");
+                failed = "workflow_registry";
+                state.workflow_registry.write().insert(id, spec);
+                completed.push("workflow_registry");
             }
-            // Same fail-loud-at-install posture as agent installs: member
-            // brofiles must already exist (install brofiles before teams).
-            for member in &tp.members {
-                if orchestration::brofile::resolve_brofile(&member.brofile, &state.store_dir, None)
-                    .is_none()
+            artifacts::ArtifactKind::Packet => {
+                let params: packets::CompileParams = serde_json::from_value(value.clone())?;
+                completed.push("validation");
+                failed = "packet_compilation";
+                state.packets.read().compile(&params)?;
+                completed.push("packet_compilation");
+            }
+            artifacts::ArtifactKind::Brofile => {
+                let brofile: orchestration::brofile::Brofile =
+                    serde_json::from_value(value.clone())?;
+                completed.push("validation");
+                failed = "brofile_file";
+                let written = orchestration::brofile::save_brofile(
+                    &brofile,
+                    "global",
+                    &state.store_dir,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
+                completed.push("brofile_file");
+                failed = "brofile_verification";
+                // Post-install verification — the artifact catalog reports
+                // "active" only when the runtime registry can actually see
+                // the brofile. Prevents silent G11-style desync where the
+                // catalog says installed but bro_brofile list returns
+                // empty.
+                if orchestration::brofile::resolve_brofile(&brofile.name, &state.store_dir, None)
+                    .is_none_or(|saved| saved.name != brofile.name)
                 {
                     anyhow::bail!(
-                        "team artifact '{}': member brofile not found: {} \
-                         (install brofiles before teams)",
-                        tp.name,
-                        member.brofile
+                        "brofile written to {} but resolve_brofile returned None — runtime registry desync",
+                        written.display()
                     );
                 }
+                completed.push("brofile_verification");
             }
-            orchestration::team::save_teamplate(&tp, "global", &state.store_dir, None);
-            // Re-install/upgrade must not clobber a live team's member
-            // sessions: instantiate only when no team holds the name yet.
-            let _lock = orchestration::team::lock_teams();
-            if orchestration::team::load_team(&tp.name, &state.store_dir).is_none() {
-                orchestration::team::instantiate_team(&tp, &tp.name, None, &state.store_dir);
-            }
-        }
-        artifacts::ArtifactKind::Cron => {
-            let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
-            crons::validate_schedule(&spec.schedule)?;
-            let dir = state.store_dir.join("crons");
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(
-                dir.join(format!("{}.json", spec.name)),
-                serde_json::to_string_pretty(&spec).unwrap_or_default(),
-            )?;
-            state.crons.install(spec.clone());
-            let handle = crons::spawn_loop(state.clone(), spec.clone());
-            state.crons.track_handle(&spec.name, handle);
-        }
-        artifacts::ArtifactKind::Agent => {
-            if !value.is_object() {
-                anyhow::bail!("agent artifact must be a JSON object");
-            }
-            let adapter_registry = state.agent_adapter_registry.read();
-            let catalog = state.artifacts.read();
-            let ctx = orchestration::agents::validate::InstallCtx {
-                adapter_registry: &adapter_registry,
-                brofile_exists: |name: &str| -> bool {
-                    catalog
-                        .metadata_for(artifacts::ArtifactKind::Brofile, name)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| m.active)
-                },
-                agent_exists: |name: &str| -> bool {
-                    catalog
-                        .metadata_for(artifacts::ArtifactKind::Agent, name)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| m.active)
-                },
-            };
-            orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
-            drop(catalog);
-            let manifest_value = value
-                .get("manifest")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("agent artifact missing manifest"))?;
-            let mut manifest: orchestration::agents::types::AgentManifest =
-                serde_json::from_value(manifest_value)?;
-            let name = p
-                .name
-                .clone()
-                .or_else(|| {
-                    value
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .ok_or_else(|| anyhow::anyhow!("agent artifact missing name"))?;
-            let version = p
-                .version
-                .clone()
-                .or_else(|| value.get("version").and_then(artifact_version_string))
-                .ok_or_else(|| anyhow::anyhow!("agent artifact missing version"))?
-                .parse::<u32>()
-                .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
-            let agent_ref = orchestration::agents::types::AgentRef { name, version };
-            manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(
-                &agent_ref, &manifest,
-            ));
-            value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
-            let install_warnings = agent_install_warnings(state, &manifest);
-            installed_agent = Some((agent_ref, manifest, install_warnings));
-        }
-        artifacts::ArtifactKind::Atom => {
-            if !value.is_object() {
-                anyhow::bail!("atom artifact must be a JSON object");
-            }
-            let catalog = state.artifacts.read();
-            let ctx = orchestration::atoms::validate::InstallCtx {
-                brofile_exists: |name: &str| -> bool {
-                    catalog
-                        .metadata_for(artifacts::ArtifactKind::Brofile, name)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| m.active)
-                },
-                atom_exists: |name: &str| -> bool {
-                    catalog
-                        .metadata_for(artifacts::ArtifactKind::Atom, name)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| m.active)
-                },
-            };
-            orchestration::atoms::validate::validate_atom_install(&value, &ctx)?;
-        }
-    }
-    let mut meta = state
-        .artifacts
-        .write()
-        .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
-        .and_then(|meta| {
-            if let Some(prev) = meta.supersedes.as_deref() {
-                if prev != meta.name {
-                    deactivate_artifact(state, meta.kind, prev)?;
+            artifacts::ArtifactKind::Team => {
+                // A team artifact IS a teamplate. Install materializes it like
+                // its siblings (brofile → brofile store, cron → spec + loop):
+                // write the teamplate store, then instantiate the team under the
+                // teamplate's own name, so ensemble actors — which resolve
+                // instantiated teams only (`load_team`, no teamplate fallback) —
+                // can dispatch it immediately (gap-37a280a6).
+                let tp: orchestration::team::Teamplate = serde_json::from_value(value.clone())?;
+                if tp.advisor.is_some() {
+                    anyhow::bail!(
+                        "team artifact '{}' declares an advisor; advisor initialization requires a \
+                     live dispatch, which install never performs — create the team via \
+                     bro_team(action=create, template=\"{}\") instead",
+                        tp.name,
+                        tp.name
+                    );
                 }
+                // Same fail-loud-at-install posture as agent installs: member
+                // brofiles must already exist (install brofiles before teams).
+                for member in &tp.members {
+                    if orchestration::brofile::resolve_brofile(
+                        &member.brofile,
+                        &state.store_dir,
+                        None,
+                    )
+                    .is_none()
+                    {
+                        anyhow::bail!(
+                            "team artifact '{}': member brofile not found: {} \
+                         (install brofiles before teams)",
+                            tp.name,
+                            member.brofile
+                        );
+                    }
+                }
+                completed.push("validation");
+                failed = "teamplate_file";
+                orchestration::team::save_teamplate(&tp, "global", &state.store_dir, None)?;
+                completed.push("teamplate_file");
+                failed = "team_instance";
+                // Re-install/upgrade must not clobber a live team's member
+                // sessions: instantiate only when no team holds the name yet.
+                let _lock = orchestration::team::lock_teams();
+                if orchestration::team::load_team(&tp.name, &state.store_dir).is_none() {
+                    orchestration::team::instantiate_team(&tp, &tp.name, None, &state.store_dir)?;
+                }
+                completed.push("team_instance");
+                failed = "team_verification";
+                if orchestration::team::load_team(&tp.name, &state.store_dir)
+                    .is_none_or(|saved| saved.name != tp.name)
+                {
+                    anyhow::bail!("saved team is unavailable under its installed identity");
+                }
+                completed.push("team_verification");
             }
-            Ok(meta)
-        })?;
-    if let Some((agent_ref, manifest, install_warnings)) = installed_agent {
-        if !install_warnings.is_empty() {
-            meta = state.artifacts.write().update_install_warnings(
-                artifacts::ArtifactKind::Agent,
-                &agent_ref.name,
-                install_warnings,
-            )?;
+            artifacts::ArtifactKind::Cron => {
+                let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
+                crons::validate_schedule(&spec.schedule)?;
+                completed.push("validation");
+                failed = "cron_file";
+                let dir = state.store_dir.join("crons");
+                std::fs::create_dir_all(&dir)?;
+                crate::json_store::atomic_write_json_locked(
+                    &dir.join(format!("{}.json", spec.name)),
+                    &spec,
+                )?;
+                completed.push("cron_file");
+                failed = "cron_registry";
+                state.crons.install(spec.clone());
+                completed.push("cron_registry");
+                failed = "cron_loop";
+                let handle = crons::spawn_loop(state.clone(), spec.clone());
+                state.crons.track_handle(&spec.name, handle);
+                completed.push("cron_loop");
+            }
+            artifacts::ArtifactKind::Agent => {
+                if !value.is_object() {
+                    anyhow::bail!("agent artifact must be a JSON object");
+                }
+                let adapter_registry = state.agent_adapter_registry.read();
+                let catalog = state.artifacts.read();
+                let ctx = orchestration::agents::validate::InstallCtx {
+                    adapter_registry: &adapter_registry,
+                    brofile_exists: |name: &str| -> bool {
+                        catalog
+                            .metadata_for(artifacts::ArtifactKind::Brofile, name)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| m.active)
+                    },
+                    agent_exists: |name: &str| -> bool {
+                        catalog
+                            .metadata_for(artifacts::ArtifactKind::Agent, name)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| m.active)
+                    },
+                };
+                orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
+                drop(catalog);
+                let manifest_value = value
+                    .get("manifest")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing manifest"))?;
+                let mut manifest: orchestration::agents::types::AgentManifest =
+                    serde_json::from_value(manifest_value)?;
+                let name = p
+                    .name
+                    .clone()
+                    .or_else(|| {
+                        value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing name"))?;
+                let version = p
+                    .version
+                    .clone()
+                    .or_else(|| value.get("version").and_then(artifact_version_string))
+                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing version"))?
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
+                let agent_ref = orchestration::agents::types::AgentRef { name, version };
+                manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(
+                    &agent_ref, &manifest,
+                ));
+                value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
+                let install_warnings = agent_install_warnings(state, &manifest);
+                installed_agent = Some((agent_ref, manifest, install_warnings));
+            }
+            artifacts::ArtifactKind::Atom => {
+                if !value.is_object() {
+                    anyhow::bail!("atom artifact must be a JSON object");
+                }
+                let catalog = state.artifacts.read();
+                let ctx = orchestration::atoms::validate::InstallCtx {
+                    brofile_exists: |name: &str| -> bool {
+                        catalog
+                            .metadata_for(artifacts::ArtifactKind::Brofile, name)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| m.active)
+                    },
+                    atom_exists: |name: &str| -> bool {
+                        catalog
+                            .metadata_for(artifacts::ArtifactKind::Atom, name)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| m.active)
+                    },
+                };
+                orchestration::atoms::validate::validate_atom_install(&value, &ctx)?;
+            }
         }
-        crate::embed_runtime::enqueue_agent_manifest(&agent_ref, &manifest);
-        persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
-    }
-    Ok(meta)
+        if !completed.contains(&"validation") {
+            completed.push("validation");
+        }
+        failed = "catalog_persistence";
+        let mut meta = state.artifacts.write().install_value(
+            p.kind,
+            p.source,
+            &value,
+            p.name,
+            p.version,
+            p.supersedes,
+        )?;
+        completed.push("catalog_persistence");
+        if let Some(prev) = meta
+            .supersedes
+            .as_deref()
+            .filter(|prev| *prev != meta.name.as_str())
+        {
+            failed = "previous_runtime_deactivation";
+            deactivate_artifact(state, meta.kind, prev)?;
+            completed.push("previous_runtime_deactivation");
+        }
+        if let Some((agent_ref, manifest, install_warnings)) = installed_agent {
+            failed = "agent_warnings";
+            if !install_warnings.is_empty() {
+                meta = state.artifacts.write().update_install_warnings(
+                    artifacts::ArtifactKind::Agent,
+                    &agent_ref.name,
+                    install_warnings,
+                )?;
+            }
+            completed.push("agent_warnings");
+            failed = "agent_embedding_queue";
+            crate::embed_runtime::enqueue_agent_manifest(&agent_ref, &manifest);
+            completed.push("agent_embedding_queue");
+            failed = "agent_provenance";
+            persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
+            completed.push("agent_provenance");
+        }
+        Ok(meta)
+    })();
+    result.map_err(|cause| {
+        remaining.retain(|step| !completed.contains(step) && *step != failed);
+        let mut failed_step = failed;
+        if let Some(persistence) = cause.downcast_ref::<artifacts::ArtifactPersistenceFailure>() {
+            completed.extend(persistence.completed.iter().copied());
+            failed_step = persistence.failed;
+            let catalog_steps = [
+                "artifact_content",
+                "catalog_metadata",
+                "catalog_version_snapshot",
+                "previous_catalog_supersession",
+            ];
+            if let Some(index) = catalog_steps.iter().position(|step| *step == failed_step) {
+                remaining.splice(
+                    0..0,
+                    catalog_steps[index + 1..].iter().copied().filter(|step| {
+                        *step != "previous_catalog_supersession" || has_supersession
+                    }),
+                );
+            }
+        }
+        ArtifactInstallFailure {
+            kind,
+            name: requested_name,
+            completed,
+            failed: failed_step,
+            remaining,
+            cause,
+        }
+        .into()
+    })
 }
 
 pub(crate) fn restore_runtime_artifacts_from_catalog(
@@ -3572,7 +3771,15 @@ pub(crate) async fn admin_team_upsert(
         advisor: None,
         diversity_floor: None,
     };
-    orchestration::team::save_teamplate(&teamplate, "global", &state.store_dir, None);
+    if let Err(error) =
+        orchestration::team::save_teamplate(&teamplate, "global", &state.store_dir, None)
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": format!("teamplate was not saved: {error}")})),
+        )
+            .into_response();
+    }
     let team = orchestration::team::Team {
         name: req.name.clone(),
         teamplate: req.name.clone(),

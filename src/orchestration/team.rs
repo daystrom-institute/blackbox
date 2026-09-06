@@ -140,13 +140,18 @@ fn project_teamplates_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bro").join("teamplates")
 }
 
-pub fn save_teamplate(tp: &Teamplate, scope: &str, store_dir: &Path, project_dir: Option<&str>) {
+pub fn save_teamplate(
+    tp: &Teamplate,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<()> {
     let dir = if scope == "project" {
         project_teamplates_dir(Path::new(project_dir.unwrap_or(".")))
     } else {
         teamplates_dir(store_dir)
     };
-    atomic_write_json(&dir, &tp.name, tp);
+    crate::json_store::atomic_write_json_locked(&dir.join(format!("{}.json", tp.name)), tp)
 }
 
 pub fn resolve_teamplate(
@@ -235,7 +240,7 @@ pub fn instantiate_team(
     team_name: &str,
     project_dir: Option<&str>,
     store_dir: &Path,
-) -> Team {
+) -> anyhow::Result<Team> {
     let mut members = Vec::new();
     for slot in &tp.members {
         let count = slot.count.max(1);
@@ -274,8 +279,11 @@ pub fn instantiate_team(
         created_at: super::now_ms(),
         diversity_floor: tp.diversity_floor,
     };
-    save_team(&team, store_dir);
-    team
+    crate::json_store::atomic_write_json_locked(
+        &teams_dir(store_dir).join(format!("{team_name}.json")),
+        &team,
+    )?;
+    Ok(team)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +470,7 @@ mod tests {
             advisor: None,
             diversity_floor: None,
         };
-        save_teamplate(&tp, "global", dir.path(), None);
+        save_teamplate(&tp, "global", dir.path(), None).unwrap();
         let loaded = resolve_teamplate("review-panel", dir.path(), None);
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
@@ -491,7 +499,7 @@ mod tests {
             diversity_floor: None,
         };
 
-        let team = instantiate_team(&tp, "test-team", Some("/tmp/proj"), dir.path());
+        let team = instantiate_team(&tp, "test-team", Some("/tmp/proj"), dir.path()).unwrap();
         assert_eq!(team.name, "test-team");
         assert_eq!(team.members.len(), 3);
         assert_eq!(team.members[0].name, "worker-1");
@@ -721,7 +729,7 @@ mod tests {
             advisor: None,
             diversity_floor: None,
         };
-        let _team = instantiate_team(&tp, "to-dissolve", None, dir.path());
+        let _team = instantiate_team(&tp, "to-dissolve", None, dir.path()).unwrap();
         assert!(load_team("to-dissolve", dir.path()).is_some());
         assert!(remove_team("to-dissolve", dir.path()));
         assert!(load_team("to-dissolve", dir.path()).is_none());
