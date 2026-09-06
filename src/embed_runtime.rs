@@ -1695,9 +1695,70 @@ pub(crate) fn status_response_for_doctor() -> EmbedStatusResponse {
     response
 }
 
-pub(crate) fn status_json_for_state(state: &SharedState, include_coverage: bool) -> Result<String> {
+pub(crate) fn status_json_for_state(
+    state: &SharedState,
+    include_coverage: bool,
+    debug: bool,
+) -> Result<String> {
     let response = status_response_for_state(state, include_coverage)?;
-    Ok(serde_json::to_string_pretty(&response)?)
+    Ok(serde_json::to_string(&project_status_response(
+        &response,
+        include_coverage,
+        debug,
+    )?)?)
+}
+
+/// MCP presentation is separate from the diagnostic DTO used by doctor and
+/// operator consumers. Keep failures and nonzero loss counters visible.
+fn project_status_response(
+    response: &EmbedStatusResponse,
+    include_coverage: bool,
+    debug: bool,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(response)?;
+    if debug {
+        return Ok(value);
+    }
+    if let Some(routes) = value["routes"].as_object_mut() {
+        for route in routes
+            .values_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            for key in [
+                "provider",
+                "model",
+                "query_model",
+                "endpoint_kind",
+                "output_dtype",
+                "compatibility_family",
+                "dim",
+                "queue_bytes",
+            ] {
+                route.remove(key);
+            }
+            if !include_coverage
+                && route
+                    .get("coverage_ratio")
+                    .is_none_or(serde_json::Value::is_null)
+            {
+                route.remove("coverage_state");
+            }
+            route.retain(|key, value| {
+                !value.is_null()
+                    && !(matches!(
+                        key.as_str(),
+                        "retried_count" | "dropped_count" | "capped_count"
+                    ) && value.as_u64() == Some(0))
+            });
+        }
+    }
+    if !include_coverage {
+        value["coverage"] = json!({
+            "requested": false,
+            "hint": "include_coverage=true scans source coverage; transcript coverage remains excluded."
+        });
+    }
+    Ok(value)
 }
 
 pub(crate) fn agent_manifest_embedding(
@@ -1966,6 +2027,45 @@ fn supersession_related(a: &KnowledgeEntry, b: &KnowledgeEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embed_status_summary_keeps_failures_losses_and_explicit_coverage() {
+        let response = super::EmbedStatusResponse {
+            routes: std::collections::BTreeMap::from([(
+                "docs".into(),
+                super::queue::RouteStatus {
+                    health: "degraded".into(),
+                    health_reason: Some("permanent drops".into()),
+                    provider: Some("test-provider".into()),
+                    dropped_count: 2,
+                    capped_count: 3,
+                    last_dropped: Some("unsupported input".into()),
+                    coverage_state: Some("not computed".into()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let summary = super::project_status_response(&response, false, false).unwrap();
+        let row = &summary["routes"]["docs"];
+        assert_eq!(row["health_reason"], "permanent drops");
+        assert_eq!(row["dropped_count"], 2);
+        assert_eq!(row["capped_count"], 3);
+        assert_eq!(row["last_dropped"], "unsupported input");
+        assert_eq!(row["queue_depth"], 0);
+        for key in [
+            "provider",
+            "coverage_state",
+            "coverage_ratio",
+            "last_error",
+            "retried_count",
+        ] {
+            assert!(row.get(key).is_none(), "unexpected summary field: {key}");
+        }
+        assert_eq!(summary["coverage"]["requested"], false);
+        let coverage = super::project_status_response(&response, true, false).unwrap();
+        assert_eq!(coverage["routes"]["docs"]["coverage_state"], "not computed");
+        let debug = super::project_status_response(&response, false, true).unwrap();
+        assert_eq!(debug, serde_json::to_value(&response).unwrap());
+    }
     use super::*;
 
     use crate::embed_queue::thread_chunk_hash;

@@ -16,6 +16,10 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EmbedStatusParams {
+    /// Include provider/model configuration and zero/null diagnostic counters.
+    /// This only expands the reply; expensive scans and probes remain opt-in.
+    #[serde(default)]
+    pub debug: bool,
     /// Compute exact embedding coverage by walking every source document.
     /// Disabled by default because a production corpus scan can take minutes;
     /// queue/provider health remains available on the cheap path.
@@ -143,7 +147,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_status",
-        description = "Return cheap route embedding health and health_reason. include_coverage explicitly requests a full source-corpus coverage scan; include_diagnostics requests deadline-bounded HNSW graph diagnostics; recall_probe_route runs a sampled self-recall probe (all opt-ins can be expensive)."
+        description = "Return compact route health, indexed counts, queue depth, and actionable errors. debug adds configuration and routine counters without extra scans. include_coverage requests a source-corpus scan; include_diagnostics requests bounded HNSW diagnostics; recall_probe_route runs a sampled probe. Those scans and probes can be expensive."
     )]
     pub(crate) async fn bbox_embed_status(
         &self,
@@ -154,6 +158,7 @@ impl BlackboxServer {
             let status = crate::embed_runtime::status_json_for_state(
                 &server.state,
                 p.include_coverage.unwrap_or(false),
+                p.debug,
             )?;
             let diagnostics_requested =
                 p.include_diagnostics.unwrap_or(false) || p.diagnostic_routes.is_some();
