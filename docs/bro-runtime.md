@@ -1,11 +1,27 @@
 # Bro Runtime
 
-`bro` is the runtime for dispatching and supervising provider sessions. Workflows
-use it under the hood, but it is also useful directly when you want one agent,
-a team, or a few parallel tasks without writing a workflow spec.
+`bro` launches, observes, and controls provider sessions. Callers compose those
+operations in their own code; Blackbox owns task identity, provider routing,
+worker transport, and execution recovery. Team waits never choose follow-up work.
 
-Use workflows for durable state machines. Use atoms for reusable capabilities.
-Use `bro_*` when you are operating live tasks.
+## Retrying an uncertain dispatch
+
+Pass a unique `request_key` to `bro_exec` or `bro_resume` before the first
+attempt. Retrying the same key and inputs returns the original task identity;
+changed inputs or bound workspace refuse reuse. Use a new key for an intentional
+new task or continuation. Keys have no automatic expiry, even after task details
+age out. Calls without a key retain their existing behavior and can duplicate
+work when retried.
+
+The durable claim precedes worker admission. A crash or cancelled call between
+that claim and its receipt can leave `admission_incomplete` with
+`execution_unknown=true`. Inspect its `taskId` with `bro_status`; absence of a
+retained task is not proof that the worker never ran. Retrying the same key never
+launches again. Blackbox does not promise exactly-once worker execution or
+silently recover an unknown admission by starting another worker.
+
+Journal records hold request hashes, identities, and minimal outcomes, not raw
+prompts or credentials. An unavailable or corrupt journal refuses keyed admission.
 
 ## Start, Resume, Wait
 
@@ -24,6 +40,7 @@ Resume the same provider session:
 ```text
 bro_resume(
   session_id="<session-id>",
+  provider="brodex",
   prompt="now implement the smallest safe patch"
 )
 ```
@@ -31,7 +48,7 @@ bro_resume(
 Wait for completion:
 
 ```text
-bro_wait(task_id="<task-id>", timeout_secs=3600)
+bro_wait(task_id="<task-id>", timeout_seconds=60)
 ```
 
 Do not resume a session while its previous task is still running. Check with
@@ -43,7 +60,7 @@ Broadcast to a team:
 
 ```text
 bro_broadcast(team="reviewers", prompt="review this diff for correctness")
-bro_when_all(task_ids=["task-a", "task-b"], timeout_secs=3600)
+bro_when_all(task_ids=["task-a", "task-b"], timeout_seconds=60)
 ```
 
 Use `bro_when_any` for races where the first useful answer wins. The losers keep

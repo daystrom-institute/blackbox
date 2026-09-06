@@ -222,6 +222,7 @@ fn allocator_status_runtime_request(
     p: &AllocatorStatusParams,
 ) -> Result<Option<orchestration::allocator::RuntimeRequest>, String> {
     let exec_like = ExecParams {
+        request_key: None,
         prompt: String::new(),
         bro: None,
         provider: None,
@@ -269,9 +270,128 @@ where
 }
 
 impl BlackboxServer {
+    async fn with_dispatch_admission<F, Fut>(
+        &self,
+        operation: orch::admission::Operation,
+        key: Option<String>,
+        mut request: Value,
+        invoke: F,
+    ) -> CallToolResult
+    where
+        F: FnOnce(Option<orch::admission::Attempt>) -> Fut,
+        Fut: std::future::Future<Output = CallToolResult>,
+    {
+        let Some(key) = key else {
+            return invoke(None).await;
+        };
+        if let Some(request) = request.as_object_mut() {
+            request.remove("request_key");
+        }
+        let authority = json!({
+            "surface": self.surface.get().map(|s| s.as_ref()),
+            "surface_project": self.surface_project.get().and_then(|p| p.as_deref()),
+            "checkout": self.session_checkout.get().and_then(|p| p.as_deref()),
+            "workspace": self.authoritative_session_workspace_binding().map(|grant| json!({
+                "workspace_id": grant.workspace_id,
+                "scope": grant.scope,
+                "project_id": grant.project_id,
+            })),
+        });
+        let fingerprint = orch::admission::fingerprint(operation, request, authority);
+        let claim = match orch::admission::claim(
+            self.state.store_dir.clone(),
+            operation,
+            key.clone(),
+            fingerprint,
+        )
+        .await
+        {
+            Ok(claim) => claim,
+            Err(error) => return Self::err_text(&error),
+        };
+        if !claim.first {
+            return self.dispatch_admission_receipt(&claim.record, true);
+        }
+        let attempt = orch::admission::Attempt::new(claim.record.identity.clone());
+        let result = invoke(Some(attempt.clone())).await;
+        let task = self
+            .state
+            .task_store
+            .read()
+            .get(&claim.record.identity.task_id);
+        let outcome = task
+            .map(|task| {
+                let inner = task.inner.lock();
+                orch::admission::Outcome::TaskRecorded {
+                    session_id: inner.session_id.clone(),
+                    provider: inner.provider,
+                }
+            })
+            .or_else(|| {
+                (!attempt.spawn_started()).then_some(orch::admission::Outcome::NotAdmitted)
+            });
+        let Some(outcome) = outcome else {
+            return self.dispatch_admission_receipt(&claim.record, false);
+        };
+        match orch::admission::finish(self.state.store_dir.clone(), key, claim.record, outcome)
+            .await
+        {
+            Ok(_) => result,
+            Err(error) => Self::err_text(&error),
+        }
+    }
+
+    fn dispatch_admission_receipt(
+        &self,
+        record: &orch::admission::Record,
+        replayed: bool,
+    ) -> CallToolResult {
+        let task = self.state.task_store.read().get(&record.identity.task_id);
+        if let Some(task) = task {
+            let inner = task.inner.lock();
+            return Self::ok_json(&json!({
+                "taskId": inner.id, "sessionId": inner.session_id,
+                "provider": inner.provider, "status": inner.status, "replayed": replayed,
+            }));
+        }
+        match &record.outcome {
+            Some(orch::admission::Outcome::TaskRecorded {
+                session_id,
+                provider,
+            }) => Self::ok_json(&json!({
+                "taskId": record.identity.task_id, "sessionId": session_id,
+                "provider": provider, "status": "unavailable", "replayed": replayed,
+                "hint": "Admission was recorded; task details are no longer retained. This key cannot launch again.",
+            })),
+            Some(orch::admission::Outcome::NotAdmitted) => Self::err_text(
+                "error.request_not_admitted: the original request failed before worker admission; this key is consumed. Correct the original error and use a new key for a new attempt.",
+            ),
+            None => {
+                let mut result = Self::ok_json(&json!({
+                    "error": {"code":"admission_incomplete", "message":"Execution outcome is unknown. Inspect taskId with bro_status; retrying this request_key will never launch another task."},
+                    "taskId": record.identity.task_id, "sessionId": record.identity.session_id,
+                    "execution_unknown": true, "replayed": replayed,
+                }));
+                result.is_error = Some(true);
+                result
+            }
+        }
+    }
+}
+
+impl BlackboxServer {
     pub(crate) async fn dispatch_fresh_bro_task(
         &self,
+        request: FreshDispatchRequest,
+    ) -> Result<FreshDispatchResult, String> {
+        self.dispatch_fresh_bro_task_with_admission(request, None)
+            .await
+    }
+
+    async fn dispatch_fresh_bro_task_with_admission(
+        &self,
         mut request: FreshDispatchRequest,
+        admission: Option<orch::admission::Attempt>,
     ) -> Result<FreshDispatchResult, String> {
         // Admission drain (maintenance window): refuse NEW work while
         // letting in-flight work continue. Workflow-origin dispatches are an
@@ -367,8 +487,14 @@ impl BlackboxServer {
             .or_else(|| request.spawn_bro_label.clone())
             .or_else(|| orch::default_task_name_from_prompt(&request.prompt));
 
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let task_id = admission
+            .as_ref()
+            .map(|a| a.identity.task_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = admission
+            .as_ref()
+            .and_then(|a| a.identity.session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -416,6 +542,9 @@ impl BlackboxServer {
         .map_err(|e| e.to_string())?;
         args.extend(dispatch_filters.args);
 
+        if let Some(admission) = &admission {
+            admission.mark_spawn_started();
+        }
         let task = orch::spawn_task_with_tool_placement(
             task_id,
             request.provider,
@@ -476,13 +605,12 @@ impl BlackboxServer {
     }
 }
 
-#[tool_router(router = dispatch_tools)]
 impl BlackboxServer {
-    #[tool(
-        name = "bro_exec",
-        description = "Launch a fresh agent task/session and return {taskId, sessionId}. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`."
-    )]
-    pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
+    async fn bro_exec_inner(
+        &self,
+        p: ExecParams,
+        admission: Option<orch::admission::Attempt>,
+    ) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
 
         let (
@@ -555,39 +683,42 @@ impl BlackboxServer {
             .or_else(|| exec_opts.as_ref().and_then(|o| o.service_tier.clone()));
         let lease_brofile_context = brofile_context.clone();
         let dispatched = match self
-            .dispatch_fresh_bro_task(FreshDispatchRequest {
-                prompt: p.prompt.clone(),
-                provider,
-                lens,
-                exec_opts,
-                env_overrides,
-                cwd: cwd.clone(),
-                brofile_filters,
-                coerce_workspace,
-                allow_recursion,
-                allow_tools: p.allow_tools.clone(),
-                disallow_tools: p.disallow_tools.clone(),
-                tool_placement: p.tool_placement.clone(),
-                brofile_tool_defaults,
-                tool_defaults: p.tool_defaults.clone(),
-                allocation_request,
-                project_dir_for_lease: p.cwd.clone(),
-                ambient_bro_name: p.bro.clone(),
-                spawn_bro_label: None,
-                spawn_agent_label: None,
-                display_name: p.display_name.clone(),
-                record_to_bro: p.bro.clone(),
-                brofile_context,
-                code_mode: resolved_code_mode,
-                service_tier: resolved_service_tier,
-                // bro_exec carries no output schema (structured output is delivered
-                // via agent dispatch from the manifest, not generic exec).
-                output_schema: None,
-                // Default the bro_exec origin to AgentDispatch; the cockpit
-                // control handler overrides this to Cockpit via the
-                // `origin_override` slot on ExecParams.
-                origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
-            })
+            .dispatch_fresh_bro_task_with_admission(
+                FreshDispatchRequest {
+                    prompt: p.prompt.clone(),
+                    provider,
+                    lens,
+                    exec_opts,
+                    env_overrides,
+                    cwd: cwd.clone(),
+                    brofile_filters,
+                    coerce_workspace,
+                    allow_recursion,
+                    allow_tools: p.allow_tools.clone(),
+                    disallow_tools: p.disallow_tools.clone(),
+                    tool_placement: p.tool_placement.clone(),
+                    brofile_tool_defaults,
+                    tool_defaults: p.tool_defaults.clone(),
+                    allocation_request,
+                    project_dir_for_lease: p.cwd.clone(),
+                    ambient_bro_name: p.bro.clone(),
+                    spawn_bro_label: None,
+                    spawn_agent_label: None,
+                    display_name: p.display_name.clone(),
+                    record_to_bro: p.bro.clone(),
+                    brofile_context,
+                    code_mode: resolved_code_mode,
+                    service_tier: resolved_service_tier,
+                    // bro_exec carries no output schema (structured output is delivered
+                    // via agent dispatch from the manifest, not generic exec).
+                    output_schema: None,
+                    // Default the bro_exec origin to AgentDispatch; the cockpit
+                    // control handler overrides this to Cockpit via the
+                    // `origin_override` slot on ExecParams.
+                    origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
+                },
+                admission,
+            )
             .await
         {
             Ok(result) => result,
@@ -653,13 +784,10 @@ impl BlackboxServer {
         Self::ok_json(&response)
     }
 
-    #[tool(
-        name = "bro_resume",
-        description = "Continue an existing session with a follow-up; single-flight per provider session and the continuity path after bro_exec."
-    )]
-    pub(crate) async fn bro_resume(
+    async fn bro_resume_inner(
         &self,
-        Parameters(p): Parameters<ResumeParams>,
+        p: ResumeParams,
+        admission: Option<orch::admission::Attempt>,
     ) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
 
@@ -713,7 +841,10 @@ impl BlackboxServer {
         }
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
-        let task_id = uuid::Uuid::new_v4().to_string();
+        let task_id = admission
+            .as_ref()
+            .map(|a| a.identity.task_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let resume_lease = match try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),
@@ -781,6 +912,9 @@ impl BlackboxServer {
         };
         args.extend(dispatch_filters.args);
 
+        if let Some(admission) = &admission {
+            admission.mark_spawn_started();
+        }
         let task = orch::spawn_task_with_tool_placement(
             task_id,
             provider,
@@ -831,8 +965,42 @@ impl BlackboxServer {
         Self::ok_json(&json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
-            "status": "running",
+            "status": inner.status,
         }))
+    }
+}
+
+#[tool_router(router = dispatch_tools)]
+impl BlackboxServer {
+    #[tool(
+        name = "bro_exec",
+        description = "Launch a fresh agent task/session and return {taskId, sessionId}. Optional request_key prevents duplicate launch after a lost reply. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`."
+    )]
+    pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
+        self.with_dispatch_admission(
+            orch::admission::Operation::Exec,
+            p.request_key.clone(),
+            serde_json::to_value(&p).expect("exec params serialize"),
+            |admission| self.bro_exec_inner(p, admission),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "bro_resume",
+        description = "Continue an existing session with a follow-up; single-flight per provider session. Optional request_key prevents duplicate continuation after a lost reply."
+    )]
+    pub(crate) async fn bro_resume(
+        &self,
+        Parameters(p): Parameters<ResumeParams>,
+    ) -> CallToolResult {
+        self.with_dispatch_admission(
+            orch::admission::Operation::Resume,
+            p.request_key.clone(),
+            serde_json::to_value(&p).expect("resume params serialize"),
+            |admission| self.bro_resume_inner(p, admission),
+        )
+        .await
     }
 
     #[tool(
@@ -2965,6 +3133,7 @@ mod tests {
 
     fn params() -> ExecParams {
         ExecParams {
+            request_key: None,
             prompt: "test".into(),
             bro: None,
             provider: None,
@@ -3101,6 +3270,64 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn keyed_dispatch_replays_without_running_the_invocation_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let request = json!({"prompt":"synthetic"});
+        let first = server
+            .with_dispatch_admission(
+                orch::admission::Operation::Exec,
+                Some("one".into()),
+                request.clone(),
+                |attempt| async {
+                    let attempt = attempt.unwrap();
+                    let task = orch::test_task(
+                        &attempt.identity.task_id,
+                        orch::TaskStatus::Completed,
+                        Provider::Brodex,
+                    );
+                    server
+                        .state
+                        .task_store
+                        .write()
+                        .insert(attempt.identity.task_id.clone(), task)
+                        .unwrap();
+                    BlackboxServer::ok_json(&json!({"taskId":attempt.identity.task_id}))
+                },
+            )
+            .await;
+        let first_id =
+            serde_json::from_str::<Value>(&call_result_text(&first)).unwrap()["taskId"].clone();
+        let replay = server
+            .with_dispatch_admission(
+                orch::admission::Operation::Exec,
+                Some("one".into()),
+                request,
+                |_| async { panic!("retry launched work") },
+            )
+            .await;
+        let replay: Value = serde_json::from_str(&call_result_text(&replay)).unwrap();
+        assert_eq!(replay["taskId"], first_id);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_origin_override_cannot_bypass_dispatch_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.drain.set(None, None).unwrap();
+        let p: ExecParams = serde_json::from_value(
+            json!({"prompt":"do not launch", "provider":"glm", "origin_override":"workflow"}),
+        )
+        .unwrap();
+        assert!(p.origin_override.is_none());
+        let result = server.bro_exec(Parameters(p)).await;
+        assert!(call_result_text(&result).contains("maintenance_pending"));
+        assert!(server.state.task_store.read().all_tasks().is_empty());
     }
 
     #[tokio::test]

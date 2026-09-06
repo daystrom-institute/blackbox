@@ -13,6 +13,12 @@ use std::collections::BTreeMap;
 // cwd (gap-16d79781). Fail loudly instead.
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecParams {
+    /// Optional durable retry key (1-256 bytes). Reuse the same key and inputs
+    /// after a lost reply; mismatched inputs or bound workspace refuse reuse.
+    /// Keys never expire automatically. An incomplete admission reports an
+    /// unknown execution outcome and never relaunches on retry.
+    #[serde(default)]
+    pub(crate) request_key: Option<String>,
     /// Task instruction for the agent
     pub(crate) prompt: String,
     /// Dispatch selector option 1: named bro instance to target. Bare names
@@ -124,7 +130,7 @@ pub(crate) struct ExecParams {
     /// can tab cockpit-launched tasks separately from peer-bros-launched
     /// ones. Not part of the public MCP schema — clients should not set
     /// it.
-    #[serde(default)]
+    #[serde(default, skip_deserializing)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,
     /// **Internal.** Roster display name for this dispatch (the operator's
@@ -141,6 +147,12 @@ pub(crate) struct ExecParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResumeParams {
+    /// Optional durable retry key (1-256 bytes). Reuse the same key and inputs
+    /// after a lost reply; mismatched inputs or bound workspace refuse reuse.
+    /// Keys never expire automatically. An incomplete admission reports an
+    /// unknown execution outcome and never relaunches on retry.
+    #[serde(default)]
+    pub(crate) request_key: Option<String>,
     /// Follow-up instruction
     pub(crate) prompt: String,
     /// Named bro instance to resume. Bare names must be unique across live
@@ -196,7 +208,7 @@ pub(crate) struct ResumeParams {
     /// it to `Origin::Cockpit` so a cockpit-driven follow-up turn stays in
     /// the fleet roster tab instead of jumping to the dispatched-agents tab.
     /// Not part of the public MCP schema — clients should not set it.
-    #[serde(default)]
+    #[serde(default, skip_deserializing)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,
 }
