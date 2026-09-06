@@ -19,13 +19,22 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Partition prune apply refuses batches above eight candidates or its identity
+  byte budget before deletion; select a route to narrow a larger preview.
+  Prune and scrub stop on the first deletion failure and report unattempted work.
+  Exact inventory pages are preview reads, not prior-apply receipts.
+- Exact MCP server inventories retain full identities. Agent metadata and
+  merged-filter summaries have complete body pages. Packet apply/audit exact
+  result reads are deterministic re-evaluations and add no observation event.
+
 - Surviving MCP reads use bounded summaries and exact continuation for growing
   thread histories, knowledge diagnostics, graph schemas, publisher health,
   packet events and configuration. Invalid selectors and action mismatches
-  refuse explicitly; aggregate waits retain unknown task IDs and truthful
-  completion outcomes.
-- GLM 5.3 Flash is selectable as `glm-5.3-flash`. Both GLM 5.3 variants use a 1M context window. Ordinary bro status, wait and dashboard
-  responses omit context telemetry; explicit diagnostics retain it.
+  refuse explicitly; aggregate waits reject unknown task selections instead of reporting empty
+  completion.
+- GLM 5.3 Flash is selectable as `glm-5.3-flash`. Both GLM 5.3 variants use a
+  1M context window. Ordinary bro status, wait and dashboard responses omit
+  context telemetry; explicit diagnostics retain it.
 - Native search observations retain provider-owned call/result blocks in durable
   transcripts. Replay repairs only client-owned calls, and MiniMax's search
   request schema variation stays scoped to that provider.

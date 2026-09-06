@@ -705,7 +705,7 @@ small changes justified by these caller-facing findings, followed by focused
 fixture/served-contract validation. The audit thread remains active.
 
 
-## Integration review evidence (in progress)
+## Integration review evidence
 
 The operator-authorized caller-contract corrections supersede the old byte-for-byte
 knowledge presentation freeze for three bridge fixture rows: all_knowledge,
@@ -730,3 +730,77 @@ follows the [Z.AI model guide](https://docs.z.ai/guides/vlm/glm-5.3-flash).
 The provider's existing flagship default remains selected unless the caller pins
 Flash. Native request support still needs a successful provider probe; code-path
 and catalog tests alone do not prove endpoint admission under a quota cap.
+
+
+### Verified integration checkpoint
+
+Code revision `9dbfb74f` includes the ten dispatched implementation drafts and
+orchestrator corrections. The full-profile workspace suite passed at `83810c02`
+(6,679 passed, 19 skipped). Workspace clippy and the concurrency lint pass after
+moving brofile store operations onto the blocking pool at `9dbfb74f`. An extra
+`clippy --workspace --all-targets` run found existing test-fixture filesystem lint
+errors in `crates/fleetd/src/workspace.rs`; that broader gate is not green.
+
+A throwaway catalog-mode daemon built at `9dbfb74f` served 109 tools. Its 58
+HTTP/MCP calls exercised these concrete cases with synthetic isolated state:
+
+| Contract | Observed result |
+| --- | --- |
+| `bro_providers(provider="glm")` | Advertises `glm-5.3-flash`; flagship default remains `glm-5.3`. |
+| `bro_when_any` and `bro_when_all`, unknown-only selection | Both refuse the selection; neither reports empty success. |
+| Brofile/MCP scope typos, action-mismatched MCP field, invalid partition action and thread detail | Explicit error responses. |
+| Account write, summary and exact inventory | Values are redacted; exact inventory reconstruction retains the account identity. |
+| Thread summary, history and exact note continuation | Summary omits the large body; continuation reconstructs the complete 16,522-byte Unicode/escaped note. |
+| Schema, unmatched knowledge and dashboard reads | Successful bounded responses against the isolated daemon. |
+
+The largest complete MCP result in those calls was 15,245 serialized bytes.
+This measurement covers those fixtures, not every possible input. The isolated
+daemon was stopped after the probe. These are built-runtime observations, not
+production deployment evidence.
+
+The native-search request, replay and durable-log regressions cover canonical
+Anthropic blocks, GLM's generic assistant results, and MiniMax's request schema
+variation. They establish those repaired protocol behaviors. They do not establish
+why the provider initiated placeholder queries. The actual GLM 5.3 probe at
+20:49:11 UTC and Flash probe at 20:57:24 UTC on 2026-09-06 both returned HTTP 429,
+code 1308, with a five-hour quota-cap message. The returned reset timestamp had no
+timezone. A successful live Flash turn remains unverified; this is not a claim of
+permanent provider unavailability.
+
+### Final integration verification
+
+At `e7985322`, the full-profile workspace gate passed all 6,684 tests with
+19 skipped; workspace clippy, the concurrency lint and pinned formatting also
+passed. The expanded isolated HTTP/MCP probe made 159 successful checks across
+109 served tools, including expected error cases. Its largest complete result
+was 15,245 bytes. The probe exercises a subset of action combinations; neither
+the catalog count nor test count represents exhaustive live execution.
+
+The follow-up findings at the earlier checkpoint are now implemented and checked:
+
+| Follow-up | Implemented contract | Evidence |
+| --- | --- | --- |
+| Partition outcomes and mappings | Exact preview inventory; candidate/skipped rows follow the visible page with global totals; oversized apply batches refuse before effects and accept a route selector. Failure stops the batch and reports completed/unattempted counts. | Workspace regressions reconstruct candidate pages and huge fields, prove pre-effect refusal, route selection and partial failure. No production prune/scrub was run. |
+| Agent summary inventories | Metadata and complete computed-summary body planes; default oversized filter/history/warning fields retain counts and exact hints. URL sources omit credential/query details. | Large-filter and metadata regressions; isolated installation and full merged-filter/metadata recovery. |
+| MCP server identities | Exact redacted list inventory recovers full names; ordinary list budgets encoded output and retains continuation. | Escaped-name/filter fixture plus isolated oversized server-name reconstruction. |
+| Packet result bodies | Exact deterministic apply/audit result pages bound to input and result; exact reads add no observation event. Large summary values expose the result reader. | First-consequent, audit-value and changed-input regression; isolated apply/audit full recovery. |
+
+Reproduce the isolated probe with `scripts/probe-mcp-survivor.py --repo <checkout>`
+after building `blackboxd` and `blackbox` for that host. In a build lane, invoke
+Python inside its pod. The script creates synthetic state, starts one throwaway
+daemon, records RPC envelopes and stops that daemon. It does not select production
+state or dispatch a provider turn. Measured results are checked in as
+[mcp-survivor-integration-verification.json](mcp-survivor-integration-verification.json).
+
+Native placeholder-search invocation cause remains open in `gap-900d052c`.
+The replay, observation and MiniMax request-shape defects are repaired and tested;
+a successful provider-level probe is still blocked by the observed quota cap.
+Preserve the enabled search capability while gathering evidence. A query deny list
+would not establish or repair the protocol cause.
+
+Callable retirement and locality restrictions retain their explicit dispositions
+in the action matrix. That matrix records the original audit; the integration
+checkpoints above record subsequent fixes and their actual verification scope.
+The audit thread remains active for the native-search investigation and the
+recorded retirement/restriction dispositions. No production mutation or retirement
+result is inferred from isolated fixture checks.
