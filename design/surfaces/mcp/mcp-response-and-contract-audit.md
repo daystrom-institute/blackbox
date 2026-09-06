@@ -11,6 +11,13 @@ brief: "Source-backed triage of tool usefulness, caller contracts, response brev
 
 # MCP response and contract audit
 
+The accepted [bro execution boundary and retirement plan](../../orchestration/bro-execution-boundary-and-retirement.md)
+now takes priority over response improvements to retiring workflow, atom,
+Badgey/Slack, reaction and whiteboard surfaces. It includes an exact current-tool
+map, preserved capabilities, deployed consumers and extraction gates. This audit
+remains open for the surviving surface; planned retirement does not count as an
+implemented fix.
+
 Snapshot: 2026-09-05, source commit `919b8f4a`. This is an adjustment backlog,
 not an implemented contract. The preceding commit fixes brofile list shaping,
 provider/model discovery, context telemetry, and GPT-6 Astra registration. It

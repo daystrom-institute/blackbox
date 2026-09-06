@@ -12,6 +12,13 @@ brief: "Hub for Blackbox orchestration designs: atoms, agents, workflows, superv
 This hub groups designs for starting, supervising, composing, and recovering
 agentic work.
 
+The accepted [bro execution boundary and retirement plan](bro-execution-boundary-and-retirement.md)
+now guides implementation: retain reliable bro execution and corpus capabilities,
+move higher-order orchestration to callers, and retire the daemon workflow,
+atom, application reaction, Slack and Badgey runtimes. The designs below describe
+the existing system and its history; the retirement plan records dependencies,
+preserved capabilities, migration contracts and verification gates.
+
 ## Capability Runtime
 
 - [Atom System](atoms/atom-system.md)

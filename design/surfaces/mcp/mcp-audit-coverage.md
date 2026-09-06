@@ -11,6 +11,14 @@ brief: "Complete registered-tool inventory grouped by adapter owner and audit fi
 
 # MCP audit coverage
 
+The accepted [orchestration retirement plan](../../orchestration/bro-execution-boundary-and-retirement.md)
+reconciles the current 190 source and live ops names with an
+[exact disposition map](../../orchestration/bro-execution-retirement-map.json).
+Its planned scope is 82 retired names and 108 survivors requiring either slimming
+or the remaining audit. The inventory below remains the original audit baseline;
+retirement is planned, not implemented, and surviving tools are not thereby
+marked passing. Native background collection is now restored and verified.
+
 Source snapshot: `919b8f4a`, 2026-09-05. The inventory enumerates all 190
 named tool declarations in 30 adapter files under `src/tools`. The connected
 session exposes 106 of these tools; specialist and restricted families still
