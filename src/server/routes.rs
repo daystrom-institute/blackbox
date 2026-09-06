@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -1323,10 +1323,8 @@ pub(crate) async fn install_artifact_value(
                 let tp: orchestration::team::Teamplate = serde_json::from_value(value.clone())?;
                 if tp.advisor.is_some() {
                     anyhow::bail!(
-                        "team artifact '{}' declares an advisor; advisor initialization requires a \
-                     live dispatch, which install never performs — create the team via \
-                     bro_team(action=create, template=\"{}\") instead",
-                        tp.name,
+                        "team artifact '{}' declares an advisor; automatic team advisors are \
+                     retired. Omit advisor and use explicit bro_exec or bro_resume calls",
                         tp.name
                     );
                 }
