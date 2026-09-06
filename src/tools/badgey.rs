@@ -226,7 +226,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "badgey_proposals_list",
-        description = "List BadgeyProposal records owned by an instance. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment — useful for reading proposals emitted by the most recent Badgey turn. Used by the per-channel triage workflow's ForeachPostProposal node to iterate proposals freshly emitted by the synthesis turn."
+        description = "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through."
     )]
     pub(crate) fn badgey_proposals_list(
         &self,
@@ -236,25 +236,14 @@ impl BlackboxServer {
             Ok(parsed) => parsed,
             Err(e) => return Self::err_text(&e),
         };
-        let proposals = match self.state.consultant_proposals.list_by_instance(&id) {
-            Ok(v) => v,
-            Err(e) => return Self::err_text(&format!("listing proposals: {e}")),
-        };
-        let filtered: Vec<_> = proposals
-            .into_iter()
-            .filter(|proposal| {
-                p.since
-                    .as_deref()
-                    .is_none_or(|since| proposal.created_at.as_str() >= since)
-            })
-            .filter(|proposal| p.only_pending != Some(true) || !proposal.is_terminal())
-            .collect();
-        Self::ok_json(&json!({
-            "badgey_id": p.badgey_id,
-            "since": p.since,
-            "count": filtered.len(),
-            "proposals": filtered,
-        }))
+        match self.state.consultant_proposals.response_page(
+            &id,
+            &p.read_options(),
+            json!({"badgey_id": p.badgey_id}),
+        ) {
+            Ok(page) => Self::ok_json(&page),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(

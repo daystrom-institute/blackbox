@@ -1,20 +1,47 @@
 {
   "name": "badgey-slack-emit-proposal-arc",
-  "version": 1,
+  "version": 2,
   "vars_schema": {
-    "proposal": { "kind": "object", "required": true },
-    "team_id": { "kind": "string", "required": true },
-    "channel_id": { "kind": "string", "required": true },
-    "channel_name": { "kind": "string" },
-    "project_dir": { "kind": "string", "required": true },
-    "badgey_id": { "kind": "string" },
-    "rendered_text": { "kind": "string" },
-    "post_response": { "kind": "object" },
-    "msg_ts": { "kind": "string" },
-    "link_recorded": { "kind": "object" }
+    "proposal": {
+      "kind": "object",
+      "required": true
+    },
+    "team_id": {
+      "kind": "string",
+      "required": true
+    },
+    "channel_id": {
+      "kind": "string",
+      "required": true
+    },
+    "channel_name": {
+      "kind": "string"
+    },
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "badgey_id": {
+      "kind": "string"
+    },
+    "rendered_text": {
+      "kind": "string"
+    },
+    "post_response": {
+      "kind": "object"
+    },
+    "msg_ts": {
+      "kind": "string"
+    },
+    "link_recorded": {
+      "kind": "object"
+    },
+    "proposal_response": {
+      "kind": "object"
+    }
   },
   "actors": {},
-  "start": "Render",
+  "start": "ReadProposal",
   "nodes": {
     "Render": {
       "actor": "",
@@ -28,7 +55,10 @@
           }
         }
       ],
-      "next": { "type": "goto", "to": "Post" }
+      "next": {
+        "type": "goto",
+        "to": "Post"
+      }
     },
     "Post": {
       "actor": "",
@@ -56,17 +86,25 @@
                 }
               }
             },
-            "expect_status": [200]
+            "expect_status": [
+              200
+            ]
           },
           "into_var": "post_response",
           "on_failure": "halt"
         },
         {
           "op": "set_var",
-          "args": { "key": "msg_ts", "value": "${vars.post_response.ts}" }
+          "args": {
+            "key": "msg_ts",
+            "value": "${vars.post_response.ts}"
+          }
         }
       ],
-      "next": { "type": "goto", "to": "RecordLink" }
+      "next": {
+        "type": "goto",
+        "to": "RecordLink"
+      }
     },
     "RecordLink": {
       "actor": "",
@@ -91,7 +129,41 @@
           "on_failure": "warn"
         }
       ],
-      "next": { "type": "terminal" }
+      "next": {
+        "type": "terminal"
+      }
+    },
+    "ReadProposal": {
+      "actor": "",
+      "prompt": "Expand this summary into its exact current draft before rendering.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "consultant_proposals_list",
+            "arguments": {
+              "consumer": "badgey",
+              "consultant_id": "${vars.badgey_id}",
+              "proposal_id": "${vars.proposal.id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "proposal_response",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "proposal",
+            "value": "${vars.proposal_response.proposals.0}"
+          }
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "Render"
+      }
     }
   }
 }

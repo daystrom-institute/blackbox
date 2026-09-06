@@ -86,6 +86,18 @@ impl From<serde_json::Error> for ProposalStoreError {
 
 pub type Result<T> = std::result::Result<T, ProposalStoreError>;
 
+/// Read-only MCP projection options, shared by consumer-neutral and pinned adapters.
+#[derive(Debug, Default)]
+pub struct ProposalReadOptions {
+    pub since: Option<String>,
+    pub only_pending: bool,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+    pub through: Option<String>,
+    pub proposal_id: Option<String>,
+    pub include_events: bool,
+}
+
 pub struct ProposalStore {
     root: PathBuf,
 }
@@ -244,6 +256,143 @@ impl ProposalStore {
         Ok(proposals)
     }
 
+    /// Stable numeric-id continuation survives state changes in earlier proposals.
+    /// `through` freezes the initial upper id bound, so new proposals do not extend
+    /// a workflow's current synthesis window indefinitely.
+    pub fn response_page(
+        &self,
+        instance: &ConsultantId,
+        options: &ProposalReadOptions,
+        mut envelope: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        use serde_json::json;
+        if options.proposal_id.is_some()
+            && (options.since.is_some()
+                || options.only_pending
+                || options.after.is_some()
+                || options.through.is_some()
+                || options.limit.is_some())
+        {
+            anyhow::bail!(
+                "error.proposal_read_options: proposal_id cannot be combined with list filters, limit, or cursors"
+            );
+        }
+        if options.after.is_some() && options.through.is_none() {
+            anyhow::bail!(
+                "error.proposal_cursor_invalid: after requires the through bound from the initial page"
+            );
+        }
+        if options.include_events && options.proposal_id.is_none() {
+            anyhow::bail!("error.proposal_read_options: include_events requires proposal_id");
+        }
+        let (rows, through, limit, total) = if let Some(id) = options.proposal_id.as_deref() {
+            let proposal = self
+                .get(instance, id)?
+                .ok_or_else(|| anyhow::anyhow!("error.proposal_not_found: {id}"))?;
+            let mut row = json!({"id": proposal.id, "kind": proposal.kind, "state": proposal.state,
+                "draft": proposal.draft, "created_at": proposal.created_at, "updated_at": proposal.updated_at});
+            if let Some(task) = proposal.applied_task_id {
+                row["applied_task_id"] = json!(task);
+            }
+            if options.include_events {
+                row["events"] = json!(proposal.events);
+            }
+            (vec![row], id.to_owned(), 1, 1)
+        } else {
+            if let Some(since) = options.since.as_deref() {
+                chrono::DateTime::parse_from_rfc3339(since).map_err(|_| {
+                    anyhow::anyhow!(
+                        "error.proposal_since_invalid: since must be an RFC3339 timestamp"
+                    )
+                })?;
+            }
+            let proposals = self.list_by_instance(instance)?;
+            let parse_cursor = |cursor: &str| {
+                proposal_number(cursor).ok_or_else(|| {
+                    anyhow::anyhow!("error.proposal_cursor_invalid: expected P-<number>")
+                })
+            };
+            let after = options
+                .after
+                .as_deref()
+                .map(parse_cursor)
+                .transpose()?
+                .unwrap_or(0);
+            let ceiling = options
+                .through
+                .as_deref()
+                .map(parse_cursor)
+                .transpose()?
+                .unwrap_or_else(|| {
+                    proposals
+                        .iter()
+                        .filter_map(|proposal| proposal_number(&proposal.id))
+                        .max()
+                        .unwrap_or(0)
+                });
+            anyhow::ensure!(
+                after <= ceiling,
+                "error.proposal_cursor_invalid: after must not exceed through"
+            );
+            let since = options
+                .since
+                .as_deref()
+                .map(chrono::DateTime::parse_from_rfc3339)
+                .transpose()?;
+            let filtered: Vec<_> = proposals
+                .into_iter()
+                .filter(|proposal| {
+                    let number = proposal_number(&proposal.id).unwrap_or(0);
+                    number > after
+                        && number <= ceiling
+                        && (!options.only_pending || !proposal.is_terminal())
+                })
+                .filter(|proposal| {
+                    since.as_ref().is_none_or(|since| {
+                        chrono::DateTime::parse_from_rfc3339(&proposal.created_at)
+                            .is_ok_and(|created| created >= *since)
+                    })
+                })
+                .collect();
+            let total = filtered.len();
+            let limit = options.limit.unwrap_or(20).clamp(1, 100);
+            let rows = filtered.into_iter().take(limit).map(|proposal| {
+                let mut row = json!({"id": proposal.id, "kind": proposal.kind, "state": proposal.state,
+                    "created_at": proposal.created_at});
+                if let Some(headline) = proposal.draft.get("headline").and_then(serde_json::Value::as_str) {
+                    row["headline"] = json!(headline);
+                    bbox_corpus_core::response_page::preview_field(&mut row, "headline", 512);
+                }
+                if let Some(task) = proposal.applied_task_id { row["applied_task_id"] = json!(task); }
+                row
+            }).collect();
+            (rows, format!("P-{ceiling}"), limit, total)
+        };
+        envelope["proposals"] = json!(rows);
+        envelope["total"] = json!(total);
+        envelope["offset"] = json!(0);
+        envelope["limit"] = json!(limit);
+        envelope["count"] = json!(rows.len());
+        envelope["through"] = json!(through);
+        envelope["next_after"] = json!(through); // reserve cursor bytes before byte selection
+        envelope["has_more"] = json!(false);
+        let mut page = bbox_corpus_core::response_page::bound_page(envelope, "proposals")?;
+        let has_more = !page["next_offset"].is_null();
+        page["has_more"] = json!(has_more);
+        page["next_after"] = if has_more {
+            page["proposals"]
+                .as_array()
+                .and_then(|rows| rows.last())
+                .map(|row| row["id"].clone())
+                .unwrap_or_default()
+        } else {
+            serde_json::Value::Null
+        };
+        page.as_object_mut().unwrap().remove("offset");
+        page.as_object_mut().unwrap().remove("next_offset");
+        Ok(page)
+    }
+
     pub fn list_non_terminal(&self) -> Result<Vec<ConsultantProposal>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -360,6 +509,137 @@ mod tests {
 
     fn instance() -> ConsultantId {
         ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap()
+    }
+
+    #[test]
+    fn proposal_pages_keep_tails_when_states_change_and_new_records_arrive() {
+        use serde_json::json;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = ProposalStore::new(root).unwrap();
+        let id = instance();
+        for _ in 0..45 {
+            store.create(&id, "packet", json!({"headline": "界".repeat(300), "private_body": "large-draft-secret".repeat(3000)}), None).unwrap();
+        }
+        let first = store
+            .response_page(
+                &id,
+                &ProposalReadOptions {
+                    only_pending: true,
+                    ..Default::default()
+                },
+                json!({}),
+            )
+            .unwrap();
+        assert_eq!(first["count"], 20);
+        assert_eq!(first["through"], "P-45");
+        assert_eq!(first["next_after"], "P-20");
+        assert_eq!(first["proposals"][0]["headline_truncated"], true);
+        assert!(!first.to_string().contains("large-draft-secret"));
+        for n in 1..=20 {
+            store
+                .transition(
+                    &id,
+                    &format!("P-{n}"),
+                    ProposalState::Pending,
+                    ProposalState::Failed,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .create(&id, "packet", json!({"headline": "new arrival"}), None)
+            .unwrap();
+        let mut options = ProposalReadOptions {
+            only_pending: true,
+            after: Some("P-20".into()),
+            through: Some("P-45".into()),
+            ..Default::default()
+        };
+        let second = store.response_page(&id, &options, json!({})).unwrap();
+        assert_eq!(second["proposals"][0]["id"], "P-21");
+        assert_eq!(second["next_after"], "P-40");
+        options.after = Some("P-40".into());
+        let last = store.response_page(&id, &options, json!({})).unwrap();
+        assert_eq!(last["count"], 5);
+        assert_eq!(last["proposals"][4]["id"], "P-45");
+        assert_eq!(last["has_more"], false);
+        assert!(last["next_after"].is_null());
+        for page in [first, second, last] {
+            assert!(
+                serde_json::to_vec(&page).unwrap().len()
+                    <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_exact_read_expands_draft_and_opt_in_history_without_mutation() {
+        use serde_json::json;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = ProposalStore::new(root).unwrap();
+        let id = instance();
+        store
+            .create(
+                &id,
+                "packet",
+                json!({"headline": "example", "body": "exact draft"}),
+                None,
+            )
+            .unwrap();
+        store
+            .transition(
+                &id,
+                "P-1",
+                ProposalState::Pending,
+                ProposalState::Failed,
+                Some("history-only".into()),
+            )
+            .unwrap();
+        let mut options = ProposalReadOptions {
+            proposal_id: Some("P-1".into()),
+            ..Default::default()
+        };
+        let compact = store.response_page(&id, &options, json!({})).unwrap();
+        assert_eq!(compact["proposals"][0]["draft"]["body"], "exact draft");
+        assert!(compact["proposals"][0].get("events").is_none());
+        options.include_events = true;
+        let expanded = store.response_page(&id, &options, json!({})).unwrap();
+        assert_eq!(
+            expanded["proposals"][0]["events"][0]["note"],
+            "history-only"
+        );
+        assert_eq!(
+            store.get(&id, "P-1").unwrap().unwrap().state,
+            ProposalState::Failed
+        );
+        options.after = Some("P-0".into());
+        assert!(store.response_page(&id, &options, json!({})).is_err());
+        assert!(
+            store
+                .response_page(
+                    &id,
+                    &ProposalReadOptions {
+                        after: Some("P-0".into()),
+                        ..Default::default()
+                    },
+                    json!({})
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .response_page(
+                    &id,
+                    &ProposalReadOptions {
+                        since: Some("not-a-timestamp".into()),
+                        ..Default::default()
+                    },
+                    json!({})
+                )
+                .is_err()
+        );
     }
 
     #[test]

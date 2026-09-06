@@ -92,17 +92,29 @@ whether scout work is still walking or has produced dispatch records.
 
 ### Proposals
 
-**`badgey_proposals_list`** - Read full proposal records (id, kind,
-state, draft fields, created_at, events). Pass `since` to scope to a
-specific synthesis turn's output.
+**`badgey_proposals_list`** returns proposal summaries in numeric id order,
+20 per page by default (maximum 100). Drafts and transition history are omitted.
+Use an RFC3339 `since` timestamp to restrict a synthesis window.
 
+```text
+badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", only_pending=true)
 ```
-badgey_proposals_list(
-  badgey_id="bg-deadbeef-cafef00d",
-  since="2026-05-07T08:00:00Z",
-  only_pending=true
-)
+
+When `has_more` is true, call again with `after=next_after`, the returned
+`through` bound, and the same filters. The cursor follows proposal ids rather
+than row positions: applying an earlier proposal does not skip later pending
+proposals. `through` excludes proposals created after the initial page.
+
+To read one current draft, use `proposal_id` without list filters or cursors:
+
+```text
+badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")
 ```
+
+The `proposals` array then contains the exact record and its full draft.
+`include_events=true` adds transition history for that exact read. Individual
+records that exceed the response budget fail explicitly; no hidden file is
+created. The consumer-neutral `consultant_proposals_list` has the same contract.
 
 **`badgey_apply_proposal`** - One-shot apply: state-machine transition
 `Pending/Failed -> Applying`, kind-specific dispatch, record

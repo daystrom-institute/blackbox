@@ -19,9 +19,11 @@ daily 08:00 system-local cron tick
                   ├── ForeachScout     (parallelism=3, subworkflow_ref=badgey-scout-arc)
                   │     └── badgey-scout-arc  (executor=badgey-scout-persona, durable=false)
                   ├── SynthesisTurn    (mcp_call badgey_resume — proposals or dream/explore)
-                  ├── ListProposals    (mcp_call badgey_proposals_list since=synthesis_started_at)
-                  └── ForeachPostProposal (parallelism=1, on_item_failure=continue)
+                  ├── ListProposals    (consultant_proposals_list summaries, since=arc started_at)
+                  └── ForeachPostProposal (parallelism=1, on_item_failure=collect_then_halt)
+                        ├── hook-route/proposal-page gate: more → NextProposalPage → foreach; done → Done
                         └── badgey-slack-emit-proposal-arc
+                              ├── ReadProposal (exact proposal_id read)
                               ├── Render      (set_var rendered_text)
                               ├── Post        (http_json chat.postMessage with metadata)
                               └── RecordLink  (mcp_call bro_slack_link_record)
@@ -59,19 +61,27 @@ admin/workflow/install path only updates the runtime registry,
 leaving the catalog stale — which makes future audits and supersession
 chains see drift between source files and the daemon's view.
 
+MCP installation accepts an inline `artifact` object or an explicit HTTP(S)
+`source` URL. Repository filenames are provenance pointers, not paths the MCP
+server can open on behalf of the caller. Obtain the source-owned JSON through
+indexed evidence or an HTTP source, then pass that object directly:
+
 ```text
-# MCP form (preferred):
-bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-persona.json")
-bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-scout-persona.json")
-bbox_artifact_install(kind="agent",   source="system-defaults/badgey/agents/badgey.json")
-bbox_artifact_install(kind="agent",   source="system-defaults/badgey/agents/badgey-scout.json")
-bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-scout-arc.json")
-bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-slack-emit-proposal-arc.json")
-bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-triage-channel-arc.json")
-bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-triage-fanout-arc.json")
-bbox_artifact_install(kind="packet",   source="system-defaults/badgey/packets/badgey-cron-routing.json")
-bbox_artifact_install(kind="cron",     source="system-defaults/badgey/crons/badgey-triage-daily.json")
+bbox_artifact_install(kind="workflow", artifact=<typed workflow JSON object>)
 ```
+
+Install the `hook-route/proposal-page` packet before upgrading
+`badgey-slack-emit-proposal-arc` and `badgey-triage-channel-arc`. The other
+prerequisites are the Badgey/scout brofiles and agents, scout workflow,
+channel-fanout workflow, cron-routing packet, and daily cron. Host deployment
+scripts may load repository files through the host-domain install API.
+
+Proposal discovery returns bounded summaries. The parent preserves the first
+page's `through` bound and follows `next_after` with unchanged `since` and
+`only_pending` filters. Every child fetches the exact current draft before
+rendering. The pure packet gate drives continuation without an LLM turn.
+A draft-read or posting failure makes the brief fail after collecting that
+page's results; it cannot report success after silently losing a proposal.
 
 ## Bind a channel
 
@@ -115,8 +125,9 @@ synthesis turn (~minutes), Slack post burst.
   thread-reply traffic.
 - `bro_webhook_deliveries(name="slack")` — every Slack event through
   the routing packet, with extracted entity + verdict classification.
-- `badgey_proposals_list(badgey_id=…)` — snapshot of all proposals
-  owned by a channel's system Badgey instance.
+- `badgey_proposals_list(badgey_id=…)` returns one summary page owned by
+  a channel's system Badgey instance. Follow `next_after` with `through` to
+  exhaust the initial window; use `proposal_id` to expand one draft.
 
 ## Tunables
 
