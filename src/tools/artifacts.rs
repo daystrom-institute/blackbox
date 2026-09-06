@@ -460,6 +460,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             let server = test_server(&tmp);
+            let member: orchestration::brofile::Brofile =
+                serde_json::from_value(json!({"name": "example", "provider": "glm"})).unwrap();
+            orchestration::brofile::save_brofile(&member, "global", &server.state.store_dir, None)
+                .unwrap();
             std::fs::create_dir_all(&server.state.store_dir).unwrap();
             std::fs::write(server.state.store_dir.join(blocked_stage), "blocked").unwrap();
             let p = serde_json::from_value(json!({"kind": "team", "version": "1", "artifact": {"name": "example", "members": [{"brofile": "example", "count": 1}]}})).unwrap();

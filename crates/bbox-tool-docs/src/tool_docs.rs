@@ -271,8 +271,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_stats",
         category: ToolCategory::Transcripts,
-        summary: "Cheap indexed-corpus document and segment counts, cached up to 60s. Does not assess source coverage, freshness, disk size or edge totals.",
-        when_to_use: "Check whether the index is populated. Use targeted search or source status to verify a particular session or publication.",
+        summary: "Indexed document and segment counts, cached up to 60s.",
+        when_to_use: "Check whether the index is populated. Does not assess source coverage, freshness, disk size or edge totals. Use targeted search or source status to verify a particular session or publication.",
         example: None,
     },
     // ── Agentic graph ────────────────────────────────────────────────
