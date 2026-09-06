@@ -1,7 +1,7 @@
 //! Explicit-root native transcript producer. No corpus or daemon dependency.
 //! Raw complete JSONL snapshots are source-owned; the daemon alone parses and
 //! indexes them. Losing local working state never advances server authority.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_transcript_source::*;
 use serde::{Deserialize, Serialize};
