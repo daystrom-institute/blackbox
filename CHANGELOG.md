@@ -10,6 +10,15 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Unpinned runtime allocation uses only the selected provider's declared
+  default account or native credentials. Unrelated global accounts no longer
+  label or inject environment into Brodex dispatches.
+- MCP configuration and account replies redact credential values while
+  preserving stored configuration. Provider catalogs no longer report
+  daemon-local binary availability as worker availability.
+- MCP invocation errors set the tool error flag, and the response guard
+  measures both text and structured content, including JSON escaping.
+
 - Agent context status reports last-request occupancy without a session
   rotation alarm. Fleet context readouts use the last measured prompt size
   instead of cumulative session usage; older logs without that measurement
@@ -34,6 +43,17 @@ out explicitly under `Changed` or `Removed`.
   (publication verification) is checked separately from currency.
 
 ### Changed
+
+- Gap lists return summary pages (20 by default, maximum 100) with total and
+  next_offset. Exact id reads default to full detail; `detail=full` expands a
+  page. Gap and knowledge diagnostics are limited to the requested project.
+
+- Oversized MCP results fail explicitly without creating server-local spill
+  files. Producers provide bounded reads; callers must inspect mutation
+  state before retrying an operation whose response exceeded the budget.
+- Hybrid search returns compact evidence and retrieval status by default;
+  `debug=true` includes ranking and vector execution details. Global embedding
+  queue telemetry belongs to `bbox_embed_status`.
 
 - `bro_brofile(action="list")` returns paginated summaries with `brofiles`,
   `total`, `offset`, and `next_offset`, omitting lenses and dispatch policy.

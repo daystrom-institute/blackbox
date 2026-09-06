@@ -34,8 +34,9 @@
 - Hybrid search never computes exact embedding coverage. That is a complete
   source-corpus walk owned by the explicit embed-status surface. BM25-only
   requests skip vector status entirely; vector-enabled requests use
-  queue-local status and nonblocking partition metrics so compaction cannot
-  stall retrieval.
+  nonblocking partition metrics so compaction cannot stall retrieval. Queue
+  and indexing telemetry belongs on bbox_embed_status; search returns only
+  concise retrieval status and result-affecting degradation by default.
 - `discover_seed` reuses `hybrid_search_typed` verbatim and differs only in
   post-processing (notable edges). Ranking changes land in one place and
   affect both; do not fork the ranking for one surface.

@@ -16,10 +16,10 @@
   rather than inventing a chain (gap-de82a74d and the 2026-06 consolidation
   are what bespoke chains cost).
 - The per-call `bytes` field logged at `blackbox::tool` is the radar for
-  chronic over-cap producers (gap-ecff3899). A tool that routinely spills
-  past the MCP response cap needs producer-side shaping (pagination,
-  projection, accessors) — the lossless spill envelope is a failure
-  signal, not a feature to lean on.
+  chronic oversized producers. Response helpers budget the complete result
+  and return a typed error on overflow. Producers must provide bounded
+  pagination, projections, and detail reads; the server does not spill tool
+  responses into files or assume the client shares its filesystem.
 - `bbox_knowledge`'s mixed response is deliberately progressive: durable
   knowledge gets the primary top-N, while rule-packet and system-memory matches
   are bounded sidecars with explicit expansion breadcrumbs. Do not "fix" recall

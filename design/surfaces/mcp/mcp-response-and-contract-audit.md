@@ -2,7 +2,7 @@
 title: "MCP response and contract audit"
 kind: design
 corpus: blackbox-design
-lifecycle: proposed
+lifecycle: partial
 topic:
   - surfaces
   - mcp
@@ -331,7 +331,7 @@ context occupancy, and never represent an unavailable measurement as zero.
 
 **Priority: P1. Serialization paths confirmed; no credential values probed.**
 
-`bro_brofile(account_list)` serializes the accounts map and `account_set`
+`bro_brofile(action="list_accounts")` serializes the accounts map and `set_account`
 echoes `env`. [`bro_mcp(action="get")`](../../../src/orchestration/mcp.rs)
 serializes `McpServerConfig`; `SecretString::Plain` serializes as its literal
 string. These are persistence representations rather than redacted views.
@@ -484,3 +484,31 @@ The audit adds no runtime behavior and performs no production mutation,
 dispatch, migration, or service restart. Existing unresolved gap records are
 evidence to reconcile against current code and deployment, not proof that
 every historical symptom still reproduces.
+
+## F14. Provider selection must not imply unrelated account membership
+
+The operator reported Brodex dispatches labeled with the `openrouter` account
+without an intentional account selection. Source inspection found that
+`allocator::account_candidates` enumerated every global account for every
+provider. The selected account environment was subsequently applied during
+execution. An unrelated account could therefore be merely a misleading label
+or an actual environment override, depending on its contents.
+
+The implementation now uses the explicit account when present, otherwise the
+selected provider's declared default or native credentials. It does not add a
+second native candidate when a provider default exists, because execution
+resolves that candidate back to the default and would create two allocation
+keys for the same credentials. Synthetic coverage checks unrelated accounts,
+provider-scoped defaults, native fallback, and explicit override. Track the
+operator report as `tooling/runtime-allocation/cross-provider-account-candidates`
+(gap-3f34ae40, queued through the checkout-owner lane).
+
+## Implementation checkpoints
+
+The first implementation milestone addresses whole-result sizing and accidental
+spill removal (F01), compact hybrid search (F04), gap summary pages and scoped
+carrier diagnostics (F05/F06), configuration redaction (F09), canonical
+invocation error flags (part of F12), and account candidate selection (F14).
+Tests and deployed smoke results are recorded at milestone completion. Other
+findings remain open; the original observations above describe the audit
+snapshot and must not be mistaken for the current implementation status.

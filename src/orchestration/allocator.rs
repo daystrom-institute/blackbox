@@ -1208,17 +1208,17 @@ fn account_candidates(
     if let Some(account) = pin.and_then(|pin| pin.account.clone()) {
         return vec![Some(account)];
     }
-    let mut accounts = Vec::new();
-    if let Some(default) = bro_config.provider_defaults.get(&provider) {
-        accounts.push(Some(default.account.clone()));
-    }
-    for name in bro_config.accounts.keys() {
-        accounts.push(Some(name.clone()));
-    }
-    accounts.push(None);
-    accounts.sort();
-    accounts.dedup();
-    accounts
+    // Accounts are global named configurations, not membership declarations
+    // for every provider. An unrelated account can both mislabel a dispatch
+    // and inject transport environment into it. Resolve the same default as
+    // execution, without a second native lane that aliases that default and
+    // could bypass its concurrency accounting.
+    vec![
+        bro_config
+            .provider_defaults
+            .get(&provider)
+            .map(|default| default.account.clone()),
+    ]
 }
 
 fn mapped_lane(
@@ -1642,6 +1642,47 @@ pub fn provider_candidates_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_accounts_are_provider_scoped() {
+        let mut config = BroConfig::default();
+        config
+            .accounts
+            .insert("openrouter".into(), Default::default());
+        config.provider_defaults.insert(
+            Provider::Glm,
+            super::super::brofile::ProviderDefault {
+                account: "openrouter".into(),
+            },
+        );
+        assert_eq!(
+            account_candidates(Provider::Brodex, None, &config),
+            vec![None]
+        );
+        assert_eq!(
+            account_candidates(Provider::Glm, None, &config),
+            vec![Some("openrouter".into())]
+        );
+
+        config.provider_defaults.insert(
+            Provider::Brodex,
+            super::super::brofile::ProviderDefault {
+                account: "coding".into(),
+            },
+        );
+        assert_eq!(
+            account_candidates(Provider::Brodex, None, &config),
+            vec![Some("coding".into())]
+        );
+        let pin = RuntimePin {
+            account: Some("explicit".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_candidates(Provider::Brodex, Some(&pin), &config),
+            vec![Some("explicit".into())]
+        );
+    }
 
     struct EnvRestore {
         prior: Vec<(&'static str, Option<std::ffi::OsString>)>,

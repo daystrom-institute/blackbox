@@ -181,7 +181,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Hybrid BM25+vector search over typed entities + graph vertices; vector_weight=0.6 default, 0.0 BM25-only, 1.0 vector-only.",
+        summary: "Hybrid BM25+vector search over typed entities and graph vertices. Returns bounded evidence hits and retrieval/degradation status; limit defaults to 10, max 50. include_vectors controls retrieval, not raw vectors. debug=true adds ranking and vector execution diagnostics.",
         when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
         example: Some(
             r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#,
@@ -646,7 +646,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_gaps",
         category: ToolCategory::Gaps,
-        summary: "List / filter substrate gap notes by typed fields (gap_kind, impact, blocking_level, dedupe_key, resolution, project).",
+        summary: "List compact gap summaries with filters and pagination (limit defaults to 20, clamped to 1..100; offset defaults to 0). Exact id defaults to full detail; detail=full expands a page. Summary omissions are explicit. Addressed gaps are excluded from lists by default. Ordering is newest created_at, then id; concurrent writes may shift offsets.",
         when_to_use: "The mandatory dedupe step before `bbox_gap`: search open gaps by `dedupe_key`, `gap_kind`, `domain`, `impact`, or free-text `query` before filing. Also the triage surface — pass `json=true` for machine-readable records to group/extract, or `include_addressed=true` to see closed gaps. Addressed gaps are hidden by default for lists, shown by default for an exact `id`. `project` accepts a project_id, a registered operator alias, or a project path, and matches rows by project identity; a value that resolves to no registered project keeps literal substring matching and says so in `diagnostics`, so an empty list is never silent about an unresolvable filter.",
         example: Some(r#"bbox_gaps(gap_kind="mcp_surface", include_addressed=false)"#),
     },
@@ -774,7 +774,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch a fresh agent task/session and return {taskId, sessionId}. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`.",
-        when_to_use: "Use to start a fresh agent session only. A dispatch selector is required: pass exactly one selector family — `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Set the session's working directory with `cwd` (canonical name; `project_dir` is accepted as a deprecated alias). Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
+        when_to_use: "Use to start a fresh agent session only. A dispatch selector is required: pass exactly one selector family — `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Set the session's working directory with `cwd` (canonical name; `project_dir` is accepted as a deprecated alias). Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. Without an account pin, allocation uses only that provider's declared default or native credentials; unrelated global accounts are not candidates. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
         example: Some(
             r#"bro_exec(prompt="review this patch", cwd="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
         ),
@@ -985,14 +985,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_providers",
         category: ToolCategory::Orchestration,
         summary: "List provider summaries; pass provider to list its model slugs and reasoning efforts.",
-        when_to_use: "Discover providers with no arguments. Pass provider=\"brodex\" (or another returned provider id) for that provider's model slugs and model-specific effort support.",
+        when_to_use: "Discover providers with no arguments. Pass provider=\"brodex\" (or another returned provider id) for that provider's model slugs and model-specific effort support. This is a static catalog, not an observation of execution-worker availability.",
         example: None,
     },
     ToolDoc {
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
         summary: "Manage brofiles and accounts. list returns paginated summaries; get by name returns the full lens and configuration.",
-        when_to_use: "Create, inspect, and manage reusable bro blueprints. `action=list` returns sorted summaries (default limit=20, max=100) with total and next_offset; provider and name filter before pagination. Lenses and dispatch policy are omitted: use `action=get` with name for full details. `context.provider_defaults` controls provider-default suppression; see `sm-brofile-context` via `bbox_knowledge` before composing minimal probes or strict suppression brofiles. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        when_to_use: "Create, inspect, and manage reusable bro blueprints. `action=list` returns sorted summaries (default limit=20, max=100) with total and next_offset; provider and name filter before pagination. Lenses and dispatch policy are omitted: use `action=get` with name for full details. `context.provider_defaults` controls provider-default suppression; see `sm-brofile-context` via `bbox_knowledge` before composing minimal probes or strict suppression brofiles. `set_account` and `list_accounts` return environment key names and account policy, never credential values. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(r#"bro_brofile(action="list")"#),
     },
     ToolDoc {
@@ -1008,7 +1008,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_mcp",
         category: ToolCategory::Orchestration,
         summary: "Manage MCP servers + tool filters for dispatched bros.",
-        when_to_use: "Explicitly add/remove MCP servers and manage dispatch-time tool filters. The daemon does not rewrite provider MCP configs on startup. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        when_to_use: "Configuration list/get replies are redacted: endpoint origins and credential key names are visible, inline values and stdio arguments are withheld. Explicitly add/remove MCP servers and manage dispatch-time tool filters. The daemon does not rewrite provider MCP configs on startup. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
         ),

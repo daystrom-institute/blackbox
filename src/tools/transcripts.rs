@@ -135,7 +135,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Hybrid BM25+vector search over typed entities + graph vertices; vector_weight=0.6 default, 0.0 BM25-only, 1.0 vector-only."
+        description = "Hybrid BM25+vector search over typed entities and graph vertices. Returns bounded evidence hits and retrieval/degradation status; limit defaults to 10, max 50. include_vectors controls retrieval, not raw vectors. debug=true adds ranking and vector execution diagnostics."
     )]
     pub(crate) async fn bbox_hybrid_search(
         &self,

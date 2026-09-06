@@ -79,6 +79,11 @@
   relies on the per-store locks instead.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.
+- MCP response budgets cover the serialized result, including text escaping
+  and structured content. Oversize is an explicit tool error, never an
+  automatic filesystem export. Producers own pagination and detail reads;
+  clients own any local persistence of received results. Domain outcomes such
+  as a failed task remain distinct from invocation errors.
 - Deferred EdgeIndex startup is a fail-closed warmup, never an empty graph.
   The watcher immediately publishes the first complete sidecar view and graph
   consumers return `error.edge_index_warming` until that publication lands.
