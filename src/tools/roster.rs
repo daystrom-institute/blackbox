@@ -64,7 +64,7 @@ impl AgentDashboardMetrics {
 impl BlackboxServer {
     #[tool(
         name = "bro_dashboard",
-        description = "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status. Context occupancy is not remaining work capacity."
+        description = "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status."
     )]
     pub(crate) fn bro_dashboard(
         &self,
@@ -166,7 +166,6 @@ impl BlackboxServer {
                 .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
         });
         let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
-        let mut context_hint = None;
         let entries: Vec<Value> = selected
             .into_iter()
             .skip(offset)
@@ -243,15 +242,6 @@ impl BlackboxServer {
                 if s.interrupted {
                     entry["interrupted"] = Value::Bool(true);
                 }
-                // Share the status observation: context occupancy does not
-                // determine whether a session can accept more work.
-                if let Some(pressure) = s.context {
-                    let mut observation = pressure.observation_json();
-                    context_hint = observation
-                        .as_object_mut()
-                        .and_then(|value| value.remove("guidance"));
-                    entry["context"] = observation;
-                }
                 entry
             })
             .collect();
@@ -264,9 +254,6 @@ impl BlackboxServer {
         let next_offset = offset.saturating_add(entries.len());
         if next_offset < total {
             response["next_offset"] = json!(next_offset);
-        }
-        if let Some(hint) = context_hint {
-            response["context_hint"] = hint;
         }
         Self::ok_json(&response)
     }
@@ -2031,7 +2018,7 @@ mod tests {
         }
 
         #[test]
-        fn dashboard_row_carries_context_pressure_when_present() {
+        fn dashboard_omits_context_telemetry_even_when_present() {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
             let t = 1_700_000_000_000_u64;
@@ -2070,13 +2057,9 @@ mod tests {
                 .collect();
 
             let row = by_id.get("pressured").expect("pressured row present");
-            assert_eq!(row["context"]["last_turn_input_tokens"], 190_000);
-            assert_eq!(row["context"]["context_window"], 200_000);
-            assert_eq!(row["context"]["utilization"], 0.95);
-            assert!(row["context"].get("approaching_ceiling").is_none());
-            assert_eq!(row["context"]["measurement"], "last_model_request");
-            assert!(row["context"].get("guidance").is_none());
-            assert!(body["context_hint"].as_str().unwrap().contains("budget"));
+            assert!(row.get("context").is_none());
+            assert!(body.get("context_hint").is_none());
+            assert_eq!(row["status"], "running");
 
             let quiet = by_id.get("quiet").expect("quiet row present");
             assert!(

@@ -26,7 +26,8 @@
 //! {
 //!   "default":           { "context_window": 200000, "compact_at": 0.75 },
 //!   "claude-*":          { "context_window": 200000 },
-//!   "glm-*":             { "context_window": 200000 },
+//!   "glm-4*":            { "context_window": 200000 },
+//!   "glm-5.3":           { "context_window": 1000000 },
 //!   "deepseek-*":        { "context_window": 128000 },
 //!   "deepseek-reasoner": { "context_window": 128000, "compact_at": 0.6 }
 //! }
@@ -210,7 +211,8 @@ fn default_entries() -> BTreeMap<String, Entry> {
     // range benefits from earlier compaction.
     for (k, w, r) in [
         ("claude-*", 200_000, None),
-        ("glm-*", 200_000, None),
+        ("glm-4*", 200_000, None),
+        ("glm-5.3", 1_000_000, None),
         ("deepseek-v4*", 1_000_000, None),
         ("deepseek-*", 128_000, None),
         ("MiniMax-M*", 1_000_000, Some(0.45)),
@@ -361,6 +363,9 @@ mod tests {
             enabled: true,
         };
         assert_eq!(p.resolve("glm-4.6").0, 200_000);
+        assert_eq!(p.context_window("glm-5.3"), Some(1_000_000));
+        assert_eq!(p.threshold("glm-5.3"), Some(750_000));
+        assert_eq!(p.context_window("glm-future-unknown"), None);
         assert_eq!(p.resolve("deepseek-chat").0, 128_000);
         assert_eq!(p.resolve("claude-opus-4-8").0, 200_000);
         // ratio inherits from default everywhere

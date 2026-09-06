@@ -5050,9 +5050,9 @@ fn task_view_json_from_inner(
             });
         }
     }
-    // Occupancy remains visible while running, with the same interpretation
-    // as the dashboard. Cumulative usage is a separate accounting measure.
-    if let Some(pressure) = context_pressure_for_inner(inner) {
+    // Context measurements belong to explicit diagnostics, not routine
+    // orchestration decisions or wait receipts.
+    if debug && let Some(pressure) = context_pressure_for_inner(inner) {
         obj["context"] = pressure.observation_json();
     }
     if let Some(ref label) = inner.bro_label {
@@ -9299,6 +9299,43 @@ mod tests {
             inner.context_window = context_window;
         }
         task
+    }
+
+    #[test]
+    fn mcp_status_and_wait_receipts_omit_context_telemetry() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            // Exercise stale persisted measurements as well as corrected producers.
+            for window in [200_000, 1_000_000] {
+                let task = task_with_context(status, Some(190_000), Some(window));
+                {
+                    let mut inner = task.inner.lock();
+                    inner.provider = Provider::Workflow;
+                    inner.last_assistant_message =
+                        Some(r#"{"structured_exit":{"ok":true}}"#.into());
+                    inner.report = Some(BroReport {
+                        message: "work progress".into(),
+                        needs: None,
+                        data: None,
+                        reported_at: 123,
+                    });
+                }
+                for detail in ["summary", "result", "report", "structured_exit"] {
+                    let view = mcp_task_status_json(&task, detail, None, None, 0, false).unwrap();
+                    assert!(view.get("context").is_none(), "{detail}: {view}");
+                }
+                let receipt = mcp_task_result_json(&task);
+                assert!(receipt.get("context").is_none(), "{receipt}");
+                assert_eq!(receipt["taskId"], task.inner.lock().id);
+                let debug = mcp_task_status_json(&task, "summary", None, None, 0, true).unwrap();
+                assert_eq!(debug["context"]["context_window"], window);
+            }
+        }
     }
 
     #[test]
