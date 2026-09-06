@@ -21,8 +21,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::orchestration::allocator::{
-    CredentialStatus, ProbeRecord, QuotaConfidence, QuotaStatus, lane_key, probe_store_load,
-    probe_store_save,
+    CredentialStatus, ProbeRecord, QuotaConfidence, QuotaStatus, lane_key, probe_store_update,
 };
 use crate::orchestration::providers::{Disruption, Provider};
 
@@ -314,21 +313,18 @@ pub async fn refresh_account_probes(store_dir: &Path, home: &Path, now: u64) -> 
     if probed.is_empty() {
         return 0;
     }
-    let mut store = probe_store_load(store_dir);
-    for (key, rec) in &probed {
-        tracing::info!(
-            %key,
-            five_hour = ?rec.five_hour_utilization,
-            seven_day = ?rec.seven_day_utilization,
-            balance = ?rec.balance_capacity,
-            "account probe refreshed"
-        );
-        store.records.insert(key.clone(), rec.clone());
+    match probe_store_update(store_dir, |store| {
+        for (key, rec) in &probed {
+            store.records.insert(key.clone(), rec.clone());
+        }
+        Ok(probed.len())
+    }) {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(target: "blackbox::allocator", %error, "probe store save failed after account refresh");
+            0
+        }
     }
-    if let Err(error) = probe_store_save(store_dir, &store) {
-        tracing::warn!(target: "blackbox::allocator", %error, "probe store save failed after account refresh");
-    }
-    probed.len()
 }
 
 /// Record a runtime disruption (a 429/overload the provider returned on a real
@@ -347,25 +343,26 @@ pub fn record_disruption_cooldown(
         Disruption::Overloaded => COOLDOWN_OVERLOADED_SECS,
     };
     let key = lane_key(provider, account);
-    let mut store = probe_store_load(store_dir);
-    let rec = store
-        .records
-        .entry(key)
-        .or_insert_with(|| base_record(provider, account.map(str::to_string), now));
-    rec.cooldown_until = Some(now.saturating_add(cooldown_secs * 1000));
-    rec.last_runtime_observation_at = Some(now);
-    rec.quota_confidence = QuotaConfidence::RuntimeRateLimit;
-    if matches!(disruption, Disruption::RateLimited) {
-        rec.quota_status = QuotaStatus::Exhausted;
-    }
-    tracing::info!(%provider, ?account, ?disruption, "runtime disruption → lane cooldown");
-    if let Err(error) = probe_store_save(store_dir, &store) {
+    if let Err(error) = probe_store_update(store_dir, |store| {
+        let rec = store
+            .records
+            .entry(key)
+            .or_insert_with(|| base_record(provider, account.map(str::to_string), now));
+        rec.cooldown_until = Some(now.saturating_add(cooldown_secs * 1000));
+        rec.last_runtime_observation_at = Some(now);
+        rec.quota_confidence = QuotaConfidence::RuntimeRateLimit;
+        if matches!(disruption, Disruption::RateLimited) {
+            rec.quota_status = QuotaStatus::Exhausted;
+        }
+        Ok(())
+    }) {
         tracing::warn!(target: "blackbox::allocator", %error, "probe store save failed after runtime disruption");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::allocator::{probe_store_load, probe_store_save};
     use super::*;
 
     #[test]
