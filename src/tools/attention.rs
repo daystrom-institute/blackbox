@@ -17,7 +17,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_pin",
-        description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope."
+        description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope. Reads are host-owned: list returns bounded preview pages (follow next_offset; exact bodies need id + full=true)."
     )]
     pub(crate) async fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
         let start = std::time::Instant::now();
@@ -27,28 +27,35 @@ impl BlackboxServer {
         // mutation behind it) off the tokio workers.
         let pin_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
-            // Durable pin scope is the registered base project: a worktree
-            // caller's path is resolved so the pin injects for every dispatch
-            // of the same project, not just the ephemeral worktree cwd. On
-            // list, the literal path stays matchable as an alias so pins
-            // keyed pre-rescope remain visible.
-            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (scope, resolved_project_id, _write_dir) =
-                    server.resolve_project_write_scope_with_id(&raw)?;
-                p.project_id = resolved_project_id;
-                // Catalog-mode ledger arm (plan §8.2): a listing sees path-only
-                // pins still keyed under one of this project's historical
-                // paths. Writes never consult it, so only `list` pays the
-                // ledger read. Empty in bridge mode.
-                if p.action == "list"
-                    && let Some(project_id) = p.project_id.as_deref()
-                {
-                    p.project_ledger_paths = server.ledger_historical_paths(project_id);
-                }
-                if scope != raw {
-                    p.project_alias = Some(raw);
-                }
-                p.project = Some(scope);
+            // Audit A03: action/scope/required-field validation precedes any
+            // project resolution, so a typo'd enum never hides behind (or
+            // trips over) a locality error.
+            validate_pin_request(&p)?;
+            // Audit A02: pins are host-owned state. Their project association
+            // resolves through the catalog/filter lane — never the checkout
+            // write lease that attachment_inactive-fails a published project.
+            let diagnostic = rescope_host_owned_project(&server, &mut p);
+            let diagnostics: Vec<String> = diagnostic.into_iter().collect();
+            let exact = p.full.unwrap_or(false) || p.cursor.is_some() || p.body_limit.is_some();
+            if exact {
+                // Audit A06: exact recovery read. The content-bound cursor
+                // rejects stale continuations and cross-pin selectors.
+                let pin = server.state.pins.read().exact(&p)?;
+                let selection = format!("pin:{}", pin.id);
+                return Ok(serde_json::to_string(&serde_json::json!({
+                    "id": pin.id,
+                    "body": super::body_page::json_body_page(
+                        &selection,
+                        &serde_json::to_value(&pin)?,
+                        p.cursor.as_deref(),
+                        p.body_limit,
+                    )?,
+                }))?);
+            }
+            if p.action == "list" {
+                return Ok(serde_json::to_string(
+                    &server.state.pins.read().list_page(&p, &diagnostics)?,
+                )?);
             }
             server.state.pins.write().pin(&p)
         })
@@ -187,6 +194,94 @@ fn append_built_from_rows(output: &mut String, label: &str, rows: &[(String, Str
     }
 }
 
+/// Audit A03: validate the pin request's shape before any project/locality
+/// work runs. Mirrors the store's messages so callers see the same errors
+/// they would from the store, just earlier and without resolution side
+/// effects.
+fn validate_pin_request(p: &PinParams) -> anyhow::Result<()> {
+    match p.action.as_str() {
+        "set" | "list" | "delete" => {}
+        other => anyhow::bail!("unknown pin action: {other} (use set, list, delete)"),
+    }
+    if let Some(raw) = p.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+        std::str::FromStr::from_str(raw)
+            .map(|_: crate::pins::PinScope| ())
+            .map_err(|_| {
+                anyhow::anyhow!("invalid scope: {raw:?} (use session, bro, thread, work_item)")
+            })?;
+    }
+    if p.action == "set" {
+        if p.scope.is_none() {
+            anyhow::bail!("scope is required for action=set");
+        }
+        if !p
+            .target
+            .as_deref()
+            .is_some_and(|target| !target.trim().is_empty())
+        {
+            anyhow::bail!("target is required for action=set");
+        }
+        if !p
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty())
+        {
+            anyhow::bail!("content is required for action=set");
+        }
+    }
+    Ok(())
+}
+
+/// Audit A02: host-owned project association for pin reads AND writes.
+/// Pins never touch checkout-owned files, so their project link resolves
+/// through the catalog/filter lane (the same one knowledge lists use) —
+/// never the checkout write lease, which `attachment_inactive`-fails a
+/// published-but-detached project. Identity arm + ledger arm + worktree→base
+/// rewrite with the checkout alias lane, mirroring `rescope_project_filter`
+/// in knowledge.rs. Returns the unresolvable-selector diagnostic so a list
+/// can say "named no registered project" instead of rendering an empty
+/// result that looks like an empty store.
+fn rescope_host_owned_project(
+    server: &crate::server::BlackboxServer,
+    p: &mut PinParams,
+) -> Option<String> {
+    use bbox_corpus_core::project_selector::{ProjectResolution, ResolvedAttachment};
+    let raw = p
+        .project
+        .clone()
+        .filter(|selector| !selector.trim().is_empty())?;
+    let mut diagnostic = None;
+    if p.project_id.is_none() {
+        match server.project_filter_identity(&raw) {
+            Ok(project_id) => p.project_id = Some(project_id),
+            Err(text) => diagnostic = Some(text),
+        }
+    }
+    let Some(resolution) = server.resolve_project_filter(&raw) else {
+        return diagnostic;
+    };
+    if let Some(project_id) = resolution.project_id() {
+        p.project_ledger_paths = server.ledger_historical_paths(project_id);
+    }
+    let ProjectResolution::Attached(ctx) = resolution else {
+        // Catalog-mode published project: the identity is stamped and the
+        // caller's selector kept — the dual-read id arm decides from here.
+        return diagnostic;
+    };
+    let checkout_dir = match &ctx.attachment {
+        ResolvedAttachment::V1Compat { checkout_dir, .. } => checkout_dir.clone(),
+        ResolvedAttachment::Catalog {
+            checkout_project_dir,
+            ..
+        } => checkout_project_dir.clone(),
+    };
+    if checkout_dir != ctx.store_key {
+        p.project_alias = Some(checkout_dir);
+    }
+    p.project = Some(ctx.store_key);
+    diagnostic
+}
+
 fn append_overlay_diagnostics(inbox: String, diagnostics: &[String]) -> String {
     if diagnostics.is_empty() {
         return inbox;
@@ -228,6 +323,15 @@ mod tests {
         assert!(rendered.contains("Checkout visibility diagnostics:"));
         assert!(rendered.contains("checkout overlay is invalid"));
         assert!(rendered.contains("No other attention items."));
+    }
+
+    fn error_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -321,6 +425,309 @@ mod tests {
             server
                 .ambient_pin_block(Some("/repo/other"), Some("executor"), None, None, None)
                 .is_none()
+        );
+    }
+
+    /// Audit A02 live case: pins are host-owned state, so a published project
+    /// with NO checkout attachment must still accept pin writes and serve pin
+    /// lists. The catalog fixture's broker denies checkout access outright —
+    /// any reach for a write lease fails this test loudly.
+    #[tokio::test]
+    async fn pin_reads_and_writes_resolve_host_owned_identity_without_checkout() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project_id = "89bd722f89bd722f89bd722f89bd722f";
+        fixture.add_published_project(project_id, &scope);
+        let server = fixture.server();
+
+        let set = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                content: Some("HOST_OWNED_PIN guidance".into()),
+                title: Some("host owned".into()),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                project: Some(project_id.into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(set.is_error, Some(true), "pin set failed: {set:?}");
+        {
+            let pins = server.state.pins.read();
+            let pin = pins
+                .all()
+                .iter()
+                .find(|pin| pin.content.contains("HOST_OWNED_PIN"))
+                .expect("pin stored");
+            assert_eq!(pin.project_id.as_deref(), Some(project_id));
+        }
+
+        // The same selector lists it back through the identity arm.
+        let listed = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                project: Some(project_id.into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(listed.is_error, Some(true), "{listed:?}");
+        let body = error_text(&listed);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 1, "{page}");
+        assert_eq!(page["pins"][0]["project_id"], project_id);
+        assert!(
+            page["pins"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("HOST_OWNED_PIN")
+        );
+
+        // An unresolvable selector reports itself instead of a bare empty
+        // page that reads as "no pins exist".
+        let unknown = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                project: Some("no-such-project".into()),
+                ..Default::default()
+            }))
+            .await;
+        let body = error_text(&unknown);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 0, "{page}");
+        let diagnostics = page["diagnostics"].as_array().expect("diagnostic present");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.as_str().unwrap().contains("no-such-project")),
+            "{page}"
+        );
+
+        // Audit A03 ordering: an invalid scope errors even when the project
+        // selector is ALSO unknown — validation precedes locality work.
+        let invalid = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                scope: Some("bogus".into()),
+                project: Some("no-such-project".into()),
+                ..Default::default()
+            }))
+            .await;
+        let body = error_text(&invalid);
+        assert!(
+            body.contains("invalid scope") && !body.contains("diagnostics"),
+            "scope validation must precede locality: {body}"
+        );
+    }
+
+    /// Audit A02 ledger arm: a path-only pin keyed under a historical path of
+    /// a relocated project stays visible when listing by the project's
+    /// current identity.
+    #[tokio::test]
+    async fn pin_list_sees_path_only_rows_through_the_ledger_arm() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        use bbox_corpus_core::project_catalog::{
+            LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry,
+            LegacyPathRelationship,
+        };
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project_id = "aaaabbbbccccddddaaaabbbbccccdddd";
+        fixture.add_published_project(project_id, &scope);
+        let historical = "/tmp/legacy-pin-root";
+        let binding_id =
+            LegacyPathBindingId::parse("lpb_11111111111111111111111111111111").unwrap();
+        let epoch = fixture.store().snapshot().unwrap().epoch();
+        fixture
+            .store()
+            .transact(epoch, |_catalog, attachments| {
+                attachments.legacy_path_bindings.insert(
+                    binding_id,
+                    LegacyPathLedgerEntry {
+                        legacy_path_binding_id: binding_id,
+                        historical_path: historical.into(),
+                        source_store: "synthetic".into(),
+                        source_row_id: "row-1".into(),
+                        member_row_count: 1,
+                        member_commitment_sha256: "a".repeat(64),
+                        inventory_epoch: 1,
+                        status: LegacyPathBindingStatus::Mapped {
+                            project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
+                                project_id,
+                            )
+                            .unwrap(),
+                            relationship: LegacyPathRelationship::Root,
+                        },
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let server = fixture.server();
+
+        // A pin keyed under the historical path, carrying no project id.
+        let set = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                content: Some("LEDGER_ARM_PIN".into()),
+                title: Some("legacy".into()),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                project: Some(historical.into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(set.is_error, Some(true), "{set:?}");
+
+        let listed = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                project: Some(project_id.into()),
+                ..Default::default()
+            }))
+            .await;
+        let body = error_text(&listed);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 1, "ledger arm must reach the row: {page}");
+        assert!(
+            page["pins"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("LEDGER_ARM_PIN")
+        );
+    }
+
+    /// Audit A06/A13: exact pin reads page the full row through the
+    /// content-bound cursor — full Unicode reconstruction, and stale or
+    /// cross-selector continuations are rejected.
+    #[tokio::test]
+    async fn pin_exact_body_pages_reconstruct_unicode_and_reject_stale_and_cross_cursors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        let body_a = "指針 🦀 recovery guidance".repeat(600);
+        for (target, content) in [("executor", body_a.clone()), ("other", "small body".into())] {
+            let set = server
+                .bbox_pin(Parameters(crate::pins::PinParams {
+                    action: "set".into(),
+                    content: Some(content),
+                    title: Some("exact".into()),
+                    scope: Some("bro".into()),
+                    target: Some(target.into()),
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(set.is_error, Some(true), "{set:?}");
+        }
+        let (id_a, id_b) = {
+            let pins = server.state.pins.read();
+            let a = pins
+                .all()
+                .iter()
+                .find(|pin| pin.target == "executor")
+                .unwrap();
+            let b = pins.all().iter().find(|pin| pin.target == "other").unwrap();
+            (a.id.clone(), b.id.clone())
+        };
+        let pin_a = {
+            let pins = server.state.pins.read();
+            pins.all()
+                .iter()
+                .find(|pin| pin.id == id_a)
+                .unwrap()
+                .clone()
+        };
+
+        // Full reconstruction across content-bound pages.
+        let mut reconstructed = String::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page_call = server
+                .bbox_pin(Parameters(crate::pins::PinParams {
+                    action: "list".into(),
+                    id: Some(id_a.clone()),
+                    full: Some(true),
+                    cursor,
+                    ..Default::default()
+                }))
+                .await;
+            let text = error_text(&page_call);
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let body = &envelope["body"];
+            assert!(serde_json::to_vec(body).unwrap().len() <= 4096, "{body}");
+            reconstructed.push_str(body["text"].as_str().unwrap());
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(
+            reconstructed.len() > 4096,
+            "must have paged: {reconstructed:?}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reconstructed).unwrap(),
+            serde_json::to_value(&pin_a).unwrap(),
+            "exact read must reconstruct the full stored row"
+        );
+
+        // Cross-selector: pin A's cursor does not continue pin B.
+        let first = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                id: Some(id_a.clone()),
+                full: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        let text = error_text(&first);
+        let cursor =
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["body"]["next_cursor"]
+                .as_str()
+                .expect("multi-page body")
+                .to_string();
+        let cross = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                id: Some(id_b),
+                full: Some(true),
+                cursor: Some(cursor.clone()),
+                ..Default::default()
+            }))
+            .await;
+        let text = error_text(&cross);
+        assert!(
+            text.contains("Error") && text.contains("changed"),
+            "cross-selector cursor must be rejected: {text}"
+        );
+
+        // Stale: mutating the pin invalidates the old continuation.
+        let update = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                id: Some(id_a.clone()),
+                content: Some("replacement body".into()),
+                title: Some("exact".into()),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(update.is_error, Some(true), "{update:?}");
+        let stale = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "list".into(),
+                id: Some(id_a),
+                full: Some(true),
+                cursor: Some(cursor),
+                ..Default::default()
+            }))
+            .await;
+        let text = error_text(&stale);
+        assert!(
+            text.contains("Error") && text.contains("changed"),
+            "stale cursor must be rejected: {text}"
         );
     }
 
