@@ -646,7 +646,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_gaps",
         category: ToolCategory::Gaps,
-        summary: "List compact gap summaries with filters and pagination (limit defaults to 20, clamped to 1..100; offset defaults to 0). Exact id defaults to full detail; detail=full expands a page. Summary omissions are explicit. Addressed gaps are excluded from lists by default. Ordering is newest created_at, then id; concurrent writes may shift offsets.",
+        summary: "List paginated gap summaries with typed filters. Exact id defaults to full detail; detail=full expands a page. Omissions and continuation are explicit.",
         when_to_use: "The mandatory dedupe step before `bbox_gap`: search open gaps by `dedupe_key`, `gap_kind`, `domain`, `impact`, or free-text `query` before filing. Also the triage surface — pass `json=true` for machine-readable records to group/extract, or `include_addressed=true` to see closed gaps. Addressed gaps are hidden by default for lists, shown by default for an exact `id`. `project` accepts a project_id, a registered operator alias, or a project path, and matches rows by project identity; a value that resolves to no registered project keeps literal substring matching and says so in `diagnostics`, so an empty list is never silent about an unresolvable filter.",
         example: Some(r#"bbox_gaps(gap_kind="mcp_surface", include_addressed=false)"#),
     },

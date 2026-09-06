@@ -704,7 +704,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_gaps",
-        description = "List compact gap summaries with filters and pagination (limit defaults to 20, clamped to 1..100; offset defaults to 0). Exact id defaults to full detail; detail=full expands a page. Summary omissions are explicit. Addressed gaps are excluded from lists by default. Ordering is newest created_at, then id; concurrent writes may shift offsets."
+        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail; detail=full expands a page. Omissions and continuation are explicit."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
