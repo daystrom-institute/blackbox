@@ -44,7 +44,7 @@ ALLOWLIST = {
     "bro_allocator_trace", "bro_brofile", "bro_cancel", "bro_council_list",
     "bro_council_open", "bro_council_posts", "bro_dashboard",
     "bro_interrupt", "bro_mcp", "bro_providers", "bro_prune", "bro_report",
-    "bro_retro", "bro_slack_link_lookup", "bro_slack_link_record",
+    "bro_retro",
     "bro_status", "bro_steer", "tool_identity_get",
     "tool_identity_list", "tool_system_event_list", "tool_system_event_open",
 }

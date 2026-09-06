@@ -1014,15 +1014,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
-        name: "bro_slack_bind",
-        category: ToolCategory::Orchestration,
-        summary: "Bind a Slack channel to a bbox project. The binding scopes inbound Slack→badgey activity to a single project and gives the daily-triage cron a per-channel home for proposal posts. Channel id (C-prefix) is the stable lookup key; rename-safe. Actions: bind, unbind, list, lookup. Project accepts absolute path or 8-hex project_id from the registry.",
-        when_to_use: "Bind every project channel you want a daily brief in. Without bindings the triage cron is a no-op (deliberately no global fallback) and inbound app_mention / reaction events can't auto-resolve their project. Before `action=bind`, register the project via `bbox_project_register` so the binding captures a stable project_id.",
-        example: Some(
-            r#"bro_slack_bind(action="bind", team_id="T0123ABCD", channel_id="C0123XYZ", channel_name="transcript-search", project="/home/me/repos/transcript-search")"#,
-        ),
-    },
-    ToolDoc {
         name: "badgey_proposals_list",
         category: ToolCategory::Orchestration,
         summary: "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine since/only_pending/limit/after/through. detail=full with proposal_id returns lossless JSON body pages; continue body.next_cursor as cursor (body_limit up to 4096). Ordinary small exact reads retain proposals[0].",
@@ -1037,15 +1028,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node.",
         when_to_use: "Called from the per-channel triage workflow's first node. Requires a binding via `bro_slack_bind action=bind`. Idempotent — re-calling against an active instance returns the existing id with `created=false`.",
         example: Some(r#"badgey_ensure_for_channel(team_id="T0123ABCD", channel_id="C0123XYZ")"#),
-    },
-    ToolDoc {
-        name: "bro_slack_link_lookup",
-        category: ToolCategory::Orchestration,
-        summary: "Resolve a Slack message ts back to its SlackProposalLink (proposal_id, instance_id, project_dir, version, posted_at). Used by the apply/refine workflows that fire on `:white_check_mark:` reactions and in-thread replies — they need the (BadgeyId, proposal_id) pair from the link to call badgey_apply_proposal or bro_resume. Returns {found: false} for messages that aren't a posted proposal (e.g. random check on an unrelated message) so workflows can no-op cleanly.",
-        when_to_use: "First node of badgey-apply-proposal-arc and badgey-clarify-arc — branch on `found` to either continue (proposal exists) or terminate cleanly (random reaction/reply on a non-proposal message).",
-        example: Some(
-            r#"bro_slack_link_lookup(team_id="T0123ABCD", channel_id="C0123XYZ", msg_ts="1778179224.543499")"#,
-        ),
     },
     ToolDoc {
         name: "badgey_apply_proposal",
@@ -1108,15 +1090,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Last mcp_call before the outcome node in a consumer-agnostic apply arc. For the redispatch path pass `outcome=${actor_results.Dispatch.status}` and `task_id=${actor_results.Dispatch.taskId}`; for the artifact-install path pass `outcome=completed` with the installed `artifact_ref`. Skip on the `already_applied` / `rejected` short-circuit paths.",
         example: Some(
             r#"consultant_proposal_complete_apply(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3", outcome="completed", task_id="3c2df23e-...", summary="Done")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bro_slack_link_record",
-        category: ToolCategory::Orchestration,
-        summary: "Record a SlackProposalLink mapping a posted Slack message back to its BadgeyProposal. Called by the per-channel triage workflow's emit-proposal subworkflow after chat.postMessage so inbound reactions/replies can resolve back to (BadgeyId, proposal_id) and the apply/refine hooks fire.",
-        when_to_use: "Workflow node hook after a successful chat.postMessage. Pass the msg_ts from the Slack response, the BadgeyProposal id, the BadgeyInstance id (so the apply hook resolves it), and the project_dir scope.",
-        example: Some(
-            r#"bro_slack_link_record(team_id="T0123ABCD", channel_id="C0123XYZ", msg_ts="1778179224.543499", proposal_id="P-3", instance_id="bg-deadbeef-cafef00d", project_dir="/repo/x")"#,
         ),
     },
     // ── Workflows ────────────────────────────────────────────────────
