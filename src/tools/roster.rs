@@ -294,6 +294,11 @@ impl BlackboxServer {
             .map(str::parse::<Provider>)
             .transpose()
         {
+            Ok(Some(provider)) if !Provider::ALL.contains(&provider) => {
+                return Self::err_text(
+                    "Unknown dispatch provider; omit provider to list valid providers",
+                );
+            }
             Ok(provider) => provider,
             Err(_) => {
                 return Self::err_text("Unknown provider; omit provider to list valid providers");
@@ -304,17 +309,10 @@ impl BlackboxServer {
             if selected.is_some_and(|selected| selected != *p) {
                 continue;
             }
-            let bin = p.bin();
-            let resolved = orch::providers::resolve_bin(&bin);
             let mut entry = json!({
-                "bin": bin,
-                "found": resolved.is_some(),
                 "promptCache": p.prompt_cache(),
                 "supportsResume": p.supports_resume(),
             });
-            if let Some(ref path) = resolved {
-                entry["path"] = json!(path);
-            }
             entry["modelCount"] = json!(p.models().len());
             entry["defaultModel"] = json!(p.models().iter().find(|m| m.default).map(|m| m.id));
             if selected.is_some() && !p.models().is_empty() {
@@ -438,11 +436,18 @@ impl BlackboxServer {
                     },
                 );
                 brofile::save_config(&config, store_dir);
-                Self::ok_json(&json!({"account": name, "env": p.env}))
+                Self::ok_json(&json!({"account": name, "updated": true,
+                    "configuration": config.accounts[name].response_view()}))
             }
             "list_accounts" => {
                 let config = brofile::load_config(store_dir);
-                Self::ok_json(&serde_json::to_value(&config.accounts).unwrap_or_default())
+                Self::ok_json(&Value::Object(
+                    config
+                        .accounts
+                        .iter()
+                        .map(|(name, account)| (name.clone(), account.response_view()))
+                        .collect(),
+                ))
             }
             "set_provider_default" => {
                 let provider = match p
@@ -1522,6 +1527,34 @@ mod tests {
     }
 
     #[test]
+    fn account_responses_hide_environment_values_but_persist_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let params: BrofileParams = serde_json::from_value(json!({
+            "action": "set_account", "name": "synthetic",
+            "env": {"TOKEN": "synthetic-secret", "CUSTOM": "opaque-secret"},
+        }))
+        .unwrap();
+        let result = server.bro_brofile(Parameters(params));
+        assert_ne!(result.is_error, Some(true));
+        let set_reply = extract_text(&result);
+        let params: BrofileParams =
+            serde_json::from_value(json!({"action": "list_accounts"})).unwrap();
+        let list_reply = extract_text(&server.bro_brofile(Parameters(params)));
+        for reply in [&set_reply, &list_reply] {
+            assert!(!reply.contains("synthetic-secret"));
+            assert!(!reply.contains("opaque-secret"));
+            assert!(reply.contains("TOKEN"));
+            assert!(reply.contains("CUSTOM"));
+        }
+        let list: Value = serde_json::from_str(&list_reply).unwrap();
+        assert_eq!(list["synthetic"]["env_keys"], json!(["CUSTOM", "TOKEN"]));
+        let account =
+            orchestration::brofile::load_account("synthetic", &server.state.store_dir).unwrap();
+        assert_eq!(account.env.unwrap()["TOKEN"], "synthetic-secret");
+    }
+
+    #[test]
     fn providers_expand_only_the_selected_provider() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -1529,6 +1562,9 @@ mod tests {
         let summary: Value = serde_json::from_str(&extract_text(&summary)).unwrap();
         assert_eq!(summary.as_object().unwrap().len(), Provider::ALL.len());
         for entry in summary.as_object().unwrap().values() {
+            for local_only in ["bin", "found", "path"] {
+                assert!(entry.get(local_only).is_none());
+            }
             assert!(entry.get("models").is_none());
             assert!(entry.get("efforts").is_none());
         }
@@ -1545,6 +1581,13 @@ mod tests {
                 .any(|model| model["id"] == "gpt-6-astra")
         );
         assert_eq!(detail["brodex"]["defaultModel"], "gpt-5.6-sol");
+        for local_only in ["bin", "found", "path"] {
+            assert!(detail["brodex"].get(local_only).is_none());
+        }
+        let workflow = server.bro_providers(Parameters(ProvidersParams {
+            provider: Some("workflow".into()),
+        }));
+        assert_eq!(workflow.is_error, Some(true));
         let invalid = server.bro_providers(Parameters(ProvidersParams {
             provider: Some("typo".into()),
         }));
