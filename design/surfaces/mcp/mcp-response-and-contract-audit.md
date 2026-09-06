@@ -803,3 +803,41 @@ reconnected client retrieved the original exec receipt. Admission is open.
 Remaining audit work includes storage-GC response bounds and apply semantics,
 queued gap-write reconciliation, and explicit dispositions for remaining
 surviving actions. The broader audit is still partial.
+
+
+### Deployed surviving-surface correction milestone
+
+Source `481b735df118` passed `bbox-verify-s6ljv`: all 6,531 selected full-profile
+workspace tests, clippy, and concurrency checks passed. Image build
+`build-bbox-image-lmx9w` succeeded; cage commit `e082517` deployed digest
+`sha256:537740875ae59f013944f50d3741730dfb573499179d99475ba9e08e2ccbae50`.
+Native bro and bro-harness were rebuilt from the runtime-equivalent source
+`7fb927c6`, stablesigned, installed, and verified. Later corrections affect
+only daemon behavior, tests, and documentation.
+
+Live checks retained 109 ops tools and verified:
+
+- Storage GC preview returned 603 bytes. Exact candidate receipt pages replayed
+  identically and continued without rerunning collection. An invalid cursor
+  refused. Destructive GC apply was tested with isolated fixtures, not live.
+- Empty unscoped gap search returned 786 bytes; bounded debug expansion returned
+  6,114 bytes. The default summarized source availability rather than printing
+  unrelated source paths. Typed degraded state remains part of the contract.
+- A one-item inbox request returned 531 bytes. The three retired mutation
+  options are absent from its schema. The installed read-only routing revision
+  passed all six audit cases; a new read-only session exposes tool-call history
+  and excludes packet-gap writes.
+- Tool-call history returned 986 bytes for two rows, and its context handle
+  opened indexed conversation content. Invalid timestamps refused. Historical
+  adapter records remained readable and inactive.
+- Real project gap filing followed by two independent updates reached the
+  checkout with both edits intact. Resolution was then admitted after delivery
+  but before publication. Its lifecycle is tracked in
+  [gap-68ed1401](../../../.bbox/gaps/gap-68ed1401.json).
+
+Admission is open. The [coverage checkpoint](mcp-audit-coverage.md) separates
+these adjusted contracts from the remaining audit. Active next fixes are
+knowledge-write reconciliation
+([gap-e2f4b76e](../../../.bbox/gaps/gap-e2f4b76e.json)) and exact packet body
+reads ([gap-3bbc041f](../../../.bbox/gaps/gap-3bbc041f.json)). Collector delivery
+preconditions and paired-file atomicity remain separate transport work.

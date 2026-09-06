@@ -92,3 +92,37 @@ continuation, schema contracts, scope refusal, and partial mutation outcomes.
 Proposal dependency installation changed live artifact/runtime state, but no
 Slack post was sent. Remaining host permission and upstream-content limitations
 are stated separately from verified tool behavior.
+
+
+## Surviving-surface correction checkpoint
+
+Source `481b735df118` addresses the first surviving-surface correctness pass:
+
+| Surface | Adjusted contract | Validation focus |
+| --- | --- | --- |
+| Gap mutations | Durable admission, project-scoped outstanding edits, publication identity checks, paired supersession validation, and first-publication admission | Concurrent and delivered-but-unpublished edits compose; stale readers cannot retire newer work; conflicting publications refuse |
+| Gap reads | Bounded diagnostic summaries with `debug=true` expansion | Typed degradation remains visible; exact rows preserve scope and publication authority |
+| Storage GC | Compact outcome counts with temporary immutable detail receipts | Partial effects survive later failures; receipt pagination cannot repeat collection; protected storage remains guarded |
+| Inbox | Bounded read-only attention groups | Retired spool and closeout options reject; read-only routing excludes packet-gap writes |
+| Tool-call history | Bounded previews with indexed context handles | Instant-based timestamp filtering, explicit truncation, and context drill-down |
+| Installed agents | Callable discovery excludes retired adapters | Historical receipts remain readable and inactive; dispatch refuses with its existing typed error |
+
+This checkpoint does not complete the surviving-surface audit. Next priorities:
+
+1. Knowledge mutation admission still reads published entries before queued
+   changes and uses a path-only pending lookup. Extend the gap reconciliation
+   invariants to knowledge writes, including deletion and supersession.
+2. Collector delivery still writes full files without a content precondition.
+   Lost acknowledgments and paired-file atomicity need separate transport
+   decisions; daemon queue reconciliation alone does not solve them.
+3. Packet inspection needs an exact, paged rule-body read. The current provider
+   exposes metadata only, forcing an operator into server-owned storage for a
+   faithful policy edit. Reuse graph property continuation rather than add a
+   new top-level tool.
+4. Publisher status, surface replay, and typed gap degradation still need
+   response-budget review. Preserve authority and actionable degraded state
+   while moving repeated hashes, raw policy inventories, and other diagnostics
+   behind bounded detail.
+
+The original inventory remains a historical baseline. Every surviving action
+still needs an explicit disposition and representative contract evidence.

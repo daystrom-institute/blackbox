@@ -1,0 +1,19 @@
+{
+  "id": "gap-3bbc041f",
+  "title": "Packet inspection cannot return the exact installed rule body",
+  "gap_kind": "tooling",
+  "domain": "mcp-audit",
+  "wanted_capability": "Read complete packet rules and evaluation configuration through bounded MCP continuation so callers can edit policy without accessing server-owned files.",
+  "evidence": [
+    "crates/bbox-providers/src/providers/packet.rs",
+    "src/tools/packets.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/mcp-audit/packet-exact-rule-body",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T17:18:30Z",
+  "updated_at": "2026-09-06T17:18:30Z"
+}
