@@ -111,6 +111,7 @@ pub use bbox_util::util;
 // call sites resolve unchanged.
 use bbox_artifacts::watcher;
 use bbox_vectors as vectors;
+mod vector_maintenance;
 mod webhooks;
 use bbox_whiteboards::whiteboards;
 mod workflow;
