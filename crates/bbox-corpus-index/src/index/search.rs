@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 use super::helpers::*;
 use super::passes::*;
 use super::project_files;
-use super::{FieldHandles, FileMeta, TranscriptIndex};
+use super::{FieldHandles, FileMeta, TranscriptIndex, first_u64};
 use bbox_corpus_core::query::smart_query_to_tantivy;
 
 #[derive(Debug)]
