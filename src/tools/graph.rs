@@ -1082,7 +1082,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents and consultants."
+        description = "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents."
     )]
     pub(crate) fn bbox_describe_schema(
         &self,

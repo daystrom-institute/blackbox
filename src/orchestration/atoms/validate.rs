@@ -551,22 +551,11 @@ fn validate_implementation<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
                 });
             }
         }
-        super::types::AtomImplementation::Consultant { consumer } => {
-            if consumer.trim().is_empty() {
-                return Err(ValidationError {
-                    step: "lint_implementation",
-                    message: "implementation.consumer must not be empty".into(),
-                });
-            }
-            if crate::orchestration::consultant::consumers::lookup(consumer).is_none() {
-                return Err(ValidationError {
-                    step: "lint_implementation",
-                    message: format!(
-                        "implementation.consumer '{consumer}' is not a registered consultant consumer (known: {})",
-                        crate::orchestration::consultant::consumers::names().join(", ")
-                    ),
-                });
-            }
+        super::types::AtomImplementation::Consultant { .. } => {
+            return Err(ValidationError {
+                step: "lint_implementation",
+                message: "consultant execution is retired; use an ordinary named bro agent".into(),
+            });
         }
         super::types::AtomImplementation::Adapter { adapter_name } => {
             if adapter_name.trim().is_empty() {
@@ -894,13 +883,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_adapter_implementation() {
+    fn retired_badgey_adapter_refuses_install() {
         let mut v = minimal_valid_atom();
         v["manifest"]["implementation"] = serde_json::json!({
             "kind": "adapter",
             "adapter_name": "badgey"
         });
-        validate_atom_install(&v, &noop_ctx()).unwrap();
+        let error = validate_atom_install(&v, &noop_ctx()).unwrap_err();
+        assert!(error.message.contains("unknown atom adapter"));
     }
 
     #[test]
@@ -1038,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn consultant_implementation_requires_registered_consumer() {
+    fn consultant_implementation_is_readable_but_refuses_new_install() {
         let mut atom: serde_json::Value = serde_json::from_str(include_str!(
             "../../../system-defaults/atoms/consultant/badgey-consult.json"
         ))
@@ -1047,12 +1037,18 @@ mod tests {
             brofile_exists: |_| true,
             atom_exists: |_| false,
         };
-        validate_atom_install(&atom, &ctx).unwrap();
+        let legacy: super::types::AtomArtifact = serde_json::from_value(atom.clone()).unwrap();
+        assert!(matches!(
+            legacy.manifest.implementation,
+            super::types::AtomImplementation::Consultant { .. }
+        ));
+        let err = validate_atom_install(&atom, &ctx).unwrap_err();
+        assert!(err.message.contains("consultant execution is retired"));
 
         atom["manifest"]["implementation"]["consumer"] = serde_json::json!("nonexistent");
         let err = validate_atom_install(&atom, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_implementation");
-        assert!(err.message.contains("not a registered consultant consumer"));
+        assert!(err.message.contains("consultant execution is retired"));
     }
 
     fn validate_atom_install_helper(v: &serde_json::Value) -> ValidationError {

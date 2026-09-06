@@ -34,9 +34,7 @@ ALLOWLIST = {
     # of baselined). Do NOT add names here without a reasoned review —
     # convert the handler to async + run_blocking instead.
     "atom_delegate", "atom_describe", "atom_get", "atom_list", "atom_search",
-    "atom_status", "badgey_close_loops", "badgey_collect", "badgey_dismiss",
-    "badgey_list", "badgey_proposals_list", "badgey_status",
-    "badgey_triage_inbox", "bbox_artifact_list", "bbox_describe_schema",
+    "atom_status", "bbox_artifact_list", "bbox_describe_schema",
     "bbox_embed_status", "bbox_gaps", "bbox_mcp_surface", "bbox_notes",
     "bbox_project_list", "bbox_thread_list",
     "bro_agent_describe", "bro_agent_get", "bro_agent_list",

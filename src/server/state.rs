@@ -377,11 +377,6 @@ pub(crate) struct SharedState {
     /// membership against the live registry.
     pub(crate) agent_adapter_registry:
         Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
-    /// Badgey wrapper state. W1 keeps the live badgey_id mapping in
-    /// memory; proposals and action journal are durable in the state dir.
-    pub(crate) consultant_registry: Arc<orchestration::consultant::ConsultantRegistry>,
-    pub(crate) consultant_proposals: Arc<orchestration::consultant::ProposalStore>,
-    pub(crate) consultant_journal: Arc<orchestration::consultant::ActionJournal>,
     /// Slack thread → claude session_id continuity map. Webhook
     /// `start_arc` looks up the prior session before starting an arc
     /// and seeds it into actor_sessions; the arc writes back when
@@ -1178,19 +1173,6 @@ impl SharedState {
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),
             )),
-            consultant_registry: Arc::new(orchestration::consultant::ConsultantRegistry::new()),
-            consultant_proposals: Arc::new(
-                orchestration::consultant::ProposalStore::new(
-                    orchestration::badgey::descriptor().proposals_root(store_dir),
-                )
-                .unwrap(),
-            ),
-            consultant_journal: Arc::new(
-                orchestration::consultant::ActionJournal::new(
-                    orchestration::badgey::descriptor().action_journal_root(store_dir),
-                )
-                .unwrap(),
-            ),
             slack_thread_store: Arc::new(
                 slack_thread_store::SlackThreadStore::open(store_dir).unwrap(),
             ),

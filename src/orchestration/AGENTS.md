@@ -72,3 +72,18 @@ Domain home for the dispatch plane. Boundary contract:
   refuses owned tasks before restoring workspace bindings. While an owning
   runtime remains installed, recovery belongs to that runtime's explicit path.
   Current ordinary bro tasks retain restart recovery and re-adoption behavior.
+
+## Retired consultant runtime
+
+Badgey and the stateful consultant runtime have no tool routes, agent adapter,
+atom execution backend, registry reconstruction, or startup recovery. Legacy
+consultant atom implementations and handles remain decodable for historical
+records; new installation and execution refuse. Ordinary bro execution and
+named bro agents remain available.
+
+Existing `badgey/proposals` and `badgey/action_journal` beneath the configured
+bro store are inactive archives. Startup does not open, reconcile, move, or
+rewrite them. Preserve their bytes, proposal provenance, and historical
+notes/threads/knowledge. Project-catalog legacy proposal inventory and stamping
+remain separate durable-data ownership contracts and must not be removed with
+runtime code. Explicit migration may still operate on these archived carriers.
