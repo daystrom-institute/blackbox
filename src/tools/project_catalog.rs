@@ -103,6 +103,177 @@ fn project_catalog_list_page(
     )
 }
 
+/// One pinned pair snapshot supplies both selector resolution and projection.
+/// Detail is sectioned so no option silently restores the full unbounded DTO.
+fn project_catalog_get_page(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    attachments: &bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+    epoch: u64,
+    p: &CatalogGetParams,
+) -> anyhow::Result<serde_json::Value> {
+    let paged = matches!(
+        p.detail,
+        CatalogGetDetail::Aliases | CatalogGetDetail::Attachments
+    );
+    let offset = p.offset.unwrap_or(0);
+    if offset > 0 && p.expected_catalog_epoch.is_none() {
+        anyhow::bail!(
+            "error.catalog_page_epoch_required: continue with expected_catalog_epoch from the previous response"
+        );
+    }
+    if p.expected_catalog_epoch
+        .is_some_and(|expected| expected != epoch)
+    {
+        anyhow::bail!(
+            "error.catalog_page_changed: catalog changed; restart at offset=0 without expected_catalog_epoch"
+        );
+    }
+    if !paged && (p.limit.is_some() || offset > 0) {
+        anyhow::bail!(
+            "error.bad_input: limit and nonzero offset apply only to detail=aliases or detail=attachments"
+        );
+    }
+    let resolution = ProjectResolverEngine::v2(catalog, attachments)
+        .resolve(&ProjectSelectorRequest::selection(
+            p.project.clone(),
+            bbox_corpus_core::project_selector::ResolveIntent::Read,
+        ))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let project_id = resolution.project_id().ok_or_else(|| {
+        anyhow::anyhow!(
+            "error.project_selector_unknown: selector does not identify one catalog project"
+        )
+    })?;
+    let project = catalog
+        .projects
+        .get(&parse_project_id(project_id)?)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "error.project_catalog_admin_unknown_project: project is not in the pinned catalog"
+            )
+        })?;
+    let mut attachment_rows = attachments
+        .attachments
+        .values()
+        .filter(|row| row.project_id == project.project_id)
+        .collect::<Vec<_>>();
+    attachment_rows.sort_by(|a, b| a.attachment_id.cmp(&b.attachment_id));
+    let active = attachment_rows
+        .iter()
+        .filter(|row| row.status == AttachmentStatus::Attached)
+        .count();
+    let default_attachment = attachments
+        .default_attachments
+        .get(&project.project_id)
+        .map(|id| id.as_str());
+    let mut result = json!({
+        "epoch": epoch,
+        "project": {"project_id": project_id, "display_name": project.display_name,
+            "scope": scope_json(&project.scope), "repo_history": project.repo_history.as_ref().map(|id| id.as_str())},
+    });
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    match p.detail {
+        CatalogGetDetail::Summary => {
+            result["detail"] = json!("summary");
+            result["aliases"] = json!({
+                "accepted": project.operator_aliases.iter().take(3).collect::<Vec<_>>(),
+                "pending": project.nominated_aliases.iter().take(3).collect::<Vec<_>>(),
+                "accepted_total": project.operator_aliases.len(), "pending_total": project.nominated_aliases.len(),
+                "preview_limit": 3,
+            });
+            result["attachments"] = json!({"total": attachment_rows.len(), "recorded_active": active, "default_attachment": default_attachment});
+            result["attachment_note"] = json!(
+                "Recorded host-local attachment status does not prove live daemon checkout access."
+            );
+            result["detail_hint"] = json!(
+                "Use detail=aliases, attachments, or observations. Alias/attachment pages accept limit, offset and expected_catalog_epoch."
+            );
+        }
+        CatalogGetDetail::Aliases => {
+            let mut aliases = project
+                .operator_aliases
+                .iter()
+                .map(|alias| (alias, "accepted"))
+                .chain(
+                    project
+                        .nominated_aliases
+                        .iter()
+                        .map(|alias| (alias, "pending")),
+                )
+                .collect::<Vec<_>>();
+            aliases.sort();
+            let rows = aliases
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(alias, status)| {
+                    let mut row = json!({"alias": alias, "status": status});
+                    if *status == "pending" {
+                        // An argv template cannot interpret shell metacharacters in
+                        // an otherwise valid alias. The catalog path belongs to the
+                        // administrator; a daemon path is not a client read handle.
+                        row["accept_argv"] = json!([
+                            "blackbox",
+                            "project-catalog",
+                            "alias",
+                            "accept",
+                            "--projects-path",
+                            "<authoritative-catalog-path>",
+                            "--project",
+                            project_id,
+                            "--alias",
+                            alias,
+                            "--expected-epoch",
+                            epoch.to_string()
+                        ]);
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
+            result["detail"] = json!("aliases");
+            result["aliases"] = json!(rows);
+            result["total"] = json!(aliases.len());
+            result["offset"] = json!(offset);
+            result["limit"] = json!(limit);
+            result["order"] = json!("alias_asc_status_asc");
+            result["operator_note"] = json!(
+                "Pending aliases are not selectors until accepted. accept_argv is an offline administrator template requiring access to the authoritative catalog; it does not call this daemon. Execute arguments without shell interpolation."
+            );
+            return bbox_corpus_core::response_page::bound_page(result, "aliases");
+        }
+        CatalogGetDetail::Attachments => {
+            result["detail"] = json!("attachments");
+            result["default_attachment"] = json!(default_attachment);
+            result["host_local_attachments"] =
+                json!(attachment_rows.iter().skip(offset).take(limit).map(|row| json!({
+                "attachment_id": row.attachment_id.as_str(), "status": row.status, "kind": row.kind,
+                "checkout_id": row.checkout_id, "checkout_project_dir": row.checkout_project_dir,
+                "project_root_relpath": row.project_root_relpath, "capabilities": row.capabilities,
+            })).collect::<Vec<_>>());
+            result["total"] = json!(attachment_rows.len());
+            result["offset"] = json!(offset);
+            result["limit"] = json!(limit);
+            result["order"] = json!("attachment_id_asc");
+            result["locality_note"] = json!(
+                "These are recorded host-local paths, not MCP file handles or proof that this daemon can read them. This call performs no checkout probes."
+            );
+            return bbox_corpus_core::response_page::bound_page(result, "host_local_attachments");
+        }
+        CatalogGetDetail::Observations => {
+            result["detail"] = json!("observations");
+            result["connector_observations"] = connector_observations_json(catalog, project);
+            result["observations_note"] = json!(
+                "Producer-reported coordinates are display evidence, not project identity or proof of current source freshness."
+            );
+        }
+    }
+    anyhow::ensure!(
+        serde_json::to_vec(&result)?.len() <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES,
+        "error.catalog_detail_too_large: catalog metadata exceeds the response budget"
+    );
+    Ok(result)
+}
+
 /// Longest accepted `audit_reason`, matching the catalog's own bounded
 /// audit-text limit so a refusal happens here rather than deep in a
 /// transaction closure.
@@ -126,11 +297,35 @@ pub(crate) struct CatalogListParams {
     pub expected_catalog_epoch: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CatalogGetDetail {
+    #[default]
+    Summary,
+    Aliases,
+    Attachments,
+    Observations,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CatalogGetParams {
-    /// Project selector: catalog project id, an accepted alias, or any
-    /// selector the resolver proves to exactly one project.
+    /// Exact project selector: id, accepted alias, or another uniquely resolved selector.
     pub project: String,
+    /// summary (default): identity and state, including alias previews/counts.
+    /// aliases: exact accepted/pending rows and operator CLI arguments.
+    /// attachments: recorded host-local attachment rows, not live access proof.
+    /// observations: producer-reported connector coordinates, not identity.
+    #[serde(default)]
+    pub detail: CatalogGetDetail,
+    /// Alias/attachment page size only: default 20, clamped to 1..=100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Alias/attachment continuation offset. Nonzero requires expected_catalog_epoch.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Previous response epoch. A changed catalog refuses; restart at offset 0.
+    #[serde(default)]
+    pub expected_catalog_epoch: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -769,7 +964,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_catalog_get",
-        description = "Read one catalog project: its id, display name, scope, connector_observations, aliases, pending alias nominations, and repo-history reference, plus a separate host_local_attachments section carrying this host's attachment rows (attachment_id, status, kind, checkout dir, relpath). The catalog section stays path-free; attachment paths are host-local operator data. A connector-scoped project has no attachment and no repo history, and its vendor coordinates render only as connector_observations: they are what a producer reported, refreshed on every onboarding, and never the project's identity. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one project by exact selector. Default detail=summary returns identity, scope, epoch, alias previews (3 accepted and 3 pending, with totals), and recorded attachment counts/default. detail=aliases returns exact alias rows and offline operator accept arguments; detail=attachments returns recorded host-local rows, not proof of live checkout access; detail=observations returns producer-reported connector coordinates, not identity or freshness. Alias/attachment pages default to 20, clamp limit to 1..=100, and obey a byte budget. Continue with next_offset and expected_catalog_epoch; nonzero offset requires that epoch and changes refuse. No unbounded full option and no checkout probes. Returns error.project_catalog_inactive on the version-1 registry."
     )]
     pub(crate) async fn bbox_project_catalog_get(
         &self,
@@ -779,53 +974,15 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         Self::run_blocking("bbox_project_catalog_get", move || {
-            let project_id = resolve_project_selection(&store, &p.project)?;
-            let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
-            let Some(project) = state.catalog().projects.get(&project_id) else {
-                anyhow::bail!(
-                    "error.project_catalog_admin_unknown_project: {project_id} is not in the catalog"
-                );
-            };
-            let attachments: Vec<serde_json::Value> = state
-                .attachments()
-                .attachments
-                .values()
-                .filter(|row| row.project_id == project_id)
-                .map(|row| {
-                    json!({
-                        "attachment_id": row.attachment_id.as_str(),
-                        "status": row.status,
-                        "kind": row.kind,
-                        "checkout_id": row.checkout_id,
-                        "checkout_project_dir": row.checkout_project_dir,
-                        "project_root_relpath": row.project_root_relpath,
-                        "capabilities": row.capabilities,
-                    })
-                })
-                .collect();
-            let default_attachment = state
-                .attachments()
-                .default_attachments
-                .get(&project_id)
-                .map(|id| id.as_str().to_string());
-            let alias_accept_commands =
-                alias_accept_commands(&project.project_id, state.epoch(), &project.nominated_aliases);
-            Ok(serde_json::to_string_pretty(&json!({
-                "epoch": state.epoch(),
-                "project": {
-                    "project_id": project.project_id.as_str(),
-                    "display_name": project.display_name,
-                    "scope": scope_json(&project.scope),
-                    "connector_observations":
-                        connector_observations_json(state.catalog(), project),
-                    "operator_aliases": project.operator_aliases,
-                    "nominated_aliases": project.nominated_aliases,
-                    "repo_history": project.repo_history.as_ref().map(|id| id.as_str()),
-                },
-                "alias_accept_commands": alias_accept_commands,
-                "host_local_attachments": attachments,
-                "default_attachment": default_attachment,
-            }))?)
+            let state = store
+                .snapshot()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(serde_json::to_string(&project_catalog_get_page(
+                state.catalog(),
+                state.attachments(),
+                state.epoch(),
+                &p,
+            )?)?)
         })
         .await
     }
@@ -2430,6 +2587,166 @@ mod tests {
     use super::*;
     use crate::server::state::SharedState;
 
+    fn catalog_get_fixture() -> (
+        bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+        bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+        String,
+    ) {
+        use bbox_corpus_core::project_catalog::{
+            AttachmentSnapshotV1, CatalogSnapshotV2, CheckoutAttachment, CorpusProject,
+        };
+        let mut catalog = CatalogSnapshotV2::empty(7).unwrap();
+        let mut attachments = AttachmentSnapshotV1::empty(7).unwrap();
+        let project_id = ProjectId::parse("p_00000000000000000000000000000001").unwrap();
+        catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                display_name: "Fixture".into(),
+                scope: ProjectScope::LegacyLocal,
+                operator_aliases: (0..105).map(|i| format!("accepted-{i:03}")).collect(),
+                nominated_aliases: (0..105).map(|i| format!("pending-{i:03}")).collect(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: Default::default(),
+            },
+        );
+        for i in (0..105).rev() {
+            let attachment_id = AttachmentId::parse(format!("att_{i:032x}")).unwrap();
+            attachments.attachments.insert(
+                attachment_id.clone(),
+                CheckoutAttachment {
+                    attachment_id,
+                    project_id: project_id.clone(),
+                    checkout_id: format!("{i:032x}"),
+                    checkout_dir: format!("/recorded-host/{i:03}"),
+                    checkout_project_dir: format!("/recorded-host/{i:03}/{}", "x".repeat(800)),
+                    project_root_relpath: ".".into(),
+                    kind: AttachmentKind::Base,
+                    validated_scope: None,
+                    computed_repo_hint: None,
+                    branch_ref: None,
+                    capabilities: Default::default(),
+                    status: AttachmentStatus::Attached,
+                    attached_at: "2026-01-01T00:00:00Z".into(),
+                    detached_at: None,
+                },
+            );
+        }
+        (catalog, attachments, project_id.to_string())
+    }
+
+    #[test]
+    fn catalog_get_summary_keeps_decision_evidence_without_hidden_attachment_or_command_payloads() {
+        let (catalog, attachments, project) = catalog_get_fixture();
+        let p: CatalogGetParams = serde_json::from_value(json!({"project": project})).unwrap();
+        let summary = project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap();
+        assert_eq!(summary["aliases"]["accepted"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["aliases"]["pending"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["aliases"]["pending_total"], 105);
+        assert_eq!(summary["attachments"]["recorded_active"], 105);
+        assert_eq!(summary["epoch"], 7);
+        let raw = summary.to_string();
+        assert!(!raw.contains("/recorded-host"));
+        assert!(!raw.contains("accept_argv"));
+        assert!(!raw.contains("host_local_attachments"));
+        assert!(raw.len() < 1500);
+        assert!(
+            serde_json::from_value::<CatalogGetParams>(
+                json!({"project": p.project, "detail": "full"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_get_attachment_pages_bound_bytes_and_resume_without_skipping() {
+        let (catalog, attachments, project) = catalog_get_fixture();
+        let mut p = CatalogGetParams {
+            project,
+            detail: CatalogGetDetail::Attachments,
+            limit: Some(1000),
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let first = project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap();
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        );
+        assert_eq!(first["limit"], 100);
+        assert_eq!(first["byte_limited"], true);
+        for row in first["host_local_attachments"].as_array().unwrap() {
+            seen.push(row["attachment_id"].as_str().unwrap().to_owned());
+        }
+        p.offset = Some(first["next_offset"].as_u64().unwrap() as usize);
+        assert!(project_catalog_get_page(&catalog, &attachments, 7, &p).is_err());
+        p.expected_catalog_epoch = Some(7);
+        assert!(project_catalog_get_page(&catalog, &attachments, 8, &p).is_err());
+        loop {
+            let page = project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap();
+            for row in page["host_local_attachments"].as_array().unwrap() {
+                seen.push(row["attachment_id"].as_str().unwrap().to_owned());
+            }
+            let Some(next) = page["next_offset"].as_u64() else {
+                break;
+            };
+            p.offset = Some(next as usize);
+        }
+        assert_eq!(
+            seen,
+            (0..105)
+                .map(|i| format!("att_{i:032x}"))
+                .collect::<Vec<_>>()
+        );
+        p.offset = Some(usize::MAX);
+        let empty = project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap();
+        assert!(
+            empty["host_local_attachments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(empty["next_offset"].is_null());
+        p.offset = Some(0);
+        p.limit = Some(0);
+        assert_eq!(project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap()["host_local_attachments"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn catalog_get_alias_details_preserve_pending_status_and_exact_safe_operator_arguments() {
+        let (mut catalog, attachments, project) = catalog_get_fixture();
+        let alias = "a;$(fixture)";
+        catalog
+            .projects
+            .get_mut(&ProjectId::parse(&project).unwrap())
+            .unwrap()
+            .nominated_aliases
+            .insert(alias.into());
+        let p = CatalogGetParams {
+            project: "accepted-000".into(),
+            detail: CatalogGetDetail::Aliases,
+            limit: Some(1),
+            ..Default::default()
+        };
+        let page = project_catalog_get_page(&catalog, &attachments, 7, &p).unwrap();
+        let row = &page["aliases"][0];
+        assert_eq!(row["alias"], alias);
+        assert_eq!(row["status"], "pending");
+        assert_eq!(row["accept_argv"][9], alias);
+        assert_eq!(row["accept_argv"][5], "<authoritative-catalog-path>");
+        assert_eq!(page["next_offset"], 1);
+        let p = CatalogGetParams {
+            project: alias.into(),
+            ..Default::default()
+        };
+        assert!(
+            project_catalog_get_page(&catalog, &attachments, 7, &p).is_err(),
+            "pending nominations must not act as accepted selectors"
+        );
+    }
+
     #[test]
     fn project_catalog_summary_pages_are_bounded_and_guard_epoch() {
         use bbox_corpus_core::project_catalog::{
@@ -2719,6 +3036,7 @@ mod tests {
             server
                 .bbox_project_catalog_get(Parameters(CatalogGetParams {
                     project: "p_00000000000000000000000000000000".into(),
+                    ..Default::default()
                 }))
                 .await,
             server
