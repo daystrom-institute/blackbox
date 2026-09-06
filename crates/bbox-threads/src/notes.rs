@@ -681,6 +681,14 @@ impl Notes {
 
     /// Bounded MCP discovery; exact ids and full=true expand note bodies.
     pub fn list_page(&self, p: &NoteListParams, offset: usize) -> Result<serde_json::Value> {
+        // Audit A03/A06: `full` is an exact-read modifier, not a list
+        // modifier — expanding every matched body would be an unbounded
+        // response. It requires `id`.
+        if p.full.unwrap_or(false) && p.id.is_none() {
+            anyhow::bail!(
+                "full=true (or a body cursor) requires id=<note-id>; the paged list previews bodies and is the discovery surface"
+            );
+        }
         let results = self.matching_notes(p)?;
         let total = results.len();
         let limit = p.limit.unwrap_or(20).clamp(1, 100) as usize;
@@ -738,10 +746,28 @@ impl Notes {
                 "notes": notes, "total": total, "offset": offset, "limit": limit,
                 "next_offset": (next_offset < total).then_some(next_offset),
                 "order": "created_at_desc,id_asc",
+                "pagination": "live_offset: note creation and resolution can shift rows between pages; re-query from offset 0 after mutating notes",
                 "detail_hint": "bbox_notes(id=<id>,full=true)",
             }),
             "notes",
         )
+    }
+
+    /// Exact single-note recovery read (audit A06): applies the same filters
+    /// as the list lane (`id` required), clones the row, and refuses
+    /// ambiguous matches. The daemon adapter pages the serialized row
+    /// through the content-bound body cursor.
+    pub fn exact(&self, p: &NoteListParams) -> Result<Note> {
+        let id = p.id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "full=true (or a body cursor) requires id=<note-id>; the paged list is the discovery surface"
+            )
+        })?;
+        match self.matching_notes(p)?.as_slice() {
+            [note] => Ok((*note).clone()),
+            [] => anyhow::bail!("note not found: {id}"),
+            _ => anyhow::bail!("note filters matched more than one row; narrow the filters"),
+        }
     }
 
     pub fn list(&self, p: &NoteListParams) -> Result<String> {
@@ -858,6 +884,74 @@ mod tests {
             store.list_page(&p, usize::MAX).unwrap()["notes"],
             serde_json::json!([])
         );
+    }
+
+    /// Audit A03/A06: `full` is an exact-read modifier — a list-shaped call
+    /// with full=true and no id refuses instead of expanding every body.
+    #[test]
+    fn note_list_full_without_id_rejects_instead_of_expanding() {
+        let (_dir, mut store) = mk_store();
+        store.store.notes.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "note-00000001", "kind": "learned", "body": "b".repeat(5000),
+                "resolution": "unresolved",
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        );
+        let err = store
+            .list_page(
+                &NoteListParams {
+                    full: Some(true),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires id"),
+            "full-without-id must reject: {err}"
+        );
+    }
+
+    /// Audit A06: the exact getter returns the complete stored row for the
+    /// daemon adapter's content-bound pages, and refuses missing ids and
+    /// unknown note ids.
+    #[test]
+    fn note_exact_read_returns_the_full_row() {
+        let (_dir, mut store) = mk_store();
+        store.store.notes.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "note-00000001", "kind": "dispute", "body": "指針 dispute body 🦀",
+                "resolution": "unresolved",
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        );
+        let note = store
+            .exact(&NoteListParams {
+                id: Some("note-00000001".into()),
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(note.body, "指針 dispute body 🦀");
+
+        let missing_id = store
+            .exact(&NoteListParams {
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(missing_id.to_string().contains("requires id"));
+        let unknown = store
+            .exact(&NoteListParams {
+                id: Some("note-deadbeef".into()),
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(unknown.to_string().contains("not found"));
     }
 
     #[test]

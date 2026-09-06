@@ -574,7 +574,7 @@ impl Threads {
     ) -> Result<ThreadMutation> {
         if p.action == "get" {
             return Ok(ThreadMutation {
-                message: self.thread_get(p)?,
+                message: serde_json::to_string(&self.thread_get_page(p, None, 20, 0)?)?,
                 changed_thread: None,
                 changed_edges: false,
             });
@@ -660,10 +660,11 @@ impl Threads {
         })
     }
 
-    fn thread_get(&self, p: &ThreadParams) -> Result<String> {
+    /// The id/name finder shared by the get paths. Accepts bare `<8hex>` as
+    /// a fallback for canonical `thread-<8hex>` — matches the schema regex
+    /// and the NoteResolveParams policy.
+    fn find_thread<'a>(&'a self, p: &ThreadParams) -> Result<&'a Thread> {
         let thread = if let Some(id) = p.id.as_deref() {
-            // Accept bare `<8hex>` as fallback for canonical `thread-<8hex>`
-            // — matches the schema regex and the NoteResolveParams policy.
             self.store
                 .threads
                 .iter()
@@ -680,107 +681,180 @@ impl Threads {
         } else {
             anyhow::bail!("'id' or 'name' is required for get");
         };
+        thread.context("Thread not found")
+    }
 
-        let thread = thread.context("Thread not found")?;
+    /// Canonical thread id for an exact-read scope: binds the content-bound
+    /// cursor to the thread identity even when the caller selected by name.
+    pub fn thread_ref(&self, p: &ThreadParams) -> Result<String> {
+        self.find_thread(p).map(|thread| thread.id.clone())
+    }
 
-        // Build a readable representation
-        let mut out = String::new();
-        out.push_str(&format!("# {} — {}\n", thread.id, thread.topic));
+    /// Exact thread-note read (audit A04 recovery): 1-based index, matching
+    /// the `index` field of the `detail=notes` page rows.
+    pub fn thread_note(&self, p: &ThreadParams, index: usize) -> Result<(String, String)> {
+        let thread = self.find_thread(p)?;
+        let note = thread.notes.get(index.wrapping_sub(1)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "thread {} has no note at index {index} (1-based; it holds {})",
+                thread.id,
+                thread.notes.len()
+            )
+        })?;
+        Ok((thread.id.clone(), note.clone()))
+    }
+
+    /// Exact handoff-doc read (audit A04 recovery).
+    pub fn thread_handoff(&self, p: &ThreadParams) -> Result<(String, String)> {
+        let thread = self.find_thread(p)?;
+        let doc = thread
+            .handoff_doc
+            .as_deref()
+            .filter(|doc| !doc.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("thread {} has no handoff doc", thread.id))?;
+        Ok((thread.id.clone(), doc.to_string()))
+    }
+
+    /// Bounded thread get (audit A04): the default summary carries counts
+    /// and 200-char previews only — never the full session/edge/note
+    /// history, which was a 23KB+ unbounded dump. History lives behind
+    /// `detail=notes|sessions|edges` pages; exact recovery reads
+    /// (`detail=note`, `detail=handoff`) are paged by the daemon adapter
+    /// through the content-bound body cursor.
+    pub fn thread_get_page(
+        &self,
+        p: &ThreadParams,
+        detail: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value> {
+        use bbox_corpus_core::response_page as page_lib;
+        let thread = self.find_thread(p)?;
+        let mut rows = match detail {
+            None => return Ok(self.thread_summary_value(thread)),
+            Some("notes") => thread
+                .notes
+                .iter()
+                .enumerate()
+                .map(|(i, note)| {
+                    let mut row = serde_json::json!({
+                        "index": i + 1,
+                        "note": note,
+                    });
+                    page_lib::preview_field(&mut row, "note", 200);
+                    row
+                })
+                .collect::<Vec<_>>(),
+            Some("sessions") => thread
+                .sessions
+                .iter()
+                .map(|session| {
+                    let mut row = serde_json::json!({
+                        "session_id": session.session_id,
+                        "provider": session.provider,
+                        "linked_at": session.linked_at,
+                    });
+                    if let Some(name) = &session.name {
+                        row["name"] = serde_json::json!(name);
+                    }
+                    page_lib::preview_field(&mut row, "name", 200);
+                    row
+                })
+                .collect::<Vec<_>>(),
+            Some("edges") => thread
+                .edges
+                .iter()
+                .map(|edge| {
+                    let mut row = serde_json::json!({
+                        "kind": edge.kind,
+                        "target": edge.target,
+                        "target_type": edge.target_type,
+                        "created_at": edge.created_at,
+                    });
+                    if let Some(note) = &edge.note {
+                        row["note"] = serde_json::json!(note);
+                    }
+                    page_lib::preview_field(&mut row, "note", 200);
+                    row
+                })
+                .collect::<Vec<_>>(),
+            Some("note" | "handoff") => anyhow::bail!(
+                "detail={detail} is an exact read served with note_index/cursor paging; pass it through the bbox_thread adapter"
+            ),
+            Some(other) => {
+                anyhow::bail!("unknown detail: {other} (use notes, sessions, edges, note, handoff)")
+            }
+        };
+        // Rows are already ordered by their stable append position; the sort
+        // keeps the invariant explicit if the collector ever changes.
+        rows.sort_by_key(|row| row["index"].as_u64().unwrap_or_default());
+        let field = detail.expect("detail page");
+        let mut page = page_lib::collection_page(rows, field, Some(limit), Some(offset))?;
+        page["order"] = serde_json::json!(format!("{field}_append_index_asc"));
+        page["pagination"] = serde_json::json!(
+            "append_only_offset: existing rows keep their index; new rows append; re-query from offset 0 after continuing a thread"
+        );
+        page["detail_hint"] = serde_json::json!(format!(
+            "bbox_thread(action=get,id={},detail=note,note_index=<1-based>)",
+            thread.id
+        ));
+        Ok(page)
+    }
+
+    /// The bounded default summary: identity fields, counts, and previews.
+    fn thread_summary_value(&self, thread: &Thread) -> serde_json::Value {
+        use bbox_corpus_core::response_page as page_lib;
+        let mut row = serde_json::json!({
+            "id": thread.id,
+            "topic": thread.topic,
+            "status": thread.status,
+            "created_at": thread.created_at,
+            "last_activity": thread.last_activity,
+            "counts": {
+                "sessions": thread.sessions.len(),
+                "notes": thread.notes.len(),
+                "edges": thread.edges.len(),
+            },
+        });
         if let Some(name) = &thread.name {
-            out.push_str(&format!("Name: {}\n", name));
+            row["name"] = serde_json::json!(name);
         }
-        out.push_str(&format!("Status: {}\n", thread.status.as_ref()));
-        if let Some(k) = thread.kind {
-            out.push_str(&format!("Kind: {}\n", k.as_ref()));
+        if let Some(kind) = thread.kind {
+            row["kind"] = serde_json::json!(kind);
         }
         if let Some(origin) = thread.origin {
-            out.push_str(&format!("Origin: {}\n", origin.as_ref()));
+            row["origin"] = serde_json::json!(origin);
         }
-        out.push_str(&format!(
-            "Project: {}\n",
-            if thread.project.is_empty() {
-                "-"
-            } else {
-                &thread.project
-            }
-        ));
-        out.push_str(&format!("Created: {}\n", thread.created_at));
-        out.push_str(&format!("Last activity: {}\n", thread.last_activity));
+        if let Some(id) = &thread.project_id {
+            row["project_id"] = serde_json::json!(id);
+        } else if !thread.project.is_empty() {
+            row["project_selector"] = serde_json::json!(thread.project);
+        }
         if let Some(resolved) = &thread.resolved_at {
-            out.push_str(&format!("Resolved: {}\n", resolved));
-        }
-        if let Some(doc) = &thread.handoff_doc {
-            out.push_str(&format!("Handoff doc: {}\n", doc));
+            row["resolved_at"] = serde_json::json!(resolved);
         }
         if let Some(promoted) = &thread.promoted_to {
-            out.push_str(&format!("Promoted to: {}\n", promoted));
+            row["promoted_to"] = serde_json::json!(promoted);
         }
-
-        // Sessions
-        if thread.sessions.is_empty() {
-            out.push_str("\nSessions: none\n");
-        } else {
-            out.push_str(&format!("\nSessions ({}):\n", thread.sessions.len()));
-            for s in &thread.sessions {
-                let display = s.name.as_deref().unwrap_or(&s.session_id);
-                out.push_str(&format!(
-                    "  - {} ({}) linked {}\n",
-                    display, s.provider, s.linked_at
-                ));
-            }
+        if let Some(latest) = thread.notes.last() {
+            row["latest_note_index"] = serde_json::json!(thread.notes.len());
+            row["latest_note"] = serde_json::json!(latest);
         }
-
-        // Edges
-        if !thread.edges.is_empty() {
-            out.push_str(&format!("\nEdges ({}):\n", thread.edges.len()));
-            for e in &thread.edges {
-                let target_label = match e.target_type {
-                    EdgeTarget::Thread => {
-                        let name = self
-                            .store
-                            .threads
-                            .iter()
-                            .find(|t| t.id == e.target)
-                            .and_then(|t| t.name.as_deref())
-                            .unwrap_or("?");
-                        format!("{} ({})", e.target, name)
-                    }
-                    EdgeTarget::Session => {
-                        // Check if this session is linked on any thread for a friendly name
-                        let name = self
-                            .store
-                            .threads
-                            .iter()
-                            .flat_map(|t| t.sessions.iter())
-                            .find(|s| s.session_id == e.target)
-                            .and_then(|s| s.name.as_deref());
-                        match name {
-                            Some(n) => {
-                                format!("session:{} ({})", &e.target[..e.target.len().min(8)], n)
-                            }
-                            None => format!("session:{}", &e.target[..e.target.len().min(8)]),
-                        }
-                    }
-                };
-                out.push_str(&format!("  - {} → {}", e.kind.as_ref(), target_label));
-                if let Some(note) = &e.note {
-                    out.push_str(&format!(" — {}", note));
-                }
-                out.push('\n');
-            }
+        if let Some(doc) = &thread.handoff_doc {
+            row["handoff_doc"] = serde_json::json!(doc);
         }
-
-        // Notes
-        if thread.notes.is_empty() {
-            out.push_str("\nNotes: none\n");
-        } else {
-            out.push_str(&format!("\nNotes ({}):\n", thread.notes.len()));
-            for (i, note) in thread.notes.iter().enumerate() {
-                out.push_str(&format!("\n--- Note {} ---\n{}\n", i + 1, note));
-            }
-        }
-
-        Ok(out)
+        page_lib::preview_field(&mut row, "topic", 200);
+        page_lib::preview_field(&mut row, "name", 200);
+        page_lib::preview_field(&mut row, "latest_note", 200);
+        page_lib::preview_field(&mut row, "handoff_doc", 200);
+        serde_json::json!({
+            "thread": row,
+            "pagination": "summary is bounded; history pages are append-only offsets",
+            "detail_hint": format!(
+                "bbox_thread(action=get,id={},detail=notes|sessions|edges|note(note_index=N)|handoff)",
+                thread.id
+            ),
+        })
     }
 
     fn thread_link(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
@@ -1251,7 +1325,8 @@ impl Threads {
                 "threads": threads, "total": total, "offset": offset, "limit": limit,
                 "next_offset": (next_offset < total).then_some(next_offset),
                 "order": "last_activity_desc,id_asc",
-                "detail_hint": "bbox_thread(action=get,id=<id>)",
+                "pagination": "live_offset: thread activity reorders rows between pages; re-query from offset 0 after mutating threads",
+                "detail_hint": "bbox_thread(action=get,id=<id>) for a bounded summary; detail=notes|sessions|edges|note|handoff for paged history",
             }),
             "threads",
         )
@@ -1597,6 +1672,276 @@ mod tests {
             })
             .unwrap();
         created.split_whitespace().nth(2).unwrap().to_string()
+    }
+
+    /// Audit A04: the default get is a bounded summary — counts and 200-char
+    /// previews only, never the full history dump that reached 23KB+.
+    #[test]
+    fn thread_get_summary_is_bounded_with_counts_and_previews() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let id = open_thread_id(&mut threads, "bounded get", "/repo/x");
+        for i in 0..50 {
+            threads
+                .thread(&ThreadParams {
+                    id: Some(id.clone()),
+                    note: Some(format!("note {i}: {}", "詳細 🦀".repeat(120))),
+                    ..params("continue")
+                })
+                .unwrap();
+        }
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                session_id: Some("sess-1".into()),
+                provider: Some("claude".into()),
+                ..params("continue")
+            })
+            .unwrap();
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                handoff_doc: Some("/owner/handoff.md".into()),
+                ..params("continue")
+            })
+            .unwrap();
+
+        let page = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                None,
+                20,
+                0,
+            )
+            .unwrap();
+        assert!(
+            serde_json::to_vec(&page).unwrap().len() <= 4 * 1024,
+            "summary must stay bounded: {page}"
+        );
+        let row = &page["thread"];
+        assert_eq!(row["id"], id);
+        assert_eq!(row["counts"]["notes"], 50);
+        assert_eq!(row["counts"]["sessions"], 1);
+        assert_eq!(row["counts"]["edges"], 0);
+        assert_eq!(row["latest_note_index"], 50);
+        assert!(
+            row["latest_note"].as_str().unwrap().len() <= 200,
+            "preview bounded"
+        );
+        assert_eq!(row["latest_note_truncated"], true);
+        assert_eq!(row["handoff_doc"], "/owner/handoff.md");
+        assert!(page["detail_hint"].as_str().unwrap().contains("detail="));
+
+        // Bounded even with a huge topic: previewed, flagged.
+        let mut wide = params("open");
+        wide.topic = Some("トピック".repeat(2000));
+        let created = threads.thread(&wide).unwrap();
+        let wide_id = created.split_whitespace().nth(2).unwrap().to_string();
+        let page = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(wide_id),
+                    ..params("get")
+                },
+                None,
+                20,
+                0,
+            )
+            .unwrap();
+        assert!(
+            page["thread"]["topic"].as_str().unwrap().len() <= 200,
+            "topic preview bounded"
+        );
+        assert_eq!(page["thread"]["topic_truncated"], true);
+    }
+
+    /// Audit A04: history pages are bounded, ordered by append index, and
+    /// labeled append-only.
+    #[test]
+    fn thread_get_detail_pages_note_history_in_append_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let id = open_thread_id(&mut threads, "paged history", "/repo/x");
+        for i in 1..=5 {
+            threads
+                .thread(&ThreadParams {
+                    id: Some(id.clone()),
+                    note: Some(format!("history note {i}: {}", "本文".repeat(150))),
+                    ..params("continue")
+                })
+                .unwrap();
+        }
+
+        let page = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                Some("notes"),
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(page["total"], 5);
+        assert_eq!(page["count"], 2);
+        assert_eq!(page["next_offset"], 2);
+        assert_eq!(page["notes"][0]["index"], 1);
+        assert_eq!(page["notes"][1]["index"], 2);
+        assert!(page["notes"][0]["note_truncated"], true);
+        assert!(
+            page["pagination"]
+                .as_str()
+                .unwrap()
+                .starts_with("append_only_offset")
+        );
+
+        let next = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                Some("notes"),
+                2,
+                2,
+            )
+            .unwrap();
+        assert_eq!(next["notes"][0]["index"], 3);
+        assert_eq!(next["notes"][1]["index"], 4);
+        assert_eq!(next["next_offset"], 4);
+
+        // Sessions and edges pages exist and stay bounded.
+        let sessions = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                Some("sessions"),
+                20,
+                0,
+            )
+            .unwrap();
+        assert_eq!(sessions["total"], 0);
+        let edges = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                Some("edges"),
+                20,
+                0,
+            )
+            .unwrap();
+        assert_eq!(edges["total"], 0);
+
+        // Unknown detail names the valid set.
+        let err = threads
+            .thread_get_page(
+                &ThreadParams {
+                    id: Some(id),
+                    ..params("get")
+                },
+                Some("bogus"),
+                20,
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown detail"),
+            "invalid detail must error: {err}"
+        );
+    }
+
+    /// Audit A04 exact recovery: the getters return complete stored text for
+    /// the adapter's content-bound pages.
+    #[test]
+    fn thread_exact_getters_return_complete_text() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let id = open_thread_id(&mut threads, "exact reads", "/repo/x");
+        let note_text = format!("exact note {}", "正確 🦀".repeat(300));
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                note: Some(note_text.clone()),
+                ..params("continue")
+            })
+            .unwrap();
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                handoff_doc: Some("/owner/handoff.md".into()),
+                ..params("continue")
+            })
+            .unwrap();
+
+        let (by_id, note) = threads
+            .thread_note(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(by_id, id);
+        assert_eq!(note.len(), note_text.len());
+
+        // Name selection binds to the canonical id.
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                name: Some("named-thread".into()),
+                ..params("rename")
+            })
+            .unwrap();
+        let (by_name, _) = threads
+            .thread_note(
+                &ThreadParams {
+                    name: Some("named-thread".into()),
+                    ..params("get")
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(by_name, id);
+
+        let handoff = threads
+            .thread_handoff(&ThreadParams {
+                id: Some(id.clone()),
+                ..params("get")
+            })
+            .unwrap();
+        assert_eq!(handoff, (id.clone(), "/owner/handoff.md".to_string()));
+
+        // Out-of-range and missing-handoff are explicit errors.
+        let err = threads
+            .thread_note(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    ..params("get")
+                },
+                2,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no note at index 2"), "{err}");
+        let id2 = open_thread_id(&mut threads, "no handoff", "/repo/x");
+        let err = threads
+            .thread_handoff(&ThreadParams {
+                id: Some(id2),
+                ..params("get")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("no handoff doc"), "{err}");
     }
 
     /// Not-found and empty-list responses carry store identity, so a caller

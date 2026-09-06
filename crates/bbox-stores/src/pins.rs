@@ -12,9 +12,10 @@ use bbox_util::util;
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PinParams {
-    /// set, list, or delete
+    /// set, list, or delete. Any other value is rejected before project
+    /// resolution runs.
     pub action: String,
-    /// Pin ID for update/delete
+    /// Pin ID for update/delete, and for exact reads (`full=true`).
     #[serde(default)]
     pub id: Option<String>,
     /// Pin body for set
@@ -23,7 +24,8 @@ pub struct PinParams {
     /// Short title
     #[serde(default)]
     pub title: Option<String>,
-    /// Scope: session, bro, thread, work_item
+    /// Scope: one of session, bro, thread, work_item. Invalid values are
+    /// rejected with an error, never silently matched against nothing.
     #[serde(default)]
     pub scope: Option<String>,
     /// Scope target value: session ID, bro name, thread ID, or work item ID
@@ -35,6 +37,22 @@ pub struct PinParams {
     /// ISO 8601 expiry
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Maximum rows per `list` page (default 20, maximum 100).
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// Continue a `list` page using its next_offset.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Exact read of one pin's complete body. Requires `id`; pages the full
+    /// row through the content-bound body cursor.
+    #[serde(default)]
+    pub full: Option<bool>,
+    /// Continue an exact (`full=true`) body page using body.next_cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Maximum bytes per exact body page (default 4096, clamped).
+    #[serde(default)]
+    pub body_limit: Option<usize>,
     /// Internal, not part of the MCP schema: an additional project path the
     /// `list` project filter also matches. Set by the daemon adapter when
     /// `project` was a worktree path resolved to its registered base, so pins
@@ -255,6 +273,12 @@ impl Pins {
         format!("pin-{:08x}", h.finish() as u32)
     }
 
+    /// Immutable slice of all stored pins — used by tests and cross-store
+    /// aggregators that can't go through the MCP layer.
+    pub fn all(&self) -> &[Pin] {
+        &self.store.pins
+    }
+
     pub fn project_ref_count(&self, project: &str) -> usize {
         self.store
             .pins
@@ -283,7 +307,7 @@ impl Pins {
     pub fn pin(&mut self, p: &PinParams) -> Result<String> {
         match p.action.as_str() {
             "set" => self.set(p),
-            "list" => self.list(p),
+            "list" => Ok(serde_json::to_string(&self.list_page(p, &[])?).unwrap()),
             "delete" => self.delete(p),
             other => anyhow::bail!("unknown pin action: {other} (use set, list, delete)"),
         }
@@ -338,7 +362,22 @@ impl Pins {
         Ok(format!("Created pin {id}"))
     }
 
-    fn list(&mut self, p: &PinParams) -> Result<String> {
+    /// The filter chain behind both the paged list and the exact read:
+    /// expiry, id, scope, target, and the dual-read project predicate.
+    /// An invalid scope errors loudly (audit A03) instead of matching
+    /// nothing and rendering as "0 pins".
+    fn matching_pins(&self, p: &PinParams) -> Result<Vec<&Pin>> {
+        let scope_filter = p
+            .scope
+            .as_deref()
+            .map(PinScope::from_str)
+            .transpose()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid scope: {:?} (use session, bro, thread, work_item)",
+                    p.scope
+                )
+            })?;
         let mut pins: Vec<&Pin> = self
             .store
             .pins
@@ -348,10 +387,8 @@ impl Pins {
                 Some(id) => pin.id == id,
                 None => true,
             })
-            .filter(|pin| match p.scope.as_deref() {
-                Some(raw) => PinScope::from_str(raw)
-                    .map(|scope| pin.scope == scope)
-                    .unwrap_or(false),
+            .filter(|pin| match scope_filter {
+                Some(scope) => pin.scope == scope,
                 None => true,
             })
             .filter(|pin| match p.target.as_deref() {
@@ -383,21 +420,69 @@ impl Pins {
                 .priority()
                 .cmp(&b.scope.priority())
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.id.cmp(&b.id))
         });
+        Ok(pins)
+    }
 
-        if pins.is_empty() {
-            return Ok("0 pins".to_string());
+    /// Bounded MCP discovery page (audit A06): bodies preview at 200 chars,
+    /// rows cap at `limit`, continuation is a live offset. The order matches
+    /// the injection lane (scope priority, then recency) with an id tiebreak
+    /// so pages stay deterministic when timestamps collide.
+    pub fn list_page(&self, p: &PinParams, diagnostics: &[String]) -> Result<serde_json::Value> {
+        let results = self.matching_pins(p)?;
+        let total = results.len();
+        let offset = usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX);
+        let limit = p.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let pins: Vec<_> = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|pin| {
+                let mut row = serde_json::json!({
+                    "id": pin.id, "scope": pin.scope, "target": pin.target,
+                    "created_at": pin.created_at, "updated_at": pin.updated_at,
+                });
+                if let Some(expires) = &pin.expires_at {
+                    row["expires_at"] = serde_json::json!(expires);
+                }
+                if let Some(id) = &pin.project_id {
+                    row["project_id"] = serde_json::json!(id);
+                } else if let Some(project) = &pin.project {
+                    row["project_selector"] = serde_json::json!(project);
+                }
+                row["title"] = serde_json::json!(pin.title);
+                row["content"] = serde_json::json!(pin.content);
+                bbox_corpus_core::response_page::preview_field(&mut row, "title", 200);
+                bbox_corpus_core::response_page::preview_field(&mut row, "content", 200);
+                row
+            })
+            .collect();
+        let next_offset = offset.saturating_add(pins.len());
+        let mut page = serde_json::json!({
+            "pins": pins, "total": total, "offset": offset, "limit": limit,
+            "next_offset": (next_offset < total).then_some(next_offset),
+            "order": "scope_priority_asc,updated_at_desc,id_asc",
+            "pagination": "live_offset: pin writes, updates, and expiries can shift rows between pages; re-query from offset 0 after mutating pins",
+            "detail_hint": "bbox_pin(action=list,id=<id>,full=true)",
+        });
+        if !diagnostics.is_empty() {
+            page["diagnostics"] = serde_json::json!(diagnostics);
         }
+        bbox_corpus_core::response_page::bound_page(page, "pins")
+    }
 
-        let mut out = format!("{} pins:\n\n", pins.len());
-        for pin in pins {
-            let project = pin.project.as_deref().unwrap_or("-");
-            out.push_str(&format!(
-                "[{}] {} | scope={} target={} project={} | updated {}\n  {}\n\n",
-                pin.id, pin.title, pin.scope, pin.target, project, pin.updated_at, pin.content
-            ));
+    /// Exact single-pin recovery read (audit A06): applies the same filters
+    /// as the list lane (so `id` is required) and refuses ambiguous matches.
+    pub fn exact(&self, p: &PinParams) -> Result<Pin> {
+        let id = p.id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("full=true (or a body cursor) requires id=<pin-id>; the paged list is the discovery surface")
+        })?;
+        match self.matching_pins(p)?.as_slice() {
+            [pin] => Ok((*pin).clone()),
+            [] => anyhow::bail!("pin not found: {id} (expired pins are not readable)"),
+            _ => anyhow::bail!("pin filters matched more than one row; narrow the filters"),
         }
-        Ok(out.trim_end().to_string())
     }
 
     fn delete(&mut self, p: &PinParams) -> Result<String> {
@@ -520,6 +605,11 @@ mod tests {
                 project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
+                limit: None,
+                offset: None,
+                full: None,
+                cursor: None,
+                body_limit: None,
             })
             .unwrap();
         assert!(out.contains("Created pin"));
@@ -563,6 +653,11 @@ mod tests {
                 project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
+                limit: None,
+                offset: None,
+                full: None,
+                cursor: None,
+                body_limit: None,
             })
             .unwrap();
         }
@@ -603,6 +698,11 @@ mod tests {
             project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
+            limit: None,
+            offset: None,
+            full: None,
+            cursor: None,
+            body_limit: None,
         })
         .unwrap();
 
@@ -663,6 +763,11 @@ mod tests {
             project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
+            limit: None,
+            offset: None,
+            full: None,
+            cursor: None,
+            body_limit: None,
         })
         .unwrap();
 
@@ -738,7 +843,8 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(listed_without_alias, "0 pins");
+        let page: serde_json::Value = serde_json::from_str(&listed_without_alias).unwrap();
+        assert_eq!(page["total"], 0, "no alias must not match: {page}");
     }
 
     #[test]
@@ -761,6 +867,11 @@ mod tests {
                 project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
+                limit: None,
+                offset: None,
+                full: None,
+                cursor: None,
+                body_limit: None,
             })
             .unwrap();
         }
@@ -824,6 +935,11 @@ mod tests {
             project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
+            limit: None,
+            offset: None,
+            full: None,
+            cursor: None,
+            body_limit: None,
         }
     }
 
@@ -931,6 +1047,156 @@ mod tests {
             !miss.contains("executor"),
             "no ledger path must not match: {miss}"
         );
+    }
+
+    #[test]
+    fn pin_list_pages_preview_bodies_and_report_live_offset_pagination() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        let huge = "界 pending decision 🦀".repeat(400);
+        for (scope, target) in [("bro", "executor"), ("session", "sess-1")] {
+            pins.pin(&PinParams {
+                action: "set".into(),
+                content: Some(huge.clone()),
+                title: Some(format!("{scope} title")),
+                scope: Some(scope.into()),
+                target: Some(target.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let out = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["limit"], 1);
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["next_offset"], 1);
+        assert_eq!(page["order"], "scope_priority_asc,updated_at_desc,id_asc");
+        assert!(
+            page["pagination"]
+                .as_str()
+                .expect("pagination label")
+                .starts_with("live_offset")
+        );
+        assert!(
+            page["detail_hint"]
+                .as_str()
+                .expect("exact hint")
+                .contains("full=true")
+        );
+        let row = &page["pins"][0];
+        // Body is previewed, never expanded: the multibyte body stays bounded
+        // and is flagged truncated.
+        let preview = row["content"].as_str().unwrap();
+        assert!(preview.len() <= 200, "preview must be bounded: {preview:?}");
+        assert_eq!(row["content_truncated"], true);
+        let huge_prefix: String = huge.chars().take(10).collect();
+        assert!(!preview.contains(&huge_prefix));
+
+        // Continuation reaches the second row.
+        let out = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["pins"][0]["scope"], "bro");
+        assert_eq!(page["next_offset"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn pin_exact_read_returns_the_full_row_for_recovery() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.pin(&PinParams {
+            action: "set".into(),
+            content: Some("complete body".into()),
+            title: Some("t".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let id = pins.store.pins[0].id.clone();
+
+        let pin = pins
+            .exact(&PinParams {
+                action: "list".into(),
+                id: Some(id.clone()),
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(pin.id, id);
+        assert_eq!(pin.content, "complete body");
+
+        // full without id is a usage error, not an unbounded list.
+        let err = pins
+            .exact(&PinParams {
+                action: "list".into(),
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("requires id"), "{err}");
+        // Unknown id says not-found instead of returning an empty page.
+        let err = pins
+            .exact(&PinParams {
+                action: "list".into(),
+                id: Some("pin-deadbeef".into()),
+                full: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn invalid_scope_errors_instead_of_matching_nothing() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.pin(&PinParams {
+            action: "set".into(),
+            content: Some("c".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                scope: Some("bogus".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid scope"),
+            "invalid scope must error: {err}"
+        );
+        // Empty result stays an honest zero-row page, not an error.
+        let out = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                scope: Some("session".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["pins"].as_array().unwrap().len(), 0);
     }
 }
 

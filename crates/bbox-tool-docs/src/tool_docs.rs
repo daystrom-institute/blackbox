@@ -514,10 +514,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_pin",
         category: ToolCategory::Knowledge,
-        summary: "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope.",
-        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. Self-inspection: `bbox_pin(action=\"list\")` with scope/target/project filters returns your active anchors — pins are not surfaced via `bbox_knowledge`, so `list` is the only read path. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
+        summary: "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope. action=list returns bounded preview pages (200-char bodies); id + full=true is the exact recovery read through a content-bound body cursor.",
+        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. Self-inspection: `bbox_pin(action=\"list\")` with scope/target/project filters returns your active anchors — pins are not surfaced via `bbox_knowledge`, so `list` is the discovery surface and `action=list,id=<pin-id>,full=true` is the exact read. Pins are host-owned state: `project` accepts a project_id or registered alias and matches by project identity, with literal-substring fallback plus a diagnostic. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
         example: Some(
-            r#"bbox_pin(action="set", scope="bro", target="executor", project="/repo/x", title="Active arc", content="For the current migration, validate every phase cut against the canonical scoping doc before proposing code changes.")"#,
+            r#"bbox_pin(action="list", project="89bd722f")   # then: bbox_pin(action="list", id="pin-<hex>", full=true)"#,
         ),
     },
     ToolDoc {
@@ -580,16 +580,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_thread",
         category: ToolCategory::Threads,
-        summary: "Open / continue / resolve / promote / rename / link a work thread.",
-        when_to_use: "Use for investigations or QC walks that span sessions. Before `action=open`, call `bbox_thread_list` to avoid duplicate threads. Use `kind=work_item` for orchestrator-led execution loops. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
-        example: Some(
-            r#"bbox_thread(action="open", topic="audit the dispatch path", project="/repo/x", kind="work_item")"#,
-        ),
+        summary: "Open / continue / resolve / promote / rename / link a work thread. action=get returns a bounded summary (counts + 200-char previews); detail=notes|sessions|edges pages history, detail=note|handoff reads exact bodies through content-bound cursors.",
+        when_to_use: "Use for investigations or QC walks that span sessions. Before `action=open`, call `bbox_thread_list` to avoid duplicate threads. Use `kind=work_item` for orchestrator-led execution loops. For context recovery, `action=get` defaults to a bounded summary; page the history with `detail` and follow `next_offset`, then read one full note (`detail=note,note_index=N`) or the handoff doc (`detail=handoff`) exactly. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        example: Some(r#"bbox_thread(action="get", id="thread-12345678", detail="notes")"#),
     },
     ToolDoc {
         name: "bbox_thread_list",
         category: ToolCategory::Threads,
-        summary: "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for full context.",
+        summary: "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for a bounded summary, then detail pages.",
         when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`. Workflow-origin arc threads are hidden by default; pass `include_workflows=true` when you need historical workflow records.",
         example: None,
     },
@@ -606,8 +604,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_notes",
         category: ToolCategory::Notes,
-        summary: "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies. Filter by kind, project, session, thread, or resolution.",
-        when_to_use: "Orchestrators reading what executors emitted this round, auditing past dispatch for a work-item thread, or retrieving a known note by `id=\"note-<8hex>\"`. The `query` filter searches note bodies, not IDs. Bodies are previewed at 200 chars by default; pass `full=true` to render complete bodies (useful for `done` summaries and structured `dispute` rationales). Addressed notes are hidden by default for list views but included by default for exact `id` lookups.",
+        summary: "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies through a content-bound cursor. Filter by kind, project, session, thread, or resolution.",
+        when_to_use: "Orchestrators reading what executors emitted this round, auditing past dispatch for a work-item thread, or retrieving a known note by `id=\"note-<8hex>\"`. The `query` filter searches note bodies, not IDs. Bodies are previewed at 200 chars by default; pass `full=true` with `id` to page the complete stored row through a content-bound cursor (useful for `done` summaries and structured `dispute` rationales); a cursor from one note is rejected on another or after the row changes. Addressed notes are hidden by default for list views but included by default for exact `id` lookups.",
         example: Some(r#"bbox_notes(id="note-a1b2c3d4", full=true)"#),
     },
     ToolDoc {
