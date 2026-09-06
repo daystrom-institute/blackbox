@@ -43,6 +43,28 @@ pub struct WebhookSpec {
     pub default_project_dir: Option<String>,
 }
 
+impl WebhookSpec {
+    /// Safe discovery projection; selector constants and host paths stay private.
+    pub fn response_view(&self, detail: bool) -> serde_json::Value {
+        let signature_kind = match &self.signature {
+            SignatureScheme::HmacSha256 { .. } => "hmac_sha256",
+            SignatureScheme::None => "none",
+        };
+        let mut row = serde_json::json!({"name": self.name, "signature": signature_kind, "routing_packet": self.routing_packet});
+        if detail {
+            row["signature"] = serde_json::json!(self.signature);
+            if let Some(header) = &self.delivery_id_header {
+                row["delivery_id_header"] = serde_json::json!(header);
+            }
+            let mut fields: Vec<_> = self.extractor.outputs.keys().collect();
+            fields.sort();
+            row["extractor_fields"] = serde_json::json!(fields);
+            row["project_configured"] = serde_json::json!(self.default_project_dir.is_some());
+        }
+        row
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignatureScheme {

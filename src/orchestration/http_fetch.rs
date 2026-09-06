@@ -60,6 +60,33 @@ pub struct HttpFetchSpec {
     pub retry: Option<RetrySpec>,
 }
 
+impl HttpFetchSpec {
+    /// Never expose resolved credentials, opaque URL components, or request bodies.
+    pub fn response_view(&self, detail: bool) -> Value {
+        let origin = reqwest::Url::parse(&self.url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .map(|url| url.origin().ascii_serialization());
+        let mut row = serde_json::json!({"method": self.method, "endpoint_origin": origin});
+        if detail {
+            let mut header_names: Vec<_> = self.headers.keys().collect();
+            header_names.sort();
+            row["header_names"] = serde_json::json!(header_names);
+            row["body_configured"] = serde_json::json!(self.body.is_some());
+            row["timeout_secs"] = serde_json::json!(self.timeout_secs);
+            row["response_kind"] = serde_json::json!(self.response_kind);
+            row["allow_empty_body"] = serde_json::json!(self.allow_empty_body);
+            if let Some(status) = &self.expect_status {
+                row["expect_status"] = serde_json::json!(status);
+            }
+            if let Some(retry) = &self.retry {
+                row["retry"] = serde_json::json!(retry);
+            }
+        }
+        row
+    }
+}
+
 fn default_method() -> String {
     "GET".into()
 }

@@ -60,6 +60,38 @@ pub struct AtomSummary {
     pub implementation_kind: Option<String>,
 }
 
+impl AtomSummary {
+    /// Discovery keeps routing information; installation diagnostics are explicit.
+    pub fn response_view(&self, detail: bool) -> serde_json::Value {
+        let mut row =
+            serde_json::json!({"name": self.name, "version": self.version, "active": self.active});
+        if let Some(description) = &self.description {
+            row["description"] = serde_json::json!(description);
+        }
+        if let Some(cost) = &self.cost_class {
+            row["cost_class"] = serde_json::json!(cost.to_string());
+        }
+        if let Some(subcontract) = &self.subcontract {
+            row["subcontract"] = serde_json::json!(subcontract);
+        }
+        if detail {
+            row["installed_at"] = serde_json::json!(self.installed_at);
+            if let Some(kind) = &self.provenance_kind {
+                row["provenance_kind"] = serde_json::json!(kind);
+            }
+            if !self.supersedes_chain.is_empty() {
+                row["supersedes_chain"] = serde_json::json!(self.supersedes_chain);
+            }
+            if let Some(kind) = &self.implementation_kind {
+                row["implementation_kind"] = serde_json::json!(kind);
+            }
+        } else {
+            bbox_corpus_core::response_page::preview_field(&mut row, "description", 512);
+        }
+        row
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AtomRecord
 // ---------------------------------------------------------------------------
@@ -580,6 +612,50 @@ mod tests {
             )
             .unwrap();
         catalog
+    }
+
+    #[test]
+    fn atoms_catalog_bounds_unicode_descriptions_and_expands_diagnostics() {
+        let summary = AtomSummary {
+            name: "example".into(),
+            version: "1".into(),
+            active: true,
+            description: Some("界\n\"".repeat(3000)),
+            cost_class: None,
+            provenance_kind: Some("hand_authored".into()),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            supersedes_chain: vec!["old".repeat(1000); 50],
+            subcontract: Some("example/v1".into()),
+            implementation_kind: Some("profile".into()),
+        };
+        let compact = summary.response_view(false);
+        assert_eq!(compact["description_truncated"], true);
+        assert!(compact["description"].as_str().unwrap().len() <= 512);
+        assert!(compact.get("installed_at").is_none());
+        assert!(compact.get("supersedes_chain").is_none());
+        let full = summary.response_view(true);
+        assert_eq!(full["description"], summary.description.as_deref().unwrap());
+        assert_eq!(full["supersedes_chain"].as_array().unwrap().len(), 50);
+        assert!(
+            bbox_corpus_core::response_page::collection_page(vec![full], "atoms", None, None)
+                .is_err()
+        );
+        let rows = vec![compact; 135];
+        let first =
+            bbox_corpus_core::response_page::collection_page(rows.clone(), "atoms", None, None)
+                .unwrap();
+        assert_eq!(first["count"], 20);
+        assert_eq!(first["next_offset"], 20);
+        let second =
+            bbox_corpus_core::response_page::collection_page(rows, "atoms", Some(1000), Some(20))
+                .unwrap();
+        let returned = second["count"].as_u64().unwrap();
+        assert!(returned > 0 && returned <= 100);
+        assert_eq!(second["next_offset"], 20 + returned);
+        assert!(
+            serde_json::to_vec(&second).unwrap().len()
+                <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        );
     }
 
     #[test]

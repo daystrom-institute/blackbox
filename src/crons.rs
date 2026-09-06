@@ -72,6 +72,22 @@ pub struct CronSpec {
     pub tz: Option<String>,
 }
 
+impl CronSpec {
+    /// MCP discovery never includes arbitrary payload values or host paths.
+    pub fn response_view(&self, detail: bool) -> Value {
+        let mut row = serde_json::json!({"name": self.name, "schedule": self.schedule,
+            "tz": self.tz.as_deref().unwrap_or("UTC"), "concurrency": self.concurrency,
+            "routing_packet": self.routing_packet});
+        if detail {
+            let mut keys: Vec<_> = self.payload.keys().collect();
+            keys.sort();
+            row["payload_keys"] = serde_json::json!(keys);
+            row["project_configured"] = serde_json::json!(self.default_project_dir.is_some());
+        }
+        row
+    }
+}
+
 fn default_concurrency() -> u32 {
     1
 }

@@ -620,8 +620,15 @@ pub(crate) struct AgentListParams {
     pub(crate) cost_class: Option<String>,
     #[serde(default)]
     pub(crate) provenance_kind: Option<String>,
+    /// Maximum rows per page (default 20, capped at 100).
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// Continue from next_offset returned by the previous page.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// Expand descriptions and installation diagnostics. Exact get/describe reads one record.
+    #[serde(default)]
+    pub(crate) detail: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1023,8 +1030,15 @@ pub(crate) struct AtomListParams {
     pub(crate) provenance_kind: Option<String>,
     #[serde(default)]
     pub(crate) subcontract: Option<String>,
+    /// Maximum rows per page (default 20, capped at 100).
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// Continue from next_offset returned by the previous page.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// Expand descriptions and installation diagnostics. Exact get/describe reads one record.
+    #[serde(default)]
+    pub(crate) detail: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

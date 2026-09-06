@@ -24,6 +24,23 @@ pub fn preview_field(row: &mut Value, field: &str, max_bytes: usize) {
     row[format!("{field}_truncated")] = json!(true);
 }
 
+/// Page an already filtered and deterministically ordered collection.
+/// Producers own projections and exact-read semantics; this helper owns caps.
+pub fn collection_page(
+    rows: Vec<Value>,
+    field: &str,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Value> {
+    let total = rows.len();
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(20).clamp(1, 100);
+    let rows: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
+    let mut page = json!({"offset": offset, "limit": limit, "total": total, "count": rows.len()});
+    page[field] = json!(rows);
+    bound_page(page, field)
+}
+
 /// Fit a complete JSON page within the discovery budget. The array is already
 /// filtered and ordered; omitted tail rows remain reachable through next_offset.
 /// An oversized first row fails explicitly rather than returning a nonadvancing
