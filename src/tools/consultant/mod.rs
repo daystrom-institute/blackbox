@@ -5,7 +5,7 @@
 //! pair. Each tool resolves `consumer` through the code-owned registry
 //! (`orchestration::consultant::consumers`) and enforces that consumer's id
 //! prefix before delegating. The `badgey_*` proposal tools are the pinned
-//! shims for `consumer="badgey"` and keep their wire format unchanged.
+//! shims for `consumer="badgey"` and share the same bounded proposal projection.
 //!
 //! The conversational lifecycle (exec/resume/dismiss) stays consumer-prefixed
 //! until the turn-loop runtime moves out of `tools/badgey` — see
@@ -47,7 +47,7 @@ fn resolve(consumer: &str, consultant_id: &str) -> Result<ConsultantId, String> 
 impl BlackboxServer {
     #[tool(
         name = "consultant_proposals_list",
-        description = "List proposal records owned by a consultant instance of any registered consumer. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment. Consumer-agnostic equivalent of `badgey_proposals_list`."
+        description = "List consultant proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through."
     )]
     pub(crate) async fn consultant_proposals_list(
         &self,
@@ -56,27 +56,14 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("consultant_proposals_list", move || {
             let id = resolve(&p.consumer, &p.consultant_id).map_err(|e| anyhow::anyhow!(e))?;
-            let proposals = server
-                .state
-                .consultant_proposals
-                .list_by_instance(&id)
-                .map_err(|e| anyhow::anyhow!("listing proposals: {e}"))?;
-            let filtered: Vec<_> = proposals
-                .into_iter()
-                .filter(|proposal| {
-                    p.since
-                        .as_deref()
-                        .is_none_or(|since| proposal.created_at.as_str() >= since)
-                })
-                .filter(|proposal| p.only_pending != Some(true) || !proposal.is_terminal())
-                .collect();
-            Ok(serde_json::to_string_pretty(&json!({
-                "consumer": p.consumer,
-                "consultant_id": p.consultant_id,
-                "since": p.since,
-                "count": filtered.len(),
-                "proposals": filtered,
-            }))?)
+            let page = server.state.consultant_proposals.response_page(
+                &id,
+                &p.read_options(),
+                json!({
+                    "consumer": p.consumer, "consultant_id": p.consultant_id,
+                }),
+            )?;
+            Ok(serde_json::to_string_pretty(&page)?)
         })
         .await
     }
@@ -266,6 +253,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shipped_proposal_workflows_follow_pages_and_expand_each_draft_without_side_effects() {
+        use crate::workflow::context::{ArcContext, resolve_arg_value};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: ConsultantId = "bg-0123abcd-4567ef89".parse().unwrap();
+        for n in 1..=25 {
+            server
+                .state
+                .consultant_proposals
+                .create(
+                    &id,
+                    "packet",
+                    json!({"headline": format!("proposal {n}"), "body": format!("draft {n}")}),
+                    None,
+                )
+                .unwrap();
+        }
+        let parent: Value = serde_json::from_str(include_str!(
+            "../../../system-defaults/badgey/workflows/badgey-triage-channel-arc.json"
+        ))
+        .unwrap();
+        let child: Value = serde_json::from_str(include_str!(
+            "../../../system-defaults/badgey/workflows/badgey-slack-emit-proposal-arc.json"
+        ))
+        .unwrap();
+        crate::workflow::compile(serde_json::from_value(parent.clone()).unwrap()).unwrap();
+        crate::workflow::compile(serde_json::from_value(child.clone()).unwrap()).unwrap();
+        let packet: crate::packets::CompileParams = serde_json::from_str(include_str!(
+            "../../../system-defaults/badgey/packets/hook-route-proposal-page.json"
+        ))
+        .unwrap();
+        server.state.packets.read().compile(&packet).unwrap();
+        let mut context = ArcContext::default();
+        context.vars.insert("badgey_id".into(), json!(id.as_str()));
+        context.meta.started_at = "2020-01-01T00:00:00Z".into();
+        let mut node = "ListProposals".to_owned();
+        let mut read_ids = Vec::new();
+        let mut pages = 0;
+        loop {
+            assert!(pages < 3, "shipped gate loop failed to terminate");
+            let arguments = &parent["nodes"][&node]["on_enter"][0]["args"]["arguments"];
+            let params =
+                serde_json::from_value(resolve_arg_value(&context, arguments).unwrap()).unwrap();
+            let response = server.consultant_proposals_list(Parameters(params)).await;
+            assert_ne!(response.is_error, Some(true), "{response:?}");
+            let page: Value = serde_json::from_str(&extract_text(&response)).unwrap();
+            context
+                .vars
+                .insert("proposals_response".into(), page.clone());
+            for summary in page["proposals"].as_array().unwrap() {
+                assert!(summary.get("draft").is_none());
+                let mut child_context = context.clone();
+                child_context
+                    .vars
+                    .insert("proposal".into(), summary.clone());
+                let arguments = &child["nodes"]["ReadProposal"]["on_enter"][0]["args"]["arguments"];
+                let params =
+                    serde_json::from_value(resolve_arg_value(&child_context, arguments).unwrap())
+                        .unwrap();
+                let response = server.consultant_proposals_list(Parameters(params)).await;
+                assert_ne!(response.is_error, Some(true), "{response:?}");
+                let exact: Value = serde_json::from_str(&extract_text(&response)).unwrap();
+                child_context.vars.insert("proposal_response".into(), exact);
+                let expanded = resolve_arg_value(
+                    &child_context,
+                    &child["nodes"]["ReadProposal"]["on_enter"][1]["args"]["value"],
+                )
+                .unwrap();
+                assert!(expanded["draft"]["body"].is_string());
+                assert_eq!(expanded["id"], summary["id"]);
+                read_ids.push(expanded["id"].as_str().unwrap().to_owned());
+            }
+            pages += 1;
+            let gate = parent["nodes"]["ForeachPostProposal"]["gate"]
+                .as_str()
+                .unwrap();
+            let verdict = server
+                .apply_workflow_gate_entity(
+                    gate,
+                    &context.flatten_for_gate("ForeachPostProposal"),
+                    "ForeachPostProposal",
+                )
+                .unwrap()
+                .unwrap();
+            node = parent["nodes"]["ForeachPostProposal"]["next"]["cases"][verdict]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if node == "Done" {
+                break;
+            }
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(
+            read_ids,
+            (1..=25).map(|n| format!("P-{n}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parent["nodes"]["ForeachPostProposal"]["foreach"]["on_item_failure"],
+            "collect_then_halt"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_with_unknown_consumer_returns_bad_input_status() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -294,6 +385,11 @@ mod tests {
             .unwrap();
         let result = server
             .consultant_proposals_list(Parameters(ConsultantProposalsListParams {
+                limit: None,
+                after: None,
+                through: None,
+                proposal_id: None,
+                include_events: false,
                 consumer: "badgey".to_string(),
                 consultant_id: id.as_str().to_string(),
                 since: None,

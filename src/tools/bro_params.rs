@@ -312,6 +312,36 @@ pub(crate) struct BadgeyProposalsListParams {
     /// Defaults to false (returns all states).
     #[serde(default)]
     pub(crate) only_pending: Option<bool>,
+    /// Summary page size: default 20, maximum 100.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Continue from next_after, keeping through and the same filters.
+    #[serde(default)]
+    pub(crate) after: Option<String>,
+    /// Initial page's upper proposal id bound. Reuse on subsequent pages.
+    #[serde(default)]
+    pub(crate) through: Option<String>,
+    /// Exact proposal/draft read; cannot combine with list filters, limit, or cursors.
+    #[serde(default)]
+    pub(crate) proposal_id: Option<String>,
+    /// Include transition history only on an exact proposal_id read.
+    #[serde(default)]
+    pub(crate) include_events: bool,
+}
+impl BadgeyProposalsListParams {
+    pub(crate) fn read_options(
+        &self,
+    ) -> crate::orchestration::consultant::proposals::ProposalReadOptions {
+        crate::orchestration::consultant::proposals::ProposalReadOptions {
+            since: self.since.clone(),
+            only_pending: self.only_pending.unwrap_or(false),
+            limit: self.limit,
+            after: self.after.clone(),
+            through: self.through.clone(),
+            proposal_id: self.proposal_id.clone(),
+            include_events: self.include_events,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1256,6 +1286,36 @@ pub(crate) struct ConsultantProposalsListParams {
     /// Defaults to false (returns all states).
     #[serde(default)]
     pub(crate) only_pending: Option<bool>,
+    /// Summary page size: default 20, maximum 100.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Continue from next_after, keeping through and the same filters.
+    #[serde(default)]
+    pub(crate) after: Option<String>,
+    /// Initial page's upper proposal id bound. Reuse on subsequent pages.
+    #[serde(default)]
+    pub(crate) through: Option<String>,
+    /// Exact proposal/draft read; cannot combine with list filters, limit, or cursors.
+    #[serde(default)]
+    pub(crate) proposal_id: Option<String>,
+    /// Include transition history only on an exact proposal_id read.
+    #[serde(default)]
+    pub(crate) include_events: bool,
+}
+impl ConsultantProposalsListParams {
+    pub(crate) fn read_options(
+        &self,
+    ) -> crate::orchestration::consultant::proposals::ProposalReadOptions {
+        crate::orchestration::consultant::proposals::ProposalReadOptions {
+            since: self.since.clone(),
+            only_pending: self.only_pending.unwrap_or(false),
+            limit: self.limit,
+            after: self.after.clone(),
+            through: self.through.clone(),
+            proposal_id: self.proposal_id.clone(),
+            include_events: self.include_events,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

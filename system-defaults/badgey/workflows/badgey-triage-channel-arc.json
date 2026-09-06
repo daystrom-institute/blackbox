@@ -1,20 +1,47 @@
 {
   "name": "badgey-triage-channel-arc",
-  "version": 2,
+  "version": 3,
   "vars_schema": {
-    "binding": { "kind": "object", "required": true },
-    "team_id": { "kind": "string" },
-    "channel_id": { "kind": "string" },
-    "channel_name": { "kind": "string" },
-    "project_dir": { "kind": "string" },
-    "instance": { "kind": "object" },
-    "badgey_id": { "kind": "string" },
-    "triage_response": { "kind": "object" },
-    "triage_data": { "kind": "object" },
-    "scout_charters": { "kind": "array" },
-    "scout_findings": { "kind": "array" },
-    "synthesis_response": { "kind": "object" },
-    "proposals_response": { "kind": "object" }
+    "binding": {
+      "kind": "object",
+      "required": true
+    },
+    "team_id": {
+      "kind": "string"
+    },
+    "channel_id": {
+      "kind": "string"
+    },
+    "channel_name": {
+      "kind": "string"
+    },
+    "project_dir": {
+      "kind": "string"
+    },
+    "instance": {
+      "kind": "object"
+    },
+    "badgey_id": {
+      "kind": "string"
+    },
+    "triage_response": {
+      "kind": "object"
+    },
+    "triage_data": {
+      "kind": "object"
+    },
+    "scout_charters": {
+      "kind": "array"
+    },
+    "scout_findings": {
+      "kind": "array"
+    },
+    "synthesis_response": {
+      "kind": "object"
+    },
+    "proposals_response": {
+      "kind": "object"
+    }
   },
   "actors": {},
   "start": "ExtractBinding",
@@ -23,12 +50,39 @@
       "actor": "",
       "prompt": "Extract per-binding fields into top-level vars for templating ergonomics downstream.",
       "on_enter": [
-        { "op": "set_var", "args": { "key": "team_id", "value": "${vars.binding.team_id}" } },
-        { "op": "set_var", "args": { "key": "channel_id", "value": "${vars.binding.channel_id}" } },
-        { "op": "set_var", "args": { "key": "channel_name", "value": "${vars.binding.channel_name}" } },
-        { "op": "set_var", "args": { "key": "project_dir", "value": "${vars.binding.project_dir}" } }
+        {
+          "op": "set_var",
+          "args": {
+            "key": "team_id",
+            "value": "${vars.binding.team_id}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "channel_id",
+            "value": "${vars.binding.channel_id}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "channel_name",
+            "value": "${vars.binding.channel_name}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "project_dir",
+            "value": "${vars.binding.project_dir}"
+          }
+        }
       ],
-      "next": { "type": "goto", "to": "EnsureInstance" }
+      "next": {
+        "type": "goto",
+        "to": "EnsureInstance"
+      }
     },
     "EnsureInstance": {
       "actor": "",
@@ -48,9 +102,18 @@
           "into_var": "instance",
           "on_failure": "halt"
         },
-        { "op": "set_var", "args": { "key": "badgey_id", "value": "${vars.instance.badgey_id}" } }
+        {
+          "op": "set_var",
+          "args": {
+            "key": "badgey_id",
+            "value": "${vars.instance.badgey_id}"
+          }
+        }
       ],
-      "next": { "type": "goto", "to": "TriageTurn" }
+      "next": {
+        "type": "goto",
+        "to": "TriageTurn"
+      }
     },
     "TriageTurn": {
       "actor": "",
@@ -73,12 +136,23 @@
         },
         {
           "op": "parse_json",
-          "args": { "from": "${vars.triage_response.result.result}" },
+          "args": {
+            "from": "${vars.triage_response.result.result}"
+          },
           "into_var": "triage_data"
         },
-        { "op": "set_var", "args": { "key": "scout_charters", "value": "${vars.triage_data.scout_charters}" } }
+        {
+          "op": "set_var",
+          "args": {
+            "key": "scout_charters",
+            "value": "${vars.triage_data.scout_charters}"
+          }
+        }
       ],
-      "next": { "type": "goto", "to": "ForeachScout" }
+      "next": {
+        "type": "goto",
+        "to": "ForeachScout"
+      }
     },
     "ForeachScout": {
       "actor": "",
@@ -87,13 +161,22 @@
         "items": "${vars.scout_charters}",
         "as_var": "charter_item",
         "subworkflow_ref": "badgey-scout-arc",
-        "imports": ["project_dir"],
-        "exports": ["done_note"],
+        "imports": [
+          "project_dir"
+        ],
+        "exports": [
+          "done_note"
+        ],
         "parallelism": 3,
         "on_item_failure": "collect_then_halt",
-        "collect": { "into_var": "scout_findings" }
+        "collect": {
+          "into_var": "scout_findings"
+        }
       },
-      "next": { "type": "goto", "to": "SynthesisTurn" }
+      "next": {
+        "type": "goto",
+        "to": "SynthesisTurn"
+      }
     },
     "SynthesisTurn": {
       "actor": "",
@@ -115,11 +198,14 @@
           "on_failure": "halt"
         }
       ],
-      "next": { "type": "goto", "to": "ListProposals" }
+      "next": {
+        "type": "goto",
+        "to": "ListProposals"
+      }
     },
     "ListProposals": {
       "actor": "",
-      "prompt": "Read the proposals Badgey emitted this synthesis turn.",
+      "prompt": "Read one summary page of proposals from this synthesis window.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -138,7 +224,10 @@
           "on_failure": "halt"
         }
       ],
-      "next": { "type": "goto", "to": "ForeachPostProposal" }
+      "next": {
+        "type": "goto",
+        "to": "ForeachPostProposal"
+      }
     },
     "ForeachPostProposal": {
       "actor": "",
@@ -147,13 +236,63 @@
         "items": "${vars.proposals_response.proposals}",
         "as_var": "proposal",
         "subworkflow_ref": "badgey-slack-emit-proposal-arc",
-        "imports": ["team_id", "channel_id", "channel_name", "project_dir", "badgey_id"],
+        "imports": [
+          "team_id",
+          "channel_id",
+          "channel_name",
+          "project_dir",
+          "badgey_id"
+        ],
         "exports": [],
         "parallelism": 1,
-        "on_item_failure": "continue",
-        "collect": { "into_var": "post_results" }
+        "on_item_failure": "collect_then_halt",
+        "collect": {
+          "into_var": "post_results"
+        }
       },
-      "next": { "type": "terminal" }
+      "next": {
+        "type": "branch",
+        "cases": {
+          "more": "NextProposalPage",
+          "done": "Done"
+        }
+      },
+      "gate": "domain:hook-route/proposal-page"
+    },
+    "NextProposalPage": {
+      "actor": "",
+      "prompt": "Read the next summary page with the original filters and upper id bound.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "consultant_proposals_list",
+            "arguments": {
+              "consumer": "badgey",
+              "consultant_id": "${vars.badgey_id}",
+              "since": "${meta.started_at}",
+              "only_pending": true,
+              "after": "${vars.proposals_response.next_after}",
+              "through": "${vars.proposals_response.through}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "proposals_response",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "ForeachPostProposal"
+      }
+    },
+    "Done": {
+      "actor": "",
+      "prompt": "All proposal pages have been processed.",
+      "next": {
+        "type": "terminal"
+      }
     }
   }
 }
