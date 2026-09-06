@@ -81,6 +81,99 @@ impl GraphValidateDetail {
     }
 }
 
+/// Precise variant selector for exact graph reads. Every field is one the
+/// list and describe summaries already expose: the authority plane, the
+/// checkout identity, and the generation content hash. Selection is applied
+/// after visibility filtering, so a selector can narrow the visible variant
+/// set but never widens authority past what the caller already sees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraphVariantSelector {
+    pub source: Option<String>,
+    pub checkout_id: Option<String>,
+    pub content_hash: Option<String>,
+}
+
+impl GraphVariantSelector {
+    /// Parses the adapter fields, validating the source vocabulary. Returns
+    /// `None` when no field was supplied so unselected reads keep their
+    /// single-variant-or-refuse contract.
+    pub(crate) fn parse(
+        source: Option<&str>,
+        checkout_id: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> Result<Option<Self>> {
+        if let Some(source) = source {
+            match source {
+                "published" | "provisional" | "connector" => {}
+                other => bail!(
+                    "error.bad_input: invalid source {other:?}; expected published, provisional, or connector"
+                ),
+            }
+        }
+        let selector = Self {
+            source: source.map(Into::into),
+            checkout_id: checkout_id.map(Into::into),
+            content_hash: content_hash.map(Into::into),
+        };
+        let empty = selector.source.is_none()
+            && selector.checkout_id.is_none()
+            && selector.content_hash.is_none();
+        Ok((!empty).then_some(selector))
+    }
+
+    pub(crate) fn matches_parts(
+        &self,
+        source: &str,
+        checkout_id: Option<&str>,
+        content_hash: &str,
+    ) -> bool {
+        self.source
+            .as_deref()
+            .map_or(true, |expected| expected == source)
+            && self
+                .checkout_id
+                .as_deref()
+                .map_or(true, |expected| Some(expected) == checkout_id)
+            && self
+                .content_hash
+                .as_deref()
+                .map_or(true, |expected| expected == content_hash)
+    }
+
+    fn matches_entry(&self, entry: &ProjectGraphViewEntry) -> bool {
+        self.matches_parts(
+            source_label(entry),
+            entry.generation.workspace_id.as_deref(),
+            entry.generation.content_hash.as_str(),
+        )
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(source) = &self.source {
+            parts.push(format!("source={source}"));
+        }
+        if let Some(checkout_id) = &self.checkout_id {
+            parts.push(format!("checkout_id={checkout_id}"));
+        }
+        if let Some(content_hash) = &self.content_hash {
+            parts.push(format!("content_hash={content_hash}"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The listed identity of one visible variant, used in refusal messages so
+/// the caller can copy the selector fields without another round trip.
+fn variant_identity(entry: &ProjectGraphViewEntry) -> String {
+    format!(
+        "source={}, checkout_id={}, content_hash={}",
+        source_label(entry),
+        entry.generation.workspace_id.as_deref().unwrap_or("-"),
+        entry.generation.content_hash
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GraphSummary {
     pub graph_id: String,
@@ -135,8 +228,10 @@ pub(crate) struct GraphRetrievalParticipation {
     /// Effective indexability: the policy flag AND a source that may be
     /// indexed at all (local-scratch never participates).
     pub indexable: bool,
-    /// Vertex types the policy excludes from word retrieval, sorted.
-    pub excluded_vertex_types: Vec<String>,
+    /// Vertex types the policy excludes from word retrieval, as a count. The
+    /// exact sorted list stays recoverable through the `detail=schema` exact
+    /// body read, so one huge exclusion array cannot inflate the summary.
+    pub excluded_vertex_type_count: usize,
     /// Documents this lane currently holds in the word index.
     pub indexed_vertex_count: usize,
     /// Generation stamp on the indexed documents, if any. Compare against
@@ -181,11 +276,14 @@ pub(crate) struct GraphValidation {
 
 /// One exact detail body plus the identity every page response preserves:
 /// selection scope, compact summary, and generation. The adapter pages
-/// `body` through the shared transport-only body-page helper.
+/// `body` through the shared transport-only body-page helper and binds the
+/// body cursor scope to the resolved variant identity.
 #[derive(Debug, Clone)]
 pub(crate) struct GraphDetailRead {
     pub project_id: String,
     pub provisional_mode: &'static str,
+    pub source: &'static str,
+    pub checkout_id: Option<String>,
     pub summary: GraphSummary,
     pub generation: bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity,
     pub body: Value,
@@ -268,15 +366,19 @@ impl BlackboxServer {
         Ok((mode, summaries, stamp))
     }
 
+    /// The visible variants of one graph id under one selection,
+    /// deterministically ordered, plus a content-bound stamp over that
+    /// variant set. The stamp lets summary continuation refuse when any
+    /// visible variant (or its retrieval state) changed between pages.
     pub(crate) fn project_graph_describe_domain(
         &self,
         project: &str,
         graph_id: &str,
         provisional: Option<&str>,
-    ) -> Result<Vec<GraphDescription>> {
-        let (project_id, _mode, _own) = self.graph_read_context(Some(project), provisional)?;
+    ) -> Result<(Vec<GraphDescription>, String)> {
+        let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
         let index = self.state.idx.read();
-        let descriptions = self
+        let mut descriptions = self
             .graph_entries(project, graph_id, provisional)?
             .into_iter()
             .map(|entry| {
@@ -290,29 +392,54 @@ impl BlackboxServer {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(descriptions)
+        descriptions.sort_by(|a, b| {
+            (
+                &a.summary.source,
+                &a.summary.checkout_id,
+                &a.summary.content_hash,
+                a.summary.status,
+            )
+                .cmp(&(
+                    &b.summary.source,
+                    &b.summary.checkout_id,
+                    &b.summary.content_hash,
+                    b.summary.status,
+                ))
+        });
+        let stamp = graph_variant_stamp(&project_id, mode, graph_id, &descriptions)?;
+        Ok((descriptions, stamp))
     }
 
-    /// Exactly one entry for an exact detail read. Under `all` visibility a
-    /// graph id can name several live generations (published plus overlays);
-    /// an exact body needs one generation, so ambiguity refuses instead of
-    /// silently paging a different graph than the caller selected.
+    /// Exactly one entry for an exact detail read. A selector filters the
+    /// already-visible variants; without one, multiple visible variants
+    /// refuse and the message lists each variant's selectable identity.
     fn single_graph_entry(
         &self,
         project: &str,
         graph_id: &str,
         provisional: Option<&str>,
+        selector: Option<&GraphVariantSelector>,
     ) -> Result<(ProjectId, ProvisionalMode, ProjectGraphViewEntry)> {
         let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
         let mut entries = self.graph_entries(project, graph_id, provisional)?;
+        if let Some(selector) = selector {
+            entries.retain(|entry| selector.matches_entry(entry));
+            if entries.is_empty() {
+                bail!(
+                    "error.not_found: no visible variant of graph `{graph_id}` matches {} in {} visibility",
+                    selector.describe(),
+                    mode_name(mode)
+                );
+            }
+        }
         if entries.len() > 1 {
-            let hashes = entries
+            let identities = entries
                 .iter()
-                .map(|entry| entry.generation.content_hash.as_str())
+                .map(variant_identity)
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join("; ");
             bail!(
-                "error.project_graph_ambiguous: exact detail matched {} graph generations ({hashes}); narrow provisional to published or own",
+                "error.project_graph_ambiguous: exact read matched {} visible variants [{identities}]; select one with source, checkout_id, and expected_content_hash (or narrow provisional to published or own)",
                 entries.len()
             );
         }
@@ -327,8 +454,9 @@ impl BlackboxServer {
         graph_id: &str,
         provisional: Option<&str>,
         detail: GraphDescribeDetail,
+        selector: Option<&GraphVariantSelector>,
     ) -> Result<GraphDetailRead> {
-        let (project_id, mode, entry) = self.single_graph_entry(project, graph_id, provisional)?;
+        let (project_id, mode, entry) = self.single_graph_entry(project, graph_id, provisional, selector)?;
         let summary = summary(entry.clone());
         let Some(graph) = entry.graph().cloned() else {
             bail!(
@@ -347,6 +475,8 @@ impl BlackboxServer {
         Ok(GraphDetailRead {
             project_id: project_id.to_string(),
             provisional_mode: mode_name(mode),
+            source: summary.source,
+            checkout_id: summary.checkout_id.clone(),
             summary,
             generation,
             body,
@@ -358,11 +488,23 @@ impl BlackboxServer {
         project: &str,
         graph_id: &str,
         provisional: Option<&str>,
+        selector: Option<&GraphVariantSelector>,
         error_offset: usize,
         error_limit: usize,
     ) -> Result<Vec<GraphValidation>> {
         let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
-        self.graph_entries(project, graph_id, provisional)?
+        let mut entries = self.graph_entries(project, graph_id, provisional)?;
+        if let Some(selector) = selector {
+            entries.retain(|entry| selector.matches_entry(entry));
+            if entries.is_empty() {
+                bail!(
+                    "error.not_found: no visible variant of graph `{graph_id}` matches {} in {} visibility",
+                    selector.describe(),
+                    mode_name(mode)
+                );
+            }
+        }
+        entries
             .into_iter()
             .map(|entry| {
                 let (valid, errors) = match entry.validity.clone() {
@@ -379,6 +521,8 @@ impl BlackboxServer {
                     &project_id,
                     mode,
                     &entry.graph_id,
+                    source,
+                    entry.generation.workspace_id.as_deref(),
                     &entry.generation.content_hash,
                     &error_values,
                 )?;
@@ -418,8 +562,10 @@ impl BlackboxServer {
         project: &str,
         graph_id: &str,
         provisional: Option<&str>,
+        selector: Option<&GraphVariantSelector>,
     ) -> Result<GraphDetailRead> {
-        let (project_id, mode, entry) = self.single_graph_entry(project, graph_id, provisional)?;
+        let (project_id, mode, entry) =
+            self.single_graph_entry(project, graph_id, provisional, selector)?;
         let summary = summary(entry.clone());
         let errors = match entry.validity.clone() {
             ProjectGraphValidity::Valid => Vec::new(),
@@ -429,6 +575,8 @@ impl BlackboxServer {
         Ok(GraphDetailRead {
             project_id: project_id.to_string(),
             provisional_mode: mode_name(mode),
+            source: summary.source,
+            checkout_id: summary.checkout_id.clone(),
             summary,
             generation,
             body: serde_json::to_value(&errors)?,
@@ -1121,17 +1269,9 @@ fn graph_retrieval_participation(
     Ok(GraphRetrievalParticipation {
         text_retrieval_enabled,
         indexable: text_retrieval_enabled && !never_indexable,
-        excluded_vertex_types: graph
-            .map(|graph| {
-                graph
-                    .schema
-                    .index_policy
-                    .retrieval_excluded_types
-                    .iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default(),
+        excluded_vertex_type_count: graph
+            .map(|graph| graph.schema.index_policy.retrieval_excluded_types.len())
+            .unwrap_or(0),
         indexed_vertex_count: stats.indexed_vertex_count,
         indexed_generation: stats.indexed_generation,
         accepted_generation: entry.generation.content_hash.clone(),
@@ -1208,15 +1348,42 @@ fn graph_view_stamp(
     format!("{:x}", hash.finalize())
 }
 
-/// Content-bound stamp over one generation's validation error set, so error
-/// pages refuse continuation when the underlying graph or its errors
-/// changed. The generation content hash alone is not enough: it names the
-/// accepted bytes, while this stamp also commits to the exact error rows a
-/// page walk is sampling.
+/// Content-bound stamp over one graph id's visible variant set under one
+/// selection. Any variant appearing, disappearing, republished, flipping
+/// valid/invalid, or changing retrieval state flips the stamp, so summary
+/// continuation refuses instead of paging a silently different variant set.
+fn graph_variant_stamp(
+    project_id: &ProjectId,
+    mode: ProvisionalMode,
+    graph_id: &str,
+    descriptions: &[GraphDescription],
+) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(project_id.as_str().as_bytes());
+    hash.update([0]);
+    hash.update(mode_name(mode).as_bytes());
+    hash.update([0]);
+    hash.update(graph_id.as_bytes());
+    hash.update([0]);
+    for description in descriptions {
+        hash.update(serde_json::to_vec(description)?);
+        hash.update(b"\n");
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Content-bound stamp over one visible variant's validation error set, so
+/// error pages refuse continuation when the selected variant, its graph, or
+/// its errors changed. The generation content hash alone is not enough: it
+/// names the accepted bytes, while this stamp also commits to the variant's
+/// authority plane, checkout identity, and the exact error rows a page walk
+/// is sampling.
 fn graph_error_stamp(
     project_id: &ProjectId,
     mode: ProvisionalMode,
     graph_id: &str,
+    source: &str,
+    checkout_id: Option<&str>,
     content_hash: &str,
     errors: &[Value],
 ) -> Result<String> {
@@ -1226,6 +1393,10 @@ fn graph_error_stamp(
     hash.update(mode_name(mode).as_bytes());
     hash.update([0]);
     hash.update(graph_id.as_bytes());
+    hash.update([0]);
+    hash.update(source.as_bytes());
+    hash.update([0]);
+    hash.update(checkout_id.unwrap_or("").as_bytes());
     hash.update([0]);
     hash.update(content_hash.as_bytes());
     hash.update([0]);
@@ -1415,10 +1586,12 @@ mod tests {
         );
     }
 
-    /// The error stamp commits to the exact error rows, not just the graph.
+    /// The error stamp commits to the exact error rows and the selected
+    /// variant's identity, not just the graph bytes.
     #[test]
-    fn error_stamp_commits_to_the_error_rows() {
+    fn error_stamp_commits_to_the_error_rows_and_variant() {
         let project = ProjectId::parse("p_errorstamp").unwrap();
+        let hash = "h".repeat(64);
         let errors = vec![
             serde_json::json!({"code": "edge.missing_vertex", "file": "edges.jsonl", "line": 7, "message": "target is missing"}),
         ];
@@ -1426,7 +1599,9 @@ mod tests {
             &project,
             ProvisionalMode::Own,
             "g",
-            &"h".repeat(64),
+            "provisional",
+            Some("workspace-one"),
+            &hash,
             &errors,
         )
         .unwrap();
@@ -1436,7 +1611,9 @@ mod tests {
                 &project,
                 ProvisionalMode::Own,
                 "g",
-                &"h".repeat(64),
+                "provisional",
+                Some("workspace-one"),
+                &hash,
                 &errors
             )
             .unwrap()
@@ -1453,7 +1630,9 @@ mod tests {
                 &project,
                 ProvisionalMode::Own,
                 "g",
-                &"h".repeat(64),
+                "provisional",
+                Some("workspace-one"),
+                &hash,
                 &changed
             )
             .unwrap()
@@ -1464,7 +1643,39 @@ mod tests {
                 &project,
                 ProvisionalMode::Own,
                 "g2",
-                &"h".repeat(64),
+                "provisional",
+                Some("workspace-one"),
+                &hash,
+                &errors
+            )
+            .unwrap()
+        );
+        // Two checkouts can carry byte-identical graphs; the stamp must keep
+        // their error pages distinct so a continuation cannot cross variants.
+        assert_ne!(
+            stamp,
+            graph_error_stamp(
+                &project,
+                ProvisionalMode::Own,
+                "g",
+                "provisional",
+                Some("workspace-two"),
+                &hash,
+                &errors
+            )
+            .unwrap()
+        );
+        // Repeating one content hash across authority planes is the same
+        // hazard: the stamp stays bound to the selected plane.
+        assert_ne!(
+            stamp,
+            graph_error_stamp(
+                &project,
+                ProvisionalMode::Own,
+                "g",
+                "published",
+                None,
+                &hash,
                 &errors
             )
             .unwrap()

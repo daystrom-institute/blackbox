@@ -4119,9 +4119,15 @@ mod tests {
                     project: "p_candidate_tool".into(),
                     graph_id: "governance-record".into(),
                     provisional: Some("published".into()),
+                    source: None,
+                    checkout_id: None,
+                    expected_content_hash: None,
                     detail: None,
                     cursor: None,
                     body_limit: None,
+                    variant_limit: None,
+                    variant_offset: None,
+                    expected_view_stamp: None,
                 },
             ))
             .await;
@@ -4505,6 +4511,7 @@ mod tests {
                 .unwrap();
             serde_json::to_value(
                 described
+                    .0
                     .first()
                     .expect("the published view carries the accepted graph")
                     .generation
