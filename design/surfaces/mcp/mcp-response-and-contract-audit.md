@@ -574,3 +574,37 @@ reply. Configuration redaction was covered with synthetic tests, without
 probing live credential values. Native ingestion is a subsequent milestone;
 this deployment's indexed transcript reads do not claim missing history was
 collected. Subsequent source commits are not covered by these deployment claims.
+
+
+### Subsequent source checkpoint: collection and exact continuation
+
+The native source transport now uses dedicated existing producer grants,
+content-addressed chunks, compare-and-swap snapshot admission, and streamed
+host capture. Reader leases and purge protection preserve the indexed generation
+across concurrent publication and source outages. Revocation still removes
+index enrollment. Source observations distinguish contact, scan completion,
+published generation, and indexed generation. Host enrollment and backfill are
+pending deployment verification; this source checkpoint is not collection proof.
+
+Graph inspection now pages edges and exact property text using revision-bound
+cursors. Bundles default to 600-character summaries with exact expansion.
+Task MCP and control status expose bounded previews and exact result/report
+continuation; duplicate snapshots and routine accounting are omitted. The
+control event detail states that it covers only retained ring events.
+
+Atom, agent, workflow, cron, poller, webhook, event, and reaction discovery now
+have bounded pages. Event continuation is anchored to journal identity; catalog
+offsets explicitly describe a live view. Trigger and reaction diagnostics omit
+credentials, opaque URL components, request values, and server-local paths.
+Storage health pages daemon-relative file coordinates and retains warnings.
+Artifact installation accepts inline JSON, propagates runtime persistence
+failures, and reports completed, failed, and unattempted stages. Its stores
+remain nontransactional; exact stage receipts describe partial effects.
+
+The full-suite gate caught a historical-agent supersession regression introduced
+while moving artifact deactivation after replacement persistence. It is being
+fixed before deployment. Proposal summary pagination also remains unfinished:
+a shipped Badgey workflow consumes complete drafts from one list call, so the
+producer and its page/expansion loop must migrate together. Blind truncation
+would silently drop proposals. Whiteboard visibility and project-admin locality
+are under the next source review, not claimed complete here.

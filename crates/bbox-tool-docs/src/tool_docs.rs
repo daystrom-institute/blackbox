@@ -1600,7 +1600,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "system_event_list",
         category: ToolCategory::Orchestration,
-        summary: "List recent system events with optional filters. Readonly.",
+        summary: "List journal event summaries newest first (default 20, maximum 100). Continue with next_before as before; keep filters unchanged. A missing/compacted cursor errors. Filters match recorded kind/producer/project tags exactly. Payload, correlation, principals, and host project paths are omitted; system_event_open(event_id) expands one event.",
         when_to_use: "Use to inspect recent events, filter by kind/producer/project. Does not leak resolved secret values.",
         example: Some(r#"system_event_list(kind="task.completed", limit=10)"#),
     },
@@ -1624,7 +1624,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "reaction_list",
         category: ToolCategory::Orchestration,
-        summary: "List installed reactions.",
+        summary: "List reactions in name order as summary pages (default 20, maximum 100). Filter exact name; continue with next_offset. detail=true expands event kinds and retry/failure policies, never action arguments or credentials. warning_count reports invalid stored specs; view=warnings pages safe warning names and categories without host paths.",
         when_to_use: "Use to see which reactions are installed and their event_kinds, action, and enabled status.",
         example: Some(r#"reaction_list()"#),
     },
