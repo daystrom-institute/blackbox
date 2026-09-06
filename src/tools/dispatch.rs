@@ -3320,10 +3320,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         server.state.drain.set(None, None).unwrap();
-        let p: ExecParams = serde_json::from_value(
+        let supplied = serde_json::from_value::<ExecParams>(
             json!({"prompt":"do not launch", "provider":"glm", "origin_override":"workflow"}),
-        )
-        .unwrap();
+        );
+        assert!(supplied.unwrap_err().to_string().contains("unknown field"));
+        let p: ExecParams =
+            serde_json::from_value(json!({"prompt":"do not launch", "provider":"glm"})).unwrap();
         assert!(p.origin_override.is_none());
         let result = server.bro_exec(Parameters(p)).await;
         assert!(call_result_text(&result).contains("maintenance_pending"));
