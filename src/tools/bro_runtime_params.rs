@@ -523,9 +523,11 @@ mod trigger_schema_tests {
 
     #[test]
     fn trigger_install_schemas_expose_required_specs_and_nested_selector_contracts() {
-        let cron = serde_json::to_value(schemars::schema_for!(CronInstallParams)).unwrap();
-        let poller = serde_json::to_value(schemars::schema_for!(PollerInstallParams)).unwrap();
-        let webhook = serde_json::to_value(schemars::schema_for!(WebhookInstallParams)).unwrap();
+        let cron = serde_json::to_value(rmcp::schemars::schema_for!(CronInstallParams)).unwrap();
+        let poller =
+            serde_json::to_value(rmcp::schemars::schema_for!(PollerInstallParams)).unwrap();
+        let webhook =
+            serde_json::to_value(rmcp::schemars::schema_for!(WebhookInstallParams)).unwrap();
         for (root, definition, fields) in [
             (
                 &cron,

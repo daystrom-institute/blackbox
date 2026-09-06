@@ -4,6 +4,10 @@
 session files. The corpus daemon receives authenticated snapshots and indexes
 those retained bytes. No shared filesystem is required.
 
+Mint a dedicated service token as 32 random bytes encoded as exactly 64
+lowercase hexadecimal characters, and store it privately on both endpoints.
+Other token formats are rejected.
+
 Enroll a source in the daemon's existing producer table. The source id must be
 operator-minted and unique, and its declared installation authority must match
 what the collector sends:
