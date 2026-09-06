@@ -1716,6 +1716,32 @@ fn project_status_response(
     debug: bool,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(response)?;
+    if let Some(routes) = value["routes"].as_object_mut() {
+        for route in routes
+            .values_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            let exact_coverage = route
+                .get("source_count")
+                .is_some_and(|count| !count.is_null());
+            if debug {
+                route.insert(
+                    "indexed_count_kind".into(),
+                    json!(if exact_coverage {
+                        "source_coverage"
+                    } else {
+                        "current_process_successes"
+                    }),
+                );
+            } else if !exact_coverage {
+                // Queue successes reset on daemon restart. They are not a
+                // measurement of how many vectors exist in the corpus.
+                if let Some(count) = route.remove("indexed_count") {
+                    route.insert("session_indexed_count".into(), count);
+                }
+            }
+        }
+    }
     if debug {
         return Ok(value);
     }
@@ -2051,6 +2077,8 @@ mod tests {
         assert_eq!(row["capped_count"], 3);
         assert_eq!(row["last_dropped"], "unsupported input");
         assert_eq!(row["queue_depth"], 0);
+        assert_eq!(row["session_indexed_count"], 0);
+        assert!(row.get("indexed_count").is_none());
         for key in [
             "provider",
             "coverage_state",
@@ -2064,7 +2092,16 @@ mod tests {
         let coverage = super::project_status_response(&response, true, false).unwrap();
         assert_eq!(coverage["routes"]["docs"]["coverage_state"], "not computed");
         let debug = super::project_status_response(&response, false, true).unwrap();
-        assert_eq!(debug, serde_json::to_value(&response).unwrap());
+        assert_eq!(debug["routes"]["docs"]["provider"], "test-provider");
+        assert_eq!(
+            debug["routes"]["docs"]["indexed_count_kind"],
+            "current_process_successes"
+        );
+        let mut measured = response;
+        measured.routes.get_mut("docs").unwrap().source_count = Some(5);
+        measured.routes.get_mut("docs").unwrap().indexed_count = 3;
+        let coverage = super::project_status_response(&measured, true, false).unwrap();
+        assert_eq!(coverage["routes"]["docs"]["indexed_count"], 3);
     }
     use super::*;
 
