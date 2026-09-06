@@ -1677,6 +1677,9 @@ impl TaskStore {
     }
 
     pub fn reserve_id(&mut self, id: &str) -> Result<(), BroSpawnError> {
+        if self.persistence_blocked {
+            return Err(BroSpawnError::TaskStoreUnavailable);
+        }
         if self.contains(id) {
             return Err(BroSpawnError::DuplicateTaskId { id: id.to_string() });
         }
@@ -1686,6 +1689,9 @@ impl TaskStore {
 
     #[allow(dead_code)] // test-only entry point; production paths use reserve_id + insert_reserved
     pub fn insert(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
+        if self.persistence_blocked {
+            return Err(BroSpawnError::TaskStoreUnavailable);
+        }
         if self.tasks.contains_key(&id) {
             return Err(BroSpawnError::DuplicateTaskId { id });
         }
@@ -1697,6 +1703,9 @@ impl TaskStore {
     }
 
     fn insert_reserved(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
+        if self.persistence_blocked {
+            return Err(BroSpawnError::TaskStoreUnavailable);
+        }
         if self.tasks.contains_key(&id) || self.quarantined_ids.contains(&id) {
             self.reserved.remove(&id);
             return Err(BroSpawnError::DuplicateTaskId { id });
@@ -2742,6 +2751,9 @@ impl AmbientContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BroSpawnError {
+    /// The startup snapshot could not be recovered safely. Refuse new work
+    /// before executor admission because its task identity cannot be persisted.
+    TaskStoreUnavailable,
     DuplicateTaskId {
         id: String,
     },
@@ -2754,6 +2766,10 @@ pub enum BroSpawnError {
 impl std::fmt::Display for BroSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TaskStoreUnavailable => write!(
+                f,
+                "task admission refused: task persistence is disabled after snapshot recovery failed; repair the configured task store and restart before dispatching new work"
+            ),
             Self::DuplicateTaskId { id } => write!(f, "duplicate task id: {id}"),
             Self::ReservedTaskId { id } => write!(f, "task id is already reserved: {id}"),
         }
@@ -7410,12 +7426,24 @@ mod tests {
             std::fs::write(root.join("tasks.json"), original).unwrap();
             let mut loaded = TaskStore::load(&root, u64::MAX);
             assert!(loaded.persistence_blocked);
-            loaded
-                .insert(
+            assert_eq!(
+                loaded.reserve_id("new-task"),
+                Err(BroSpawnError::TaskStoreUnavailable)
+            );
+            assert!(matches!(
+                loaded.insert(
                     "new-task".into(),
-                    test_task("new-task", TaskStatus::Completed, Provider::Brodex),
-                )
-                .unwrap();
+                    test_task("new-task", TaskStatus::Completed, Provider::Brodex)
+                ),
+                Err(BroSpawnError::TaskStoreUnavailable)
+            ));
+            assert!(matches!(
+                loaded.insert_reserved(
+                    "new-task".into(),
+                    test_task("new-task", TaskStatus::Completed, Provider::Brodex)
+                ),
+                Err(BroSpawnError::TaskStoreUnavailable)
+            ));
             assert!(loaded.serialize_snapshot(50).is_none());
             loaded.persist(&root);
             loaded.persist_all_events(&root);
@@ -7426,6 +7454,40 @@ mod tests {
         std::fs::create_dir(root.join("tasks.json")).unwrap();
         assert!(TaskStore::load(&root, u64::MAX).persistence_blocked);
         assert!(!TaskStore::load(&root.join("missing-store"), u64::MAX).persistence_blocked);
+    }
+
+    #[tokio::test]
+    async fn task_store_unrecoverable_snapshot_refuses_dispatch_before_executor_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let original = b"incomplete snapshot";
+        std::fs::write(root.join("tasks.json"), original).unwrap();
+        let task_store = Arc::new(RwLock::new(TaskStore::load(&root, u64::MAX)));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(8);
+        let result = spawn_with_pre_minted_id(
+            "refused-task".into(),
+            SpawnTaskParams {
+                provider: Provider::Brodex,
+                args: vec![],
+                session_id: "refused-session".into(),
+                cwd: None,
+                env_overrides: None,
+                store_dir: root.clone(),
+                task_store: task_store.clone(),
+                tail_tx,
+                roster_events: None,
+                bro_label: None,
+                agent_label: None,
+                system_events: None,
+                origin: bro_core::Origin::Cockpit,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BroSpawnError::TaskStoreUnavailable)));
+        assert!(!task_store.read().contains("refused-task"));
+        assert!(task_store.read().all_tasks().is_empty());
+        assert_eq!(std::fs::read(root.join("tasks.json")).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     }
 
     #[test]
