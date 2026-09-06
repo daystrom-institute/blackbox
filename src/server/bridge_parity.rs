@@ -1172,19 +1172,45 @@ mod harness {
     /// cannot be pinned are named individually in the ledger entry and
     /// substituted by exact value, not dropped.
     async fn doctor_row(fixture: &BridgeFixture) -> Row {
-        let result = fixture
-            .server
-            .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
-                format: Some("json".into()),
-                detail: Some("full".into()),
-                ..Default::default()
-            }))
-            .await;
+        // detail=full returns exact bounded body pages (A14). Reassemble the
+        // pages here so the parity capture still freezes the COMPLETE report
+        // payload: concatenated pages are byte-identical to the historical
+        // monolithic serialization, so the committed fixture does not move.
+        let mut full_text = String::new();
+        let mut body_offset: Option<usize> = None;
+        loop {
+            let result = fixture
+                .server
+                .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
+                    format: Some("json".into()),
+                    detail: Some("full".into()),
+                    body_offset,
+                    ..Default::default()
+                }))
+                .await;
+            let page_value = tool_row(&result);
+            let page_text = page_value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let page: Value = serde_json::from_str(page_text)
+                .unwrap_or_else(|err| panic!("doctor detail=full page must parse as JSON: {err}"));
+            let body = &page["body"];
+            full_text.push_str(
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .expect("doctor body page carries text"),
+            );
+            match body.get("next_cursor").and_then(Value::as_u64) {
+                Some(next) => body_offset = Some(next as usize),
+                None => break,
+            }
+        }
         // Doctor carries the observation snapshot twice: as a `checkout_access`
         // object and as rendered findings. Both get the same D-041 narrowing,
         // applied to the SAME fields, so the narrowing cannot leak back in
         // through the prose copy.
-        let mut value = tool_row(&result);
+        let mut value = json!({ "is_error": false, "text": full_text });
         if let Some(text) = value.get("text").and_then(Value::as_str) {
             let narrowed_prose = narrow_timing_dependent_prose(text);
             let narrowed = match serde_json::from_str::<Value>(&narrowed_prose) {

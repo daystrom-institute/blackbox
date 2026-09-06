@@ -258,6 +258,93 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     Ok(report)
 }
 
+/// Applicable section vocabulary in report order. Deliberately cheap: this
+/// is the pre-scan validation surface, so it only probes authority mode and
+/// never invokes a section producer.
+pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'static str> {
+    let catalog = state.project_authority.catalog_store().is_some();
+    let mut names = vec![
+        "daemon",
+        "index",
+        "code_sources",
+        "vectors",
+        "graph",
+        "projects",
+        "checkout_access",
+    ];
+    if catalog {
+        names.push("knowledge_transport");
+    }
+    names.push("resolver_compat");
+    if catalog {
+        names.extend([
+            "accepted_publication",
+            "publisher_binding",
+            "overlay_baseline",
+            "attachment_capability",
+            "artifact_watcher",
+        ]);
+    }
+    names.extend(["memories", "knowledge", "attention"]);
+    names
+}
+
+/// Collect exactly one section through its existing independent producer.
+/// A14: a requested section must not pay for (or depend on) collection of
+/// the unrelated sections. The section name is validated against the
+/// applicable vocabulary BEFORE any collection runs.
+pub(crate) fn run_section(
+    server: &crate::server::BlackboxServer,
+    section: &str,
+) -> anyhow::Result<DoctorReport> {
+    let state = &server.state;
+    if !section_names(state).contains(&section) {
+        anyhow::bail!("Unknown section `{section}`; omit section to discover available names");
+    }
+    if section == "checkout_access" {
+        let checkout_access = state.checkout_access_observations.health();
+        let section_report = checkout_access_section(&checkout_access);
+        return Ok(
+            DoctorReport::from_sections(vec![section_report]).with_checkout_access(checkout_access)
+        );
+    }
+    if section == "knowledge_transport" {
+        let checkout_access = state.checkout_access_observations.health();
+        let observations = state.knowledge_transport_observations.snapshot();
+        let section_report = knowledge_transport_section(state, &checkout_access, &observations);
+        return Ok(DoctorReport::from_sections(vec![section_report])
+            .with_knowledge_transport(observations));
+    }
+    let section_report = match section {
+        "daemon" => daemon_section(state),
+        "index" => index_section(state),
+        "code_sources" => code_sources_section(state),
+        "vectors" => vectors_section(state),
+        "graph" => graph_section(server),
+        "projects" => projects_section(state),
+        "resolver_compat" => resolver_compat_section(state),
+        "accepted_publication"
+        | "publisher_binding"
+        | "overlay_baseline"
+        | "attachment_capability"
+        | "artifact_watcher" => {
+            let statuses = catalog_project_statuses(state).unwrap_or_default();
+            match section {
+                "accepted_publication" => accepted_publication_section(&statuses),
+                "publisher_binding" => publisher_binding_section(&statuses),
+                "overlay_baseline" => overlay_baseline_section(&statuses),
+                "attachment_capability" => attachment_capability_section(&statuses),
+                _ => artifact_watcher_section(&statuses),
+            }
+        }
+        "memories" => memories_section(state),
+        "knowledge" => knowledge_section(state),
+        "attention" => attention_section(state),
+        _ => unreachable!("section vocabulary was validated above"),
+    };
+    Ok(DoctorReport::from_sections(vec![section_report]))
+}
+
 /// How many per-project findings one catalog section emits before it
 /// summarizes the rest. Doctor output is an operator surface, not a
 /// dump; the projection itself stays complete for programmatic consumers.
@@ -1927,6 +2014,40 @@ mod tests {
         serde_json::to_string(&report).expect("report serializes");
         // Renders without panicking and leads with the status line.
         assert!(report.render_summary().starts_with("status: "));
+    }
+
+    /// A14: a requested section validates against the applicable vocabulary
+    /// (bridge modes have no catalog sections) and then collects exactly one
+    /// section instead of the full report.
+    #[test]
+    fn run_section_collects_only_the_requested_section() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = crate::server::BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(tmp.path()),
+        ));
+        let names = section_names(&server.state);
+        assert_eq!(names.first(), Some(&"daemon"));
+        assert!(names.contains(&"attention"));
+        assert!(
+            !names.contains(&"knowledge_transport"),
+            "bridge test state has no catalog sections"
+        );
+        let report = run_section(&server, "attention").expect("focused doctor section");
+        assert_eq!(report.sections.len(), 1);
+        assert_eq!(report.sections[0].section, "attention");
+        assert!(!report.sections[0].findings.is_empty());
+        let bridge_only = run_section(&server, "knowledge_transport").unwrap_err();
+        assert!(
+            bridge_only.to_string().contains("Unknown section"),
+            "catalog section must be refused in bridge mode: {bridge_only}"
+        );
+        let unknown = run_section(&server, "not-a-section").unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("Unknown section `not-a-section`")
+        );
     }
 
     #[test]
