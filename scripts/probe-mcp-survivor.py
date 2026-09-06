@@ -13,6 +13,8 @@ sock=socket.socket(); sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; so
 env={'PATH':os.environ['PATH'],'HOME':str(root/'home'),'XDG_CONFIG_HOME':str(root/'config'),'XDG_CACHE_HOME':str(root/'cache'),'XDG_DATA_HOME':str(root/'data'),'XDG_STATE_HOME':str(root/'xdg-state'),'BLACKBOX_CONFIG':str(config),'BLACKBOX_STATE_DIR':str(root/'state'),'BLACKBOX_DEFAULTS_DIR':str(repo/'system-defaults'),'BLACKBOX_VECTORS_PATH':str(root/'state/vectors'),'TRANSCRIPT_SEARCH_INDEX_PATH':str(root/'index'),'TRANSCRIPT_SEARCH_ROOTS':'throwaway='+str(root/'transcripts'),'TRANSCRIPT_SEARCH_CODEX_ROOT':str(root/'codex'),'BLACKBOX_REINDEX_INTERVAL_SECS':'999999','BLACKBOX_EDGE_INDEX_BOOT_REBUILD':'false','BBOX_BIND':'127.0.0.1','BBOX_PORT':str(port),'BLACKBOX_MCP_NAME':'mcp-audit-isolated','RUST_LOG':'blackbox=info'}
 with (root/'genesis.log').open('w') as log:
  subprocess.run([str(repo/'target/debug/blackbox'),'project-catalog','genesis','--config',str(config),'--state-dir',str(root/'state')],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+# Admission preview checks executable presence but never dispatches it.
+env['BRO_HARNESS_BIN']='/bin/true'
 log=(root/'daemon.log').open('w'); proc=subprocess.Popen([str(repo/'target/debug/blackboxd')],env=env,stdout=log,stderr=subprocess.STDOUT,cwd=root)
 rows=[]; session=None; seq=0; url=f'http://127.0.0.1:{port}/mcp?surface=ops'
 def rpc(method,params,notify=False):
@@ -119,6 +121,21 @@ try:
  assert probe_text in json.dumps(probe,ensure_ascii=False) or any(v==probe_text for v in probe.values()),probe
  call('bro_allocator_status',{'detail':'probes','body_limit':1024})
  print('allocator probe persistence and exact detail PASS',flush=True)
+ preview_args={'pin_provider':'glm','pin_model':'glm-5.3-flash','pin_effort':'low','detail':'preview'}
+ call('bro_allocator_probe',{'provider':'glm','credential_status':'present','quota_status':'exhausted','quota_confidence':'runtime_rate_limit','cooldown_ms':3600000,'five_hour_utilization':1.0,'raw_summary':'Synthetic runtime 429'})
+ preview=exact('bro_allocator_status',preview_args)
+ assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
+ call('bro_allocator_probe',{'provider':'glm','cooldown_until':1})
+ preview=exact('bro_allocator_status',preview_args)
+ candidate=preview['candidates'][0]
+ assert candidate['eligible'] and preview['selected']['model']=='glm-5.3-flash',preview
+ assert candidate['score_components']['quota_capacity']==0.5,preview
+ assert candidate['probe']['quota_status']=='unknown' and candidate['probe']['runtime_observation_expired'],preview
+ assert 'five_hour_utilization' not in candidate['probe'],preview
+ call('bro_allocator_probe',{'provider':'glm','quota_confidence':'quota_probe'})
+ preview=exact('bro_allocator_status',preview_args)
+ assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
+ print('runtime quota cooldown expiry and authoritative quota refusal PASS',flush=True)
  call('bbox_packet_list',{})
  consequent='Synthetic large consequent: '+('界\n"'*4000)
  compiled=call('bbox_compile',{'domain':'synthetic-result-fixture','scope':'global','rules':[{'id':'always','antecedent':{'op':'True'},'classification':'pass','consequent':consequent}]})

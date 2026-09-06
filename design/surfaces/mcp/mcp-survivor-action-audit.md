@@ -798,6 +798,50 @@ a successful provider-level probe is still blocked by the observed quota cap.
 Preserve the enabled search capability while gathering evidence. A query deny list
 would not establish or repair the protocol cause.
 
+### Native search scrutiny follow-up
+
+The saved GLM exchanges contain typed `server_tool_use` calls named
+`web_search_prime`, paired with provider-owned generic assistant `tool_result`
+blocks. In one exchange, both searches and the eventual client `tool_search`
+call belong to the same assistant response. The harness did not dispatch a
+client tool between those searches. These are provider-native executions,
+not merely rendered text, but the snapshots do not preserve the exact request
+tool catalog that preceded them.
+
+Both incidents followed process resumes. Successful `tool_search` receipts
+before those resumes had activated `mcp__blackbox__bro_report`. Registry
+activations were memory-only: session persistence retained the conversation's
+loaded-tool promises but omitted the activation set. The native binary's
+synthetic endpoint probe reproduced the defect directly: `file_read` was
+absent initially, present after activation, and absent again in the first
+request after resume. This proves a discoverability defect; it does not prove
+why the model selected a placeholder web query.
+
+`a9825318` persists activation names in existing session side-state. Legacy
+sessions recover names from successful, paired `tool_search` results in the
+durable event log, including receipts no longer present after compaction.
+Restoration intersects with the current filtered catalog and uses current
+schemas. A native process probe passed normal resume, legacy recovery,
+permission removal, and explicit empty activation state. Native search was
+present in all six captured requests. Reproduce with
+`python3 scripts/probe-tool-search-resume.py --binary <bro-harness>`; it uses
+only a local scripted endpoint and isolated synthetic state.
+
+A separate live allocator preview explained Flash's `no_candidates` response:
+the GLM lane had `quota_confidence=runtime_rate_limit`, `quota_status=exhausted`,
+and an already expired cooldown. The hard exclusion ignored expiry. The
+allocator correction permits a fresh attempt after that runtime cooldown,
+scores quota as unknown, and retains the historical receipt. Current summaries
+mark the observation expired instead of presenting old utilization as current.
+Authoritative quota-probe exhaustion and credential failures still refuse.
+
+The direct Flash probe at `2026-09-06T21:46:50Z` returned HTTP 429/code 1308
+with a five-hour cap. The provider response and the allocator's stale exclusion
+are separate evidence. Neither the local scripted probe nor expired cooldown
+establishes successful live GLM admission. `gap-900d052c` remains open for
+provider query-selection attribution; `gap-ff52b07c` tracks activation recovery
+and `gap-6451641a` tracks the allocator expiry defect.
+
 Callable retirement and locality restrictions retain their explicit dispositions
 in the action matrix. That matrix records the original audit; the integration
 checkpoints above record subsequent fixes and their actual verification scope.

@@ -1,0 +1,23 @@
+{
+  "id": "gap-6451641a",
+  "title": "Runtime 429 exhaustion hard-excludes a lane after its cooldown has expired",
+  "gap_kind": "tooling",
+  "domain": "runtime-allocator/quota",
+  "wanted_capability": "After a runtime rate-limit observation's cooldown expires, allocation should permit a fresh attempt with quota treated as unknown, while retaining the historical observation and respecting authoritative quota probes, credentials and other admission checks.",
+  "fallback_used": "Direct credential-safe HTTP probe to distinguish current provider response from cached allocator exclusion.",
+  "evidence": [
+    "thread-d7cd3385",
+    "live bro_allocator_status preview glm-5.3-flash: quota_exhausted with cooldown_active false and runtime_rate_limit confidence",
+    "src/orchestration/allocator.rs: score_candidate excludes Exhausted before checking cooldown",
+    "src/orchestration/account_probes.rs: record_disruption_cooldown marks runtime 429 as Exhausted"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/runtime-allocator/expired-rate-limit-still-hard-excludes",
+  "notes": "A fresh direct Flash request still returned 429/code1308 at 21:46:50Z. This gap describes the independent stale admission latch, not evidence that upstream quota has reset.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T21:58:28Z",
+  "updated_at": "2026-09-06T21:58:28Z"
+}

@@ -1,0 +1,24 @@
+{
+  "id": "gap-ff52b07c",
+  "title": "Process resume drops tool_search activations while replay retains loaded-tool promises",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/tool-search",
+  "wanted_capability": "Persist deferred tool activation across standalone harness process resumes and restore it only against the current filtered catalog. Older sessions should recover successful tool_search activation receipts from their durable events when no activation state exists.",
+  "fallback_used": "Reload tools with tool_search after every process resume.",
+  "evidence": [
+    "thread-d7cd3385",
+    "crates/bro-harness/src/registry.rs: Registry::with_options always constructs an empty activated set",
+    "crates/bro-harness/src/agent_loop.rs: Session::side_state omits registry activations",
+    "session70e95922: bro_report loaded 19:44:20Z, process resumed 19:47:59Z, native placeholder queries 19:56:43Z",
+    "session2fa230ee: bro_report loaded 19:25:32Z, process resumed 19:39:33Z, subsequent native placeholder query"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/deferred-tool-activation-lost-on-resume",
+  "notes": "Concrete resume contract defect; correlation with native search incidents does not prove the cause of provider query selection. Keep native search enabled.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T21:51:02Z",
+  "updated_at": "2026-09-06T21:51:02Z"
+}

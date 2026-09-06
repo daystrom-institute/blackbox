@@ -13,15 +13,18 @@
     "crates/bro-harness/src/transport/anthropic.rs normalize_anthropic_messages counts server calls but only generic tool_result",
     "e7985322: full workspace suite 6684 passed; isolated MCP probe 159 calls passed",
     "crates/bro-harness/src/transport/anthropic.rs canonical/GLM replay and MiniMax-only request-schema regressions",
-    "crates/bro-harness/src/agent_loop.rs native block observation regression"
+    "crates/bro-harness/src/agent_loop.rs native block observation regression",
+    "a9825318: native process reproduction proves deferred tool schema loss on resume; fixed persistence and legacy receipt recovery pass six-request probe",
+    "gap-ff52b07c: bro_report activation was lost across process resumes preceding both native search incidents",
+    "gap-6451641a: independent runtime-rate-limit admission latch survives cooldown expiry"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/glm-server-builtin-suppression",
-  "notes": "Confirmed replay and durable-observation defects are repaired in commits 624c8603 and 8c01614d; native input_schema is limited to the MiniMax protocol variation. Full workspace verification at e7985322 passed 6684 tests. Canonical and GLM server blocks have replay and log regressions. The cause of placeholder search initiation remains unproven; neither a query deny list nor capability disablement is the repair. Fresh provider probes on 2026-09-06 at 20:49:11 UTC (glm-5.3) and 20:57:24 UTC (glm-5.3-flash) returned HTTP 429 code 1308, explicitly a five-hour quota cap. The reset timestamp did not carry a timezone. Successful provider-level confirmation remains outstanding.",
+  "notes": "Confirmed replay and durable-observation defects are repaired in commits 624c8603 and 8c01614d; native input_schema is limited to the MiniMax protocol variation. Full workspace verification at e7985322 passed 6684 tests. Canonical and GLM server blocks have replay and log regressions. The cause of placeholder search initiation remains unproven; neither a query deny list nor capability disablement is the repair. Fresh provider probes on 2026-09-06 at 20:49:11 UTC (glm-5.3) and 20:57:24 UTC (glm-5.3-flash) returned HTTP 429 code 1308, explicitly a five-hour quota cap. The reset timestamp did not carry a timezone. Successful provider-level confirmation remains outstanding. Follow-up at 2026-09-06T21:46:50Z again directly observed Flash HTTP429/code1308. Native-search scrutiny found and reproduced lost tool_search activation on process resume; this is correlated with both saved incidents, but provider query-selection causality remains unproven. No query deny list or default search disablement was added. Live allocator preview separately attributed no_candidates to an expired runtime-rate-limit exclusion.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T20:12:05Z",
-  "updated_at": "2026-09-06T21:32:35Z"
+  "updated_at": "2026-09-06T22:02:52.539655Z"
 }
