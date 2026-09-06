@@ -111,6 +111,37 @@ bro_team(action="list")
 bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")
 ```
 
+`list`, `list_templates`, and `roster` return summary pages, with default
+`limit=20` (clamped to 1..100), a response byte cap, and `next_offset` for
+continuation. `list` and `list_templates` accept an exact `name` filter.
+`project_dir` filters live teams by their stored association; it is not a file
+handle or evidence of daemon checkout access. Roster members carry stored brofile
+names and session/task identities, without resolving configuration from a checkout.
+
+```text
+bro_team(action="list_templates")
+bro_team(action="roster", name="bbox-red", limit=20)
+bro_team(action="get_template", name="red-team")
+bro_team(action="get", name="bbox-red")
+```
+
+`get_template` exposes the full template; `get` exposes the live team's stored
+configuration, including advisor overrides and task history. These exact reads
+return JSON text under `body`, even for small records. Concatenate `body.text`
+while following `body.next_cursor` unchanged, then parse the resulting JSON.
+Each body page is at most 4096 encoded bytes; `body_limit` can request a smaller
+page. Changed records or selectors reject stale cursors; restart without one.
+Summary pages do not hide full advisor charters, context, or brofile lenses in
+structured content. Malformed stored records report errors instead of disappearing.
+
+`scope` applies only to template actions and accepts `global` (default) or
+`project`. Project template discovery requires an explicit absolute owner-host
+`project_dir` in legacy bridge mode. Catalog mode refuses this legacy
+`.bro/teamplates` read because it has no remote source lane. Inspect those files
+with the owning checkout's file tools, or discover daemon-owned templates using
+`scope="global"` without `project_dir`. No discovery path falls back to the
+daemon's current directory.
+
 Use teams for ensemble review, blind comparison, provider races, or repeated
 panels. If the control flow has gates, retries, waits, or cleanup, write a
 workflow instead of hand-driving the team.

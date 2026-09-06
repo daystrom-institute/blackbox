@@ -190,6 +190,112 @@ pub fn delete_teamplate(
     fs::remove_file(dir.join(format!("{name}.json"))).is_ok()
 }
 
+/// Scoped discovery never falls back from project templates to global ones.
+/// Keep the legacy resolution helper for dispatch compatibility.
+pub fn get_teamplate_checked(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<Option<Teamplate>> {
+    let dir = checked_teamplates_dir(scope, store_dir, project_dir)?;
+    load_json_checked(&dir, name)
+}
+
+pub fn list_teamplates_checked(
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<Vec<Teamplate>> {
+    list_json_files_checked(&checked_teamplates_dir(scope, store_dir, project_dir)?)
+}
+
+fn checked_teamplates_dir(
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    match scope {
+        "global" if project_dir.is_none() => Ok(teamplates_dir(store_dir)),
+        "project" => {
+            let project = project_dir
+                .ok_or_else(|| anyhow::anyhow!("project_dir is required for project templates"))?;
+            anyhow::ensure!(
+                Path::new(project).is_absolute(),
+                "project template directory must be absolute"
+            );
+            Ok(project_teamplates_dir(Path::new(project)))
+        }
+        _ => anyhow::bail!("invalid template scope/project_dir combination"),
+    }
+}
+
+pub fn load_team_checked(name: &str, store_dir: &Path) -> anyhow::Result<Option<Team>> {
+    load_json_checked(&teams_dir(store_dir), name)
+}
+
+pub fn load_all_teams_checked(store_dir: &Path) -> anyhow::Result<Vec<Team>> {
+    list_json_files_checked(&teams_dir(store_dir))
+}
+
+// Caller-facing discovery must distinguish an empty catalog from an unreadable
+// or malformed one. Existing dispatch/lifecycle readers keep their contract.
+fn load_json_checked<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+    name: &str,
+) -> anyhow::Result<Option<T>> {
+    use anyhow::Context;
+    anyhow::ensure!(
+        !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0']),
+        "stored team/template name is not a path"
+    );
+    let data = match fs::read_to_string(dir.join(format!("{name}.json"))) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stored team/template {name} could not be read"));
+        }
+    };
+    serde_json::from_str(&data)
+        .with_context(|| format!("stored team/template {name} is invalid JSON"))
+        .map(Some)
+}
+
+fn list_json_files_checked<T: serde::de::DeserializeOwned>(dir: &Path) -> anyhow::Result<Vec<T>> {
+    use anyhow::Context;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("team catalog could not be read"),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let path = entry
+            .context("team catalog entry could not be read")?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            names.push(
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .context("team catalog has an invalid record name")?
+                    .to_owned(),
+            );
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            load_json_checked(dir, &name)?
+                .context("team catalog changed during discovery; retry the read")
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Team disk ops
 // ---------------------------------------------------------------------------
