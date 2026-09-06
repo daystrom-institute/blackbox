@@ -539,7 +539,7 @@ impl BlackboxServer {
             };
             if rec.retired {
                 return Self::err_text(
-                    "custom dispatch adapters are retired; use a simple brofile-bound agent",
+                    "error.unsupported(code=adapter_unavailable): custom dispatch adapters are retired; use a simple brofile-bound agent",
                 );
             }
             if !rec.active {
