@@ -424,7 +424,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_catalog_list",
         category: ToolCategory::ProjectCatalog,
-        summary: "List every project in the durable catalog, including remote-only projects with no attachment on this host. Path-free rows: project_id, display_name, scope (published repo_id + bbox_root_relpath, legacy_local, or connector connector_source_id + connector_kind), connector_observations (a connector producer's observed vendor coordinates, null for every other scope family; observations are replaceable claims, never identity), operator and nominated aliases, and the count of active attachments. Returns the catalog epoch to pass as expected_catalog_epoch on a following administration call. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        summary: "List project summary pages (default 20, maximum 100), ordered by project_id. Continue with next_offset and expected_catalog_epoch from the previous page to reject catalog changes. Filter by query; use bbox_project_catalog_get for aliases, connector observations, and attachment details. Returns error.project_catalog_inactive on the version-1 registry.",
         when_to_use: "Use to see the complete catalog, including projects with no local checkout, and to read the current epoch before any administration call. `bbox_project_list` still reports the attached version-1 rows.",
         example: None,
     },
@@ -603,7 +603,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_thread_list",
         category: ToolCategory::Threads,
-        summary: "Scan threads by lifecycle status and idle age.",
+        summary: "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for full context.",
         when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`. Workflow-origin arc threads are hidden by default; pass `include_workflows=true` when you intentionally want workflow scaffolding.",
         example: None,
     },
@@ -620,7 +620,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_notes",
         category: ToolCategory::Notes,
-        summary: "List / filter notes by exact id, kind, project, session, thread, resolution.",
+        summary: "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies. Filter by kind, project, session, thread, or resolution.",
         when_to_use: "Orchestrators reading what executors emitted this round, auditing past dispatch for a work-item thread, or retrieving a known note by `id=\"note-<8hex>\"`. The `query` filter searches note bodies, not IDs. Bodies are previewed at 200 chars by default; pass `full=true` to render complete bodies (useful for `done` summaries and structured `dispute` rationales). Addressed notes are hidden by default for list views but included by default for exact `id` lookups.",
         example: Some(r#"bbox_notes(id="note-a1b2c3d4", full=true)"#),
     },
@@ -689,7 +689,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed workflow, packet, brofile, agent, atom, team, and cron artifacts with version, source, active status, and supersession metadata.",
+        summary: "List installed artifact summary pages (default 20, maximum 100). Continue with next_offset; filter by kind/name and set detail=true for installation and supersession metadata. Storage paths and source credentials are omitted.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },
@@ -740,7 +740,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_packet_list",
         category: ToolCategory::Packets,
-        summary: "Discover compiled rule-packets before authoring a new one. Filter by `domain` (exact), `scope` (global/project), or `query` (case-insensitive substring across id, domain, rule ids, classification values). Pass `latest_per_domain=true` to collapse multiple revisions of the same domain. Each summary includes a classification histogram and the first few rule ids so you can judge relevance without calling bbox_apply. If a packet already covers your domain, compose it via `Apply{packet_id, expect}` or reuse via `bbox_apply`. See sm-rule-packets via bbox_knowledge.",
+        summary: "Discover compiled rule-packet summary pages (default 20, maximum 100), newest first then id. Filter by domain, scope, or query before paging; continue with next_offset. Select packet_id and detail=true for classification histograms and rule previews. latest_per_domain=true keeps the newest revision of each domain.",
         when_to_use: "Run BEFORE `bbox_compile` on any new domain. Query by concept (\"breaking\", \"pii\", \"deny\") when you don't know the exact domain label. If a match exists: reuse via `bbox_apply` or compose via `Apply{packet_id, expect}` inside your new packet — don't re-derive. Pair with `bbox_packet_events(packet_id=...)` to check the packet's track record (fidelity, no_match rate) before depending on it.",
         example: Some(r#"bbox_packet_list(query="breaking", latest_per_domain=true, limit=10)"#),
     },
