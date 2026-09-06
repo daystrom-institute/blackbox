@@ -124,7 +124,65 @@ pub enum McpServerConfig {
     },
 }
 
+/// Endpoint origins identify the service without exposing userinfo or opaque
+/// credential-bearing paths, queries, and fragments. Malformed endpoints fail
+/// closed instead of echoing their raw input.
+fn endpoint_origin(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+}
+
+fn redacted_values(values: &BTreeMap<String, SecretString>) -> serde_json::Value {
+    values
+        .iter()
+        .map(|(key, value)| {
+            let view = match value {
+                SecretString::Plain(_) => serde_json::json!({"redacted": true}),
+                SecretString::Secret { name } => serde_json::json!({"$secret": name}),
+            };
+            (key.clone(), view)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 impl McpServerConfig {
+    /// Safe tool-facing configuration view. Persistence and dispatch continue to
+    /// serialize the original config; no debug mode can opt out of this view.
+    fn response_view(&self) -> serde_json::Value {
+        match self {
+            Self::Http {
+                url,
+                headers,
+                exclude_tools,
+            }
+            | Self::Sse {
+                url,
+                headers,
+                exclude_tools,
+            } => {
+                let transport = if matches!(self, Self::Http { .. }) {
+                    "http"
+                } else {
+                    "sse"
+                };
+                serde_json::json!({
+                    "type": transport,
+                    "endpoint_origin": endpoint_origin(url),
+                    "endpoint_redacted": true,
+                    "headers": redacted_values(headers),
+                    "exclude_tools": exclude_tools,
+                })
+            }
+            Self::Stdio { command, args, env } => serde_json::json!({
+                "type": "stdio",
+                "command_configured": !command.is_empty(),
+                "argument_count": args.len(),
+                "env": redacted_values(env),
+            }),
+        }
+    }
+
     /// Per-server exclude list (Gemini-only at present, applied at
     /// registration time). Empty for Stdio (no add fan-out).
     pub fn exclude_tools(&self) -> &[String] {
@@ -645,16 +703,11 @@ fn run_cli_with_timeout(
 ) -> Result<()> {
     let out = capture_cli_with_timeout(provider, args, cwd, timeout)?;
     if !out.status.success() {
-        let raw_bin = provider.bin();
-        let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+        // Provider stderr and argv can echo resolved credentials. Expose only
+        // the failure class and exit code, never the raw child output.
         anyhow::bail!(
-            "{bin} {} exited {:?}: {}",
-            args.join(" "),
+            "{provider} MCP registration command exited {:?}; command arguments and output withheld",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .next()
-                .unwrap_or(""),
         );
     }
     Ok(())
@@ -695,7 +748,9 @@ fn capture_cli_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!("{bin} {} timed out after {:?}", args.join(" "), timeout,);
+                    anyhow::bail!(
+                        "{provider} MCP registration command timed out after {timeout:?}"
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -812,7 +867,10 @@ fn action_list(p: &McpToolParams) -> Result<String> {
     let project = project.transpose()?.flatten();
 
     let eff = resolve_effective(&global, project.as_ref(), false);
+    Ok(render_server_list(&eff))
+}
 
+fn render_server_list(eff: &EffectiveMcp) -> String {
     let mut out = String::new();
     if eff.servers.is_empty() {
         out.push_str("No MCP servers registered.\n");
@@ -820,14 +878,23 @@ fn action_list(p: &McpToolParams) -> Result<String> {
         out.push_str(&format!("{} server(s):\n", eff.servers.len()));
         for (name, cfg) in &eff.servers {
             match cfg {
-                McpServerConfig::Http { url, .. } => {
-                    out.push_str(&format!("  {name} — http {url}\n"));
+                McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => {
+                    let transport = if matches!(cfg, McpServerConfig::Http { .. }) {
+                        "http"
+                    } else {
+                        "sse"
+                    };
+                    let origin =
+                        endpoint_origin(url).unwrap_or_else(|| "[redacted endpoint]".into());
+                    out.push_str(&format!(
+                        "  {name}: {transport} {origin} (endpoint details redacted)\n"
+                    ));
                 }
-                McpServerConfig::Sse { url, .. } => {
-                    out.push_str(&format!("  {name} — sse {url}\n"));
-                }
-                McpServerConfig::Stdio { command, args, .. } => {
-                    out.push_str(&format!("  {name} — stdio {command} {}\n", args.join(" ")));
+                McpServerConfig::Stdio { args, .. } => {
+                    out.push_str(&format!(
+                        "  {name}: stdio ({} arguments; values redacted)\n",
+                        args.len()
+                    ));
                 }
             }
         }
@@ -846,7 +913,7 @@ fn action_list(p: &McpToolParams) -> Result<String> {
         }
     }
 
-    Ok(out)
+    out
 }
 
 fn action_get(p: &McpToolParams) -> Result<String> {
@@ -854,7 +921,10 @@ fn action_get(p: &McpToolParams) -> Result<String> {
     let path = resolve_scope_path(p)?;
     let store = McpStore::load(&path)?;
     match store.servers.get(name) {
-        Some(cfg) => Ok(format!("{name}: {}", serde_json::to_string_pretty(cfg)?)),
+        Some(cfg) => Ok(format!(
+            "{name}: {}",
+            serde_json::to_string_pretty(&cfg.response_view())?
+        )),
         None => Ok(format!("{name}: not registered")),
     }
 }
@@ -1074,6 +1144,73 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn mcp_configuration_responses_redact_secrets_without_changing_persistence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cfg = McpServerConfig::Http {
+            url: "https://sample-user:sample-password@example.test/private-token?token=query-secret#fragment-secret".into(),
+            headers: BTreeMap::from([
+                ("Authorization".into(), "Bearer inline-secret".into()),
+                ("X-Custom".into(), "opaque-secret".into()),
+                ("X-Reference".into(), SecretString::Secret { name: "SYNTHETIC_KEY_REFERENCE".into() }),
+            ]),
+            exclude_tools: vec!["admin_delete".into()],
+        };
+        let mut store = McpStore::new();
+        store.servers.insert("remote".into(), cfg.clone());
+        store.save(&project_store_path(&root)).unwrap();
+        let p: McpToolParams = serde_json::from_value(serde_json::json!({
+            "action": "get", "name": "remote", "scope": "project", "project": root,
+        }))
+        .unwrap();
+        let detail = action_get(&p).unwrap();
+        let listing = render_server_list(&resolve_effective(&store, None, false));
+        for response in [&detail, &listing] {
+            for secret in [
+                "sample-user",
+                "sample-password",
+                "private-token",
+                "query-secret",
+                "fragment-secret",
+                "inline-secret",
+                "opaque-secret",
+            ] {
+                assert!(!response.contains(secret), "response disclosed {secret}");
+            }
+            assert!(response.contains("https://example.test"));
+        }
+        assert!(detail.contains("SYNTHETIC_KEY_REFERENCE"));
+        assert!(detail.contains("admin_delete"));
+        let view = cfg.response_view();
+        assert_eq!(view["headers"]["X-Custom"]["redacted"], true);
+        let loaded = McpStore::load(&project_store_path(&root)).unwrap();
+        assert_eq!(loaded.servers["remote"], cfg);
+    }
+
+    #[test]
+    fn mcp_configuration_responses_hide_stdio_command_arguments_and_env() {
+        let cfg = McpServerConfig::Stdio {
+            command: "secret-command".into(),
+            args: vec!["--token=secret-argument".into()],
+            env: BTreeMap::from([("CUSTOM_VALUE".into(), "secret-environment".into())]),
+        };
+        let view = cfg.response_view();
+        let mut store = McpStore::new();
+        store.servers.insert("local".into(), cfg);
+        let listing = render_server_list(&resolve_effective(&store, None, false));
+        assert_eq!(view["argument_count"], 1);
+        assert_eq!(view["command_configured"], true);
+        assert_eq!(view["env"]["CUSTOM_VALUE"]["redacted"], true);
+        for response in [view.to_string(), listing] {
+            for secret in ["secret-command", "secret-argument", "secret-environment"] {
+                assert!(!response.contains(secret));
+            }
+        }
+        assert_eq!(endpoint_origin("malformed-secret-endpoint"), None);
+        assert_eq!(endpoint_origin("data:text/plain,secret-value"), None);
+    }
 
     #[test]
     fn roundtrip_http_server() {

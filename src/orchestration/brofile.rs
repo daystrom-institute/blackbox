@@ -240,6 +240,35 @@ pub struct Account {
     pub disabled: bool,
 }
 
+impl Account {
+    /// Account policy and configured environment keys, without credential values.
+    pub fn response_view(&self) -> serde_json::Value {
+        let mut env_keys: Vec<&str> = self
+            .env
+            .iter()
+            .flat_map(|env| env.keys().map(String::as_str))
+            .collect();
+        env_keys.sort_unstable();
+        let mut view = serde_json::json!({"env_keys": env_keys});
+        if !self.allowed_tiers.is_empty() {
+            view["allowed_tiers"] = serde_json::json!(self.allowed_tiers);
+        }
+        if !self.allowed_models.is_empty() {
+            view["allowed_models"] = serde_json::json!(self.allowed_models);
+        }
+        if !self.capabilities.is_empty() {
+            view["capabilities"] = serde_json::json!(self.capabilities);
+        }
+        if let Some(limit) = self.max_concurrent {
+            view["max_concurrent"] = serde_json::json!(limit);
+        }
+        if self.disabled {
+            view["disabled"] = serde_json::json!(true);
+        }
+        view
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
