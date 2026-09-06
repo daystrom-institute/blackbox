@@ -5280,6 +5280,23 @@ pub(crate) fn mcp_task_status_json(
         recent.reverse();
         out["recentEvents"] = json!(recent);
     }
+    if detail != "summary" && !debug {
+        let fields = out.as_object_mut().unwrap();
+        for key in [
+            "context",
+            "eventCount",
+            "hasLastMessage",
+            "lastAssistantSnippet",
+            "resultBytes",
+            "resultHint",
+            "transcriptAvailable",
+        ] {
+            fields.remove(key);
+        }
+        if detail == "report" {
+            fields.remove("report");
+        }
+    }
     Ok(out)
 }
 
@@ -9752,6 +9769,20 @@ mod tests {
         }
         assert_eq!(result, text);
         let first = mcp_task_status_json(&task, "result", None, Some(7), 0, false).unwrap();
+        for key in [
+            "lastAssistantSnippet",
+            "resultBytes",
+            "resultHint",
+            "eventCount",
+            "hasLastMessage",
+        ] {
+            assert!(first.get(key).is_none(), "redundant body metadata: {key}");
+        }
+        assert_eq!(first["status"], "completed");
+        assert_eq!(first["hasResult"], true);
+        let debug = mcp_task_status_json(&task, "result", None, Some(7), 0, true).unwrap();
+        assert!(debug.get("eventCount").is_some());
+        assert!(debug.get("lastAssistantSnippet").is_some());
         let cursor = first["body"]["next_cursor"].as_str().unwrap();
         task.inner.lock().last_assistant_message = Some("changed".into());
         assert!(
