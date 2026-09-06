@@ -6,6 +6,27 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 
+#[derive(Debug, Default, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct ThreadListToolParams {
+    #[serde(flatten)]
+    pub filters: ThreadListParams,
+    /// Maximum summaries, default 20, maximum 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Continue using next_offset; rows order by last_activity descending, id ascending.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+impl From<ThreadListParams> for ThreadListToolParams {
+    fn from(filters: ThreadListParams) -> Self {
+        Self {
+            filters,
+            ..Default::default()
+        }
+    }
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::threads_tools()
 }
@@ -101,17 +122,19 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_thread_list",
-        description = "Scan threads by lifecycle status and idle age."
+        description = "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for full context."
     )]
     pub(crate) fn bbox_thread_list(
         &self,
-        Parameters(p): Parameters<ThreadListParams>,
+        Parameters(p): Parameters<ThreadListToolParams>,
     ) -> CallToolResult {
         Self::run("bbox_thread_list", || {
             // Normalize a managed fleet worktree project filter to its registered
             // base so list-before-open (create etiquette) sees base-keyed threads
             // from inside a worktree and doesn't drive duplicate opens.
-            let mut p = p;
+            let limit = p.limit.unwrap_or(20);
+            let offset = p.offset.unwrap_or(0);
+            let mut p = p.filters;
             if let Some(raw) = p.project.clone() {
                 // Catalog-mode ledger arm (plan §8.2): path-only threads still
                 // keyed under one of this project's historical paths stay
@@ -138,7 +161,13 @@ impl BlackboxServer {
                     p.project_ledger_paths = self.ledger_historical_paths(resolved);
                 }
             }
-            self.state.threads.read().thread_list(&p)
+            Ok(serde_json::to_string(
+                &self
+                    .state
+                    .threads
+                    .read()
+                    .thread_list_page(&p, limit, offset)?,
+            )?)
         })
     }
 }
@@ -299,10 +328,13 @@ mod tests {
         );
 
         // list-before-open from the worktree surfaces the base-keyed thread.
-        let list = server.bbox_thread_list(Parameters(ThreadListParams {
-            project: Some(wt.clone()),
-            ..tlp()
-        }));
+        let list = server.bbox_thread_list(Parameters(
+            ThreadListParams {
+                project: Some(wt.clone()),
+                ..tlp()
+            }
+            .into(),
+        ));
         assert_ne!(list.is_error, Some(true), "list failed: {list:?}");
         let body = format!("{:?}", list.content);
         assert!(

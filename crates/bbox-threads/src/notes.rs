@@ -107,7 +107,7 @@ pub struct NoteListParams {
     /// ISO 8601: only notes created at or after this timestamp
     #[serde(default)]
     pub since: Option<String>,
-    /// Max rows (default: 50)
+    /// Maximum MCP rows (default 20, maximum 100).
     #[serde(default)]
     pub limit: Option<u64>,
     /// Include notes whose resolution is "addressed" (default: false for list
@@ -570,7 +570,7 @@ impl Notes {
 
     // ── bbox_notes (list) ──────────────────────────────────────────
 
-    pub fn list(&self, p: &NoteListParams) -> Result<String> {
+    fn matching_notes(&self, p: &NoteListParams) -> Result<Vec<&Note>> {
         let kind_filter = p
             .kind
             .as_deref()
@@ -586,8 +586,6 @@ impl Notes {
             .map_err(|_| anyhow::anyhow!("Unknown resolution filter: {:?}", p.resolution))?;
 
         let include_addressed = p.include_addressed.unwrap_or(p.id.is_some());
-        let full = p.full.unwrap_or(false);
-        let limit = p.limit.unwrap_or(50).max(1) as usize;
 
         let id_filter = p.id.as_deref().map(str::to_ascii_lowercase);
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
@@ -646,10 +644,12 @@ impl Notes {
                 // paths say; either side missing an id keeps the path predicate.
                 // The ledger arm is catalog-mode only and matches a path-only
                 // row still keyed under a historical path of this project.
-                if let Some(pl) = &project_lower
+                if (project_lower.is_some() || project_id_filter.is_some())
                     && !project_scope_matches(n.project_id.as_deref(), project_id_filter, || {
                         let row_project = n.project.as_deref().unwrap_or("").to_lowercase();
-                        row_project.contains(pl)
+                        project_lower
+                            .as_ref()
+                            .is_some_and(|filter| row_project.contains(filter))
                             || ledger_lower
                                 .iter()
                                 .any(|historical| row_project.contains(historical.as_str()))
@@ -671,6 +671,78 @@ impl Notes {
             })
             .collect();
 
+        results.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(results)
+    }
+
+    /// Bounded MCP discovery; exact ids and full=true expand note bodies.
+    pub fn list_page(&self, p: &NoteListParams, offset: usize) -> Result<serde_json::Value> {
+        let results = self.matching_notes(p)?;
+        let total = results.len();
+        let limit = p.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let full = p.full.unwrap_or(false);
+        let notes: Vec<_> = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|note| {
+                let mut row = serde_json::json!({
+                    "id": note.id, "kind": note.kind, "resolution": note.resolution,
+                    "created_at": note.created_at,
+                });
+                for (field, value) in [
+                    ("body", Some(note.body.as_str())),
+                    ("resolution_note", note.resolution_note.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        let preview = if full {
+                            value.to_owned()
+                        } else {
+                            value.chars().take(200).collect::<String>()
+                        };
+                        if preview.len() < value.len() {
+                            row[format!("{field}_truncated")] = serde_json::json!(true);
+                        }
+                        row[field] = serde_json::json!(preview);
+                    }
+                }
+                for (field, value) in [
+                    ("bro", &note.bro),
+                    ("provider", &note.provider),
+                    ("task_id", &note.task_id),
+                    ("session_id", &note.session_id),
+                    ("thread_id", &note.thread_id),
+                    ("project_id", &note.project_id),
+                ] {
+                    if let Some(value) = value {
+                        row[field] = serde_json::json!(value);
+                    }
+                }
+                if note.project_id.is_none() {
+                    if let Some(project) = &note.project {
+                        row["project_selector"] = serde_json::json!(project);
+                    }
+                }
+                row
+            })
+            .collect();
+        let next_offset = offset.saturating_add(notes.len());
+        Ok(serde_json::json!({
+            "notes": notes, "total": total, "offset": offset, "limit": limit,
+            "next_offset": (next_offset < total).then_some(next_offset),
+            "order": "created_at_desc,id_asc",
+            "detail_hint": "bbox_notes(id=<id>,full=true)",
+        }))
+    }
+
+    pub fn list(&self, p: &NoteListParams) -> Result<String> {
+        let mut results = self.matching_notes(p)?;
+        let full = p.full.unwrap_or(false);
+        let limit = p.limit.unwrap_or(50).max(1) as usize;
         if results.is_empty() {
             return Ok("No notes found.".to_string());
         }
@@ -739,6 +811,82 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn note_summary_pages_preserve_exact_expansion_and_bound_both_bodies() {
+        let (_dir, mut store) = mk_store();
+        for i in (0..105).rev() {
+            store.store.notes.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("note-{i:08x}"), "kind": "surprise", "body": "界".repeat(300),
+                    "resolution_note": "resolution".repeat(100), "resolution": "unresolved",
+                    "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+                }))
+                .unwrap(),
+            );
+        }
+        let mut p = NoteListParams {
+            limit: Some(u64::MAX),
+            ..Default::default()
+        };
+        let first = store.list_page(&p, 0).unwrap();
+        assert_eq!(first["notes"].as_array().unwrap().len(), 100);
+        assert_eq!(first["next_offset"], 100);
+        assert_eq!(first["notes"][0]["id"], "note-00000000");
+        assert_eq!(first["notes"][0]["body_truncated"], true);
+        assert_eq!(first["notes"][0]["resolution_note_truncated"], true);
+        let last = store.list_page(&p, 100).unwrap();
+        assert_eq!(last["notes"].as_array().unwrap().len(), 5);
+        assert!(last["next_offset"].is_null());
+        p.id = Some("note-00000000".into());
+        p.full = Some(true);
+        let detail = store.list_page(&p, 0).unwrap();
+        assert_eq!(detail["total"], 1);
+        assert_eq!(detail["notes"][0]["body"], "界".repeat(300));
+        assert!(detail["notes"][0].get("body_truncated").is_none());
+        assert_eq!(
+            store.list_page(&p, usize::MAX).unwrap()["notes"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn note_summary_pages_apply_id_only_scope_and_legacy_ledger() {
+        let (_dir, mut store) = mk_store();
+        for (i, (project_id, project)) in [
+            (Some("11111111"), "/repo/relocated"),
+            (Some("22222222"), "/repo/old-target"),
+            (None, "/repo/old-target"),
+            (None, "/repo/other"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.store.notes.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("note-{i:08x}"), "body": "scoped", "kind": "surprise",
+                    "project": project, "project_id": project_id,
+                    "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+                }))
+                .unwrap(),
+            );
+        }
+        let mut p = NoteListParams {
+            project_id: Some("11111111".into()),
+            project_ledger_paths: vec!["/repo/old-target".into()],
+            ..Default::default()
+        };
+        let by_id = store.list_page(&p, 0).unwrap();
+        assert_eq!(by_id["total"], 2);
+        assert_eq!(by_id["notes"][0]["id"], "note-00000000");
+        assert_eq!(by_id["notes"][1]["id"], "note-00000002");
+        p.project = Some("/repo/current".into());
+        assert_eq!(store.list_page(&p, 0).unwrap()["notes"], by_id["notes"]);
+        p.project = None;
+        p.project_id = Some("33333333".into());
+        p.project_ledger_paths.clear();
+        assert_eq!(store.list_page(&p, 0).unwrap()["total"], 0);
+    }
 
     fn mk_store() -> (tempfile::TempDir, Notes) {
         let dir = tempdir().unwrap();

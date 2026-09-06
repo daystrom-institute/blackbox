@@ -806,10 +806,13 @@ mod tests {
                 .expect("note stored");
             assert_eq!(stored.project.as_deref(), Some(base_str.as_str()));
         }
-        let listed = server.bbox_notes(Parameters(crate::notes::NoteListParams {
-            project: Some(wt.clone()),
-            ..Default::default()
-        }));
+        let listed = server.bbox_notes(Parameters(
+            crate::notes::NoteListParams {
+                project: Some(wt.clone()),
+                ..Default::default()
+            }
+            .into(),
+        ));
         assert!(
             format!("{:?}", listed.content).contains("WORKTREE_NOTE_MARKER"),
             "worktree-path note filter should map to the base scope: {listed:?}"
