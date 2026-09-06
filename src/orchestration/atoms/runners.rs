@@ -174,18 +174,6 @@ impl AtomRunner for ValidateSchemaRunner {
     }
 }
 
-struct BadgeyAdapterRunner;
-
-impl AtomRunner for BadgeyAdapterRunner {
-    fn run(&self, args: &serde_json::Value) -> RunnerResult {
-        RunnerResult::ok(serde_json::json!({
-            "adapter": "badgey",
-            "accepted": true,
-            "input": args.clone(),
-        }))
-    }
-}
-
 // Registered so the atom artifact validates against the schema; the actual
 // execution is intercepted by system_events_runtime::executors before this runner runs.
 struct ForgejoEnsureUserRunner;
@@ -206,7 +194,6 @@ pub fn default_registry() -> RunnerRegistry {
     reg.register_deterministic("validate-schema", Box::new(ValidateSchemaRunner));
     reg.register_deterministic("refactor-plan-validate", Box::new(ValidateSchemaRunner));
     reg.register_deterministic("forgejo-ensure-user", Box::new(ForgejoEnsureUserRunner));
-    reg.register_adapter("badgey", Box::new(BadgeyAdapterRunner));
     reg
 }
 
@@ -342,7 +329,7 @@ mod tests {
         assert!(reg.has_deterministic("noop"));
         assert!(reg.has_deterministic("validate-schema"));
         assert!(!reg.has_deterministic("nonexistent"));
-        assert!(reg.has_adapter("badgey"));
+        assert!(!reg.has_adapter("badgey"));
         assert!(!reg.has_adapter("echo"));
     }
 
@@ -354,7 +341,7 @@ mod tests {
         assert!(det.contains(&"noop"));
         assert!(det.contains(&"validate-schema"));
         let adapters = reg.adapter_names();
-        assert!(adapters.contains(&"badgey"));
+        assert!(adapters.is_empty());
     }
 
     #[test]
@@ -404,7 +391,7 @@ mod tests {
         let reg = RunnerRegistry::default();
         assert!(reg.has_deterministic("echo"));
         assert!(reg.has_deterministic("noop"));
-        assert!(reg.has_adapter("badgey"));
+        assert!(!reg.has_adapter("badgey"));
     }
 
     #[test]

@@ -18,15 +18,6 @@ pub struct AgentSchemaEntry {
     pub example_invocation: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ConsultantSchemaEntry {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub tools: Vec<&'static str>,
-    pub use_cases: Vec<&'static str>,
-    pub anti_patterns: Vec<&'static str>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct DescribeSchemaOptions {
     pub include_agents: bool,
@@ -78,42 +69,12 @@ pub fn describe_schema_with_options(
         if !agents.is_empty() {
             response["agents"] = json!(agents);
         }
-        response["consultants"] = json!(consultants());
     } else {
         response["agents_omitted"] = json!(true);
         response["agents_hint"] =
-            json!("Pass include_agents=true or mode=full for installed agents and consultants.");
+            json!("Pass include_agents=true or mode=full for installed agents.");
     }
     Ok(serde_json::to_string_pretty(&response)?)
-}
-
-fn consultants() -> Vec<ConsultantSchemaEntry> {
-    vec![ConsultantSchemaEntry {
-        name: "badgey",
-        description: "Agentic-corpus consultant with wrapper-owned session continuity, proposal gating, scout fan-out, and thread-of-record audit notes.",
-        tools: vec![
-            "badgey_exec",
-            "badgey_resume",
-            "badgey_ask",
-            "badgey_scout",
-            "badgey_collect",
-            "badgey_triage_inbox",
-            "badgey_close_loops",
-            "badgey_status",
-            "badgey_list",
-            "badgey_dismiss",
-        ],
-        use_cases: vec![
-            "answer graph/corpus questions with cited entity refs",
-            "teach a caller how to navigate the corpus without Badgey next time",
-            "draft gated workflow, packet, brofile, lens, agent, or redispatch proposals",
-        ],
-        anti_patterns: vec![
-            "do not use for direct code execution",
-            "do not auto-apply proposals",
-            "do not synthesize executor done notes",
-        ],
-    }]
 }
 
 fn edge_families() -> Vec<serde_json::Value> {
@@ -328,21 +289,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_includes_badgey_consultant_section() {
+    fn schema_does_not_advertise_retired_consultants() {
         let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        let consultants = value["consultants"].as_array().unwrap();
-        let badgey = consultants
-            .iter()
-            .find(|entry| entry["name"] == "badgey")
-            .expect("badgey consultant entry");
-        assert!(
-            badgey["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool == "badgey_exec")
-        );
-        assert!(value.get("text").is_none());
+        assert!(value.get("consultants").is_none());
+        assert!(!rendered.contains("badgey_exec"));
     }
 }

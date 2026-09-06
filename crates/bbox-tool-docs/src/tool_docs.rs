@@ -309,8 +309,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
-        summary: "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents and consultants.",
-        when_to_use: "Use once for graph vocabulary and traversal orientation. Default omits agent and consultant catalogs; include_agents=true or mode=full adds them. mode=agents is a deprecated full alias; unknown modes fail. dispatch_adapter remains on each agent row. No rendered text mirror or duplicate agent grouping is returned.",
+        summary: "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents.",
+        when_to_use: "Use once for graph vocabulary and traversal orientation. Default omits agent catalogs; include_agents=true or mode=full adds them. mode=agents is a deprecated full alias; unknown modes fail. dispatch_adapter remains on each agent row. No rendered text mirror or duplicate agent grouping is returned.",
         example: Some("bbox_describe_schema()"),
     },
     ToolDoc {
@@ -814,86 +814,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
-        name: "badgey_exec",
-        category: ToolCategory::Orchestration,
-        summary: "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids.",
-        when_to_use: "Use when you want Badgey to consult over a project with continuity. The wrapper opens a work-item thread, dispatches the badgey brofile, and owns the session mapping. Use `badgey_resume` or `badgey_ask` for follow-up turns.",
-        example: Some(
-            r#"badgey_exec(project_dir="/repo/x", brief="help me navigate the agent graph work")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_resume",
-        category: ToolCategory::Orchestration,
-        summary: "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume.",
-        when_to_use: "Use for any follow-up where Badgey should keep its thread-of-record context. Calls are serialized per badgey_id so concurrent callers do not corrupt the provider session.",
-        example: Some(
-            r#"badgey_resume(badgey_id="bg-0123abcd-4567ef89", prompt="teach me why this edge matters")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_ask",
-        category: ToolCategory::Orchestration,
-        summary: "Question-shaped alias for badgey_resume.",
-        when_to_use: "Use when the caller is asking a direct question of an existing Badgey instance and you prefer `question` over `prompt` in the request shape.",
-        example: Some(
-            r#"badgey_ask(badgey_id="bg-0123abcd-4567ef89", question="what should I inspect next?")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_dismiss",
-        category: ToolCategory::Orchestration,
-        summary: "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record.",
-        when_to_use: "Use when a Badgey consultation is done or should stop accepting turns. After dismissal, new resumes for that badgey_id fail with instance_dismissed.",
-        example: Some(
-            r#"badgey_dismiss(badgey_id="bg-0123abcd-4567ef89", reason="work complete")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_status",
-        category: ToolCategory::Orchestration,
-        summary: "Inspect one Badgey instance, including queue status and proposals; without badgey_id, returns active instances.",
-        when_to_use: "Use to debug a Badgey consultation, see queue depth, inspect provider/session/thread bindings, or check proposal state before applying.",
-        example: Some(r#"badgey_status(badgey_id="bg-0123abcd-4567ef89")"#),
-    },
-    ToolDoc {
-        name: "badgey_list",
-        category: ToolCategory::Orchestration,
-        summary: "List Badgey instances and their thread/session bindings.",
-        when_to_use: "Use when you need to find active Badgey instances or include dismissed records for audit.",
-        example: Some(r#"badgey_list(include_dismissed=true)"#),
-    },
-    ToolDoc {
-        name: "badgey_scout",
-        category: ToolCategory::Orchestration,
-        summary: "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions.",
-        when_to_use: "Use for bounded fan-out investigation when Badgey should decompose one question into focused scout turns without exposing bro_exec to the Badgey provider session.",
-        example: Some(
-            r#"badgey_scout(badgey_id="bg-0123abcd-4567ef89", charter="compare these two graph paths")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_collect",
-        category: ToolCategory::Orchestration,
-        summary: "Collect scout/sub-bro events for a Badgey instance or scout id.",
-        when_to_use: "Use after badgey_scout or bg-action-spawn-subbro processing to see whether scout work is still walking or has produced dispatch records.",
-        example: Some(r#"badgey_collect(badgey_id="bg-0123abcd-4567ef89")"#),
-    },
-    ToolDoc {
-        name: "badgey_triage_inbox",
-        category: ToolCategory::Orchestration,
-        summary: "Produce a Badgey-shaped inbox triage proposal sheet for stale/open work in a scope.",
-        when_to_use: "Use for morning-brief triage. The result is a proposal-sheet shape; applying concrete actions still goes through Badgey's proposal gate.",
-        example: Some(r#"badgey_triage_inbox(scope="/repo/x")"#),
-    },
-    ToolDoc {
-        name: "badgey_close_loops",
-        category: ToolCategory::Orchestration,
-        summary: "Classify dispatched tasks without done notes; never synthesizes executor done notes.",
-        when_to_use: "Use for completion-contract audits. Results may identify suspected completions, crashes, or stalls, but the tool does not write kind=done on behalf of executors.",
-        example: Some(r#"badgey_close_loops(window_days=14, project_dir="/repo/x")"#),
-    },
-    ToolDoc {
         name: "bro_wait",
         category: ToolCategory::Orchestration,
         summary: "Observe one task until completion; never launches follow-up work. Timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success.",
@@ -1011,85 +931,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Configuration list/get replies are redacted: endpoint origins and credential key names are visible, inline values and stdio arguments are withheld. Explicitly add/remove MCP servers and manage dispatch-time tool filters. The daemon does not rewrite provider MCP configs on startup. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_proposals_list",
-        category: ToolCategory::Orchestration,
-        summary: "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine since/only_pending/limit/after/through. detail=full with proposal_id returns lossless JSON body pages; continue body.next_cursor as cursor (body_limit up to 4096). Ordinary small exact reads retain proposals[0].",
-        when_to_use: "Workflow node that needs the full proposal record (draft fields, state, etc.) — `badgey_resume` only returns proposal_id list, not the bodies. Pair with `since` set to the synthesis-turn start timestamp to scope to just-emitted proposals.",
-        example: Some(
-            r#"badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_ensure_for_channel",
-        category: ToolCategory::Orchestration,
-        summary: "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node.",
-        when_to_use: "Called from the per-channel triage workflow's first node. Requires a binding via `bro_slack_bind action=bind`. Idempotent — re-calling against an active instance returns the existing id with `created=false`.",
-        example: Some(r#"badgey_ensure_for_channel(team_id="T0123ABCD", channel_id="C0123XYZ")"#),
-    },
-    ToolDoc {
-        name: "badgey_apply_proposal",
-        category: ToolCategory::Orchestration,
-        summary: "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. One-shot wrapper — for the Slack-reaction flow prefer the split `badgey_proposal_begin_apply` + `badgey_proposal_complete_apply` pair so the workflow engine tracks the dispatched bro natively as an actor node.",
-        when_to_use: "Workflow / direct callers that want a one-shot apply. The Slack-reaction badgey-apply-proposal-arc uses the split pair instead so the dispatched bro is tracked as an actor node (visible in actor_results.<NodeId> for downstream PostOutcome rendering). Pass `retry_failed=true` only when explicitly retrying a proposal in Failed state.",
-        example: Some(
-            r#"badgey_apply_proposal(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_proposal_begin_apply",
-        category: ToolCategory::Orchestration,
-        summary: "Phase 1 of the split apply path. Transitions a proposal Pending|Failed → Applying and returns dispatch parameters (prompt + brofile + label for redispatch_task; artifact_kind + source + version for artifact installs). Does NOT spawn the bro or install the artifact — the workflow caller does that via an actor node or `bbox_artifact_install` mcp_call, then calls `badgey_proposal_complete_apply` with the outcome. Lets the engine track the dispatched work natively (actor task lifecycle, retries, gates) instead of opaquely spawning behind a wrapper.",
-        when_to_use: "First mcp_call inside badgey-apply-proposal-arc after the Slack link is resolved. Read the returned `outcome`: `redispatch` → run an actor with `prompt`; `install` → mcp_call bbox_artifact_install with the returned source/kind; `already_applied` → skip dispatch and skip the complete call (PostOutcome emits green directly); `rejected` → skip with a failure post.",
-        example: Some(
-            r#"badgey_proposal_begin_apply(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
-        ),
-    },
-    ToolDoc {
-        name: "badgey_proposal_complete_apply",
-        category: ToolCategory::Orchestration,
-        summary: "Phase 2 of the split apply path. Given the outcome of the dispatched work (passed in `outcome`: `completed` / `failed` / `cancelled` / `timed_out`), transitions the proposal Applying → Applied or Applying → Failed and writes the audit decision. Always returns `{status: applied|failed, ...}` so the workflow's PostOutcome node can read the final state and pick the badge.",
-        when_to_use: "Last mcp_call before PostOutcome in badgey-apply-proposal-arc. For the redispatch path, pass `outcome=${actor_results.Dispatch.status}`, `task_id=${actor_results.Dispatch.taskId}`, `summary=${actor_results.Dispatch.result}`. For the artifact-install path, pass `outcome=completed` on a successful install, with `artifact_ref=${vars.install_response.<artifact_ref>}`. Skip this call entirely on the `already_applied` / `rejected` short-circuit paths.",
-        example: Some(
-            r#"badgey_proposal_complete_apply(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3", outcome="completed", task_id="3c2df23e-...", summary="Done — fix landed at src/main.rs:669")"#,
-        ),
-    },
-    ToolDoc {
-        name: "consultant_proposals_list",
-        category: ToolCategory::Orchestration,
-        summary: "List consultant proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine since/only_pending/limit/after/through. detail=full with proposal_id returns lossless JSON body pages; continue body.next_cursor as cursor (body_limit up to 4096). Ordinary small exact reads retain proposals[0].",
-        when_to_use: "Workflow nodes that need full proposal records without hard-coding a consumer's tool name — pass `consumer` (e.g. `badgey`) plus the instance id. Prefer this over `badgey_proposals_list` in new consumer-agnostic arcs; the badgey_* form remains as the pinned shim.",
-        example: Some(
-            r#"consultant_proposals_list(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
-        ),
-    },
-    ToolDoc {
-        name: "consultant_apply_proposal",
-        category: ToolCategory::Orchestration,
-        summary: "Apply a stored consultant proposal for any registered consumer — state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact kinds → bbox_artifact_install; redispatch_task → privileged task spawn), record applied_task_id, transition (Applying → Applied | Failed). One-shot wrapper; workflow callers that want the engine to track the dispatched work natively should use the split `consultant_proposal_begin_apply` + `consultant_proposal_complete_apply` pair. Consumer-agnostic equivalent of `badgey_apply_proposal`.",
-        when_to_use: "One-shot applies from consumer-agnostic callers. Returns `{status: applied|already_applied|failed|bad_input, summary}` like the badgey shim. Pass `retry_failed=true` only when explicitly retrying a Failed proposal.",
-        example: Some(
-            r#"consultant_apply_proposal(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
-        ),
-    },
-    ToolDoc {
-        name: "consultant_proposal_begin_apply",
-        category: ToolCategory::Orchestration,
-        summary: "Phase 1 of the consumer-agnostic split apply path. Transitions a proposal Pending|Failed → Applying and returns dispatch parameters (prompt + brofile + label for redispatch_task; artifact_kind + source + version for artifact installs). Does NOT spawn the bro or install the artifact — the workflow caller does that via an actor node or `bbox_artifact_install` mcp_call, then calls `consultant_proposal_complete_apply` with the outcome. Consumer-agnostic equivalent of `badgey_proposal_begin_apply`.",
-        when_to_use: "First mcp_call of a consumer-agnostic apply arc. Read the returned `outcome`: `redispatch` → run an actor with `prompt`; `install` → mcp_call bbox_artifact_install with the returned source/kind; `already_applied` → skip dispatch and the complete call; `rejected` → skip with a failure post.",
-        example: Some(
-            r#"consultant_proposal_begin_apply(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
-        ),
-    },
-    ToolDoc {
-        name: "consultant_proposal_complete_apply",
-        category: ToolCategory::Orchestration,
-        summary: "Phase 2 of the consumer-agnostic split apply path. Given the outcome of the dispatched work (`completed` / `failed` / `cancelled` / `timed_out`), transitions the proposal Applying → Applied or Applying → Failed and writes the audit decision. Always returns `{status: applied|failed, ...}` so the workflow's outcome node can read the final state. Consumer-agnostic equivalent of `badgey_proposal_complete_apply`.",
-        when_to_use: "Last mcp_call before the outcome node in a consumer-agnostic apply arc. For the redispatch path pass `outcome=${actor_results.Dispatch.status}` and `task_id=${actor_results.Dispatch.taskId}`; for the artifact-install path pass `outcome=completed` with the installed `artifact_ref`. Skip on the `already_applied` / `rejected` short-circuit paths.",
-        example: Some(
-            r#"consultant_proposal_complete_apply(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3", outcome="completed", task_id="3c2df23e-...", summary="Done")"#,
         ),
     },
     // ── Workflows ────────────────────────────────────────────────────

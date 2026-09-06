@@ -27,9 +27,6 @@ extern crate self as blackbox;
 #[path = "../eval/agents/check.rs"]
 mod agent_eval_check;
 use bbox_artifacts::artifacts;
-#[cfg(test)]
-#[path = "../eval/badgey/check.rs"]
-mod badgey_eval_check;
 // chunker extracted into the bbox-chunker crate (stage 1); aliased back to
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;

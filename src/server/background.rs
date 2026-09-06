@@ -6,9 +6,6 @@ use crate::server::runtime_metrics::{
     spawn_runtime_metrics_sampler, spawn_scheduler_latency_probe,
 };
 use crate::server::storage_gc::{spawn_storage_gc_thread, storage_gc_interval_from_env};
-use crate::tools::badgey_adapter::{
-    BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
-};
 use crate::tools::bro_helpers::tier0_cosine_threshold_from_env;
 use crate::{embed, embed_queue, orchestration, util, vectors, watcher};
 use std::sync::Arc;
@@ -25,10 +22,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     // Operator-minted workspace bindings are durable: re-arm the ones
     // persisted under the knowledge-source store before anything can capture.
     super::knowledge_source::restore_operator_workspace_bindings(&shared);
-    install_badgey_adapter(&shared);
     configure_dispatch_path_env();
-    restore_badgey_registry_from_notes(&shared);
-    recover_badgey_non_terminal_state(&shared);
     configure_embed_runtime(&shared);
     spawn_vector_warmup_thread(shared.clone())?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
@@ -191,15 +185,6 @@ fn configure_dispatch_path_env() {
     unsafe {
         std::env::set_var("PATH", augmented);
     }
-}
-
-fn install_badgey_adapter(shared: &Arc<SharedState>) {
-    shared
-        .agent_adapter_registry
-        .write()
-        .register(Arc::new(BadgeyAgentAdapter {
-            state: shared.clone(),
-        }));
 }
 
 fn configure_embed_runtime(shared: &Arc<SharedState>) {

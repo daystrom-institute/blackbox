@@ -616,10 +616,12 @@ async fn atom_invoke_deterministic_runner_returns_terminal_trace() {
 }
 
 #[tokio::test]
-async fn atom_invoke_adapter_runner_returns_terminal_trace() {
+async fn retired_badgey_adapter_refuses_install_and_historical_invocation() {
     let tmp = tempfile::tempdir().unwrap();
-    let server = test_server(&tmp);
-    install_artifact_value(
+    let root = tmp.path().canonicalize().unwrap();
+    let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+    let artifact = badgey_adapter_atom("badgey-adapter");
+    let result = install_artifact_value(
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Atom,
@@ -628,15 +630,28 @@ async fn atom_invoke_adapter_runner_returns_terminal_trace() {
             version: None,
             supersedes: None,
         },
-        badgey_adapter_atom("badgey-adapter"),
+        artifact.clone(),
     )
-    .await
-    .unwrap();
-
+    .await;
+    assert!(result.is_err());
+    // Simulate an already-installed historical record without current admission.
+    server
+        .state
+        .artifacts
+        .read()
+        .install_value(
+            artifacts::ArtifactKind::Atom,
+            "historical-fixture".into(),
+            &artifact,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     let invoke = server
         .atom_invoke(Parameters(AtomInvokeParams {
             atom: "atom:badgey-adapter@v1".into(),
-            args: serde_json::json!({"brief": "hello badgey"}),
+            args: serde_json::json!({"brief": "legacy request"}),
             project_dir: None,
             owner: Some("operator:test".into()),
             parent_invocation_id: None,
@@ -645,12 +660,60 @@ async fn atom_invoke_adapter_runner_returns_terminal_trace() {
             suppress_auto_supervision: false,
         }))
         .await;
-    assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
-    let body: serde_json::Value = serde_json::from_str(&extract_text(&invoke)).unwrap();
-    assert_eq!(body["status"], "succeeded");
-    assert_eq!(body["data"]["adapter"], "badgey");
-    assert_eq!(body["data"]["accepted"], true);
-    assert_eq!(body["output_shape"]["valid"], true);
+    assert_eq!(invoke.is_error, Some(true));
+    assert!(extract_text(&invoke).contains("badgey_adapter_removed"));
+    assert!(server.state.task_store.read().all_tasks().is_empty());
+}
+
+#[tokio::test]
+async fn historical_consultant_atom_refuses_execution_without_rewriting_notes_or_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let legacy_root = root.join("badgey");
+    std::fs::create_dir_all(legacy_root.join("proposals")).unwrap();
+    std::fs::create_dir_all(legacy_root.join("action_journal")).unwrap();
+    let proposal = legacy_root.join("proposals/P-1.json");
+    let journal = legacy_root.join("action_journal/action-1.json");
+    std::fs::write(&proposal, b"legacy proposal evidence").unwrap();
+    std::fs::write(&journal, b"legacy action evidence").unwrap();
+    let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+    let artifact: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../system-defaults/atoms/consultant/badgey-consult.json"
+    ))
+    .unwrap();
+    let metadata = server
+        .state
+        .artifacts
+        .read()
+        .install_value(
+            artifacts::ArtifactKind::Atom,
+            "historical-fixture".into(),
+            &artifact,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let invoke = server
+        .atom_invoke(Parameters(AtomInvokeParams {
+            atom: format!("atom:{}@v{}", metadata.name, metadata.version),
+            args: serde_json::json!({"brief": "legacy request"}),
+            project_dir: None,
+            owner: Some("operator:test".into()),
+            parent_invocation_id: None,
+            runtime: None,
+            supervision_override: None,
+            suppress_auto_supervision: false,
+        }))
+        .await;
+    assert_eq!(invoke.is_error, Some(true));
+    assert!(extract_text(&invoke).contains("consultant_runtime_removed"));
+    assert!(server.state.task_store.read().all_tasks().is_empty());
+    assert_eq!(
+        std::fs::read(proposal).unwrap(),
+        b"legacy proposal evidence"
+    );
+    assert_eq!(std::fs::read(journal).unwrap(), b"legacy action evidence");
 }
 
 #[tokio::test]

@@ -163,21 +163,8 @@ fn resolve_atom_binding_providers(
                 })?;
             Ok(vec![bf.provider])
         }
-        orchestration::atoms::types::AtomImplementation::Consultant { consumer } => {
-            let descriptor = orchestration::consultant::consumers::lookup(consumer)
-                .ok_or_else(|| format!("unknown consultant consumer '{consumer}'"))?;
-            let bf = orchestration::brofile::resolve_brofile(
-                descriptor.brofile_ref,
-                &state.store_dir,
-                None,
-            )
-            .ok_or_else(|| {
-                format!(
-                    "atom binding '{}' references missing brofile '{}'",
-                    binding.atom_ref, descriptor.brofile_ref
-                )
-            })?;
-            Ok(vec![bf.provider])
+        orchestration::atoms::types::AtomImplementation::Consultant { .. } => {
+            Err("consultant execution is retired; use an ordinary bro actor".into())
         }
         orchestration::atoms::types::AtomImplementation::Workflow { .. } => Ok(Vec::new()),
         orchestration::atoms::types::AtomImplementation::Deterministic { .. } => Ok(Vec::new()),
