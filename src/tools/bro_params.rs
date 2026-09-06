@@ -224,10 +224,16 @@ pub(crate) struct WaitParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WhenParams {
-    /// Team name — waits on each member's most recent task
+    /// Team name. Waits on each member's most recent task. The whole
+    /// selection is validated before waiting: unknown teams, empty teams,
+    /// members without task history, or members whose latest task was pruned
+    /// reject the call. Mutually exclusive with task_ids.
     #[serde(default)]
     pub(crate) team: Option<String>,
-    /// Explicit list of task IDs
+    /// Explicit task IDs. Every ID must exist; unknown or pruned IDs reject
+    /// the whole selection before waiting. Duplicates are preserved: each
+    /// requested occurrence gets its own result row. Maximum 64 IDs per
+    /// call; split larger batches.
     #[serde(default)]
     pub(crate) task_ids: Option<Vec<String>>,
     /// Max seconds to wait (recommended: 120)

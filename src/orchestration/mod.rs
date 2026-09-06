@@ -5738,6 +5738,290 @@ fn observed_event_count(inner: &TaskInner) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregate wait and broadcast reply shaping
+// ---------------------------------------------------------------------------
+
+/// Maximum task occurrences one aggregate wait (`bro_when_all` /
+/// `bro_when_any`) may observe. Oversized selections are rejected before any
+/// waiting so callers partition batches explicitly instead of losing rows.
+pub(crate) const WHEN_TARGET_LIMIT: usize = 64;
+
+/// Serialized byte budget for aggregate wait result rows, derived from the
+/// real transport cap. The shaped reply travels as the `text` field of an
+/// rmcp `CallToolResult`, whose own JSON serialization escapes every quote
+/// and backslash in the document; doubling the inner bytes plus this fixed
+/// wrapper allowance bounds the complete serialized result.
+const ENVELOPE_WRAPPER_BYTES: usize = 4 * 1024;
+const ENVELOPE_INNER_BUDGET_BYTES: usize =
+    (crate::server::BlackboxServer::MCP_RESPONSE_CAP_BYTES - ENVELOPE_WRAPPER_BYTES) / 2;
+
+/// Fixed allowance for the summary keys (`all_completed`, `outcome_counts`,
+/// the truncation note) that ship outside the result-row array.
+const WHEN_SUMMARY_RESERVE_BYTES: usize = 1024;
+pub(crate) const WHEN_ROWS_BUDGET_BYTES: usize =
+    ENVELOPE_INNER_BUDGET_BYTES - WHEN_SUMMARY_RESERVE_BYTES;
+
+/// Fixed allowance for the reply keys (`team`, truncation note) outside the
+/// receipt array. Full broadcast receipts are only emitted into whatever
+/// budget remains after every member's minimal compact receipt is reserved,
+/// so the complete envelope stays inside the transport cap.
+const BROADCAST_SUMMARY_RESERVE_BYTES: usize = 1024;
+pub(crate) const BROADCAST_RECEIPTS_BUDGET_BYTES: usize =
+    ENVELOPE_INNER_BUDGET_BYTES - BROADCAST_SUMMARY_RESERVE_BYTES;
+
+/// Serialized length of a JSON value in UTF-8 bytes; unserializable values
+/// count as infinite so they always fall to the compact path.
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Maximum members one `bro_broadcast` call may dispatch. The check runs
+/// before any member launch or team-file write so an oversized (for example
+/// hand-edited) team cannot fan out unbounded effects.
+pub(crate) const BROADCAST_MEMBER_LIMIT: usize = 256;
+
+/// Outcome counts for aggregate waits, classified from the same captured
+/// result rows that are returned to the caller (never by re-reading live
+/// task state, which could change between row capture and counting). A row
+/// with `timed_out: true` counts as `running` even if its embedded status
+/// raced a late completion, so the summary can never disagree with the rows
+/// and a timeout never masquerades as success. Duplicate IDs count once per
+/// requested occurrence, matching result-row cardinality.
+pub(crate) fn when_outcome_counts(rows: &[Value]) -> Value {
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = 0usize;
+    let mut running = 0usize;
+    for row in rows {
+        if row.get("timed_out") == Some(&Value::Bool(true)) {
+            running += 1;
+            continue;
+        }
+        match row.get("status").and_then(Value::as_str) {
+            Some("completed") => completed += 1,
+            Some("failed") => failed += 1,
+            Some("cancelled") => cancelled += 1,
+            _ => running += 1,
+        }
+    }
+    json!({
+        "completed": completed,
+        "failed": failed,
+        "cancelled": cancelled,
+        "running": running,
+    })
+}
+
+/// Compact one wait row to identity plus outcome plus the `bro_status`
+/// recovery hint. `taskId` stays exact (it is the recovery key); the `bro`
+/// attribution is diagnostic and therefore bounded.
+fn compact_when_row(row: &Value, with_hint: bool) -> Value {
+    let mut compact = serde_json::Map::new();
+    for key in ["taskId", "provider", "status", "timed_out"] {
+        if let Some(value) = row.get(key).filter(|value| !value.is_null()) {
+            compact.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(bro) = row.get("bro").and_then(Value::as_str) {
+        compact.insert("bro".into(), Value::String(truncated_chars(bro, 64)));
+    }
+    compact.insert("resultOmitted".into(), Value::Bool(true));
+    if with_hint {
+        compact.insert(
+            "resultHint".into(),
+            Value::String(
+                "Read bro_status(task_id=..., detail=result); follow body.next_cursor for further pages."
+                    .to_string(),
+            ),
+        );
+    }
+    Value::Object(compact)
+}
+
+/// Bound aggregate wait rows to `WHEN_ROWS_BUDGET_BYTES` measured against
+/// the complete shaped reply. Every row's minimal compact receipt is
+/// reserved up front; full bodies are only emitted into whatever budget
+/// remains, so compaction can never append unaccounted bytes after the
+/// budget is exhausted. Every requested task keeps a row in selection
+/// order, and compacted rows keep identity plus outcome plus the
+/// `bro_status` recovery hint.
+pub(crate) fn bound_when_rows(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
+    let mut with_hints: Vec<Value> = rows.iter().map(|row| compact_when_row(row, true)).collect();
+    let mut reserved: usize = with_hints.iter().map(serialized_len).sum();
+    // Defensive fallback for stores that bypassed the pre-wait fit check:
+    // drop the per-row hint (the envelope-level hint below still points at
+    // `bro_status`) rather than exceed the budget.
+    if reserved > WHEN_ROWS_BUDGET_BYTES {
+        with_hints = rows
+            .iter()
+            .map(|row| compact_when_row(row, false))
+            .collect();
+        reserved = with_hints.iter().map(serialized_len).sum();
+    }
+    let mut used = reserved;
+    let mut compacted = 0usize;
+    let mut bounded = Vec::with_capacity(rows.len());
+    for (row, compact) in rows.into_iter().zip(with_hints) {
+        let bytes = serialized_len(&row);
+        if used.saturating_add(bytes) > WHEN_ROWS_BUDGET_BYTES {
+            compacted += 1;
+            bounded.push(compact);
+        } else {
+            used += bytes;
+            bounded.push(row);
+        }
+    }
+    let truncation = (compacted > 0).then(|| {
+        json!({
+            "compacted_rows": compacted,
+            "byte_budget": WHEN_ROWS_BUDGET_BYTES,
+            "hint": "Every selected task keeps a row; compacted rows omit bodies. Read exact per-task results with bro_status(task_id=..., detail=result), following body.next_cursor.",
+        })
+    });
+    (bounded, truncation)
+}
+
+/// Upper bound for one task's compact wait receipt: exact `taskId`
+/// (the recovery key) plus worst-case bounded provider, status, and bro
+/// attribution plus the recovery hint. Used to reject selections whose
+/// guaranteed receipts cannot fit the envelope before any waiting starts.
+fn when_minimal_row_bytes(task_id: &str) -> usize {
+    let template = json!({
+        "taskId": task_id,
+        "provider": "P".repeat(64),
+        "status": "cancelled",
+        "timed_out": true,
+        "bro": "B".repeat(129),
+    });
+    serialized_len(&compact_when_row(&template, true))
+}
+
+/// Pre-wait fit check: the sum of every selected task's minimal receipt
+/// plus the summary reserve must fit the row budget, so the shaped reply is
+/// guaranteed to fit the transport cap before the caller blocks on a wait.
+pub(crate) fn when_selection_fits(task_ids: &[String]) -> bool {
+    let minimal: usize = task_ids.iter().map(|id| when_minimal_row_bytes(id)).sum();
+    minimal.saturating_add(WHEN_SUMMARY_RESERVE_BYTES) <= WHEN_ROWS_BUDGET_BYTES
+}
+
+/// Truncate a diagnostic string on a character boundary, marking the cut
+/// with an ellipsis so caller-supplied text cannot inflate error replies.
+pub(crate) fn truncated_chars(value: &str, max_chars: usize) -> String {
+    let mut cut: String = value.chars().take(max_chars).collect();
+    if cut.chars().count() < value.chars().count() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// Error-text bounds for broadcast receipts: full receipts keep 512 chars
+/// before compaction; compact receipts keep 64.
+const BROADCAST_FULL_ERROR_CHARS: usize = 512;
+const BROADCAST_COMPACT_ERROR_CHARS: usize = 64;
+
+/// Bound broadcast receipts against the complete shaped reply. Each member
+/// keeps a receipt preserving identity and admission outcome: over-long
+/// error text is truncated with an explicit marker, every row's minimal
+/// compact receipt is reserved up front, and full rows are only emitted
+/// into whatever budget remains, so compaction never appends unaccounted
+/// bytes after the budget is exhausted. Dispatch mechanics are untouched;
+/// only the serialized reply is shaped.
+pub(crate) fn bound_broadcast_receipts(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
+    let mut truncated: Vec<Value> = rows
+        .into_iter()
+        .map(|mut row| {
+            if let Some(error) = row.get("error").and_then(Value::as_str).map(str::to_string)
+                && error.chars().count() > BROADCAST_FULL_ERROR_CHARS
+                && let Some(map) = row.as_object_mut()
+            {
+                map.insert(
+                    "error".into(),
+                    Value::String(truncated_chars(&error, BROADCAST_FULL_ERROR_CHARS)),
+                );
+                map.insert("errorTruncated".into(), Value::Bool(true));
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let minimal: Vec<Value> = truncated
+        .iter()
+        .map(|row| compact_broadcast_receipt(row))
+        .collect();
+    let reserved: usize = minimal.iter().map(serialized_len).sum();
+    let mut used = reserved;
+    let mut compacted = 0usize;
+    let mut bounded = Vec::with_capacity(truncated.len());
+    for (row, compact) in truncated.into_iter().zip(minimal) {
+        let bytes = serialized_len(&row);
+        if used.saturating_add(bytes) > BROADCAST_RECEIPTS_BUDGET_BYTES {
+            compacted += 1;
+            bounded.push(compact);
+        } else {
+            used += bytes;
+            bounded.push(row);
+        }
+    }
+    let truncation = (compacted > 0).then(|| {
+        json!({
+            "compacted_receipts": compacted,
+            "byte_budget": BROADCAST_RECEIPTS_BUDGET_BYTES,
+            "hint": "Every member keeps a receipt; compacted receipts omit session detail. Read admitted task state with bro_status(task_id=...).",
+        })
+    });
+    (bounded, truncation)
+}
+
+/// Compact one broadcast receipt to exact member identity plus either the
+/// admitted taskId or a bounded error, whichever outcome the member got.
+fn compact_broadcast_receipt(row: &Value) -> Value {
+    let mut compact = serde_json::Map::new();
+    if let Some(name) = row.get("bro").filter(|value| !value.is_null()) {
+        compact.insert("bro".into(), name.clone());
+    }
+    if let Some(task_id) = row.get("taskId").filter(|value| !value.is_null()) {
+        compact.insert("taskId".into(), task_id.clone());
+    } else if let Some(error) = row.get("error").and_then(Value::as_str) {
+        compact.insert(
+            "error".into(),
+            Value::String(truncated_chars(error, BROADCAST_COMPACT_ERROR_CHARS)),
+        );
+    }
+    compact.insert("receiptCompacted".into(), Value::Bool(true));
+    Value::Object(compact)
+}
+
+/// Upper bound for one member's guaranteed compact receipt: exact member
+/// name plus the larger of the admitted (bounded taskId) and rejected
+/// (bounded error) forms. The pre-effect fit check uses this so a team
+/// whose receipts cannot fit the envelope rejects before any member
+/// launch or team-file write.
+fn broadcast_minimal_receipt_bytes(member_name: &str) -> usize {
+    let admitted = json!({
+        "bro": member_name,
+        "taskId": "T".repeat(64),
+        "receiptCompacted": true,
+    });
+    let rejected = json!({
+        "bro": member_name,
+        "error": "E".repeat(BROADCAST_COMPACT_ERROR_CHARS + 1),
+        "receiptCompacted": true,
+    });
+    serialized_len(&admitted).max(serialized_len(&rejected))
+}
+
+/// Pre-effect fit check: the sum of every member's minimal receipt plus the
+/// summary reserve must fit the receipt budget.
+pub(crate) fn broadcast_receipts_fit(member_names: &[&str]) -> bool {
+    let minimal: usize = member_names
+        .iter()
+        .map(|name| broadcast_minimal_receipt_bytes(name))
+        .sum();
+    minimal.saturating_add(BROADCAST_SUMMARY_RESERVE_BYTES) <= BROADCAST_RECEIPTS_BUDGET_BYTES
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -5752,6 +6036,176 @@ mod tests {
     fn test_tail_tx() -> tokio::sync::broadcast::Sender<tail::TailEvent> {
         let (tail_tx, _) = tokio::sync::broadcast::channel(16);
         tail_tx
+    }
+
+    #[test]
+    fn when_outcome_counts_match_returned_rows() {
+        let rows = vec![
+            json!({"taskId": "a", "status": "completed"}),
+            // Duplicate occurrences count once per request, not once per ID.
+            json!({"taskId": "a", "status": "completed"}),
+            json!({"taskId": "b", "status": "failed"}),
+            json!({"taskId": "c", "status": "cancelled"}),
+            json!({"taskId": "d", "status": "running", "timed_out": true}),
+            // A late completion racing the timeout still counts as running:
+            // the row (and only the row) is the summary's source of truth.
+            json!({"taskId": "e", "status": "completed", "timed_out": true}),
+        ];
+        let counts = when_outcome_counts(&rows);
+        assert_eq!(counts["completed"], serde_json::json!(2));
+        assert_eq!(counts["failed"], serde_json::json!(1));
+        assert_eq!(counts["cancelled"], serde_json::json!(1));
+        assert_eq!(counts["running"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn bound_when_rows_compact_without_dropping_rows() {
+        let rows: Vec<Value> = (0..12)
+            .map(|index| {
+                json!({
+                    "taskId": format!("task-{index}"),
+                    "status": "completed",
+                    "timed_out": false,
+                    "result": "R".repeat(6 * 1024),
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_when_rows(rows);
+        assert_eq!(bounded.len(), 12);
+        let note = truncation.expect("budget must trigger compaction");
+        assert!(note["compacted_rows"].as_u64().unwrap() > 0);
+        for (index, row) in bounded.iter().enumerate() {
+            assert_eq!(row["taskId"], json!(format!("task-{index}")));
+            assert_eq!(row["status"], json!("completed"));
+        }
+        let compacted = bounded
+            .iter()
+            .filter(|row| row.get("resultOmitted") == Some(&json!(true)))
+            .count();
+        assert!(compacted > 0);
+        assert!(
+            bounded
+                .iter()
+                .any(|row| row["resultHint"].as_str().unwrap().contains("bro_status"))
+        );
+    }
+
+    #[test]
+    fn selection_fit_checks_reject_unfittable_minimal_receipts() {
+        let tasks: Vec<String> = (0..WHEN_TARGET_LIMIT)
+            .map(|index| format!("task-{index:02}"))
+            .collect();
+        assert!(when_selection_fits(&tasks));
+        assert!(!when_selection_fits(&vec!["x".repeat(64 * 1024)]));
+
+        let names: Vec<String> = (0..BROADCAST_MEMBER_LIMIT)
+            .map(|index| format!("member-{index:03}"))
+            .collect();
+        let sane: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(broadcast_receipts_fit(&sane));
+        let long: Vec<String> = (0..BROADCAST_MEMBER_LIMIT)
+            .map(|_| "m".repeat(256))
+            .collect();
+        let oversized: Vec<&str> = long.iter().map(String::as_str).collect();
+        assert!(!broadcast_receipts_fit(&oversized));
+    }
+
+    #[test]
+    fn bound_when_rows_reserve_compact_receipts_at_max_fanout() {
+        // Escaped Unicode and control text inflates both the inner JSON and
+        // the outer CallToolResult escaping; the reservation must still keep
+        // every identity inside the budget.
+        let hot = "\u{1}\"\\😀\u{2028}\u{7}";
+        let rows: Vec<Value> = (0..WHEN_TARGET_LIMIT)
+            .map(|index| {
+                json!({
+                    "taskId": format!("fan-{index:02}"),
+                    "status": "completed",
+                    "timed_out": false,
+                    "bro": format!("bro-\u{1}-{index:02}"),
+                    "result": hot.repeat(256),
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_when_rows(rows);
+        assert_eq!(bounded.len(), WHEN_TARGET_LIMIT);
+        let note = truncation.expect("max fanout must trigger compaction");
+        assert!(note["compacted_rows"].as_u64().unwrap() > 0);
+        let emitted: usize = bounded.iter().map(serialized_len).sum();
+        assert!(
+            emitted <= WHEN_ROWS_BUDGET_BYTES,
+            "emitted {emitted} bytes over budget {WHEN_ROWS_BUDGET_BYTES}"
+        );
+        for index in 0..WHEN_TARGET_LIMIT {
+            let row = bounded
+                .iter()
+                .find(|row| row["taskId"] == json!(format!("fan-{index:02}")))
+                .unwrap_or_else(|| panic!("missing row {index}"));
+            assert_eq!(row["status"], json!("completed"));
+        }
+    }
+
+    #[test]
+    fn bound_broadcast_receipts_reserve_minimal_receipts_at_max_fanout() {
+        let hot = "\u{1}\"\\😀\u{2028}\u{7}";
+        let rows: Vec<Value> = (0..BROADCAST_MEMBER_LIMIT)
+            .map(|index| {
+                json!({
+                    "bro": format!("m\u{1}-{index:03}\u{2028}"),
+                    "taskId": format!("task-{index:03}"),
+                    "sessionId": format!("session-{index:03}"),
+                    "error": hot.repeat(128),
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_broadcast_receipts(rows);
+        assert_eq!(bounded.len(), BROADCAST_MEMBER_LIMIT);
+        let note = truncation.expect("max fanout must compact receipts");
+        assert!(note["compacted_receipts"].as_u64().unwrap() > 0);
+        let emitted: usize = bounded.iter().map(serialized_len).sum();
+        assert!(
+            emitted <= BROADCAST_RECEIPTS_BUDGET_BYTES,
+            "emitted {emitted} bytes over budget {BROADCAST_RECEIPTS_BUDGET_BYTES}"
+        );
+        for index in 0..BROADCAST_MEMBER_LIMIT {
+            let expected = format!("m\u{1}-{index:03}\u{2028}");
+            assert!(
+                bounded
+                    .iter()
+                    .any(|row| row["bro"] == json!(expected.clone())),
+                "missing identity {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_broadcast_receipts_compact_and_truncate_errors() {
+        let long_error = "E".repeat(2048);
+        let rows: Vec<Value> = (0..96)
+            .map(|index| {
+                json!({
+                    "bro": format!("member-{index}"),
+                    "taskId": format!("task-{index}"),
+                    "sessionId": format!("session-{index}"),
+                    "error": long_error,
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_broadcast_receipts(rows);
+        assert_eq!(bounded.len(), 96);
+        let note = truncation.expect("budget must compact receipts");
+        assert!(note["compacted_receipts"].as_u64().unwrap() > 0);
+        for (index, row) in bounded.iter().enumerate() {
+            assert_eq!(row["bro"], json!(format!("member-{index}")));
+            if let Some(error) = row["error"].as_str() {
+                assert!(error.chars().count() <= 513, "{error}");
+            }
+        }
+        assert!(
+            bounded
+                .iter()
+                .any(|row| row.get("receiptCompacted") == Some(&json!(true)))
+        );
     }
 
     #[test]
