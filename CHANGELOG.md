@@ -19,6 +19,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Surviving MCP reads use bounded summaries and exact continuation for growing
+  thread histories, knowledge diagnostics, graph schemas, publisher health,
+  packet events and configuration. Invalid selectors and action mismatches
+  refuse explicitly; aggregate waits retain unknown task IDs and truthful
+  completion outcomes.
+- GLM 5.3 Flash is selectable as `glm-5.3-flash`. Both GLM 5.3 variants use a 1M context window. Ordinary bro status, wait and dashboard
+  responses omit context telemetry; explicit diagnostics retain it.
+- Native search observations retain provider-owned call/result blocks in durable
+  transcripts. Replay repairs only client-owned calls, and MiniMax's search
+  request schema variation stays scoped to that provider.
+
 - Exact packet inspection returns complete installed JSON through bounded
   property pages, including rules and evaluation configuration. Packet
   authoring docs state scalar result types and show predicate JSON.

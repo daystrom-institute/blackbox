@@ -685,12 +685,13 @@ pub(crate) struct BrofileParams {
     /// not supported: global scope rejects a supplied project_dir.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
-    /// Exact action=get/get_account only: pass body.next_cursor unchanged. A
+    /// Exact get/get_account or list_accounts inventory: pass body.next_cursor unchanged. A
     /// changed record or selector refuses continuation; restart without
     /// cursor.
     #[serde(default)]
     pub(crate) cursor: Option<String>,
-    /// Exact action=get/get_account JSON body page byte budget; default/max
+    /// Exact get/get_account JSON body page byte budget; on list_accounts,
+    /// selects exact redacted inventory pages instead of row summaries. Default/max
     /// 4096, min 4.
     #[serde(default)]
     pub(crate) body_limit: Option<usize>,

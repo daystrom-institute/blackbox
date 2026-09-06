@@ -437,3 +437,37 @@ fn event_cursors_reject_filter_changes_and_same_size_rewrites() {
             .contains("stale_event_cursor")
     );
 }
+
+#[test]
+fn huge_event_details_recover_exactly_without_overflowing_discovery() {
+    let (_directory, packets) = tmp_packets();
+    let source = "\u{0001}🦀".repeat(3000);
+    let event = packets.log_gap(&source, None, None, None, None).unwrap();
+    for detail in [false, true] {
+        let page = packets
+            .events_page(&serde_json::from_value(json!({"detail":detail})).unwrap())
+            .unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 24576);
+        let reference = page["events"][0]["event_ref"].as_str().unwrap();
+        let mut cursor = None;
+        let mut joined = String::new();
+        loop {
+            let page = packets
+                .events_page(
+                    &serde_json::from_value(json!({"event_ref":reference,"body_cursor":cursor}))
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() < 8192);
+            joined.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&joined).unwrap(),
+            serde_json::to_value(&event).unwrap()
+        );
+    }
+}

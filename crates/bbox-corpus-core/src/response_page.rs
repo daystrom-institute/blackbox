@@ -1,7 +1,8 @@
 //! Pure response shaping for bounded collection discovery.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// Leave headroom below the transport safeguard for the MCP envelope.
 pub const PAGE_BUDGET_BYTES: usize = 24 * 1024;
@@ -85,6 +86,53 @@ pub fn bound_page(mut page: Value, field: &str) -> Result<Value> {
         page.as_object_mut().unwrap().remove("byte_limited");
     }
     Ok(page)
+}
+
+/// Page one exact JSON value, binding continuation to selection and content.
+pub fn json_body_page(
+    scope: &str,
+    value: &Value,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let text = serde_json::to_string(value)?;
+    let mut hash = Sha256::new();
+    hash.update(scope.as_bytes());
+    hash.update([0]);
+    hash.update(text.as_bytes());
+    let revision = format!("{:x}", hash.finalize());
+    let offset = match cursor {
+        None => 0,
+        Some(cursor) => {
+            let (expected, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid cursor; use body.next_cursor"))?;
+            if expected != revision {
+                bail!("evidence or selection changed; restart without cursor");
+            }
+            offset.parse::<usize>()?
+        }
+    };
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        bail!("invalid cursor byte boundary; restart without cursor");
+    }
+    let mut budget = limit.unwrap_or(4096).clamp(4, 4096);
+    loop {
+        let mut end = offset.saturating_add(budget).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut body = json!({"text":&text[offset..end], "format":"json", "offset":offset, "total_bytes":text.len()});
+        if end < text.len() {
+            body["next_cursor"] = json!(format!("{revision}:{end}"));
+        }
+        // Account for JSON escaping as well as raw UTF-8. The outer MCP
+        // envelope may mirror the exact body in text and structured content.
+        if serde_json::to_vec(&body)?.len() <= 4096 || budget == 4 {
+            return Ok(body);
+        }
+        budget = (budget / 2).max(4);
+    }
 }
 
 #[cfg(test)]

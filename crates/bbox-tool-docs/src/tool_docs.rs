@@ -732,7 +732,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_packet_events",
         category: ToolCategory::Packets,
         summary: "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since.",
-        when_to_use: "Diagnostic surface for the packet subsystem. Continue older pages with next_cursor; appends preserve older offsets, while a shrunken log rejects the cursor. Default detail rows use compact projections; detail=true includes complete event details.",
+        when_to_use: "Diagnostic surface for the packet subsystem. Continue older pages with next_cursor; appends preserve older offsets; changed filters, removals, or rewritten events reject continuation. detail=true expands small events. event_ref from any row returns an exact event through body pages, including oversized details; continue with body_cursor=body.next_cursor. Exact reads omit list filters.",
         example: Some(r#"bbox_packet_events(op="gap", limit=20)"#),
     },
     ToolDoc {

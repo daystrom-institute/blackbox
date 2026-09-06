@@ -365,12 +365,28 @@ pub fn account_summary_row(name: &str, account: &Account) -> serde_json::Value {
         .flat_map(|env| env.keys().map(String::as_str))
         .collect();
     let mut row = serde_json::Map::new();
-    row.insert("name".into(), serde_json::json!(name));
+    if name.len() <= 256 {
+        row.insert("name".into(), serde_json::json!(name));
+    } else {
+        row.insert(
+            "name_preview".into(),
+            serde_json::json!(name.chars().take(64).collect::<String>()),
+        );
+        row.insert("name_bytes".into(), serde_json::json!(name.len()));
+        row.insert("detail_hint".into(), serde_json::json!("bro_brofile(action=list_accounts,body_limit=4096) recovers exact account identities"));
+    }
     row.insert("env_key_count".into(), serde_json::json!(env_keys.len()));
     let mut preview: Vec<&str> = env_keys.clone();
     preview.sort_unstable();
     preview.truncate(ACCOUNT_ROW_ENV_KEY_LIMIT);
-    row.insert("env_keys".into(), serde_json::json!(preview));
+    let bounded_keys: Vec<_> = preview
+        .iter()
+        .map(|key| key.chars().take(48).collect::<String>())
+        .collect();
+    if preview.iter().any(|key| key.chars().count() > 48) {
+        row.insert("env_keys_truncated".into(), serde_json::json!(true));
+    }
+    row.insert("env_keys".into(), serde_json::json!(bounded_keys));
     if env_keys.len() > ACCOUNT_ROW_ENV_KEY_LIMIT {
         row.insert(
             "env_keys_omitted".into(),
@@ -405,7 +421,7 @@ pub fn account_summary_page(
     accounts: &HashMap<String, Account>,
     offset: usize,
     limit: usize,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let mut names: Vec<&String> = accounts.keys().collect();
     names.sort();
     let total = names.len();
@@ -417,13 +433,14 @@ pub fn account_summary_page(
         .map(|name| account_summary_row(name, &accounts[name.as_str()]))
         .collect();
     let next = offset.saturating_add(rows.len());
-    serde_json::json!({
+    let page = serde_json::json!({
         "accounts": rows,
         "total": total,
         "offset": offset,
         "next_offset": (next < total).then_some(next),
         "detail_hint": "Rows are bounded identity/presence summaries; credential values are never returned. get_account pages one account's exact redacted key/policy projection.",
-    })
+    });
+    bbox_corpus_core::response_page::bound_page(page, "accounts")
 }
 
 pub fn resolve_brofile(name: &str, store_dir: &Path, project_dir: Option<&str>) -> Option<Brofile> {

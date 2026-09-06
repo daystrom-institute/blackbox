@@ -351,6 +351,23 @@ impl BlackboxServer {
     )]
     pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
+        let exact = matches!(p.action.as_str(), "get" | "get_account" | "list_accounts");
+        if !exact && (p.cursor.is_some() || p.body_limit.is_some()) {
+            return Self::err_text(
+                "cursor and body_limit require get, get_account, or list_accounts",
+            );
+        }
+        if !matches!(p.action.as_str(), "list" | "list_accounts")
+            && (p.limit.is_some() || p.offset.is_some())
+        {
+            return Self::err_text("limit and offset require list or list_accounts");
+        }
+        if p.project_dir
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Self::err_text("project_dir must not be blank");
+        }
         let store_dir = &self.state.store_dir;
         let scope = match brofile::validate_scope(p.scope.as_deref()) {
             Ok(scope) => scope,
@@ -552,11 +569,45 @@ impl BlackboxServer {
 
             "list_accounts" => {
                 let config = brofile::load_config(store_dir);
-                Self::ok_json(&brofile::account_summary_page(
+                if p.cursor.is_some() || p.body_limit.is_some() {
+                    if p.limit.is_some() || p.offset.is_some() {
+                        return Self::err_text(
+                            "exact account inventory uses cursor/body_limit; omit row limit/offset",
+                        );
+                    }
+                    let accounts: std::collections::BTreeMap<_, _> = config
+                        .accounts
+                        .iter()
+                        .map(|(name, account)| (name.clone(), account.response_view()))
+                        .collect();
+                    let selection = format!("account-inventory:{}", store_identity(store_dir));
+                    return match super::body_page::json_body_page(
+                        &selection,
+                        &json!(accounts),
+                        p.cursor.as_deref(),
+                        p.body_limit,
+                    ) {
+                        Ok(body) => Self::ok_json(&json!({"body":body})),
+                        Err(error) => Self::err_text(&format!(
+                            "account inventory: {error}; restart without cursor"
+                        )),
+                    };
+                }
+                match brofile::account_summary_page(
                     &config.accounts,
                     p.offset.unwrap_or(0),
                     p.limit.unwrap_or(20),
-                ))
+                ) {
+                    Ok(mut page) => {
+                        page["detail_hint"] = json!(
+                            "get_account(name) reads one exact redacted account; list_accounts(body_limit=4096) pages the entire redacted inventory including full identities"
+                        );
+                        Self::ok_json(&page)
+                    }
+                    Err(error) => Self::err_text(&format!(
+                        "account inventory: {error}; use list_accounts(body_limit=4096) for exact bounded recovery"
+                    )),
+                }
             }
             "set_provider_default" => {
                 let provider = match p
@@ -1866,6 +1917,56 @@ mod tests {
         assert_eq!(recovered.name, "twin");
         assert_eq!(recovered.lens.as_deref(), Some("l".repeat(20000).as_str()));
         assert_eq!(recovered.tool_defaults.as_ref().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn account_inventory_bounds_long_identities_and_recovers_them_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let name = "\u{0001}🦀".repeat(600);
+        let env_key = "LONG_KEY_".repeat(100);
+        let mut config = orchestration::brofile::BroConfig::default();
+        config.accounts.insert(
+            name.clone(),
+            orchestration::brofile::Account {
+                env: Some(std::collections::HashMap::from([(
+                    env_key.clone(),
+                    "credential-sentinel".into(),
+                )])),
+                ..Default::default()
+            },
+        );
+        orchestration::brofile::save_config(&config, &server.state.store_dir).unwrap();
+        let response = server.bro_brofile(Parameters(
+            serde_json::from_value(json!({"action":"list_accounts"})).unwrap(),
+        ));
+        assert_ne!(response.is_error, Some(true));
+        assert!(serde_json::to_vec(&response).unwrap().len() < 4096);
+        let summary: Value = serde_json::from_str(&extract_text(&response)).unwrap();
+        assert!(summary["accounts"][0].get("name").is_none());
+        assert!(summary["accounts"][0]["name_preview"].is_string());
+        let mut joined = String::new();
+        let mut cursor = None;
+        loop {
+            let response = server.bro_brofile(Parameters(
+                serde_json::from_value(
+                    json!({"action":"list_accounts", "body_limit":512,"cursor":cursor}),
+                )
+                .unwrap(),
+            ));
+            assert_ne!(response.is_error, Some(true));
+            let text = extract_text(&response);
+            assert!(!text.contains("credential-sentinel"));
+            let page: Value = serde_json::from_str(&text).unwrap();
+            joined.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let exact: Value = serde_json::from_str(&joined).unwrap();
+        assert_eq!(exact.as_object().unwrap().len(), 1);
+        assert_eq!(exact[&name], config.accounts[&name].response_view());
     }
 
     #[test]

@@ -4998,20 +4998,25 @@ mod tests {
         assert_eq!(body["summary"]["id"], trace.id);
         assert_eq!(body["summary"]["candidate_count"], 1);
         assert_eq!(body["summary"]["error"], "exhausted");
-        assert!(
-            body["summary"]["candidates"]["candidates"]
-                .as_array()
-                .unwrap()
-                .len()
-                == 1
+        assert!(body["summary"].get("candidates").is_none());
+        let mut joined = body["body"]["text"].as_str().unwrap().to_owned();
+        let mut cursor = body["body"]["next_cursor"].as_str().map(str::to_owned);
+        while cursor.is_some() {
+            let continued = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
+                selection_trace_id: trace.id.clone(),
+                cursor,
+                body_limit: Some(64),
+            }));
+            assert_ne!(continued.is_error, Some(true));
+            let value: serde_json::Value =
+                serde_json::from_str(&call_result_text(&continued)).unwrap();
+            joined.push_str(value["body"]["text"].as_str().unwrap());
+            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&joined).unwrap(),
+            serde_json::to_value(&trace).unwrap()
         );
-        let cursor = body["body"]["next_cursor"].as_str().unwrap().to_string();
-        let continued = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
-            selection_trace_id: trace.id.clone(),
-            cursor: Some(cursor),
-            body_limit: Some(64),
-        }));
-        assert_ne!(continued.is_error, Some(true));
 
         let unknown = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
             selection_trace_id: "alloc-deadbeef".into(),

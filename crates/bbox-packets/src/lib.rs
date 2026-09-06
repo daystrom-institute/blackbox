@@ -133,6 +133,15 @@ pub struct EventsParams {
     /// projections when their serialized form is too large for a page.
     #[serde(default)]
     pub detail: bool,
+    /// Exact event identity from a list row. Omit list filters and cursor.
+    #[serde(default)]
+    pub event_ref: Option<String>,
+    /// Exact event continuation from body.next_cursor.
+    #[serde(default)]
+    pub body_cursor: Option<String>,
+    /// Exact event JSON page budget, default/max 4096 bytes.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -715,29 +724,25 @@ fn parse_event_cursor(raw: &str) -> Result<EventCursor> {
     })
 }
 
+fn event_ref(event: &PacketEvent) -> String {
+    bbox_corpus_core::project_catalog_snapshot::sha256_hex(
+        &serde_json::to_vec(event).expect("event JSON serializes"),
+    )
+}
+
 fn event_page_row(event: &PacketEvent, detail: bool) -> serde_json::Value {
-    if detail {
-        return serde_json::to_value(event).unwrap_or_else(|_| serde_json::Value::Null);
+    let mut row = serde_json::to_value(event).expect("event JSON serializes");
+    let reference = event_ref(event);
+    if !detail || serde_json::to_vec(&row).is_ok_and(|bytes| bytes.len() > 2048) {
+        if serde_json::to_vec(&event.details).is_ok_and(|bytes| bytes.len() > 512) {
+            row["details"] = serde_json::json!({"omitted":true,"detail_hint":"bbox_packet_events(event_ref=<row.event_ref>) returns exact JSON body pages"});
+        }
+        for field in ["timestamp", "op", "outcome", "packet_id", "domain"] {
+            bbox_corpus_core::response_page::preview_field(&mut row, field, 128);
+        }
     }
-    let details = if event.details.is_null() {
-        serde_json::Value::Null
-    } else if serde_json::to_vec(&event.details).map_or(true, |bytes| bytes.len() <= 512) {
-        event.details.clone()
-    } else {
-        serde_json::json!({
-            "omitted": true,
-            "reason": "details exceed the compact row projection",
-            "detail_hint": "bbox_packet_events(detail=true)",
-        })
-    };
-    serde_json::json!({
-        "timestamp": event.timestamp,
-        "op": event.op,
-        "outcome": event.outcome,
-        "packet_id": event.packet_id,
-        "domain": event.domain,
-        "details": details,
-    })
+    row["event_ref"] = serde_json::json!(reference);
+    row
 }
 
 impl Packets {
@@ -858,6 +863,23 @@ impl Packets {
     /// move older offsets. Continuations bind the selection and previously
     /// observed events, rejecting removals and rewrites before returning rows.
     pub fn events_page(&self, params: &EventsParams) -> Result<serde_json::Value> {
+        if params.event_ref.is_some() {
+            anyhow::ensure!(
+                params.op.is_none()
+                    && params.packet_id.is_none()
+                    && params.outcome.is_none()
+                    && params.since.is_none()
+                    && params.limit.is_none()
+                    && params.cursor.is_none()
+                    && !params.detail,
+                "event_ref selects one exact event; omit list filters, detail, limit and cursor"
+            );
+        } else {
+            anyhow::ensure!(
+                params.body_cursor.is_none() && params.body_limit.is_none(),
+                "body_cursor and body_limit require event_ref"
+            );
+        }
         let since = params
             .since
             .as_deref()
@@ -917,6 +939,22 @@ impl Packets {
             total += 1;
         }
 
+        if let Some(reference) = params.event_ref.as_deref() {
+            let event = events
+                .iter()
+                .find(|event| event_ref(event) == reference)
+                .context(
+                    "error.event_not_found: exact event is no longer present; refresh the list",
+                )?;
+            let scope = format!("packet-event:{}:{reference}", path.display());
+            let body = bbox_corpus_core::response_page::json_body_page(
+                &scope,
+                &serde_json::to_value(event)?,
+                params.body_cursor.as_deref(),
+                params.body_limit,
+            )?;
+            return Ok(serde_json::json!({"event_ref":reference,"body":body}));
+        }
         if let Some(cursor) = cursor.as_ref()
             && (cursor.total > total || cursor.offset > total)
         {
@@ -957,7 +995,7 @@ impl Packets {
             "continuation_semantics": "append_stable: cursors bind filters and prior events; changed selection, removal or rewrite requires restart",
             "malformed_lines_omitted": malformed,
             "detail": params.detail,
-            "detail_hint": "Set detail=true for complete event details; packet:<id> body pages remain the exact packet reader.",
+            "detail_hint": "detail=true expands small events; event_ref from a row reads any exact event through body pages.",
         });
         page = bbox_corpus_core::response_page::bound_page(page, "events")?;
         let bounded_next_offset = page["next_offset"].as_u64().unwrap_or(next_offset as u64);

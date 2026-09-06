@@ -722,3 +722,11 @@ metadata, knowledge map insertion, complete review envelope bounds, fixture
 continuations, and source/documentation chooser parity. Protocol replay and native
 observation regressions passed earlier at 8c01614d. No deployed proof is claimed
 for these integration changes.
+
+
+The requested Flash option uses `glm-5.3-flash` in the shared provider catalog
+and preserves that slug on native requests. Its explicit 1M context metadata
+follows the [Z.AI model guide](https://docs.z.ai/guides/vlm/glm-5.3-flash).
+The provider's existing flagship default remains selected unless the caller pins
+Flash. Native request support still needs a successful provider probe; code-path
+and catalog tests alone do not prove endpoint admission under a quota cap.
