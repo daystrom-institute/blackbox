@@ -452,6 +452,13 @@ pub struct GapFileParams {
     pub project_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GapDetail {
+    Summary,
+    Full,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GapListParams {
     /// Exact gap id `gap-<8hex>` (bare 8-hex suffix accepted).
@@ -487,8 +494,17 @@ pub struct GapListParams {
     /// ISO 8601: only gaps created at or after this timestamp.
     #[serde(default)]
     pub since: Option<String>,
+    /// Page size, default 20, clamped to 1..100.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Zero-based offset after filtering, ordered by newest created_at then id.
+    /// Paging is over the current view; concurrent writes may shift offsets.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Response depth: summary (list default) or full (exact-id default).
+    /// Summary previews identify omitted or shortened fields.
+    #[serde(default)]
+    pub detail: Option<GapDetail>,
     /// Include addressed gaps (default: false for lists, true for exact id).
     #[serde(default)]
     pub include_addressed: Option<bool>,
@@ -2009,7 +2025,7 @@ impl GapStore {
 
     /// Filtered, newest-first view. Returns owned clones so callers can render
     /// or serialize without holding the borrow.
-    pub fn query(&self, p: &GapListParams) -> Vec<GapNote> {
+    fn matching(&self, p: &GapListParams) -> Vec<GapNote> {
         let gap_kind = p
             .gap_kind
             .as_deref()
@@ -2094,10 +2110,12 @@ impl GapStore {
                 // paths say; either side missing an id keeps the path predicate.
                 // The ledger arm is catalog-mode only and matches a path-only
                 // row still keyed under a historical path of this project.
-                if let Some(pl) = &project_lower
+                if (project_lower.is_some() || project_id_filter.is_some())
                     && !project_scope_matches(g.project_id.as_deref(), project_id_filter, || {
                         let row_project = g.project.as_deref().unwrap_or("").to_lowercase();
-                        row_project.contains(pl)
+                        project_lower
+                            .as_ref()
+                            .is_some_and(|pl| row_project.contains(pl))
                             || ledger_lower
                                 .iter()
                                 .any(|historical| row_project.contains(historical.as_str()))
@@ -2126,13 +2144,85 @@ impl GapStore {
             .cloned()
             .collect();
 
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let limit = p.limit.unwrap_or(50).max(1) as usize;
-        out.truncate(limit);
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         out
     }
 
-    pub fn list_rendered(&self, p: &GapListParams) -> Result<String> {
+    pub fn query(&self, p: &GapListParams) -> Vec<GapNote> {
+        self.matching(p)
+            .into_iter()
+            .skip(usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX))
+            .take(p.limit.unwrap_or(20).clamp(1, 100) as usize)
+            .collect()
+    }
+
+    /// Apply one projection to both MCP representations. Persistence records
+    /// stay unchanged; response metadata is attached only to these read rows.
+    pub fn list_page(&self, p: &GapListParams) -> Result<Value> {
+        // Validate before selecting: an invalid enum must never broaden a query.
+        self.validate_list_filters(p)?;
+        let matched = self.matching(p);
+        let total = matched.len();
+        let offset = p.offset.unwrap_or(0);
+        let detail = p.detail.unwrap_or(if p.id.is_some() {
+            GapDetail::Full
+        } else {
+            GapDetail::Summary
+        });
+        let rows = matched
+            .iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(p.limit.unwrap_or(20).clamp(1, 100) as usize)
+            .map(|gap| self.response_row(gap, detail == GapDetail::Full))
+            .collect::<Result<Vec<_>>>()?;
+        let end = offset.saturating_add(rows.len() as u64);
+        Ok(serde_json::json!({
+            "rows": rows, "total": total, "offset": offset,
+            "next_offset": (end < total as u64).then_some(end),
+            "detail": detail,
+            "detail_hint": "Use id for one complete record, or detail=full for complete records on this page."
+        }))
+    }
+
+    fn response_row(&self, gap: &GapNote, detail: bool) -> Result<Value> {
+        let metadata = self.view_metadata(&gap.id);
+        let mut row = serde_json::to_value(GapResponseRow {
+            gap: gap.clone(),
+            built_from_ref: metadata.and_then(|m| m.built_from_ref.clone()),
+            compatibility_lane: metadata.and_then(|m| m.compatibility_lane.clone()),
+        })?;
+        let object = row.as_object_mut().expect("gap record is an object");
+        // A carrier is an implementation detail, never a client file target.
+        object.remove("write_dir");
+        if !detail {
+            let mut omitted = Vec::new();
+            for field in ["evidence", "notes", "missing_primitive", "fallback_used"] {
+                if object.remove(field).is_some() {
+                    omitted.push(field);
+                }
+            }
+            for field in ["title", "wanted_capability", "resolution_note"] {
+                if let Some(value) = object.get_mut(field) {
+                    if let Some(text) = value.as_str() {
+                        if text.chars().count() > 240 {
+                            *value = Value::String(text.chars().take(240).collect());
+                            omitted.push(field);
+                        }
+                    }
+                }
+            }
+            if !omitted.is_empty() {
+                object.insert("omitted_fields".into(), serde_json::json!(omitted));
+            }
+        }
+        Ok(row)
+    }
+
+    fn validate_list_filters(&self, p: &GapListParams) -> Result<()> {
         // Surface enum-filter typos loudly rather than silently matching nothing.
         if let Some(v) = p.gap_kind.as_deref() {
             parse_gap_kind(v)?;
@@ -2148,65 +2238,58 @@ impl GapStore {
                 .map_err(|_| anyhow::anyhow!("Unknown resolution filter: {v}"))?;
         }
 
-        let results = self.query(p);
-        if p.json.unwrap_or(false) {
-            let rows = results
-                .into_iter()
-                .map(|gap| {
-                    let metadata = self.view_metadata(&gap.id);
-                    GapResponseRow {
-                        gap,
-                        built_from_ref: metadata.and_then(|row| row.built_from_ref.clone()),
-                        compatibility_lane: metadata.and_then(|row| row.compatibility_lane.clone()),
-                    }
-                })
-                .collect::<Vec<_>>();
-            return Ok(serde_json::to_string_pretty(&rows)?);
+        Ok(())
+    }
+
+    pub fn list_rendered(&self, p: &GapListParams) -> Result<String> {
+        let page = self.list_page(p)?;
+        Self::render_page(&page, p.json.unwrap_or(false))
+    }
+
+    pub fn render_page(page: &Value, json: bool) -> Result<String> {
+        if json {
+            return Ok(serde_json::to_string_pretty(page)?);
         }
-        if results.is_empty() {
-            return Ok("No gaps found.".to_string());
-        }
-        let mut out = format!("{} gap(s)\n\n", results.len());
-        for g in &results {
-            let scope = g.project.as_deref().map_or("global".to_string(), |p| {
-                p.rsplit('/').next().unwrap_or(p).to_string()
-            });
-            let provisional = g
-                .provisional_checkout_id
-                .as_deref()
-                .map(|checkout| format!("  checkout={checkout}"))
-                .unwrap_or_default();
-            let built_from = self
-                .view_metadata(&g.id)
-                .map(|metadata| {
-                    match (
-                        metadata.built_from_ref.as_deref(),
-                        metadata.compatibility_lane.as_deref(),
-                    ) {
-                        (Some(reference), _) => format!("  built_from={reference}"),
-                        (None, Some(lane)) => format!("  built_from={lane}"),
-                        (None, None) => String::new(),
-                    }
-                })
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}{provisional}{built_from}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
-                id = g.id,
-                kind = g.gap_kind.as_ref(),
-                impact = g.impact.as_ref(),
-                res = g.resolution.as_ref(),
-                ts = g.created_at,
-                dedupe = g.dedupe_key,
-                title = g.title,
-                want = g.wanted_capability,
-            ));
-            if let Some(by) = &g.superseded_by {
-                out.push_str(&format!("  superseded_by: {by}\n"));
+        let rows = page["rows"].as_array().expect("gap page rows are an array");
+        let mut out = if rows.is_empty() {
+            if page["total"].as_u64() == Some(0) {
+                "No gaps found.\n".to_string()
+            } else {
+                "No gaps on this page.\n".to_string()
             }
-            if let Some(rn) = &g.resolution_note {
-                out.push_str(&format!("  ↳ {rn}\n"));
-            }
+        } else {
+            format!(
+                "{} gap(s), {} total, offset {}\n",
+                rows.len(),
+                page["total"],
+                page["offset"]
+            )
+        };
+        // Render the same projected fields, including any omission markers.
+        // Compact labels retain the existing provenance breadcrumb syntax.
+        for row in rows {
             out.push('\n');
+            for (key, value) in row.as_object().expect("gap row is an object") {
+                let text = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string());
+                if key == "built_from_ref" {
+                    out.push_str(&format!("built_from={text}\n"));
+                } else {
+                    out.push_str(&format!("{key}: {text}\n"));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "\npage: total={}, offset={}, detail={}\n",
+            page["total"], page["offset"], page["detail"]
+        ));
+        if !page["next_offset"].is_null() {
+            out.push_str(&format!("\nnext_offset: {}\n", page["next_offset"]));
+        }
+        if let Some(hint) = page["detail_hint"].as_str() {
+            out.push_str(hint);
         }
         Ok(out)
     }
@@ -2322,6 +2405,149 @@ mod tests {
         }
     }
 
+    fn projection_fixture(count: usize) -> GapStore {
+        let mut gaps = Vec::new();
+        for n in (0..count).rev() {
+            let mut gap = dual_read_gap("gap-00000000", "/repos/fixture", None);
+            gap.id = format!("gap-{n:08x}");
+            gap.created_at = "2026-09-01T00:00:00Z".into();
+            gap.wanted_capability = "界".repeat(500);
+            gap.evidence = vec!["large evidence".repeat(500)];
+            gap.notes = Some("long notes".repeat(500));
+            gap.resolution_note = Some("resolution".repeat(100));
+            gap.superseded_by = Some("gap-ffffffff".into());
+            gap.project_id = Some(if n % 2 == 0 { "project-a" } else { "project-b" }.into());
+            gaps.push(gap);
+        }
+        GapStore::detached_view(gaps, BTreeMap::new())
+    }
+
+    #[test]
+    fn gap_summary_pages_are_bounded_stable_and_explicit_about_omissions() {
+        let view = projection_fixture(125);
+        let page = view.list_page(&GapListParams::default()).unwrap();
+        assert_eq!(page["total"], 125);
+        assert_eq!(page["rows"].as_array().unwrap().len(), 20);
+        assert_eq!(page["next_offset"], 20);
+        assert_eq!(page["detail"], "summary");
+        let row = &page["rows"][0];
+        assert_eq!(row["id"], "gap-00000000");
+        assert_eq!(
+            row["wanted_capability"].as_str().unwrap().chars().count(),
+            240
+        );
+        assert!(row.get("evidence").is_none());
+        assert!(row.get("notes").is_none());
+        assert_eq!(row["superseded_by"], "gap-ffffffff");
+        assert_eq!(row["project_id"], "project-a");
+        assert!(
+            row["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("evidence".into()))
+        );
+        let rendered = GapStore::render_page(&page, false).unwrap();
+        assert!(!rendered.contains("large evidence"));
+        assert!(rendered.contains("omitted_fields"));
+        assert!(serde_json::to_vec(&page).unwrap().len() < 40_000);
+        let next = view
+            .list_page(&GapListParams {
+                offset: Some(20),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(next["rows"][0]["id"], "gap-00000014");
+    }
+
+    #[test]
+    fn gap_pages_clamp_limits_and_keep_filtered_totals() {
+        let view = projection_fixture(125);
+        let zero = view
+            .list_page(&GapListParams {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(zero["rows"].as_array().unwrap().len(), 1);
+        let max = view
+            .list_page(&GapListParams {
+                limit: Some(u64::MAX),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(max["rows"].as_array().unwrap().len(), 100);
+        assert_eq!(max["next_offset"], 100);
+        let past = view
+            .list_page(&GapListParams {
+                offset: Some(u64::MAX),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(past["rows"].as_array().unwrap().is_empty());
+        assert!(past["next_offset"].is_null());
+        let filtered = view
+            .list_page(&GapListParams {
+                project_id: Some("project-a".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(filtered["total"], 63);
+        assert!(
+            filtered["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["project_id"] == "project-a")
+        );
+        assert!(
+            view.list_page(&GapListParams {
+                impact: Some("typo".into()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gap_exact_id_and_full_depth_expand_the_same_records() {
+        let view = projection_fixture(1);
+        let exact = view
+            .list_page(&GapListParams {
+                id: Some("00000000".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(exact["detail"], "full");
+        assert_eq!(
+            exact["rows"][0]["wanted_capability"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            500
+        );
+        assert!(exact["rows"][0].get("evidence").is_some());
+        assert!(exact["rows"][0].get("omitted_fields").is_none());
+        let full = view
+            .list_page(&GapListParams {
+                detail: Some(GapDetail::Full),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(exact["rows"], full["rows"]);
+        let summary = view
+            .list_page(&GapListParams {
+                id: Some("00000000".into()),
+                detail: Some(GapDetail::Summary),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(summary["detail"], "summary");
+        assert!(
+            serde_json::from_value::<GapListParams>(serde_json::json!({"detail": "typo"})).is_err()
+        );
+    }
+
     #[test]
     fn detached_gap_view_exposes_response_ref_in_text_and_json() {
         let dir = tempdir().unwrap();
@@ -2354,7 +2580,7 @@ mod tests {
             })
             .unwrap();
         let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(rows[0]["built_from_ref"], "built_from_0");
+        assert_eq!(rows["rows"][0]["built_from_ref"], "built_from_0");
     }
 
     #[test]

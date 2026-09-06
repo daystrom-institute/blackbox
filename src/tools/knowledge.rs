@@ -1647,6 +1647,9 @@ impl BlackboxServer {
             // The mutation store's reload tolerates unreadable carriers by
             // skipping them; tell the caller which projects that hid.
             for (project, error) in server.state.kb.read().degraded_carriers() {
+                if !server.carrier_affects_project_filter(project, p.project.as_deref(), p.project_id.as_deref(), &p.project_ledger_paths) {
+                    continue;
+                }
                 filter_diagnostics.push(format!(
                     "knowledge store overlay skipped for project {project}: {error}"
                 ));
