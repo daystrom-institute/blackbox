@@ -391,17 +391,8 @@ pub fn load_config(store_dir: &Path) -> BroConfig {
         .unwrap_or_default()
 }
 
-pub fn save_config(config: &BroConfig, store_dir: &Path) {
-    let file = config_file(store_dir);
-    let tmp = store_dir.join("config.json.tmp");
-    let _ = fs::create_dir_all(store_dir);
-    if let Ok(data) = serde_json::to_string_pretty(config) {
-        if let Ok(mut f) = fs::File::create(&tmp) {
-            let _ = f.write_all(data.as_bytes());
-            let _ = f.sync_all();
-            let _ = fs::rename(&tmp, &file);
-        }
-    }
+pub fn save_config(config: &BroConfig, store_dir: &Path) -> anyhow::Result<()> {
+    crate::json_store::atomic_write_json_locked(&config_file(store_dir), config)
 }
 
 pub fn load_account(name: &str, store_dir: &Path) -> Option<Account> {
@@ -1016,7 +1007,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        save_config(&config, dir.path());
+        save_config(&config, dir.path()).unwrap();
 
         let loaded = load_config(dir.path());
         assert!(loaded.accounts.contains_key("work"));
@@ -1622,7 +1613,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        save_config(&config, store.path());
+        save_config(&config, store.path()).unwrap();
 
         let resolved =
             resolve_provider_env(Provider::Glm, Some("account2"), None, store.path(), None)
@@ -1641,7 +1632,7 @@ mod tests {
                 account: "account2".into(),
             },
         );
-        save_config(&config, store.path());
+        save_config(&config, store.path()).unwrap();
 
         let effective = effective_account(Provider::Glm, None, store.path());
         assert_eq!(effective.as_deref(), Some("account2"));
@@ -1664,7 +1655,7 @@ mod tests {
                 account: "account2".into(),
             },
         );
-        save_config(&config, store.path());
+        save_config(&config, store.path()).unwrap();
 
         let resolved = resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
@@ -1703,7 +1694,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        save_config(&config, store.path());
+        save_config(&config, store.path()).unwrap();
 
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(
@@ -1816,7 +1807,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        save_config(&config, store.path());
+        save_config(&config, store.path()).unwrap();
 
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(
