@@ -588,14 +588,16 @@ pub(crate) struct ProvidersParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BrofileParams {
-    /// Operation: create, list, get, delete, set_account, list_accounts,
-    /// set_provider_default, get_provider_default, list_provider_defaults,
-    /// clear_provider_default
+    /// Operation: create, list, get, delete, get_account, set_account,
+    /// list_accounts, set_provider_default, get_provider_default,
+    /// list_provider_defaults, clear_provider_default
     pub(crate) action: String,
-    /// Maximum brofile summaries for action=list (default 20, maximum 100).
+    /// Maximum brofile summaries for action=list and account rows for
+    /// action=list_accounts (default 20, maximum 100).
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-    /// Starting row for action=list, after provider/name filtering.
+    /// Starting row for action=list (after provider/name filtering) and
+    /// action=list_accounts (after name sorting).
     #[serde(default)]
     pub(crate) offset: Option<usize>,
     #[serde(default)]
@@ -615,10 +617,24 @@ pub(crate) struct BrofileParams {
     /// Durable tool argument defaults embedded in the brofile.
     #[serde(default)]
     pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
+    /// Brofile store to address: global (default) or project. list/get read
+    /// only the selected store; project requires project_dir, and global
+    /// rejects it. Unknown scopes are refused before any store access.
     #[serde(default)]
     pub(crate) scope: Option<String>,
+    /// Owner-host project directory for scope=project; ignored-when-absent is
+    /// not supported: global scope rejects a supplied project_dir.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
+    /// Exact action=get/get_account only: pass body.next_cursor unchanged. A
+    /// changed record or selector refuses continuation; restart without
+    /// cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact action=get/get_account JSON body page byte budget; default/max
+    /// 4096, min 4.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
     /// Persona-bound allow/disallow patterns embedded in the brofile.
     /// Apply at every dispatch using this brofile, between project
     /// mcp.json and per-dispatch ExecParams overrides.

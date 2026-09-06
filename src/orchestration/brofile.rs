@@ -323,6 +323,109 @@ pub fn load_brofile(name: &str, dir: &Path) -> Option<Brofile> {
     serde_json::from_str(&data).ok()
 }
 
+/// Closed brofile-store scope vocabulary. Callers validate before any store
+/// access so a typo cannot silently widen into the global store.
+pub fn validate_scope(scope: Option<&str>) -> anyhow::Result<&'static str> {
+    match scope.unwrap_or("global") {
+        "global" => Ok("global"),
+        "project" => Ok("project"),
+        other => anyhow::bail!("Unknown scope '{other}'; use global or project"),
+    }
+}
+
+/// Store-selected exact read for `bro_brofile get`. Unlike
+/// [`resolve_brofile`] (dispatch-time project-over-global resolution), this
+/// reads only the requested store so `scope` is effective, not advisory.
+pub fn get_brofile(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> Option<Brofile> {
+    match scope {
+        "project" => load_brofile(
+            name,
+            &project_brofiles_dir(Path::new(project_dir.unwrap_or("."))),
+        ),
+        _ => load_brofile(name, &brofiles_dir(store_dir)),
+    }
+}
+
+/// How many environment key names a summary row previews before truncating
+/// with an honest omitted count. Rows stay bounded even for accounts with
+/// thousands of configured keys; `get_account` pages the exact key list.
+pub const ACCOUNT_ROW_ENV_KEY_LIMIT: usize = 20;
+
+/// Bounded per-account identity/presence row: name, policy scalars, counts,
+/// and a truncated environment-key preview. Credential values never appear.
+pub fn account_summary_row(name: &str, account: &Account) -> serde_json::Value {
+    let env_keys: Vec<&str> = account
+        .env
+        .iter()
+        .flat_map(|env| env.keys().map(String::as_str))
+        .collect();
+    let mut row = serde_json::Map::new();
+    row.insert("name".into(), serde_json::json!(name));
+    row.insert("env_key_count".into(), serde_json::json!(env_keys.len()));
+    let mut preview: Vec<&str> = env_keys.clone();
+    preview.sort_unstable();
+    preview.truncate(ACCOUNT_ROW_ENV_KEY_LIMIT);
+    row.insert("env_keys".into(), serde_json::json!(preview));
+    if env_keys.len() > ACCOUNT_ROW_ENV_KEY_LIMIT {
+        row.insert(
+            "env_keys_omitted".into(),
+            serde_json::json!(env_keys.len() - ACCOUNT_ROW_ENV_KEY_LIMIT),
+        );
+    }
+    row.insert(
+        "allowed_tier_count".into(),
+        serde_json::json!(account.allowed_tiers.len()),
+    );
+    row.insert(
+        "allowed_model_count".into(),
+        serde_json::json!(account.allowed_models.len()),
+    );
+    row.insert(
+        "capability_count".into(),
+        serde_json::json!(account.capabilities.len()),
+    );
+    if let Some(limit) = account.max_concurrent {
+        row.insert("max_concurrent".into(), serde_json::json!(limit));
+    }
+    if account.disabled {
+        row.insert("disabled".into(), serde_json::json!(true));
+    }
+    serde_json::Value::Object(row)
+}
+
+/// Bounded account inventory: sorted bounded rows, `total`, `next_offset`,
+/// and an exact-recovery hint. Row bodies and row counts are both bounded;
+/// `get_account` pages one account's full redacted key/policy projection.
+pub fn account_summary_page(
+    accounts: &HashMap<String, Account>,
+    offset: usize,
+    limit: usize,
+) -> serde_json::Value {
+    let mut names: Vec<&String> = accounts.keys().collect();
+    names.sort();
+    let total = names.len();
+    let limit = limit.clamp(1, 100);
+    let rows: Vec<serde_json::Value> = names
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|name| account_summary_row(name, &accounts[name.as_str()]))
+        .collect();
+    let next = offset.saturating_add(rows.len());
+    serde_json::json!({
+        "accounts": rows,
+        "total": total,
+        "offset": offset,
+        "next_offset": (next < total).then_some(next),
+        "detail_hint": "Rows are bounded identity/presence summaries; credential values are never returned. get_account pages one account's exact redacted key/policy projection.",
+    })
+}
+
 pub fn resolve_brofile(name: &str, store_dir: &Path, project_dir: Option<&str>) -> Option<Brofile> {
     // Project-local overrides global
     if let Some(pd) = project_dir {

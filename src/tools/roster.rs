@@ -360,12 +360,43 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_brofile",
-        description = "Manage brofiles and accounts. list returns paginated summaries; get by name returns the full lens and configuration."
+        description = "Manage brofiles and accounts. list returns paginated summaries; get returns the exact brofile as bounded JSON body pages; list_accounts pages redacted account rows."
     )]
     pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
         let store_dir = &self.state.store_dir;
-        let scope = p.scope.as_deref().unwrap_or("global");
+        let scope = match brofile::validate_scope(p.scope.as_deref()) {
+            Ok(scope) => scope,
+            Err(error) => return Self::err_text(&format!("Error: {error:#}")),
+        };
+        let project_dir = match (scope, p.project_dir.as_deref()) {
+            ("project", Some(dir)) => Some(dir),
+            ("project", None) => {
+                return Self::err_text("project_dir is required for scope=project");
+            }
+            ("global", None) => None,
+            _ => {
+                return Self::err_text(
+                    "project_dir applies only to scope=project; omit it for global scope",
+                );
+            }
+        };
+
+        let account_scoped = matches!(
+            p.action.as_str(),
+            "set_account"
+                | "list_accounts"
+                | "get_account"
+                | "set_provider_default"
+                | "get_provider_default"
+                | "list_provider_defaults"
+                | "clear_provider_default"
+        );
+        if account_scoped && scope == "project" {
+            return Self::err_text(
+                "scope=project does not apply to account/provider-default actions; account configuration lives in the daemon-owned store",
+            );
+        }
 
         match p.action.as_str() {
             "create" => {
@@ -373,9 +404,6 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                if scope == "project" && p.project_dir.is_none() {
-                    return Self::err_text("project_dir required for project scope");
-                }
                 let provider = match p
                     .provider
                     .as_deref()
@@ -404,15 +432,27 @@ impl BlackboxServer {
                     code_mode: p.code_mode,
                     service_tier: p.service_tier.clone(),
                 };
-                if let Err(e) =
-                    brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
-                {
+                if let Err(e) = brofile::save_brofile(&bf, scope, store_dir, project_dir) {
                     return Self::err_text(&format!("brofile save failed: {e}"));
                 }
-                Self::ok_json(&json!({"created": name, "scope": scope, "brofile": bf}))
+                Self::ok_json(&json!({
+                    "created": name,
+                    "scope": scope,
+                    "summary": {
+                        "name": bf.name,
+                        "provider": bf.provider,
+                        "account": bf.account,
+                        "model": bf.model,
+                        "effort": bf.effort,
+                        "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
+                    },
+                    "detail_hint": format!(
+                        "bro_brofile(action=\"get\", name=\"{name}\", scope=\"{scope}\") returns the exact stored brofile as bounded body pages"
+                    ),
+                }))
             }
             "list" => {
-                let list = brofile::list_brofiles(scope, store_dir, p.project_dir.as_deref());
+                let list = brofile::list_brofiles(scope, store_dir, project_dir);
                 let provider = match p
                     .provider
                     .as_deref()
@@ -435,9 +475,33 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                match brofile::resolve_brofile(name, store_dir, p.project_dir.as_deref()) {
-                    Some(bf) => Self::ok_json(&serde_json::to_value(&bf).unwrap_or_default()),
-                    None => Self::err_text(&format!("Brofile not found: {name}")),
+                match brofile::get_brofile(name, scope, store_dir, project_dir) {
+                    Some(bf) => {
+                        let value = serde_json::to_value(&bf).unwrap_or_default();
+                        let selection = brofile_selection(scope, store_dir, project_dir, name);
+                        match super::body_page::json_body_page(
+                            &selection,
+                            &value,
+                            p.cursor.as_deref(),
+                            p.body_limit,
+                        ) {
+                            Ok(body) => Self::ok_json(&json!({
+                                "name": name,
+                                "scope": scope,
+                                "summary": {
+                                    "name": bf.name,
+                                    "provider": bf.provider,
+                                    "account": bf.account,
+                                    "model": bf.model,
+                                    "effort": bf.effort,
+                                    "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
+                                },
+                                "body": body,
+                            })),
+                            Err(error) => Self::err_text(&format!("Error: {error:#}")),
+                        }
+                    }
+                    None => Self::err_text(&format!("Brofile not found in {scope} scope: {name}")),
                 }
             }
             "delete" => {
@@ -445,10 +509,7 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                if scope == "project" && p.project_dir.is_none() {
-                    return Self::err_text("project_dir required for project scope");
-                }
-                if brofile::delete_brofile(name, scope, store_dir, p.project_dir.as_deref()) {
+                if brofile::delete_brofile(name, scope, store_dir, project_dir) {
                     Self::ok_json(&json!({"deleted": name}))
                 } else {
                     Self::err_text(&format!("Brofile not found: {name}"))
@@ -462,23 +523,52 @@ impl BlackboxServer {
                 match brofile::update_config(store_dir, |config| {
                     let account = config.accounts.entry(name.clone()).or_default();
                     account.env = p.env.clone();
-                    account.response_view()
+                    brofile::account_summary_row(name, account)
                 }) {
-                    Ok(configuration) => Self::ok_json(&json!({
-                        "account": name, "updated": true, "configuration": configuration,
+                    Ok(summary) => Self::ok_json(&json!({
+                        "account": name,
+                        "updated": true,
+                        "summary": summary,
+                        "detail_hint": format!(
+                            "get_account(name=\"{name}\") pages the exact redacted key/policy projection"
+                        ),
                     })),
                     Err(error) => Self::err_text(&format!("Configuration was not saved: {error}")),
                 }
             }
 
+            "get_account" => {
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
+                match brofile::load_account(name, store_dir) {
+                    Some(account) => {
+                        let value = account.response_view();
+                        let selection = format!("account:{}:{name}", store_identity(store_dir));
+                        match super::body_page::json_body_page(
+                            &selection,
+                            &value,
+                            p.cursor.as_deref(),
+                            p.body_limit,
+                        ) {
+                            Ok(body) => Self::ok_json(&json!({
+                                "name": name,
+                                "body": body,
+                            })),
+                            Err(error) => Self::err_text(&format!("Error: {error:#}")),
+                        }
+                    }
+                    None => Self::err_text(&format!("Account not found: {name}")),
+                }
+            }
+
             "list_accounts" => {
                 let config = brofile::load_config(store_dir);
-                Self::ok_json(&Value::Object(
-                    config
-                        .accounts
-                        .iter()
-                        .map(|(name, account)| (name.clone(), account.response_view()))
-                        .collect(),
+                Self::ok_json(&brofile::account_summary_page(
+                    &config.accounts,
+                    p.offset.unwrap_or(0),
+                    p.limit.unwrap_or(20),
                 ))
             }
             "set_provider_default" => {
@@ -761,6 +851,32 @@ impl BlackboxServer {
 
 /// Team project association is worker context. Only bridge mode also grants
 /// local template/brofile lookup authority; apply this on dispatch as on create.
+/// Canonical store identity for content-bound cursors. The digest inside a
+/// cursor never discloses the path; canonicalization keeps two distinct
+/// aliases of one store from splitting identity, falling back to the raw
+/// path when the store is not resolvable.
+fn store_identity(dir: &Path) -> String {
+    std::fs::canonicalize(dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dir.to_string_lossy().into_owned())
+}
+
+/// Body-page selection for `bro_brofile get`. Binds scope, the selected
+/// store's identity, and the brofile name so identical bodies stored in
+/// distinct project (or global) stores cannot accept one another's cursors.
+fn brofile_selection(
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+    name: &str,
+) -> String {
+    let store = match (scope, project_dir) {
+        ("project", Some(dir)) => store_identity(Path::new(dir)),
+        _ => store_identity(store_dir),
+    };
+    format!("brofile:{scope}:{store}:{name}")
+}
+
 pub(crate) fn team_source_project_dir<'a>(
     server: &BlackboxServer,
     project: Option<&'a str>,
@@ -1622,10 +1738,206 @@ mod tests {
             assert!(reply.contains("CUSTOM"));
         }
         let list: Value = serde_json::from_str(&list_reply).unwrap();
-        assert_eq!(list["synthetic"]["env_keys"], json!(["CUSTOM", "TOKEN"]));
+        let rows = list["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "synthetic");
+        assert_eq!(rows[0]["env_keys"], json!(["CUSTOM", "TOKEN"]));
+        assert_eq!(list["total"], 1);
         let account =
             orchestration::brofile::load_account("synthetic", &server.state.store_dir).unwrap();
         assert_eq!(account.env.unwrap()["TOKEN"], "synthetic-secret");
+    }
+
+    #[test]
+    fn brofile_scope_validation_rejects_unknown_and_ambiguous_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cases = [
+            (Some("typo"), None, "Unknown scope"),
+            (Some("project"), None, "project_dir is required"),
+            (Some("global"), Some("/nonexistent/project"), "applies only"),
+        ];
+        for (scope, project_dir, expected) in cases {
+            let params: BrofileParams = serde_json::from_value(json!({
+                "action": "list", "scope": scope, "project_dir": project_dir,
+            }))
+            .unwrap();
+            let result = server.bro_brofile(Parameters(params));
+            assert_eq!(result.is_error, Some(true), "{scope:?} {project_dir:?}");
+            let text = extract_text(&result);
+            assert!(text.contains(expected), "{scope:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn brofile_get_reads_only_the_requested_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let shared: orchestration::brofile::Brofile = serde_json::from_value(json!({
+            "name": "shared", "provider": "glm", "lens": "global lens",
+        }))
+        .unwrap();
+        let override_bf: orchestration::brofile::Brofile = serde_json::from_value(json!({
+            "name": "shared", "provider": "glm", "lens": "project lens",
+        }))
+        .unwrap();
+        orchestration::brofile::save_brofile(&shared, "global", &server.state.store_dir, None)
+            .unwrap();
+        orchestration::brofile::save_brofile(
+            &override_bf,
+            "project",
+            &server.state.store_dir,
+            Some(project.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let project_get: BrofileParams = serde_json::from_value(json!({
+            "action": "get", "name": "shared", "scope": "project",
+            "project_dir": project.to_str().unwrap(),
+        }))
+        .unwrap();
+        let reply = extract_text(&server.bro_brofile(Parameters(project_get)));
+        assert!(reply.contains("project lens"), "{reply}");
+        assert!(!reply.contains("global lens"), "{reply}");
+
+        let global_only: BrofileParams = serde_json::from_value(json!({
+            "action": "get", "name": "override-missing", "scope": "global",
+        }))
+        .unwrap();
+        let reply = extract_text(&server.bro_brofile(Parameters(global_only)));
+        assert!(reply.contains("not found in global scope"), "{reply}");
+    }
+
+    #[test]
+    fn brofile_get_body_pages_bind_store_identity_and_recover_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_a = root.join("project-a");
+        let project_b = root.join("project-b");
+        for dir in [&project_a, &project_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut tool_defaults = serde_json::Map::new();
+        for i in 0..200 {
+            tool_defaults.insert(format!("tool_{i}"), json!(format!("granted-{i}")));
+        }
+        let bf: orchestration::brofile::Brofile = serde_json::from_value(json!({
+            "name": "twin", "provider": "glm", "lens": "l".repeat(20000),
+            "tool_defaults": tool_defaults,
+        }))
+        .unwrap();
+        for dir in [&project_a, &project_b] {
+            orchestration::brofile::save_brofile(
+                &bf,
+                "project",
+                &server.state.store_dir,
+                Some(dir.to_str().unwrap()),
+            )
+            .unwrap();
+        }
+
+        let page: BrofileParams = serde_json::from_value(json!({
+            "action": "get", "name": "twin", "scope": "project",
+            "project_dir": project_a.to_str().unwrap(),
+        }))
+        .unwrap();
+        let first = extract_text(&server.bro_brofile(Parameters(page)));
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert!(first["body"]["text"].as_str().unwrap().len() <= 4096);
+        let cursor = first["body"]["next_cursor"].as_str().unwrap().to_owned();
+
+        // Identical bodies in distinct project stores must not accept one
+        // another's cursors: the selection digest binds the store identity.
+        let cross_store: BrofileParams = serde_json::from_value(json!({
+            "action": "get", "name": "twin", "scope": "project",
+            "project_dir": project_b.to_str().unwrap(), "cursor": cursor,
+        }))
+        .unwrap();
+        let result = server.bro_brofile(Parameters(cross_store));
+        assert_eq!(result.is_error, Some(true));
+
+        let mut reconstructed = first["body"]["text"].as_str().unwrap().to_owned();
+        let mut cursor = Some(cursor);
+        while let Some(current) = cursor {
+            let params: BrofileParams = serde_json::from_value(json!({
+                "action": "get", "name": "twin", "scope": "project",
+                "project_dir": project_a.to_str().unwrap(), "cursor": current,
+            }))
+            .unwrap();
+            let page: Value =
+                serde_json::from_str(&extract_text(&server.bro_brofile(Parameters(params))))
+                    .unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+        }
+        let recovered: orchestration::brofile::Brofile =
+            serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered.name, "twin");
+        assert_eq!(recovered.lens.as_deref(), Some("l".repeat(20000).as_str()));
+        assert_eq!(recovered.tool_defaults.as_ref().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn account_pages_bound_single_oversized_row_and_recover_redacted_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut env = std::collections::HashMap::new();
+        for i in 0..5000 {
+            env.insert(format!("KEY_{i:04}"), format!("value-synthetic-{i}"));
+        }
+        let mut config = orchestration::brofile::BroConfig::default();
+        config.accounts.insert(
+            "oversized".into(),
+            orchestration::brofile::Account {
+                env: Some(env),
+                allowed_models: vec![format!("model-{}", "m".repeat(64))],
+                ..Default::default()
+            },
+        );
+        orchestration::brofile::save_config(&config, &server.state.store_dir).unwrap();
+
+        let params: BrofileParams =
+            serde_json::from_value(json!({"action": "list_accounts"})).unwrap();
+        let reply = extract_text(&server.bro_brofile(Parameters(params)));
+        assert!(!reply.contains("value-synthetic"), "{reply}");
+        let page: Value = serde_json::from_str(&reply).unwrap();
+        let row = &page["accounts"][0];
+        assert_eq!(row["name"], "oversized");
+        assert_eq!(row["env_key_count"], 5000);
+        assert_eq!(row["env_keys"].as_array().unwrap().len(), 20);
+        assert_eq!(row["env_keys_omitted"], 4980);
+        assert!(
+            serde_json::to_vec(&page).unwrap().len() < 2048,
+            "oversized row leaked into summary page"
+        );
+
+        let mut reconstructed = String::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut request = json!({"action": "get_account", "name": "oversized"});
+            if let Some(current) = cursor.as_deref() {
+                request["cursor"] = json!(current);
+            }
+            let params: BrofileParams = serde_json::from_value(request).unwrap();
+            let page: Value =
+                serde_json::from_str(&extract_text(&server.bro_brofile(Parameters(params))))
+                    .unwrap();
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(!reconstructed.contains("value-synthetic"));
+        let view: Value = serde_json::from_str(&reconstructed).unwrap();
+        let keys = view["env_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 5000);
+        assert_eq!(keys[0], "KEY_0000");
+        assert_eq!(keys[4999], "KEY_4999");
     }
 
     #[test]

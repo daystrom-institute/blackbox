@@ -21,25 +21,27 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bro_mcp", || {
             let mut p = p;
-            if let Some(raw) = p.project.clone() {
-                // Selection-class engine resolution (phase-2 §9.2 B5): a
-                // resolving selector rewrites to the durable store key; the
-                // version-1 arm keeps raw-path storage for unregistered
-                // dirs (tagged compatibility), the catalog arm fails closed.
-                match self.resolve_project_selection(&raw) {
-                    Ok(resolution) => match resolution.store_key() {
-                        Some(key) => p.project = Some(key.to_owned()),
-                        None => anyhow::bail!(
-                            "error.project_attachment_required: project '{raw}' has no active checkout attachment to carry MCP project scope"
-                        ),
-                    },
-                    Err(_) if self.state.project_authority.is_bridge() => {
-                        self.state.resolver_compat.record(
-                            "bro_mcp",
-                            crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
-                        );
+            // Project selectors are meaningful only for scope=project; the
+            // tool layer rejects the global+project combination explicitly,
+            // so an ambiguous call never resolves a selector it would then
+            // ignore.
+            if p.scope.as_deref() == Some("project") {
+                if let Some(raw) = p.project.clone() {
+                    match self.resolve_project_selection(&raw) {
+                        Ok(resolution) => match resolution.store_key() {
+                            Some(key) => p.project = Some(key.to_owned()),
+                            None => anyhow::bail!(
+                                "error.project_attachment_required: project '{raw}' has no active checkout attachment to carry MCP project scope"
+                            ),
+                        },
+                        Err(_) if self.state.project_authority.is_bridge() => {
+                            self.state.resolver_compat.record(
+                                "bro_mcp",
+                                crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
+                            );
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
                 }
             }
             orchestration::mcp::handle(&p)
