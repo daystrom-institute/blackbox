@@ -250,6 +250,7 @@ impl BlackboxServer {
     fn capture_gap_mutation_snapshot(
         &self,
         project_id: &str,
+        expected_scope: &bbox_corpus_core::identity::PublishedScope,
         mut after_snapshot: impl FnMut(),
     ) -> anyhow::Result<(
         Vec<crate::gaps::GapNote>,
@@ -266,6 +267,10 @@ impl BlackboxServer {
             after_snapshot();
             let queue = self.state.checkout_mutations.write();
             let current = runtime.load_verified(&project)?;
+            anyhow::ensure!(
+                current.content_stamp().accepted_scope() == expected_scope,
+                "project publication scope differs from the mutation target; retry after scope reconciliation"
+            );
             if view.accepted_content.get(&project) == Some(current.content_stamp()) {
                 return Ok((
                     view.gaps
@@ -315,7 +320,7 @@ impl BlackboxServer {
             "a gap edit cannot target the same record twice"
         );
         let (published_gaps, mut queue) =
-            self.capture_gap_mutation_snapshot(project_id, &mut after_snapshot)?;
+            self.capture_gap_mutation_snapshot(project_id, &scope, &mut after_snapshot)?;
         let published = ids
             .iter()
             .map(|id| -> anyhow::Result<Option<String>> {
@@ -439,7 +444,8 @@ impl BlackboxServer {
         gap.provider = p.provider.clone();
         gap.bro = p.bro.clone();
         gap.thread_id = p.thread_id.clone();
-        let (published_gaps, mut queue) = self.capture_gap_mutation_snapshot(&project_id, || {})?;
+        let (published_gaps, mut queue) =
+            self.capture_gap_mutation_snapshot(&project_id, &scope, || {})?;
         if !p.allow_recurrence.unwrap_or(false) {
             let mut visible = published_gaps
                 .iter()
@@ -1175,7 +1181,7 @@ mod tests {
 
         let mut captured = false;
         let (rows, _queue) = server
-            .capture_gap_mutation_snapshot("p_queue", || {
+            .capture_gap_mutation_snapshot("p_queue", &scope, || {
                 if !captured {
                     captured = true;
                     fixture.install_publication(
