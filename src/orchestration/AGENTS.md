@@ -46,3 +46,28 @@ Domain home for the dispatch plane. Boundary contract:
   makes checkout-local render impossible even when workspace authority is
   valid. Workflow workers remain on `agent-internal`; recursive agent and atom
   dispatches remain on `default`.
+
+## Persisted task compatibility and damaged snapshots
+
+- Persisted provider/origin variants outlive their dispatch surfaces. Keep legacy
+  workflow and atom records readable until an explicit data migration retires
+  them. Loading a mixed snapshot must not erase otherwise readable tasks.
+- Decode each array row independently. Unreadable rows and every row sharing a
+  duplicate ID stay opaque in later snapshots; their IDs cannot be reused for
+  executable tasks. They are not pruned by task TTL because their metadata is
+  untrusted. Before permitting replacement of the snapshot, retain its exact
+  bytes in a content-addressed `tasks.quarantine.<sha256>.json` beside
+  `tasks.json`, with restricted permissions and durable file/directory sync.
+- Whole-file parse/read failures or a failed quarantine block every normal
+  snapshot path and emit an error. Runtime tasks may still be visible in memory,
+  but new changes cannot become durable until an operator repairs the configured
+  task store and restarts. Preserve the original and quarantine files during
+  repair; never treat an empty in-memory store as authority to discard them.
+  Quarantine backups require explicit operator cleanup after repair.
+- Workflow/atom origin, workflow provider, or an explicit `workflow_owned` flag
+  preserves owner-managed closeout protection. On restart, a running owned task
+  becomes failed and is retained for inspection without ordinary bro recovery
+  eligibility; older recoverable flags are cleared. Ordinary harness re-adoption
+  refuses owned tasks before restoring workspace bindings. While an owning
+  runtime remains installed, recovery belongs to that runtime's explicit path.
+  Current ordinary bro tasks retain restart recovery and re-adoption behavior.
