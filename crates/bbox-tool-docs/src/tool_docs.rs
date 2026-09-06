@@ -431,7 +431,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_catalog_get",
         category: ToolCategory::ProjectCatalog,
-        summary: "Read one catalog project: its id, display name, scope, connector_observations, aliases, pending alias nominations, and repo-history reference, plus a separate host_local_attachments section carrying this host's attachment rows (attachment_id, status, kind, checkout dir, relpath). The catalog section stays path-free; attachment paths are host-local operator data. A connector-scoped project has no attachment and no repo history, and its vendor coordinates render only as connector_observations: they are what a producer reported, refreshed on every onboarding, and never the project's identity. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        summary: "Read one project by exact selector. Default detail=summary returns identity, scope, epoch, alias previews (3 accepted and 3 pending, with totals), and recorded attachment counts/default. detail=aliases returns exact alias rows and offline operator accept arguments; detail=attachments returns recorded host-local rows, not proof of live checkout access; detail=observations returns producer-reported connector coordinates, not identity or freshness. Alias/attachment pages default to 20, clamp limit to 1..=100, and obey a byte budget. Continue with next_offset and expected_catalog_epoch; nonzero offset requires that epoch and changes refuse. No unbounded full option and no checkout probes. Returns error.project_catalog_inactive on the version-1 registry.",
         when_to_use: "Use when you need one project's aliases, pending nominations, repo history, or the attachments this host carries for it. Pair with `bbox_project_catalog_list` for the epoch.",
         example: Some(r#"bbox_project_catalog_get(project="p_4f6a1c9e5b2d47a8b0c3e1f5a9d76b24")"#),
     },
@@ -1025,7 +1025,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "badgey_proposals_list",
         category: ToolCategory::Orchestration,
-        summary: "List BadgeyProposal records owned by an instance. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment — useful for reading proposals emitted by the most recent Badgey turn. Used by the per-channel triage workflow's ForeachPostProposal node to iterate proposals freshly emitted by the synthesis turn.",
+        summary: "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through.",
         when_to_use: "Workflow node that needs the full proposal record (draft fields, state, etc.) — `badgey_resume` only returns proposal_id list, not the bodies. Pair with `since` set to the synthesis-turn start timestamp to scope to just-emitted proposals.",
         example: Some(
             r#"badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
@@ -1077,7 +1077,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "consultant_proposals_list",
         category: ToolCategory::Orchestration,
-        summary: "List proposal records owned by a consultant instance of any registered consumer. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment. Consumer-agnostic equivalent of `badgey_proposals_list`.",
+        summary: "List consultant proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through.",
         when_to_use: "Workflow nodes that need full proposal records without hard-coding a consumer's tool name — pass `consumer` (e.g. `badgey`) plus the instance id. Prefer this over `badgey_proposals_list` in new consumer-agnostic arcs; the badgey_* form remains as the pinned shim.",
         example: Some(
             r#"consultant_proposals_list(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
@@ -1148,14 +1148,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_arc_status",
         category: ToolCategory::Workflows,
-        summary: "Read-only structured query against active and recently-finished arcs. Returns the current ArcSnapshot (current_node, completed_nodes, in_flight_nodes, last_verdict, visit_counts, started_at) plus pending-wait registrations for the arc.",
+        summary: "Inspect active/recent workflow positions and typed wait correlations. Select arc_id (arcId or arc_thread_id), or list deterministic summaries with limit (default 10, max 20), offset and next_offset. Summary omits completed-node history and visit-count maps and bounds waits. detail=full returns exact selected snapshots and waits as JSON body pages; continue cursor=body.next_cursor. Unknown arc ids and invalid detail/selectors are errors.",
         when_to_use: "Use to debug stuck arcs without parsing event logs — answers 'where is this arc and what's it waiting on?' in one shot. With no arc_id, lists every running arc plus all pending waits.",
         example: Some(r#"bro_arc_status(arc_id="thread-abc12345")"#),
     },
     ToolDoc {
         name: "bro_arc_result",
         category: ToolCategory::Workflows,
-        summary: "Read a completed workflow arc's structured result without the event-log bulk: `structuredExit` (vars._structured_exit), final `vars` (optionally filtered by `keys`), `arcThreadId`, and `actorSessions`. Accepts the arcId from bro_orchestrate_run or the workflow task id. `include_node_outputs=true` adds per-node prose. Covers task-backed arcs (bro_orchestrate_run); webhook/SSE-ingress arcs are not task-backed.",
+        summary: "Read a task-backed workflow result: structuredExit, selected vars, arcThreadId and actorSessions; include_node_outputs=true adds node prose. Accepts arcId or workflow task id. keys selects vars; default vars omit duplicate _structured_exit. Small selected results stay inline; large selections explicitly return a preview. detail=full returns exact selected JSON body pages; continue cursor=body.next_cursor with the same selectors and parse concatenated body.text. Webhook/SSE-ingress arcs are not task-backed.",
         when_to_use: "Use after a workflow finishes to consume its output — the replacement for parsing bro_wait's escaped result envelope. `keys` narrows to the vars you actually need (e.g. keys=[\"sieve\"]). Running arcs return {status: running}; pair with bro_arc_status for live position and bbox_notes(thread_id=<arc_thread_id>) for the audit trail.",
         example: Some(
             r#"bro_arc_result(arc_id="arc-c60058fe9116dad8465043a39987a76c", keys=["sieve"])"#,
