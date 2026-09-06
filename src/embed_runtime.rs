@@ -124,25 +124,78 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct EmbedPartitionsParams {
     /// "list" (default) reports every partition with its route mapping;
-    /// "prune" deletes orphaned partitions older than `older_than_days`.
+    /// "prune" deletes orphaned partitions older than `older_than_days`;
+    /// "scrub" reclassifies one mapped partition's vectors (dry-run by
+    /// default). Unknown actions and action-mismatched fields fail BEFORE
+    /// any vector-store scan.
     #[serde(default)]
     pub action: Option<String>,
     /// Required for prune: only partitions whose last write is older than
-    /// this many days are candidates. There is no default on purpose —
+    /// this many days are candidates. There is no default on purpose:
     /// the age threshold is an operator decision.
     #[serde(default)]
     pub older_than_days: Option<u64>,
-    /// Prune is dry-run by default; pass apply=true to delete.
+    /// Prune and scrub are dry-run by default; pass apply=true to delete.
+    /// Ignored by list.
     #[serde(default)]
     pub apply: bool,
     /// Required for scrub: the mapped partition to sweep for vectors whose
     /// entities now attribute to a different route (e.g. after a bucket
-    /// attribution rule change).
+    /// attribution rule change). Ignored by list and prune.
     #[serde(default)]
     pub route: Option<String>,
+    /// Partition inventory page size for list and prune. Default 20,
+    /// minimum 1, maximum 100. Ignored by scrub.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Partitions skipped in route order. The inventory is a live view and
+    /// can change between pages; restart at offset 0 after lifecycle
+    /// actions.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// A10/A13: validate the closed action vocabulary and per-action fields
+/// before touching the vector store. Returns the normalized action.
+fn validate_partition_params(p: &EmbedPartitionsParams) -> Result<String> {
+    let action = p.action.as_deref().map(str::trim).unwrap_or("list");
+    if !matches!(action, "list" | "prune" | "scrub") {
+        bail!("unknown action `{action}`; expected `list`, `prune`, or `scrub`");
+    }
+    match action {
+        "list" => {
+            if p.apply {
+                bail!("error.bad_input: apply has no effect on action=list");
+            }
+            if p.older_than_days.is_some() {
+                bail!("error.bad_input: older_than_days applies to prune only");
+            }
+            if p.route.is_some() {
+                bail!("error.bad_input: route applies to scrub only");
+            }
+        }
+        "prune" => {
+            if p.route.is_some() {
+                bail!("error.bad_input: route applies to scrub only");
+            }
+        }
+        "scrub" => {
+            if p.older_than_days.is_some() {
+                bail!("error.bad_input: older_than_days applies to prune only");
+            }
+            if p.limit.is_some() || p.offset.is_some() {
+                bail!(
+                    "error.bad_input: limit and offset page the list/prune partition inventory; \
+                     scrub reports classification counts for one route"
+                );
+            }
+        }
+        _ => unreachable!("action vocabulary was validated above"),
+    }
+    Ok(action.to_string())
 }
 
 /// Partition lifecycle (`bbox_embed_partitions`). Deliberately separate
@@ -150,8 +203,9 @@ pub struct EmbedPartitionsParams {
 /// orphaned vector spaces are different operator decisions
 /// (design/corpus/agentic-corpus/multimodal-embedding-routing.md Layer 5).
 pub fn embed_partitions(p: &EmbedPartitionsParams, state: &SharedState) -> Result<String> {
+    let action = validate_partition_params(p)?;
     let router = EmbeddingRouter::load_default().unwrap_or_default();
-    if p.action.as_deref().map(str::trim) == Some("scrub") {
+    if action == "scrub" {
         return embed_partitions_scrub(p, state, &router);
     }
     let infos = crate::vectors::partition_infos()?
@@ -370,11 +424,19 @@ fn embed_partitions_with(
         })
         .collect::<Vec<_>>();
 
+    let mut page = bbox_corpus_core::response_page::collection_page(
+        partitions,
+        "partitions",
+        p.limit,
+        p.offset,
+    )?;
+    page["action"] = json!(action);
+    page["continuation"] = json!(
+        "live inventory; the partition set can change between pages; restart at offset 0 after lifecycle actions"
+    );
+
     if action == "list" {
-        return Ok(serde_json::to_string_pretty(&json!({
-            "action": "list",
-            "partitions": partitions,
-        }))?);
+        return Ok(serde_json::to_string_pretty(&page)?);
     }
 
     let Some(older_than_days) = p.older_than_days else {
@@ -422,16 +484,13 @@ fn embed_partitions_with(
         }
     }
 
-    Ok(serde_json::to_string_pretty(&json!({
-        "action": "prune",
-        "dry_run": !p.apply,
-        "older_than_days": older_than_days,
-        "prune_candidates": candidates,
-        "pruned": pruned,
-        "skipped": skipped,
-        "errors": errors,
-        "partitions": partitions,
-    }))?)
+    page["dry_run"] = json!(!p.apply);
+    page["older_than_days"] = json!(older_than_days);
+    page["prune_candidates"] = json!(candidates);
+    page["pruned"] = json!(pruned);
+    page["skipped"] = json!(skipped);
+    page["errors"] = json!(errors);
+    Ok(serde_json::to_string_pretty(&page)?)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2108,6 +2167,8 @@ mod tests {
             older_than_days: None,
             apply: false,
             route: None,
+            limit: None,
+            offset: None,
         };
         let rendered =
             embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap();
@@ -2151,6 +2212,8 @@ pdf_figure = "voyage_visual"
             older_than_days: Some(30),
             apply: true,
             route: None,
+            limit: None,
+            offset: None,
         };
         let mut removed = Vec::new();
         let rendered = embed_partitions_with(
@@ -2225,6 +2288,8 @@ pdf_figure = "voyage_visual"
             older_than_days: None,
             apply: false,
             route: None,
+            limit: None,
+            offset: None,
         };
         let err = embed_partitions_with(
             &params,
@@ -2247,6 +2312,8 @@ pdf_figure = "voyage_visual"
             older_than_days: Some(30),
             apply: false,
             route: None,
+            limit: None,
+            offset: None,
         };
         let rendered = embed_partitions_with(&params, &router, infos, now, |_| {
             panic!("dry run must not delete")
@@ -2281,6 +2348,8 @@ pdf_figure = "voyage_visual"
             older_than_days: Some(30),
             apply: true,
             route: None,
+            limit: None,
+            offset: None,
         };
         let mut removed = Vec::new();
         let rendered = embed_partitions_with(&params, &router, infos, now, |route| {
@@ -2295,6 +2364,143 @@ pdf_figure = "voyage_visual"
         let skipped = value["skipped"].as_array().unwrap();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["route"], "voyage-new-model-1024-cafebabe");
+    }
+
+    #[test]
+    fn partition_params_validate_closed_action_vocabulary_before_scans() {
+        let unknown = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("explode".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        let rendered = format!("{unknown:#}");
+        assert!(
+            rendered.contains("unknown action `explode`"),
+            "error must name the rejected action: {rendered}"
+        );
+        assert!(
+            rendered.contains("scrub"),
+            "closed vocabulary must include scrub: {rendered}"
+        );
+
+        let list_apply = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("list".into()),
+            apply: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(list_apply.to_string().contains("apply"));
+
+        let list_age = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("list".into()),
+            older_than_days: Some(30),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(list_age.to_string().contains("older_than_days"));
+
+        let prune_route = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            route: Some("voyage-1024".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(prune_route.to_string().contains("route"));
+
+        let scrub_age = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("scrub".into()),
+            route: Some("voyage-1024".into()),
+            older_than_days: Some(30),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(scrub_age.to_string().contains("older_than_days"));
+
+        let scrub_paging = validate_partition_params(&EmbedPartitionsParams {
+            action: Some("scrub".into()),
+            route: Some("voyage-1024".into()),
+            limit: Some(20),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(scrub_paging.to_string().contains("limit and offset"));
+
+        assert_eq!(
+            validate_partition_params(&EmbedPartitionsParams::default()).unwrap(),
+            "list"
+        );
+    }
+
+    #[test]
+    fn partition_inventory_pages_with_totals_and_live_view_note() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let infos: Vec<_> = (0..5)
+            .map(|n| partition_info(&format!("orphan-{n}-1024-deadbeef"), 90, now))
+            .collect();
+        let params = EmbedPartitionsParams {
+            action: Some("list".into()),
+            limit: Some(2),
+            offset: Some(1),
+            ..Default::default()
+        };
+        let rendered =
+            embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["total"], 5);
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["offset"], 1);
+        assert_eq!(value["next_offset"], 3);
+        assert_eq!(value["partitions"][0]["route"], "orphan-0-1024-deadbeef");
+        assert_eq!(value["partitions"][1]["route"], "orphan-1-1024-deadbeef");
+        assert!(
+            value["continuation"]
+                .as_str()
+                .unwrap()
+                .contains("live inventory"),
+            "continuation must state that the underlying view can change"
+        );
+
+        let prune_params = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let infos = vec![
+            partition_info("voyage-old-model-1024-deadbeef", 90, now),
+            partition_info("voyage-older-model-1024-cafebabe", 120, now),
+        ];
+        let rendered =
+            embed_partitions_with(&prune_params, &router, infos, now, |_| unreachable!()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["action"], "prune");
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["next_offset"], 1);
+        assert_eq!(
+            value["prune_candidates"].as_array().unwrap().len(),
+            2,
+            "prune decisions cover the whole projection even when the inventory is paged"
+        );
+    }
+
+    #[test]
+    fn oversized_partition_row_refuses_rather_than_silent_trim() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let infos = vec![partition_info(&"r".repeat(30_000), 1, now)];
+        let params = EmbedPartitionsParams {
+            action: Some("list".into()),
+            ..Default::default()
+        };
+        let err =
+            embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap_err();
+        assert!(
+            err.to_string().contains("collection_row_too_large"),
+            "oversized single partition rows must refuse explicitly: {err:#}"
+        );
     }
 
     #[test]
