@@ -245,7 +245,7 @@ impl BlackboxServer {
 
         let limit = p.limit.unwrap_or(20).clamp(1, 100);
         let offset = p.offset.unwrap_or(0);
-        let verdict = surface_verdict_summary(&decision.verdict);
+        let verdict = Self::surface_verdict_summary(&decision.verdict);
         if matches!(p.detail, Some(McpSurfaceDetail::Policy)) {
             let rows = Self::surface_policy_rows(&decision.verdict);
             let page = serde_json::json!({
@@ -354,7 +354,7 @@ impl BlackboxServer {
         );
         drop(packets);
 
-        let verdict = surface_verdict_summary(&decision.verdict);
+        let verdict = Self::surface_verdict_summary(&decision.verdict);
         let limit = p.limit.unwrap_or(20).clamp(1, 100);
         let offset = p.offset.unwrap_or(0);
         if matches!(p.detail, Some(McpSurfaceDetail::Policy)) {

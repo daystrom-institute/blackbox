@@ -153,13 +153,7 @@ async fn review_list_serialized_envelope_bounds_worst_case_escaping() {
             entry
         })
         .collect();
-    fixture.install_publication(
-        PROJECT,
-        &scope,
-        &"2".repeat(40),
-        &entries,
-        &[],
-    );
+    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &entries, &[]);
     let server = queue_server(&fixture);
     let result = server
         .bbox_review(Parameters(ReviewParams {

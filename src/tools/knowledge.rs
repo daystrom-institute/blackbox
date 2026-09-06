@@ -8,6 +8,7 @@ use crate::packets::packet_matches_query;
 use crate::server::BlackboxServer;
 use crate::system_memory;
 
+use anyhow::Context;
 use bbox_indexing::accepted_publication_runtime::ERROR_ACCEPTED_PUBLICATION_MISSING;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1734,7 +1735,7 @@ fn exact_entry_detail_response(
     Ok((text, structured))
 }
 
-fn bound_entry_metadata(entry: &mut serde_json::Value) -> bool {
+fn bound_entry_metadata(entry: &mut serde_json::Map<String, serde_json::Value>) -> bool {
     let mut truncated = false;
     for field in [
         "title",
@@ -1746,7 +1747,11 @@ fn bound_entry_metadata(entry: &mut serde_json::Value) -> bool {
         "expires_at",
         "source",
     ] {
-        let Some(value) = entry[field].as_str().map(str::to_string) else {
+        let Some(value) = entry
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
             continue;
         };
         if value.len() > STRUCTURED_KNOWLEDGE_METADATA_BYTES {
@@ -1760,7 +1765,7 @@ fn bound_entry_metadata(entry: &mut serde_json::Value) -> bool {
         }
     }
     for field in ["variants", "providers", "links"] {
-        let Some(value) = entry[field].clone() else {
+        let Some(value) = entry.get(field).cloned() else {
             continue;
         };
         let serialized = serde_json::to_string(&value).unwrap_or_default();
@@ -1790,7 +1795,10 @@ fn bound_structured_knowledge_rows(structured: &mut serde_json::Value, p: &Knowl
             continue;
         };
         let mut truncated = false;
-        if let Some(content) = entry["content"].as_str().map(str::to_string)
+        if let Some(content) = entry
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
             && content.len() > STRUCTURED_KNOWLEDGE_CONTENT_BYTES
         {
             entry["content"] = json!(compact_text_fragment(
