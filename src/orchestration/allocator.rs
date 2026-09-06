@@ -266,12 +266,17 @@ impl ProbeRecord {
     /// truncation marker, and the exact per-lane record stays reachable
     /// through the probe read's bounded body pages.
     pub fn summary_view(&self, now: u64) -> Value {
+        let runtime_expired = runtime_quota_observation_expired(self, now);
         let mut view = serde_json::json!({
             "provider": self.provider.as_str(),
             "credential_status": self.credential_status,
-            "quota_status": self.quota_status,
+            "quota_status": if runtime_expired { &QuotaStatus::Unknown } else { &self.quota_status },
             "quota_confidence": self.quota_confidence,
         });
+        if runtime_expired {
+            view["runtime_observation_expired"] = Value::Bool(true);
+            view["last_observed_quota_status"] = serde_json::json!(self.quota_status);
+        }
         if let Some(account) = &self.account {
             view["account"] = Value::String(account.clone());
         }
@@ -280,7 +285,7 @@ impl ProbeRecord {
             ("seven_day_utilization", self.seven_day_utilization),
             ("balance_capacity", self.balance_capacity),
         ] {
-            if let Some(value) = value {
+            if let Some(value) = value.filter(|_| !runtime_expired) {
                 view[field] = serde_json::json!(value);
             }
         }
@@ -2432,6 +2437,12 @@ mod tests {
         );
         assert!(matches!(probe.quota_status, QuotaStatus::Exhausted));
         assert_eq!(probe.raw_summary.as_deref(), Some("historical runtime 429"));
+        let summary = probe.summary_view(now);
+        assert_eq!(summary["quota_status"], "unknown");
+        assert_eq!(summary["last_observed_quota_status"], "exhausted");
+        assert_eq!(summary["runtime_observation_expired"], true);
+        assert!(summary.get("five_hour_utilization").is_none());
+        assert!(summary.get("seven_day_utilization").is_none());
         assert!(runtime_quota_observation_expired(&probe, now - 1));
         assert!(!runtime_quota_observation_expired(&probe, now - 2));
         probe.credential_status = CredentialStatus::Expired;
