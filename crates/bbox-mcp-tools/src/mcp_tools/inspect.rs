@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use sha2::{Digest, Sha256};
 
 use anyhow::{Result, bail};
 use rmcp::schemars;
@@ -12,6 +14,7 @@ use bbox_providers::entity_loader;
 use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InspectEntityParams {
     pub entity_ref: String,
     /// Knowledge visibility policy: published, own, or all.
@@ -21,14 +24,30 @@ pub struct InspectEntityParams {
     /// Edge direction: out, in, or both (default).
     pub direction: Option<String>,
     /// Maximum edges per family and direction: default 5.
-    /// Zero requests properties only. At most 100 edges are returned overall;
-    /// edge_truncation reports matching and omitted counts when capped.
+    /// Zero requests properties only. At most 100 edges are returned per page.
+    /// Follow edge_page.next_cursor with the same selectors for remaining edges.
     pub per_type_limit: Option<usize>,
     /// Property detail: smart (default, text shortened to 300 characters),
     /// summary (names, status, source identity and freshness), or full.
     /// property_projection identifies omitted/shortened properties and how
     /// to retrieve them in full. Unknown values are errors.
     pub property_mode: Option<String>,
+    /// Opaque edge_page.next_cursor from the preceding response. Keep the same
+    /// entity_ref, direction, edge_types and per_type_limit. Changed evidence
+    /// or selection rejects the cursor; restart without it.
+    #[serde(default)]
+    pub edge_cursor: Option<String>,
+    /// Read this exact property as text pages instead of an edge/property
+    /// overview. Choose a key under properties or property_projection.omitted_keys. Empty strings are
+    /// valid property values; absent keys return error.not_found.
+    #[serde(default)]
+    pub property: Option<String>,
+    /// Opaque body.next_cursor from a preceding read of the same property.
+    #[serde(default)]
+    pub property_cursor: Option<String>,
+    /// Bytes per exact property page: default/max 4096, minimum 4.
+    #[serde(default)]
+    pub property_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +204,27 @@ pub fn inspect_entity(
             ));
         }
     };
+    if p.property.is_none() && (p.property_cursor.is_some() || p.property_limit.is_some()) {
+        return Ok(bad_input_field(
+            "property",
+            "property_cursor and property_limit require property",
+            "Set property to a key returned under properties.",
+        ));
+    }
+    if p.property.is_some() && p.edge_cursor.is_some() {
+        return Ok(bad_input_field(
+            "edge_cursor",
+            "property body reads cannot also continue edges",
+            "Read property pages and edge pages in separate calls.",
+        ));
+    }
+    if p.edge_cursor.is_some() && p.per_type_limit == Some(0) {
+        return Ok(bad_input_field(
+            "per_type_limit",
+            "zero disables edge retrieval",
+            "Continue with the same positive per_type_limit as the preceding edge page.",
+        ));
+    }
     let per_type_limit = p.per_type_limit.unwrap_or(5);
     let edge_filter = parse_edge_filter(p.edge_types.as_deref());
     let provider = providers::provider_for(r.entity_type());
@@ -204,6 +244,9 @@ pub fn inspect_entity(
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };
     let canonical_ref = EntityRef::parse(&entity.ref_string).unwrap_or_else(|_| r.clone());
+    if let Some(property) = p.property.as_deref() {
+        return property_body_response(p, &entity, &canonical_ref, property);
+    }
     let full_neighborhood = if matches!(
         r.entity_type(),
         bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
@@ -226,12 +269,25 @@ pub fn inspect_entity(
         }
         neighborhood
     };
-    entity.neighborhood = filtered_neighborhood(
+    let (neighborhood, edge_page) = match page_neighborhood(
         &full_neighborhood,
+        &canonical_ref.to_string(),
+        &entity.properties,
         direction,
         edge_filter.as_ref(),
         per_type_limit,
-    );
+        p.edge_cursor.as_deref(),
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            return Ok(bad_input_field(
+                "edge_cursor",
+                error.to_string(),
+                "Restart without edge_cursor when evidence or selectors change.",
+            ));
+        }
+    };
+    entity.neighborhood = neighborhood;
     // Resolve freshness only for the bounded preview. Counts and authored
     // next-hop semantics use the complete neighborhood without endpoint loads.
     for edge in entity
@@ -291,26 +347,26 @@ pub fn inspect_entity(
     if !coverage_json.is_empty() {
         out["edge_family_coverage"] = json!(coverage_json);
     }
-    if let Some(truncation) = edge_truncation(
-        &full_neighborhood,
-        &entity.neighborhood,
-        direction,
-        edge_filter.as_ref(),
-        per_type_limit,
-    ) {
-        out["edge_truncation"] = truncation;
+    if let Some(page) = edge_page {
+        out["edge_page"] = page;
     }
-    let omitted = entity.properties.len().saturating_sub(properties.len());
+    let omitted_keys: Vec<&str> = entity
+        .properties
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+        .map(String::as_str)
+        .collect();
     let shortened: Vec<&str> = properties
         .iter()
         .filter(|(key, value)| entity.properties.get(*key) != Some(*value))
         .map(|(key, _)| key.as_str())
         .collect();
-    if omitted > 0 || !shortened.is_empty() {
+    if !omitted_keys.is_empty() || !shortened.is_empty() {
         out["property_projection"] = json!({
-            "omitted": omitted,
+            "omitted": omitted_keys.len(),
+            "omitted_keys": omitted_keys,
             "shortened": shortened,
-            "expand_hint": "Call bbox_inspect_entity with this entity_ref and property_mode=full for complete properties.",
+            "expand_hint": "Use property=<key> for exact text pages and follow body.next_cursor; property_mode=full returns all properties when they fit.",
         });
     }
     Ok(serde_json::to_string_pretty(&out)?)
@@ -426,88 +482,214 @@ fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
     }
 }
 
-fn filtered_neighborhood(
-    full: &Neighborhood,
-    direction: InspectDirection,
-    edge_filter: Option<&HashSet<String>>,
-    per_type_limit: usize,
-) -> Neighborhood {
-    if per_type_limit == 0 {
-        return Neighborhood::default();
-    }
-    let mut forward = if matches!(direction, InspectDirection::Out | InspectDirection::Both) {
-        filter_and_limit(&full.forward, edge_filter, per_type_limit)
-    } else {
-        Vec::new()
-    };
-    let mut reverse = if matches!(direction, InspectDirection::In | InspectDirection::Both) {
-        filter_and_limit(&full.reverse, edge_filter, per_type_limit)
-    } else {
-        Vec::new()
-    };
-    let out_budget = (TOTAL_EDGE_CAP / 2).max(TOTAL_EDGE_CAP.saturating_sub(reverse.len()));
-    forward.truncate(out_budget);
-    reverse.truncate(TOTAL_EDGE_CAP.saturating_sub(forward.len()));
-    Neighborhood { forward, reverse }
-}
-
 const TOTAL_EDGE_CAP: usize = 100;
+const PROPERTY_PAGE_BYTES: usize = 4096;
 
-fn edge_truncation(
+fn cursor_offset(cursor: Option<&str>, revision: &str) -> Result<usize> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let (expected, offset) = cursor
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid continuation cursor"))?;
+    if expected != revision {
+        bail!("evidence or selectors changed; restart without cursor");
+    }
+    offset
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid continuation offset"))
+}
+
+struct OrderedEdge<'a> {
+    round: usize,
+    kind: &'a str,
+    direction: &'static str,
+    within_group: usize,
+    wire: String,
+    edge: &'a Edge,
+}
+
+/// Stable rounds preserve per-family previews while exposing every edge.
+/// A page never crosses a round boundary, so a small family cannot consume
+/// another family's quota; the aggregate cap can split a wide round.
+fn page_neighborhood(
     full: &Neighborhood,
-    returned: &Neighborhood,
+    entity_ref: &str,
+    properties: &BTreeMap<String, String>,
     direction: InspectDirection,
     edge_filter: Option<&HashSet<String>>,
     per_type_limit: usize,
-) -> Option<serde_json::Value> {
-    let matching = |edges: &[Edge]| {
-        edges
-            .iter()
-            .filter(|edge| edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)))
-            .count()
-    };
-    let out = if matches!(direction, InspectDirection::Out | InspectDirection::Both) {
-        matching(&full.forward)
+    cursor: Option<&str>,
+) -> Result<(Neighborhood, Option<serde_json::Value>)> {
+    if per_type_limit == 0 {
+        return Ok((Neighborhood::default(), None));
+    }
+    let mut groups = BTreeMap::<(&str, &'static str), Vec<(String, &Edge)>>::new();
+    for (label, edges, included) in [
+        (
+            "out",
+            &full.forward,
+            matches!(direction, InspectDirection::Out | InspectDirection::Both),
+        ),
+        (
+            "in",
+            &full.reverse,
+            matches!(direction, InspectDirection::In | InspectDirection::Both),
+        ),
+    ] {
+        if !included {
+            continue;
+        }
+        for edge in edges {
+            if edge_filter.is_some_and(|allowed| !allowed.contains(&edge.kind)) {
+                continue;
+            }
+            groups
+                .entry((&edge.kind, label))
+                .or_default()
+                .push((serde_json::to_string(edge)?, edge));
+        }
+    }
+    let mut ordered = Vec::new();
+    for ((kind, direction), mut group) in groups {
+        group.sort_by(|a, b| a.0.cmp(&b.0));
+        for (index, (wire, edge)) in group.into_iter().enumerate() {
+            ordered.push(OrderedEdge {
+                round: index / per_type_limit,
+                kind,
+                direction,
+                within_group: index % per_type_limit,
+                wire,
+                edge,
+            });
+        }
+    }
+    ordered.sort_by(|a, b| {
+        (a.round, a.kind, a.direction, a.within_group).cmp(&(
+            b.round,
+            b.kind,
+            b.direction,
+            b.within_group,
+        ))
+    });
+    let mut hash = Sha256::new();
+    let selected_types = edge_filter.map(|types| types.iter().collect::<BTreeSet<_>>());
+    let authority: BTreeMap<_, _> = properties
+        .iter()
+        .filter(|(key, _)| is_identity_property(key))
+        .collect();
+    hash.update(serde_json::to_vec(&(
+        "inspect-edges-v1",
+        entity_ref,
+        authority,
+        format!("{direction:?}"),
+        selected_types,
+        per_type_limit,
+    ))?);
+    for item in &ordered {
+        hash.update(item.direction.as_bytes());
+        hash.update(item.wire.as_bytes());
+    }
+    let revision = format!("{:x}", hash.finalize());
+    let offset = cursor_offset(cursor, &revision)?;
+    if offset > ordered.len() {
+        bail!("continuation offset exceeds selected edge count");
+    }
+    let mut page = Neighborhood::default();
+    let mut end = offset;
+    if let Some(first) = ordered.get(offset) {
+        for item in ordered.iter().skip(offset).take(TOTAL_EDGE_CAP) {
+            if item.round != first.round {
+                break;
+            }
+            if item.direction == "out" {
+                page.forward.push(item.edge.clone());
+            } else {
+                page.reverse.push(item.edge.clone());
+            }
+            end += 1;
+        }
+    }
+    let metadata = if end < ordered.len() || offset > 0 {
+        let mut value =
+            json!({"matching": ordered.len(), "offset": offset, "returned": end - offset});
+        if end < ordered.len() {
+            value["next_cursor"] = json!(format!("{revision}:{end}"));
+        }
+        Some(value)
     } else {
-        0
+        None
     };
-    let inbound = if matches!(direction, InspectDirection::In | InspectDirection::Both) {
-        matching(&full.reverse)
-    } else {
-        0
-    };
-    let out_omitted = out.saturating_sub(returned.forward.len());
-    let in_omitted = inbound.saturating_sub(returned.reverse.len());
-    (out_omitted + in_omitted > 0).then(|| json!({
-        "matching": out + inbound,
-        "returned": returned.forward.len() + returned.reverse.len(),
-        "out_omitted": out_omitted,
-        "in_omitted": in_omitted,
-        "per_type_limit": per_type_limit,
-        "total_limit": TOTAL_EDGE_CAP,
-        "next_step": "This is a capped preview. Narrow edge_types and direction, or increase per_type_limit within the total limit. There is no edge continuation cursor.",
-    }))
+    Ok((page, metadata))
 }
 
-fn filter_and_limit(
-    edges: &[Edge],
-    edge_filter: Option<&HashSet<String>>,
-    per_type_limit: usize,
-) -> Vec<Edge> {
-    let mut counts = HashMap::<&str, usize>::new();
-    let mut out = Vec::new();
-    for edge in edges {
-        if edge_filter.is_some_and(|allowed| !allowed.contains(&edge.kind)) {
-            continue;
+fn property_body_response(
+    p: &InspectEntityParams,
+    entity: &EntityView,
+    canonical_ref: &EntityRef,
+    property: &str,
+) -> Result<String> {
+    let Some(value) = entity.properties.get(property) else {
+        return Ok(json!({"status":"error.not_found", "error": {"code":"error.not_found", "field":"property", "message":format!("No property named {property}")}, "entity_ref":canonical_ref.to_string()}).to_string());
+    };
+    let mut hash = Sha256::new();
+    let authority: BTreeMap<_, _> = entity
+        .properties
+        .iter()
+        .filter(|(key, _)| is_identity_property(key))
+        .collect();
+    hash.update(serde_json::to_vec(&(
+        "inspect-property-v1",
+        &entity.ref_string,
+        property,
+        value,
+        authority,
+    ))?);
+    let revision = format!("{:x}", hash.finalize());
+    let offset = match cursor_offset(p.property_cursor.as_deref(), &revision) {
+        Ok(offset) if offset <= value.len() && value.is_char_boundary(offset) => offset,
+        Ok(_) => {
+            return Ok(bad_input_field(
+                "property_cursor",
+                "invalid property byte boundary",
+                "Restart this property read without property_cursor.",
+            ));
         }
-        let count = counts.entry(edge.kind.as_str()).or_default();
-        if *count >= per_type_limit {
-            continue;
+        Err(error) => {
+            return Ok(bad_input_field(
+                "property_cursor",
+                error.to_string(),
+                "Restart this property read without property_cursor.",
+            ));
         }
-        *count += 1;
-        out.push(edge.clone());
+    };
+    let mut end = offset
+        .saturating_add(
+            p.property_limit
+                .unwrap_or(PROPERTY_PAGE_BYTES)
+                .clamp(4, PROPERTY_PAGE_BYTES),
+        )
+        .min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-    out
+    let mut body = json!({"text": &value[offset..end], "offset":offset, "total_bytes":value.len()});
+    if end < value.len() {
+        body["next_cursor"] = json!(format!("{revision}:{end}"));
+    }
+    let identity: BTreeMap<_, _> = entity
+        .properties
+        .iter()
+        .filter(|(key, _)| is_identity_property(key) && key.as_str() != property)
+        .collect();
+    let mut out = json!({
+        "status":"ok", "entity_ref":canonical_ref.to_string(), "entity_type":canonical_ref.entity_type().as_str(),
+        "property":property, "body":body,
+    });
+    if !identity.is_empty() {
+        out["source"] = json!(identity);
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> Vec<RenderedEdge> {
@@ -593,14 +775,22 @@ fn next_hop_line(hop: &RenderedNextHop) -> String {
     )
 }
 
-fn is_identity_property(key: &str) -> bool {
+pub(super) fn is_identity_property(key: &str) -> bool {
     key.ends_with("_id")
         || key.ends_with("_ref")
         || key.ends_with("_generation")
+        || key.ends_with("_version")
+        || key.ends_with("_hash")
         || key.starts_with("evidence.")
         || matches!(
             key,
             "ref"
+                | "sha"
+                | "commit_sha"
+                | "version"
+                | "fingerprint"
+                | "updated_at"
+                | "observed_at"
                 | "source_uri"
                 | "relative_path"
                 | "generation"
@@ -731,8 +921,22 @@ mod tests {
     }
 
     #[test]
+    fn property_and_edge_continuation_fields_reject_misspellings() {
+        assert!(
+            serde_json::from_value::<InspectEntityParams>(json!({
+                "entity_ref":"knowledge:example", "edge_cusror":"wrong",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn invalid_options_report_the_actual_field_before_loading_an_entity() {
         let mut params = InspectEntityParams {
+            edge_cursor: None,
+            property: None,
+            property_cursor: None,
+            property_limit: None,
             entity_ref: "knowledge:missing".into(),
             provisional: None,
             edge_types: None,
@@ -809,23 +1013,38 @@ mod tests {
                 })
                 .collect(),
         };
-        let preview = filtered_neighborhood(&full, InspectDirection::Both, None, 5);
+        let (preview, page) = page_neighborhood(
+            &full,
+            "knowledge:center",
+            &BTreeMap::new(),
+            InspectDirection::Both,
+            None,
+            5,
+            None,
+        )
+        .unwrap();
         assert_eq!(preview.forward.len(), 50);
         assert_eq!(preview.reverse.len(), 50);
-        let omitted = edge_truncation(&full, &preview, InspectDirection::Both, None, 5).unwrap();
-        assert_eq!(omitted["matching"], 300);
-        assert_eq!(omitted["returned"], 100);
-        assert_eq!(omitted["out_omitted"], 100);
-        assert_eq!(omitted["in_omitted"], 100);
+        let page = page.unwrap();
+        assert_eq!(page["matching"], 300);
+        assert_eq!(page["returned"], 100);
+        assert!(page["next_cursor"].is_string());
 
         let filter = HashSet::from(["FAMILY_0".into()]);
-        let targeted = filtered_neighborhood(&full, InspectDirection::In, Some(&filter), 5);
+        let (targeted, page) = page_neighborhood(
+            &full,
+            "knowledge:center",
+            &BTreeMap::new(),
+            InspectDirection::In,
+            Some(&filter),
+            5,
+            None,
+        )
+        .unwrap();
         assert!(targeted.forward.is_empty());
-        let omitted =
-            edge_truncation(&full, &targeted, InspectDirection::In, Some(&filter), 5).unwrap();
-        assert_eq!(omitted["matching"], 10);
-        assert_eq!(omitted["in_omitted"], 5);
-        assert_eq!(omitted["out_omitted"], 0);
+        let page = page.unwrap();
+        assert_eq!(page["matching"], 10);
+        assert_eq!(page["returned"], 5);
     }
 
     #[test]
@@ -845,12 +1064,226 @@ mod tests {
                 .collect(),
             reverse: Vec::new(),
         };
-        let preview = filtered_neighborhood(&full, InspectDirection::Out, None, 75);
+        let (preview, page) = page_neighborhood(
+            &full,
+            "knowledge:center",
+            &BTreeMap::new(),
+            InspectDirection::Out,
+            None,
+            75,
+            None,
+        )
+        .unwrap();
         assert_eq!(preview.forward.len(), 75);
-        let omission = edge_truncation(&full, &preview, InspectDirection::Out, None, 75).unwrap();
-        assert_eq!(omission["per_type_limit"], 75);
-        assert_eq!(omission["matching"], 90);
-        assert_eq!(omission["out_omitted"], 15);
+        let page = page.unwrap();
+        assert_eq!(page["matching"], 90);
+        assert_eq!(page["returned"], 75);
+        let (tail, last_page) = page_neighborhood(
+            &full,
+            "knowledge:center",
+            &BTreeMap::new(),
+            InspectDirection::Out,
+            None,
+            75,
+            page["next_cursor"].as_str(),
+        )
+        .unwrap();
+        assert_eq!(tail.forward.len(), 15);
+        assert!(last_page.unwrap().get("next_cursor").is_none());
+    }
+
+    #[test]
+    fn edge_continuation_visits_every_selected_edge_once_and_rejects_changed_selection() {
+        use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+        let mut full = Neighborhood {
+            forward: (0..315)
+                .map(|index| Edge {
+                    source: EntityRef::parse("knowledge:source").unwrap(),
+                    target: EntityRef::parse(&format!("knowledge:target{index}")).unwrap(),
+                    kind: format!("FAMILY_{}", index % 21),
+                    provenance: EdgeProvenance::Derived,
+                    confidence: EdgeConfidence::Exact,
+                    metadata: BTreeMap::from([("evidence.freshness".into(), "stale".into())]),
+                    project_id: None,
+                })
+                .collect(),
+            reverse: Vec::new(),
+        };
+        let properties = BTreeMap::from([("generation".into(), "generation-1".into())]);
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let (page, metadata) = page_neighborhood(
+                &full,
+                "knowledge:source",
+                &properties,
+                InspectDirection::Out,
+                None,
+                5,
+                cursor.as_deref(),
+            )
+            .unwrap();
+            assert!(page.forward.len() <= TOTAL_EDGE_CAP);
+            for edge in page.forward {
+                assert_eq!(edge.metadata["evidence.freshness"], "stale");
+                assert!(
+                    seen.insert(edge.target.to_string()),
+                    "duplicate across pages"
+                );
+            }
+            cursor = metadata.and_then(|meta| meta["next_cursor"].as_str().map(str::to_string));
+            if cursor.is_none() {
+                break;
+            }
+            // Input enumeration order cannot invalidate or reorder continuation.
+            full.forward.reverse();
+        }
+        assert_eq!(seen.len(), 315);
+        let (_, first) = page_neighborhood(
+            &full,
+            "knowledge:source",
+            &properties,
+            InspectDirection::Out,
+            None,
+            5,
+            None,
+        )
+        .unwrap();
+        let first = first.unwrap();
+        let cursor = first["next_cursor"].as_str();
+        let mut ticking_properties = properties.clone();
+        ticking_properties.insert("elapsed".into(), "updated display value".into());
+        assert!(
+            page_neighborhood(
+                &full,
+                "knowledge:source",
+                &ticking_properties,
+                InspectDirection::Out,
+                None,
+                5,
+                cursor
+            )
+            .is_ok()
+        );
+        assert!(
+            page_neighborhood(
+                &full,
+                "knowledge:source",
+                &properties,
+                InspectDirection::In,
+                None,
+                5,
+                cursor
+            )
+            .is_err()
+        );
+        assert!(
+            page_neighborhood(
+                &full,
+                "knowledge:source",
+                &properties,
+                InspectDirection::Out,
+                None,
+                6,
+                cursor
+            )
+            .is_err()
+        );
+        full.forward[0]
+            .metadata
+            .insert("evidence.freshness".into(), "current".into());
+        assert!(
+            page_neighborhood(
+                &full,
+                "knowledge:source",
+                &properties,
+                InspectDirection::Out,
+                None,
+                5,
+                cursor
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn property_body_pages_are_exact_utf8_and_revision_bound() {
+        let reference = EntityRef::parse("knowledge:example").unwrap();
+        let original = "🦀 café\n".repeat(1800);
+        let mut entity = EntityView {
+            ref_string: reference.to_string(),
+            entity_type: reference.entity_type(),
+            properties: BTreeMap::from([
+                ("content".into(), original.clone()),
+                ("generation".into(), "v1".into()),
+                ("source_uri".into(), "blackbox://knowledge/example".into()),
+            ]),
+            neighborhood: Neighborhood::default(),
+            next_hop_hints: Vec::new(),
+        };
+        let mut params = InspectEntityParams {
+            entity_ref: reference.to_string(),
+            provisional: None,
+            edge_types: None,
+            direction: None,
+            per_type_limit: None,
+            property_mode: None,
+            edge_cursor: None,
+            property: Some("content".into()),
+            property_cursor: None,
+            property_limit: Some(101),
+        };
+        let mut reconstructed = String::new();
+        loop {
+            let page: serde_json::Value = serde_json::from_str(
+                &property_body_response(&params, &entity, &reference, "content").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(page["source"]["generation"], "v1");
+            assert!(page.get("edges").is_none());
+            let text = page["body"]["text"].as_str().unwrap();
+            assert!(text.len() <= 101);
+            reconstructed.push_str(text);
+            params.property_cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+            if params.property_cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(reconstructed, original);
+        let first: serde_json::Value = serde_json::from_str(
+            &property_body_response(&params, &entity, &reference, "content").unwrap(),
+        )
+        .unwrap();
+        params.property_cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
+        entity
+            .properties
+            .insert("elapsed".into(), "updated display value".into());
+        let continued: serde_json::Value = serde_json::from_str(
+            &property_body_response(&params, &entity, &reference, "content").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(continued["status"], "ok");
+        entity.properties.insert("generation".into(), "v2".into());
+        let rejected: serde_json::Value = serde_json::from_str(
+            &property_body_response(&params, &entity, &reference, "content").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rejected["status"], "error.bad_input");
+        assert_eq!(rejected["error"]["field"], "property_cursor");
+        params.property_cursor = None;
+        entity.properties.insert("content".into(), String::new());
+        let empty: serde_json::Value = serde_json::from_str(
+            &property_body_response(&params, &entity, &reference, "content").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty["status"], "ok");
+        assert_eq!(empty["body"]["text"], "");
+        assert_eq!(empty["body"]["total_bytes"], 0);
+        let missing: serde_json::Value = serde_json::from_str(
+            &property_body_response(&params, &entity, &reference, "absent").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(missing["status"], "error.not_found");
     }
 
     #[test]
@@ -909,6 +1342,10 @@ mod tests {
             "/../../system-defaults/memories"
         )));
         let params = InspectEntityParams {
+            edge_cursor: None,
+            property: None,
+            property_cursor: None,
+            property_limit: None,
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             provisional: None,
             edge_types: None,
@@ -929,6 +1366,13 @@ mod tests {
         assert_eq!(value["status"], "ok");
         assert!(value.get("text").is_none());
         assert!(value["property_projection"]["omitted"].as_u64().unwrap() > 0);
+        assert!(
+            value["property_projection"]["omitted_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| key == "content")
+        );
         assert!(value["property_projection"]["expand_hint"].is_string());
         assert_eq!(
             value["entity_ref"],
@@ -945,6 +1389,10 @@ mod tests {
         // EdgeIndex::forward_edges_with_synthesis, and the (required) edge
         // family coverage row must report it present.
         let params = InspectEntityParams {
+            edge_cursor: None,
+            property: None,
+            property_cursor: None,
+            property_limit: None,
             entity_ref: "transcript:claude:sess-1:42:0".into(),
             provisional: None,
             edge_types: None,
@@ -990,6 +1438,10 @@ mod tests {
             "/../../system-defaults/memories"
         )));
         let params = InspectEntityParams {
+            edge_cursor: None,
+            property: None,
+            property_cursor: None,
+            property_limit: None,
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             provisional: None,
             edge_types: None,

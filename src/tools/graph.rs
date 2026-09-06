@@ -2042,6 +2042,10 @@ mod tests {
     async fn inspect_published(server: &BlackboxServer, entity_ref: &str) -> serde_json::Value {
         let result = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
+                edge_cursor: None,
+                property: None,
+                property_cursor: None,
+                property_limit: None,
                 entity_ref: entity_ref.to_string(),
                 provisional: Some("published".into()),
                 edge_types: None,
@@ -2510,6 +2514,10 @@ mod tests {
 
         let inspected = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
+                edge_cursor: None,
+                property: None,
+                property_cursor: None,
+                property_limit: None,
                 entity_ref: format!("project_graph_vertex:{project_id}:records:filing-1"),
                 provisional: Some("published".into()),
                 edge_types: None,
@@ -2614,6 +2622,10 @@ mod tests {
             format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
         let inspected = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
+                edge_cursor: None,
+                property: None,
+                property_cursor: None,
+                property_limit: None,
                 entity_ref: vertex_ref.clone(),
                 provisional: Some("published".into()),
                 edge_types: None,
@@ -3477,6 +3489,10 @@ mod tests {
             async move {
                 let result = server
                     .bbox_inspect_entity(Parameters(InspectEntityParams {
+                        edge_cursor: None,
+                        property: None,
+                        property_cursor: None,
+                        property_limit: None,
                         entity_ref,
                         provisional: None,
                         edge_types: None,
@@ -3722,6 +3738,10 @@ mod tests {
             async move {
                 let result = server
                     .bbox_inspect_entity(Parameters(InspectEntityParams {
+                        edge_cursor: None,
+                        property: None,
+                        property_cursor: None,
+                        property_limit: None,
                         entity_ref,
                         provisional: None,
                         edge_types: None,
@@ -3774,6 +3794,10 @@ mod tests {
 
         let result = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
+                edge_cursor: None,
+                property: None,
+                property_cursor: None,
+                property_limit: None,
                 entity_ref: "thread:thread-00000000".into(),
                 provisional: None,
                 edge_types: None,

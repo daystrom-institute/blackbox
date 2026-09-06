@@ -25,9 +25,10 @@ pub struct BundleEvidenceParams {
     /// Knowledge visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
-    /// Entity properties: full (default), summary (strings shortened to 600
-    /// characters), or none. Unknown modes are rejected. Shortened summaries
-    /// are marked; repeat with full and fewer entity_refs for complete bodies.
+    /// Entity properties: summary (default, text shortened to 600 characters),
+    /// full, or none. Source identity/freshness is never shortened. Shortened
+    /// property keys are listed per entity; retrieve exact text through
+    /// bbox_inspect_entity(entity_ref=..., property=<key>) and its body cursor.
     #[serde(default)]
     pub property_mode: Option<String>,
 }
@@ -112,12 +113,8 @@ pub fn bundle_evidence(
     let intra_bundle_convergences_truncated =
         intra_bundle_convergence_count > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_convergences.truncate(INTRA_BUNDLE_EDGE_CAP);
-    // Build `degraded` from only the signal-bearing facts. A clean bundle —
-    // nothing stale, nothing unresolved, nothing omitted or truncated, full
-    // property mode — degraded to nothing, so the whole block is dropped rather
-    // than emitting `{stale_path_ids: [], omitted_entity_refs: 0, ...}` padding
-    // on every healthy response. property_mode is surfaced only when it altered
-    // the payload (summary/none); "full" is the no-op default a reader assumes.
+    // Retrieval degradation is distinct from the requested property projection.
+    // Only stale, unresolved, or budget-omitted evidence enters this block.
     let mut degraded = serde_json::Map::new();
     if !stale_path_ids.is_empty() {
         degraded.insert("stale_path_ids".into(), json!(stale_path_ids));
@@ -148,23 +145,35 @@ pub fn bundle_evidence(
             json!(intra_bundle_convergence_count - INTRA_BUNDLE_EDGE_CAP),
         );
     }
-    if property_mode != PropertyMode::Full {
-        degraded.insert("property_mode".into(), json!(property_mode.as_str()));
-    }
     let mut out = json!({
         "status": "ok",
         "question": p.question,
-        "entities": entities.iter().map(|(r, properties)| json!({
-            "entity_ref": r.to_string(),
-            "label": render_node(ctx, r),
-            "properties": properties_for_mode(properties, property_mode),
-        })).collect::<Vec<_>>(),
+        "entities": entities.iter().map(|(r, properties)| {
+            let mut entity = json!({
+                "entity_ref": r.to_string(),
+                "label": render_node(ctx, r),
+                "properties": properties_for_mode(properties, property_mode),
+            });
+            if property_mode == PropertyMode::Summary {
+                let shortened: Vec<&str> = properties.iter().filter(|(key, value)|
+                    !super::inspect::is_identity_property(key) && value.chars().count() > 600
+                ).map(|(key, _)| key.as_str()).collect();
+                if !shortened.is_empty() { entity["shortened_properties"] = json!(shortened); }
+            }
+            entity
+        }).collect::<Vec<_>>(),
         "paths": paths.iter().map(|path| json!({
             "id": path.id,
             "summary": render_path(ctx, path),
             "steps": path.steps,
         })).collect::<Vec<_>>(),
     });
+    if property_mode != PropertyMode::Full {
+        out["property_mode"] = json!(property_mode.as_str());
+        out["properties_hint"] = json!(
+            "Use bbox_inspect_entity(entity_ref=..., property=<key>) for exact text pages; follow body.next_cursor with property_cursor."
+        );
+    }
     // Intra-bundle structure is the exception, not the rule — most bundles have
     // none. Emit these arrays only when non-empty so the common case doesn't
     // carry two empty lists.
@@ -189,7 +198,12 @@ enum PropertyMode {
 
 impl PropertyMode {
     fn from_param(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("full").trim().to_ascii_lowercase().as_str() {
+        match raw
+            .unwrap_or("summary")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "summary" | "compact" => Ok(Self::Summary),
             "none" | "omit" | "omitted" => Ok(Self::None),
             "full" => Ok(Self::Full),
@@ -213,7 +227,14 @@ fn properties_for_mode(properties: &BTreeMap<String, String>, mode: PropertyMode
         PropertyMode::Summary => json!(
             properties
                 .iter()
-                .map(|(key, value)| (key.clone(), truncate_property(value, 600)))
+                .map(|(key, value)| (
+                    key.clone(),
+                    if super::inspect::is_identity_property(key) {
+                        value.clone()
+                    } else {
+                        truncate_property(value, 600)
+                    }
+                ))
                 .collect::<BTreeMap<_, _>>()
         ),
     }
@@ -531,7 +552,7 @@ mod tests {
 
     #[test]
     fn clean_bundle_omits_degraded_and_empty_intra_arrays() {
-        // A single resolvable ref, full property mode, no paths: nothing
+        // A single resolvable ref, summary property mode, no paths: nothing
         // degraded and no intra-bundle structure. The padding blocks should
         // be absent entirely.
         bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
@@ -554,6 +575,20 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["status"], "ok");
+        assert_eq!(value["property_mode"], "summary");
+        assert!(
+            value["entities"][0]["shortened_properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| key == "content")
+        );
+        assert!(
+            value["properties_hint"]
+                .as_str()
+                .unwrap()
+                .contains("property_cursor")
+        );
         for absent in [
             "text",
             "degraded",
@@ -579,6 +614,32 @@ mod tests {
         let content = summarized["content"].as_str().unwrap();
         assert!(content.len() < 700);
         assert!(content.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn bundle_defaults_to_summary_without_shortening_source_identity() {
+        assert_eq!(
+            PropertyMode::from_param(None).unwrap(),
+            PropertyMode::Summary
+        );
+        let properties = BTreeMap::from([
+            ("content".into(), "body".repeat(300)),
+            ("source_uri".into(), "opaque".repeat(200)),
+            ("evidence.freshness".into(), "stale".into()),
+        ]);
+        let summary = properties_for_mode(&properties, PropertyMode::Summary);
+        assert_eq!(summary["source_uri"], properties["source_uri"]);
+        assert_eq!(summary["evidence.freshness"], "stale");
+        assert!(
+            summary["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("...[truncated]")
+        );
+        assert_eq!(
+            properties_for_mode(&properties, PropertyMode::Full)["content"],
+            properties["content"]
+        );
     }
 
     #[test]
