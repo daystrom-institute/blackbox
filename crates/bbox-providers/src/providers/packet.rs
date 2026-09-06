@@ -36,6 +36,9 @@ impl InspectableEntityProvider for PacketProvider {
             if let Some(project) = packet.project {
                 properties.insert("project".into(), project);
             }
+            if let Some(project_id) = packet.project_id {
+                properties.insert("project_id".into(), project_id);
+            }
             properties.insert("rule_count".into(), packet.rules.len().to_string());
             properties.insert(
                 "classification_lattice".into(),
@@ -56,6 +59,7 @@ impl InspectableEntityProvider for PacketProvider {
                 "domain",
                 "scope",
                 "project",
+                "project_id",
                 "rule_count",
                 "classification_lattice",
                 "created_at",

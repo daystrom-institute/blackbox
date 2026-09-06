@@ -64,7 +64,12 @@ pub struct CompileParams {
     /// Rules serialized as a JSON array. Each rule is
     /// `{ id, antecedent: <Predicate>, consequent: <Value>, classification?: string,
     ///   emit?: "independent"|"fallback", confidence?: f32, provenance?: [string] }`.
-    /// Predicate AST operators are documented in the module-level doc comment.
+    /// Consequents are JSON scalars: string, boolean, integer, or float.
+    /// Objects, arrays, and null are not supported consequent values.
+    /// Predicates use a case-sensitive `op` tag, for example
+    /// `{"op":"Eq","field":"tests_pass","value":true}` or `{"op":"True"}`.
+    /// Fetch bbox_knowledge(query="sm-rule-packets") for the complete operator
+    /// reference and composition examples before authoring complex predicates.
     pub rules: serde_json::Value,
     /// Classification lattice, highest priority first. Defaults to the
     /// review lattice `["fail", "flag", "manual", "pass", "info"]` when
@@ -101,7 +106,7 @@ pub struct CompileParams {
     /// global or project (default: global)
     #[serde(default)]
     pub scope: Option<String>,
-    /// Project path for project-scoped packets
+    /// Project selector (registered ID or alias) for project-scoped packets.
     #[serde(default)]
     pub project: Option<String>,
     /// Internal, not part of the MCP schema: the resolving authority's

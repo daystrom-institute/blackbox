@@ -271,7 +271,7 @@ mod tests {
             "rank_lookup_key":"actor", "threshold_lookup_key":"asset",
             "classification_lattice":["pass"], "prefix_inference":{"allow_":"pass"},
             "rules":[{"id":"allow_complete", "antecedent":{"op":"True"},
-                "consequent":{"message":"bounded \"λ🙂\" ".repeat(700)}, "classification":"pass"}],
+                "consequent":"bounded \"λ🙂\" ".repeat(700), "classification":"pass"}],
             "source_ids":["fixture:packet-inspection"],
         }))
         .unwrap();
