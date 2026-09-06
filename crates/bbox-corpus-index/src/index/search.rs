@@ -3,10 +3,10 @@ use std::fs;
 use std::io::BufRead;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
@@ -18,7 +18,39 @@ use super::passes::*;
 use super::project_files;
 use super::{FieldHandles, FileMeta, TranscriptIndex};
 use bbox_corpus_core::query::smart_query_to_tantivy;
-use bro_transcript as parser;
+
+#[derive(Debug)]
+struct IndexedTranscriptMessage {
+    locator: String,
+    session_id: String,
+    source: String,
+    entity_ref: String,
+    byte_offset: u64,
+    role: String,
+    timestamp: String,
+    content: String,
+}
+
+impl IndexedTranscriptMessage {
+    fn response(&self, max_bytes: usize) -> Value {
+        let mut end = self.content.len().min(max_bytes);
+        while !self.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut row = serde_json::json!({
+            "locator": self.locator, "session_id": self.session_id, "source": self.source,
+            "byte_offset": self.byte_offset, "role": self.role,
+            "content": &self.content[..end], "content_truncated": end < self.content.len(),
+        });
+        if !self.entity_ref.is_empty() {
+            row["entity_ref"] = Value::String(self.entity_ref.clone());
+        }
+        if !self.timestamp.is_empty() {
+            row["timestamp"] = Value::String(self.timestamp.clone());
+        }
+        row
+    }
+}
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -431,37 +463,49 @@ impl TranscriptSearchMode {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextParams {
-    /// Path to the JSONL transcript file
+    /// Exact stored transcript locator from bbox_search.file_path. This is an
+    /// opaque lookup key, never a path opened on the daemon.
     pub file_path: String,
-    /// Byte offset of the target line (from search results)
+    /// Exact stored event offset from search results (Slack uses message timestamp digits).
     pub byte_offset: u64,
-    /// Number of JSONL events before/after to include (default: 5)
+    /// Indexed events before/after the target (default 5, maximum 25).
+    /// Native replies are indexed projections, not complete source transcripts.
     #[serde(default)]
     pub context_lines: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionParams {
-    /// Session UUID or friendly name
+    /// Exact indexed session id returned by bbox_search or bbox_sessions_list.
     pub session_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessagesParams {
+    /// Exact indexed session id. Provide exactly one of session_id or file_path.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Opaque stored transcript locator from bbox_search.file_path, never a
+    /// daemon filesystem path. Native messages are stored projections and may
+    /// already be parser-truncated. Slack reads its authoritative landing store.
     #[serde(default)]
     pub file_path: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub include_subagents: Option<bool>,
+    /// Per-message preview bytes (default 500). Native replies cap at 12000;
+    /// zero requests up to that stored-content cap, not full source recovery.
     #[serde(default)]
     pub max_content_length: Option<u64>,
     #[serde(default)]
     pub from_end: Option<bool>,
+    /// Messages to skip from the selected end. Native pages return next_offset
+    /// based on the actual number returned, including when byte-limited.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// Message count (default 50, maximum 200). Native replies clamp zero to one
+    /// and use a 40000-byte row budget. Order is locator, then source byte offset.
     #[serde(default)]
     pub limit: Option<u64>,
 }
@@ -1634,151 +1678,91 @@ impl TranscriptIndex {
             );
         }
 
-        let target_offset = p.byte_offset;
-
-        let content =
-            fs::read_to_string(file_path).with_context(|| format!("Failed to read {file_path}"))?;
-
-        let lines: Vec<&str> = content.split('\n').collect();
-
-        // Find the line containing target_offset
-        let mut offset = 0u64;
-        let mut target_idx = 0usize;
-        for (i, line) in lines.iter().enumerate() {
-            if offset >= target_offset {
-                target_idx = i;
-                break;
+        let messages = self.indexed_transcript_messages(Some(file_path), None, None, true)?;
+        let target = messages.iter().position(|message| message.byte_offset == p.byte_offset)
+            .ok_or_else(|| anyhow::anyhow!(
+                "error.transcript_not_indexed: no indexed message at this locator and offset; use bbox_search for retained source coordinates. Reindex cannot recover a source the producer has not delivered."
+            ))?;
+        let context = ctx_lines.min(25);
+        let mut start = target.saturating_sub(context);
+        let mut end = target
+            .saturating_add(context)
+            .saturating_add(1)
+            .min(messages.len());
+        let requested = end - start;
+        let rows = loop {
+            let rows = messages[start..end]
+                .iter()
+                .map(|message| {
+                    let mut row = message.response(400);
+                    row["target"] = Value::Bool(message.byte_offset == p.byte_offset);
+                    row
+                })
+                .collect::<Vec<_>>();
+            if serde_json::to_vec(&rows)?.len() <= 40_000 {
+                break rows;
             }
-            offset += line.len() as u64 + 1;
-        }
-
-        let start = target_idx.saturating_sub(ctx_lines);
-        let end = (target_idx + ctx_lines + 1).min(lines.len());
-
-        let is_codex = file_path.contains("/.codex/");
-        let codex_sid = if is_codex {
-            extract_codex_session_id(Path::new(file_path))
-        } else {
-            String::new()
-        };
-
-        let mut output = Vec::new();
-        for (i, line) in (start..end).zip(&lines[start..end]) {
-            let events = if is_codex {
-                parser::parse_codex_line(line, &codex_sid)
+            if end - start == 1 {
+                anyhow::bail!(
+                    "error.transcript_message_too_large: indexed target metadata exceeds the context page budget"
+                );
+            }
+            if target - start > end - target - 1 {
+                start += 1;
             } else {
-                parser::parse_transcript_line(line)
-            };
-            if events.is_empty() {
-                continue;
+                end -= 1;
             }
-            for ev in &events {
-                let marker = if i == target_idx { ">>>" } else { "   " };
-                let preview = if ev.content.len() > 400 {
-                    let mut end = 400;
-                    while end > 0 && !ev.content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}...", &ev.content[..end])
-                } else {
-                    ev.content.clone()
-                };
-                output.push(format!("{} [{}] {}", marker, ev.role, preview));
-            }
-        }
-
-        if output.is_empty() {
-            Ok("No parseable events in the requested range.".to_string())
-        } else {
-            Ok(output.join("\n\n"))
-        }
+        };
+        serde_json::to_string(&serde_json::json!({
+            "view": "indexed_transcript", "completeness": "indexed_projection_only",
+            "source_freshness": "not_established", "total_indexed_messages": messages.len(),
+            "offset": start, "next_offset": (end < messages.len()).then_some(end),
+            "page_limited_by_bytes": rows.len() < requested,
+            "messages": rows,
+            "content_note": "Stored content may already be parser-truncated; content_truncated only describes this response preview."
+        })).map_err(Into::into)
     }
 
     // ── Session ─────────────────────────────────────────────────────
 
     pub fn session(&self, p: &SessionParams) -> Result<String> {
-        let raw_id = p.session_id.as_str();
-
-        // If it's a friendly name, resolve to UUID
-        let resolved_id =
-            resolve_session_name(raw_id, &self.config.roots, self.config.codex_root.as_ref());
-        let session_id = resolved_id.as_deref().unwrap_or(raw_id);
-
-        // Load name maps for display
-        let claude_names = load_claude_session_names(&self.config.roots);
-        let codex_names = load_codex_session_names(self.config.codex_root.as_ref());
-        let name = claude_names
-            .get(session_id)
-            .or_else(|| codex_names.get(session_id))
-            .cloned()
-            .unwrap_or_default();
-        let name_line = if name.is_empty() {
-            String::new()
-        } else {
-            format!("Name: {name}\n")
-        };
-
-        // Try session-meta JSON files first
-        for (account_name, root) in &self.config.roots {
-            let meta_file = root
-                .join("usage-data")
-                .join("session-meta")
-                .join(format!("{}.json", session_id));
-            if meta_file.exists() {
-                let raw = fs::read_to_string(&meta_file)?;
-                let v: Value = serde_json::from_str(&raw)?;
-                let project = v["project_path"].as_str().unwrap_or("?");
-                let duration = v["duration_minutes"].as_u64().unwrap_or(0);
-                let user_msgs = v["user_message_count"].as_u64().unwrap_or(0);
-                let asst_msgs = v["assistant_message_count"].as_u64().unwrap_or(0);
-                let first_prompt = v["first_prompt"].as_str().unwrap_or("?");
-                let tools = &v["tool_counts"];
-
-                return Ok(format!(
-                    "Session: {session_id}\n\
-                     {name_line}\
-                     Account: {account_name}\n\
-                     Project: {project}\n\
-                     Duration: {duration} min\n\
-                     Messages: {user_msgs} user, {asst_msgs} assistant\n\
-                     Tools: {tools}\n\
-                     First prompt: {first_prompt}"
-                ));
-            }
+        let messages = self.indexed_transcript_messages(None, Some(&p.session_id), None, true)?;
+        if messages.is_empty() {
+            anyhow::bail!(
+                "error.transcript_not_indexed: session has no indexed messages; use bbox_search or bbox_sessions_list for retained sessions. Native producer ingestion is required for absent source history."
+            );
         }
-
-        // Fallback: search index for this session
-        if self.is_empty() {
-            return Ok("Index empty and no session-meta found.".to_string());
-        }
-
-        let searcher = self.reader.searcher();
-        let query = TermQuery::new(
-            Term::from_field_text(self.fields.session_id, session_id),
-            IndexRecordOption::Basic,
-        );
-        let top = searcher.search(&query, &TopDocs::with_limit(1))?;
-        if let Some((_score, addr)) = top.first() {
-            let doc: TantivyDocument = searcher.doc(*addr)?;
-            let project = self.doc_text(&doc, self.fields.project);
-            let account = self.doc_text(&doc, self.fields.account);
-            let file_path = self.doc_text(&doc, self.fields.file_path);
-            Ok(format!(
-                "Session: {session_id}\n\
-                 {name_line}\
-                 Account: {account}\n\
-                 Project: {project}\n\
-                 File: {file_path}\n\
-                 (No session-meta available — limited info from index)"
-            ))
-        } else {
-            Ok(format!("Session {} not found.", session_id))
-        }
+        let sources = messages
+            .iter()
+            .map(|message| message.source.as_str())
+            .collect::<BTreeSet<_>>();
+        let locators = messages
+            .iter()
+            .map(|message| message.locator.as_str())
+            .collect::<BTreeSet<_>>();
+        let timestamps = messages
+            .iter()
+            .map(|message| message.timestamp.as_str())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>();
+        serde_json::to_string(&serde_json::json!({
+            "session_id": p.session_id, "view": "indexed_transcript",
+            "completeness": "indexed_projection_only", "source_freshness": "not_established",
+            "indexed_message_count": messages.len(), "sources": sources,
+            "locator_count": locators.len(),
+            "first_indexed_timestamp": timestamps.first(), "last_indexed_timestamp": timestamps.last(),
+            "detail_hint": "Use bbox_messages(session_id=...) to page retained message projections."
+        })).map_err(Into::into)
     }
 
     // ── Messages ────────────────────────────────────────────────────
 
     pub fn messages(&self, p: &MessagesParams) -> Result<String> {
+        if p.file_path.is_some() == p.session_id.is_some() {
+            anyhow::bail!(
+                "error.bad_input: provide exactly one of file_path (stored locator) or session_id"
+            );
+        }
         let role_filter = p.role.as_deref();
         let include_subagents = p.include_subagents.unwrap_or(false);
         let max_length = p.max_content_length.unwrap_or(500) as usize;
@@ -1825,289 +1809,186 @@ impl TranscriptIndex {
             );
         }
 
-        // Resolve to file path(s) — accept either file_path or session_id
-        let files: Vec<String> = if let Some(fp) = p.file_path.as_deref() {
-            vec![fp.to_string()]
-        } else if let Some(sid) = p.session_id.as_deref() {
-            self.resolve_session_files(sid)?
+        let messages = self.indexed_transcript_messages(
+            p.file_path.as_deref(),
+            p.session_id.as_deref(),
+            role_filter,
+            include_subagents,
+        )?;
+        if messages.is_empty()
+            && self
+                .indexed_transcript_messages(
+                    p.file_path.as_deref(),
+                    p.session_id.as_deref(),
+                    None,
+                    true,
+                )?
+                .is_empty()
+        {
+            anyhow::bail!(
+                "error.transcript_not_indexed: no indexed messages match this locator/session; use bbox_search for retained source coordinates. Native producer ingestion is required for absent source history."
+            );
+        }
+        let total = messages.len();
+        let offset = offset.min(total);
+        let limit = limit.max(1);
+        let (start, end) = if from_end {
+            (
+                total.saturating_sub(offset.saturating_add(limit)),
+                total.saturating_sub(offset),
+            )
         } else {
-            anyhow::bail!("Either 'session_id' or 'file_path' is required");
+            (offset, offset.saturating_add(limit).min(total))
         };
-
-        if files.is_empty() {
-            return Ok("Session not found.".to_string());
-        }
-
-        // Collect all matching messages first (for accurate count + pagination)
-        let mut all_messages: Vec<String> = Vec::new();
-        let mut file_labels: Vec<(usize, String)> = Vec::new(); // (insert_before_index, label)
-
-        for file_path in &files {
-            let is_subagent_file = file_path.contains("/subagents/");
-            if is_subagent_file && !include_subagents {
-                continue;
-            }
-
-            let content = match fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    all_messages.push(format!("[Error reading {}: {}]", file_path, e));
-                    continue;
-                }
-            };
-
-            if files.len() > 1 && include_subagents {
-                let label = if is_subagent_file {
-                    let name = Path::new(file_path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    format!("=== Subagent: {} ===", name)
-                } else {
-                    "=== Main transcript ===".to_string()
-                };
-                file_labels.push((all_messages.len(), label));
-            }
-
-            let is_codex = file_path.contains("/.codex/");
-            let codex_sid = if is_codex {
-                extract_codex_session_id(Path::new(file_path))
-            } else {
-                String::new()
-            };
-
-            for line in content.lines() {
-                let events = if is_codex {
-                    parser::parse_codex_line(line, &codex_sid)
-                } else {
-                    parser::parse_transcript_line(line)
-                };
-                for ev in &events {
-                    if let Some(rf) = role_filter {
-                        if ev.role.as_ref() != rf {
-                            continue;
-                        }
-                    }
-
-                    let preview = if max_length == 0 {
-                        ev.content.clone()
-                    } else if ev.content.len() > max_length {
-                        let mut end = max_length;
-                        while end > 0 && !ev.content.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &ev.content[..end])
-                    } else {
-                        ev.content.clone()
-                    };
-
-                    let ts = ev.timestamp.as_deref().unwrap_or("");
-                    all_messages.push(format!("[{}] [{}] {}", ts, ev.role, preview));
-                }
-            }
-        }
-
-        let total = all_messages.len();
-        if total == 0 {
-            return Ok("No messages found matching filters.".to_string());
-        }
-
-        // Apply pagination — from_end reverses so offset 0 = last messages
-        let (page, showing_start, showing_end): (Vec<&String>, usize, usize) = if from_end {
-            let tail_start = total.saturating_sub(offset + limit);
-            let tail_end = total.saturating_sub(offset);
-            let p: Vec<&String> = all_messages[tail_start..tail_end].iter().collect();
-            (p, tail_start, tail_end)
+        let max_length = if max_length == 0 {
+            12_000
         } else {
-            let p: Vec<&String> = all_messages.iter().skip(offset).take(limit).collect();
-            let end = (offset + limit).min(total);
-            (p, offset, end)
+            max_length.min(12_000)
         };
-
-        let mut header = format!(
-            "Messages {}-{} of {} total",
-            showing_start + 1,
-            showing_end,
-            total
-        );
-        if !from_end && showing_end < total {
-            header.push_str(&format!(" (next page: offset={})", showing_end));
-        }
-        if from_end && showing_start > 0 {
-            header.push_str(&format!(
-                " (earlier: from_end=true, offset={})",
-                offset + limit
-            ));
-        }
-
-        // Assemble body with size cap (80KB) to avoid blowing MCP result limits
-        const MAX_RESPONSE_BYTES: usize = 80_000;
-        let mut body = String::new();
-        for (included, msg) in page.iter().enumerate() {
-            let entry = format!("{msg}\n\n");
-            if body.len() + entry.len() > MAX_RESPONSE_BYTES {
-                body.push_str(&format!(
-                    "[Response truncated at {included} messages — narrow with role filter, smaller limit, or higher max_content_length]\n"
-                ));
+        // Choose a contiguous page from the requested end. The next offset
+        // advances by the actual returned count, including under a byte cap.
+        let candidates = if from_end {
+            (start..end).rev().collect::<Vec<_>>()
+        } else {
+            (start..end).collect::<Vec<_>>()
+        };
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        for index in candidates {
+            let row = messages[index].response(max_length);
+            let size = serde_json::to_vec(&row)?.len();
+            if bytes.saturating_add(size) > 40_000 {
+                if rows.is_empty() {
+                    anyhow::bail!(
+                        "error.transcript_message_too_large: indexed message metadata exceeds the page budget; use a smaller max_content_length."
+                    );
+                }
                 break;
             }
-            body.push_str(&entry);
+            bytes += size;
+            rows.push(row);
         }
-
-        Ok(format!("{}\n\n{}", header, body.trim_end()))
+        if from_end {
+            rows.reverse();
+        }
+        let returned = rows.len();
+        let consumed = offset.saturating_add(returned);
+        serde_json::to_string(&serde_json::json!({
+            "view": "indexed_transcript", "completeness": "indexed_projection_only",
+            "source_freshness": "not_established", "total_matching_messages": total,
+            "offset": offset, "from_end": from_end,
+            "next_offset": (consumed < total).then_some(consumed),
+            "page_limited_by_bytes": returned < end - start,
+            "messages": rows,
+            "content_note": "Stored content may already be parser-truncated; content_truncated only describes this response preview. max_content_length=0 returns up to 12000 stored bytes."
+        })).map_err(Into::into)
     }
 
-    /// Resolve a session ID to its JSONL file path(s) — main transcript + subagents.
-    fn resolve_session_files(&self, session_id: &str) -> Result<Vec<String>> {
-        // If session_id is a friendly name, resolve to UUID first
-        let resolved_id = resolve_session_name(
-            session_id,
-            &self.config.roots,
-            self.config.codex_root.as_ref(),
-        );
-        let session_id = resolved_id.as_deref().unwrap_or(session_id);
-
-        let mut main_file: Option<String> = None;
-
-        // Strategy 1: index lookup — may return a subagent file, so derive main from it
-        if !self.is_empty() {
-            let searcher = self.reader.searcher();
-            let query = TermQuery::new(
-                Term::from_field_text(self.fields.session_id, session_id),
-                IndexRecordOption::Basic,
+    /// Retrieve stored projections by exact source identity. No client-supplied
+    /// locator is ever opened, statted, or resolved through daemon filesystem state.
+    fn indexed_transcript_messages(
+        &self,
+        locator: Option<&str>,
+        session: Option<&str>,
+        role: Option<&str>,
+        include_subagents: bool,
+    ) -> Result<Vec<IndexedTranscriptMessage>> {
+        if locator.is_some() == session.is_some() {
+            anyhow::bail!(
+                "error.bad_input: provide exactly one of file_path (stored locator) or session_id"
             );
-            let top = searcher.search(&query, &TopDocs::with_limit(1))?;
-            if let Some((_score, addr)) = top.first() {
-                let doc: TantivyDocument = searcher.doc(*addr)?;
-                let fp = self.doc_text(&doc, self.fields.file_path);
-                if !fp.is_empty() {
-                    let derived = Self::derive_main_transcript(&fp, session_id);
-                    // Skip monolithic files (e.g. history.jsonl) that contain mixed sessions.
-                    // A valid per-session file either has the session_id in its name (Claude)
-                    // or follows the codex rollout-*-UUID.jsonl pattern.
-                    let stem = Path::new(&derived)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if stem.contains(session_id) || stem == session_id {
-                        main_file = Some(derived);
-                    }
-                }
-            }
         }
-
-        // Strategy 2: filesystem scan — look for <session-id>.jsonl
-        if main_file.is_none() || !Path::new(main_file.as_ref().unwrap()).exists() {
-            main_file = None;
-            for (_name, root) in &self.config.roots {
-                let projects_dir = root.join("projects");
-                if !projects_dir.exists() {
-                    continue;
-                }
-                for entry in WalkDir::new(&projects_dir)
-                    .follow_links(true)
-                    .max_depth(3) // projects/<encoded>/<uuid>.jsonl
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    let p = entry.path();
-                    if p.extension().map(|e| e == "jsonl").unwrap_or(false)
-                        && p.file_stem().map(|s| s.to_string_lossy()) == Some(session_id.into())
-                        && !p.to_string_lossy().contains("/subagents/")
-                    {
-                        main_file = Some(p.to_string_lossy().to_string());
-                        break;
-                    }
-                }
-                if main_file.is_some() {
-                    break;
-                }
-            }
+        let selected = locator.or(session).unwrap_or_default();
+        if selected.trim().is_empty() {
+            anyhow::bail!("error.bad_input: transcript selector must not be blank");
         }
-
-        // Strategy 3: codex sessions — look for rollout-*-<session-id>.jsonl
-        if main_file.is_none() || !Path::new(main_file.as_ref().unwrap()).exists() {
-            main_file = None;
-            if let Some(ref codex_root) = self.config.codex_root {
-                let sessions_dir = codex_root.join("sessions");
-                if sessions_dir.exists() {
-                    for entry in WalkDir::new(&sessions_dir)
-                        .follow_links(true)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        let p = entry.path();
-                        if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                            let extracted = extract_codex_session_id(p);
-                            if extracted == session_id {
-                                main_file = Some(p.to_string_lossy().to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let main = match main_file {
-            Some(ref f) if Path::new(f).exists() => f.clone(),
-            _ => return Ok(vec![]),
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.doc_type, "transcript"),
+                IndexRecordOption::Basic,
+            )),
+        )];
+        let field = if locator.is_some() {
+            self.fields.file_path
+        } else {
+            self.fields.session_id
         };
-
-        let mut files = vec![main.clone()];
-
-        // Check for subagent directory alongside the main file
-        // Main: .../projects/<proj>/<session-id>.jsonl
-        // Subs: .../projects/<proj>/<session-id>/subagents/agent-*.jsonl
-        let main_path = Path::new(&main);
-        if let Some(stem) = main_path.file_stem() {
-            if let Some(parent) = main_path.parent() {
-                let subagent_dir = parent
-                    .join(stem.to_string_lossy().as_ref())
-                    .join("subagents");
-                if subagent_dir.exists() {
-                    for entry in WalkDir::new(&subagent_dir)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        let p = entry.path();
-                        if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                            files.push(p.to_string_lossy().to_string());
-                        }
-                    }
-                }
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(field, selected),
+                IndexRecordOption::Basic,
+            )),
+        ));
+        if let Some(role) = role {
+            if role.parse::<bro_transcript::MessageRole>().is_err() {
+                anyhow::bail!("error.bad_input: unknown transcript role {role}");
             }
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.role, role),
+                    IndexRecordOption::Basic,
+                )),
+            ));
         }
-
-        Ok(files)
-    }
-
-    /// Given a file path (possibly a subagent file) and a session ID, derive the main transcript path.
-    /// Subagent: .../projects/<proj>/<session-id>/subagents/agent-xxx.jsonl
-    /// Main:     .../projects/<proj>/<session-id>.jsonl
-    fn derive_main_transcript(file_path: &str, session_id: &str) -> String {
-        if !file_path.contains("/subagents/") {
-            return file_path.to_string();
+        if !include_subagents {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(self.fields.is_subagent, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ));
         }
-        // Walk up from subagent path to find the session dir, then look for <session-id>.jsonl beside it
-        let p = Path::new(file_path);
-        let mut current = p.parent(); // agent file's dir (subagents/)
-        while let Some(dir) = current {
-            if dir.file_name().map(|n| n.to_string_lossy()) == Some(session_id.into()) {
-                // Found .../projects/<proj>/<session-id>/
-                // Main transcript is .../projects/<proj>/<session-id>.jsonl
-                let main = dir.with_extension("jsonl");
-                return main.to_string_lossy().to_string();
-            }
-            current = dir.parent();
+        let searcher = self.reader.searcher();
+        // byte_offset is STORED-only. A ranked cap would silently lose later
+        // source events, so collect the exact selected document set before sorting.
+        let addresses = searcher.search(&BooleanQuery::new(clauses), &DocSetCollector)?;
+        let mut messages = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let doc: TantivyDocument = searcher.doc(address)?;
+            messages.push(IndexedTranscriptMessage {
+                locator: self.doc_text(&doc, self.fields.file_path),
+                session_id: self.doc_text(&doc, self.fields.session_id),
+                source: self.doc_text(&doc, self.fields.source),
+                entity_ref: self.doc_text(&doc, self.fields.entity_id),
+                byte_offset: first_u64(&doc, self.fields.byte_offset),
+                role: self.doc_text(&doc, self.fields.role),
+                timestamp: self.doc_text(&doc, self.fields.timestamp),
+                content: self.doc_text(&doc, self.fields.content),
+            });
         }
-        file_path.to_string()
+        messages.sort_by(|a, b| {
+            (
+                &a.locator,
+                a.byte_offset,
+                &a.role,
+                &a.content,
+                &a.entity_ref,
+                &a.session_id,
+                &a.source,
+                &a.timestamp,
+            )
+                .cmp(&(
+                    &b.locator,
+                    b.byte_offset,
+                    &b.role,
+                    &b.content,
+                    &b.entity_ref,
+                    &b.session_id,
+                    &b.source,
+                    &b.timestamp,
+                ))
+        });
+        Ok(messages)
     }
 
     // ── Topics ──────────────────────────────────────────────────────
 
     pub fn topics(&self, p: &TopicsParams) -> Result<String> {
-        let top_n = p.limit.unwrap_or(25) as usize;
+        let top_n = p.limit.unwrap_or(25).clamp(1, 100) as usize;
         let role_filter = p.role.as_deref();
         let session_id = p.session_id.as_deref();
         let file_path = p.file_path.as_deref();
@@ -2116,78 +1997,20 @@ impl TranscriptIndex {
             anyhow::bail!("Either 'session_id' or 'file_path' is required");
         }
 
-        // Collect content from the session
+        let messages =
+            self.indexed_transcript_messages(file_path, session_id, role_filter, true)?;
+        if messages.is_empty() {
+            anyhow::bail!(
+                "error.transcript_not_indexed: no indexed messages match this selector; use bbox_search for retained source coordinates."
+            );
+        }
         let mut all_content = String::new();
-
-        if let Some(fp) = file_path {
-            // Read directly from file
-            let content = fs::read_to_string(fp)?;
-            let is_codex = fp.contains("/.codex/");
-            let codex_sid = if is_codex {
-                extract_codex_session_id(Path::new(fp))
-            } else {
-                String::new()
-            };
-            for line in content.lines() {
-                let events = if is_codex {
-                    parser::parse_codex_line(line, &codex_sid)
-                } else {
-                    parser::parse_transcript_line(line)
-                };
-                for ev in &events {
-                    if let Some(rf) = role_filter {
-                        if ev.role.as_ref() != rf {
-                            continue;
-                        }
-                    }
-                    // Skip tool_result — too noisy for topic extraction
-                    if ev.role == bro_transcript::MessageRole::ToolResult {
-                        continue;
-                    }
-                    all_content.push(' ');
-                    all_content.push_str(&ev.content);
-                }
+        for message in messages {
+            if role_filter.is_none() && message.role == "tool_result" {
+                continue;
             }
-        } else if let Some(sid) = session_id {
-            // Use index to find all docs for this session
-            if self.is_empty() {
-                return Ok("Index is empty. Run blackbox_reindex first.".to_string());
-            }
-            let searcher = self.reader.searcher();
-            let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.session_id, sid),
-                    IndexRecordOption::Basic,
-                )),
-            )];
-            if let Some(rf) = role_filter {
-                clauses.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.role, rf),
-                        IndexRecordOption::Basic,
-                    )),
-                ));
-            }
-            // Exclude tool_result by default
-            if role_filter.is_none() {
-                clauses.push((
-                    Occur::MustNot,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.role, "tool_result"),
-                        IndexRecordOption::Basic,
-                    )),
-                ));
-            }
-            let query = BooleanQuery::new(clauses);
-            let top_docs = searcher.search(&query, &TopDocs::with_limit(5000))?;
-            for (_score, addr) in &top_docs {
-                let doc: TantivyDocument = searcher.doc(*addr)?;
-                let content = self.doc_text(&doc, self.fields.content);
-                all_content.push(' ');
-                all_content.push_str(&content);
-            }
+            all_content.push(' ');
+            all_content.push_str(&message.content);
         }
 
         if all_content.is_empty() {
@@ -2213,7 +2036,11 @@ impl TranscriptIndex {
             .map(|(word, count)| format!("{:>4}  {}", count, word))
             .collect();
 
-        Ok(format!("Top {} terms:\n{}", sorted.len(), lines.join("\n")))
+        Ok(format!(
+            "Top {} terms from indexed projections (source completeness and freshness not established):\n{}",
+            sorted.len(),
+            lines.join("\n")
+        ))
     }
 
     // ── Sessions List ───────────────────────────────────────────────
@@ -3903,14 +3730,13 @@ mod conversation_read_plane_tests {
     }
 
     #[test]
-    fn a_non_slack_file_path_and_session_id_keep_the_filesystem_reader_unchanged() {
+    fn missing_native_sources_report_indexed_lookup_failure_without_file_reads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = landed_index(&root);
 
-        // A regular (non-existent) transcript path still hits the
-        // filesystem reader and its ordinary ENOENT error, unaffected by
-        // the slack: branch.
+        // A native locator is an indexed identity even when it looks like
+        // a host path. Missing rows produce a source-aware lookup error.
         let missing = root.join("no-such-transcript.jsonl");
         let err = index
             .context(&ContextParams {
@@ -3919,10 +3745,12 @@ mod conversation_read_plane_tests {
                 context_lines: None,
             })
             .unwrap_err();
-        assert!(err.to_string().contains("Failed to read"), "{err}");
+        assert!(
+            err.to_string().contains("error.transcript_not_indexed"),
+            "{err}"
+        );
 
-        // A session id with no slash (the ordinary shape) still falls
-        // through to the file-based resolver and its own "not found" text.
+        // Missing sessions name the searchable retained-corpus alternative.
         let out = index
             .messages(&MessagesParams {
                 session_id: Some("some-uuid-session".to_string()),
@@ -3934,8 +3762,200 @@ mod conversation_read_plane_tests {
                 offset: None,
                 limit: None,
             })
+            .unwrap_err();
+        assert!(out.to_string().contains("error.transcript_not_indexed"));
+        assert!(out.to_string().contains("bbox_search"));
+    }
+}
+
+#[cfg(test)]
+mod native_drilldown_tests {
+    use super::*;
+
+    fn fixture(root: &Path, locator: &str, count: usize, content_bytes: usize) -> TranscriptIndex {
+        let index = TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        // Reverse write order proves source byte order does not depend on
+        // segment insertion or equal-score TopDocs ordering.
+        for n in (0..count).rev() {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(fields.doc_type, "transcript");
+            doc.add_text(fields.file_path, locator);
+            doc.add_text(fields.session_id, "session-fixture");
+            doc.add_text(fields.source, "codex");
+            doc.add_text(
+                fields.entity_id,
+                format!("transcript:codex:session-fixture:{}", n * 100),
+            );
+            doc.add_text(fields.role, if n % 2 == 0 { "user" } else { "assistant" });
+            doc.add_text(fields.timestamp, "2026-09-01T00:00:00Z");
+            doc.add_text(
+                fields.content,
+                format!("stored{n} {}", "界".repeat(content_bytes / 3)),
+            );
+            doc.add_u64(fields.byte_offset, n as u64 * 100);
+            doc.add_u64(fields.is_subagent, 0);
+            writer.add_document(doc.clone()).unwrap();
+            // Tool-call projections share native event coordinates but must
+            // not duplicate transcript messages in the read family.
+            if n == 0 {
+                let mut tool = TantivyDocument::new();
+                tool.add_text(fields.doc_type, "tool_call");
+                tool.add_text(fields.file_path, locator);
+                tool.add_text(fields.session_id, "session-fixture");
+                tool.add_text(fields.content, "duplicate tool projection");
+                writer.add_document(tool).unwrap();
+            }
+        }
+        writer.commit().unwrap();
+        index.reader.reload().unwrap();
+        index
+    }
+
+    fn params() -> MessagesParams {
+        serde_json::from_value(serde_json::json!({"session_id": "session-fixture"})).unwrap()
+    }
+
+    #[test]
+    fn native_drilldown_uses_stored_projection_even_when_locator_is_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("host-transcript.jsonl");
+        std::fs::write(&file, "unindexed local content must never be returned").unwrap();
+        let locator = file.to_string_lossy();
+        let index = fixture(&root, &locator, 5, 30);
+        let context: Value = serde_json::from_str(
+            &index
+                .context(&ContextParams {
+                    file_path: locator.to_string(),
+                    byte_offset: 200,
+                    context_lines: Some(1),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(context["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(context["messages"][1]["byte_offset"], 200);
+        assert_eq!(context["messages"][1]["target"], true);
+        assert_eq!(context["completeness"], "indexed_projection_only");
+        assert_eq!(context["source_freshness"], "not_established");
+        assert!(!context.to_string().contains("unindexed local content"));
+        std::fs::remove_file(&file).unwrap();
+        let messages: Value = serde_json::from_str(&index.messages(&params()).unwrap()).unwrap();
+        assert_eq!(messages["total_matching_messages"], 5);
+        assert_eq!(messages["messages"][0]["byte_offset"], 0);
+        let session: Value = serde_json::from_str(
+            &index
+                .session(&SessionParams {
+                    session_id: "session-fixture".into(),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["indexed_message_count"], 5);
+        let topics = index
+            .topics(&TopicsParams {
+                session_id: None,
+                file_path: Some(locator.to_string()),
+                role: None,
+                limit: Some(5),
+            })
             .unwrap();
-        assert_eq!(out, "Session not found.");
+        assert!(topics.contains("indexed projections"));
+    }
+
+    #[test]
+    fn native_pages_resume_without_skipping_under_the_byte_budget_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = fixture(&root, "native:producer/session", 12, 12_000);
+        for from_end in [false, true] {
+            let mut p = params();
+            p.from_end = Some(from_end);
+            p.max_content_length = Some(0);
+            let mut offsets = Vec::new();
+            loop {
+                let raw = index.messages(&p).unwrap();
+                assert!(raw.len() < 41_000);
+                let page: Value = serde_json::from_str(&raw).unwrap();
+                for row in page["messages"].as_array().unwrap() {
+                    offsets.push(row["byte_offset"].as_u64().unwrap());
+                    assert!(row["content"].as_str().unwrap().len() <= 12_000);
+                }
+                let Some(next) = page["next_offset"].as_u64() else {
+                    break;
+                };
+                assert!(next > p.offset.unwrap_or(0));
+                p.offset = Some(next);
+            }
+            offsets.sort();
+            assert_eq!(offsets, (0..12).map(|n| n * 100).collect::<Vec<u64>>());
+        }
+    }
+
+    #[test]
+    fn native_selectors_roles_and_offsets_are_exact_and_previews_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = fixture(&root, "native:producer/session", 4, 90);
+        let mut p = params();
+        p.role = Some("assistant".into());
+        p.max_content_length = Some(9);
+        p.limit = Some(1);
+        let page: Value = serde_json::from_str(&index.messages(&p).unwrap()).unwrap();
+        assert_eq!(page["total_matching_messages"], 2);
+        assert_eq!(page["next_offset"], 1);
+        assert_eq!(page["messages"][0]["content_truncated"], true);
+        p.role = Some("developer".into());
+        let empty: Value = serde_json::from_str(&index.messages(&p).unwrap()).unwrap();
+        assert_eq!(empty["total_matching_messages"], 0);
+        assert!(empty["messages"].as_array().unwrap().is_empty());
+        p.role = Some("typo".into());
+        assert!(
+            index
+                .messages(&p)
+                .unwrap_err()
+                .to_string()
+                .contains("error.bad_input")
+        );
+        p.role = None;
+        p.file_path = Some("native:producer/session".into());
+        assert!(
+            index
+                .messages(&p)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+        assert!(
+            index
+                .context(&ContextParams {
+                    file_path: "native:producer/session".into(),
+                    byte_offset: 101,
+                    context_lines: None
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("error.transcript_not_indexed")
+        );
+        assert!(
+            index
+                .session(&SessionParams {
+                    session_id: "session".into()
+                })
+                .is_err()
+        );
     }
 }
 
