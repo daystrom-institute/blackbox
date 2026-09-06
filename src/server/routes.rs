@@ -960,9 +960,16 @@ pub(crate) async fn orchestrate_by_id_handler(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ControlStatusQuery {
     #[serde(default)]
     tail: Option<usize>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 pub(crate) async fn control_exec_handler(
@@ -1327,14 +1334,18 @@ pub(crate) async fn control_status_handler(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     Query(query): Query<ControlStatusQuery>,
 ) -> axum::Json<CallToolResult> {
-    // The Fleet control DTO includes its legacy snapshot and result fields.
-    // MCP routine status uses a separate compact projection.
     let task = state.task_store.read().get(&task_id);
     axum::Json(match task {
-        Some(task) => BlackboxServer::ok_json(&orchestration::task_status_json(
+        Some(task) => match orchestration::control_task_status_json(
             &task,
+            query.detail.as_deref().unwrap_or("summary"),
+            query.cursor.as_deref(),
+            query.limit,
             query.tail.unwrap_or(0),
-        )),
+        ) {
+            Ok(value) => BlackboxServer::ok_json(&value),
+            Err(error) => BlackboxServer::err_text(&error.to_string()),
+        },
         None => BlackboxServer::err_text(&format!("Unknown task ID: {task_id}")),
     })
 }
