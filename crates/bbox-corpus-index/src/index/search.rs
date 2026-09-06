@@ -16,6 +16,7 @@ use super::helpers::*;
 use super::passes::*;
 use super::project_files;
 use super::{FieldHandles, FileMeta, TranscriptIndex, first_u64};
+use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::query::smart_query_to_tantivy;
 
 #[derive(Debug)]
@@ -28,6 +29,187 @@ struct IndexedTranscriptMessage {
     role: String,
     timestamp: String,
     content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchRecovery {
+    NativeTranscript {
+        locator: Option<String>,
+        byte_offset: Option<u64>,
+        session_id: Option<String>,
+    },
+    SlackTranscript {
+        locator: Option<String>,
+        byte_offset: Option<u64>,
+        session_id: Option<String>,
+    },
+    Thread {
+        thread_id: String,
+    },
+    Entity {
+        entity_ref: String,
+    },
+    Unavailable {
+        doc_type: String,
+    },
+}
+
+fn non_blank(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn canonical_entity_ref(value: &str) -> Option<String> {
+    EntityRef::parse(value)
+        .ok()
+        .map(|entity_ref| entity_ref.to_string())
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("UTF-8 string serialization cannot fail")
+}
+
+impl SearchRecovery {
+    fn new(
+        doc_type: &str,
+        entity_id: &str,
+        locator: &str,
+        session_id: &str,
+        raw_byte_offset: Option<u64>,
+        message_ts: &str,
+    ) -> Self {
+        let locator = non_blank(locator);
+        let session_id = non_blank(session_id);
+        if doc_type == "transcript" {
+            if locator
+                .as_deref()
+                .is_some_and(|value| value.starts_with("slack:"))
+            {
+                let byte_offset = crate::transcripts::conversation::message_ts_digits(message_ts);
+                let has_context = locator.is_some() && byte_offset.is_some();
+                let has_messages = session_id.is_some() || locator.is_some();
+                if !has_context && !has_messages {
+                    return Self::Unavailable {
+                        doc_type: doc_type.to_string(),
+                    };
+                }
+                return Self::SlackTranscript {
+                    locator,
+                    byte_offset,
+                    session_id,
+                };
+            }
+            let has_context = locator.is_some() && raw_byte_offset.is_some();
+            let has_messages = session_id.is_some() || locator.is_some();
+            if !has_context && !has_messages {
+                return Self::Unavailable {
+                    doc_type: doc_type.to_string(),
+                };
+            }
+            return Self::NativeTranscript {
+                locator,
+                byte_offset: raw_byte_offset,
+                session_id,
+            };
+        }
+
+        let entity_ref = match EntityRef::parse(entity_id) {
+            Ok(entity_ref) => entity_ref,
+            Err(_) => {
+                return Self::Unavailable {
+                    doc_type: doc_type.to_string(),
+                };
+            }
+        };
+        if let EntityRef::Thread { thread_id } = entity_ref {
+            return Self::Thread { thread_id };
+        }
+        Self::Entity {
+            entity_ref: entity_ref.to_string(),
+        }
+    }
+
+    fn append_next_steps(&self, out: &mut String) {
+        match self {
+            Self::NativeTranscript {
+                locator,
+                byte_offset,
+                session_id,
+            } => {
+                if let (Some(locator), Some(byte_offset)) = (locator, byte_offset) {
+                    out.push_str(&format!(
+                        "  → Surrounding conversation: bbox_context(file_path={}, byte_offset={byte_offset})\n",
+                        json_string(locator)
+                    ));
+                }
+                if let Some(session_id) = session_id {
+                    out.push_str(&format!(
+                        "  → Read the whole session: bbox_messages(session_id={})\n",
+                        json_string(session_id)
+                    ));
+                } else if let Some(locator) = locator {
+                    out.push_str(&format!(
+                        "  → Read the indexed transcript: bbox_messages(file_path={})\n",
+                        json_string(locator)
+                    ));
+                }
+            }
+            Self::SlackTranscript {
+                locator,
+                byte_offset,
+                session_id,
+            } => {
+                if let (Some(locator), Some(byte_offset)) = (locator, byte_offset) {
+                    out.push_str(&format!(
+                        "  → Surrounding conversation: bbox_context(file_path={}, byte_offset={byte_offset})\n",
+                        json_string(locator)
+                    ));
+                }
+                if let Some(session_id) = session_id {
+                    out.push_str(&format!(
+                        "  → Read the day's messages: bbox_messages(session_id={})\n",
+                        json_string(session_id)
+                    ));
+                    let channel_id = session_id.split('/').next().unwrap_or(session_id);
+                    out.push_str(&format!(
+                        "  → The whole channel's messages: bbox_search(query={}, channel={})\n",
+                        json_string("..."),
+                        json_string(channel_id)
+                    ));
+                } else if let Some(locator) = locator {
+                    out.push_str(&format!(
+                        "  → The whole channel's messages: bbox_messages(file_path={})\n",
+                        json_string(locator)
+                    ));
+                }
+                out.push_str(
+                    "  → Open a specific message in Slack: follow its Permalink line above\n",
+                );
+            }
+            Self::Thread { thread_id } => {
+                let thread_ref = json_string(&format!("thread:{thread_id}"));
+                out.push_str(&format!(
+                    "  → Read the thread summary and detail entry point: bbox_thread(action={}, id={})\n",
+                    json_string("get"),
+                    json_string(thread_id)
+                ));
+                out.push_str(&format!(
+                    "  → Inspect thread relations: bbox_inspect_entity(entity_ref={thread_ref})\n"
+                ));
+            }
+            Self::Entity { entity_ref } => {
+                out.push_str(&format!(
+                    "  → Inspect the exact entity: bbox_inspect_entity(entity_ref={})\n",
+                    json_string(entity_ref)
+                ));
+            }
+            Self::Unavailable { doc_type } => {
+                out.push_str(&format!(
+                    "  → No exact follow-up reader is available for this {doc_type} hit\n"
+                ));
+            }
+        }
+    }
 }
 
 impl IndexedTranscriptMessage {
@@ -914,40 +1096,38 @@ impl TranscriptIndex {
         let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
 
         let mut results = Vec::new();
-        // Top hit's coordinates, captured for the response breadcrumb so the
-        // agent can paste them into the read tools (bbox_context / bbox_messages).
-        let mut top_hit: Option<(String, String, u64)> = None;
+        // The top hit's kind and canonical identity drive the follow-up hints.
+        // Transcript hints are selected only from the indexed reader coordinates
+        // that actually survive the read tools' validation.
+        let mut top_recovery: Option<SearchRecovery> = None;
         for (score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
 
+            let doc_type = self.doc_text(&doc, self.fields.doc_type);
+            let entity_id = self.doc_text(&doc, self.fields.entity_id);
             let file_path = self.doc_text(&doc, self.fields.file_path);
             let session_id = self.doc_text(&doc, self.fields.session_id);
             let role = self.doc_text(&doc, self.fields.role);
             let ts = self.doc_text(&doc, self.fields.timestamp);
             let project = self.doc_text(&doc, self.fields.project);
             let account = self.doc_text(&doc, self.fields.account);
-            let byte_offset = doc
-                .get_first(self.fields.byte_offset)
-                .and_then(|value| match value {
-                    tantivy::schema::OwnedValue::U64(value) => Some(*value),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if top_hit.is_none() {
-                // Every slack document carries `byte_offset: 0` (it has no
-                // file to offset into — see `RawTranscriptRef::provider_event`);
-                // the breadcrumb below needs the message's own digit-encoded
-                // timestamp instead, which is what `bbox_context`'s slack
-                // branch actually reads as `byte_offset`.
-                let slack_offset = if file_path.starts_with("slack:") {
-                    let message_ts = self.doc_text(&doc, self.fields.conversation_message_ts);
-                    crate::transcripts::conversation::message_ts_digits(&message_ts)
-                        .unwrap_or(byte_offset)
-                } else {
-                    byte_offset
-                };
-                top_hit = Some((session_id.clone(), file_path.clone(), slack_offset));
+            let byte_offset =
+                doc.get_first(self.fields.byte_offset)
+                    .and_then(|value| match value {
+                        tantivy::schema::OwnedValue::U64(value) => Some(*value),
+                        _ => None,
+                    });
+            if top_recovery.is_none() {
+                let message_ts = self.doc_text(&doc, self.fields.conversation_message_ts);
+                top_recovery = Some(SearchRecovery::new(
+                    &doc_type,
+                    &entity_id,
+                    &file_path,
+                    &session_id,
+                    byte_offset,
+                    &message_ts,
+                ));
             }
 
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
@@ -989,12 +1169,24 @@ impl TranscriptIndex {
                 provenance.push_str(&format!("\nPermalink: {permalink}"));
             }
 
+            let identity = if matches!(
+                doc_type.as_str(),
+                "transcript" | "tool_call" | "project_file"
+            ) && !file_path.trim().is_empty()
+            {
+                format!("Locator: {file_path}")
+            } else if let Some(entity_ref) = canonical_entity_ref(&entity_id) {
+                format!("Entity ref: {entity_ref}")
+            } else {
+                format!("Entity type: {doc_type}")
+            };
+
             results.push(format!(
                 "Score: {score:.2} | mode={} | {account} | {role}\n\
                  Session: {session_id}\n\
                  Project: {project}\n\
                  Time: {ts}\n\
-                 Locator: {file_path}{provenance}\n\
+                 {identity}{provenance}\n\
                  Excerpt: {excerpt}",
                 match mode {
                     TranscriptSearchMode::Smart => "smart",
@@ -1008,39 +1200,18 @@ impl TranscriptIndex {
             results.len(),
             results.join("\n\n---\n\n")
         );
-        if let Some((session_id, file_path, byte_offset)) = top_hit {
-            out.push_str("\n\nNext steps:\n");
-            if file_path.starts_with("slack:") {
-                // The slack read plane resolves these against the landing
-                // store (gap-2d4d17da), so both read tools work again here:
-                // bbox_context's byte_offset is this hit's digit-encoded
-                // message timestamp, and bbox_messages' session_id is its
-                // per-channel-per-day bucket. The channel id is that
-                // session_id's first segment.
-                let channel_id = session_id.split('/').next().unwrap_or(&session_id);
-                out.push_str(&format!(
-                    "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
-                ));
-                out.push_str(&format!(
-                    "  → Read the day's messages: bbox_messages(session_id=\"{session_id}\")\n"
-                ));
-                out.push_str(&format!(
-                    "  → The whole channel's messages: bbox_search(query=\"...\", channel=\"{channel_id}\")\n"
-                ));
-                out.push_str(
-                    "  → Open a specific message in Slack: follow its Permalink line above\n",
-                );
-            } else {
-                out.push_str(&format!(
-                    "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
-                ));
-                out.push_str(&format!(
-                    "  → Read the whole session: bbox_messages(session_id=\"{session_id}\")\n"
-                ));
-            }
-            out.push_str(
-                "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
+        if let Some(recovery) = top_recovery {
+            let transcript_hit = matches!(
+                recovery,
+                SearchRecovery::NativeTranscript { .. } | SearchRecovery::SlackTranscript { .. }
             );
+            out.push_str("\n\nNext steps:\n");
+            recovery.append_next_steps(&mut out);
+            if transcript_hit {
+                out.push_str(
+                    "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
+                );
+            }
         }
         Ok(out)
     }
@@ -3787,6 +3958,291 @@ mod conversation_read_plane_tests {
 }
 
 #[cfg(test)]
+mod search_recovery_hint_tests {
+    use super::*;
+    use crate::index::TranscriptIndex;
+    use std::collections::BTreeMap;
+
+    const PROJECT: &str = "p_00000000000000000000000000000f71";
+
+    fn open_index(root: &Path) -> TranscriptIndex {
+        TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap()
+    }
+
+    fn document(
+        fields: &crate::index::FieldHandles,
+        doc_type: &str,
+        entity_id: &str,
+        marker: &str,
+    ) -> TantivyDocument {
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, doc_type);
+        document.add_text(fields.entity_id, entity_id);
+        document.add_text(fields.content, marker);
+        document
+    }
+
+    fn search(index: &TranscriptIndex, marker: &str, active_project: Option<&str>) -> String {
+        let selectors = active_project
+            .map(|project| {
+                (
+                    project.to_string(),
+                    bbox_code_source::local_selector(project),
+                )
+            })
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        index
+            .search_with_active_selectors(
+                &SearchParams {
+                    query: marker.to_string(),
+                    mode: Some("fulltext".into()),
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(1),
+                    source: None,
+                    author: None,
+                    channel: None,
+                    exclude_self: None,
+                },
+                &selectors,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_native_transcript_top_hit_gets_working_reader_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let mut transcript = document(
+            &fields,
+            "transcript",
+            "transcript:codex:session-fixture:0:0",
+            "native-recovery-positive",
+        );
+        transcript.add_text(fields.file_path, "native:producer/session-fixture");
+        transcript.add_text(fields.session_id, "session-fixture");
+        transcript.add_u64(fields.byte_offset, 123);
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(transcript).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let hits = search(&index, "native-recovery-positive", None);
+        assert!(
+            hits.contains(
+                "bbox_context(file_path=\"native:producer/session-fixture\", byte_offset=123)"
+            ),
+            "{hits}"
+        );
+        assert!(
+            hits.contains("bbox_messages(session_id=\"session-fixture\")"),
+            "{hits}"
+        );
+    }
+
+    #[test]
+    fn a_blank_native_session_never_receives_a_blank_session_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let mut transcript = document(
+            &fields,
+            "transcript",
+            "transcript:codex:anonymous:0:0",
+            "native-recovery-blank-session",
+        );
+        transcript.add_text(fields.file_path, "native:producer/anonymous");
+        transcript.add_u64(fields.byte_offset, 77);
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(transcript).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let hits = search(&index, "native-recovery-blank-session", None);
+        assert!(
+            hits.contains("bbox_context(file_path=\"native:producer/anonymous\", byte_offset=77)"),
+            "{hits}"
+        );
+        assert!(
+            hits.contains("bbox_messages(file_path=\"native:producer/anonymous\")"),
+            "{hits}"
+        );
+        assert!(!hits.contains("bbox_messages(session_id=\"\""), "{hits}");
+    }
+
+    #[test]
+    fn a_native_hit_without_indexed_coordinates_states_recovery_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let transcript = document(
+            &fields,
+            "transcript",
+            "",
+            "native-recovery-missing-coordinates",
+        );
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(transcript).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let hits = search(&index, "native-recovery-missing-coordinates", None);
+        assert!(!hits.contains("bbox_context("), "{hits}");
+        assert!(!hits.contains("bbox_messages("), "{hits}");
+        assert!(
+            hits.contains("No exact follow-up reader is available for this transcript hit"),
+            "{hits}"
+        );
+    }
+
+    #[test]
+    fn a_thread_hit_recommends_exact_thread_readers_not_store_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let mut thread = document(
+            &fields,
+            "thread",
+            "thread:thread-12345678",
+            "thread-recovery-fixture",
+        );
+        thread.add_text(
+            fields.file_path,
+            root.join("threads.json").to_string_lossy(),
+        );
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(thread).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let hits = search(&index, "thread-recovery-fixture", None);
+        assert!(
+            hits.contains("bbox_thread(action=\"get\", id=\"thread-12345678\")"),
+            "{hits}"
+        );
+        assert!(
+            hits.contains("bbox_inspect_entity(entity_ref=\"thread:thread-12345678\")"),
+            "{hits}"
+        );
+        assert!(!hits.contains("threads.json"), "{hits}");
+    }
+
+    #[test]
+    fn knowledge_and_code_hits_use_canonical_entity_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let mut knowledge = document(
+            &fields,
+            "knowledge",
+            "knowledge:abc12345",
+            "knowledge-recovery-fixture",
+        );
+        knowledge.add_text(fields.file_path, root.join("kb.json").to_string_lossy());
+        let mut project_file = document(
+            &fields,
+            "project_file",
+            "project_file_v2:p_00000000000000000000000000000f71:collected-snapshot:12345678:deadbeef:0",
+            "code-recovery-fixture",
+        );
+        project_file.add_text(fields.project_id, PROJECT);
+        project_file.add_text(
+            fields.code_source_selector,
+            &bbox_code_source::local_selector(PROJECT),
+        );
+        project_file.add_text(fields.file_path, "src/recovery.rs");
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(knowledge).unwrap();
+        writer.add_document(project_file).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let knowledge_hits = search(&index, "knowledge-recovery-fixture", None);
+        assert!(
+            knowledge_hits.contains("bbox_inspect_entity(entity_ref=\"knowledge:abc12345\")"),
+            "{knowledge_hits}"
+        );
+        assert!(!knowledge_hits.contains("kb.json"), "{knowledge_hits}");
+
+        let code_hits = search(&index, "code-recovery-fixture", Some(PROJECT));
+        assert!(
+            code_hits.contains(
+                "bbox_inspect_entity(entity_ref=\"project_file_v2:p_00000000000000000000000000000f71:collected-snapshot:12345678:deadbeef:0\")"
+            ),
+            "{code_hits}"
+        );
+        assert!(!code_hits.contains("bbox_context("), "{code_hits}");
+        assert!(!code_hits.contains("bbox_messages("), "{code_hits}");
+    }
+
+    #[test]
+    fn slack_and_generic_entity_hits_get_matching_recovery_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        let fields = index.field_handles();
+        let mut slack = document(&fields, "transcript", "", "slack-recovery-fixture");
+        slack.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
+        slack.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
+        slack.add_text(fields.conversation_message_ts, "1786390478.000100");
+        let generic = document(
+            &fields,
+            "project_graph_vertex",
+            "project_graph_vertex:p_00000000000000000000000000000f71:graph-a:vertex/service",
+            "generic-entity-recovery-fixture",
+        );
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(slack).unwrap();
+        writer.add_document(generic).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let slack_hits = search(&index, "slack-recovery-fixture", None);
+        assert!(
+            slack_hits.contains(
+                "bbox_context(file_path=\"slack:T0RECOVERY/C0RECOVERY\", byte_offset=1786390478000100)"
+            ),
+            "{slack_hits}"
+        );
+        assert!(
+            slack_hits.contains("bbox_messages(session_id=\"C0RECOVERY/2026-08-10\")"),
+            "{slack_hits}"
+        );
+        assert!(
+            slack_hits.contains("channel=\"C0RECOVERY\""),
+            "{slack_hits}"
+        );
+
+        let generic_hits = search(&index, "generic-entity-recovery-fixture", None);
+        assert!(
+            generic_hits.contains(
+                "bbox_inspect_entity(entity_ref=\"project_graph_vertex:p_00000000000000000000000000000f71:graph-a:vertex/service\")"
+            ),
+            "{generic_hits}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod native_drilldown_tests {
     use super::*;
 
@@ -3843,6 +4299,85 @@ mod native_drilldown_tests {
 
     fn params() -> MessagesParams {
         serde_json::from_value(serde_json::json!({"session_id": "session-fixture"})).unwrap()
+    }
+
+    fn generated_selector_arg(output: &str, tool: &str, argument: &str) -> String {
+        let line = output
+            .lines()
+            .find(|line| line.contains(&format!("{tool}(")))
+            .unwrap_or_else(|| panic!("missing {tool} selector in:\n{output}"));
+        let start = line
+            .find(&format!("{argument}="))
+            .expect("selector argument");
+        let encoded = line[start + argument.len() + 1..].trim_start();
+        serde_json::Deserializer::from_str(encoded)
+            .deserialize()
+            .unwrap()
+    }
+
+    #[test]
+    fn generated_native_selectors_round_trip_through_the_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let locator = r#"native:producer/quote"back\slash"#;
+        let index = fixture(&root, locator, 5, 30);
+        let hits = index
+            .search_with_active_selectors(
+                &SearchParams {
+                    query: "stored2".into(),
+                    mode: Some("fulltext".into()),
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(1),
+                    source: None,
+                    author: None,
+                    channel: None,
+                    exclude_self: None,
+                },
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            generated_selector_arg(&hits, "bbox_context", "file_path"),
+            locator
+        );
+        let context_line = hits
+            .lines()
+            .find(|line| line.contains("bbox_context("))
+            .unwrap();
+        let byte_offset = context_line
+            .split("byte_offset=")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap();
+        assert_eq!(byte_offset, 200);
+        let context: Value = serde_json::from_str(
+            &index
+                .context(&ContextParams {
+                    file_path: locator.into(),
+                    byte_offset,
+                    context_lines: Some(1),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(context["messages"][1]["byte_offset"], 200);
+        assert_eq!(context["messages"][1]["target"], true);
+        let session_id = generated_selector_arg(&hits, "bbox_messages", "session_id");
+        assert_eq!(session_id, "session-fixture");
+        let messages: Value = serde_json::from_str(
+            &index
+                .messages(&MessagesParams {
+                    session_id: Some(session_id),
+                    ..params()
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(messages["total_matching_messages"], 5);
     }
 
     #[test]
