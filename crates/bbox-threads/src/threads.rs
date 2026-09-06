@@ -779,7 +779,7 @@ impl Threads {
                 })
                 .collect::<Vec<_>>(),
             Some("note" | "handoff") => anyhow::bail!(
-                "detail={detail} is an exact read served with note_index/cursor paging; pass it through the bbox_thread adapter"
+                "detail={detail:?} is an exact read served with note_index/cursor paging; pass it through the bbox_thread adapter"
             ),
             Some(other) => {
                 anyhow::bail!("unknown detail: {other} (use notes, sessions, edges, note, handoff)")
@@ -1793,7 +1793,7 @@ mod tests {
         assert_eq!(page["next_offset"], 2);
         assert_eq!(page["notes"][0]["index"], 1);
         assert_eq!(page["notes"][1]["index"], 2);
-        assert!(page["notes"][0]["note_truncated"], true);
+        assert_eq!(page["notes"][0]["note_truncated"], true);
         assert!(
             page["pagination"]
                 .as_str()

@@ -383,7 +383,7 @@ fn large_event_pages_remain_bounded_and_recover_the_tail() {
         "byte budget must bound the requested 500 rows"
     );
     assert_eq!(first["next_offset"], first_count);
-    let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let mut cursor = first["next_cursor"].as_str().map(str::to_owned);
     let mut newest_remaining = 500u64;
 
     let mut continuation: EventsParams =
@@ -397,10 +397,7 @@ fn large_event_pages_remain_bounded_and_recover_the_tail() {
         assert!(sequence < newest_remaining);
         newest_remaining = sequence;
         first_count += count;
-        cursor = tail["next_cursor"]
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_default();
+        cursor = tail["next_cursor"].as_str().map(str::to_owned);
     }
     assert_eq!(first_count, 501);
     assert_eq!(newest_remaining, 0);

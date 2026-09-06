@@ -1177,14 +1177,14 @@ mod harness {
         // payload: concatenated pages are byte-identical to the historical
         // monolithic serialization, so the committed fixture does not move.
         let mut full_text = String::new();
-        let mut body_offset: Option<usize> = None;
+        let mut cursor: Option<String> = None;
         loop {
             let result = fixture
                 .server
                 .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
                     format: Some("json".into()),
                     detail: Some("full".into()),
-                    body_offset,
+                    cursor,
                     ..Default::default()
                 }))
                 .await;
@@ -1201,8 +1201,8 @@ mod harness {
                     .and_then(Value::as_str)
                     .expect("doctor body page carries text"),
             );
-            match body.get("next_cursor").and_then(Value::as_u64) {
-                Some(next) => body_offset = Some(next as usize),
+            match body.get("next_cursor").and_then(Value::as_str) {
+                Some(next) => cursor = Some(next.to_string()),
                 None => break,
             }
         }

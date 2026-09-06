@@ -35,6 +35,11 @@ impl BlackboxServer {
             // resolves through the catalog/filter lane — never the checkout
             // write lease that attachment_inactive-fails a published project.
             let diagnostic = rescope_host_owned_project(&server, &mut p);
+            if p.action != "list"
+                && let Some(error) = diagnostic.as_ref()
+            {
+                anyhow::bail!("{error}; mutations require a registered project identity");
+            }
             let diagnostics: Vec<String> = diagnostic.into_iter().collect();
             let exact = p.full.unwrap_or(false) || p.cursor.is_some() || p.body_limit.is_some();
             if exact {
@@ -203,12 +208,21 @@ fn validate_pin_request(p: &PinParams) -> anyhow::Result<()> {
         "set" | "list" | "delete" => {}
         other => anyhow::bail!("unknown pin action: {other} (use set, list, delete)"),
     }
-    if let Some(raw) = p.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(raw) = p.scope.as_deref() {
         std::str::FromStr::from_str(raw)
             .map(|_: crate::pins::PinScope| ())
             .map_err(|_| {
                 anyhow::anyhow!("invalid scope: {raw:?} (use session, bro, thread, work_item)")
             })?;
+    }
+    if p.action != "list"
+        && (p.full.is_some()
+            || p.cursor.is_some()
+            || p.body_limit.is_some()
+            || p.limit.is_some()
+            || p.offset.is_some())
+    {
+        anyhow::bail!("full, cursor, body_limit, limit and offset require action=list");
     }
     if p.action == "set" {
         if p.scope.is_none() {
@@ -503,6 +517,33 @@ mod tests {
                 .any(|line| line.as_str().unwrap().contains("no-such-project")),
             "{page}"
         );
+
+        let before_count = server.state.pins.read().all().len();
+        let rejected = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                content: Some("must not persist".into()),
+                project: Some("no-such-project".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(rejected.is_error, Some(true));
+        assert_eq!(server.state.pins.read().all().len(), before_count);
+        let rejected = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                content: Some("must not become a read".into()),
+                full: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(rejected.is_error, Some(true));
+        assert!(error_text(&rejected).contains("require action=list"));
+        assert_eq!(server.state.pins.read().all().len(), before_count);
 
         // Audit A03 ordering: an invalid scope errors even when the project
         // selector is ALSO unknown — validation precedes locality work.

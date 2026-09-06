@@ -24,7 +24,7 @@ pub(crate) struct StorageMigrationParams {
     /// selectors fail identically in both modes. Required when dry_run=false.
     #[serde(default)]
     pub project: Option<String>,
-    /// Dry-run plan page size. Default 20, minimum 1, maximum 100. Ignored
+    /// Dry-run plan page size. Default 20, minimum 1, maximum 100. Refused
     /// for apply, which migrates exactly one project.
     #[serde(default)]
     pub limit: Option<usize>,
