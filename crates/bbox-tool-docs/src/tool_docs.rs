@@ -279,8 +279,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_inspect_entity",
         category: ToolCategory::Graph,
-        summary: "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Edge omissions are explicit.",
-        when_to_use: "Use after search to verify a ref and inspect relevant relations. Select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Inspection caps the aggregate at 100 edges and reports omission counts in edge_truncation. There is currently no edge cursor; narrower edge_types/direction can recover other families but cannot exhaust an oversized single family. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
+        summary: "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Follow edge_page.next_cursor for more edges; property retrieves exact text in pages.",
+        when_to_use: "Use after search to verify a ref and inspect relevant relations. Select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Edges page at 100 maximum; follow edge_page.next_cursor as edge_cursor with the same selection. Read a property key from properties or property_projection.omitted_keys with property=<key>; body.next_cursor continues via property_cursor. property_limit is 4..4096 UTF-8 bytes, default 4096. Cursors reject changed selections or source revisions. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
         example: Some(
             r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
         ),
@@ -325,7 +325,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_bundle_evidence",
         category: ToolCategory::Graph,
-        summary: "Bundle entity refs and cached path IDs with provenance and current evidence freshness. property_mode=summary reduces bodies; default is full. Stale paths are explicit.",
+        summary: "Bundle entity refs and cached path IDs with provenance and current evidence freshness. Default summary bodies are 600 characters; full and none are explicit. Exact property pages are available through bbox_inspect_entity. Stale paths are explicit.",
         when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). Use `property_mode=\"summary\"` when bundling broad knowledge/tool refs or other long entities. This tool packages evidence only; it does not synthesize the answer for you. When a bundled binding reports a non-current freshness, say so in the answer; the bundle records what was asserted, not that it is still true.",
         example: Some(
             r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"], property_mode="summary")"#,

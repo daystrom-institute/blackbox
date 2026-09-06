@@ -3567,6 +3567,10 @@ mod tests {
                 direction: Some("both".into()),
                 per_type_limit: Some(10),
                 property_mode: Some("full".into()),
+                edge_cursor: None,
+                property: None,
+                property_cursor: None,
+                property_limit: None,
             }))
             .await;
         let inspected_text = error_text(&inspected);
