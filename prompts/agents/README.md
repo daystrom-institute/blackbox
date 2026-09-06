@@ -21,6 +21,7 @@ Parent: [Prompts](../README.md)
 
 | Lens | Paired brofile | Role |
 |------|----------------|------|
+| [mcp-survivor-fixes/](mcp-survivor-fixes/README.md) | GLM 5.3 dispatches | Ten bounded MCP caller-contract fix briefs with isolated file ownership, pushed branch deliverables, and orchestrator-owned cluster verification. |
 | [gap-processing-orchestrator.md](gap-processing-orchestrator.md) | `.bbox/brofiles/gap-processing.json` (codex) | The gap-processing **workflow** orchestrator actor: runs as the Cluster node (pull → cluster by semantic theme) and the Sieve node (merge verdicts → group/sort). No dispatch — the workflow `foreach` fans out the validators. Launched via [../gap-processing.md](../gap-processing.md). |
 | [gap-cluster-validator.md](gap-cluster-validator.md) | `.bbox/brofiles/gap-cluster-validator.json` (deepseek) + atom `gap-cluster-validator` (`gap-validation/v1`) | Per-cluster judge: classify each gap landed/dupe/externality/stale/actionable with evidence + criticality. Read-only; propose-only. Invoked by the workflow as a typed atom (`atom_invoke`). |
 | [MINE_CLI.md](MINE_CLI.md) | — (dispatched by [`../REFRESH_ALL_CLIS.md`](../REFRESH_ALL_CLIS.md)) | Forward-mine one CLI version against the harness research corpus's 15 axes; write/refresh that subject's cells + snapshot. |
