@@ -35,7 +35,7 @@ ALLOWLIST = {
     # convert the handler to async + run_blocking instead.
     "atom_delegate", "atom_describe", "atom_get", "atom_list", "atom_search",
     "atom_status", "bbox_artifact_list", "bbox_describe_schema",
-    "bbox_embed_status", "bbox_gaps", "bbox_mcp_surface", "bbox_notes",
+    "bbox_embed_status", "bbox_gaps", "bbox_notes",
     "bbox_project_list", "bbox_thread_list",
     "bro_agent_describe", "bro_agent_get", "bro_agent_list",
     "bro_agent_search", "bro_allocator_probe", "bro_allocator_status",

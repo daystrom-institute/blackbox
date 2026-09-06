@@ -14,14 +14,24 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSurfaceAction {
+    Replay,
+    List,
+    Describe,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct McpSurfaceParams {
     /// Action to perform. "replay" evaluates a surface; "list" shows
     /// installed surface packets; "describe" shows a surface packet's rules.
-    pub action: String,
-    /// Surface name to evaluate. Defaults to "default".
+    pub action: McpSurfaceAction,
+    /// Surface name for replay/describe. Defaults to "default".
     #[serde(default)]
     pub surface: Option<String>,
-    /// Optional project path for project-scoped surface packets.
+    /// Project selector (registered ID or alias) for replay/describe policy
+    /// selection. List returns the installed routing-packet catalog.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -32,11 +42,12 @@ impl BlackboxServer {
         name = "bbox_mcp_surface",
         description = "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface."
     )]
-    pub(crate) fn bbox_mcp_surface(
+    pub(crate) async fn bbox_mcp_surface(
         &self,
         Parameters(p): Parameters<McpSurfaceParams>,
     ) -> CallToolResult {
-        Self::run("bbox_mcp_surface", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_mcp_surface", move || {
             // Filter-class engine resolution (phase-2 §9.2 B8), aligned
             // with the `/mcp?project=` wire head: a resolving selector
             // rewrites to the packet scope key (store key, or the stable
@@ -46,7 +57,7 @@ impl BlackboxServer {
             let mut p = p;
             let mut resolved_project_id = None;
             if let Some(raw) = p.project.clone() {
-                p.project = Some(match self.resolve_project_filter(&raw) {
+                p.project = Some(match server.resolve_project_filter(&raw) {
                     Some(resolution) => {
                         resolved_project_id = resolution.project_id().map(str::to_owned);
                         match resolution
@@ -56,7 +67,7 @@ impl BlackboxServer {
                         {
                             Some(resolved) => resolved,
                             None => {
-                                self.state.resolver_compat.record(
+                                server.state.resolver_compat.record(
                                     "bbox_mcp_surface",
                                     crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
                                 );
@@ -65,7 +76,7 @@ impl BlackboxServer {
                         }
                     }
                     None => {
-                        self.state.resolver_compat.record(
+                        server.state.resolver_compat.record(
                             "bbox_mcp_surface",
                             crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
                         );
@@ -74,16 +85,13 @@ impl BlackboxServer {
                 });
             }
             let resolved_project_id = resolved_project_id.as_deref();
-            match p.action.as_str() {
-                "replay" => self.handle_mcp_surface_replay(&p, resolved_project_id),
-                "list" => self.handle_mcp_surface_list(),
-                "describe" => self.handle_mcp_surface_describe(&p, resolved_project_id),
-                _ => Err(anyhow::anyhow!(
-                    "unknown action '{}'. Valid actions: replay, list, describe",
-                    p.action
-                )),
+            match p.action {
+                McpSurfaceAction::Replay => server.handle_mcp_surface_replay(&p, resolved_project_id),
+                McpSurfaceAction::List => server.handle_mcp_surface_list(),
+                McpSurfaceAction::Describe => server.handle_mcp_surface_describe(&p, resolved_project_id),
             }
         })
+        .await
     }
 }
 
@@ -325,8 +333,8 @@ mod tests {
         (tmp, server)
     }
 
-    #[test]
-    fn test_replay_readonly_returns_filtered_tools() {
+    #[tokio::test]
+    async fn test_replay_readonly_returns_filtered_tools() {
         let (_tmp, server) = make_server();
         let packets = server.state.packets.read();
 
@@ -348,17 +356,15 @@ mod tests {
         drop(packets);
 
         let result = server
-            .handle_mcp_surface_replay(
-                &McpSurfaceParams {
-                    action: "replay".to_string(),
-                    surface: Some("readonly".to_string()),
-                    project: None,
-                },
-                None,
-            )
-            .unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            .bbox_mcp_surface(Parameters(McpSurfaceParams {
+                action: McpSurfaceAction::Replay,
+                surface: Some("readonly".to_string()),
+                project: None,
+            }))
+            .await;
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
         assert!(!parsed["visible_tools"].as_array().unwrap().is_empty());
         let visible: Vec<&str> = parsed["visible_tools"]
@@ -397,7 +403,7 @@ mod tests {
         let result = server
             .handle_mcp_surface_replay(
                 &McpSurfaceParams {
-                    action: "replay".to_string(),
+                    action: McpSurfaceAction::Replay,
                     surface: Some("unknown".to_string()),
                     project: None,
                 },
@@ -445,7 +451,7 @@ mod tests {
         let result = server
             .handle_mcp_surface_replay(
                 &McpSurfaceParams {
-                    action: "replay".to_string(),
+                    action: McpSurfaceAction::Replay,
                     surface: Some("default".to_string()),
                     project: Some(project_path.to_string()),
                 },
@@ -470,7 +476,7 @@ mod tests {
         let result_global = server
             .handle_mcp_surface_replay(
                 &McpSurfaceParams {
-                    action: "replay".to_string(),
+                    action: McpSurfaceAction::Replay,
                     surface: Some("default".to_string()),
                     project: None,
                 },
@@ -555,7 +561,7 @@ mod tests {
         let result = server
             .handle_mcp_surface_describe(
                 &McpSurfaceParams {
-                    action: "describe".to_string(),
+                    action: McpSurfaceAction::Describe,
                     surface: Some("readonly".to_string()),
                     project: None,
                 },
@@ -582,7 +588,7 @@ mod tests {
 
         let result = server.handle_mcp_surface_describe(
             &McpSurfaceParams {
-                action: "describe".to_string(),
+                action: McpSurfaceAction::Describe,
                 surface: Some("readonly".to_string()),
                 project: None,
             },
