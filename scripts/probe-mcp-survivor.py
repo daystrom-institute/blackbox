@@ -13,7 +13,7 @@ sock=socket.socket(); sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; so
 env={'PATH':os.environ['PATH'],'HOME':str(root/'home'),'XDG_CONFIG_HOME':str(root/'config'),'XDG_CACHE_HOME':str(root/'cache'),'XDG_DATA_HOME':str(root/'data'),'XDG_STATE_HOME':str(root/'xdg-state'),'BLACKBOX_CONFIG':str(config),'BLACKBOX_STATE_DIR':str(root/'state'),'BLACKBOX_DEFAULTS_DIR':str(repo/'system-defaults'),'BLACKBOX_VECTORS_PATH':str(root/'state/vectors'),'TRANSCRIPT_SEARCH_INDEX_PATH':str(root/'index'),'TRANSCRIPT_SEARCH_ROOTS':'throwaway='+str(root/'transcripts'),'TRANSCRIPT_SEARCH_CODEX_ROOT':str(root/'codex'),'BLACKBOX_REINDEX_INTERVAL_SECS':'999999','BLACKBOX_EDGE_INDEX_BOOT_REBUILD':'false','BBOX_BIND':'127.0.0.1','BBOX_PORT':str(port),'BLACKBOX_MCP_NAME':'mcp-audit-isolated','RUST_LOG':'blackbox=info'}
 with (root/'genesis.log').open('w') as log:
  subprocess.run([str(repo/'target/debug/blackbox'),'project-catalog','genesis','--config',str(config),'--state-dir',str(root/'state')],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
-# Admission preview checks executable presence but never dispatches it.
+# Synthetic dispatches use an inert executable; no provider API is contacted.
 env['BRO_HARNESS_BIN']='/bin/true'
 log=(root/'daemon.log').open('w'); proc=subprocess.Popen([str(repo/'target/debug/blackboxd')],env=env,stdout=log,stderr=subprocess.STDOUT,cwd=root)
 rows=[]; session=None; seq=0; url=f'http://127.0.0.1:{port}/mcp?surface=ops'
@@ -53,6 +53,23 @@ try:
  rpc('notifications/initialized',{},True)
  catalog=rpc('tools/list',{})['result']['tools']; names={t['name'] for t in catalog}; (root/'catalog.json').write_text(json.dumps(catalog,indent=2)); print('catalog',len(names),flush=True)
  providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; assert isinstance(providers['glm']['peak_usage'],bool); print('Flash catalog and peak advisory PASS',flush=True)
+ summaries=call('bro_providers',{})
+ assert all(isinstance(summaries[p]['peak_usage'],bool) for p in ['glm','deepseek'])
+ assert 'peak_usage' not in summaries['brodex']
+ call('bro_dashboard',{})
+ dispatch_args={'provider':'glm','prompt':'Synthetic peak advisory fixture','cwd':str(root),'request_key':'synthetic-peak-exec'}
+ dispatched=call('bro_exec',dispatch_args)
+ assert isinstance(dispatched['peak_usage'],bool),dispatched
+ call('bro_wait',{'task_id':dispatched['taskId'],'timeout_seconds':10})
+ replayed=call('bro_exec',dispatch_args)
+ assert replayed['taskId']==dispatched['taskId'] and replayed['peak_usage']==dispatched['peak_usage'] and replayed['replayed'],replayed
+ resume_args={'provider':'glm','session_id':dispatched['sessionId'],'prompt':'Synthetic continuation','cwd':str(root),'request_key':'synthetic-peak-resume'}
+ resumed=call('bro_resume',resume_args)
+ assert isinstance(resumed['peak_usage'],bool),resumed
+ call('bro_wait',{'task_id':resumed['taskId'],'timeout_seconds':10})
+ replayed=call('bro_resume',resume_args)
+ assert replayed['taskId']==resumed['taskId'] and replayed['peak_usage']==resumed['peak_usage'] and replayed['replayed'],replayed
+ print('provider discovery and synthetic dispatch/resume peak advisories PASS',flush=True)
  for name in ['bro_when_any','bro_when_all']:
   call(name,{'task_ids':['00000000-0000-0000-0000-000000000000'],'timeout_seconds':0},True)
  for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'}),('bbox_packet',{'action':'typo'})]:
