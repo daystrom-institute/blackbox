@@ -8,13 +8,17 @@ export pulls a daemon-authored observed-edge plan and applies it through the
 shared checkout-local writer. The daemon remains responsible for chunking,
 indexing, embeddings, entity references, graph snapshots, and activation.
 
-This is an overlap facility. The daemon must already have catalog projects
-whose committed `.bbox/config.toml` resolve to the configured published
-scopes. Git-history transport additionally requires every published member of
-one repo-history identity to be assigned to the same producer. Verified history
-sources materialize and activate through the same corpus builder as local
-history. Provenance export is project-scoped and does not widen one member's
-credential to its repository siblings.
+In catalog mode, a configured scope that has no project yet remains pending
+onboarding. The authenticated collector probes its owning checkout, submits the
+recorded identity, and admits the project through the catalog onboarding lane.
+Source publication requires the admitted scope's producer grant; enrollment
+alone does not authorize reads from arbitrary paths. No matching daemon-local
+checkout is required for collected code and transported Git history.
+
+Git-history transport requires every published member of one repo-history
+identity to be assigned to the same producer. Verified history sources
+materialize and activate through the corpus builder. Provenance export is
+project-scoped and does not widen one member's credential to repository siblings.
 
 ## Configure the daemon
 
@@ -55,7 +59,9 @@ scopes = [
 ```
 
 The daemon fails closed at startup when an enabled token is unsafe, a scope is
-assigned twice, or a scope does not resolve to exactly one registered project.
+assigned twice, or an existing scope is ambiguous. In catalog mode an unregistered
+scope can wait for authenticated onboarding; it cannot publish before admission.
+Legacy bridge mode still requires scopes to resolve to registered projects.
 On SIGHUP, an invalid replacement retains the previous complete assignment and
 authentication table.
 
