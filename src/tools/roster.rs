@@ -443,20 +443,18 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                let mut config = brofile::load_config(store_dir);
-                config.accounts.insert(
-                    name.clone(),
-                    brofile::Account {
-                        env: p.env.clone(),
-                        ..Default::default()
-                    },
-                );
-                if let Err(error) = brofile::save_config(&config, store_dir) {
-                    return Self::err_text(&format!("Configuration was not saved: {error}"));
+                match brofile::update_config(store_dir, |config| {
+                    let account = config.accounts.entry(name.clone()).or_default();
+                    account.env = p.env.clone();
+                    account.response_view()
+                }) {
+                    Ok(configuration) => Self::ok_json(&json!({
+                        "account": name, "updated": true, "configuration": configuration,
+                    })),
+                    Err(error) => Self::err_text(&format!("Configuration was not saved: {error}")),
                 }
-                Self::ok_json(&json!({"account": name, "updated": true,
-                    "configuration": config.accounts[name].response_view()}))
             }
+
             "list_accounts" => {
                 let config = brofile::load_config(store_dir);
                 Self::ok_json(&Value::Object(
@@ -480,14 +478,14 @@ impl BlackboxServer {
                     Some(a) if !a.trim().is_empty() => a.trim().to_string(),
                     _ => return Self::err_text("account is required"),
                 };
-                let mut config = brofile::load_config(store_dir);
-                config.provider_defaults.insert(
-                    provider,
-                    brofile::ProviderDefault {
-                        account: account.clone(),
-                    },
-                );
-                if let Err(error) = brofile::save_config(&config, store_dir) {
+                if let Err(error) = brofile::update_config(store_dir, |config| {
+                    config.provider_defaults.insert(
+                        provider,
+                        brofile::ProviderDefault {
+                            account: account.clone(),
+                        },
+                    );
+                }) {
                     return Self::err_text(&format!("Configuration was not saved: {error}"));
                 }
                 Self::ok_json(
@@ -524,13 +522,16 @@ impl BlackboxServer {
                     Some(p) => p,
                     None => return Self::err_text("valid provider is required"),
                 };
-                let mut config = brofile::load_config(store_dir);
-                let removed = config.provider_defaults.remove(&provider).is_some();
-                if let Err(error) = brofile::save_config(&config, store_dir) {
-                    return Self::err_text(&format!("Configuration was not saved: {error}"));
+                match brofile::update_config(store_dir, |config| {
+                    config.provider_defaults.remove(&provider).is_some()
+                }) {
+                    Ok(removed) => {
+                        Self::ok_json(&json!({"provider": provider.as_str(), "removed": removed}))
+                    }
+                    Err(error) => Self::err_text(&format!("Configuration was not saved: {error}")),
                 }
-                Self::ok_json(&json!({"provider": provider.as_str(), "removed": removed}))
             }
+
             _ => Self::err_text(&format!("Unknown brofile action: {}", p.action)),
         }
     }
@@ -1546,6 +1547,77 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn account_mutations_preserve_malformed_or_unreadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let path = root.join("config.json");
+        let malformed = br#"{"accounts":{"synthetic":{"env":"stored-secret"}}}"#;
+        std::fs::write(&path, malformed).unwrap();
+        for action in [
+            "set_account",
+            "set_provider_default",
+            "clear_provider_default",
+        ] {
+            let params: BrofileParams = serde_json::from_value(json!({
+                "action": action, "name": "synthetic", "provider": "brodex", "account": "synthetic",
+            }))
+            .unwrap();
+            let result = server.bro_brofile(Parameters(params));
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{action} overwrote invalid configuration"
+            );
+            assert!(!extract_text(&result).contains("stored-secret"));
+            assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        }
+        // A directory cannot be read as JSON, regardless of test permissions.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("retained"), "existing-data").unwrap();
+        let params: BrofileParams =
+            serde_json::from_value(json!({"action": "set_account", "name": "synthetic"})).unwrap();
+        let result = server.bro_brofile(Parameters(params));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            std::fs::read_to_string(path.join("retained")).unwrap(),
+            "existing-data"
+        );
+    }
+
+    #[test]
+    fn account_env_update_preserves_existing_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut config = orchestration::brofile::BroConfig::default();
+        config.accounts.insert(
+            "synthetic".into(),
+            orchestration::brofile::Account {
+                disabled: true,
+                allowed_models: vec!["test-model".into()],
+                allowed_tiers: vec!["test-tier".into()],
+                max_concurrent: Some(2),
+                ..Default::default()
+            },
+        );
+        orchestration::brofile::save_config(&config, &server.state.store_dir).unwrap();
+        let params: BrofileParams = serde_json::from_value(json!({
+            "action": "set_account", "name": "synthetic", "env": {"TOKEN": "new-secret"},
+        }))
+        .unwrap();
+        let result = server.bro_brofile(Parameters(params));
+        assert_ne!(result.is_error, Some(true));
+        let updated =
+            orchestration::brofile::load_account("synthetic", &server.state.store_dir).unwrap();
+        assert!(updated.disabled);
+        assert_eq!(updated.allowed_models, ["test-model"]);
+        assert_eq!(updated.allowed_tiers, ["test-tier"]);
+        assert_eq!(updated.max_concurrent, Some(2));
+        assert_eq!(updated.env.unwrap()["TOKEN"], "new-secret");
     }
 
     #[test]
