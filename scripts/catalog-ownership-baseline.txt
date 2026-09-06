@@ -133,7 +133,7 @@ checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	
 checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn attachment_row_governing	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	4	collapse into the lease confined readers
-checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_catalog_get	1	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn project_catalog_get_page	1	response-only recorded attachment coordinate; does not access the checkout
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_advance	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_bind	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn probe_migration_attachments	2	collapse into the lease confined readers
