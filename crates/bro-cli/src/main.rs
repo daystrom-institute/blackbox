@@ -248,25 +248,6 @@ fn write_tail_frame(out: &mut impl Write, frame: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-fn default_base_url() -> anyhow::Result<String> {
-    Ok(bro_fleet_client::daemon_url())
-}
-
-/// Minimal RFC 3986 component-encoder for the one query param we send
-/// (`thread_id` — already in canonical `thread-<8hex>` form but defensive
-/// encoding costs nothing).
-fn urlencoding_lite(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                vec![c]
-            } else {
-                format!("%{:02X}", c as u32).chars().collect::<Vec<_>>()
-            }
-        })
-        .collect()
-}
-
 fn find_sse_separator(buf: &[u8]) -> Option<usize> {
     // SSE record terminator is `\n\n`. Some servers use `\r\n\r\n`;
     // handle both.
@@ -281,36 +262,6 @@ fn find_sse_separator(buf: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-fn print_stream_event(data: &str) {
-    // Attempt structured parse for pretty output; fall back to raw.
-    match serde_json::from_str::<serde_json::Value>(data) {
-        Ok(ev) => {
-            let kind = ev["kind"].as_str().unwrap_or("?");
-            let ts = ev["timestamp"].as_str().unwrap_or("");
-            if kind == "result" {
-                println!("\n=== terminal ===");
-                let result = &ev["data"];
-                let status = result["status"].as_str().unwrap_or("?");
-                println!("status: {status}");
-                if let Some(arc) = result["arc_thread_id"].as_str() {
-                    println!("arc_thread_id: {arc}");
-                }
-                if let Some(outputs) = result["node_outputs"].as_object() {
-                    for (node, out) in outputs {
-                        let preview: String =
-                            out.as_str().unwrap_or("").chars().take(500).collect();
-                        println!("\n─── {node} ───\n{preview}");
-                    }
-                }
-            } else {
-                let data_s = ev["data"].to_string();
-                println!("[{ts}] {kind}: {data_s}");
-            }
-        }
-        Err(_) => println!("{data}"),
-    }
 }
 
 /// Capture each fleet harness session's stdout transcript + stderr (including

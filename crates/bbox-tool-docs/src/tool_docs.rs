@@ -34,8 +34,6 @@ pub enum ToolCategory {
     Artifacts,
     Packets,
     Orchestration,
-    Workflows,
-    Whiteboards,
     Roadmap,
     StorageHealth,
     Workspace,
@@ -58,11 +56,9 @@ impl ToolCategory {
             Self::Artifacts => "Artifact catalog",
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
-            Self::Workflows => "Workflow orchestration",
-            Self::Whiteboards => "Whiteboards",
             Self::Roadmap => "Roadmap",
             Self::StorageHealth => "Storage health",
-            Self::Workspace => "Workspace tools",
+            Self::Workspace => "Tool-call history",
             Self::Operations => "Operations",
         }
     }
@@ -85,7 +81,7 @@ impl ToolCategory {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
             }
             Self::Notes => {
-                "Structured side channel for *notable* observations surfaced during delegated work — orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when a caller (atom, workflow, or an explicit completion contract) asks for a structured sign-off — it is not required on every dispatch."
+                "Structured side channel for *notable* observations surfaced during delegated work — orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when an explicit caller contract asks for a structured sign-off — it is not required on every dispatch."
             }
             Self::Gaps => {
                 "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
@@ -94,26 +90,20 @@ impl ToolCategory {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
             }
             Self::Artifacts => {
-                "Versioned install catalog for producer-side workflows, rule-packets, and brofiles. Use this surface instead of hand-copying shipped artifacts into daemon state; metadata tracks source, active version, and supersession."
+                "Versioned catalog for packets, brofiles, simple agents and teams. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts."
             }
             Self::Packets => {
                 "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
             }
             Self::Orchestration => {
-                "Dispatch agents across providers (Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
-            }
-            Self::Workflows => {
-                "Define multi-phase agent protocols as JSON specs with per-node `next` transitions and dispatch them as a unit. The daemon owns the state machine; actors (executor / ensemble) are dispatched INTO the loop as stateless turns — persona / role / contract is the brofile lens, not an engine type. `atom_bindings` let nodes invoke standalone atom contracts directly. Gate packets route choice nodes by verdict; retry ceilings cap back-edges; fork + `late_inject` express async steering; sub-workflows compose arcs like rule-packets compose via `Apply`; workflow-level `policy_packet` mechanizes arc-health decisions without an LLM advisor. Whiteboards (see `whiteboard_*` tools) provide multi-agent deliberation with phases + structured posts; `wait_for_phase` resumes arcs on board transitions. Every run opens a workflow-origin `bbox_thread(kind=work_item)` with structured notes + rolling compaction anchors; normal `bbox_thread_list` calls hide workflow-origin threads unless `include_workflows=true`. Replaces long skill-prose protocols (overmind, crucible). See `sm-workflow-orchestration` via `bbox_knowledge` for the full runbook and `examples/workflows/` for the catalog."
-            }
-            Self::Whiteboards => {
-                "Multi-agent deliberation surface. Posts (proposals / claims / concerns / informational), annotations (challenge / corroborate / resolve / validation), and votes accumulate on a board, advanced through phases (blind → read → validate → debate → resolve → archived) by a facilitator-or-operator role. Three audiences share one surface: in-workflow ensemble specialists (their structured outputs auto-post when the node has a `board:` field), in-workflow facilitators (single bro, drives transitions), and external agents — operator's Claude session, dispatched help, eventually humans through slack / ntfy adapters — that read state via `whiteboard_state` and act via `whiteboard_post` / `whiteboard_vote` / `whiteboard_transition`. Phase transitions emit `board-transitioned` signals through the same `dispatch_routed_event` pipeline webhooks use; arcs `wait_for_phase` to resume when the board advances. Replaces phaser as a peer external MCP server."
+                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
             Self::Roadmap => {
                 "Operator-directed prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Use `action=\"next\"` to rank accepted items, and `action=\"promote\"` to spin a roadmap item into a work thread."
             }
             Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
-                "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
+                "Search indexed historical tool calls with bbox_tool_calls. Execute file, shell and Git operations in the caller harness."
             }
             Self::Operations => {
                 "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands."
@@ -127,8 +117,6 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
         ToolCategory::Gaps => Some("sm-gap-notes"),
         ToolCategory::Packets => Some("sm-rule-packets"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
-        ToolCategory::Workflows => Some("sm-workflow-orchestration"),
-        ToolCategory::Whiteboards => Some("sm-whiteboards"),
         ToolCategory::StorageHealth => Some("sm-storage-health"),
         ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
         _ => None,
@@ -146,8 +134,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Artifacts,
     ToolCategory::Packets,
     ToolCategory::Orchestration,
-    ToolCategory::Workflows,
-    ToolCategory::Whiteboards,
     ToolCategory::Roadmap,
 ];
 
@@ -604,7 +590,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_thread_list",
         category: ToolCategory::Threads,
         summary: "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for full context.",
-        when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`. Workflow-origin arc threads are hidden by default; pass `include_workflows=true` when you intentionally want workflow scaffolding.",
+        when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`. Workflow-origin arc threads are hidden by default; pass `include_workflows=true` when you need historical workflow records.",
         example: None,
     },
     // ── Notes ────────────────────────────────────────────────────────
@@ -612,7 +598,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when a caller (atom, workflow, team broadcast, or an explicit completion contract) asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. Substrate gaps that other projects could plausibly hit too are NOT side-channel notes — file them with `bbox_gap` (see `sm-gap-notes` via `bbox_knowledge`), not here.",
+        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when an explicit caller contract asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. Substrate gaps that other projects could plausibly hit too are NOT side-channel notes — file them with `bbox_gap` (see `sm-gap-notes` via `bbox_knowledge`), not here.",
         example: Some(
             r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
         ),
@@ -681,9 +667,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
         summary: "Install a packet, brofile, simple agent or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, atom and cron installation is retired.",
-        when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog. Team artifacts are teamplate-shaped and materialize on install: the teamplate store is written and the team instantiated under the teamplate's name (member brofiles must already be installed; re-install never clobbers a live team's sessions; advisor-carrying teamplates are rejected; automatic advisors are retired, so omit advisor and dispatch reviewers explicitly).",
+        when_to_use: "List before installing. The installer validates packet, brofile, simple-agent or team JSON and records its version. Teams require installed member brofiles; reinstalling preserves live sessions. Automatic advisors are retired: dispatch reviewers explicitly. Caller paths are never read by this tool.",
         example: Some(
-            r#"bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/schema-migration-arc.json")"#,
+            r#"bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"brodex","lens":"Review correctness and explain material findings."})"#,
         ),
     },
     ToolDoc {
@@ -697,9 +683,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_artifact_supersede",
         category: ToolCategory::Artifacts,
         summary: "Mark one installed artifact superseded by another artifact of the same kind.",
-        when_to_use: "Use when a customized workflow/packet/brofile/agent replaces an installed version but you want the old version retained for audit.",
+        when_to_use: "Use when a customized packet/brofile/agent replaces an installed version but you want the old version retained for audit.",
         example: Some(
-            r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
+            r#"bbox_artifact_supersede(kind="brofile", name="reviewer", superseded_by="reviewer-v2")"#,
         ),
     },
     ToolDoc {
@@ -817,21 +803,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_wait",
         category: ToolCategory::Orchestration,
         summary: "Observe one task until completion; never launches follow-up work. Timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success.",
-        when_to_use: "After `bro_exec` or `bro_resume` when you need the result. USE MAXIMUM TIMEOUT for provider work. On timeout, or when a completed result is empty/suspicious, call `bro_status(tail=N)` before deciding the task is stuck, treating it as success, cancelling it, or dispatching replacement work. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
+        when_to_use: "After `bro_exec` or `bro_resume` when you need the result. USE MAXIMUM TIMEOUT for provider work. On timeout, or when a completed result is empty/suspicious, call `bro_status(tail=N)` before deciding the task is stuck, treating it as success, cancelling it, or dispatching replacement work. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. ",
         example: None,
     },
     ToolDoc {
         name: "bro_when_all",
         category: ToolCategory::Orchestration,
         summary: "Observe ALL selected tasks or team members until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch.",
-        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. On timeout, inspect member status before cancelling or redispatching. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
+        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. On timeout, inspect member status before cancelling or redispatching. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. ",
         example: None,
     },
     ToolDoc {
         name: "bro_when_any",
         category: ToolCategory::Orchestration,
         summary: "Block until the FIRST task completes; use for races instead of polling each task yourself.",
-        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. Before cancelling laggards, check status and cancel only if the remaining work is truly no longer useful. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. Internal workflow consumers retain exact full exits.",
+        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. Before cancelling laggards, check status and cancel only if the remaining work is truly no longer useful. Completed replies include small deliverables inline. resultTruncated/resultCursor continues through bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value. ",
         example: None,
     },
     ToolDoc {
@@ -859,7 +845,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_report",
         category: ToolCategory::Orchestration,
         summary: "Attach the latest progress report to a task.",
-        when_to_use: "Agents and workflow hooks call this at major milestones so bro_dashboard and bro_status show what the task last reported, what it needs, and when it last checked in.",
+        when_to_use: "Dispatched agents call this at major milestones so bro_dashboard and bro_status show what the task last reported, what it needs, and when it last checked in.",
         example: Some(
             r#"bro_report(task_id="...", message="writing tests", needs="review API naming")"#,
         ),
@@ -898,7 +884,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_retro",
         category: ToolCategory::Orchestration,
         summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task.",
-        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_/work_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
+        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
         example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {
@@ -1052,12 +1038,12 @@ broader recall.
 
 - **Orchestrator** — dispatches, reviews, reads `bbox_inbox`, resolves notes, \
 and records durable commitments.
-- **Executor** — when running as a dispatched bro/task/workflow/atom actor, \
+- **Executor** — when running as a dispatched bro/task actor, \
 does the work and returns its result. `bbox_note` is available for *notable* \
 observations worth surfacing to the orchestrator (`dispute`, `surprise`, \
 `blocked`, `learned`, actionable `followup`) — it is not a per-dispatch ritual, \
 so stay silent when nothing is notable. A caller that needs a structured \
-sign-off (an atom, workflow, or explicit completion contract) may require a \
+sign-off contract may require a \
 `kind=done` note on top of this default; absent that instruction, a done note \
 is optional.
 
@@ -1091,15 +1077,11 @@ ad hoc teams. Cleanup is operator-gated, not automatic.
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
 The one-year test picks between rendered and pin — would it still be correct \
 a year from now with current arcs done?
-- Workflow vs. manual dispatch: when you're about to author (or \
-re-author) a multi-phase protocol with gates, retries, or ensemble \
-review — reach for `bro_orchestrate_run` with a mermaid-shaped spec \
-instead of pasting a discipline-protocol into an LLM and hoping it \
-won't drift. The daemon owns the state machine; the LLM is a turn. \
-See `sm-workflow-orchestration` via `bbox_knowledge`.
+- Compose gates, retries, schedules and review protocols in your caller. Blackbox \
+executes and resumes bro turns; it does not choose the next application step.
 - `bbox_learn` is for operator-approved, user-stated rules; `bbox_note(kind=learned)` is for \
 agent-discovered facts.
-- For long-running bro work, instruct dispatched agents and workflow hook nodes \
+- For long-running bro work, instruct dispatched agents \
 to call `bro_report` at major milestones. `bro_dashboard` should show the last \
 thing each bro reported, what it needs, and how long ago it checked in.
 ";
@@ -1364,8 +1346,6 @@ mod tests {
         for (cat, memory_id) in [
             (ToolCategory::Packets, "sm-rule-packets"),
             (ToolCategory::Orchestration, "sm-bro-dispatch-patterns"),
-            (ToolCategory::Workflows, "sm-workflow-orchestration"),
-            (ToolCategory::Whiteboards, "sm-whiteboards"),
         ] {
             assert!(md.contains(&format!("## {}", cat.heading())));
             assert!(md.contains(&format!(
@@ -1439,8 +1419,8 @@ mod tests {
         let md = render_markdown();
         assert!(md.contains("sm-rule-packets"));
         assert!(md.contains("bbox_knowledge(query=\"sm-rule-packets\")"));
-        assert!(md.contains("sm-whiteboards"));
-        assert!(md.contains("bbox_knowledge(query=\"sm-whiteboards\")"));
+        assert!(!md.contains("bro_orchestrate_run"));
+        assert!(!md.contains("## Whiteboards"));
     }
 
     #[test]

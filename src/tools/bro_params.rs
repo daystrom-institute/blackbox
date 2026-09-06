@@ -59,10 +59,9 @@ pub(crate) struct ExecParams {
     /// brofile defaults for this invocation only.
     #[serde(default)]
     pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
-    /// Override the brofile's `coerce_workspace` setting for this dispatch.
-    /// When true, injects the workspace-tools appendix into the ambient
-    /// prefix. When false or absent, defers to the brofile setting.
-    #[serde(default)]
+    /// Retired compatibility flag, not part of the caller schema.
+    #[serde(skip_deserializing)]
+    #[schemars(skip)]
     pub(crate) coerce_workspace: Option<bool>,
     /// Dispatch selector option 3: runtime allocation tier key. When set,
     /// dispatch resolves a pooled provider/account/model/effort lane before
@@ -197,10 +196,9 @@ pub(crate) struct ResumeParams {
     /// and named-bro defaults for this resumed invocation.
     #[serde(default)]
     pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
-    /// Override the brofile's `coerce_workspace` setting for this resume.
-    /// When true, injects the workspace-tools appendix into the ambient
-    /// prefix. When false or absent, defers to the brofile setting.
-    #[serde(default)]
+    /// Retired compatibility flag, not part of the caller schema.
+    #[serde(skip_deserializing)]
+    #[schemars(skip)]
     pub(crate) coerce_workspace: Option<bool>,
     /// **Internal.** Spawn-time origin override, mirroring the slot on
     /// `ExecParams`: the MCP `bro_resume` tool ignores it and resumes as
@@ -633,9 +631,9 @@ pub(crate) struct BrofileParams {
     /// the verdict into the dispatch filter plane (harness-process-boundary.md §3).
     #[serde(default)]
     pub(crate) surface: Option<String>,
-    /// When true, inject the workspace-tools appendix into every dispatch
-    /// using this brofile. Default off (absent / false).
-    #[serde(default)]
+    /// Retired compatibility flag, not part of the caller schema.
+    #[serde(skip_deserializing)]
+    #[schemars(skip)]
     pub(crate) coerce_workspace: Option<bool>,
     /// Optional context-assembly policy, including provider default
     /// suppression for providers that support it.

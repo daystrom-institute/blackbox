@@ -2275,71 +2275,6 @@ pub const MILESTONE_REPORT_HINT: &str = "\
 Report at major milestones via `bro_report` with a one-line status. \
 Examples: starting implementation, tests passing, blocked on X, work complete.";
 
-/// Workspace-tools appendix injected when `AmbientContext::coerce_workspace`
-/// is true. Teaches agents to prefer workspace-scoped tool surfaces over
-/// raw filesystem access. References the implemented workspace tool surface
-/// (`work_smart_read`, `work_bash`, `work_git_*`) and the safe fallback
-/// (`bbox_note(kind=learned)`) when those tools are not available in a
-/// narrowed tool catalog.
-pub const WORKSPACE_TOOLS_APPENDIX: &str = "\
-[workspace-tools mode]\n\
-You are in workspace-tools mode. Prefer workspace-scoped tool surfaces over \
-raw filesystem access:\n\
-  - Treat injected project docs/tool guidance as already-present context, not \
-as a separate read-instructions ceremony. Open source files only when the next \
-step needs exact lines, the injected copy appears stale, or the file was not \
-injected.\n\
-  - Start with the agentic grounding sequence: accept injected context and scope; \
-run sandbox grounding; use blackbox retrieval/evidence bundling when claims \
-depend on prior decisions, design docs, threads, code graph facts, or \
-conversation history; then edit/validate in the grounded cwd.\n\
-  - For the sandbox boundary, call `sandbox_grounding` when available. It \
-returns the launch manifest for the harness root. Worktree creation is \
-host-owned: fleet dispatch and workflow ops create isolated worktrees \
-mechanically before launching editable sessions.\n\
-  - For blackbox evidence, use the opening sequence instead of memory when \
-provenance matters: `bbox_describe_schema` once per session, \
-`bbox_hybrid_search`, `bbox_inspect_entity`, conditional `bbox_find_paths`, then \
-`bbox_bundle_evidence` before making provenance-sensitive claims. The detailed \
-question-shape runbook is `sm-agentic-opening-sequence`; pull it only when the \
-injected tool guidance is insufficient. Use `property_mode=\"summary\"` when \
-bundling broad tool/knowledge refs or other long entities. For fresh \
-probe/retro evidence, if \
-hybrid search returns only generic seeds, no results, or a degraded \
-BM25-only/vector-warming notice, pivot to `bbox_notes`/`bbox_gaps` with exact \
-task, project, bro, or short substrings before broadening to git/filesystem \
-evidence. If `bbox_describe_schema` reports `project_file` / `project_file_v2` \
-population `0`, do not investigate or patch indexing as part of a sandbox \
-probe. State the corpus gap, dedupe/file a `sandbox-observability` gap if one \
-does not already exist, and use `work_smart_read` or scoped file reads for exact \
-code locations while still bundling any non-code bbox evidence that resolved \
-cleanly.\n\
-  - For authorial work, pick the matching primitive: `exec` to run a JS/TS cell \
-that composes tool calls in-process — the whole tool surface is available as the \
-typed `tools.*` namespace, `text(...)` emits output to your context, and \
-`store(...)`/`load(...)` persist values across cells in the session; `wait` to \
-resume a still-running cell by `cell_id`; \
-the `code.*`/`java.*`/`edits.*`/`analysis.*`/`lsp.*` cell bindings for \
-structural refactor and code-navigation work; \
-`bro_exec` then `bro_wait`/`bro_status`/`bro_resume` for ad-hoc child agents. \
-A cell's nested `tools.X(...)` call dispatches the same filtered tool the flat \
-surface exposes (the deny policy is honored in-box). If a child bro completes \
-with an empty/suspicious result, or a long-running cell stays `tool_running` \
-after a wait timeout, call \
-`bro_status(tail=N)` before resuming, cancelling, or filing a gap.\n\
-  - Prefer `work_smart_read` over `Read` for file inspection.\n\
-  - Prefer `work_bash` over `Bash` for shell commands.\n\
-  - Prefer `work_git_status` / `work_git_diff` / `work_git_log` over \
-bare `Bash(\"git …\")` invocations.\n\
-Treat the harness launch root as authoritative for generic file, shell, and git \
-tools. Do not create worktrees from inside the agent session; use fleet/workflow \
-mechanical worktree creation before dispatch.\n\
-When a workspace tool is not available in the current session, fall back to \
-the standard tool and emit `bbox_note(kind=learned, body=\"work_* unavailable, \
-used <standard_tool> as fallback\")` so the orchestrator can track coverage.\n\
-Do NOT implement `work_*` handlers yourself; they are provided by the host.\n\
-Do NOT add new workspace tool names under the `bbox_*` namespace.";
-
 /// The workload-retrospective probe prompt, injected as a fake user turn
 /// when a bro's own session is resumed by `bro_prune(retro=true)` or
 /// `bro_retro`. It invites — but never compels — a `bbox_gap` substrate-gap
@@ -2485,11 +2420,7 @@ pub struct AmbientContext {
     #[allow(dead_code)]
     // reserved hook for defense-in-depth text guards; see comment above apply_ambient
     pub provider: Option<providers::Provider>,
-    /// Inject workspace-tools appendix. When true, `apply_ambient` appends
-    /// the WORKSPACE_TOOLS_APPENDIX after the completion contract, teaching
-    /// the agent to prefer work_smart_read / work_bash / work_git_* over
-    /// raw filesystem access. Sourced from brofile `coerce_workspace` or
-    /// per-dispatch ExecParams/ResumeParams override. Default off.
+    /// Legacy stored flag. Inert: file, shell and Git tools belong to the harness.
     pub coerce_workspace: bool,
 }
 
@@ -2710,14 +2641,6 @@ impl AmbientContext {
             true,
             MILESTONE_REPORT_HINT,
         ));
-        if self.coerce_workspace {
-            directives.push(directive(
-                "workspace",
-                DirectiveCadence::Standing,
-                false,
-                WORKSPACE_TOOLS_APPENDIX,
-            ));
-        }
 
         let scope = DispatchScope {
             task: self.task_id.clone(),
@@ -9080,9 +9003,7 @@ mod tests {
         assert!(task_shape.text.contains("bbox_packet_gap"));
         assert_eq!(task_shape.cadence, bro_protocol::DirectiveCadence::Standing);
 
-        // Orchestrator with workspace coercion: orchestrator after task_shape,
-        // workspace last (the old preamble's ordering, preserved as the
-        // directive vec order).
+        // A legacy workspace flag must not restore a retired tool directive.
         let orch = AmbientContext {
             allow_recursion: true,
             coerce_workspace: true,
@@ -9091,13 +9012,7 @@ mod tests {
         let payload = orch.dispatch_context(None);
         assert_eq!(
             directive_ids(&payload),
-            vec![
-                "recall",
-                "task_shape",
-                "orchestrator",
-                "milestone",
-                "workspace"
-            ]
+            vec!["recall", "task_shape", "orchestrator", "milestone"]
         );
     }
 
@@ -9108,32 +9023,16 @@ mod tests {
     }
 
     #[test]
-    fn coerce_workspace_gates_workspace_directive() {
-        let payload = AmbientContext {
-            coerce_workspace: false,
-            ..Default::default()
-        }
-        .dispatch_context(None);
-        assert!(!directive_ids(&payload).contains(&"workspace"));
-
+    fn legacy_workspace_flag_does_not_inject_retired_tools() {
         let payload = AmbientContext {
             coerce_workspace: true,
             ..Default::default()
         }
         .dispatch_context(None);
-        let ws = directive(&payload, "workspace");
-        for needle in [
-            "[workspace-tools mode]",
-            "work_smart_read",
-            "work_bash",
-            "work_git_status",
-            "work_git_diff",
-            "work_git_log",
-            "bbox_note(kind=learned",
-        ] {
-            assert!(ws.text.contains(needle), "appendix must reference {needle}");
+        assert!(!directive_ids(&payload).contains(&"workspace"));
+        for directive in payload.directives {
+            assert!(!directive.text.contains("work_smart_read"));
         }
-        assert_eq!(ws.cadence, bro_protocol::DirectiveCadence::Standing);
     }
 
     #[test]

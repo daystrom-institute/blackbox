@@ -45,11 +45,7 @@ pub struct Brofile {
     /// design/bro-harness/harness-process-boundary.md §3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
-    /// When true, inject the workspace-tools appendix into every dispatch
-    /// using this brofile. The appendix teaches the agent to prefer
-    /// workspace-scoped tools (work_smart_read, work_bash, work_git_*)
-    /// over raw filesystem access, falling back to bbox_note(kind=learned)
-    /// when workspace tools are unavailable. Default off.
+    /// Legacy stored flag, accepted for decoding but no longer injects instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coerce_workspace: Option<bool>,
     /// Optional late-bound runtime allocation defaults. When present,

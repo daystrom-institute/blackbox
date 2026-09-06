@@ -8,6 +8,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+serde_json = "1"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-corpus-index = { path = "../bbox-corpus-index" }
 bbox-packets = { path = "../bbox-packets" }

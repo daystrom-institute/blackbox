@@ -913,6 +913,7 @@ dependencies = [
  "bbox-threads",
  "bbox-whiteboards",
  "parking_lot",
+ "serde_json",
  "tantivy",
  "tempfile",
 ]
