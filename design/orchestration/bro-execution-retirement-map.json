@@ -1,13 +1,17 @@
 {
   "schema_version": 1,
-  "status": "planned_not_implemented",
+  "status": "retirement_deployed_survivor_audit_partial",
   "source_commit": "8031e3d5",
   "source_declaration_count": 190,
   "live_ops_count": 190,
   "observed_date": "2026-09-06",
   "scope_note": "Names are exact MCP declarations. Retire removes the full tool; slim requires action/DTO review. Keep is architectural scope, not a passing audit verdict. Host paths and live installation payloads are excluded.",
   "groups": {
-    "corpus_tool_history": {"disposition": "keep", "wave": "S3", "reason": "Retain indexed tool-call history as a corpus read, with bounded candidate pagination."},
+    "corpus_tool_history": {
+      "disposition": "keep",
+      "wave": "S3",
+      "reason": "Retain indexed tool-call history as a corpus read, with bounded candidate pagination."
+    },
     "bro_control": {
       "disposition": "slim",
       "wave": "S1",
@@ -85,206 +89,1354 @@
     "existing_survivors": 95
   },
   "tools": [
-    {"tool": "atom_delegate","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_describe","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_get","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_invoke","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_list","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_resume","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_search","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "atom_status","source": "src/tools/atoms.rs","group": "atoms","disposition": "retire","wave": "S3"},
-    {"tool": "badgey_apply_proposal","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_ask","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_close_loops","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_collect","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_dismiss","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_ensure_for_channel","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_exec","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_list","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_proposal_begin_apply","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_proposal_complete_apply","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_proposals_list","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_resume","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_scout","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_status","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "badgey_triage_inbox","source": "src/tools/badgey.rs","group": "badgey","disposition": "retire","wave": "S2"},
-    {"tool": "bbox_absorb","source": "src/tools/render.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_apply","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_artifact_install","source": "src/tools/artifacts.rs","group": "artifacts","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_artifact_list","source": "src/tools/artifacts.rs","group": "artifacts","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_artifact_remove","source": "src/tools/artifacts.rs","group": "artifacts","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_artifact_supersede","source": "src/tools/artifacts.rs","group": "artifacts","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_audit","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_blame","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_bootstrap","source": "src/tools/render.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_bundle_evidence","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_cite","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_compile","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_context","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_corpus_search","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_decide","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_describe_schema","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_discover_seed_entities","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_doctor","source": "src/tools/doctor.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_edge_compact","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_embed_partitions","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_embed_status","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_find_paths","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_forget","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_gap","source": "src/tools/gaps.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_gap_resolve","source": "src/tools/gaps.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_gap_update","source": "src/tools/gaps.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_gaps","source": "src/tools/gaps.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_hybrid_search","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_inbox","source": "src/tools/attention.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_inspect_entity","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_knowledge","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_knowledge_link","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_learn","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_lint","source": "src/tools/render.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_mcp_surface","source": "src/tools/mcp_surface.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_messages","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_note","source": "src/tools/notes.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_note_resolve","source": "src/tools/notes.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_notes","source": "src/tools/notes.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_packet_events","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_packet_gap","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_packet_list","source": "src/tools/packets.rs","group": "policy_packets","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_pin","source": "src/tools/attention.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_attach","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_catalog_get","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_catalog_list","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_default_attachment","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_detach","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_eject","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_graph_describe","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_graph_list","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_graph_validate","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_init","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_list","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_promote","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_publisher_advance","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_publisher_bind","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_publisher_status","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_register","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_rename","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_scope_migrate","source": "src/tools/project_catalog.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_project_unregister","source": "src/tools/projects.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_provenance_export","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_provenance_export_plan","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_provenance_import","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_reembed","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_ref_size","source": "src/tools/graph.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_reindex","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_remember","source": "src/tools/knowledge.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_render","source": "src/tools/render.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_review","source": "src/tools/render.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_roadmap","source": "src/tools/roadmap.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_search","source": "src/tools/transcripts.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_session","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_sessions_list","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_stats","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_storage_gc","source": "src/tools/storage_gc.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_storage_health","source": "src/tools/storage_health.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_storage_migrate_legacy_edges","source": "src/tools/storage_migration.rs","group": "cross_cutting","disposition": "slim","wave": "S4"},
-    {"tool": "bbox_thread","source": "src/tools/threads.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_thread_list","source": "src/tools/threads.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bbox_topics","source": "src/tools/sessions.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bro_agent_describe","source": "src/tools/agents.rs","group": "agent_templates","disposition": "slim","wave": "S1"},
-    {"tool": "bro_agent_dispatch","source": "src/tools/agents.rs","group": "agent_templates","disposition": "slim","wave": "S1"},
-    {"tool": "bro_agent_get","source": "src/tools/agents.rs","group": "agent_templates","disposition": "slim","wave": "S1"},
-    {"tool": "bro_agent_list","source": "src/tools/agents.rs","group": "agent_templates","disposition": "slim","wave": "S1"},
-    {"tool": "bro_agent_search","source": "src/tools/agents.rs","group": "agent_templates","disposition": "slim","wave": "S1"},
-    {"tool": "bro_allocator_probe","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_allocator_status","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_allocator_trace","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_arc_cancel","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_arc_result","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_arc_signal","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_arc_status","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_broadcast","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_brofile","source": "src/tools/roster.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_cancel","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_cron_install","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_cron_list","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_cron_remove","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_cron_upcoming","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_dashboard","source": "src/tools/roster.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_exec","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_interrupt","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_mcp","source": "src/tools/config.rs","group": "corpus_and_operations","disposition": "keep","wave": "S5"},
-    {"tool": "bro_orchestrate_author","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_orchestrate_run","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_poller_install","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_poller_list","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_poller_remove","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_providers","source": "src/tools/roster.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_prune","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_report","source": "src/tools/roster.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_resume","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_retro","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_signals","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_slack_bind","source": "src/tools/config.rs","group": "slack","disposition": "retire","wave": "S2"},
-    {"tool": "bro_slack_link_lookup","source": "src/tools/config.rs","group": "slack","disposition": "retire","wave": "S2"},
-    {"tool": "bro_slack_link_record","source": "src/tools/config.rs","group": "slack","disposition": "retire","wave": "S2"},
-    {"tool": "bro_status","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_steer","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_team","source": "src/tools/roster.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_wait","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_webhook_deliveries","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_webhook_install","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_webhook_list","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_webhook_remove","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_webhook_replay","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_when_all","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_when_any","source": "src/tools/dispatch.rs","group": "bro_control","disposition": "slim","wave": "S1"},
-    {"tool": "bro_workflow_install","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_workflow_list","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "bro_workflow_remove","source": "src/tools/orchestrate.rs","group": "workflows_triggers","disposition": "retire","wave": "S3"},
-    {"tool": "consultant_apply_proposal","source": "src/tools/consultant/mod.rs","group": "consultant","disposition": "retire","wave": "S2"},
-    {"tool": "consultant_proposal_begin_apply","source": "src/tools/consultant/mod.rs","group": "consultant","disposition": "retire","wave": "S2"},
-    {"tool": "consultant_proposal_complete_apply","source": "src/tools/consultant/mod.rs","group": "consultant","disposition": "retire","wave": "S2"},
-    {"tool": "consultant_proposals_list","source": "src/tools/consultant/mod.rs","group": "consultant","disposition": "retire","wave": "S2"},
-    {"tool": "identity_get","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "identity_list","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_deliveries","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_execute","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_install","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_list","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_replay","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "reaction_retry","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "system_event_compact","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "system_event_emit","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "system_event_list","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "system_event_open","source": "src/tools/system_events.rs","group": "event_automation","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_annotate","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_archive","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_conflicts","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_open","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_post","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_register","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_state","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_summarize","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_transition","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "whiteboard_vote","source": "src/tools/whiteboards.rs","group": "whiteboards","disposition": "retire","wave": "S4"},
-    {"tool": "work_bash","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_git_commit","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_git_diff","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_git_log","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_git_show","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_git_status","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_smart_read","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
-    {"tool": "work_tool_calls","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"}
-  ]
-,
+    {
+      "tool": "atom_delegate",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_describe",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_get",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_invoke",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_list",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_resume",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_search",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "atom_status",
+      "source": "src/tools/atoms.rs",
+      "group": "atoms",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "badgey_apply_proposal",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_ask",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_close_loops",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_collect",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_dismiss",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_ensure_for_channel",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_exec",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_list",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_proposal_begin_apply",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_proposal_complete_apply",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_proposals_list",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_resume",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_scout",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_status",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "badgey_triage_inbox",
+      "source": "src/tools/badgey.rs",
+      "group": "badgey",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "bbox_absorb",
+      "source": "src/tools/render.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_apply",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_artifact_install",
+      "source": "src/tools/artifacts.rs",
+      "group": "artifacts",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_artifact_list",
+      "source": "src/tools/artifacts.rs",
+      "group": "artifacts",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_artifact_remove",
+      "source": "src/tools/artifacts.rs",
+      "group": "artifacts",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_artifact_supersede",
+      "source": "src/tools/artifacts.rs",
+      "group": "artifacts",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_audit",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_blame",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_bootstrap",
+      "source": "src/tools/render.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_bundle_evidence",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_cite",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_compile",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_context",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_corpus_search",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_decide",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_describe_schema",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_discover_seed_entities",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_doctor",
+      "source": "src/tools/doctor.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_edge_compact",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_embed_partitions",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_embed_status",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_find_paths",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_forget",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_gap",
+      "source": "src/tools/gaps.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_gap_resolve",
+      "source": "src/tools/gaps.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_gap_update",
+      "source": "src/tools/gaps.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_gaps",
+      "source": "src/tools/gaps.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_hybrid_search",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_inbox",
+      "source": "src/tools/attention.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_inspect_entity",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_knowledge",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_knowledge_link",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_learn",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_lint",
+      "source": "src/tools/render.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_mcp_surface",
+      "source": "src/tools/mcp_surface.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_messages",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_note",
+      "source": "src/tools/notes.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_note_resolve",
+      "source": "src/tools/notes.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_notes",
+      "source": "src/tools/notes.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_packet_events",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_packet_gap",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_packet_list",
+      "source": "src/tools/packets.rs",
+      "group": "policy_packets",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_pin",
+      "source": "src/tools/attention.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_attach",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_catalog_get",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_catalog_list",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_default_attachment",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_detach",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_eject",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_graph_describe",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_graph_list",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_graph_validate",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_init",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_list",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_promote",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_publisher_advance",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_publisher_bind",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_publisher_status",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_register",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_rename",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_scope_migrate",
+      "source": "src/tools/project_catalog.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_project_unregister",
+      "source": "src/tools/projects.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_provenance_export",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_provenance_export_plan",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_provenance_import",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_reembed",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_ref_size",
+      "source": "src/tools/graph.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_reindex",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_remember",
+      "source": "src/tools/knowledge.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_render",
+      "source": "src/tools/render.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_review",
+      "source": "src/tools/render.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_roadmap",
+      "source": "src/tools/roadmap.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_search",
+      "source": "src/tools/transcripts.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_session",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_sessions_list",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_stats",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_storage_gc",
+      "source": "src/tools/storage_gc.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_storage_health",
+      "source": "src/tools/storage_health.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_storage_migrate_legacy_edges",
+      "source": "src/tools/storage_migration.rs",
+      "group": "cross_cutting",
+      "disposition": "slim",
+      "wave": "S4"
+    },
+    {
+      "tool": "bbox_thread",
+      "source": "src/tools/threads.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_thread_list",
+      "source": "src/tools/threads.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bbox_topics",
+      "source": "src/tools/sessions.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bro_agent_describe",
+      "source": "src/tools/agents.rs",
+      "group": "agent_templates",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_agent_dispatch",
+      "source": "src/tools/agents.rs",
+      "group": "agent_templates",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_agent_get",
+      "source": "src/tools/agents.rs",
+      "group": "agent_templates",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_agent_list",
+      "source": "src/tools/agents.rs",
+      "group": "agent_templates",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_agent_search",
+      "source": "src/tools/agents.rs",
+      "group": "agent_templates",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_allocator_probe",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_allocator_status",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_allocator_trace",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_arc_cancel",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_arc_result",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_arc_signal",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_arc_status",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_broadcast",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_brofile",
+      "source": "src/tools/roster.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_cancel",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_cron_install",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_cron_list",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_cron_remove",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_cron_upcoming",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_dashboard",
+      "source": "src/tools/roster.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_exec",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_interrupt",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_mcp",
+      "source": "src/tools/config.rs",
+      "group": "corpus_and_operations",
+      "disposition": "keep",
+      "wave": "S5"
+    },
+    {
+      "tool": "bro_orchestrate_author",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_orchestrate_run",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_poller_install",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_poller_list",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_poller_remove",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_providers",
+      "source": "src/tools/roster.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_prune",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_report",
+      "source": "src/tools/roster.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_resume",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_retro",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_signals",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_slack_bind",
+      "source": "src/tools/config.rs",
+      "group": "slack",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "bro_slack_link_lookup",
+      "source": "src/tools/config.rs",
+      "group": "slack",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "bro_slack_link_record",
+      "source": "src/tools/config.rs",
+      "group": "slack",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "bro_status",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_steer",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_team",
+      "source": "src/tools/roster.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_wait",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_webhook_deliveries",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_webhook_install",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_webhook_list",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_webhook_remove",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_webhook_replay",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_when_all",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_when_any",
+      "source": "src/tools/dispatch.rs",
+      "group": "bro_control",
+      "disposition": "slim",
+      "wave": "S1"
+    },
+    {
+      "tool": "bro_workflow_install",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_workflow_list",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "bro_workflow_remove",
+      "source": "src/tools/orchestrate.rs",
+      "group": "workflows_triggers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "consultant_apply_proposal",
+      "source": "src/tools/consultant/mod.rs",
+      "group": "consultant",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "consultant_proposal_begin_apply",
+      "source": "src/tools/consultant/mod.rs",
+      "group": "consultant",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "consultant_proposal_complete_apply",
+      "source": "src/tools/consultant/mod.rs",
+      "group": "consultant",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "consultant_proposals_list",
+      "source": "src/tools/consultant/mod.rs",
+      "group": "consultant",
+      "disposition": "retire",
+      "wave": "S2"
+    },
+    {
+      "tool": "identity_get",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "identity_list",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_deliveries",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_execute",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_install",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_list",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_replay",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "reaction_retry",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "system_event_compact",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "system_event_emit",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "system_event_list",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "system_event_open",
+      "source": "src/tools/system_events.rs",
+      "group": "event_automation",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_annotate",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_archive",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_conflicts",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_open",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_post",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_register",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_state",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_summarize",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_transition",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "whiteboard_vote",
+      "source": "src/tools/whiteboards.rs",
+      "group": "whiteboards",
+      "disposition": "retire",
+      "wave": "S4"
+    },
+    {
+      "tool": "work_bash",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_git_commit",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_git_diff",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_git_log",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_git_show",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_git_status",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_smart_read",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    },
+    {
+      "tool": "work_tool_calls",
+      "source": "src/tools/workspace.rs",
+      "group": "workspace_wrappers",
+      "disposition": "retire",
+      "wave": "S3"
+    }
+  ],
   "additions": [
-  {
-    "tool": "bbox_tool_calls",
-    "source": "src/tools/tool_calls.rs",
-    "group": "corpus_tool_history",
-    "disposition": "keep",
-    "wave": "S3",
-    "reason": "Preserve indexed tool-call evidence independently of retired workflow-local file and shell execution."
+    {
+      "tool": "bbox_tool_calls",
+      "source": "src/tools/tool_calls.rs",
+      "group": "corpus_tool_history",
+      "disposition": "keep",
+      "wave": "S3",
+      "reason": "Preserve indexed tool-call evidence independently of retired workflow-local file and shell execution."
+    }
+  ],
+  "deployment": {
+    "source_commit": "2dd385a2c6f4",
+    "image_digest": "sha256:fcc38786110223005443e35305b589cef94207aadeafc8c23d9faf74975a3ff6",
+    "verified_workflow": "bbox-verify-458xm",
+    "build_workflow": "build-bbox-image-pvnbj",
+    "live_ops_count": 109,
+    "retired_absent": 82,
+    "survivor_audit": "partial"
   }
-]
 }

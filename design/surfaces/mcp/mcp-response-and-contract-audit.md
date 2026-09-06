@@ -782,3 +782,24 @@ reaction deliveries, event-open body and linked-history shaping, the opaque
 reaction-install specification schema, and storage-GC candidate and diagnostic
 responses. The coverage inventory still needs explicit dispositions and
 supporting evidence for surfaces kept unchanged as well as those adjusted.
+
+
+### Deployed orchestration retirement milestone
+
+`2dd385a2c6f4` passed full cluster verification (`bbox-verify-458xm`), built
+successfully (`build-bbox-image-pvnbj`) and deployed with cage commit `249c9fd`.
+The live ops catalog exactly matches 109 surviving tools; all 82 planned
+retirements are absent. This retires the reaction/event-delivery response work
+rather than counting it as a surviving-tool payload improvement.
+
+Historical workflow/atom/cron receipts return `retired=true, active=false`.
+Stored conversation context/messages matched pre-cutover responses. Provider
+summaries measured 854 bytes, a three-brofile page 638 bytes, and bounded
+historical tool-call pages about 1 KiB. Native bro and bro-harness were rebuilt,
+stablesigned and installed. Real Brodex/Astra exec and resume probes completed;
+request-key retries reused their original task IDs, conflicts refused, and a
+reconnected client retrieved the original exec receipt. Admission is open.
+
+Remaining audit work includes storage-GC response bounds and apply semantics,
+queued gap-write reconciliation, and explicit dispositions for remaining
+surviving actions. The broader audit is still partial.

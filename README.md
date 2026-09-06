@@ -64,7 +64,7 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
   `bro_resume` for continuity. Wait with `bro_wait` or `bro_when_all`; inspect
   `bro_status` before replacing apparently stalled work.
 - Discover providers with `bro_providers`; select a provider to list its models.
-  `brofiles` lists compact summaries and expands a selected persona on request.
+  `bro_brofile(action="list")` returns compact summaries; select a persona for detail.
 - Install packets, brofiles, simple agents and teams using inline artifact JSON
   or an HTTP(S) URL. Local caller paths are rejected. List before installing.
 

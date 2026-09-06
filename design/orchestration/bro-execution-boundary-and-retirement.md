@@ -32,25 +32,33 @@ activation. Counts describe this snapshot, not a permanent product budget.
   Previously collected search/context/messages retain the same evidence after
   cutover; the removed producer credential returns HTTP 401. The old collector
   journal volume is retained, and ordinary bro admission is open.
-- E1 request-key admission is pushed through `a3d40cc7`. Four focused cluster
-  checks cover concurrent/reopened claims, corrupt claims, repeated invocation,
-  and hidden-origin rejection. It is not deployed yet. An unresolved durable
-  claim never authorizes another launch; this is not exactly-once execution.
-- E4 maintenance moved into `bbox-vectors`; all 51 focused vector checks passed.
-  Connectivity repair snapshots under a short read lock, builds outside the
-  partition lock and defers stale publication. Storage GC, embedding residue
-  and observation-journal retention run as independent mechanical loops.
-- S3/S4 source is pushed through `cb2702f8`: workflow/atom execution, trigger
-  routes, reaction delivery and whiteboard mutation are removed. The map gate
-  passes 109 surviving declarations and all 82 planned retirements absent.
-  `bbox_tool_calls` preserves indexed tool history. Native bro and bro-harness
-  builds passed, were stablesigned and installed; Fleet remains and the retired
-  orchestrate command is absent. The cage is still running S2 pending full gates.
-- S5 removed executable defaults and updated caller-composition guidance.
-  Focused checks passed retained history, project ownership and visibility.
-  Full verification is in progress; stale permission-test expectations and the
-  empty custom-agent adapter registry are being removed before convergence.
-  The final deployed surface and response audit remain open.
+- S3/S4/S5 deployed from `2dd385a2c6f4` after full verification
+  `bbox-verify-458xm` and image build `build-bbox-image-pvnbj` passed.
+  Image digest: `sha256:fcc38786110223005443e35305b589cef94207aadeafc8c23d9faf74975a3ff6`.
+  Cage commit `249c9fd` pins the deployment. Admission is open.
+- Live ops catalog equality passed: 109 survivors, all 82 planned retirements
+  absent. Workflow/atom execution, trigger routes, reaction delivery, custom
+  agent adapters and whiteboard mutation are removed. Historical artifact
+  receipts remain readable and are explicitly inactive/retired. Stored
+  conversation context and messages matched their pre-retirement evidence.
+- E1 live Astra probes completed ordinary exec and resume turns. Repeating
+  either request key returned the same task; changed inputs were refused.
+  Exec replay also survived client reconnection. Unrelated OpenRouter account
+  labels were absent. An unresolved durable claim still does not authorize
+  another launch; the contract is admission deduplication, not exactly-once
+  execution.
+- E4 maintenance lives in `bbox-vectors`; all 51 focused vector checks passed.
+  Connectivity repair builds outside the partition lock and defers stale
+  publication. Storage GC, embedding residue and observation-journal retention
+  run independently of workflow artifacts.
+- Native bro and bro-harness builds passed, were stablesigned and installed.
+  Fleet remains; the orchestrate command and atom compatibility alias are gone.
+  Retired executable defaults were removed. Live replacement runbooks describe
+  caller composition and historical visibility. Provider discovery was 854
+  bytes, a three-brofile page 638 bytes and tool-history pages about 1 KiB.
+- The runtime retirement is deployed. The broader surviving-surface audit
+  remains partial, including GC response bounds and preview/apply semantics,
+  queued gap-write reconciliation and explicit per-action audit dispositions.
 
 ## Responsibility boundary
 
@@ -449,5 +457,5 @@ retaining executable workflow/atom/reaction engines.
 - Native collection is restored, verified with stablesign and a successful
   background cycle. It remains in the retained execution/corpus baseline.
 
-The plan is ready for S1 extraction work. The full audit and runtime retirement
-remain open until the waves and evidence above are complete.
+Runtime retirement is deployed as recorded above. The surviving-surface audit
+remains open; a retired tool is not counted as an adjusted surviving tool.
