@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
 
-use crate::config;
 use crate::embed_queue;
 use crate::entity_ref::EntityRef;
 use crate::index::{roadmap_chunk_hash, roadmap_entity_id};
@@ -56,6 +54,8 @@ pub(crate) struct RoadmapParams {
     pub(crate) link_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dry_run: Option<bool>,
+    /// Retired MCP option. Render returns markdown for the caller to apply;
+    /// supplying a server-local write destination is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) write_path: Option<String>,
     /// Inline Tera template source. When provided, the roadmap context is
@@ -64,8 +64,8 @@ pub(crate) struct RoadmapParams {
     /// starting point for customisation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) template: Option<String>,
-    /// Path to a Tera template file. Alternative to `template` (inline source).
-    /// File is read at render time; no caching — edits take effect immediately.
+    /// Retired MCP option. Supply template source inline using `template`.
+    /// The daemon never reads a caller's template path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) template_path: Option<String>,
 }
@@ -843,57 +843,20 @@ impl BlackboxServer {
         .to_string())
     }
 
-    // migration debt: ROADMAP.md render write belongs on the blocking pool / a persister; tracked in thread-935b467d.
-    #[allow(clippy::disallowed_methods)]
     fn roadmap_render(&self, p: serde_json::Value) -> anyhow::Result<String> {
         let project = p.get("project").and_then(|v| v.as_str()).or_else(|| {
             p.get("project_dir")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
         });
-        let write_path: Option<String> = p
-            .get("write_path")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .or_else(|| {
-                project.and_then(|project_root| {
-                    config::load_project(Path::new(project_root))
-                        .ok()
-                        .and_then(|c| {
-                            c.roadmap
-                                .write_path
-                                .map(|p| p.to_string_lossy().into_owned())
-                        })
-                })
-            })
-            .or_else(|| {
-                config::load().ok().and_then(|c| {
-                    c.roadmap
-                        .write_path
-                        .map(|p| p.to_string_lossy().into_owned())
-                })
-            });
+        if p.get("write_path").is_some_and(|v| !v.is_null())
+            || p.get("template_path").is_some_and(|v| !v.is_null())
+        {
+            anyhow::bail!(
+                "error.roadmap_locality: render returns markdown and accepts inline template source. Remove write_path/template_path; the caller owns file application."
+            );
+        }
         let inline_template = p.get("template").and_then(|v| v.as_str());
-        let template_path: Option<String> = p
-            .get("template_path")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .or_else(|| {
-                project.and_then(|project_root| {
-                    config::load_project(Path::new(project_root))
-                        .ok()
-                        .and_then(|c| {
-                            c.roadmap
-                                .template_path
-                                .map(|p| p.to_string_lossy().into_owned())
-                        })
-                })
-            })
-            .or_else(|| {
-                config::load().ok().and_then(|c| {
-                    c.roadmap
-                        .template_path
-                        .map(|p| p.to_string_lossy().into_owned())
-                })
-            });
         let project = project.unwrap_or("blackbox");
 
         let rm = self.state.roadmap.read();
@@ -933,24 +896,11 @@ impl BlackboxServer {
         let md = if let Some(src) = inline_template {
             let ctx = rm.to_template_context(project, &spawn);
             template::render(src, &ctx)?
-        } else if let Some(ref path) = template_path {
-            let ctx = rm.to_template_context(project, &spawn);
-            template::render_file(Path::new(path), &ctx)?
         } else {
             rm.render_markdown(project, &spawn)
         };
 
-        if let Some(ref path) = write_path {
-            std::fs::write(path, &md)
-                .map_err(|e| anyhow::anyhow!("failed to write ROADMAP.md to {path}: {e}"))?;
-            Ok(serde_json::json!({
-                "written": path,
-                "bytes": md.len(),
-            })
-            .to_string())
-        } else {
-            Ok(md)
-        }
+        Ok(md)
     }
 }
 
@@ -971,4 +921,32 @@ fn resolve_project_file_path(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod render_locality_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_render_returns_inline_content_and_refuses_file_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(&root)));
+        let path = root.join("must-not-write.md");
+        assert!(
+            server
+                .roadmap_render(serde_json::json!({"write_path": path}))
+                .is_err()
+        );
+        assert!(!path.exists());
+        assert!(
+            server
+                .roadmap_render(serde_json::json!({"template_path": path}))
+                .is_err()
+        );
+        let content = server
+            .roadmap_render(serde_json::json!({"template": "Synthetic roadmap"}))
+            .unwrap();
+        assert_eq!(content, "Synthetic roadmap");
+    }
 }

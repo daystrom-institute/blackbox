@@ -580,7 +580,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_review",
         category: ToolCategory::Knowledge,
         summary: "Approve or reject entries awaiting review.",
-        when_to_use: "Use to approve or reject unverified entries, especially after `bbox_absorb`. Review state controls whether absorbed knowledge should become renderable. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to approve or reject existing unverified entries. Review controls render eligibility; it does not import rendered-file edits. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: None,
     },
     ToolDoc {
@@ -1547,15 +1547,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_roadmap",
         category: ToolCategory::Roadmap,
         summary: "Manage the bbox roadmap — an operator-directed prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted.",
-        when_to_use: "Use only when the operator explicitly asks to manage future work, review what's designed but not yet built, decide what to work on next, or promote a specific roadmap item. Do not initiate roadmap actions as an agent-selected deferral path; if the operator requested implementation, do the implementation unless they explicitly redirect it to roadmap tracking. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from). `action=\"render\"` emits a Tera-templated markdown artifact; pass `template` (inline Tera source) or `template_path` to customise layout and which statuses are included — `delivered`/`rejected` are excluded from the default template. `action=\"default_template\"` returns the built-in Tera source as a starting point.",
+        when_to_use: "Use only when the operator explicitly asks to manage future work, review what's designed but not yet built, decide what to work on next, or promote a specific roadmap item. Do not initiate roadmap actions as an agent-selected deferral path; if the operator requested implementation, do the implementation unless they explicitly redirect it to roadmap tracking. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from). `action=\"render\"` emits a Tera-templated markdown artifact; pass `template` (inline Tera source) to customise layout and which statuses are included — `delivered`/`rejected` are excluded from the default template. `action=\"default_template\"` returns the built-in Tera source as a starting point. Render returns markdown for caller-owned application; write_path/template_path are rejected and server-local configuration cannot choose implicit file destinations.",
         example: Some(r#"bbox_roadmap(action="next", n=5)"#),
     },
     // ── Operations ──────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_doctor",
         category: ToolCategory::Operations,
-        summary: "Read-only health aggregation across daemon, index, code sources, vectors, graph, projects, checkout access, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json (including bounded checkout-access counters).",
-        when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\" — replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint, bbox_inbox) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Artifact/inlet/workflow drift sections land with the bundle phases.",
+        summary: "Diagnose Blackbox health with ranked, paginated findings. format selects summary text or JSON; detail=full adds server-owned diagnostics. Narrow with section.",
+        when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\" — replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint, bbox_inbox) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Default detail=summary returns up to 20 findings (max 100) ordered worst severity, section, then message; next_offset continues. Section status is separate from the findings page. detail=full includes diagnostics and can be narrowed by an exact section name. format=json does not imply full detail. Health is live, so restart pagination after a state change.",
         example: Some(r#"bbox_doctor(format="summary")"#),
     },
     // ── Storage health ──────────────────────────────────────────────
@@ -1863,7 +1863,10 @@ pub fn render_markdown() -> String {
         } else {
             out.push_str(cat.intro());
             out.push_str("\n\n");
-            for doc in TOOL_DOCS.iter().filter(|d| d.category == *cat) {
+            for doc in TOOL_DOCS
+                .iter()
+                .filter(|d| d.category == *cat && d.name != "bbox_absorb")
+            {
                 out.push_str(&format!(
                     "- **`{}`** — {}\n",
                     doc.name,
@@ -1987,7 +1990,7 @@ mod tests {
     fn render_contains_hot_tool_names() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
-            if !HOT_RENDER_CATEGORIES.contains(&doc.category) {
+            if !HOT_RENDER_CATEGORIES.contains(&doc.category) || doc.name == "bbox_absorb" {
                 continue;
             }
             if deferred_system_memory(doc.category).is_some() {

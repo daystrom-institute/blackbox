@@ -1176,6 +1176,8 @@ mod harness {
             .server
             .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
                 format: Some("json".into()),
+                detail: Some("full".into()),
+                ..Default::default()
             }))
             .await;
         // Doctor carries the observation snapshot twice: as a `checkout_access`

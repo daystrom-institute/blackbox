@@ -522,3 +522,16 @@ it does not establish source completeness or restore ingestion. The native
 collector/source replacement remains in progress. The bridge fixture amendment
 records the intended presentation changes rather than weakening view-selection
 or authority assertions.
+
+
+The next source checkpoint separates doctor encoding from detail, adds bounded
+ranked summary pages, and preserves explicit full diagnostic JSON for existing
+operator consumers. The retired absorb no-op is hidden from the remaining
+ordinary interactive surface and ambient recommendations; its migration alias
+remains on ops. Shipped render/review runbooks no longer claim it imports edits.
+Roadmap retains useful operator-directed stored work tracking: checked-in docs
+and promotion/link consumers justify keeping it pending a real graph migration.
+Its MCP renderer now returns content and accepts inline templates; explicit
+local paths refuse and implicit server-configured destinations are removed.
+Badgey's question alias remains because two shipped eval workflows call it;
+Badgey tools already belong outside ordinary default/interactive discovery.

@@ -532,8 +532,10 @@ pub struct ReindexParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TopicsParams {
+    /// Exact indexed session id. Provide exactly one selector.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Opaque stored locator from bbox_search, never opened as a file.
     #[serde(default)]
     pub file_path: Option<String>,
     #[serde(default)]
@@ -1623,7 +1625,8 @@ impl TranscriptIndex {
 
         let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
 
-        let mut rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
+        let mut rows: Vec<(String, String, String, String, String, String, u64, String)> =
+            Vec::new();
         for (_score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
@@ -1636,6 +1639,7 @@ impl TranscriptIndex {
                 self.doc_text(&doc, self.fields.session_id),
                 self.doc_text(&doc, self.fields.role),
                 self.doc_text(&doc, self.fields.file_path),
+                first_u64(&doc, self.fields.byte_offset),
                 excerpt,
             ));
         }
@@ -1646,9 +1650,9 @@ impl TranscriptIndex {
 
         let mut out = String::new();
         out.push_str(&format!("{} citation(s) for: {claim}\n\n", rows.len()));
-        for (ts, account, project, sid, r, file, excerpt) in &rows {
+        for (ts, account, project, sid, r, locator, offset, excerpt) in &rows {
             out.push_str(&format!(
-                "[{ts}] {account}/{r} — {project}\n  session: {sid}\n  file: {file}\n  > {excerpt}\n\n"
+                "[{ts}] {account}/{r} — {project}\n  session: {sid}\n  locator: {locator}\n  byte_offset: {offset}\n  > {excerpt}\n\n"
             ));
         }
 
@@ -1770,10 +1774,8 @@ impl TranscriptIndex {
         let offset = p.offset.unwrap_or(0) as usize;
         let limit = p.limit.unwrap_or(50).min(200) as usize;
 
-        // A slack: locator or a channel/day session id names no file the
-        // filesystem reader below can open — that dead end is gap-2d4d17da.
-        // Resolve against the landing store instead, before falling through
-        // to the file-based resolution every other lane still uses.
+        // Slack coordinates resolve through the conversation landing store.
+        // Native coordinates below resolve through retained indexed projections.
         if let Some(fp) = p.file_path.as_deref()
             && let Some((workspace_id, channel_id)) =
                 crate::transcripts::conversation::parse_channel_locator(fp)

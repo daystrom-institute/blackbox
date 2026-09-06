@@ -1,17 +1,17 @@
 +++
-title = "Render lifecycle — render, absorb, review, lint"
+title = "Render lifecycle: render, review, lint"
 tags = ["render", "absorb", "review", "lint", "knowledge", "lifecycle", "runbook"]
 order = 20
 template = false
 +++
-# Render lifecycle — render, absorb, review, lint
+# Render lifecycle: render, review, lint
 
 The render path is easy to misuse because the verbs are adjacent in the UI but operate on different parts of the lifecycle.
 
 This is the compact model:
 
 - `bbox_render` publishes approved knowledge into managed files.
-- `bbox_absorb` imports external edits back into the knowledge store as unverified entries.
+- Rendered files are unidirectional projections. `bbox_absorb` is a retired compatibility no-op and cannot import edits.
 - `bbox_review` accepts or rejects those unverified entries.
 - `bbox_lint` checks the store for contradictions, duplication, and stale structure.
 - `bbox_pin` is not part of this lifecycle. Pins stay out of rendered memory entirely.
@@ -26,12 +26,11 @@ This is the default path when the source of truth is the knowledge store.
 
 ## Reverse path after manual edits
 
-1. user edits rendered memory files directly
-2. `bbox_absorb`
-3. `bbox_review`
-4. `bbox_render`
-
-This is the reconcile loop when the rendered files were edited outside the store.
+Managed regions are regenerated from knowledge. To retain an intentional edit,
+update its source entry through the knowledge tools, then render again. Review
+controls unverified entries already present in the store; it does not import
+rendered files. Hand-authored instruction bootstrap is a separate import lane
+that must obtain its inputs from their owning checkout.
 
 ## Scope thinking
 
@@ -49,7 +48,7 @@ Use when the guidance belongs only to the current repo and its project-local mem
 
 - `bbox_render` is not a review step. It publishes what is already approved/renderable.
 - `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," use `bbox_pin`, not render.
-- `bbox_absorb` is not publication. It imports external edits into the store, usually as unverified state.
+- `bbox_absorb` performs no import or publication.
 - `bbox_review` is not rendering. It changes whether absorbed entries are accepted.
 - `bbox_lint` is not a sync step. It is hygiene/diagnostics.
 
@@ -58,7 +57,7 @@ Use when the guidance belongs only to the current repo and its project-local mem
 Use `bbox_lint`:
 
 - before large knowledge-store refactors
-- after bulk absorb/review work
+- after bulk knowledge imports or review
 - when the rendered output looks inconsistent with what you expected
 
 ## Keep hot vs cold
@@ -66,7 +65,6 @@ Use `bbox_lint`:
 Keep hot in tool docs:
 
 - render publishes
-- absorb imports
 - review approves
 - lint diagnoses
 
@@ -74,4 +72,4 @@ Keep cold here:
 
 - forward vs reverse lifecycle
 - scope thinking
-- the absorb -> review -> render reconciliation loop
+- owner-side application and review of imported entries

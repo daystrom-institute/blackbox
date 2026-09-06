@@ -18,7 +18,7 @@ bbox_search(query="redis locking", project="/repo/x", role="user")
 Open context around a hit:
 
 ```text
-bbox_context(file_path="<jsonl>", byte_offset=12345)
+bbox_context(file_path="<search-hit-locator>", byte_offset=12345)
 ```
 
 Inspect the session:
@@ -114,8 +114,8 @@ Use `bbox_sessions_list` when recency matters more than text:
 bbox_sessions_list(project="/repo/x", limit=20)
 ```
 
-Use `bbox_session` for metadata: first prompt, project, duration, tool counts,
-and transcript file path.
+Use `bbox_session` for retained message count, source identities, and indexed
+time range. Session IDs are exact; no producer file is opened.
 
 Use `bbox_messages` when you already know the session and need chronological
 flow. Tail mode is useful for takeover:
@@ -158,3 +158,19 @@ needs provenance across entities:
 - which docs and symbols relate to an artifact
 
 Transcript search finds text. The graph finds paths.
+
+
+## Native source limits and continuation
+
+Pass the search hit's `file_path` unchanged: it is an opaque stored locator,
+including when it looks like a path. Context and messages never open it on the
+daemon. Native replies describe retained indexed projections, which may already
+be parser-truncated; they explicitly report unknown source freshness. Reindexing
+cannot recover history that no producer has delivered.
+
+`bbox_context` selects indexed events around an exact offset (default five on
+each side, maximum 25), with short previews. Expand with `bbox_messages` using
+exactly one of `session_id` or `file_path`. Follow `next_offset`, including when
+`from_end=true`; it accounts for byte-limited pages. Native message content is
+capped at 12000 stored bytes even with `max_content_length=0`. Preview truncation
+is separate from truncation already present in the stored source projection.

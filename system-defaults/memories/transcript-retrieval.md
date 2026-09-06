@@ -60,7 +60,7 @@ This is the right step when context is still too sparse and you need the actual 
 
 Use `bbox_session`.
 
-This is useful before reading the full conversation when you want to confirm you found the right session by project, first prompt, tool usage, or duration.
+This reports retained message count, source identities, and indexed time range for an exact session ID. It does not establish source completeness or freshness.
 
 ### Browse without a concrete query
 
@@ -140,3 +140,19 @@ Keep cold here:
 - multi-step retrieval ladders
 - common query workflows
 - how to escalate from coarse search to full replay
+
+
+## Native source limits and continuation
+
+Pass the search hit's `file_path` unchanged: it is an opaque stored locator,
+including when it looks like a path. Context and messages never open it on the
+daemon. Native replies describe retained indexed projections, which may already
+be parser-truncated; they explicitly report unknown source freshness. Reindexing
+cannot recover history that no producer has delivered.
+
+`bbox_context` selects indexed events around an exact offset (default five on
+each side, maximum 25), with short previews. Expand with `bbox_messages` using
+exactly one of `session_id` or `file_path`. Follow `next_offset`, including when
+`from_end=true`; it accounts for byte-limited pages. Native message content is
+capped at 12000 stored bytes even with `max_content_length=0`. Preview truncation
+is separate from truncation already present in the stored source projection.
