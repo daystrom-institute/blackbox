@@ -8,12 +8,33 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
+mod report;
+
+#[cfg(test)]
+mod tests;
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::storage_gc_tools()
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StorageGcParams {
+    /// Response projection. Default summary contains counts and outcome only.
+    /// Other projections return exact JSON body pages, at most 4096 bytes.
+    #[serde(default)]
+    pub detail: StorageGcDetail,
+    /// Read a prior immutable receipt without planning or executing GC.
+    /// Use only with detail/cursor/limit, not non-default GC options.
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    /// Continue body.next_cursor with the same receipt_id and detail.
+    /// Never accepted for a new GC operation.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Body-page byte limit, clamped to 4..=4096. Requires non-summary detail.
+    #[serde(default)]
+    pub limit: Option<usize>,
     /// Dry-run mode: report candidates without deleting. Default true.
     #[serde(default = "default_true")]
     pub dry_run: bool,
@@ -89,6 +110,49 @@ pub(crate) struct StorageGcParams {
     pub prune_duplicate_packets: bool,
 }
 
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StorageGcDetail {
+    #[default]
+    Summary,
+    Candidates,
+    Deleted,
+    Errors,
+    Exclusions,
+    Packets,
+    Full,
+}
+
+impl StorageGcParams {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.cursor.is_some() && self.receipt_id.is_none() {
+            anyhow::bail!("error.bad_input: cursor requires receipt_id; GC is never rerun to page");
+        }
+        if self.detail == StorageGcDetail::Summary
+            && (self.cursor.is_some() || self.limit.is_some())
+        {
+            anyhow::bail!("error.bad_input: cursor and limit require non-summary detail");
+        }
+        if self.receipt_id.is_some() {
+            let defaults: Self = serde_json::from_value(serde_json::json!({}))?;
+            let mut actual = serde_json::to_value(self)?;
+            let mut expected = serde_json::to_value(defaults)?;
+            for key in ["detail", "receipt_id", "cursor", "limit"] {
+                actual.as_object_mut().unwrap().remove(key);
+                expected.as_object_mut().unwrap().remove(key);
+            }
+            if actual != expected {
+                anyhow::bail!(
+                    "error.bad_input: receipt reads accept only receipt_id/detail/cursor/limit; omit GC options"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -124,7 +188,7 @@ fn default_orphan_after_days() -> u64 {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_gc",
-        description = "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule for temps, backups, orphan classes, inactive snapshots, and observed cap warnings."
+        description = "Preview (default) or apply storage GC with bounded counts, bytes, and honest partial outcomes. detail=candidates/deleted/errors/exclusions/packets/full returns exact JSON body pages (limit max 4096 bytes). Read subsequent pages using receipt_id, the same detail, and body.next_cursor only: receipt reads never run GC. Receipts are temporary, not executable plans. Native retention and rollback protections always apply."
     )]
     pub(crate) async fn bbox_storage_gc(
         &self,
@@ -132,6 +196,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_storage_gc", move || {
+            p.validate()?;
+            if let Some(receipt_id) = &p.receipt_id {
+                return report::read(&server.state, receipt_id, &p);
+            }
             let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
             let registered = server.state.corpus_registered_project_ids();
@@ -224,6 +292,7 @@ impl BlackboxServer {
             // comparison; the cost of omitting it is discovering, after a
             // future planner learns a new candidate class, that the sweep
             // deleted a rebuild generation.
+            let planned_count = candidates.len();
             let candidates: Vec<storage_health::GcCandidate> = candidates
                 .into_iter()
                 .filter(|candidate| {
@@ -231,13 +300,17 @@ impl BlackboxServer {
                         || !exclusions.protects(std::path::Path::new(&candidate.path))
                 })
                 .collect();
+            let excluded_count = planned_count - candidates.len();
+            let exclusions = serde_json::to_value(exclusions)?;
 
             let deletable: Vec<&storage_health::GcCandidate> = candidates
                 .iter()
                 .filter(|c| c.deletable && !c.path.is_empty())
                 .collect();
             let deletable_count = deletable.len();
-            let deletable_bytes = deletable.iter().map(|c| c.bytes).sum::<u64>();
+            let deletable_bytes = deletable.iter().fold(0u64, |total, candidate| {
+                total.saturating_add(candidate.bytes)
+            });
 
             let (deleted, delete_errors) = if p.dry_run {
                 (None, None)
@@ -247,7 +320,7 @@ impl BlackboxServer {
             };
 
             let result = storage_health::GcResult {
-                applied: !p.dry_run,
+                applied: !p.dry_run && delete_errors.is_none(),
                 candidates,
                 deletable_count,
                 deletable_bytes,
@@ -256,28 +329,19 @@ impl BlackboxServer {
             };
 
             let packet_gc = if p.prune_duplicate_packets {
-                let report = server
-                    .state
-                    .packets
-                    .read()
-                    .gc_duplicate_packets(!p.dry_run)?;
-                Some(report)
+                Some(server.state.packets.read().gc_duplicate_packets(!p.dry_run))
             } else {
                 None
             };
 
-            let mut out = serde_json::json!({
-                "status": if p.dry_run { "dry_run" } else { "applied" },
-                "result": result,
-                // Reported, not merely applied: an external sweep is the real
-                // consumer of section 10.2, and it can only honour the
-                // exclusion set if this surface publishes it.
-                "catalog_gc_exclusions": exclusions,
-            });
-            if let Some(report) = packet_gc {
-                out["packet_gc"] = serde_json::to_value(&report)?;
-            }
-            Ok(serde_json::to_string_pretty(&out)?)
+            report::publish(
+                &server.state,
+                &p,
+                result,
+                exclusions,
+                excluded_count,
+                packet_gc,
+            )
         })
         .await
     }

@@ -188,6 +188,9 @@ pub enum CompileOutcome {
 /// Report from [`Packets::gc_duplicate_packets`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PacketGcReport {
+    /// Whether deletion was requested, independently of completion.
+    pub apply_requested: bool,
+    /// True only for apply with no reported deletion or scan failures.
     pub applied: bool,
     /// Total packets scanned across both scopes.
     pub scanned: usize,
@@ -197,6 +200,12 @@ pub struct PacketGcReport {
     pub protected_by_refs: usize,
     /// Lock files without a backing packet json swept up.
     pub orphan_locks_removed: usize,
+    /// Orphan locks observed by the sweep, including failures in apply.
+    pub orphan_lock_candidates: usize,
+    /// Unprotected duplicates eligible for deletion.
+    pub duplicate_candidates: usize,
+    /// Failures after planning. Successful deletions remain reflected above.
+    pub errors: Vec<String>,
     /// Deleted-duplicate counts by domain.
     pub per_domain: BTreeMap<String, usize>,
 }
@@ -1049,7 +1058,19 @@ impl Packets {
     /// references can never dangle. Sibling `.json.lock` files are removed
     /// with their packet, and orphaned lock files (packet json already gone,
     /// e.g. from `remove_domain`) are swept opportunistically.
+    /// Inventory failures before mutation return Err. Later failures are
+    /// collected in the report so earlier effects and cache invalidation
+    /// are not lost. Preview counts duplicate candidates in `deleted`, but
+    /// never counts orphan locks as removed.
     pub fn gc_duplicate_packets(&self, apply: bool) -> Result<PacketGcReport> {
+        self.gc_duplicate_packets_with_remove(apply, |path| fs::remove_file(path))
+    }
+
+    fn gc_duplicate_packets_with_remove(
+        &self,
+        apply: bool,
+        mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<PacketGcReport> {
         let all = self.list_all()?;
 
         // Ids referenced from any packet's Apply antecedents are protected.
@@ -1085,21 +1106,33 @@ impl Packets {
 
         let mut deleted = 0usize;
         let mut protected_by_refs = 0usize;
+        let mut duplicate_candidates = 0usize;
+        let mut errors = Vec::new();
         let mut per_domain: BTreeMap<String, usize> = BTreeMap::new();
         for packet in &candidates {
             if referenced.contains(&normalize_id(&packet.id)) {
                 protected_by_refs += 1;
                 continue;
             }
+            duplicate_candidates += 1;
             if apply {
                 let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
-                if path.exists() {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("removing packet {}", path.display()))?;
+                match remove(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        errors.push(format!("removing packet {}: {error}", path.display()));
+                        continue;
+                    }
                 }
                 let lock_path = path.with_extension("json.lock");
-                if lock_path.exists() {
-                    let _ = fs::remove_file(&lock_path);
+                if let Err(error) = remove(&lock_path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    errors.push(format!(
+                        "removing packet lock {}: {error}",
+                        lock_path.display()
+                    ));
                 }
             }
             deleted += 1;
@@ -1108,44 +1141,84 @@ impl Packets {
 
         // Sweep lock files whose packet json no longer exists.
         let mut orphan_locks_removed = 0usize;
+        let mut orphan_lock_candidates = 0usize;
         for scope in &["global", "project"] {
             let dir = scope_dir(&self.packets_dir, scope);
-            if !dir.exists() {
-                continue;
-            }
-            for entry in fs::read_dir(&dir)? {
-                let path = entry?.path();
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    errors.push(format!("scanning packet locks {}: {error}", dir.display()));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(error) => {
+                        errors.push(format!("reading packet lock entry: {error}"));
+                        continue;
+                    }
+                };
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let Some(stem) = name.strip_suffix(".json.lock") else {
                     continue;
                 };
-                if !dir.join(format!("{stem}.json")).exists() {
-                    if apply {
-                        let _ = fs::remove_file(&path);
+                let backing_packet = dir.join(format!("{stem}.json"));
+                let packet_exists = match backing_packet.try_exists() {
+                    Ok(exists) => exists,
+                    Err(error) => {
+                        errors.push(format!(
+                            "checking orphan lock backing packet {}: {error}",
+                            backing_packet.display()
+                        ));
+                        continue;
                     }
-                    orphan_locks_removed += 1;
+                };
+                if !packet_exists {
+                    orphan_lock_candidates += 1;
+                    if apply {
+                        match remove(&path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(error) => {
+                                errors.push(format!(
+                                    "removing orphan lock {}: {error}",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                        }
+                        orphan_locks_removed += 1;
+                    }
                 }
             }
         }
 
-        if apply && deleted > 0 {
+        if apply && (deleted > 0 || orphan_locks_removed > 0) {
             self.bump_generation();
             self.append_event(
-                &PacketEvent::now("gc", "ok").with_details(serde_json::json!({
-                    "deleted": deleted,
-                    "duplicate_groups": per_domain.len(),
-                    "protected_by_refs": protected_by_refs,
-                    "orphan_locks_removed": orphan_locks_removed,
-                })),
+                &PacketEvent::now("gc", if errors.is_empty() { "ok" } else { "partial" })
+                    .with_details(serde_json::json!({
+                        "deleted": deleted,
+                        "duplicate_groups": per_domain.len(),
+                        "protected_by_refs": protected_by_refs,
+                        "orphan_locks_removed": orphan_locks_removed,
+                        "error_count": errors.len(),
+                    })),
             );
         }
 
         Ok(PacketGcReport {
-            applied: apply,
+            apply_requested: apply,
+            applied: apply && errors.is_empty(),
             scanned: all.len(),
             deleted,
             protected_by_refs,
             orphan_locks_removed,
+            orphan_lock_candidates,
+            duplicate_candidates,
+            errors,
             per_domain,
         })
     }

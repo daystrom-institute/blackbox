@@ -715,6 +715,161 @@ fn gc_sweeps_orphaned_lock_files() {
     assert_eq!(remaining, 0);
 }
 
+#[test]
+fn gc_reports_partial_duplicate_deletions_and_invalidates_generation() {
+    let (_directory, store) = tmp_packets();
+    let params = compile_params(
+        "gc-partial",
+        json!([{"id":"pass_ok","antecedent":{"op":"True"},"consequent":"OK"}]),
+    );
+    for _ in 0..3 {
+        store.compile(&params).unwrap();
+    }
+    let generation = store.generation();
+    let mut packet_attempts = 0;
+    let report = store
+        .gc_duplicate_packets_with_remove(true, |path| {
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                packet_attempts += 1;
+                if packet_attempts == 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected second packet failure",
+                    ));
+                }
+            }
+            std::fs::remove_file(path)
+        })
+        .unwrap();
+    assert!(report.apply_requested);
+    assert!(!report.applied);
+    assert_eq!(report.duplicate_candidates, 2);
+    assert_eq!(report.deleted, 1);
+    assert_eq!(report.per_domain.get("gc-partial"), Some(&1));
+    assert_eq!(report.errors.len(), 1);
+    assert!(report.errors[0].contains("injected second packet failure"));
+    assert_eq!(store.list_all().unwrap().len(), 2);
+    assert!(store.generation() > generation);
+}
+
+#[test]
+fn gc_preserves_counts_when_lock_scan_fails_after_packet_deletion() {
+    let (directory, store) = tmp_packets();
+    let root = directory.path().canonicalize().unwrap();
+    let project_scope = root.join("project");
+    std::fs::create_dir_all(&project_scope).unwrap();
+    let params = compile_params(
+        "gc-scan-failure",
+        json!([{"id":"pass_ok","antecedent":{"op":"True"},"consequent":"OK"}]),
+    );
+    for _ in 0..3 {
+        store.compile(&params).unwrap();
+    }
+    let mut changed = false;
+    let report = store
+        .gc_duplicate_packets_with_remove(true, |path| {
+            std::fs::remove_file(path)?;
+            if !changed {
+                std::fs::remove_dir(&project_scope)?;
+                std::fs::write(&project_scope, b"not a directory")?;
+                changed = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(!report.applied);
+    assert_eq!(report.deleted, 2);
+    assert_eq!(report.per_domain.get("gc-scan-failure"), Some(&2));
+    assert_eq!(report.errors.len(), 1);
+    assert!(report.errors[0].contains("scanning packet locks"));
+}
+
+#[test]
+fn gc_preview_never_calls_remove_and_lock_failures_are_not_counted_as_removed() {
+    let (directory, store) = tmp_packets();
+    let root = directory.path().canonicalize().unwrap();
+    let global = root.join("global");
+    std::fs::create_dir_all(&global).unwrap();
+    let orphan = global.join("packet-orphan.json.lock");
+    std::fs::write(&orphan, b"lock").unwrap();
+    let preview = store
+        .gc_duplicate_packets_with_remove(false, |_| panic!("preview attempted deletion"))
+        .unwrap();
+    assert!(!preview.apply_requested);
+    assert!(!preview.applied);
+    assert_eq!(preview.orphan_lock_candidates, 1);
+    assert_eq!(preview.orphan_locks_removed, 0);
+    assert!(orphan.exists());
+    let report = store
+        .gc_duplicate_packets_with_remove(true, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected lock failure",
+            ))
+        })
+        .unwrap();
+    assert!(!report.applied);
+    assert_eq!(report.orphan_locks_removed, 0);
+    assert_eq!(report.orphan_lock_candidates, 1);
+    assert_eq!(report.errors.len(), 1);
+    assert!(orphan.exists());
+}
+
+#[test]
+fn gc_missing_duplicate_is_not_counted_as_a_deletion() {
+    let (_directory, store) = tmp_packets();
+    let params = compile_params(
+        "gc-missing",
+        json!([{"id":"pass_ok","antecedent":{"op":"True"},"consequent":"OK"}]),
+    );
+    for _ in 0..2 {
+        store.compile(&params).unwrap();
+    }
+    let report = store
+        .gc_duplicate_packets_with_remove(true, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(report.duplicate_candidates, 1);
+    assert_eq!(report.deleted, 0);
+    assert!(report.per_domain.is_empty());
+    assert!(report.errors.is_empty());
+}
+
+#[test]
+fn gc_reports_sibling_lock_failure_without_hiding_packet_deletion() {
+    let (_directory, store) = tmp_packets();
+    let params = compile_params(
+        "gc-sibling-lock",
+        json!([{"id":"pass_ok","antecedent":{"op":"True"},"consequent":"OK"}]),
+    );
+    for _ in 0..2 {
+        store.compile(&params).unwrap();
+    }
+    let report = store
+        .gc_duplicate_packets_with_remove(true, |path| {
+            if path.extension().and_then(|extension| extension.to_str()) == Some("lock") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sibling lock failure",
+                ));
+            }
+            std::fs::remove_file(path)
+        })
+        .unwrap();
+    assert!(!report.applied);
+    assert_eq!(report.deleted, 1);
+    assert_eq!(report.orphan_locks_removed, 0);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("removing packet lock"))
+    );
+    assert_eq!(store.list_all().unwrap().len(), 1);
+}
+
 // ── Dual-read (plan §8.2) ────────────────────────────────────────────────
 
 fn project_scoped_params(domain: &str, project: &str, project_id: Option<&str>) -> CompileParams {
