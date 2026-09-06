@@ -52,6 +52,16 @@ pub struct PendingCheckoutMutation {
     pub last_error: Option<String>,
     pub acked_at: Option<String>,
     pub ack_content_sha256: Option<String>,
+    /// Present for writes whose read/modify/write base is tracked across delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<MutationPublication>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationPublication {
+    pub base_content_json: Option<String>,
+    #[serde(default)]
+    pub observed: bool,
 }
 
 pub struct CheckoutMutations {
@@ -101,6 +111,7 @@ impl CheckoutMutations {
             last_error: None,
             acked_at: None,
             ack_content_sha256: None,
+            publication: None,
         });
         Ok(true)
     }
@@ -199,6 +210,135 @@ impl CheckoutMutations {
         })
     }
 
+    /// Latest outstanding write, isolated by durable scope. Applied tracked
+    /// writes remain an overlay until their content is observed in publication.
+    pub fn outstanding_writes(&self) -> impl Iterator<Item = &PendingCheckoutMutation> {
+        self.store.mutations.iter().filter(|row| {
+            row.status != CheckoutMutationStatus::Failed
+                && row.mutation.mode == "write"
+                && match &row.publication {
+                    Some(publication) => !publication.observed,
+                    None => row.status == CheckoutMutationStatus::Pending,
+                }
+        })
+    }
+
+    /// Retire the overlay prefix whose exact content has reached publication.
+    /// Delivery acknowledgement alone is insufficient: the owner may not have
+    /// committed and published the delivered file yet.
+    pub fn observe_publication(
+        &mut self,
+        scope: &PublishedScope,
+        relative_path: &str,
+        published: Option<&str>,
+    ) -> bool {
+        let last = self.store.mutations.iter().rposition(|row| {
+            &row.mutation.scope == scope
+                && row.mutation.relative_path == relative_path
+                && row.status != CheckoutMutationStatus::Failed
+                && row.publication.is_some()
+                && same_json(row.mutation.content_json.as_deref(), published)
+        });
+        let Some(last) = last else {
+            return false;
+        };
+        let mut changed = false;
+        for row in &mut self.store.mutations[..=last] {
+            if &row.mutation.scope == scope
+                && row.mutation.relative_path == relative_path
+                && let Some(publication) = &mut row.publication
+                && !publication.observed
+            {
+                publication.observed = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Choose a write base while the caller holds the queue's exclusive lock.
+    /// A changed publication that does not incorporate the outstanding write
+    /// is a conflict, never permission to overwrite either side.
+    pub fn write_base(
+        &mut self,
+        scope: &PublishedScope,
+        relative_path: &str,
+        published: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.observe_publication(scope, relative_path, published);
+        let latest = self
+            .outstanding_writes()
+            .filter(|row| {
+                &row.mutation.scope == scope && row.mutation.relative_path == relative_path
+            })
+            .last();
+        let Some(latest) = latest else {
+            return Ok(published.map(str::to_owned));
+        };
+        if let Some(publication) = &latest.publication
+            && !same_json(publication.base_content_json.as_deref(), published)
+            && !self.store.mutations.iter().any(|row| {
+                row.mutation.scope == *scope
+                    && row.mutation.relative_path == relative_path
+                    && row.publication.as_ref().is_some_and(|state| state.observed)
+                    && same_json(row.mutation.content_json.as_deref(), published)
+            })
+        {
+            anyhow::bail!(
+                "error.checkout_mutation_conflict: published content changed while mutation {} \
+                 is awaiting publication; reconcile that mutation in the owning checkout and \
+                 publish it before retrying",
+                latest.mutation.mutation_id
+            );
+        }
+        Ok(latest.mutation.content_json.clone())
+    }
+
+    /// Validate every file before appending any, so a paired update cannot
+    /// leave half its intent queued when the other file is invalid.
+    pub fn enqueue_tracked_writes(
+        &mut self,
+        scope: PublishedScope,
+        writes: Vec<(String, String, Option<String>)>,
+        reason: String,
+        now: String,
+    ) -> Result<Vec<String>> {
+        let mut rows = Vec::new();
+        for (relative_path, content, base) in writes {
+            let mutation = CheckoutMutationV1 {
+                schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
+                mutation_id: self.mint_id(),
+                scope: scope.clone(),
+                relative_path,
+                mode: "write".into(),
+                content_json: Some(content),
+                reason: reason.clone(),
+                enqueued_at: now.clone(),
+            };
+            mutation
+                .validate()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            rows.push(PendingCheckoutMutation {
+                mutation,
+                status: CheckoutMutationStatus::Pending,
+                attempts: 0,
+                last_error: None,
+                acked_at: None,
+                ack_content_sha256: None,
+                publication: Some(MutationPublication {
+                    base_content_json: base,
+                    observed: false,
+                }),
+            });
+        }
+        let ids = rows
+            .iter()
+            .map(|row| row.mutation.mutation_id.clone())
+            .collect();
+        self.store.mutations.extend(rows);
+        Ok(ids)
+    }
+
     /// Every pending write's (relative_path, content_json) pair.
     pub fn pending_writes(&self) -> impl Iterator<Item = (&str, &str)> {
         self.store
@@ -277,6 +417,23 @@ impl CheckoutMutations {
     }
 }
 
+fn same_json(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            if left == right {
+                return true;
+            }
+            matches!(
+                (serde_json::from_str::<serde_json::Value>(left),
+                 serde_json::from_str::<serde_json::Value>(right)),
+                (Ok(left), Ok(right)) if left == right
+            )
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +453,120 @@ mod tests {
             reason: "test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn tracked_writes_survive_ack_and_restart_and_recognize_intermediate_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("mutations.json");
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        let file = ".bbox/gaps/gap-0123abcd.json";
+        let original = r#"{"title":"old"}"#;
+        let first = r#"{"title":"new"}"#;
+        let second = r#"{"title":"new","notes":"later"}"#;
+        let enqueue = |store: &mut CheckoutMutations, content: &str| {
+            store
+                .enqueue_tracked_writes(
+                    scope(),
+                    vec![(file.into(), content.into(), Some(original.into()))],
+                    "test".into(),
+                    "2026-09-06T00:00:00Z".into(),
+                )
+                .unwrap()[0]
+                .clone()
+        };
+        let id = enqueue(&mut store, first);
+        store
+            .ack(&id, "applied", None, None, "2026-09-06T00:00:01Z")
+            .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&store.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        assert_eq!(
+            store
+                .write_base(&scope(), file, Some(original))
+                .unwrap()
+                .as_deref(),
+            Some(first)
+        );
+        enqueue(&mut store, second);
+        assert_eq!(
+            store
+                .write_base(&scope(), file, Some(first))
+                .unwrap()
+                .as_deref(),
+            Some(second)
+        );
+        assert_eq!(
+            store
+                .write_base(&scope(), file, Some(second))
+                .unwrap()
+                .as_deref(),
+            Some(second)
+        );
+        assert_eq!(store.outstanding_writes().count(), 0);
+        assert_eq!(
+            store
+                .write_base(&scope(), file, Some(original))
+                .unwrap()
+                .as_deref(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn tracked_writes_refuse_publication_conflicts_and_isolate_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let file = ".bbox/gaps/gap-0123abcd.json";
+        store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(
+                    file.into(),
+                    r#"{"title":"queued"}"#.into(),
+                    Some("{}".into()),
+                )],
+                "test".into(),
+                "2026-09-06T00:00:00Z".into(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .write_base(&scope(), file, Some(r#"{"title":"external"}"#))
+                .unwrap_err()
+                .to_string()
+                .contains("checkout_mutation_conflict")
+        );
+        let peer = PublishedScope::try_new("other-repo", ".").unwrap();
+        assert_eq!(
+            store
+                .write_base(&peer, file, Some("{}"))
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+        assert!(!store.observe_publication(&peer, file, Some(r#"{"title":"queued"}"#)));
+        assert_eq!(store.outstanding_writes().count(), 1);
+        let count = store.pending_count();
+        assert!(
+            store
+                .enqueue_tracked_writes(
+                    scope(),
+                    vec![
+                        (file.into(), "{}".into(), None),
+                        ("src/main.rs".into(), "{}".into(), None)
+                    ],
+                    "invalid pair".into(),
+                    "2026-09-06T00:00:00Z".into()
+                )
+                .is_err()
+        );
+        assert_eq!(store.pending_count(), count);
     }
 
     #[test]

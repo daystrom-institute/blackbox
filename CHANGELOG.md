@@ -8,6 +8,11 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Preserve queued project-gap edits across concurrent calls and delivery before
+  publication; isolate overlays by project and reject conflicting publications.
+  Supersession changes validate both records before either file is queued.
+
+
 ### Removed
 
 - Daemon workflows, atoms, application crons/pollers/webhooks, reaction delivery,

@@ -201,39 +201,89 @@ impl BlackboxServer {
         }
     }
 
-    /// Enqueue the exact committed-file bytes for checkout-owner delivery
-    /// and record the transport observation. Returns the mutation id.
-    fn enqueue_gap_file(
+    /// Serialize the read/modify/enqueue sequence for all files in one gap edit.
+    /// Published content is captured before the queue lock; the queue overlays
+    /// all earlier intents, including delivered writes not yet published.
+    fn edit_queued_gaps(
         &self,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
-        gap: &crate::gaps::GapNote,
+        ids: &[&str],
         reason: &str,
+        edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
-        let bytes = crate::gaps::committed_gap_note_bytes(gap)?;
-        let content = String::from_utf8(bytes)?;
-        let relative_path = format!(".bbox/gaps/{}.json", gap.id);
-        let mutation_id = self
-            .state
-            .checkout_mutations
-            .write()
-            .enqueue_file_mutation(
-                scope,
-                relative_path.clone(),
-                "write",
-                Some(content),
-                reason.to_string(),
-                bbox_util::util::now_iso(),
-            )?;
+        let view = self.session_gap_view(Some(project_id), Some("published"))?;
+        let published = ids
+            .iter()
+            .map(|id| -> anyhow::Result<Option<String>> {
+                Ok(view
+                    .gaps
+                    .all()
+                    .iter()
+                    .find(|gap| {
+                        Self::gap_id_matches(&gap.id, id)
+                            && gap.project_id.as_deref() == Some(project_id)
+                    })
+                    .map(crate::gaps::committed_gap_note_bytes)
+                    .transpose()?
+                    .map(String::from_utf8)
+                    .transpose()?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut queue = self.state.checkout_mutations.write();
+        let mut gaps = Vec::new();
+        for (id, base) in ids.iter().zip(&published) {
+            let canonical = if id.starts_with("gap-") {
+                id.to_string()
+            } else {
+                format!("gap-{id}")
+            };
+            let content = queue
+                .write_base(
+                    &scope,
+                    &format!(".bbox/gaps/{canonical}.json"),
+                    base.as_deref(),
+                )?
+                .ok_or_else(|| anyhow::anyhow!("Gap not found in project {project_id}: {id}"))?;
+            let gap: crate::gaps::GapNote = serde_json::from_str(&content)?;
+            if gap.project_id.as_deref() != Some(project_id) {
+                anyhow::bail!("gap {id} does not belong to project {project_id}");
+            }
+            gaps.push(gap);
+        }
+        edit(&mut gaps)?;
+        let writes = gaps
+            .iter()
+            .zip(published)
+            .map(|(gap, base)| {
+                Ok((
+                    format!(".bbox/gaps/{}.json", gap.id),
+                    String::from_utf8(crate::gaps::committed_gap_note_bytes(gap)?)?,
+                    base,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mutations = queue.enqueue_tracked_writes(
+            scope,
+            writes,
+            reason.into(),
+            bbox_util::util::now_iso(),
+        )?;
+        drop(queue);
         self.state.checkout_mutations_persister.request();
+        self.observe_gap_delivery(project_id);
+        Ok(format!(
+            "queued {}; delivery and publication are asynchronous",
+            mutations.join(", ")
+        ))
+    }
+
+    fn observe_gap_delivery(&self, project_id: &str) {
         self.observe_knowledge_transport_operation(
             project_id,
             bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
             bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
         );
-        Ok(format!(
-            "queued {mutation_id} -> {relative_path}; it lands in the checkout within one collector cycle and publishes when committed"
-        ))
     }
 
     /// Covered-project gap filing through the checkout-owner backchannel.
@@ -248,39 +298,6 @@ impl BlackboxServer {
         let Some((project_id, scope)) = self.covered_project_scope(raw) else {
             return Ok(None);
         };
-        if !p.allow_recurrence.unwrap_or(false) {
-            let key = p.dedupe_key.trim().to_string();
-            let view = self.session_gap_view(Some(raw), None)?;
-            let probe = GapListParams {
-                dedupe_key: Some(key.clone()),
-                ..Default::default()
-            };
-            let published = view
-                .gaps
-                .query(&probe)
-                .into_iter()
-                .find(|gap| gap.resolution != crate::gaps::GapResolution::Addressed)
-                .map(|gap| gap.id);
-            let pending = {
-                let store = self.state.checkout_mutations.read();
-                store
-                    .pending_writes()
-                    .filter(|(path, _)| path.starts_with(".bbox/gaps/"))
-                    .filter_map(|(_, content)| {
-                        serde_json::from_str::<crate::gaps::GapNote>(content).ok()
-                    })
-                    .find(|gap| {
-                        gap.dedupe_key == key
-                            && gap.resolution != crate::gaps::GapResolution::Addressed
-                    })
-                    .map(|gap| gap.id)
-            };
-            if let Some(existing) = published.or(pending) {
-                return Ok(Some(format!(
-                    "Gap already open as {existing} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference {existing} from a follow-up"
-                )));
-            }
-        }
         let mut envelope = serde_json::json!({
             "type": "blackbox.gap_note.v1",
             "title": p.title,
@@ -314,12 +331,54 @@ impl BlackboxServer {
         gap.provider = p.provider.clone();
         gap.bro = p.bro.clone();
         gap.thread_id = p.thread_id.clone();
-        let delivery = self.enqueue_gap_file(
-            &project_id,
+        let view = self.session_gap_view(Some(raw), Some("published"))?;
+        let mut queue = self.state.checkout_mutations.write();
+        if !p.allow_recurrence.unwrap_or(false) {
+            let mut visible = view
+                .gaps
+                .all()
+                .iter()
+                .filter(|gap| gap.project_id.as_deref() == Some(&project_id))
+                .map(|gap| (gap.id.clone(), gap.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for pending in queue
+                .outstanding_writes()
+                .filter(|row| row.mutation.scope == scope)
+            {
+                if pending.mutation.relative_path.starts_with(".bbox/gaps/")
+                    && let Some(content) = &pending.mutation.content_json
+                {
+                    let pending_gap: crate::gaps::GapNote = serde_json::from_str(content)?;
+                    visible.insert(pending_gap.id.clone(), pending_gap);
+                }
+            }
+            if let Some(existing) = visible.values().find(|gap| {
+                gap.dedupe_key == p.dedupe_key.trim()
+                    && gap.resolution != crate::gaps::GapResolution::Addressed
+            }) {
+                return Ok(Some(format!(
+                    "Gap already open as {} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference it from a follow-up",
+                    existing.id
+                )));
+            }
+        }
+        let ids = queue.enqueue_tracked_writes(
             scope,
-            &gap,
-            &format!("bbox_gap(project_id={project_id})"),
+            vec![(
+                format!(".bbox/gaps/{id}.json"),
+                String::from_utf8(crate::gaps::committed_gap_note_bytes(&gap)?)?,
+                None,
+            )],
+            format!("bbox_gap(project_id={project_id})"),
+            bbox_util::util::now_iso(),
         )?;
+        drop(queue);
+        self.state.checkout_mutations_persister.request();
+        self.observe_gap_delivery(&project_id);
+        let delivery = format!(
+            "queued {}; delivery and publication are asynchronous",
+            ids.join(", ")
+        );
         Ok(Some(format!(
             "Gap {id} filed via the checkout-owner lane ({delivery})"
         )))
@@ -398,13 +457,29 @@ impl BlackboxServer {
             return Ok(None);
         }
         let view = self.session_gap_view(None, None)?;
-        let Some(project_id) = view
+        let mut owners = view
             .gaps
             .all()
             .iter()
-            .find(|gap| Self::gap_id_matches(&gap.id, id))
-            .and_then(|gap| gap.project_id.clone())
-        else {
+            .filter(|gap| Self::gap_id_matches(&gap.id, id))
+            .filter_map(|gap| gap.project_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for row in self.state.checkout_mutations.read().outstanding_writes() {
+            if row.mutation.relative_path.starts_with(".bbox/gaps/")
+                && let Some(content) = &row.mutation.content_json
+                && let Ok(gap) = serde_json::from_str::<crate::gaps::GapNote>(content)
+                && Self::gap_id_matches(&gap.id, id)
+                && let Some(project_id) = gap.project_id
+                && self.covered_scope_for_project_id(&project_id).as_ref()
+                    == Some(&row.mutation.scope)
+            {
+                owners.insert(project_id);
+            }
+        }
+        if owners.len() > 1 {
+            anyhow::bail!("gap {id} exists in multiple projects; pass project to select its owner");
+        }
+        let Some(project_id) = owners.into_iter().next() else {
             return Ok(None);
         };
         Ok(self
@@ -423,34 +498,6 @@ impl BlackboxServer {
             Some(raw) => Ok(self.covered_project_scope(raw)),
             None => self.covered_scope_for_gap_id(id),
         }
-    }
-
-    /// Load one gap for a covered-project mutation: published view first,
-    /// then the pending-delivery overlay. `raw` narrows the view when the
-    /// caller supplied a selector; without one the whole served view is the
-    /// lookup surface, exactly as the unfiltered list is.
-    fn served_gap(&self, raw: Option<&str>, id: &str) -> anyhow::Result<crate::gaps::GapNote> {
-        let view = self.session_gap_view(raw, None)?;
-        if let Some(gap) = view
-            .gaps
-            .all()
-            .iter()
-            .find(|gap| Self::gap_id_matches(&gap.id, id))
-        {
-            return Ok(gap.clone());
-        }
-        let canonical = if id.starts_with("gap-") {
-            id.to_string()
-        } else {
-            format!("gap-{id}")
-        };
-        if let Some(content) =
-            self.pending_mutation_content(&format!(".bbox/gaps/{canonical}.json"))
-            && let Ok(gap) = serde_json::from_str::<crate::gaps::GapNote>(&content)
-        {
-            return Ok(gap);
-        }
-        anyhow::bail!("Gap not found: {id} (expected `gap-<8hex>`)")
     }
 
     /// Store-identity breadcrumb for an id-addressed mutation miss
@@ -502,84 +549,87 @@ impl BlackboxServer {
         let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
-        let mut gap = self.served_gap(raw, &p.id)?;
-        if let Some(value) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            gap.title = value.to_string();
-        }
-        if let Some(value) = p.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            gap.domain = value.to_string();
-        }
-        if let Some(value) = p
-            .wanted_capability
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            gap.wanted_capability = value.to_string();
-        }
-        if let Some(value) = &p.impact {
-            let mut envelope = serde_json::json!({
-                "type": "blackbox.gap_note.v1",
-                "title": gap.title,
-                "gap_kind": gap.gap_kind.as_ref(),
-                "domain": gap.domain,
-                "wanted_capability": gap.wanted_capability,
-                "impact": value,
-            });
-            envelope
-                .as_object_mut()
-                .expect("object envelope")
-                .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
-            let checked = crate::gaps::GapNote::from_envelope(
-                &envelope,
-                gap.id.clone(),
-                gap.created_at.clone(),
-            )?;
-            gap.impact = checked.impact;
-        }
-        if let Some(value) = &p.blocking_level {
-            let mut envelope = serde_json::json!({
-                "type": "blackbox.gap_note.v1",
-                "title": gap.title,
-                "gap_kind": gap.gap_kind.as_ref(),
-                "domain": gap.domain,
-                "wanted_capability": gap.wanted_capability,
-                "blocking_level": value,
-            });
-            envelope
-                .as_object_mut()
-                .expect("object envelope")
-                .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
-            let checked = crate::gaps::GapNote::from_envelope(
-                &envelope,
-                gap.id.clone(),
-                gap.created_at.clone(),
-            )?;
-            gap.blocking_level = checked.blocking_level;
-        }
-        if let Some(value) = &p.missing_primitive {
-            gap.missing_primitive = Some(value.clone()).filter(|s| !s.trim().is_empty());
-        }
-        if let Some(value) = &p.fallback_used {
-            gap.fallback_used = Some(value.clone()).filter(|s| !s.trim().is_empty());
-        }
-        if let Some(value) = &p.evidence {
-            gap.evidence = value.clone();
-        }
-        if let Some(value) = &p.suggested_owner {
-            gap.suggested_owner = Some(value.clone()).filter(|s| !s.trim().is_empty());
-        }
-        if let Some(value) = &p.notes {
-            gap.notes = Some(value.clone()).filter(|s| !s.trim().is_empty());
-        }
-        gap.updated_at = bbox_util::util::now_iso();
-        let id = gap.id.clone();
-        let delivery = self.enqueue_gap_file(
+        let delivery = self.edit_queued_gaps(
             &project_id,
             scope,
-            &gap,
+            &[&p.id],
             &format!("bbox_gap_update(project_id={project_id})"),
+            |gaps| {
+                let gap = &mut gaps[0];
+                if let Some(value) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    gap.title = value.to_string();
+                }
+                if let Some(value) = p.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    gap.domain = value.to_string();
+                }
+                if let Some(value) = p
+                    .wanted_capability
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    gap.wanted_capability = value.to_string();
+                }
+                if let Some(value) = &p.impact {
+                    let mut envelope = serde_json::json!({
+                        "type": "blackbox.gap_note.v1",
+                        "title": gap.title,
+                        "gap_kind": gap.gap_kind.as_ref(),
+                        "domain": gap.domain,
+                        "wanted_capability": gap.wanted_capability,
+                        "impact": value,
+                    });
+                    envelope
+                        .as_object_mut()
+                        .expect("object envelope")
+                        .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
+                    let checked = crate::gaps::GapNote::from_envelope(
+                        &envelope,
+                        gap.id.clone(),
+                        gap.created_at.clone(),
+                    )?;
+                    gap.impact = checked.impact;
+                }
+                if let Some(value) = &p.blocking_level {
+                    let mut envelope = serde_json::json!({
+                        "type": "blackbox.gap_note.v1",
+                        "title": gap.title,
+                        "gap_kind": gap.gap_kind.as_ref(),
+                        "domain": gap.domain,
+                        "wanted_capability": gap.wanted_capability,
+                        "blocking_level": value,
+                    });
+                    envelope
+                        .as_object_mut()
+                        .expect("object envelope")
+                        .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
+                    let checked = crate::gaps::GapNote::from_envelope(
+                        &envelope,
+                        gap.id.clone(),
+                        gap.created_at.clone(),
+                    )?;
+                    gap.blocking_level = checked.blocking_level;
+                }
+                if let Some(value) = &p.missing_primitive {
+                    gap.missing_primitive = Some(value.clone()).filter(|s| !s.trim().is_empty());
+                }
+                if let Some(value) = &p.fallback_used {
+                    gap.fallback_used = Some(value.clone()).filter(|s| !s.trim().is_empty());
+                }
+                if let Some(value) = &p.evidence {
+                    gap.evidence = value.clone();
+                }
+                if let Some(value) = &p.suggested_owner {
+                    gap.suggested_owner = Some(value.clone()).filter(|s| !s.trim().is_empty());
+                }
+                if let Some(value) = &p.notes {
+                    gap.notes = Some(value.clone()).filter(|s| !s.trim().is_empty());
+                }
+                gap.updated_at = bbox_util::util::now_iso();
+                Ok(())
+            },
         )?;
+        let id = &p.id;
         Ok(Some(format!(
             "Gap {id} updated via the checkout-owner lane ({delivery})"
         )))
@@ -596,10 +646,7 @@ impl BlackboxServer {
         let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
-        let resolution = p.resolution.as_str();
-        let mut gap = self.served_gap(raw, &p.id)?;
-        let now = bbox_util::util::now_iso();
-        gap.resolution = match resolution {
+        let resolution = match p.resolution.as_str() {
             "unresolved" => crate::gaps::GapResolution::Unresolved,
             "acknowledged" => crate::gaps::GapResolution::Acknowledged,
             "addressed" => crate::gaps::GapResolution::Addressed,
@@ -607,44 +654,43 @@ impl BlackboxServer {
                 "resolution must be unresolved, acknowledged, or addressed, got `{other}`"
             ),
         };
-        gap.updated_at = now.clone();
-        gap.resolved_at = if resolution == "unresolved" {
-            None
-        } else {
-            Some(now.clone())
-        };
-        if let Some(note) = p.note.as_deref() {
-            gap.resolution_note = Some(note.to_string());
-        }
-        let mut supersessor = None;
+        let mut ids = vec![p.id.as_str()];
         if let Some(by) = p.superseded_by.as_deref() {
-            let mut other = self.served_gap(raw, by)?;
-            gap.superseded_by = Some(other.id.clone());
-            other.supersedes = Some(gap.id.clone());
-            other.updated_at = now;
-            supersessor = Some(other);
+            if Self::gap_id_matches(by, &p.id) || Self::gap_id_matches(&p.id, by) {
+                anyhow::bail!("a gap cannot supersede itself");
+            }
+            ids.push(by);
         }
-        let id = gap.id.clone();
-        let delivery = self.enqueue_gap_file(
+        let delivery = self.edit_queued_gaps(
             &project_id,
-            scope.clone(),
-            &gap,
+            scope,
+            &ids,
             &format!("bbox_gap_resolve(project_id={project_id})"),
+            |gaps| {
+                let now = bbox_util::util::now_iso();
+                let gap = &mut gaps[0];
+                gap.resolution = resolution;
+                gap.updated_at = now.clone();
+                gap.resolved_at = if p.resolution == "unresolved" {
+                    None
+                } else {
+                    Some(now.clone())
+                };
+                if let Some(note) = &p.note {
+                    gap.resolution_note = Some(note.clone());
+                }
+                if gaps.len() == 2 {
+                    gaps[0].superseded_by = Some(gaps[1].id.clone());
+                    gaps[1].supersedes = Some(gaps[0].id.clone());
+                    gaps[1].updated_at = now;
+                }
+                Ok(())
+            },
         )?;
-        let mut text = format!("Gap {id} → {resolution} via the checkout-owner lane ({delivery})");
-        if let Some(other) = supersessor {
-            let other_id = other.id.clone();
-            let other_delivery = self.enqueue_gap_file(
-                &project_id,
-                scope,
-                &other,
-                &format!("bbox_gap_resolve supersession link (project_id={project_id})"),
-            )?;
-            text.push_str(&format!(
-                "; supersessor {other_id} relinked ({other_delivery})"
-            ));
-        }
-        Ok(Some(text))
+        Ok(Some(format!(
+            "Gap {} -> {} via the checkout-owner lane ({delivery})",
+            p.id, p.resolution
+        )))
     }
 }
 
@@ -939,6 +985,173 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn queued_gap_edits_compose_across_delivery_and_publication() {
+        use crate::server::state::catalog_fixture::{CatalogFixture, gap_note};
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_queue", &scope);
+        fixture.install_publication(
+            "p_queue",
+            &scope,
+            &"1".repeat(40),
+            &[],
+            &[gap_note("gap-1234abcd", "published title")],
+        );
+        let server = fixture.server();
+        server
+            .edit_queued_gaps(
+                "p_queue",
+                scope.clone(),
+                &["gap-1234abcd"],
+                "edit title",
+                |gaps| {
+                    gaps[0].title = "queued title".into();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let first = server
+            .state
+            .checkout_mutations
+            .read()
+            .poll(&std::collections::BTreeSet::from([scope.clone()]))
+            .0[0]
+            .mutation_id
+            .clone();
+        server
+            .state
+            .checkout_mutations
+            .write()
+            .ack(&first, "applied", None, None, "2026-09-06T00:00:00Z")
+            .unwrap();
+        server
+            .edit_queued_gaps(
+                "p_queue",
+                scope.clone(),
+                &["1234abcd"],
+                "edit notes",
+                |gaps| {
+                    assert_eq!(gaps[0].title, "queued title");
+                    gaps[0].notes = Some("later note".into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let latest: crate::gaps::GapNote = serde_json::from_str(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_writes()
+                .last()
+                .unwrap()
+                .mutation
+                .content_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest.title, "queued title");
+        assert_eq!(latest.notes.as_deref(), Some("later note"));
+        fixture.install_publication("p_queue", &scope, &"2".repeat(40), &[], &[latest.clone()]);
+        server.invalidate_catalog_published_content(
+            &bbox_corpus_core::project_catalog::ProjectId::parse("p_queue").unwrap(),
+        );
+        server
+            .session_gap_view(Some("p_queue"), Some("published"))
+            .unwrap();
+        assert_eq!(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_writes()
+                .count(),
+            0
+        );
+        let mut external = latest;
+        external.title = "subsequent published edit".into();
+        fixture.install_publication("p_queue", &scope, &"3".repeat(40), &[], &[external]);
+        server.invalidate_catalog_published_content(
+            &bbox_corpus_core::project_catalog::ProjectId::parse("p_queue").unwrap(),
+        );
+        server
+            .edit_queued_gaps("p_queue", scope, &["gap-1234abcd"], "resolve", |gaps| {
+                assert_eq!(gaps[0].title, "subsequent published edit");
+                gaps[0].resolution = crate::gaps::GapResolution::Addressed;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_queued_gap_edits_keep_every_append_and_refuse_cross_scope_pairs() {
+        use crate::server::state::catalog_fixture::{CatalogFixture, gap_note};
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_queue", &scope);
+        fixture.install_publication(
+            "p_queue",
+            &scope,
+            &"1".repeat(40),
+            &[],
+            &[gap_note("gap-1234abcd", "published title")],
+        );
+        let server = fixture.server();
+        let mut tasks = Vec::new();
+        for i in 0..12 {
+            let server = server.clone();
+            let scope = scope.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                server
+                    .edit_queued_gaps("p_queue", scope, &["gap-1234abcd"], "append", |gaps| {
+                        gaps[0].evidence.push(format!("evidence-{i}"));
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let queue = server.state.checkout_mutations.read();
+        let latest: crate::gaps::GapNote = serde_json::from_str(
+            queue
+                .outstanding_writes()
+                .last()
+                .unwrap()
+                .mutation
+                .content_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        for i in 0..12 {
+            assert!(latest.evidence.contains(&format!("evidence-{i}")));
+        }
+        let count = queue.pending_count();
+        drop(queue);
+        assert!(
+            server
+                .edit_queued_gaps(
+                    "p_queue",
+                    scope,
+                    &["gap-1234abcd", "gap-ffffffff"],
+                    "paired edit",
+                    |gaps| {
+                        gaps[0].title = "must not enqueue".into();
+                        Ok(())
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            server.state.checkout_mutations.read().pending_count(),
+            count
+        );
+    }
 
     #[test]
     fn degraded_carrier_diagnostics_follow_the_requested_scope() {

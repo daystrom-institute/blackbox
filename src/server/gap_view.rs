@@ -1194,6 +1194,35 @@ impl BlackboxServer {
             return cached;
         }
         let snapshot = published_gaps_from_accepted(verified);
+        // A collector ack only proves checkout delivery. Retire queued write
+        // overlays when this accepted publication actually contains them.
+        let mut queue = self.state.checkout_mutations.write();
+        let paths = queue
+            .outstanding_writes()
+            .filter(|row| {
+                row.mutation.scope == snapshot.published_scope
+                    && row.mutation.relative_path.starts_with(".bbox/gaps/")
+            })
+            .map(|row| row.mutation.relative_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+        for path in paths {
+            let id = path
+                .trim_start_matches(".bbox/gaps/")
+                .trim_end_matches(".json");
+            if let Some(entry) = snapshot.gaps.get(id)
+                && let Ok(bytes) = bbox_gaps::gaps::committed_gap_note_bytes(&entry.gap)
+                && let Ok(content) = String::from_utf8(bytes)
+            {
+                changed |=
+                    queue.observe_publication(&snapshot.published_scope, &path, Some(&content));
+            }
+        }
+        drop(queue);
+        if changed {
+            self.state.checkout_mutations_persister.request();
+        }
+
         self.state.catalog_gap_published_cache.write().insert(
             project_id.clone(),
             CatalogPublishedGapCacheEntry {
