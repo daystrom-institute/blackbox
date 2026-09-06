@@ -10,7 +10,6 @@ use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
 use bbox_embed::embed::{Bucket, EmbeddingRouter, VisualRouteMeta, query_cache};
-use bbox_embed::embed_queue;
 use bbox_indexing::index::{GRAPH_VERTEX_DOC_TYPE, HybridBm25Hit, TranscriptIndex};
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_providers::entity_loader;
@@ -26,12 +25,20 @@ const VECTOR_WEIGHT: f32 = 0.6;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HybridSearchParams {
     pub query: String,
+    /// Maximum returned hits. Defaults to 10; clamped to 1..=50.
     #[serde(default)]
     pub limit: Option<u64>,
     #[serde(default)]
     pub doc_type: Option<String>,
+    /// Enable vector retrieval (default true), not raw vector output.
+    /// A zero vector_weight also disables vector retrieval.
     #[serde(default)]
     pub include_vectors: Option<bool>,
+    /// Include ranking scores, fusion contributions, and vector execution
+    /// diagnostics. Default false; evidence identity and degradation are
+    /// always returned. Use bbox_embed_status for fleet-wide indexing health.
+    #[serde(default)]
+    pub debug: bool,
     /// Weight assigned to vector rank lists during RRF fusion.
     /// Defaults to 0.6; 0.0 is BM25-only, 1.0 is vector-only.
     #[serde(default)]
@@ -94,32 +101,82 @@ pub struct HybridSearchParams {
     pub rerank: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct HybridSearchResponse {
+    /// Internal human rendering for typed callers. Never duplicated on the wire.
     pub text: String,
-    /// Response breadcrumbs: the next tools in the locate-information funnel,
-    /// carrying the actual top-seed refs. Mirrors inspect_entity's
-    /// `recommended_next_hops` — injected at the decision point so the agent is
-    /// pulled through discover → inspect → (paths) → bundle rather than
-    /// recalling the opening sequence from memory.
     pub next_steps: Vec<String>,
     pub results: Vec<HybridResult>,
-    /// Vector-lane health. Omitted entirely when no vector partitions were
-    /// searched (the common BM25-only / vectors-disabled path), so a healthy
-    /// response doesn't carry three empty collections.
-    #[serde(skip_serializing_if = "HybridVectorStatus::is_empty")]
+    pub vector_search: VectorSearchStatus,
     pub vector_status: HybridVectorStatus,
-    /// Per-route vector degradation. Omitted entirely when nothing degraded —
-    /// the overwhelmingly common case — so green responses stay terse.
-    #[serde(skip_serializing_if = "HybridDegraded::is_empty")]
     pub degraded: HybridDegraded,
+    pub debug: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorSearchStatus {
+    Disabled,
+    Searched,
+    Unavailable,
+}
+
+impl Serialize for HybridSearchResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Ranking<'a> {
+            score: f32,
+            base_score: f32,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            sources: &'a BTreeMap<String, f32>,
+        }
+        #[derive(Serialize)]
+        struct Hit<'a> {
+            #[serde(flatten)]
+            evidence: &'a HybridResult,
+            #[serde(flatten)]
+            ranking: Option<Ranking<'a>>,
+        }
+        #[derive(Serialize)]
+        struct Response<'a> {
+            results: Vec<Hit<'a>>,
+            next_steps: &'a [String],
+            vector_search: VectorSearchStatus,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            vector_status: Option<&'a HybridVectorStatus>,
+            #[serde(skip_serializing_if = "HybridDegraded::is_empty")]
+            degraded: &'a HybridDegraded,
+        }
+        Response {
+            results: self
+                .results
+                .iter()
+                .map(|hit| Hit {
+                    evidence: hit,
+                    ranking: self.debug.then_some(Ranking {
+                        score: hit.score,
+                        base_score: hit.base_score,
+                        sources: &hit.sources,
+                    }),
+                })
+                .collect(),
+            next_steps: &self.next_steps,
+            vector_search: self.vector_search,
+            vector_status: (self.debug && !self.vector_status.is_empty())
+                .then_some(&self.vector_status),
+            degraded: &self.degraded,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HybridResult {
     pub rank: usize,
     pub entity_id: String,
+    #[serde(skip)]
     pub score: f32,
+    #[serde(skip)]
     pub base_score: f32,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,7 +220,7 @@ pub struct HybridResult {
     /// handle; the logical form resolves through the read plane directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_logical_ref: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(skip)]
     pub sources: BTreeMap<String, f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
@@ -171,8 +228,6 @@ pub struct HybridResult {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HybridVectorStatus {
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub queues: BTreeMap<String, bbox_embed::embed::queue::RouteStatus>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub partitions: BTreeMap<String, PartitionMetrics>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -183,7 +238,7 @@ impl HybridVectorStatus {
     /// True when no vector lane activity is worth surfacing — every sub-field
     /// empty. Gates whether the wrapper is serialized at all.
     pub fn is_empty(&self) -> bool {
-        self.queues.is_empty() && self.partitions.is_empty() && self.searched_partitions.is_empty()
+        self.partitions.is_empty() && self.searched_partitions.is_empty()
     }
 }
 
@@ -275,7 +330,7 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     let limit = p
         .limit
         .unwrap_or(DEFAULT_LIMIT as u64)
-        .min(MAX_LIMIT as u64) as usize;
+        .clamp(1, MAX_LIMIT as u64) as usize;
     // Widened to limit*8 so per-file collapse has enough depth to surface
     // `limit` distinct files even when the top-N is dominated by multiple
     // chunks of the same hot file.
@@ -385,10 +440,9 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     if vectors_requested(p.include_vectors, vector_weight) {
         // Search is a latency-sensitive hot path. Exact embedding coverage
         // walks the complete source corpus and belongs only on the explicit
-        // bbox_embed_status surface. Queue-local status is constant-time, and
-        // nonblocking metrics omit a partition currently held by compaction
+        // bbox_embed_status surface. Nonblocking metrics omit a partition
+        // currently held by compaction
         // instead of stalling the query behind its write lock.
-        vector_status.queues = embed_queue::status_response().routes;
         vector_status.partitions = match vectors::metrics_nonblocking() {
             Some(partitions) => partitions,
             None => {
@@ -580,14 +634,23 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
         result.rank = idx + 1;
     }
 
+    let vector_search = if !vectors_requested(p.include_vectors, vector_weight) {
+        VectorSearchStatus::Disabled
+    } else if vector_status.searched_partitions.is_empty() {
+        VectorSearchStatus::Unavailable
+    } else {
+        VectorSearchStatus::Searched
+    };
     let next_steps = build_next_steps(&results);
     let text = render_text(query, &results, &next_steps, &vector_status, &degraded);
     Ok(HybridSearchResponse {
         text,
         next_steps,
         results,
+        vector_search,
         vector_status,
         degraded,
+        debug: p.debug,
     })
 }
 
@@ -722,23 +785,9 @@ fn build_next_steps(results: &[HybridResult]) -> Vec<String> {
         ];
     }
     let top = &results[0].entity_id;
-    let bundle_refs = results
-        .iter()
-        .take(3)
-        .map(|r| format!("\"{}\"", r.entity_id))
-        .collect::<Vec<_>>()
-        .join(", ");
-    vec![
-        format!(
-            "Confirm the top seed: bbox_inspect_entity(entity_ref=\"{top}\") — properties + targeted edges in one call."
-        ),
-        format!(
-            "Multi-hop question? bbox_find_paths(from=\"{top}\", to_type=<target>), then pass the path_ids onward."
-        ),
-        format!(
-            "Package the answer: bbox_bundle_evidence(question=<q>, entity_refs=[{bundle_refs}])."
-        ),
-    ]
+    vec![format!(
+        "Inspect the top seed with bbox_inspect_entity(entity_ref=\"{top}\"); use bbox_find_paths for multi-hop questions, then bbox_bundle_evidence with selected refs and path_ids."
+    )]
 }
 
 /// Aggregates per-chunk BM25 scores up to per-file scores and returns a
@@ -1410,8 +1459,7 @@ fn render_text(
         }
     }
     out.push_str(&format!(
-        "\nVector status: {} queue route(s), {} partition(s), {} searched\n",
-        vector_status.queues.len(),
+        "\nVector status: {} partition(s), {} searched\n",
         vector_status.partitions.len(),
         vector_status.searched_partitions.len()
     ));
@@ -1422,24 +1470,6 @@ fn render_text(
         }
         for (route, err) in &degraded.skipped_partitions {
             out.push_str(&format!("  - {route}: {err}\n"));
-        }
-    }
-    let unhealthy_routes = vector_status
-        .queues
-        .iter()
-        .filter(|(_, status)| status.health != "ok")
-        .collect::<Vec<_>>();
-    if !unhealthy_routes.is_empty() {
-        out.push_str("Vector route health:\n");
-        for (route, status) in unhealthy_routes {
-            let reason = status.health_reason.as_deref().unwrap_or("unavailable");
-            out.push_str(&format!(
-                "  - {route}: {} ({reason}; queue_depth={}, indexed_count={})\n",
-                status.health, status.queue_depth, status.indexed_count
-            ));
-            if let Some(err) = status.last_error.as_deref() {
-                out.push_str(&format!("    last_error: {}\n", sanitize_status_error(err)));
-            }
         }
     }
     out
@@ -1464,18 +1494,6 @@ fn sanitize_error(err: &anyhow::Error) -> String {
     }
     if value.len() > 200 {
         value.truncate(197);
-        value.push_str("...");
-    }
-    value
-}
-
-fn sanitize_status_error(err: &str) -> String {
-    let mut value = err.to_string();
-    if let Some((first, _)) = value.split_once('\n') {
-        value = first.to_string();
-    }
-    if value.len() > 160 {
-        value.truncate(157);
         value.push_str("...");
     }
     value
@@ -1814,14 +1832,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn healthy_response_omits_empty_status_and_null_fields() {
-        // A green BM25-only result: no vector lane activity, no degradation,
-        // and a result whose optional facets are all absent. None of the
-        // empty containers or null option fields should reach the wire.
-        let response = HybridSearchResponse {
+    fn response_fixture() -> HybridSearchResponse {
+        HybridSearchResponse {
             text: "fixture".into(),
             next_steps: vec![],
+            vector_search: VectorSearchStatus::Disabled,
+            debug: false,
             results: vec![HybridResult {
                 rank: 1,
                 entity_id: "knowledge:a".into(),
@@ -1845,7 +1861,12 @@ mod tests {
             }],
             vector_status: HybridVectorStatus::default(),
             degraded: HybridDegraded::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn healthy_response_omits_empty_status_and_null_fields() {
+        let response = response_fixture();
         let value = serde_json::to_value(&response).unwrap();
         assert!(
             value.get("vector_status").is_none(),
@@ -1856,7 +1877,15 @@ mod tests {
             "empty degraded should be omitted: {value}"
         );
         let first = &value["results"][0];
-        for absent in ["doc_type", "chunk_kind", "role", "sources", "excerpt"] {
+        for absent in [
+            "doc_type",
+            "chunk_kind",
+            "role",
+            "score",
+            "base_score",
+            "sources",
+            "excerpt",
+        ] {
             assert!(
                 first.get(absent).is_none(),
                 "empty/null result field {absent} should be omitted: {first}"
@@ -1865,47 +1894,59 @@ mod tests {
     }
 
     #[test]
-    fn render_text_names_unhealthy_vector_route_reasons() {
-        let mut queues = BTreeMap::new();
-        queues.insert(
-            "code".into(),
-            bbox_embed::embed::queue::RouteStatus {
-                available: false,
-                health: "unavailable".into(),
-                health_reason: Some("queue_full".into()),
-                queue_depth: 10_000,
-                indexed_count: 12,
-                last_error: Some("embedding route queue full: depth=10000".into()),
-                ..bbox_embed::embed::queue::RouteStatus::default()
-            },
+    fn compact_response_preserves_evidence_and_degradation_with_debug_opt_in() {
+        let mut response = response_fixture();
+        let hit = &mut response.results[0];
+        hit.entity_id = "project_graph_vertex:p:records:record-1".into();
+        hit.graph_source = Some("published".into());
+        hit.graph_generation = Some("generation-1".into());
+        hit.graph_logical_ref = Some(hit.entity_id.clone());
+        hit.project_id = Some("p".into());
+        hit.excerpt = Some("The accepted record establishes the requirement.".into());
+        hit.sources.insert("bm25".into(), 0.1);
+        response.next_steps = build_next_steps(&response.results);
+        response.vector_search = VectorSearchStatus::Searched;
+        response
+            .vector_status
+            .searched_partitions
+            .push("text-route".into());
+        response
+            .degraded
+            .vector_errors
+            .insert("code-route".into(), "provider unavailable".into());
+        response.degraded.rerank_unavailable = Some("rerank unavailable; used heuristic".into());
+        let compact = serde_json::to_value(&response).unwrap();
+        assert!(compact.get("text").is_none());
+        assert!(compact.get("vector_status").is_none());
+        assert_eq!(compact["vector_search"], "searched");
+        assert_eq!(compact["results"][0]["graph_generation"], "generation-1");
+        assert_eq!(compact["results"][0]["graph_source"], "published");
+        assert!(compact["results"][0].get("score").is_none());
+        assert!(compact["results"][0].get("sources").is_none());
+        assert_eq!(
+            compact["degraded"]["vector_errors"]["code-route"],
+            "provider unavailable"
         );
-        queues.insert(
-            "notes".into(),
-            bbox_embed::embed::queue::RouteStatus {
-                available: false,
-                health: "unavailable".into(),
-                health_reason: Some("credential_missing".into()),
-                last_error: Some("VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required".into()),
-                ..bbox_embed::embed::queue::RouteStatus::default()
-            },
-        );
-        let vector_status = HybridVectorStatus {
-            queues,
-            partitions: BTreeMap::new(),
-            searched_partitions: Vec::new(),
-        };
+        assert!(compact["degraded"]["rerank_unavailable"].is_string());
 
-        let text = render_text(
-            "fixture",
-            &[],
-            &[],
-            &vector_status,
-            &HybridDegraded::default(),
+        response.debug = true;
+        let mut debug = serde_json::to_value(&response).unwrap();
+        assert!(debug.get("text").is_none());
+        assert!(debug["results"][0]["score"].is_number());
+        assert!(debug["results"][0]["base_score"].is_number());
+        assert!(debug["results"][0]["sources"]["bm25"].is_number());
+        assert_eq!(
+            debug["vector_status"]["searched_partitions"][0],
+            "text-route"
         );
-
-        assert!(text.contains("Vector route health:"));
-        assert!(text.contains("code: unavailable (queue_full; queue_depth=10000"));
-        assert!(text.contains("notes: unavailable (credential_missing;"));
+        // The debug switch cannot alter evidence, order, authority, or failure.
+        debug.as_object_mut().unwrap().remove("vector_status");
+        for hit in debug["results"].as_array_mut().unwrap() {
+            for field in ["score", "base_score", "sources"] {
+                hit.as_object_mut().unwrap().remove(field);
+            }
+        }
+        assert_eq!(compact, debug);
     }
 
     #[test]
@@ -1965,17 +2006,10 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("bbox_inspect_entity(entity_ref=\"knowledge:top\")"))
         );
-        assert!(
-            steps
-                .iter()
-                .any(|s| s.contains("bbox_find_paths(from=\"knowledge:top\""))
-        );
-        // Bundle step lists the top refs for direct paste.
-        assert!(
-            steps
-                .iter()
-                .any(|s| s.contains("\"knowledge:top\", \"thread:abc\""))
-        );
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].contains("bbox_find_paths"));
+        assert!(steps[0].contains("bbox_bundle_evidence"));
+        assert_eq!(steps[0].matches("knowledge:top").count(), 1);
     }
 
     #[test]
@@ -2600,6 +2634,7 @@ mod graph_word_lane_pipeline {
     fn params(query: &str) -> HybridSearchParams {
         HybridSearchParams {
             query: query.to_string(),
+            debug: false,
             limit: Some(10),
             doc_type: None,
             include_vectors: None,
@@ -2613,6 +2648,31 @@ mod graph_word_lane_pipeline {
             rerank_cap: None,
             rerank: Some("none".to_string()),
         }
+    }
+
+    #[test]
+    fn compact_search_debug_keeps_ranking_and_zero_limit_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[
+                vertex_doc(PROJECT, "records", "record-1", "Alpha settlement record"),
+                vertex_doc(PROJECT, "records", "record-2", "Beta settlement record"),
+            ],
+        );
+        let mut request = params("settlement record");
+        request.limit = Some(0);
+        let compact = search(&index, &request, None);
+        assert_eq!(compact.results.len(), 1);
+        request.debug = true;
+        let debug = search(&index, &request, None);
+        assert_eq!(compact.results[0].entity_id, debug.results[0].entity_id);
+        assert_eq!(compact.results[0].score, debug.results[0].score);
+        let wire = serde_json::to_value(&compact).unwrap();
+        assert_eq!(wire["vector_search"], "disabled");
+        assert!(wire.get("text").is_none());
+        assert!(wire["results"][0].get("score").is_none());
+        assert!(serde_json::to_value(&debug).unwrap()["results"][0]["score"].is_number());
     }
 
     /// Exit gate (a): a query naming no ref finds a project-authored record
