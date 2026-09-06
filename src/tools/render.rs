@@ -853,21 +853,6 @@ mod tests {
             "{bootstrap}"
         );
 
-        let smart_read = crate::tools::workspace::impl_work_smart_read(
-            &fixture.server,
-            &crate::tools::workspace::WorkSmartReadParams {
-                file_path: fixture.source_file.to_string_lossy().into_owned(),
-                enrich: Some(true),
-                offset: None,
-                limit: None,
-            },
-        )
-        .unwrap();
-        assert!(smart_read.contains(&fixture.own_ref), "{smart_read}");
-        assert!(smart_read.contains("OWN_REVIEW"), "{smart_read}");
-        assert!(!smart_read.contains(&fixture.peer_ref), "{smart_read}");
-        assert!(!smart_read.contains("PEER_REVIEW"), "{smart_read}");
-
         let published_server = BlackboxServer::new(fixture.state.clone());
         let published = published_server.review_session_knowledge(&list).unwrap();
         assert!(published.contains("[visible]"), "{published}");
@@ -918,16 +903,6 @@ mod tests {
                     project: project.clone(),
                 })
                 .unwrap_err(),
-            crate::tools::workspace::impl_work_smart_read(
-                &fixture.server,
-                &crate::tools::workspace::WorkSmartReadParams {
-                    file_path: fixture.source_file.to_string_lossy().into_owned(),
-                    enrich: Some(true),
-                    offset: None,
-                    limit: None,
-                },
-            )
-            .unwrap_err(),
         ];
         for error in errors {
             assert!(

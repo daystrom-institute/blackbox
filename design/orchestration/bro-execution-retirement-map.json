@@ -7,6 +7,7 @@
   "observed_date": "2026-09-06",
   "scope_note": "Names are exact MCP declarations. Retire removes the full tool; slim requires action/DTO review. Keep is architectural scope, not a passing audit verdict. Host paths and live installation payloads are excluded.",
   "groups": {
+    "corpus_tool_history": {"disposition": "keep", "wave": "S3", "reason": "Retain indexed tool-call history as a corpus read, with bounded candidate pagination."},
     "bro_control": {
       "disposition": "slim",
       "wave": "S1",
@@ -275,4 +276,15 @@
     {"tool": "work_smart_read","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"},
     {"tool": "work_tool_calls","source": "src/tools/workspace.rs","group": "workspace_wrappers","disposition": "retire","wave": "S3"}
   ]
+,
+  "additions": [
+  {
+    "tool": "bbox_tool_calls",
+    "source": "src/tools/tool_calls.rs",
+    "group": "corpus_tool_history",
+    "disposition": "keep",
+    "wave": "S3",
+    "reason": "Preserve indexed tool-call evidence independently of retired workflow-local file and shell execution."
+  }
+]
 }

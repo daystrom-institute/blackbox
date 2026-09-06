@@ -39,6 +39,6 @@ pub mod storage_health;
 pub mod storage_migration;
 pub mod system_events;
 pub mod threads;
+pub mod tool_calls;
 pub mod transcripts;
 pub mod whiteboards;
-pub mod workspace;

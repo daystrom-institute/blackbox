@@ -1293,68 +1293,12 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Use force=true from cleanup hooks (e.g. on_arc_exit) when a failed arc stranded the board mid-phase. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
     },
-    // ── Workspace tools ──────────────────────────────────────────────
     ToolDoc {
-        name: "work_tool_calls",
-        category: ToolCategory::Workspace,
-        summary: "Query indexed workspace tool-call records by server, tool_name, glob_pattern, tool_kind, target, project, and time. Rows preserve (server, tool_name) identity.",
-        when_to_use: "Use to answer recent tool-use questions. Filter by server + tool_name for one tool, or glob_pattern for families like `work_git_*`.",
-        example: Some(
-            r#"work_tool_calls(server="blackbox", tool_kind="bash", project="/repo/x", limit=20)"#,
-        ),
-    },
-    ToolDoc {
-        name: "work_smart_read",
-        category: ToolCategory::Workspace,
-        summary: "Read a file with stable line numbers and optional bounded bbox overlays. Use offset/limit to window large files; set enrich=false for plain reads.",
-        when_to_use: "Use instead of raw Read on registered-project files when line citations or related notes may matter.",
-        example: Some(r#"work_smart_read(file_path="/repo/x/src/main.rs", offset=0, limit=100)"#),
-    },
-    ToolDoc {
-        name: "work_bash",
-        category: ToolCategory::Workspace,
-        summary: "Run a shell command in an explicit cwd with streaming progress chunks, 32KB stdout/stderr final caps, and timeout handling.",
-        when_to_use: "Use instead of raw Bash only when workspace-tools mode is explicitly enabled for the dispatch. `cwd` is required; `task_id` correlates the call to a dispatch task.",
-        example: Some(
-            r#"work_bash(command="cargo test --bin blackboxd", cwd="/repo/x", timeout_secs=120)"#,
-        ),
-    },
-    ToolDoc {
-        name: "work_git_status",
-        category: ToolCategory::Workspace,
-        summary: "Structured git status for a repository: branch, staged/unstaged/untracked files, and clean flag.",
-        when_to_use: "Use before committing or dispatching a writer; the clean flag is easy to gate on.",
-        example: Some(r#"work_git_status(repo="/repo/x")"#),
-    },
-    ToolDoc {
-        name: "work_git_log",
-        category: ToolCategory::Workspace,
-        summary: "Structured git commit log with sha, parents, author, date, and subject. Default limit is 20, max 200.",
-        when_to_use: "Use for branch orientation before edits; JSON output is easier to parse than raw git log.",
-        example: Some(r#"work_git_log(repo="/repo/x", limit=10)"#),
-    },
-    ToolDoc {
-        name: "work_git_diff",
-        category: ToolCategory::Workspace,
-        summary: "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap. Set include_untracked=true to include untracked files as new-file patches.",
-        when_to_use: "Use to review changes before committing or verify that an edit produced the expected delta. Set include_untracked=true during closeout review when new files may not be staged yet.",
-        example: Some(r#"work_git_diff(repo="/repo/x", staged=true, include_untracked=true)"#),
-    },
-    ToolDoc {
-        name: "work_git_show",
-        category: ToolCategory::Workspace,
-        summary: "Show one commit by hex SHA with metadata and diff, capped at 32KB.",
-        when_to_use: "Use to inspect a specific commit returned by `work_git_log`. SHA is validated as hex-only before use to prevent injection.",
-        example: Some(r#"work_git_show(repo="/repo/x", sha="abc123def456")"#),
-    },
-    ToolDoc {
-        name: "work_git_commit",
-        category: ToolCategory::Workspace,
-        summary: "Stage and commit files, rejecting sensitive paths before staging. Omitting files stages tracked modifications only; never pushes.",
-        when_to_use: "Use when an executor needs to commit. Supply `task_id` for a done note; prefer explicit files for scoped changes.",
-        example: Some(
-            r#"work_git_commit(repo="/repo/x", message="fix: correct off-by-one in parser", files=["src/parser.rs"], task_id="task-abc")"#,
-        ),
+        name: "bbox_tool_calls",
+        category: ToolCategory::Transcripts,
+        summary: "Search indexed tool-call history by server, tool name, kind, target, project and time. Returns bounded rows and next_offset; paths in records describe historical calls, not files the caller must open.",
+        when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. No automatic reindex or local file read occurs.",
+        example: Some(r#"bbox_tool_calls(server="blackbox", tool_name="bro_exec", limit=20)"#),
     },
     // ── Roadmap ─────────────────────────────────────────────────────
     ToolDoc {

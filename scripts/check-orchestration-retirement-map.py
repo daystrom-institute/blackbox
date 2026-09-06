@@ -105,12 +105,14 @@ def main():
     mapping = json.loads(
         (root / "design/orchestration/bro-execution-retirement-map.json").read_text()
     )
-    rows = mapping["tools"]
+    baseline_rows = mapping["tools"]
+    additions = mapping.get("additions", [])
+    rows = baseline_rows + additions
     problems = []
     by_name = {row["tool"]: row for row in rows}
     if len(rows) != len(by_name):
         problems.append("duplicate names in retirement map")
-    if len(rows) != mapping["source_declaration_count"]:
+    if len(baseline_rows) != mapping["source_declaration_count"]:
         problems.append("map count does not match declared baseline")
     for row in rows:
         group = mapping["groups"].get(row["group"])
@@ -135,7 +137,7 @@ def main():
     survivors = baseline - retired
     for name in sorted(current - baseline):
         problems.append(f"unmapped tool: {name}")
-    required = baseline if args.mode == "baseline" else survivors
+    required = {row["tool"] for row in baseline_rows} if args.mode == "baseline" else survivors
     for name in sorted(required - current):
         problems.append(f"missing required tool: {name}")
     if args.mode == "target":

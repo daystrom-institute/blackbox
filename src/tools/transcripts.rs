@@ -26,7 +26,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 /// Filter-class boundary for the corpus-search family (`bbox_search`,
-/// `bbox_cite`, `bbox_sessions_list`, `work_tool_calls`): resolve the raw
+/// `bbox_cite`, `bbox_sessions_list`, `bbox_tool_calls`): resolve the raw
 /// selector once here and hand the index engine a typed filter. The
 /// literal travels unchanged so the substring lane keeps its semantics;
 /// the `base_project_id` term lane fires only when the selector resolved
