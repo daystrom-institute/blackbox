@@ -375,9 +375,27 @@ pub(crate) struct BroadcastParams {
 pub(crate) struct StatusParams {
     /// Task ID to check
     pub(crate) task_id: String,
-    /// Number of recent events to include (default: 0)
+    /// Recent event preview count for summary detail (default 0, maximum 50).
+    /// Count and byte omissions are explicit in eventTruncation.
     #[serde(default)]
     pub(crate) tail: Option<usize>,
+    /// summary (default) returns state, activity and blockers without replaying
+    /// the deliverable. result, report, and structured_exit return an exact
+    /// body page. report/structured_exit pages are JSON text: concatenate
+    /// body.text pages before parsing JSON.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Opaque next_cursor from the preceding result/report body page. A changed
+    /// body rejects the cursor so pages from different revisions cannot mix.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Maximum bytes per result/report page: default/max 4096, minimum 4.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Include accounting and execution-owner transcript coordinates. Default
+    /// false. These coordinates are not caller-local filesystem paths.
+    #[serde(default)]
+    pub(crate) debug: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -505,8 +523,13 @@ pub(crate) struct DashboardParams {
     pub(crate) team: Option<String>,
     #[serde(default)]
     pub(crate) status: Option<String>,
+    /// Page size: default 20, maximum 100.
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// Offset into tasks ordered by descending start time, then task ID.
+    /// Tasks can move between pages while the roster changes.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

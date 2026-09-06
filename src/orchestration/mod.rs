@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use crate::managed_worktrees;
@@ -4837,7 +4837,6 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 }
 
 pub fn task_result_json(task: &Task) -> Value {
-    populate_transcript_handle(task);
     let inner = task.inner.lock();
     task_result_json_from_inner(&inner)
 }
@@ -4859,6 +4858,15 @@ pub(crate) fn context_pressure_for_inner(
 }
 
 fn task_result_json_from_inner(inner: &TaskInner) -> Value {
+    task_view_json_from_inner(inner, true, true, false)
+}
+
+fn task_view_json_from_inner(
+    inner: &TaskInner,
+    deliverable: bool,
+    debug: bool,
+    transcript_coordinates: bool,
+) -> Value {
     let mut obj = serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -4867,7 +4875,7 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
         "elapsed": format_elapsed(inner.started_at, inner.completed_at),
     });
 
-    if let Some(ref msg) = inner.last_assistant_message {
+    if deliverable && let Some(ref msg) = inner.last_assistant_message {
         obj["result"] = Value::String(msg.clone());
         // Workflow task results are a serialized WorkflowRunResult; lift the
         // machine-readable exit value out of the escaped envelope so callers
@@ -4880,6 +4888,13 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
         {
             obj["structuredExit"] = exit.clone();
         }
+    }
+    if !deliverable && let Some(message) = inner.last_assistant_message.as_deref() {
+        obj["lastAssistantSnippet"] = json!(message.chars().take(256).collect::<String>());
+        obj["resultBytes"] = json!(message.len());
+        obj["resultHint"] = json!(
+            "Read the deliverable with bro_status(task_id=..., detail=result); follow body.next_cursor for additional pages."
+        );
     }
     if inner.interrupted {
         obj["interrupted"] = Value::Bool(true);
@@ -4895,25 +4910,28 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     // Interrupted cancellations still carry meaningful terminal metadata
     // (partial usage, turn count), so the gate includes them.
     if matches!(inner.status, TaskStatus::Completed | TaskStatus::Failed) || inner.interrupted {
-        if let Some(ref u) = inner.usage {
-            // `input_tokens` is fresh (cache-exclusive). Surface the cache
-            // breakdown only when present so cache-free providers stay terse.
-            let mut usage = serde_json::json!({
-                "input_tokens": u.input_tokens,
-                "output_tokens": u.output_tokens,
-            });
-            if u.cached_input_tokens > 0 || u.cache_creation_input_tokens > 0 {
-                usage["cached_input_tokens"] = Value::from(u.cached_input_tokens);
-                usage["cache_creation_input_tokens"] = Value::from(u.cache_creation_input_tokens);
-                usage["total_input_tokens"] = Value::from(u.total_input_tokens());
+        if debug {
+            if let Some(ref u) = inner.usage {
+                // `input_tokens` is fresh (cache-exclusive). Surface the cache
+                // breakdown only when present so cache-free providers stay terse.
+                let mut usage = serde_json::json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                });
+                if u.cached_input_tokens > 0 || u.cache_creation_input_tokens > 0 {
+                    usage["cached_input_tokens"] = Value::from(u.cached_input_tokens);
+                    usage["cache_creation_input_tokens"] =
+                        Value::from(u.cache_creation_input_tokens);
+                    usage["total_input_tokens"] = Value::from(u.total_input_tokens());
+                }
+                obj["usage"] = usage;
             }
-            obj["usage"] = usage;
-        }
-        if let Some(cost) = inner.cost_usd {
-            obj["costUsd"] = Value::from(cost);
-        }
-        if let Some(turns) = inner.num_turns {
-            obj["numTurns"] = Value::from(turns);
+            if let Some(cost) = inner.cost_usd {
+                obj["costUsd"] = Value::from(cost);
+            }
+            if let Some(turns) = inner.num_turns {
+                obj["numTurns"] = Value::from(turns);
+            }
         }
         if inner.last_assistant_message.is_none() {
             obj["resultCapture"] = serde_json::json!({
@@ -4938,13 +4956,27 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
         obj["agentLabel"] = Value::String(label.clone());
     }
     if let Some(ref report) = inner.report {
-        obj["report"] = report.to_json();
+        obj["report"] = if debug {
+            report.to_json()
+        } else {
+            task_report_summary(
+                &report.message,
+                report.needs.as_deref(),
+                report.data.is_some(),
+                report.reported_at,
+            )
+        };
     }
-    if let Some(ref location) = inner.transcript_location {
-        obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
-    }
-    if let Some(ref cursor) = inner.transcript_cursor {
-        obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
+    if transcript_coordinates {
+        if let Some(ref location) = inner.transcript_location {
+            obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
+            obj["transcriptLocationOwner"] = json!("execution_worker");
+        }
+        if let Some(ref cursor) = inner.transcript_cursor {
+            obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
+        }
+    } else if inner.transcript_location.is_some() {
+        obj["transcriptAvailable"] = json!(true);
     }
     let supervision_now = inner.completed_at.unwrap_or_else(now_ms);
     // Gate the liveness row out of terminal, healthy responses — on a finished
@@ -4983,6 +5015,226 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
         }
     }
     obj
+}
+
+const MCP_TASK_BODY_PAGE_BYTES: usize = 4096;
+const MCP_TASK_EVENTS_BYTES: usize = 8192;
+
+pub(crate) fn task_report_summary(
+    message: &str,
+    needs: Option<&str>,
+    has_data: bool,
+    reported_at: u64,
+) -> Value {
+    let mut out = json!({
+        "message": message.chars().take(512).collect::<String>(),
+        "reportedAt": reported_at,
+    });
+    if let Some(needs) = needs {
+        out["needs"] = json!(needs.chars().take(512).collect::<String>());
+    }
+    if has_data || message.chars().count() > 512 || needs.is_some_and(|s| s.chars().count() > 512) {
+        out["detailsOmitted"] = json!(true);
+        out["detailHint"] = json!(
+            "Read the full report with bro_status(task_id=..., detail=report); follow body.next_cursor."
+        );
+    }
+    out
+}
+
+fn task_body_revision(task_id: &str, detail: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(task_id.as_bytes());
+    hash.update([0]);
+    hash.update(detail.as_bytes());
+    hash.update([0]);
+    hash.update(body.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn task_body_page(
+    task_id: &str,
+    detail: &str,
+    text: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let revision = task_body_revision(task_id, detail, text);
+    let offset = match cursor {
+        None => 0,
+        Some(cursor) => {
+            let (expected, offset) = cursor.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("invalid body cursor; use body.next_cursor from the preceding page")
+            })?;
+            if expected != revision {
+                anyhow::bail!(
+                    "body changed or cursor belongs to another task/detail; restart without cursor"
+                );
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("invalid body cursor offset"))?
+        }
+    };
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        anyhow::bail!("invalid body cursor boundary; restart without cursor");
+    }
+    let limit = limit.clamp(4, MCP_TASK_BODY_PAGE_BYTES);
+    let mut end = offset.saturating_add(limit).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = json!({
+        "text": &text[offset..end],
+        "format": if matches!(detail, "report" | "structured_exit") { "json" } else { "text" },
+        "offset": offset,
+        "total_bytes": text.len(),
+    });
+    if end < text.len() {
+        out["next_cursor"] = json!(format!("{revision}:{end}"));
+    }
+    Ok(out)
+}
+
+/// MCP routine status and explicit exact body pages. The Fleet HTTP/control
+/// snapshot and workflow engine keep their existing full typed contracts.
+pub(crate) fn mcp_task_status_json(
+    task: &Task,
+    detail: &str,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    tail: usize,
+    debug: bool,
+) -> anyhow::Result<Value> {
+    if !matches!(detail, "summary" | "result" | "report" | "structured_exit") {
+        anyhow::bail!("detail must be summary, result, report, or structured_exit");
+    }
+    if detail == "summary" && (cursor.is_some() || limit.is_some()) {
+        anyhow::bail!("cursor and limit require detail=result, report, or structured_exit");
+    }
+    if detail != "summary" && tail > 0 {
+        anyhow::bail!("tail is an event preview for detail=summary; fetch the body separately");
+    }
+    let inner = task.inner.lock();
+    let mut out = task_view_json_from_inner(&inner, false, debug, debug);
+    // Debug diagnostics never reintroduce an unbounded full progress report.
+    if let Some(report) = inner.report.as_ref() {
+        out["report"] = task_report_summary(
+            &report.message,
+            report.needs.as_deref(),
+            report.data.is_some(),
+            report.reported_at,
+        );
+    }
+    out["eventCount"] = json!(observed_event_count(&inner));
+    if detail == "result" {
+        let body = inner
+            .last_assistant_message
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("task has no captured assistant result"))?;
+        out["detail"] = json!(detail);
+        out["body"] = task_body_page(
+            &inner.id,
+            detail,
+            body,
+            cursor,
+            limit.unwrap_or(MCP_TASK_BODY_PAGE_BYTES),
+        )?;
+    } else if detail == "report" {
+        let report = inner
+            .report
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("task has no progress report"))?;
+        // Stable serialized source data, not report.to_json's ticking reportedAgo.
+        let body = serde_json::to_string(report)?;
+        out["detail"] = json!(detail);
+        out["body"] = task_body_page(
+            &inner.id,
+            detail,
+            &body,
+            cursor,
+            limit.unwrap_or(MCP_TASK_BODY_PAGE_BYTES),
+        )?;
+    } else if detail == "structured_exit" {
+        let exit = inner
+            .last_assistant_message
+            .as_deref()
+            .filter(|_| inner.provider == Provider::Workflow)
+            .and_then(|message| serde_json::from_str::<Value>(message).ok())
+            .and_then(|mut value| {
+                value
+                    .as_object_mut()
+                    .and_then(|object| object.remove("structured_exit"))
+            })
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| anyhow::anyhow!("task has no workflow structured exit"))?;
+        let body = serde_json::to_string(&exit)?;
+        out["detail"] = json!(detail);
+        out["body"] = task_body_page(
+            &inner.id,
+            detail,
+            &body,
+            cursor,
+            limit.unwrap_or(MCP_TASK_BODY_PAGE_BYTES),
+        )?;
+    } else if tail > 0 {
+        let mut recent = Vec::new();
+        let mut bytes = 0;
+        for event in inner
+            .events
+            .iter()
+            .rev()
+            .filter_map(compact_status_event)
+            .take(tail.min(50))
+        {
+            let event_bytes = serde_json::to_vec(&event)?.len();
+            if bytes + event_bytes > MCP_TASK_EVENTS_BYTES {
+                break;
+            }
+            bytes += event_bytes;
+            recent.push(event);
+        }
+        if recent.len() < tail.min(inner.events.len()) {
+            out["eventTruncation"] = json!({"requested": tail, "returned": recent.len(), "retained_events": inner.events.len(), "byte_limit": MCP_TASK_EVENTS_BYTES});
+        }
+        recent.reverse();
+        out["recentEvents"] = json!(recent);
+    }
+    Ok(out)
+}
+
+/// Completed waits return the deliverable, with exact continuation for large
+/// bodies. Small structured exits stay inline; large ones have an explicit
+/// JSON body accessor. Internal workflow consumers keep the full exit.
+pub(crate) fn mcp_task_result_json(task: &Task) -> Value {
+    let inner = task.inner.lock();
+    let mut out = task_view_json_from_inner(&inner, true, false, false);
+    if let Some(body) = inner.last_assistant_message.as_deref()
+        && body.len() > MCP_TASK_BODY_PAGE_BYTES
+    {
+        let page = task_body_page(&inner.id, "result", body, None, MCP_TASK_BODY_PAGE_BYTES)
+            .expect("initial page of an existing UTF-8 body is valid");
+        out["result"] = page["text"].clone();
+        out["resultTruncated"] = json!(true);
+        out["resultBytes"] = json!(body.len());
+        out["resultCursor"] = page["next_cursor"].clone();
+        out["resultHint"] = json!(
+            "Continue with bro_status(task_id=..., detail=result, cursor=resultCursor), then follow body.next_cursor; concatenate text exactly."
+        );
+    }
+    if let Some(exit) = out.get("structuredExit") {
+        let bytes = serde_json::to_vec(exit).map(|body| body.len()).unwrap_or(0);
+        if bytes > MCP_TASK_BODY_PAGE_BYTES {
+            out.as_object_mut().unwrap().remove("structuredExit");
+            out["structuredExitOmitted"] = json!(true);
+            out["structuredExitBytes"] = json!(bytes);
+            out["structuredExitHint"] = json!(
+                "Read bro_status(task_id=..., detail=structured_exit); concatenate body.text pages using body.next_cursor, then parse JSON."
+            );
+        }
+    }
+    out
 }
 
 fn populate_transcript_handle(task: &Task) {
@@ -5119,7 +5371,6 @@ fn tail_str_safe(s: &str, max_bytes: usize) -> String {
 }
 
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
-    populate_transcript_handle(task);
     let (mut obj, snapshot, event_count, had_events, compacted_events, stderr_tail) = {
         let inner = task.inner.lock();
         let obj = task_result_json_from_inner(&inner);
@@ -9055,6 +9306,193 @@ mod tests {
         apply_cwd_updates_from_event(&mut inner, &evt);
 
         assert_eq!(inner.cwd.as_deref(), Some("/repo/base"));
+    }
+
+    #[test]
+    fn mcp_task_summary_keeps_blockers_without_replaying_deliverables_or_worker_paths() {
+        let task = task_with(TaskStatus::Completed, "", vec![]);
+        {
+            let mut inner = task.inner.lock();
+            inner.last_assistant_message = Some("completed work ".repeat(5000));
+            inner.cost_usd = Some(0.5);
+            inner.usage = Some(Usage {
+                input_tokens: 500,
+                output_tokens: 100,
+                ..Default::default()
+            });
+            inner.report = Some(BroReport {
+                message: "Awaiting review".into(),
+                needs: Some("Review the migration".into()),
+                data: Some(json!({"trace": "x".repeat(30000)})),
+                reported_at: 123,
+            });
+            inner.transcript_location = harness_transcript_location(
+                Provider::Glm,
+                std::path::Path::new("/worker-only"),
+                "s",
+                None,
+            );
+        }
+        let summary = mcp_task_status_json(&task, "summary", None, None, 0, false).unwrap();
+        assert_eq!(summary["status"], "completed");
+        assert_eq!(summary["hasResult"], true);
+        assert_eq!(summary["report"]["needs"], "Review the migration");
+        assert_eq!(summary["report"]["detailsOmitted"], true);
+        assert!(summary["report"].get("data").is_none());
+        for absent in [
+            "result",
+            "usage",
+            "costUsd",
+            "snapshot",
+            "transcriptLocation",
+            "transcriptCursor",
+        ] {
+            assert!(summary.get(absent).is_none(), "{absent}");
+        }
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 4096);
+        let full = task_result_json_from_inner(&task.inner.lock());
+        assert!(full.get("transcriptLocation").is_none());
+        assert!(full.get("transcriptCursor").is_none());
+        assert_eq!(full["transcriptAvailable"], true);
+        let debug = mcp_task_status_json(&task, "summary", None, None, 0, true).unwrap();
+        assert!(debug["usage"].is_object());
+        assert_eq!(debug["transcriptLocationOwner"], "execution_worker");
+        assert!(debug["report"].get("data").is_none());
+    }
+
+    #[test]
+    fn mcp_task_result_pages_reassemble_unicode_and_reject_changed_bodies() {
+        let text = "🦀 café\n\"quoted\"".repeat(12);
+        let task = task_with(TaskStatus::Completed, "", vec![]);
+        task.inner.lock().last_assistant_message = Some(text.clone());
+        let mut cursor: Option<String> = None;
+        let mut result = String::new();
+        loop {
+            let page = mcp_task_status_json(&task, "result", cursor.as_deref(), Some(7), 0, false)
+                .unwrap();
+            let chunk = page["body"]["text"].as_str().unwrap();
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= 7);
+            result.push_str(chunk);
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(result, text);
+        let first = mcp_task_status_json(&task, "result", None, Some(7), 0, false).unwrap();
+        let cursor = first["body"]["next_cursor"].as_str().unwrap();
+        task.inner.lock().last_assistant_message = Some("changed".into());
+        assert!(
+            mcp_task_status_json(&task, "result", Some(cursor), Some(7), 0, false)
+                .unwrap_err()
+                .to_string()
+                .contains("body changed")
+        );
+    }
+
+    #[test]
+    fn mcp_wait_continues_exactly_and_preserves_workflow_structured_exit() {
+        let task = task_with(TaskStatus::Completed, "", vec![]);
+        let original = "text 🦀\n".repeat(1400);
+        task.inner.lock().last_assistant_message = Some(original.clone());
+        let wait = mcp_task_result_json(&task);
+        assert_eq!(wait["resultTruncated"], true);
+        let mut assembled = wait["result"].as_str().unwrap().to_string();
+        let mut cursor = wait["resultCursor"].as_str().map(str::to_string);
+        while let Some(next) = cursor {
+            let page = mcp_task_status_json(&task, "result", Some(&next), None, 0, false).unwrap();
+            assembled.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+        }
+        assert_eq!(assembled, original);
+        assert_eq!(
+            task_result_json_from_inner(&task.inner.lock())["result"],
+            original
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.provider = Provider::Workflow;
+            inner.last_assistant_message = Some(
+                json!({"structured_exit": {"ready": true}, "trace": "x".repeat(10000)}).to_string(),
+            );
+        }
+        assert_eq!(
+            mcp_task_result_json(&task)["structuredExit"],
+            json!({"ready": true})
+        );
+        assert_eq!(
+            task_result_json_from_inner(&task.inner.lock())["structuredExit"],
+            json!({"ready": true})
+        );
+    }
+
+    #[test]
+    fn mcp_large_structured_exit_has_exact_continuation_without_changing_workflow_exports() {
+        let task = task_with(TaskStatus::Completed, "", vec![]);
+        let exit = json!({"evidence": "語".repeat(5000), "ready": true});
+        {
+            let mut inner = task.inner.lock();
+            inner.provider = Provider::Workflow;
+            inner.last_assistant_message = Some(json!({"structured_exit": exit}).to_string());
+        }
+        let wait = mcp_task_result_json(&task);
+        assert!(wait.get("structuredExit").is_none());
+        assert_eq!(wait["structuredExitOmitted"], true);
+        assert!(
+            wait["structuredExitHint"]
+                .as_str()
+                .unwrap()
+                .contains("structured_exit")
+        );
+        let mut body = String::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let response =
+                mcp_task_status_json(&task, "structured_exit", cursor.as_deref(), None, 0, false)
+                    .unwrap();
+            assert_eq!(response["body"]["format"], "json");
+            body.push_str(response["body"]["text"].as_str().unwrap());
+            cursor = response["body"]["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), exit);
+        assert_eq!(
+            task_result_json_from_inner(&task.inner.lock())["structuredExit"],
+            exit
+        );
+    }
+
+    #[test]
+    fn mcp_report_pages_keep_complete_data_and_stable_revision() {
+        let task = task_with(TaskStatus::Running, "", vec![]);
+        task.inner.lock().report = Some(BroReport {
+            message: "Progress".into(),
+            needs: Some("Review".into()),
+            data: Some(json!({"payload": "é".repeat(9000)})),
+            reported_at: 1,
+        });
+        let mut cursor: Option<String> = None;
+        let mut full = String::new();
+        loop {
+            let response =
+                mcp_task_status_json(&task, "report", cursor.as_deref(), None, 0, false).unwrap();
+            assert_eq!(response["body"]["format"], "json");
+            full.push_str(response["body"]["text"].as_str().unwrap());
+            cursor = response["body"]["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let report: Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(report["data"]["payload"], "é".repeat(9000));
+        assert_eq!(report["reportedAt"], 1);
+        assert!(report.get("reportedAgo").is_none());
+        assert!(mcp_task_status_json(&task, "summary", Some("bad"), None, 0, false).is_err());
+        assert!(mcp_task_status_json(&task, "unknown", None, None, 0, false).is_err());
+        assert!(mcp_task_status_json(&task, "report", None, None, 1, false).is_err());
     }
 
     #[test]

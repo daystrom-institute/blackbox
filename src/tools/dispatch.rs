@@ -1088,7 +1088,7 @@ impl BlackboxServer {
             h.abort();
         }
         let result = if completed {
-            orch::task_result_json(&task)
+            orch::mcp_task_result_json(&task)
         } else {
             orch::timeout_snapshot_json(&task)
         };
@@ -1097,8 +1097,16 @@ impl BlackboxServer {
             orchestration::team::find_bro_ref_for_task(&p.task_id, &self.state.store_dir)
         {
             out["bro"] = Value::String(team_ref.member_name.clone());
+            // Advisor checkpoints consume complete internal deliverables.
+            // Only the MCP-facing copy is paged.
+            let mut advisor_result = if completed {
+                orch::task_result_json(&task)
+            } else {
+                out.clone()
+            };
+            advisor_result["bro"] = json!(team_ref.member_name);
             match self
-                .maybe_resume_team_advisor(&team_ref.team_name, "wait", &[out.clone()])
+                .maybe_resume_team_advisor(&team_ref.team_name, "wait", &[advisor_result])
                 .await
             {
                 Ok(Some(value)) => out["advisor"] = value,
@@ -1156,7 +1164,7 @@ impl BlackboxServer {
                         orchestration::team::find_bro_name_for_task(&inner.id, &sd)
                     };
                     let mut r = if completed {
-                        orch::task_result_json(&task)
+                        orch::mcp_task_result_json(&task)
                     } else {
                         orch::timeout_snapshot_json(&task)
                     };
@@ -1175,7 +1183,21 @@ impl BlackboxServer {
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
         let advisor = match p.team.as_deref() {
             Some(team_name) => {
-                self.maybe_resume_team_advisor(team_name, "when_all", &results)
+                let advisor_results: Vec<Value> = tasks
+                    .iter()
+                    .zip(&results)
+                    .map(|(task, result)| {
+                        if result.get("timed_out").is_some() {
+                            return result.clone();
+                        }
+                        let mut full = orch::task_result_json(task);
+                        if let Some(bro) = result.get("bro") {
+                            full["bro"] = bro.clone();
+                        }
+                        full
+                    })
+                    .collect();
+                self.maybe_resume_team_advisor(team_name, "when_all", &advisor_results)
                     .await
             }
             None => Ok(None),
@@ -1261,7 +1283,7 @@ impl BlackboxServer {
             drop(inner);
 
             let mut r = if task.inner.lock().status.is_terminal() {
-                orch::task_result_json(task)
+                orch::mcp_task_result_json(task)
             } else {
                 orch::timeout_snapshot_json(task)
             };
@@ -1581,7 +1603,17 @@ impl BlackboxServer {
     )]
     pub(crate) fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
-            Some(task) => Self::ok_json(&orch::task_status_json(&task, p.tail.unwrap_or(0))),
+            Some(task) => match orch::mcp_task_status_json(
+                &task,
+                p.detail.as_deref().unwrap_or("summary"),
+                p.cursor.as_deref(),
+                p.limit,
+                p.tail.unwrap_or(0),
+                p.debug,
+            ) {
+                Ok(value) => Self::ok_json(&value),
+                Err(error) => Self::err_text(&error.to_string()),
+            },
             None => Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         }
     }
