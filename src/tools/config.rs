@@ -44,7 +44,38 @@ impl BlackboxServer {
                     }
                 }
             }
-            orchestration::mcp::handle(&p)
+            orchestration::mcp::handle(&p).and_then(|reply| page_mcp_reply(reply, &p))
         })
+    }
+}
+
+/// Render a `bro_mcp` reply as the complete serialized tool response. Body
+/// replies wrap the exact redacted value in bounded JSON body pages whose
+/// cursors bind the selection and content, so a single huge accepted record
+/// (env/header-key inventory, exclude list, long name) recovers exactly
+/// without exceeding the transport cap.
+pub(crate) fn page_mcp_reply(
+    reply: orchestration::mcp::McpToolReply,
+    p: &orchestration::mcp::McpToolParams,
+) -> anyhow::Result<String> {
+    use orchestration::mcp::McpToolReply;
+    match reply {
+        McpToolReply::Text(text) => Ok(text),
+        McpToolReply::Body {
+            scope,
+            selection,
+            value,
+        } => {
+            let body = super::body_page::json_body_page(
+                &selection,
+                &value,
+                p.cursor.as_deref(),
+                p.body_limit,
+            )?;
+            Ok(serde_json::to_string(&serde_json::json!({
+                "scope": scope,
+                "body": body,
+            }))?)
+        }
     }
 }
