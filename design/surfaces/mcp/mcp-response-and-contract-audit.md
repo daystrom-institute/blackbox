@@ -653,3 +653,51 @@ stored-property continuation, not recovery of text already shortened during
 indexing; that distinction is under further scrutiny. No live Slack message
 was sent for these probes. Configuration and whiteboard confidentiality
 checks used synthetic fixtures rather than exposing live private values.
+
+
+### Deployed proposal and catalog milestone, 2026-09-06 UTC
+
+Image `a85fc06768aa`, digest
+`34a5913a5196d0195410f5c7110c2ffa0d19eb6efe6d51a826ad112215c2052f`,
+passed build `build-bbox-image-g7j4c`. Verification `bbox-verify-bvt7h`
+passed 7481 tests (21 skipped), Clippy, and concurrency lint on `1b56fe5b`.
+That verification revision only updates the ownership audit's function name
+and classification for response-only attachment coordinates after helper
+extraction. The initial full run caught the stale audit entry; no gate was
+waived. Converge updated both runtime Deployments, which became ready with
+zero restarts.
+
+The deployed proposal API and shipped workflow consumers were upgraded together:
+`hook-route/proposal-page` v1, `badgey-slack-emit-proposal-arc` v2, then
+`badgey-triage-channel-arc` v3. Each install was preceded by discovery; installed
+runtime and artifact versions were checked afterward. The arc runtime was quiet
+and no Slack post was triggered. There were no installed Badgey instances to
+exercise a real draft: large draft reconstruction and workflow pagination were
+verified with synthetic adapter/workflow fixtures.
+
+Live catalog summary and alias reads succeeded (789 and 708 bytes for the
+source-only native history project). Full arc JSON reconstructed across five
+8-byte pages. The three trigger install schemas now expose required nested
+spec contracts. A synthetic invalid timezone was rejected by the live cron
+install endpoint, and exact cron discovery remained empty before and after.
+These probes validate error admission without installing or running a timer.
+
+### Further source scrutiny
+
+Embedding status repeated provider configuration, null values, zero counters,
+and coverage advice across nine routes (7554 bytes live). Its summary now keeps
+health, queue depth, actionable failures, nonzero loss/cap counters, and one
+coverage note; `debug=true` restores configuration diagnostics without enabling
+expensive scans. Queue success counts now say `session_indexed_count` rather
+than appearing to measure corpus totals after restart. Exact coverage retains
+separate source/indexed counts. Poller summaries distinguish requested cadence
+from the effective interval captured when the loop starts; cron diagnostics
+report the effective timezone and identify legacy unsupported settings.
+
+Commit inspection now returns stored indexed content, so ordinary smart
+projection marks shortening and exact property pages can recover beyond the
+old intrinsic 300-character preview. Upstream ingestion loss remains explicit;
+other provider preview fields cannot reconstruct content they never retained.
+Team discovery moves full charters and templates behind exact JSON body pages,
+uses bounded summary pages, and reports malformed store records visibly.
+These follow-up source changes require their own gates and deployed probes.

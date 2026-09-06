@@ -67,3 +67,19 @@ Re-run the declaration scan after changing the router. Review changed parameter
 schemas and handler projections with their domain DTOs; the same persistence
 type can serve multiple adapters and need different projections. The inventory
 intentionally stores no live response bodies or installation-specific objects.
+
+
+## Verification checkpoints
+
+The original inventory above is a triage snapshot, not an exhaustive execution
+claim. The response audit records subsequent deployed milestones, exact
+verification revisions, and measured complete result sizes. Live checks cover
+provider/brofile discovery, a synthetic Astra dispatch and result continuation,
+retrieval/gaps, native transcript backfill and drill-down, atom pagination,
+agent/workflow/trigger catalogs, event/health/doctor summaries, graph stored
+property pages and bundles, project catalog detail selection, arc JSON pages,
+and invalid cron admission. Synthetic tests cover confidentiality, oversized
+continuation, schema contracts, scope refusal, and partial mutation outcomes.
+Proposal dependency installation changed live artifact/runtime state, but no
+Slack post was sent. Remaining host permission and upstream-content limitations
+are stated separately from verified tool behavior.
