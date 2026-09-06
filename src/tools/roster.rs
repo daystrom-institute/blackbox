@@ -558,9 +558,23 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_team",
-        description = "Manage teamplates and instantiated teams."
+        description = "Manage teamplates and teams. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
     )]
     pub(crate) async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
+        if let Err(error) = validate_team_params(&p) {
+            return Self::err_text(&error.to_string());
+        }
+        if matches!(
+            p.action.as_str(),
+            "list" | "list_templates" | "roster" | "get" | "get_template"
+        ) {
+            let server = self.clone();
+            return Self::run_blocking_with_structured("bro_team", move || {
+                let value = team_discovery(&server, &p)?;
+                Ok((serde_json::to_string(&value)?, value))
+            })
+            .await;
+        }
         use orchestration::team;
         let store_dir = &self.state.store_dir;
         let scope = p.scope.as_deref().unwrap_or("global");
@@ -617,10 +631,6 @@ impl BlackboxServer {
                     return Self::err_text(&format!("Teamplate was not saved: {error}"));
                 }
                 Self::ok_json(&json!({"saved": name, "scope": scope}))
-            }
-            "list_templates" => {
-                let list = team::list_teamplates(scope, store_dir, p.project_dir.as_deref());
-                Self::ok_json(&serde_json::to_value(&list).unwrap_or_default())
             }
             "delete_template" => {
                 let name = match &p.name {
@@ -711,29 +721,6 @@ impl BlackboxServer {
                     })),
                 }))
             }
-            "list" => {
-                let teams = team::load_all_teams(store_dir);
-                let list: Vec<Value> = teams
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "teamplate": t.teamplate,
-                            "memberCount": t.members.len(),
-                            "createdAt": t.created_at,
-                            "projectDir": t.project_dir,
-                            "advisor": t.advisor.as_ref().map(|a| json!({
-                                "name": a.name,
-                                "brofile": a.config.brofile,
-                                "sessionId": a.session_id,
-                                "packetId": a.config.packet_id,
-                                "mode": a.config.mode.as_ref(),
-                            })),
-                        })
-                    })
-                    .collect();
-                Self::ok_json(&json!(list))
-            }
             "dissolve" => {
                 let name = match &p.name {
                     Some(n) => n,
@@ -759,66 +746,6 @@ impl BlackboxServer {
                 }
                 team::remove_team(name, store_dir);
                 Self::ok_json(&json!({"dissolved": name}))
-            }
-            "roster" => {
-                let name = match &p.name {
-                    Some(n) => n,
-                    None => return Self::err_text("name is required"),
-                };
-                let loaded_team = match team::load_team(name, store_dir) {
-                    Some(t) => t,
-                    None => return Self::err_text(&format!("Unknown team: {name}")),
-                };
-                let task_store = self.state.task_store.read();
-                let roster: Vec<Value> = loaded_team
-                    .members
-                    .iter()
-                    .map(|m| {
-                        let account = orchestration::brofile::resolve_brofile(
-                            &m.brofile,
-                            store_dir,
-                            loaded_team.project_dir.as_deref(),
-                        )
-                        .and_then(|bf| {
-                            orchestration::brofile::effective_account(
-                                bf.provider,
-                                bf.account.as_deref(),
-                                store_dir,
-                            )
-                        });
-                        let latest_tid = m.task_history.last();
-                        let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
-                        let inner = t.inner.lock();
-                        json!({
-                            "taskId": inner.id,
-                            "status": inner.status,
-                            "elapsed": orch::format_elapsed(inner.started_at, inner.completed_at),
-                        })
-                    });
-                        json!({
-                            "name": m.name,
-                            "brofile": m.brofile,
-                            "account": account,
-                            "sessionId": m.session_id,
-                            "taskCount": m.task_history.len(),
-                            "latestTask": latest,
-                        })
-                    })
-                    .collect();
-                Self::ok_json(&json!({
-                    "team": name,
-                    "teamplate": loaded_team.teamplate,
-                    "advisor": loaded_team.advisor.as_ref().map(|a| json!({
-                        "name": a.name,
-                        "brofile": a.config.brofile,
-                        "sessionId": a.session_id,
-                        "taskCount": a.task_history.len(),
-                        "packetId": a.config.packet_id,
-                        "mode": a.config.mode.as_ref(),
-                        "charter": a.config.charter,
-                    })),
-                    "members": roster
-                }))
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
@@ -1484,6 +1411,223 @@ Next step: <one concrete steering suggestion>\n"
     }
 }
 
+/// Validate action-specific selectors before any store access. A missing
+/// project selector must never become the daemon's current directory.
+fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
+    let template_action = matches!(
+        p.action.as_str(),
+        "save_template" | "list_templates" | "get_template" | "delete_template"
+    );
+    let list = matches!(p.action.as_str(), "list" | "list_templates" | "roster");
+    let exact = matches!(p.action.as_str(), "get" | "get_template");
+    if !list && (p.limit.is_some() || p.offset.is_some()) {
+        anyhow::bail!("limit and offset require list, list_templates, or roster");
+    }
+    if !exact && (p.cursor.is_some() || p.body_limit.is_some()) {
+        anyhow::bail!("cursor and body_limit require get or get_template");
+    }
+    if template_action {
+        match p.scope.as_deref().unwrap_or("global") {
+            "global" if p.project_dir.is_some() => {
+                anyhow::bail!("project_dir requires scope=project for template actions")
+            }
+            "global" => {}
+            "project" => {
+                let path = p.project_dir.as_deref().ok_or_else(|| anyhow::anyhow!("project_dir is required for scope=project; no daemon current-directory fallback"))?;
+                anyhow::ensure!(
+                    Path::new(path).is_absolute(),
+                    "project template directory must be absolute"
+                );
+            }
+            _ => anyhow::bail!("scope must be global or project"),
+        }
+    } else if p.scope.is_some() {
+        anyhow::bail!(
+            "scope applies only to template actions; use project_dir to filter live teams"
+        );
+    }
+    if matches!(p.action.as_str(), "get" | "get_template" | "roster") && p.name.is_none() {
+        anyhow::bail!("name is required");
+    }
+    if let Some(name) = p.name.as_deref().filter(|_| list || exact) {
+        anyhow::ensure!(
+            !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0']),
+            "name must be an exact stored team/template name, not a path"
+        );
+    }
+    if (list || exact)
+        && (p.members.is_some()
+            || p.template.is_some()
+            || p.cancel_running.is_some()
+            || p.advisor.is_some())
+    {
+        anyhow::bail!(
+            "members, template, cancel_running, and advisor are mutation parameters, not discovery filters"
+        );
+    }
+    Ok(())
+}
+
+fn team_advisor_summary(advisor: &orchestration::team::TeamAdvisor) -> Value {
+    let mut row = json!({"name": advisor.name, "brofile": advisor.config.brofile, "mode": advisor.config.mode});
+    if let Some(session) = &advisor.session_id {
+        row["sessionId"] = json!(session);
+    }
+    if let Some(packet) = &advisor.config.packet_id {
+        row["packetId"] = json!(packet);
+    }
+    if !advisor.task_history.is_empty() {
+        row["taskCount"] = json!(advisor.task_history.len());
+    }
+    row
+}
+
+fn team_template_summary(template: &orchestration::team::Teamplate) -> Value {
+    let brofiles = template
+        .members
+        .iter()
+        .map(|member| member.brofile.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut row = json!({"name": template.name, "slotCount": template.members.len(),
+        "memberCount": template.members.iter().map(|member| u64::from(member.count.max(1))).sum::<u64>(),
+        "brofiles": brofiles.iter().take(3).collect::<Vec<_>>(),
+    });
+    if brofiles.len() > 3 {
+        row["omittedBrofileCount"] = json!(brofiles.len() - 3);
+    }
+    if let Some(floor) = template.diversity_floor {
+        row["diversityFloor"] = json!(floor);
+    }
+    if let Some(advisor) = &template.advisor {
+        row["advisor"] = json!({"name": advisor.display_name(), "brofile": advisor.brofile, "mode": advisor.mode});
+    }
+    row
+}
+
+fn team_summary_page(
+    rows: Vec<Value>,
+    field: &str,
+    p: &TeamParams,
+    mut metadata: Value,
+) -> anyhow::Result<Value> {
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    metadata["total"] = json!(rows.len());
+    metadata["offset"] = json!(offset);
+    metadata["limit"] = json!(limit);
+    let selected = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    metadata["count"] = json!(selected.len());
+    metadata[field] = json!(selected);
+    bbox_corpus_core::response_page::bound_page(metadata, field)
+}
+
+fn team_discovery(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<Value> {
+    use orchestration::team;
+    let store = &server.state.store_dir;
+    if matches!(p.action.as_str(), "list_templates" | "get_template") {
+        let scope = p.scope.as_deref().unwrap_or("global");
+        if scope == "project" && !server.state.project_authority.is_bridge() {
+            anyhow::bail!(
+                "error.team_template_locality_required: project .bro/teamplates have no remote discovery lane; inspect them with the checkout owner's file tools, or list daemon-owned templates with scope=global and no project_dir. Passing a caller path cannot grant daemon checkout access"
+            );
+        }
+        if p.action == "get_template" {
+            let name = p.name.as_deref().expect("validated template name");
+            let template =
+                team::get_teamplate_checked(name, scope, store, p.project_dir.as_deref())?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Teamplate not found; use list_templates in the same scope")
+                    })?;
+            let selection = json!(["teamplate", scope, p.project_dir, template.name]).to_string();
+            return Ok(json!({"name":template.name, "scope":scope,
+                "body":super::body_page::json_body_page(&selection, &serde_json::to_value(&template)?, p.cursor.as_deref(), p.body_limit)?}));
+        }
+        let mut templates = if let Some(name) = p.name.as_deref() {
+            team::get_teamplate_checked(name, scope, store, p.project_dir.as_deref())?
+                .into_iter()
+                .collect()
+        } else {
+            team::list_teamplates_checked(scope, store, p.project_dir.as_deref())?
+        };
+        templates.sort_by(|a, b| a.name.cmp(&b.name));
+        return team_summary_page(
+            templates.iter().map(team_template_summary).collect(),
+            "templates",
+            p,
+            json!({"scope":scope, "detail_hint":"bro_team(action=get_template, name=<name>, same scope/project_dir); follow body.next_cursor"}),
+        );
+    }
+    if p.action == "list" {
+        let mut teams = if let Some(name) = p.name.as_deref() {
+            team::load_team_checked(name, store)?.into_iter().collect()
+        } else {
+            team::load_all_teams_checked(store)?
+        };
+        teams.retain(|row| {
+            p.name.as_deref().is_none_or(|name| row.name == name)
+                && p.project_dir
+                    .as_deref()
+                    .is_none_or(|project| row.project_dir.as_deref() == Some(project))
+        });
+        teams.sort_by(|a, b| a.name.cmp(&b.name));
+        let rows = teams.iter().map(|team| {
+            let mut row = json!({"name":team.name, "teamplate":team.teamplate, "memberCount":team.members.len(), "createdAt":team.created_at});
+            if let Some(project) = &team.project_dir { row["projectDir"] = json!(project); }
+            if let Some(advisor) = &team.advisor { row["advisor"] = team_advisor_summary(advisor); }
+            row
+        }).collect();
+        return team_summary_page(
+            rows,
+            "teams",
+            p,
+            json!({"detail_hint":"bro_team(action=roster, name=<name>) for members; action=get for exact JSON body pages. projectDir is a stored association, not a filesystem read handle."}),
+        );
+    }
+    let name = p.name.as_deref().expect("validated exact team selector");
+    let team = team::load_team_checked(name, store)?
+        .ok_or_else(|| anyhow::anyhow!("Team not found; use bro_team(action=list)"))?;
+    anyhow::ensure!(
+        p.project_dir
+            .as_deref()
+            .is_none_or(|project| team.project_dir.as_deref() == Some(project)),
+        "team does not match the exact project_dir filter"
+    );
+    if p.action == "get" {
+        let selection = json!(["team", name, p.project_dir]).to_string();
+        return Ok(
+            json!({"name":name, "body":super::body_page::json_body_page(&selection, &serde_json::to_value(&team)?, p.cursor.as_deref(), p.body_limit)?}),
+        );
+    }
+    let task_store = server.state.task_store.read();
+    let mut members = team.members.iter().collect::<Vec<_>>();
+    members.sort_by(|a, b| (&a.name, &a.brofile).cmp(&(&b.name, &b.brofile)));
+    let rows = members.into_iter().map(|member| {
+        let mut row = json!({"name":member.name, "brofile":member.brofile, "taskCount":member.task_history.len()});
+        if let Some(session) = &member.session_id { row["sessionId"] = json!(session); }
+        if let Some(id) = member.task_history.last() {
+            if let Some(task) = task_store.get(id) {
+                let inner = task.inner.lock();
+                row["latestTask"] = json!({"taskId":inner.id, "status":inner.status, "provider":inner.provider,
+                    "elapsed":orch::format_elapsed(inner.started_at, inner.completed_at)});
+            } else {
+                row["latestTask"] = json!({"taskId":id, "statusUnavailable":true});
+            }
+        }
+        row
+    }).collect();
+    drop(task_store);
+    let mut metadata = json!({"team":name, "teamplate":team.teamplate,
+        "detail_hint":"bro_team(action=get, name=<team>) for stored advisor configuration and task history; follow body.next_cursor. Brofile configuration expands through bro_brofile(action=get, name=<brofile>)."});
+    if let Some(advisor) = &team.advisor {
+        metadata["advisor"] = team_advisor_summary(advisor);
+    }
+    team_summary_page(rows, "members", p, metadata)
+}
+
 /// Pick the `broLabel` value the legacy `bro_dashboard` row
 /// surfaced. `RosterSummaryV1.label` collapses `bro_label` and
 /// `agent_label` (one or the other) — but the dashboard
@@ -1521,6 +1665,240 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    fn team_params(value: Value) -> TeamParams {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn fixture_team(name: &str, project: &str) -> orchestration::team::Team {
+        orchestration::team::Team {
+            name: name.into(),
+            teamplate: "panel".into(),
+            project_dir: Some(project.into()),
+            created_at: 1,
+            members: vec![],
+            advisor: None,
+            diversity_floor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn team_discovery_filters_and_pages_without_expanding_stored_brofiles() {
+        use orchestration::team::{self, TeamMember};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let nonexistent = root.join("not-a-checkout").to_string_lossy().into_owned();
+        for n in (0..105).rev() {
+            let team = fixture_team(
+                &format!("team-{n:03}"),
+                if n == 104 {
+                    "other-project"
+                } else {
+                    &nonexistent
+                },
+            );
+            team::save_team(&team, &server.state.store_dir);
+        }
+        let result = server
+            .bro_team(Parameters(team_params(
+                json!({"action":"list", "project_dir":nonexistent}),
+            )))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let page: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(result.structured_content.as_ref(), Some(&page));
+        assert_eq!(page["total"], 104);
+        assert_eq!(page["count"], 20);
+        assert_eq!(page["teams"][0]["name"], "team-000");
+        assert_eq!(page["next_offset"], 20);
+        let mut params = team_params(
+            json!({"action":"list", "project_dir":nonexistent, "offset":100, "limit":1000}),
+        );
+        let tail = team_discovery(&server, &params).unwrap();
+        assert_eq!(tail["limit"], 100);
+        assert_eq!(tail["count"], 4);
+        assert!(tail["next_offset"].is_null());
+        params.name = Some("team-103".into());
+        params.offset = None;
+        params.limit = Some(0);
+        let exact = team_discovery(&server, &params).unwrap();
+        assert_eq!(exact["total"], 1);
+        assert_eq!(exact["limit"], 1);
+
+        let mut team = fixture_team("members", &nonexistent);
+        team.members = (0..105)
+            .rev()
+            .map(|n| TeamMember {
+                name: format!("member-{n:03}"),
+                brofile: "uninstalled-brofile".into(),
+                session_id: None,
+                task_history: vec![format!("old-task-{n}")],
+            })
+            .collect();
+        team::save_team(&team, &server.state.store_dir);
+        let roster = team_discovery(
+            &server,
+            &team_params(json!({"action":"roster","name":"members"})),
+        )
+        .unwrap();
+        assert_eq!(roster["count"], 20);
+        assert_eq!(roster["members"][0]["name"], "member-000");
+        assert_eq!(roster["members"][0]["latestTask"]["taskId"], "old-task-0");
+        assert_eq!(
+            roster["members"][0]["latestTask"]["statusUnavailable"],
+            true
+        );
+        assert!(roster["members"][0].get("account").is_none());
+        assert!(!Path::new(&nonexistent).exists());
+    }
+
+    #[test]
+    fn team_exact_body_recovers_oversized_advisor_configuration_and_rejects_stale_cursor() {
+        use orchestration::team::{
+            self, TeamAdvisor, TeamAdvisorConfig, Teamplate, TeamplateMember,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let advisor = TeamAdvisorConfig {
+            brofile: "advisor".into(),
+            alias: None,
+            charter: "effective-charter-界".repeat(1000),
+            context: Some("retained-context".repeat(1000)),
+            halt_conditions: vec!["halt".repeat(1000)],
+            exit_conditions: vec![],
+            packet_id: None,
+            timeout_seconds: None,
+            mode: Default::default(),
+        };
+        let mut template = Teamplate {
+            name: "large".into(),
+            members: vec![TeamplateMember {
+                brofile: "reviewer".into(),
+                alias: None,
+                count: 0,
+            }],
+            advisor: Some(advisor.clone()),
+            diversity_floor: Some(2),
+        };
+        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
+        let summary =
+            team_discovery(&server, &team_params(json!({"action":"list_templates"}))).unwrap();
+        assert_eq!(summary["templates"][0]["memberCount"], 1);
+        assert_eq!(summary["templates"][0]["diversityFloor"], 2);
+        assert!(!summary.to_string().contains("effective-charter"));
+        assert!(!summary.to_string().contains("retained-context"));
+        let mut params = team_params(json!({"action":"get_template","name":"large"}));
+        let first = team_discovery(&server, &params).unwrap();
+        let original_cursor = first["body"]["next_cursor"].as_str().unwrap().to_owned();
+        let mut text = String::new();
+        loop {
+            let page = team_discovery(&server, &params).unwrap();
+            assert!(serde_json::to_vec(&page["body"]).unwrap().len() <= 4096);
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            params.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if params.cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            serde_json::to_value(&template).unwrap()
+        );
+        template.members[0].count = 3;
+        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
+        params.cursor = Some(original_cursor);
+        assert!(
+            team_discovery(&server, &params)
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        let mut live = fixture_team("live", "stored-association");
+        live.advisor = Some(TeamAdvisor {
+            name: "advisor".into(),
+            config: advisor,
+            session_id: None,
+            task_history: vec!["retained-task".into()],
+        });
+        team::save_team(&live, &server.state.store_dir);
+        let roster = team_discovery(
+            &server,
+            &team_params(json!({"action":"roster","name":"live"})),
+        )
+        .unwrap();
+        assert!(!roster.to_string().contains("effective-charter"));
+        let exact =
+            team_discovery(&server, &team_params(json!({"action":"get","name":"live"}))).unwrap();
+        assert!(exact["body"]["next_cursor"].is_string());
+    }
+
+    #[test]
+    fn team_summary_byte_pages_resume_without_losing_rows() {
+        let rows = (0..105)
+            .map(|n| json!({"name":format!("member-{n:03}"), "brofile":"界\n".repeat(300)}))
+            .collect::<Vec<_>>();
+        let mut p = team_params(json!({"action":"roster","name":"large","limit":100}));
+        let mut seen = Vec::new();
+        loop {
+            let page =
+                team_summary_page(rows.clone(), "members", &p, json!({"team":"large"})).unwrap();
+            assert!(
+                serde_json::to_vec(&page).unwrap().len()
+                    <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+            );
+            for row in page["members"].as_array().unwrap() {
+                seen.push(row["name"].as_str().unwrap().to_owned());
+            }
+            if let Some(next) = page["next_offset"].as_u64() {
+                p.offset = Some(next as usize);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..105)
+                .map(|n| format!("member-{n:03}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn team_discovery_refuses_ambiguous_scope_and_reports_corrupt_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        for request in [
+            json!({"action":"list_templates","scope":"project"}),
+            json!({"action":"list_templates","scope":"typo"}),
+            json!({"action":"list_templates","project_dir":"/unused"}),
+            json!({"action":"list","scope":"project"}),
+            json!({"action":"get","name":"../other"}),
+            json!({"action":"roster","name":"team","cursor":"ignored"}),
+        ] {
+            assert!(validate_team_params(&team_params(request)).is_err());
+        }
+        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        let catalog_server = fixture.server();
+        let result=catalog_server.bro_team(Parameters(team_params(json!({"action":"list_templates","scope":"project","project_dir":"/nonexistent-owner-checkout"})))).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(extract_text(&result).contains("error.team_template_locality_required"));
+        let dir = server.state.store_dir.join("teamplates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.json"), "{").unwrap();
+        let filtered = team_discovery(
+            &server,
+            &team_params(json!({"action":"list_templates","name":"absent"})),
+        )
+        .unwrap();
+        assert_eq!(filtered["total"], 0);
+        assert!(
+            team_discovery(&server, &team_params(json!({"action":"list_templates"})))
+                .unwrap_err()
+                .to_string()
+                .contains("broken")
+        );
     }
 
     #[test]

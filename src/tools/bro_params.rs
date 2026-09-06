@@ -951,22 +951,43 @@ pub(crate) struct SlackProposalLinkRecordParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TeamParams {
-    /// Operation: save_template, list_templates, delete_template, create, list, dissolve, roster
+    /// Operation: save_template, list_templates, get_template, delete_template,
+    /// create, list, get, dissolve, roster. Discovery lists return summary pages;
+    /// get/get_template return exact JSON body pages using body.next_cursor.
     pub(crate) action: String,
+    /// Required for get/get_template/roster/dissolve and template writes;
+    /// optional exact name filter for list/list_templates.
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[serde(default)]
     pub(crate) members: Option<Vec<TeamMemberSlot>>,
     #[serde(default)]
     pub(crate) template: Option<String>,
+    /// Create's project association; exact stored association filter for team
+    /// list/get/roster. Template actions require scope=project and an explicit
+    /// absolute owner-host directory; catalog-mode discovery has no local read fallback.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
+    /// Template actions only: global (default) or project. Never filters live teams.
     #[serde(default)]
     pub(crate) scope: Option<String>,
     #[serde(default)]
     pub(crate) cancel_running: Option<bool>,
     #[serde(default)]
     pub(crate) advisor: Option<AdvisorSpecParams>,
+    /// Summary list/list_templates/roster page size; default 20, clamp 1..100.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    /// Continue summary discovery with the returned next_offset.
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// Exact get/get_template only: pass body.next_cursor unchanged. Changed
+    /// records or selectors refuse continuation; restart without cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact JSON body page byte budget; default/max 4096, minimum 4.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
