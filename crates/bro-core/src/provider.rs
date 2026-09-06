@@ -371,6 +371,13 @@ static GLM_MODELS: &[ModelInfo] = &[
         default_effort: None,
     },
     ModelInfo {
+        id: "glm-5.3-flash",
+        description: "Z.AI Coding Plan native multimodal GLM 5.3 Flash",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
         id: "glm-5.2",
         description: "Prior flagship GLM model via Claude Code",
         default: false,
@@ -875,6 +882,21 @@ mod tests {
         assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-6-astra"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-5.3-codex-spark"), Some("high"));
+    }
+
+    #[test]
+    fn glm_catalog_exposes_flash_without_changing_the_default() {
+        let models = Provider::Glm.models();
+        let flash = models
+            .iter()
+            .find(|model| model.id == "glm-5.3-flash")
+            .unwrap();
+        assert!(!flash.default);
+        assert_eq!(
+            models.iter().find(|model| model.default).unwrap().id,
+            "glm-5.3"
+        );
+        assert!(Provider::Glm.model_efforts(flash.id).contains(&"max"));
     }
 
     #[test]

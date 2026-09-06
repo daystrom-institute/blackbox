@@ -1134,6 +1134,18 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_slug_reaches_the_native_request_unchanged() {
+        let mut tx = transport();
+        tx.provider = Some("glm".into());
+        let mut options = opts(SystemPrompt::default());
+        options.model = "glm-5.3-flash".into();
+        options.effort = Some("max".into());
+        let body = tx.build_body(&[], &options);
+        assert_eq!(body["model"], "glm-5.3-flash");
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    #[test]
     fn server_search_schema_variation_is_local_to_minimax() {
         let mut o = opts(SystemPrompt::default());
         o.web_search = true;

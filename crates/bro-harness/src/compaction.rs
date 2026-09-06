@@ -213,6 +213,7 @@ fn default_entries() -> BTreeMap<String, Entry> {
         ("claude-*", 200_000, None),
         ("glm-4*", 200_000, None),
         ("glm-5.3", 1_000_000, None),
+        ("glm-5.3-flash", 1_000_000, None),
         ("deepseek-v4*", 1_000_000, None),
         ("deepseek-*", 128_000, None),
         ("MiniMax-M*", 1_000_000, Some(0.45)),
@@ -365,6 +366,8 @@ mod tests {
         assert_eq!(p.resolve("glm-4.6").0, 200_000);
         assert_eq!(p.context_window("glm-5.3"), Some(1_000_000));
         assert_eq!(p.threshold("glm-5.3"), Some(750_000));
+        assert_eq!(p.context_window("glm-5.3-flash"), Some(1_000_000));
+        assert_eq!(p.threshold("glm-5.3-flash"), Some(750_000));
         assert_eq!(p.context_window("glm-future-unknown"), None);
         assert_eq!(p.resolve("deepseek-chat").0, 128_000);
         assert_eq!(p.resolve("claude-opus-4-8").0, 200_000);
