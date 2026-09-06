@@ -29,6 +29,7 @@ pub mod project_catalog_snapshot;
 pub mod project_record;
 pub mod project_selector;
 pub mod query;
+pub mod response_page;
 pub mod search;
 pub mod template;
 pub mod transaction;

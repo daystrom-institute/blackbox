@@ -1241,16 +1241,20 @@ impl Threads {
                 } else if !thread.project.is_empty() {
                     row["project_selector"] = serde_json::json!(thread.project);
                 }
+                bbox_corpus_core::response_page::preview_field(&mut row, "name", 200);
                 row
             })
             .collect();
         let next_offset = offset.saturating_add(threads.len());
-        Ok(serde_json::json!({
-            "threads": threads, "total": total, "offset": offset, "limit": limit,
-            "next_offset": (next_offset < total).then_some(next_offset),
-            "order": "last_activity_desc,id_asc",
-            "detail_hint": "bbox_thread(action=get,id=<id>)",
-        }))
+        bbox_corpus_core::response_page::bound_page(
+            serde_json::json!({
+                "threads": threads, "total": total, "offset": offset, "limit": limit,
+                "next_offset": (next_offset < total).then_some(next_offset),
+                "order": "last_activity_desc,id_asc",
+                "detail_hint": "bbox_thread(action=get,id=<id>)",
+            }),
+            "threads",
+        )
     }
 
     pub fn thread_list(&self, p: &ThreadListParams) -> Result<String> {
@@ -1438,8 +1442,13 @@ mod tests {
         }
         let p = ThreadListParams::default();
         let first = store.thread_list_page(&p, 1000, 0).unwrap();
-        assert_eq!(first["threads"].as_array().unwrap().len(), 100);
-        assert_eq!(first["next_offset"], 100);
+        let returned = first["threads"].as_array().unwrap().len();
+        assert!(returned > 0 && returned <= 100);
+        assert_eq!(first["next_offset"], returned);
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        );
         assert_eq!(first["total"], 105);
         assert_eq!(first["threads"][0]["id"], "thread-00000000");
         assert_eq!(

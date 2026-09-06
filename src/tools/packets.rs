@@ -6,6 +6,7 @@ use crate::server::BlackboxServer;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
+use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde_json::Value;
 
@@ -27,7 +28,7 @@ pub(crate) struct PacketListToolParams {
 fn packet_list_page(
     mut packets: Vec<crate::packets::Packet>,
     params: &PacketListToolParams,
-) -> Value {
+) -> anyhow::Result<Value> {
     let p = &params.filters;
     packets.sort_by(|a, b| {
         b.created_at
@@ -61,16 +62,21 @@ fn packet_list_page(
             if params.detail {
                 packet_summary(&packet)
             } else {
-                serde_json::json!({"id": packet.id, "domain": packet.domain, "scope": packet.scope,
-                "rules_count": packet.rules.len(), "created_at": packet.created_at})
+                let mut row = serde_json::json!({"id": packet.id, "domain": packet.domain, "scope": packet.scope,
+                "rules_count": packet.rules.len(), "created_at": packet.created_at});
+                bbox_corpus_core::response_page::preview_field(&mut row, "domain", 200);
+                row
             }
         })
         .collect();
     let next_offset = offset.saturating_add(packets.len());
-    serde_json::json!({"count": packets.len(), "packets": packets, "total": total, "offset": offset, "limit": limit,
-        "next_offset": (next_offset < total).then_some(next_offset), "order": "created_at_desc,id_asc",
-        "detail_hint": "bbox_packet_list(packet_id=<id>,detail=true)",
-    })
+    bbox_corpus_core::response_page::bound_page(
+        serde_json::json!({"count": packets.len(), "packets": packets, "total": total, "offset": offset, "limit": limit,
+            "next_offset": (next_offset < total).then_some(next_offset), "order": "created_at_desc,id_asc",
+            "detail_hint": "bbox_packet_list(packet_id=<id>,detail=true)",
+        }),
+        "packets",
+    )
 }
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -155,7 +161,7 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_packet_list", move || {
             let packets = server.state.packets.read().list_all()?;
-            Ok(serde_json::to_string(&packet_list_page(packets, &p))?)
+            Ok(serde_json::to_string(&packet_list_page(packets, &p)?)?)
         })
         .await
     }
@@ -257,7 +263,7 @@ mod tests {
             "rules": [], "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
         })).unwrap()).collect();
         let mut p: PacketListToolParams = serde_json::from_value(json!({"limit": 1000})).unwrap();
-        let first = packet_list_page(packets.clone(), &p);
+        let first = packet_list_page(packets.clone(), &p).unwrap();
         assert_eq!(first["packets"].as_array().unwrap().len(), 100);
         assert_eq!(first["next_offset"], 100);
         assert_eq!(first["packets"][0]["id"], "packet-00000000");
@@ -267,16 +273,16 @@ mod tests {
                 .is_none()
         );
         p.offset = Some(100);
-        let last = packet_list_page(packets.clone(), &p);
+        let last = packet_list_page(packets.clone(), &p).unwrap();
         assert_eq!(last["packets"].as_array().unwrap().len(), 5);
         assert!(last["next_offset"].is_null());
         p.offset = Some(0);
         p.filters.domain = Some("domain-1".into());
-        let filtered = packet_list_page(packets.clone(), &p);
+        let filtered = packet_list_page(packets.clone(), &p).unwrap();
         assert_eq!(filtered["total"], 52);
         p.packet_id = Some("packet-00000001".into());
         p.detail = true;
-        let detail = packet_list_page(packets, &p);
+        let detail = packet_list_page(packets, &p).unwrap();
         assert_eq!(detail["total"], 1);
         assert!(
             detail["packets"][0]

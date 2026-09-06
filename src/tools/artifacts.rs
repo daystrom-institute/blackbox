@@ -7,6 +7,7 @@ use crate::server::routes::{deactivate_artifact, install_artifact_from_params};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
+use rmcp::schemars;
 use rmcp::{tool, tool_router};
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -27,7 +28,7 @@ pub(crate) struct ArtifactCatalogListParams {
 fn artifact_list_page(
     mut rows: Vec<crate::artifacts::ArtifactListEntry>,
     p: &ArtifactCatalogListParams,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     rows.sort_by(|a, b| {
         a.kind
             .as_str()
@@ -42,7 +43,7 @@ fn artifact_list_page(
     let artifacts: Vec<_> = rows.into_iter().skip(offset).take(limit).map(|entry| {
         let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active});
         if let Some(description) = entry.description {
-            let preview: String = description.chars().take(200).collect();
+            let preview: String = if p.detail { description.clone() } else { description.chars().take(200).collect() };
             if preview.len() < description.len() { row["description_truncated"] = serde_json::json!(true); }
             row["description"] = serde_json::json!(preview);
         }
@@ -54,11 +55,14 @@ fn artifact_list_page(
         row
     }).collect();
     let next_offset = offset.saturating_add(artifacts.len());
-    serde_json::json!({"artifacts": artifacts, "total": total, "limit": limit, "offset": offset,
-        "next_offset": (next_offset < total).then_some(next_offset),
-        "order": "kind_asc,name_asc,installed_at_desc,version_asc",
-        "detail_hint": "bbox_artifact_list(kind=<kind>,name=<name>,detail=true)",
-    })
+    bbox_corpus_core::response_page::bound_page(
+        serde_json::json!({"artifacts": artifacts, "total": total, "limit": limit, "offset": offset,
+            "next_offset": (next_offset < total).then_some(next_offset),
+            "order": "kind_asc,name_asc,installed_at_desc,version_asc",
+            "detail_hint": "bbox_artifact_list(kind=<kind>,name=<name>,detail=true)",
+        }),
+        "artifacts",
+    )
 }
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -91,7 +95,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_artifact_list", || {
             let rows = self.state.artifacts.read().list(&p.filters)?;
-            Ok(serde_json::to_string(&artifact_list_page(rows, &p))?)
+            Ok(serde_json::to_string(&artifact_list_page(rows, &p)?)?)
         })
     }
 
@@ -183,15 +187,20 @@ mod tests {
             .collect();
         let mut p: ArtifactCatalogListParams =
             serde_json::from_value(json!({"limit": 1000})).unwrap();
-        let first = artifact_list_page(rows.clone(), &p);
-        assert_eq!(first["artifacts"].as_array().unwrap().len(), 100);
-        assert_eq!(first["next_offset"], 100);
+        let first = artifact_list_page(rows.clone(), &p).unwrap();
+        let returned = first["artifacts"].as_array().unwrap().len();
+        assert!(returned > 0 && returned <= 100);
+        assert_eq!(first["next_offset"], returned);
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        );
         assert_eq!(first["artifacts"][0]["name"], "agent-000");
         assert_eq!(first["artifacts"][0]["description_truncated"], true);
         assert!(first["artifacts"][0].get("supersedes_chain").is_none());
         p.offset = Some(100);
         p.detail = true;
-        let last = artifact_list_page(rows, &p);
+        let last = artifact_list_page(rows, &p).unwrap();
         assert_eq!(last["artifacts"].as_array().unwrap().len(), 5);
         assert!(last["next_offset"].is_null());
         assert_eq!(
@@ -202,6 +211,33 @@ mod tests {
             assert!(!response.to_string().contains("synthetic-secret"));
             assert!(!response.to_string().contains("/private/daemon"));
         }
+    }
+
+    #[test]
+    fn artifact_expanded_nested_row_refuses_without_losing_continuation() {
+        let entry = artifacts::ArtifactListEntry {
+            kind: artifacts::ArtifactKind::Agent,
+            name: "large-history".into(),
+            version: "1".into(),
+            source: "inline".into(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            active: true,
+            supersedes_chain: vec!["界".repeat(1000); 50],
+            path: "/private/daemon/artifact.json".into(),
+            superseded_by: None,
+            description: Some("界".repeat(1000)),
+        };
+        let p: ArtifactCatalogListParams = serde_json::from_value(json!({"detail": true})).unwrap();
+        assert!(
+            artifact_list_page(vec![entry.clone()], &p)
+                .unwrap_err()
+                .to_string()
+                .contains("collection_row_too_large")
+        );
+        let p: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
+        let summary = artifact_list_page(vec![entry], &p).unwrap();
+        assert_eq!(summary["artifacts"][0]["description_truncated"], true);
+        assert!(summary["next_offset"].is_null());
     }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
