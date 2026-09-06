@@ -538,8 +538,8 @@ impl BlackboxServer {
                 }
             };
             if rec.retired {
-                anyhow::bail!(
-                    "custom dispatch adapters are retired; use a simple brofile-bound agent"
+                return Self::err_text(
+                    "custom dispatch adapters are retired; use a simple brofile-bound agent",
                 );
             }
             if !rec.active {
