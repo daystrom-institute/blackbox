@@ -1912,6 +1912,9 @@ impl ArtifactCatalog {
                     Some(previous) => self.metadata_for(kind, previous)?.is_none_or(|previous| {
                         !previous.active && previous.superseded_by.as_deref() == Some(name.as_str())
                     }),
+                    None if supersedes == Some(name.as_str()) => self
+                        .active_history_scoped(&scope, kind, &name, &version)?
+                        .is_empty(),
                     None => true,
                 };
             if content_complete
@@ -1922,18 +1925,24 @@ impl ArtifactCatalog {
                 return Ok(meta.clone());
             }
         }
+        let supersedes = supersedes_override.or_else(|| artifact_supersedes(value));
+        let retry_chain = existing
+            .as_ref()
+            .filter(|meta| meta.supersedes == supersedes)
+            .map(|meta| meta.supersedes_chain.clone());
         let installed_at = existing
             .map(|meta| meta.installed_at)
             .unwrap_or_else(util::now_iso);
-
-        let supersedes = supersedes_override.or_else(|| artifact_supersedes(value));
-        let mut chain = Vec::new();
-        if let Some(prev) = supersedes.as_deref() {
-            if let Ok(prev_meta) = self.load_metadata(kind, prev) {
-                chain.extend(prev_meta.supersedes_chain.clone());
+        let chain = retry_chain.unwrap_or_else(|| {
+            let mut chain = Vec::new();
+            if let Some(prev) = supersedes.as_deref() {
+                if let Ok(prev_meta) = self.load_metadata(kind, prev) {
+                    chain.extend(prev_meta.supersedes_chain.clone());
+                }
+                chain.push(prev.to_string());
             }
-            chain.push(prev.to_string());
-        }
+            chain
+        });
 
         let mut completed = Vec::new();
         let mut failed = "artifact_content";
@@ -1967,13 +1976,20 @@ impl ArtifactCatalog {
             failed = "catalog_version_snapshot";
             self.save_version_snapshot_scoped(&scope, &metadata, value)?;
             completed.push("catalog_version_snapshot");
-            if let Some(previous) = metadata
-                .supersedes
-                .as_deref()
-                .filter(|previous| *previous != metadata.name.as_str())
-            {
+            if let Some(previous) = metadata.supersedes.as_deref() {
                 failed = "previous_catalog_supersession";
-                if self.metadata_for(kind, previous)?.is_some() {
+                if previous == metadata.name {
+                    // The current record now identifies the replacement. Retire only
+                    // historical snapshots, including leftovers from interrupted retries.
+                    for (path, mut previous) in
+                        self.active_history_scoped(&scope, kind, &metadata.name, &metadata.version)?
+                    {
+                        previous.active = false;
+                        previous.superseded_by = Some(metadata.name.clone());
+                        atomic_write_json(&path, &previous)?;
+                    }
+                    completed.push("previous_catalog_supersession");
+                } else if self.metadata_for(kind, previous)?.is_some() {
                     self.mark_superseded(kind, previous, &metadata.name)?;
                     completed.push("previous_catalog_supersession");
                 }
@@ -1988,6 +2004,48 @@ impl ArtifactCatalog {
             }
             .into()
         })
+    }
+
+    /// Strictly inspect historical metadata so a retry cannot accept a partially
+    /// completed same-name supersession or overwrite metadata owned by another id.
+    fn active_history_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+        current_version: &str,
+    ) -> Result<Vec<(PathBuf, ArtifactMetadata)>> {
+        let directory = self.version_dir_path_scoped(scope, kind, name)?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut active = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let Some(version) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('v'))
+                .and_then(|name| name.strip_suffix(".metadata.json"))
+            else {
+                continue;
+            };
+            if version == current_version {
+                continue;
+            }
+            let metadata: ArtifactMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            anyhow::ensure!(
+                metadata.kind == kind && metadata.name == name && metadata.version == version,
+                "historical artifact metadata identity does not match its catalog key"
+            );
+            if metadata.active {
+                active.push((path, metadata));
+            }
+        }
+        active.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(active)
     }
 
     pub fn list(&self, p: &ArtifactListParams) -> Result<Vec<ArtifactListEntry>> {
@@ -3787,6 +3845,102 @@ mod tests {
         assert_eq!(back.project_id.as_deref(), Some("proj-123"));
         assert_eq!(back.project_path.as_deref(), Some("/home/user/myproject"));
         assert!(back.local);
+    }
+
+    #[test]
+    fn same_name_upgrade_retires_history_only_after_replacement_and_repairs_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let catalog = ArtifactCatalog::open(root.join("catalog")).unwrap();
+        let first = serde_json::json!({"name": "example", "version": "1"});
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "inline".into(),
+                &first,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let replacement =
+            serde_json::json!({"name": "example", "version": "2", "supersedes": "example"});
+        let blocked = catalog
+            .version_artifact_path(ArtifactKind::Agent, "example", "2")
+            .unwrap();
+        fs::create_dir_all(&blocked).unwrap();
+        assert!(
+            catalog
+                .install_value(
+                    ArtifactKind::Agent,
+                    "inline".into(),
+                    &replacement,
+                    None,
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            catalog
+                .metadata_for_version(ArtifactKind::Agent, "example", "1")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        fs::remove_dir(&blocked).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "inline".into(),
+                &replacement,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let old = catalog
+            .metadata_for_version(ArtifactKind::Agent, "example", "1")
+            .unwrap()
+            .unwrap();
+        assert!(!old.active);
+        assert_eq!(old.superseded_by.as_deref(), Some("example"));
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "example")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            catalog
+                .metadata_for_version(ArtifactKind::Agent, "example", "2")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        // Recreate the precise persisted state left by an interrupted history write.
+        let mut interrupted = old;
+        interrupted.active = true;
+        interrupted.superseded_by = None;
+        catalog.save_version_metadata(&interrupted).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "inline".into(),
+                &replacement,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !catalog
+                .metadata_for_version(ArtifactKind::Agent, "example", "1")
+                .unwrap()
+                .unwrap()
+                .active
+        );
     }
 
     #[test]
