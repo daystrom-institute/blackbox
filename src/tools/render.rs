@@ -350,7 +350,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_review",
-        description = "Approve or reject entries awaiting review."
+        description = "Approve or reject entries awaiting review, or page bounded review reads."
     )]
     pub(crate) async fn bbox_review(
         &self,
@@ -837,6 +837,7 @@ mod tests {
             project: None,
             action: Some("list".into()),
             id: None,
+            ..Default::default()
         };
 
         let lint = fixture.server.lint_session_knowledge().unwrap();
@@ -905,6 +906,7 @@ mod tests {
                     project: None,
                     action: Some("list".into()),
                     id: None,
+                    ..Default::default()
                 })
                 .unwrap_err(),
             fixture

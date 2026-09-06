@@ -128,6 +128,99 @@ fn latest(server: &BlackboxServer, scope: &PublishedScope, id: &str) -> Knowledg
     serde_json::from_str(row.mutation.content_json.as_deref().unwrap()).unwrap()
 }
 
+fn serialized_text(result: &CallToolResult) -> (usize, String) {
+    let wire = serde_json::to_vec(result).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    let text = envelope["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|content| content["text"].as_str())
+        .unwrap()
+        .to_string();
+    (wire.len(), text)
+}
+
+#[tokio::test]
+async fn review_list_serialized_envelope_bounds_worst_case_escaping() {
+    let (fixture, scope) = published_fixture();
+    let entries: Vec<_> = (0..100)
+        .map(|index| {
+            let id = format!("{index:016x}");
+            let mut entry = knowledge_entry(&id, &"\"escaped\"\t".repeat(256));
+            entry.title = "\"title\"\n".repeat(128);
+            entry.approval = Approval::AgentInferred;
+            entry
+        })
+        .collect();
+    fixture.install_publication(
+        PROJECT,
+        &scope,
+        &"2".repeat(40),
+        &entries,
+        &[],
+    );
+    let server = queue_server(&fixture);
+    let result = server
+        .bbox_review(Parameters(ReviewParams {
+            action: Some("list".into()),
+            limit: Some(100),
+            ..Default::default()
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let (wire_bytes, text) = serialized_text(&result);
+    assert!(
+        wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+        "serialized review list was {wire_bytes} bytes"
+    );
+    let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["rows"].as_array().unwrap().len(), 100);
+    for row in reply["rows"].as_array().unwrap() {
+        assert!(row["title_preview"].as_str().unwrap().len() < 192);
+        assert!(row["content_preview"].as_str().unwrap().len() < 192);
+    }
+}
+
+#[tokio::test]
+async fn review_exact_serialized_envelope_pages_one_huge_record() {
+    let (fixture, scope) = published_fixture();
+    let mut entry = knowledge_entry(ENTRY, &"\"escaped content\"\t".repeat(4_000));
+    entry.title = "\"escaped title\"\n".repeat(2_000);
+    entry.approval = Approval::AgentInferred;
+    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[entry.clone()], &[]);
+    let server = queue_server(&fixture);
+    let mut params = ReviewParams {
+        action: Some("get".into()),
+        id: Some(ENTRY.into()),
+        limit: Some(257),
+        ..Default::default()
+    };
+    let first = server.bbox_review(Parameters(params.clone())).await;
+    assert_ne!(first.is_error, Some(true), "{first:?}");
+    let (wire_bytes, text) = serialized_text(&first);
+    assert!(
+        wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+        "serialized exact review page was {wire_bytes} bytes"
+    );
+    let first: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
+    let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+    while let Some(active_cursor) = cursor {
+        params.cursor = Some(active_cursor);
+        let page = server.bbox_review(Parameters(params.clone())).await;
+        assert_ne!(page.is_error, Some(true), "{page:?}");
+        let (wire_bytes, text) = serialized_text(&page);
+        assert!(wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        let page: serde_json::Value = serde_json::from_str(&text).unwrap();
+        reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+    }
+    let recovered: KnowledgeEntry = serde_json::from_str(&reconstructed).unwrap();
+    assert_eq!(recovered.title, entry.title);
+    assert_eq!(recovered.content, entry.content);
+}
+
 #[tokio::test]
 async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publication() {
     let (fixture, server, scope) = fixture();
@@ -509,6 +602,7 @@ async fn queued_knowledge_genesis_and_id_addressed_updates_survive_restart() {
             project: None,
             action: Some("reject".into()),
             id: Some(id.into()),
+            ..Default::default()
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -862,6 +956,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
             id: Some(ENTRY.into()),
             action: Some("approve".into()),
             project: None,
+            ..Default::default()
         }))
         .await;
     assert_eq!(ambiguous.is_error, Some(true));
@@ -886,6 +981,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
             id: Some(global.id.clone()),
             action: Some("approve".into()),
             project: Some(PROJECT.into()),
+            ..Default::default()
         }))
         .await;
     assert_eq!(mismatch.is_error, Some(true));
@@ -894,6 +990,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
             id: Some(global.id),
             action: Some("approve".into()),
             project: None,
+            ..Default::default()
         }))
         .await;
     assert_ne!(local.is_error, Some(true), "{local:?}");
@@ -904,6 +1001,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
                 id: Some(ENTRY.into()),
                 action: Some("approve".into()),
                 project: Some(selector.into()),
+                ..Default::default()
             }))
             .await;
         assert_eq!(result.is_error, Some(true));
@@ -914,6 +1012,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
             id: Some(ENTRY.into()),
             action: Some("approve".into()),
             project: Some(PROJECT.into()),
+            ..Default::default()
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -1069,6 +1168,7 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
             project: None,
             action: Some("approve".into()),
             id: Some(global.id.clone()),
+            ..Default::default()
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
