@@ -8,11 +8,6 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
-- Preserve queued project-gap edits across concurrent calls and delivery before
-  publication; isolate overlays by project and reject conflicting publications.
-  Supersession changes validate both records before either file is queued.
-
-
 ### Removed
 
 - Daemon workflows, atoms, application crons/pollers/webhooks, reaction delivery,
@@ -24,6 +19,16 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Storage GC returns a compact outcome summary and immutable receipt pages.
+  Partial deletion results survive later-stage failures; receipt reads never
+  rerun collection.
+- Inbox is read-only, with bounded attention groups and gap aggregates. Retired
+  spool-import and closeout options are rejected. Gap diagnostics summarize
+  source warnings by default and offer bounded detail with `debug=true`.
+- Tool-call history previews large fields and returns indexed context handles.
+  Retired agent adapters leave callable discovery; explicit historical reads
+  retain their receipts and mark them inactive.
+
 - Vector connectivity repair and event-journal retention run independently of
   workflow artifacts. Rebuild construction releases the partition lock and
   defers publication when concurrent ingestion makes its snapshot stale.
@@ -34,6 +39,12 @@ out explicitly under `Changed` or `Removed`.
   to start another task.
 
 ### Fixed
+
+- Queued project-gap edits compose across concurrent calls and delivery before
+  publication. Admission is durable, overlays stay project-scoped, conflicting
+  publications are rejected, and covered projects can file and update gaps
+  before their first publication. Supersession validates both records before
+  either file is queued.
 
 - Task snapshots retain readable tasks when individual legacy records are
   malformed. Unreadable records are quarantined; unsafe snapshot recovery
