@@ -142,6 +142,23 @@ fn serialized_text(result: &CallToolResult) -> (usize, String) {
 }
 
 #[tokio::test]
+async fn review_rejects_read_fields_before_checkout_owner_admission() {
+    let (_fixture, server, _scope) = fixture();
+    for action in ["approve", "reject"] {
+        for value in [
+            json!({"action":action,"id":ENTRY,"project":PROJECT,"cursor":"invalid"}),
+            json!({"action":action,"id":ENTRY,"project":PROJECT,"limit":128}),
+            json!({"action":action,"id":"","project":PROJECT}),
+        ] {
+            let params: ReviewParams = serde_json::from_value(value).unwrap();
+            let result = server.bbox_review(Parameters(params)).await;
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(server.state.checkout_mutations.read().outstanding_writes().count(), 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn review_list_serialized_envelope_bounds_worst_case_escaping() {
     let (fixture, scope) = published_fixture();
     let entries: Vec<_> = (0..100)
