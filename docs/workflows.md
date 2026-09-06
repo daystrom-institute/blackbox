@@ -770,11 +770,16 @@ shape:
 }
 ```
 
-- `every_seconds` is clamped above `BBOX_POLLER_MIN_INTERVAL_SECS`
-  (default 5s) - operators can't accidentally hammer an upstream.
+- `every_seconds` is the requested cadence. The runtime clamps it to the
+  daemon's `poller_min_interval_secs` (default 5s; overridable with
+  `BBOX_POLLER_MIN_INTERVAL_SECS`), with an unconditional floor of 1s.
+  Install/list replies also report `effective_every_seconds`, captured when
+  the loop starts. Changing the minimum requires reinstall or restart to
+  affect existing loops. The first fetch follows one effective interval.
 - `source` is the same `HttpFetchSpec` shape the workflow `http_json`
-  op consumes. `${env.X}` is resolved at spec-load time (no per-tick
-  ArcContext to resolve `${vars.X}` against - credentials live in env).
+  op consumes. URL and header `${env.X}` references resolve from the daemon
+  environment on each tick; persisted specs retain references. Body templates
+  and `${vars.X}` are not resolved.
 - `iterate` (optional) - array path; each element becomes its own
   event (extractor runs per-element). Absent → whole response is one
   event.
@@ -811,8 +816,9 @@ based and the dispatched arc itself does the data acquisition.
 - `schedule` uses the `cron` crate's 6- or 7-field form (seconds-first;
   prefix a classic 5-field cron with `0 ` to run-at-second-0). Validated
   at install time. `bro_cron_upcoming` is a pure helper that returns
-  the next N scheduled times for a candidate expression - use to sanity-
-  check before installing.
+  the next N scheduled times in UTC for a candidate expression. It does
+  not apply an installed cron's Local timezone. List replies report effective
+  `tz`; unsupported settings also appear as `configured_tz` and run in UTC.
 - `payload` is operator-supplied entity fields. Synthetic `cron_name`
   and `tick_at` (RFC3339 UTC) are merged in at tick time so routing
   rules can discriminate without operator boilerplate. Operator-supplied
