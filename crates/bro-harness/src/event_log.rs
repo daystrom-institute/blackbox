@@ -137,6 +137,67 @@ impl EventLog {
             .unwrap_or(0)
     }
 
+    /// Migrate sessions predating persisted registry activations. Only successful
+    /// results paired with actual tool_search calls supply names; arbitrary
+    /// tool output, user prose and failed searches cannot activate anything.
+    /// The registry intersects these names with the current filtered catalog.
+    /// Called on the blocking pool during resume, never during model turns.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy session migration runs on the blocking pool"
+    )]
+    pub fn tool_search_activations(path: &Path) -> Value {
+        use std::collections::{BTreeSet, HashSet};
+        use std::io::BufRead;
+
+        let Ok(file) = std::fs::File::open(path) else {
+            return json!([]);
+        };
+        let mut pending = HashSet::new();
+        let mut activated = BTreeSet::new();
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(row) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let event = &row["event"];
+            if event["isReplay"] == true {
+                continue;
+            }
+            for block in event["message"]["content"].as_array().into_iter().flatten() {
+                if event["type"] == "assistant"
+                    && block["type"] == "tool_use"
+                    && block["name"] == crate::registry::TOOL_SEARCH
+                {
+                    if let Some(id) = block["id"].as_str() {
+                        pending.insert(id.to_owned());
+                    }
+                } else if event["type"] == "user"
+                    && block["type"] == "tool_result"
+                    && block["tool_use_id"]
+                        .as_str()
+                        .is_some_and(|id| pending.remove(id))
+                    && block["is_error"] != true
+                {
+                    let Some(content) = block["content"].as_str() else {
+                        continue;
+                    };
+                    let Ok(result) = serde_json::from_str::<Value>(content) else {
+                        continue;
+                    };
+                    activated.extend(
+                        result["loaded"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+            }
+        }
+        json!(activated)
+    }
+
     /// Append one envelope event as a timestamped line. Best-effort.
     pub fn append_event(&self, event: &Value) {
         self.append_line(json!({
@@ -299,6 +360,53 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_activations_require_successful_paired_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("session.events.jsonl");
+        let call = |id: &str, name: &str| {
+            json!({"event":{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":id,"name":name,"input":{}}
+            ]}}})
+        };
+        let result = |id: &str, name: &str, error: bool| {
+            json!({"event":{"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":id,"is_error":error,
+                 "content":json!({"loaded":[name]}).to_string()}
+            ]}}})
+        };
+        let rows = [
+            call("read", "tool_search"),
+            result("read", "file_read", false),
+            result("read", "duplicate_receipt", false),
+            call("failed", "tool_search"),
+            result("failed", "failed_tool", true),
+            call("other", "file_read"),
+            result("other", "forged_tool", false),
+            result("unknown", "orphan_tool", false),
+            json!({"event":{"type":"user","message":{"content":[{"type":"text","text":"loaded file_write"}]}}}),
+            json!({"event":{"type":"system","subtype":"compact_boundary"}}),
+            call("report", "tool_search"),
+            result("report", "mcp__fixture__report", false),
+        ];
+        let mut body = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push_str("\n{partial crash tail");
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            EventLog::tool_search_activations(&path),
+            json!(["file_read", "mcp__fixture__report"])
+        );
+        assert_eq!(
+            EventLog::tool_search_activations(&root.join("absent")),
+            json!([])
+        );
+    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let pid = std::process::id();

@@ -19,6 +19,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Tools loaded with `tool_search` retain their schemas after a harness process
+  resume. Older sessions recover successful activation receipts from the event
+  log; current permissions and tool availability still govern restoration.
+
 - Partition prune apply refuses batches above eight candidates or its identity
   byte budget before deletion; select a route to narrow a larger preview.
   Prune and scrub stop on the first deletion failure and report unattempted work.

@@ -177,6 +177,34 @@ impl Registry {
         Self { tools, activated }
     }
 
+    /// Session-owned activation names, never persisted schemas or permissions.
+    pub fn activation_state(&self) -> Value {
+        let mut names: Vec<_> = self.activated.lock().unwrap().iter().cloned().collect();
+        names.sort();
+        json!(names)
+    }
+
+    /// Restore visibility only for tools surviving the current catalog,
+    /// placement and policy filters. A prior activation cannot grant access.
+    pub fn restore_activations(&self, state: &Value) {
+        let mut activated = self.activated.lock().unwrap();
+        activated.clear();
+        for name in state
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if self
+                .tools
+                .get(name)
+                .is_some_and(|entry| entry.tier == Tier::Deferred)
+            {
+                activated.insert(name.to_string());
+            }
+        }
+    }
+
     fn spec_of(e: &Entry) -> ToolSpec {
         ToolSpec {
             name: e.tool.name().to_string(),
@@ -579,6 +607,59 @@ mod tests {
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"bbox_stats".to_string()));
         assert!(!reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
+    }
+
+    #[tokio::test]
+    async fn activations_roundtrip_with_current_catalog_and_policy() {
+        let pin = PinPolicy { patterns: vec![] };
+        let reg = Registry::with_options(
+            vec![mk("file_read", "old read"), mk("file_write", "old write")],
+            vec![mk("mcp__fixture__removed", "removed")],
+            &pin,
+            &ToolFilter::default(),
+            true,
+        );
+        reg.dispatch(
+            TOOL_SEARCH,
+            json!({"query":"select:file_read,file_write,mcp__fixture__removed"}),
+            &test_cx(bro_tools::ToolArgDefaults::default()),
+        )
+        .await;
+        let saved = reg.activation_state();
+        assert_eq!(
+            saved,
+            json!(["file_read", "file_write", "mcp__fixture__removed"])
+        );
+        let filter = ToolFilter::from_csv(Some("file_write"), None);
+        let resumed = Registry::with_options(
+            vec![
+                mk("file_read", "current read"),
+                mk("file_write", "current write"),
+            ],
+            vec![mk("mcp__fixture__new", "new tool")],
+            &pin,
+            &filter,
+            true,
+        );
+        resumed.restore_activations(&saved);
+        assert_eq!(resumed.activation_state(), json!(["file_read"]));
+        let wire = resumed.wire_specs();
+        assert_eq!(
+            wire.iter()
+                .find(|s| s.name == "file_read")
+                .unwrap()
+                .description,
+            "current read"
+        );
+        assert!(!wire.iter().any(|s| s.name == "file_write"
+            || s.name == "mcp__fixture__removed"
+            || s.name == "mcp__fixture__new"));
+        assert_eq!(
+            resumed.manifest(),
+            vec![("mcp__fixture__new".into(), "new tool".into())]
+        );
+        resumed.restore_activations(&json!([null, 7, "unknown"]));
+        assert_eq!(resumed.activation_state(), json!([]));
     }
 
     #[test]

@@ -1002,6 +1002,18 @@ impl Session {
             &tool_filter,
             code_mode.defers_builtins(),
         );
+        if restored_snapshot {
+            let activations = match prior_side.get("tool_activations") {
+                Some(saved) => saved.clone(),
+                None => {
+                    let path = event_log.path().to_path_buf();
+                    tokio::task::spawn_blocking(move || EventLog::tool_search_activations(&path))
+                        .await
+                        .context("restore legacy tool activations")?
+                }
+            };
+            reg.restore_activations(&activations);
+        }
         validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 
         let base_opts = TurnOpts {
@@ -2037,6 +2049,7 @@ impl Session {
             .map(|t| t.to_side())
             .unwrap_or(Value::Null);
         side["nudges"] = self.hooks.to_side();
+        side["tool_activations"] = self.reg.activation_state();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
         side["reference_context"] = self
             .reference_context_item
