@@ -1217,7 +1217,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_poller_install",
         category: ToolCategory::Workflows,
-        summary: "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task.",
+        summary: "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (requested seconds; clamped to the daemon minimum, default 5s, at least 1s), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. URL/header env references resolve each tick. Persisted for restart; first fetch follows one effective interval. Replies distinguish requested every_seconds from effective_every_seconds. Reinstall replaces the running task.",
         when_to_use: "Use when there's no webhook (closed-network upstream, no public ingress on the daemon, polling-only API) or when a clock-driven trigger is what you actually want. Routing packet evaluates against per-item extracted entity exactly the way webhook ingress does — same dispatch_routed_event entry point.",
         example: Some(
             r#"bro_poller_install(spec={"name":"forgejo-issues","every_seconds":120,"source":{"url":"http://127.0.0.1:3000/api/v1/repos/owner/repo/issues?state=open","headers":{"Authorization":"token ..."}},"iterate":{"kind":"json_path","path":"$"},"extractor":{...},"dedup_id_path":{"kind":"json_path","path":"$.id"},"routing_packet":"domain:webhook-routing/forgejo"})"#,
@@ -1226,8 +1226,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_poller_list",
         category: ToolCategory::Workflows,
-        summary: "List installed pollers as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
-        when_to_use: "Inventory check before installing to avoid duplicate names; also surfaces effective tick intervals (which may be clamped above your configured value via BBOX_POLLER_MIN_INTERVAL_SECS).",
+        summary: "List installed pollers as name-ordered summary pages (default 20, maximum 100). every_seconds is requested; effective_every_seconds is the interval captured when the loop starts (null if none registered). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
+        when_to_use: "Check names before installing; compare requested every_seconds with effective_every_seconds captured at loop startup. Reinstall or restart applies changes to the daemon minimum.",
         example: Some("bro_poller_list()"),
     },
     ToolDoc {
@@ -1249,8 +1249,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cron_list",
         category: ToolCategory::Workflows,
-        summary: "List installed crons as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
-        when_to_use: "Inventory check before installing; also surfaces in-flight count so you can tell whether a cap is currently blocking a tick.",
+        summary: "List installed crons as name-ordered summary pages (default 20, maximum 100). tz is the effective scheduler mode (UTC or daemon Local); configured_tz appears when an unsupported setting falls back to UTC. Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
+        when_to_use: "Check installed schedules, effective timezone modes, configured concurrency caps, and routing packet references before installing. detail=true adds payload key names and project-presence diagnostics.",
         example: Some("bro_cron_list()"),
     },
     ToolDoc {
@@ -1263,8 +1263,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cron_upcoming",
         category: ToolCategory::Workflows,
-        summary: "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry.",
-        when_to_use: "Validate a schedule before installing or eyeball when a live cron will fire next. Useful for human review of `0 */15 * * * *` etc. without booting a daemon.",
+        summary: "Compute the next N scheduled times for a cron expression interpreted in UTC, as RFC3339 strings. Pure function; does not use an installed cron or its timezone.",
+        when_to_use: "Preview a candidate UTC schedule before installing. This helper does not apply the timezone of an installed cron; Local schedules require separate timezone-aware review.",
         example: Some(r#"bro_cron_upcoming(schedule="0 0 9 * * *", count=3)"#),
     },
     ToolDoc {

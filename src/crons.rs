@@ -76,11 +76,24 @@ pub struct CronSpec {
 }
 
 impl CronSpec {
+    /// Match the scheduler's supported timezone modes, including UTC fallback.
+    pub fn effective_timezone(&self) -> &'static str {
+        match self.tz.as_deref() {
+            Some("Local" | "local") => "Local",
+            _ => "UTC",
+        }
+    }
+
     /// MCP discovery never includes arbitrary payload values or host paths.
     pub fn response_view(&self, detail: bool) -> Value {
         let mut row = serde_json::json!({"name": self.name, "schedule": self.schedule,
-            "tz": self.tz.as_deref().unwrap_or("UTC"), "concurrency": self.concurrency,
+            "tz": self.effective_timezone(), "concurrency": self.concurrency,
             "routing_packet": self.routing_packet});
+        if let Some(tz) = self.tz.as_deref() {
+            if !matches!(tz, "Local" | "local" | "UTC" | "utc") {
+                row["configured_tz"] = serde_json::json!(tz);
+            }
+        }
         if detail {
             let mut keys: Vec<_> = self.payload.keys().collect();
             keys.sort();
@@ -531,6 +544,33 @@ mod tests {
         assert_eq!(upcoming.len(), 3);
         assert!(upcoming[0] < upcoming[1]);
         assert!(upcoming[1] < upcoming[2]);
+    }
+
+    #[test]
+    fn cron_response_timezone_matches_runtime_including_fallback() {
+        for (configured, effective, fallback) in [
+            (None, "UTC", false),
+            (Some("UTC"), "UTC", false),
+            (Some("utc"), "UTC", false),
+            (Some("Local"), "Local", false),
+            (Some("local"), "Local", false),
+            (Some("America/Toronto"), "UTC", true),
+        ] {
+            let spec: CronSpec = serde_json::from_value(json!({
+                "name": "nightly", "schedule": "0 0 9 * * *",
+                "routing_packet": "test-routing", "tz": configured,
+            }))
+            .unwrap();
+            for detail in [false, true] {
+                let row = spec.response_view(detail);
+                assert_eq!(row["tz"], effective);
+                assert_eq!(row["tz"], spec.effective_timezone());
+                assert_eq!(row.get("configured_tz").is_some(), fallback);
+                if fallback {
+                    assert_eq!(row["configured_tz"], configured.unwrap());
+                }
+            }
+        }
     }
 
     #[test]

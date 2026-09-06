@@ -132,11 +132,15 @@ bro_poller_install(spec = {
 
 | Field | Purpose |
 |---|---|
-| `every_seconds` | Poll interval (≥ `BBOX_POLLER_MIN_INTERVAL_SECS`, default 5) |
+| `every_seconds` | Requested interval; runtime clamps to the daemon minimum (default 5s), at least 1s |
 | `iterate` | JSONPath selector to explode array responses into per-item events |
 | `dedup_id_path` | Stable id for dedup (in-memory recent-seen ring per poller) |
 | `extractor` | Field projections - same shape as webhook extractors |
 | `routing_packet` | Packet that classifies each extracted entity |
+
+Install/list replies retain requested `every_seconds` and report
+`effective_every_seconds` captured when the loop starts. The first fetch follows
+one effective interval. Reinstall or restart applies a changed daemon minimum.
 
 ### Management
 
@@ -191,11 +195,15 @@ Use the `cron_name` field to discriminate:
 | Parameter | Default | Purpose |
 |---|---|---|
 | `schedule` | required | 6-field cron expr (`sec min hour dom mon dow`) |
-| `concurrency_cap` | `1` | Max concurrent runs (set `0` to disable) |
+| `concurrency` | `1` | Max concurrent runs (set `0` to disable) |
 | `routing_packet` | required | Packet id for classification |
 | `default_project_dir` | optional | Default project for `start_arc` verdicts |
 
 ### Preview upcoming ticks
+
+This helper evaluates in UTC; it does not apply an installed cron's timezone.
+Cron list `tz` reports the effective mode, with `configured_tz` present when an
+unsupported setting falls back to UTC.
 
 ```json
 bro_cron_upcoming(schedule = "0 0 9 * * *", count = 5)

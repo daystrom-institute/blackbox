@@ -892,7 +892,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_poller_install",
-        description = "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task."
+        description = "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (requested seconds; clamped to the daemon minimum, default 5s, at least 1s), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. URL/header env references resolve each tick. Persisted for restart; first fetch follows one effective interval. Replies distinguish requested every_seconds from effective_every_seconds. Reinstall replaces the running task."
     )]
     // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
     #[allow(clippy::disallowed_methods)]
@@ -921,24 +921,19 @@ Constraints:\n\
             "status": "installed",
             "name": spec.name,
             "every_seconds": spec.every_seconds,
+            "effective_every_seconds": self.state.pollers.effective_every_seconds(&spec.name),
         }))
     }
 
     #[tool(
         name = "bro_poller_list",
-        description = "List installed pollers as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
+        description = "List installed pollers as name-ordered summary pages (default 20, maximum 100). every_seconds is requested; effective_every_seconds is the interval captured when the loop starts (null if none registered). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
     )]
     pub(crate) async fn bro_poller_list(
         &self,
         Parameters(p): Parameters<RuntimeCatalogListParams>,
     ) -> CallToolResult {
-        let rows = self
-            .state
-            .pollers
-            .list()
-            .iter()
-            .map(|spec| spec.response_view(p.detail))
-            .collect();
+        let rows = self.state.pollers.response_views(p.detail);
         match runtime_catalog_page(rows, "pollers", &p) {
             Ok(page) => Self::ok_json(&page),
             Err(error) => Self::err_text(&error.to_string()),
@@ -1016,7 +1011,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_cron_list",
-        description = "List installed crons as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
+        description = "List installed crons as name-ordered summary pages (default 20, maximum 100). tz is the effective scheduler mode (UTC or daemon Local); configured_tz appears when an unsupported setting falls back to UTC. Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
     )]
     pub(crate) async fn bro_cron_list(
         &self,
@@ -1068,7 +1063,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_cron_upcoming",
-        description = "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry."
+        description = "Compute the next N scheduled times for a cron expression interpreted in UTC, as RFC3339 strings. Pure function; does not use an installed cron or its timezone."
     )]
     pub(crate) async fn bro_cron_upcoming(
         &self,
@@ -1078,6 +1073,7 @@ Constraints:\n\
         match crons::upcoming_times(&p.schedule, n) {
             Ok(times) => Self::ok_json(&serde_json::json!({
                 "schedule": p.schedule,
+                "tz": "UTC",
                 "upcoming": times,
             })),
             Err(e) => Self::err_text(&format!("schedule '{}': {e}", p.schedule)),
@@ -1401,6 +1397,36 @@ mod tests {
         let mut changed = exact;
         changed["vars"] = serde_json::json!({});
         assert!(arc_result_projection(changed, &params).is_err());
+    }
+
+    #[tokio::test]
+    async fn cron_upcoming_identifies_utc_independent_of_installed_timezone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.crons.install(
+            serde_json::from_value(serde_json::json!({
+                "name": "local-cron", "schedule": "0 0 9 * * *", "tz": "Local",
+                "routing_packet": "test-routing"
+            }))
+            .unwrap(),
+        );
+        let response = server
+            .bro_cron_upcoming(Parameters(CronUpcomingParams {
+                schedule: "0 0 9 * * *".into(),
+                count: Some(2),
+            }))
+            .await;
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let body: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(body["tz"], "UTC");
+        let upcoming = body["upcoming"].as_array().unwrap();
+        assert_eq!(upcoming.len(), 2);
+        for time in upcoming {
+            let time = chrono::DateTime::parse_from_rfc3339(time.as_str().unwrap()).unwrap();
+            assert_eq!(time.offset().local_minus_utc(), 0);
+            assert_eq!(time.format("%H:%M:%S").to_string(), "09:00:00");
+        }
     }
 
     #[tokio::test]

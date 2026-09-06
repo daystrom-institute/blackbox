@@ -3572,6 +3572,7 @@ pub(crate) async fn admin_poller_install(
         "status": "installed",
         "name": spec.name,
         "every_seconds": spec.every_seconds,
+        "effective_every_seconds": state.pollers.effective_every_seconds(&spec.name),
     }))
     .into_response()
 }

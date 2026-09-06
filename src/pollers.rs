@@ -21,7 +21,7 @@
 //! correctness layer.
 //!
 //! Cancellation: install hands back a `JoinHandle` stored in the
-//! registry; future `bro_poller_uninstall` aborts it. Restart-on-
+//! registry; `bro_poller_remove` aborts it. Restart-on-
 //! startup re-spawns from disk.
 
 use std::collections::{HashMap, VecDeque};
@@ -45,15 +45,13 @@ const DEDUP_RING_CAP: usize = 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PollerSpec {
     pub name: String,
-    /// Tick interval in seconds. Minimum enforced is 5s (operator-
-    /// blessed escape hatch via `BBOX_POLLER_MIN_INTERVAL_SECS` env).
+    /// Requested tick interval in seconds. The runtime applies the daemon
+    /// minimum (default 5s), with an unconditional floor of 1s.
     pub every_seconds: u64,
     /// HTTP fetch performed every tick. Same shape the workflow
-    /// `http_json` op consumes — `${env.X}` templating happens here
-    /// at parse time (env values baked into the spec) since pollers
-    /// have no per-tick ArcContext to resolve `${vars.X}` against.
-    /// Workflow author embeds credentials via env vars resolved when
-    /// the spec is loaded.
+    /// `http_json` op consumes. URL and header `${env.X}` references
+    /// resolve from the daemon environment on each tick; persisted specs
+    /// retain the references. Body templates and `${vars.X}` are not resolved.
     pub source: HttpFetchSpec,
     /// Optional dotted path into the response that selects an array;
     /// each element becomes its own event (extractor runs per-element,
@@ -114,9 +112,15 @@ impl DedupRing {
     }
 }
 
+struct InstalledPoller {
+    spec: PollerSpec,
+    // Captured when spawning the loop, never recomputed from current config.
+    effective_every_seconds: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct PollerRegistry {
-    by_name: RwLock<HashMap<String, PollerSpec>>,
+    by_name: RwLock<HashMap<String, InstalledPoller>>,
     handles: RwLock<HashMap<String, JoinHandle<()>>>,
     seen: RwLock<HashMap<String, DedupRing>>,
 }
@@ -127,17 +131,54 @@ impl PollerRegistry {
     }
 
     pub fn install(&self, spec: PollerSpec) {
-        self.by_name.write().insert(spec.name.clone(), spec);
+        self.by_name.write().insert(
+            spec.name.clone(),
+            InstalledPoller {
+                spec,
+                effective_every_seconds: None,
+            },
+        );
     }
 
     pub fn list(&self) -> Vec<PollerSpec> {
-        self.by_name.read().values().cloned().collect()
+        self.by_name
+            .read()
+            .values()
+            .map(|entry| entry.spec.clone())
+            .collect()
+    }
+
+    /// Runtime cadence captured at spawn; None means no loop has been registered.
+    pub fn effective_every_seconds(&self, name: &str) -> Option<u64> {
+        self.by_name
+            .read()
+            .get(name)
+            .and_then(|entry| entry.effective_every_seconds)
+    }
+
+    fn record_interval(&self, spec: &PollerSpec, interval: u64) {
+        if let Some(entry) = self.by_name.write().get_mut(&spec.name) {
+            entry.effective_every_seconds = Some(interval);
+        }
+    }
+
+    pub fn response_views(&self, detail: bool) -> Vec<Value> {
+        self.by_name
+            .read()
+            .values()
+            .map(|entry| {
+                let mut row = entry.spec.response_view(detail);
+                row["effective_every_seconds"] = serde_json::json!(entry.effective_every_seconds);
+                row
+            })
+            .collect()
     }
 
     pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<PollerSpec> {
         let mut updated = Vec::new();
         let mut by_name = self.by_name.write();
-        for spec in by_name.values_mut() {
+        for entry in by_name.values_mut() {
+            let spec = &mut entry.spec;
             if spec.default_project_dir.as_deref() == Some(old_project) {
                 spec.default_project_dir = Some(new_project.to_string());
                 updated.push(spec.clone());
@@ -290,10 +331,23 @@ pub fn spawn_loop(state: Arc<SharedState>, spec: PollerSpec) -> JoinHandle<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5u64)
     };
-    let interval_secs = spec.every_seconds.max(min_secs);
+    spawn_loop_with_minimum(state, spec, min_secs)
+}
+
+fn effective_interval_seconds(requested: u64, minimum: u64) -> u64 {
+    requested.max(minimum).max(1)
+}
+
+fn spawn_loop_with_minimum(
+    state: Arc<SharedState>,
+    spec: PollerSpec,
+    minimum: u64,
+) -> JoinHandle<()> {
+    let interval_secs = effective_interval_seconds(spec.every_seconds, minimum);
+    state.pollers.record_interval(&spec, interval_secs);
     if interval_secs != spec.every_seconds {
         tracing::warn!(
-            "poller '{}': every_seconds={} clamped up to {} (BBOX_POLLER_MIN_INTERVAL_SECS)",
+            "poller '{}': every_seconds={} clamped up to {} (daemon minimum, at least 1s)",
             spec.name,
             spec.every_seconds,
             interval_secs
@@ -464,6 +518,46 @@ mod tests {
             routing_packet: "packet-test".to_string(),
             default_project_dir: None,
         }
+    }
+
+    #[test]
+    fn poller_effective_interval_clamps_minimum_and_never_uses_zero() {
+        assert_eq!(effective_interval_seconds(2, 5), 5);
+        assert_eq!(effective_interval_seconds(60, 5), 60);
+        assert_eq!(effective_interval_seconds(0, 0), 1);
+        assert_eq!(effective_interval_seconds(0, 5), 5);
+    }
+
+    #[tokio::test]
+    async fn poller_discovery_reports_captured_interval_and_resets_on_reinstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let spec = sample_spec("cadence");
+        state.pollers.install(spec.clone());
+        assert!(state.pollers.response_views(false)[0]["effective_every_seconds"].is_null());
+
+        // Explicit minimum bypasses all host configuration reads. Abort before
+        // polling either task: this test never fetches or dispatches anything.
+        for minimum in [7200, 10800] {
+            let handle = spawn_loop_with_minimum(state.clone(), spec.clone(), minimum);
+            handle.abort();
+            for detail in [false, true] {
+                let row = &state.pollers.response_views(detail)[0];
+                assert_eq!(row["every_seconds"], 3600);
+                assert_eq!(row["effective_every_seconds"], minimum);
+            }
+            assert_eq!(
+                state.pollers.effective_every_seconds("cadence"),
+                Some(minimum)
+            );
+            assert_eq!(state.pollers.list()[0].every_seconds, 3600);
+            // Reinstall invalidates old timing until the new loop captures it.
+            state.pollers.install(spec.clone());
+            assert_eq!(state.pollers.effective_every_seconds("cadence"), None);
+        }
+        assert!(state.pollers.remove("cadence"));
+        assert!(state.pollers.response_views(false).is_empty());
     }
 
     #[test]
