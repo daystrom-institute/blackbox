@@ -747,3 +747,11 @@ No claim is made that every action of all 190 registered tools was exercised
 against production state; the coverage inventory distinguishes source review,
 synthetic contract tests, live reads, and the limited authorized deployments and
 artifact upgrades.
+
+
+Final checkout-owner publication reached durable success for code, Git history,
+and repo-owned knowledge/gaps at publisher commit `21e62d85`; the updated native
+collection gap was confirmed through the published MCP view. The same collector
+cycle received `503 edge_index_warming` for provenance export while the complete
+graph rebuilt after deployment. That export was not claimed successful; indexed
+property reads and the separate publication lanes succeeded independently.
