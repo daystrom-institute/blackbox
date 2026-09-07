@@ -2708,23 +2708,100 @@ mod tests {
         assert!(out.is_none());
     }
 
-    #[test]
-    fn system_memory_catalog_returns_all_memories() {
+    #[tokio::test]
+    async fn system_memory_catalog_returns_all_memories() {
         init_system_memory();
-        let out = exact_system_memory_response(&KnowledgeListParams {
-            category: Some("system_memory".into()),
-            ..Default::default()
-        })
-        .expect("system_memory category should return catalog");
-
-        assert!(out.contains("── System memories"));
-        assert!(out.contains("[system] sm-rule-packets"));
-        assert!(out.contains("[system] sm-refactor"));
-        assert!(out.contains("[system] sm-agentic-opening-sequence"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&root),
+        ));
         assert!(
-            !out.contains("bbox_compile"),
-            "catalog listing should not include full body"
+            system_memory::search(None).len() > 3,
+            "fixture must span pages"
         );
+        for query in [None, Some("refactor")] {
+            let memories = system_memory::search(query);
+            let expected: Vec<_> = memories.iter().map(|memory| memory.id.as_str()).collect();
+            let mut recovered = Vec::new();
+            let mut offset = 0;
+            loop {
+                let result = server
+                    .bbox_knowledge(Parameters(KnowledgeListParams {
+                        category: Some("system_memory".into()),
+                        query: query.map(str::to_owned),
+                        limit: Some(3),
+                        offset: Some(offset),
+                        ..Default::default()
+                    }))
+                    .await;
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                assert!(
+                    serde_json::to_vec(&result).unwrap().len()
+                        <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+                );
+                let structured = result.structured_content.as_ref().unwrap();
+                let out = structured["text"].as_str().unwrap();
+                let ids: Vec<_> = out
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix("[system] ")
+                            .and_then(|line| line.split_once(':').map(|(id, _)| id.to_owned()))
+                    })
+                    .collect();
+                assert!(!ids.is_empty() && ids.len() <= 3, "{out}");
+                for id in &ids {
+                    assert!(out.contains(&format!("ref: system_memory:{id}")), "{out}");
+                    assert!(
+                        out.contains(&format!("bbox_knowledge(query=\"{id}\")")),
+                        "{out}"
+                    );
+                }
+                for memory in &memories {
+                    if memory.content.len() > 4096 {
+                        assert!(
+                            !out.contains(&memory.content),
+                            "catalog must keep long runbooks behind exact readers"
+                        );
+                    }
+                }
+                recovered.extend(ids);
+                let next = out.lines().find_map(|line| {
+                    line.strip_prefix("Continue bbox_knowledge(category=system_memory, offset=")
+                        .and_then(|rest| {
+                            rest.split_once(',')
+                                .map(|(offset, _)| offset.parse::<u64>().unwrap())
+                        })
+                });
+                let Some(next) = next else {
+                    break;
+                };
+                assert_eq!(
+                    next as usize,
+                    recovered.len(),
+                    "continuation must not skip catalog rows"
+                );
+                assert!(next > offset);
+                assert!(
+                    out.contains("with the same query; live catalog order can change after reload")
+                );
+                offset = next;
+            }
+            assert_eq!(
+                recovered, expected,
+                "all matching memories must appear once in catalog order"
+            );
+            let exhausted = system_memory_catalog_response(&KnowledgeListParams {
+                category: Some("system_memory".into()),
+                query: query.map(str::to_owned),
+                offset: Some(recovered.len() as u64),
+                limit: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(!exhausted.contains("[system]"));
+            assert!(!exhausted.contains("Continue bbox_knowledge"));
+        }
     }
 
     #[test]
