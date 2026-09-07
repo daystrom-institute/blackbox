@@ -299,9 +299,20 @@ mod tests {
         let text = error_text(&listed);
         let page: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(page["total"], 1, "{page}");
-        server.state.notes.write().create(&serde_json::from_value(serde_json::json!({
-            "kind":"learned", "body":"historical path note", "project":"former-project-path", "project_id":project_id
-        })).unwrap()).unwrap();
+        let mut historical: NoteParams = serde_json::from_value(serde_json::json!({
+            "kind":"learned", "body":"unstamped historical path note", "project":"former-project-path", "project_id":project_id
+        })).unwrap();
+        assert!(
+            historical.project_id.is_none(),
+            "wire input cannot assert resolver-owned identity"
+        );
+        server.state.notes.write().create(&historical).unwrap();
+        // Seed the identity through the internal resolver-owned field. A
+        // deserialized project_id is intentionally ignored, and a path-only
+        // historical note needs an explicit ledger mapping to be visible.
+        historical.project_id = Some(server.project_filter_identity(project_id).unwrap());
+        historical.body = "historical path note".into();
+        server.state.notes.write().create(&historical).unwrap();
         let note = server
             .state
             .notes
@@ -311,6 +322,30 @@ mod tests {
             .find(|note| note.body == "historical path note")
             .unwrap()
             .clone();
+        assert_eq!(note.project_id.as_deref(), Some(project_id));
+        assert_eq!(note.project.as_deref(), Some("former-project-path"));
+        assert!(server.filter_ledger_paths(project_id).is_empty());
+        let before = serde_json::to_value(server.state.notes.read().all()).unwrap();
+        let listed = server.bbox_notes(Parameters(
+            NoteListParams {
+                project: Some(project_id.into()),
+                ..Default::default()
+            }
+            .into(),
+        ));
+        assert_ne!(listed.is_error, Some(true), "{listed:?}");
+        let listed: serde_json::Value = serde_json::from_str(&error_text(&listed)).unwrap();
+        assert_eq!(
+            listed["total"], 2,
+            "unstamped historical paths require ledger mapping"
+        );
+        assert!(
+            listed["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == note.id)
+        );
         // The stored path spelling can differ from the resolving selector;
         // exact recovery must use the same identity arm as discovery.
         let exact = server.bbox_notes(Parameters(
@@ -323,7 +358,35 @@ mod tests {
             .into(),
         ));
         assert_ne!(exact.is_error, Some(true), "{exact:?}");
-        let before = serde_json::to_value(server.state.notes.read().all()).unwrap();
+        let exact: serde_json::Value = serde_json::from_str(&error_text(&exact)).unwrap();
+        let recovered: serde_json::Value =
+            serde_json::from_str(exact["body"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(recovered, serde_json::to_value(&note).unwrap());
+        let unstamped_id = server
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .find(|note| note.body == "unstamped historical path note")
+            .unwrap()
+            .id
+            .clone();
+        for (id, selector) in [
+            (unstamped_id, project_id),
+            (note.id.clone(), "unknown-project-selector"),
+        ] {
+            let refused = server.bbox_notes(Parameters(
+                NoteListParams {
+                    id: Some(id),
+                    project: Some(selector.into()),
+                    full: Some(true),
+                    ..Default::default()
+                }
+                .into(),
+            ));
+            assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        }
         let invalid = server.bbox_notes(Parameters(NoteListToolParams {
             filters: NoteListParams {
                 id: Some(note.id),
