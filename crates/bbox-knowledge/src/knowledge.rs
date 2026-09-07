@@ -3686,7 +3686,7 @@ impl Knowledge {
         });
         let total_results = results.len();
         let offset = usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX);
-        results.drain(..offset.min(total_results));
+        drop(results.drain(..offset.min(total_results)));
         results.truncate(limit);
 
         if results.is_empty() {

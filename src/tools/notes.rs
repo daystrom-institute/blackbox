@@ -124,21 +124,16 @@ impl BlackboxServer {
             let exact =
                 p.filters.full.unwrap_or(false) || p.cursor.is_some() || p.body_limit.is_some();
             if exact {
-                let note = self.state.notes.read().exact(&p.filters)?;
-                let selection = format!("note:{}", note.id);
-                return Ok(serde_json::to_string(&serde_json::json!({
-                    "id": note.id,
-                    "body": super::body_page::json_body_page(
-                        &selection,
-                        &serde_json::to_value(&note)?,
-                        p.cursor.as_deref(),
-                        p.body_limit,
-                    )?,
-                }))?);
+                anyhow::ensure!(
+                    p.offset.is_none() && p.filters.limit.is_none(),
+                    "exact note reads do not accept offset or limit; use body_limit"
+                );
             }
             // Worktree filter paths map to the registered base (where notes
             // are keyed); substring filters pass through untouched.
             let offset = p.offset.unwrap_or(0);
+            let cursor = p.cursor;
+            let body_limit = p.body_limit;
             let mut p = p.filters;
             if let Some(raw) = p.project.clone() {
                 // Catalog-mode ledger arm (plan §8.2): path-only notes still
@@ -166,6 +161,19 @@ impl BlackboxServer {
                     p.project_id = Some(resolved.to_owned());
                     p.project_ledger_paths = self.ledger_historical_paths(resolved);
                 }
+            }
+            if exact {
+                let note = self.state.notes.read().exact(&p)?;
+                let selection = format!("note:{}", note.id);
+                return Ok(serde_json::to_string(&serde_json::json!({
+                    "id": note.id,
+                    "body": super::body_page::json_body_page(
+                        &selection,
+                        &serde_json::to_value(&note)?,
+                        cursor.as_deref(),
+                        body_limit,
+                    )?,
+                }))?);
             }
             Ok(serde_json::to_string(
                 &self.state.notes.read().list_page(&p, offset)?,
@@ -291,6 +299,45 @@ mod tests {
         let text = error_text(&listed);
         let page: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(page["total"], 1, "{page}");
+        server.state.notes.write().create(&serde_json::from_value(serde_json::json!({
+            "kind":"learned", "body":"historical path note", "project":"former-project-path", "project_id":project_id
+        })).unwrap()).unwrap();
+        let note = server
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .find(|note| note.body == "historical path note")
+            .unwrap()
+            .clone();
+        // The stored path spelling can differ from the resolving selector;
+        // exact recovery must use the same identity arm as discovery.
+        let exact = server.bbox_notes(Parameters(
+            NoteListParams {
+                id: Some(note.id.clone()),
+                project: Some(project_id.into()),
+                full: Some(true),
+                ..Default::default()
+            }
+            .into(),
+        ));
+        assert_ne!(exact.is_error, Some(true), "{exact:?}");
+        let before = serde_json::to_value(server.state.notes.read().all()).unwrap();
+        let invalid = server.bbox_notes(Parameters(NoteListToolParams {
+            filters: NoteListParams {
+                id: Some(note.id),
+                full: Some(true),
+                ..Default::default()
+            },
+            offset: Some(0),
+            ..Default::default()
+        }));
+        assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(server.state.notes.read().all()).unwrap(),
+            before
+        );
     }
 
     /// Audit A06/A13: exact note reads page the complete stored row through
