@@ -35,7 +35,7 @@ pub(crate) struct StorageHealthParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_health",
-        description = "Read daemon-owned edge storage totals and the ten largest contributors. include_files=true returns file pages (limit default 20, max 100); follow next_offset. File paths are relative to daemon storage, not caller-readable paths. Use bbox_storage_gc for managed cleanup. Manifest and retention warnings remain visible."
+        description = "Read daemon-owned edge storage totals and the ten largest contributors. include_files=true returns file pages (limit default 20, max 100); follow next_offset. File paths are relative to daemon storage, not caller-readable paths. Use bbox_storage_gc for managed cleanup. Each call rescans the selected daemon storage before projecting totals or file pages. Manifest and retention warnings remain visible."
     )]
     pub(crate) async fn bbox_storage_health(
         &self,
