@@ -987,7 +987,7 @@ impl Session {
             pin.also_pin(FINAL_RESULT_TOOL);
         }
 
-        let reg = Registry::with_options(
+        let mut reg = Registry::with_options(
             builtins,
             mcp_out_box,
             &pin,
@@ -995,16 +995,30 @@ impl Session {
             code_mode.defers_builtins(),
         );
         if restored_snapshot {
-            let activations = match prior_side.get("tool_activations") {
-                Some(saved) => saved.clone(),
-                None => {
-                    let path = event_log.path().to_path_buf();
-                    tokio::task::spawn_blocking(move || EventLog::tool_search_activations(&path))
-                        .await
-                        .context("restore legacy tool activations")?
+            // Receipts are independent evidence, even when an explicit saved
+            // activation list is empty. Neither source can erase the other.
+            let path = event_log.path().to_path_buf();
+            let snapshot = store.restored.as_ref().unwrap().snapshot.clone();
+            let receipts = tokio::task::spawn_blocking(move || {
+                let mut names = std::collections::BTreeSet::new();
+                for source in [
+                    EventLog::tool_search_activations(&path),
+                    EventLog::snapshot_tool_search_activations(&snapshot),
+                ] {
+                    names.extend(
+                        source
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned),
+                    );
                 }
-            };
-            reg.restore_activations(&activations);
+                json!(names)
+            })
+            .await
+            .context("read resume tool activation receipts")?;
+            reg.restore_resume_activations(prior_side.get("tool_activations"), &receipts);
         }
         validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 
@@ -1028,6 +1042,12 @@ impl Session {
             Some(event_log.clone()),
             seq_counter.clone(),
         );
+        if let Err(error) = reg.validate_resume_tool_schemas() {
+            emitter.result_error(&format!("{error:#}"), 0);
+            let log = event_log.clone();
+            let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
+            return Err(error);
+        }
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
         let context_window = compaction.context_window(&base_opts.model);
@@ -1130,6 +1150,7 @@ impl Session {
     /// Manual `/compact`: summarize-and-replace the prefix and emit a manual
     /// `compact_boundary`. A no-op (logged) when there isn't enough history.
     async fn compact_manual(&mut self) -> Result<()> {
+        self.reg.validate_resume_tool_schemas()?;
         let tool_specs = self.reg.wire_specs();
         self.event_log.append_milestone(
             "compaction_start",
@@ -1190,6 +1211,7 @@ impl Session {
         mut cancel: watch::Receiver<bool>,
         mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
     ) -> Result<()> {
+        self.reg.validate_resume_tool_schemas()?;
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
 
@@ -2961,6 +2983,171 @@ mod tests {
         assert!(pushed[0][0].content.contains("FILE-BODY"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn resumed_missing_schemas_stop_before_model_or_compaction() {
+        let cases = [
+            (
+                "policy_denied",
+                Some(json!(["file_read"])),
+                true,
+                true,
+                true,
+                false,
+            ),
+            (
+                "catalog_missing",
+                Some(json!(["file_read"])),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "explicit_empty_receipt",
+                Some(json!([])),
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                "explicit_empty_snapshot_receipt",
+                Some(json!([])),
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "intact",
+                Some(json!(["file_read"])),
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                "intact_saved_only",
+                Some(json!(["file_read"])),
+                true,
+                false,
+                false,
+                true,
+            ),
+            ("legacy_snapshot_receipt", None, true, false, false, true),
+            ("legacy_log_receipt", None, true, false, true, true),
+            (
+                "unactivated_code_mode",
+                Some(json!([])),
+                true,
+                false,
+                false,
+                true,
+            ),
+        ];
+        for (case, saved, present, denied, log_receipt, succeeds) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
+            let call = json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"load-read","name":"tool_search","input":{"query":"select:file_read"}
+            }]});
+            let result = json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"load-read","is_error":false,
+                "content":json!({"loaded":["file_read"]}).to_string()
+            }]});
+            if log_receipt {
+                log.append_event(&json!({"type":"assistant","message":call}));
+                log.append_event(&json!({"type":"user","message":result}));
+                let flush = log.clone();
+                tokio::task::spawn_blocking(move || flush.flush_blocking())
+                    .await
+                    .unwrap();
+            }
+            let receipts = if case.ends_with("snapshot_receipt") {
+                EventLog::snapshot_tool_search_activations(&json!([call, result]))
+            } else {
+                let path = log.path().to_path_buf();
+                tokio::task::spawn_blocking(move || EventLog::tool_search_activations(&path))
+                    .await
+                    .unwrap()
+            };
+            let (mut session, shared) = mk_session_with_store(
+                vec![MockTurn::Text("checkpoint".into())],
+                Some(SessionStore::for_test(root.join("session.json"))),
+            );
+            let builtins: Vec<Arc<dyn Tool>> = if present {
+                vec![Arc::new(FileReadTool)]
+            } else {
+                vec![]
+            };
+            let filter = mcp::ToolFilter::from_csv(denied.then_some("file_read"), None);
+            session.reg =
+                Registry::with_options(builtins, vec![], &PinPolicy::default(), &filter, true);
+            session
+                .reg
+                .restore_resume_activations(saved.as_ref(), &receipts);
+            session.event_log = log.clone();
+            session.emitter = Emitter::new(case.into()).with_event_log(log.clone());
+            session.cx.root = root;
+            // Force the proactive compaction branch if the guard were late.
+            session.compact_threshold = Some(0);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let result = session
+                .user_turn(
+                    "Report the checkpoint.",
+                    cancel_rx,
+                    Arc::new(StdMutex::new(VecDeque::new())),
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{case}");
+            if succeeds {
+                assert_eq!(shared.started.load(Ordering::SeqCst), 1, "{case}");
+                if case == "unactivated_code_mode" {
+                    assert_eq!(session.reg.activation_state(), json!([]));
+                    assert!(
+                        !session
+                            .reg
+                            .wire_specs()
+                            .iter()
+                            .any(|tool| tool.name == "file_read")
+                    );
+                } else {
+                    assert_eq!(session.reg.activation_state(), json!(["file_read"]));
+                }
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("error.resume_tool_schema_missing"),
+                    "{case}: {error}"
+                );
+                assert!(error.contains("file_read"), "{case}: {error}");
+                assert!(session.compact_manual().await.is_err(), "{case}");
+                assert_eq!(shared.started.load(Ordering::SeqCst), 0, "{case}");
+                assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 0, "{case}");
+                assert_eq!(session.reg.activation_state(), json!([]), "{case}");
+                let rows: Vec<Value> = std::fs::read_to_string(log.path())
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let terminal: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["event"]["type"] == "result")
+                    .collect();
+                assert_eq!(terminal.len(), 1, "{case}");
+                assert_eq!(terminal[0]["event"]["is_error"], true, "{case}");
+                assert!(
+                    terminal[0]["event"]["result"]
+                        .as_str()
+                        .unwrap()
+                        .contains("error.resume_tool_schema_missing"),
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

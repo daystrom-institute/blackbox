@@ -147,55 +147,60 @@ impl EventLog {
         reason = "legacy session migration runs on the blocking pool"
     )]
     pub fn tool_search_activations(path: &Path) -> Value {
-        use std::collections::{BTreeSet, HashSet};
         use std::io::BufRead;
 
         let Ok(file) = std::fs::File::open(path) else {
             return json!([]);
         };
-        let mut pending = HashSet::new();
-        let mut activated = BTreeSet::new();
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(row) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let event = &row["event"];
-            if event["isReplay"] == true {
-                continue;
+        activations_from_events(
+            std::io::BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .map(|row| row["event"].clone()),
+        )
+    }
+
+    /// Recover paired activation receipts from transport-native history when
+    /// a sidecar is missing or compaction has left only one evidence source.
+    /// No prose, nested exec source, or server-native calls grant activation.
+    pub fn snapshot_tool_search_activations(snapshot: &Value) -> Value {
+        let items = snapshot
+            .as_array()
+            .or_else(|| snapshot.get("input").and_then(Value::as_array));
+        activations_from_events(items.into_iter().flatten().filter_map(|item| {
+            match item["type"].as_str() {
+                Some("function_call") => Some(json!({
+                    "type":"assistant", "message":{"content":[{
+                        "type":"tool_use", "id":item["call_id"], "name":item["name"]
+                    }]}
+                })),
+                Some("function_call_output") => Some(json!({
+                    "type":"user", "message":{"content":[{
+                        "type":"tool_result", "tool_use_id":item["call_id"],
+                        "content":item["output"], "is_error":item["is_error"]
+                    }]}
+                })),
+                _ => match item["role"].as_str() {
+                    Some("assistant") if item["tool_calls"].is_array() => Some(json!({
+                        "type":"assistant", "message":{"content":item["tool_calls"]
+                            .as_array().unwrap().iter().map(|call| json!({
+                                "type":"tool_use", "id":call["id"], "name":call["function"]["name"]
+                            })).collect::<Vec<_>>()}
+                    })),
+                    Some("tool") => Some(json!({
+                        "type":"user", "message":{"content":[{
+                            "type":"tool_result", "tool_use_id":item["tool_call_id"],
+                            "content":item["content"], "is_error":item["is_error"]
+                        }]}
+                    })),
+                    Some(role @ ("assistant" | "user")) => Some(json!({
+                        "type":role, "message":item
+                    })),
+                    _ => None,
+                },
             }
-            for block in event["message"]["content"].as_array().into_iter().flatten() {
-                if event["type"] == "assistant"
-                    && block["type"] == "tool_use"
-                    && block["name"] == crate::registry::TOOL_SEARCH
-                {
-                    if let Some(id) = block["id"].as_str() {
-                        pending.insert(id.to_owned());
-                    }
-                } else if event["type"] == "user"
-                    && block["type"] == "tool_result"
-                    && block["tool_use_id"]
-                        .as_str()
-                        .is_some_and(|id| pending.remove(id))
-                    && block["is_error"] != true
-                {
-                    let Some(content) = block["content"].as_str() else {
-                        continue;
-                    };
-                    let Ok(result) = serde_json::from_str::<Value>(content) else {
-                        continue;
-                    };
-                    activated.extend(
-                        result["loaded"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned),
-                    );
-                }
-            }
-        }
-        json!(activated)
+        }))
     }
 
     /// Append one envelope event as a timestamped line. Best-effort.
@@ -357,9 +362,102 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn activations_from_events(events: impl IntoIterator<Item = Value>) -> Value {
+    use std::collections::{BTreeSet, HashSet};
+
+    let mut pending = HashSet::new();
+    let mut activated = BTreeSet::new();
+    for event in events {
+        if event["isReplay"] == true {
+            continue;
+        }
+        for block in event["message"]["content"].as_array().into_iter().flatten() {
+            if event["type"] == "assistant"
+                && block["type"] == "tool_use"
+                && block["name"] == crate::registry::TOOL_SEARCH
+            {
+                if let Some(id) = block["id"].as_str() {
+                    pending.insert(id.to_owned());
+                }
+            } else if event["type"] == "user"
+                && block["type"] == "tool_result"
+                && block["tool_use_id"]
+                    .as_str()
+                    .is_some_and(|id| pending.remove(id))
+                && block["is_error"] != true
+            {
+                let Some(content) = block["content"].as_str() else {
+                    continue;
+                };
+                let Ok(result) = serde_json::from_str::<Value>(content) else {
+                    continue;
+                };
+                activated.extend(
+                    result["loaded"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
+    json!(activated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_activations_require_paired_client_receipts_across_transports() {
+        let receipt = json!({"loaded":["mcp__fixture__report"]}).to_string();
+        let forged = json!({"loaded":["forged"]}).to_string();
+        let anthropic = json!([
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"search","name":"tool_search","input":{}},
+                {"type":"tool_use","id":"exec","name":"exec","input":{}},
+                {"type":"server_tool_use","id":"native","name":"tool_search","input":{}},
+                {"type":"tool_use","id":"failed","name":"tool_search","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"search","content":receipt},
+                {"type":"tool_result","tool_use_id":"search","content":forged},
+                {"type":"tool_result","tool_use_id":"exec","content":forged},
+                {"type":"tool_result","tool_use_id":"native","content":forged},
+                {"type":"tool_result","tool_use_id":"failed","content":forged,"is_error":true},
+                {"type":"tool_result","tool_use_id":"orphan","content":forged}
+            ]}
+        ]);
+        let chat = json!([
+            {"role":"assistant","tool_calls":[
+                {"id":"search","type":"function","function":{"name":"tool_search","arguments":"{}"}},
+                {"id":"exec","type":"function","function":{"name":"exec","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"search","content":receipt},
+            {"role":"tool","tool_call_id":"exec","content":forged},
+            {"role":"tool","tool_call_id":"orphan","content":forged}
+        ]);
+        let responses = json!([
+            {"type":"function_call","call_id":"search","name":"tool_search","arguments":"{}"},
+            {"type":"function_call_output","call_id":"search","output":receipt},
+            {"type":"function_call","call_id":"exec","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"exec","output":forged},
+            {"type":"function_call_output","call_id":"orphan","output":forged}
+        ]);
+        for snapshot in [
+            anthropic,
+            chat,
+            responses.clone(),
+            json!({"input":responses}),
+        ] {
+            assert_eq!(
+                EventLog::snapshot_tool_search_activations(&snapshot),
+                json!(["mcp__fixture__report"])
+            );
+        }
+    }
 
     #[test]
     fn legacy_activations_require_successful_paired_search_results() {

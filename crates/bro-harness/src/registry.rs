@@ -39,6 +39,7 @@ pub enum Tier {
 /// Which tools get elevated to `Pinned`. Patterns are exact names or a
 /// trailing-`*` prefix glob. Override with `BRO_HARNESS_PIN_TOOLS`
 /// (comma-separated).
+#[derive(Default)]
 pub struct PinPolicy {
     patterns: Vec<String>,
 }
@@ -78,6 +79,9 @@ struct Entry {
 pub struct Registry {
     tools: HashMap<String, Entry>,
     activated: Arc<Mutex<HashSet<String>>>,
+    /// Prior flat activation promises remain evidence even if restoration is
+    /// explicitly cleared or current catalog/policy removes a tool.
+    resume_required: std::collections::BTreeSet<String>,
 }
 
 impl Registry {
@@ -174,7 +178,11 @@ impl Registry {
             );
         }
 
-        Self { tools, activated }
+        Self {
+            tools,
+            activated,
+            resume_required: Default::default(),
+        }
     }
 
     /// Session-owned activation names, never persisted schemas or permissions.
@@ -203,6 +211,43 @@ impl Registry {
                 activated.insert(name.to_string());
             }
         }
+    }
+
+    /// Saved state controls restoration; successful receipts independently
+    /// constrain the schema promised to a resumed conversation. Only legacy
+    /// snapshots with no activation field recover activations from receipts.
+    pub fn restore_resume_activations(&mut self, saved: Option<&Value>, receipts: &Value) {
+        self.restore_activations(saved.unwrap_or(receipts));
+        self.resume_required = saved
+            .into_iter()
+            .chain(std::iter::once(receipts))
+            .flat_map(|value| value.as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+
+    /// Prior flat activation requires a current flat schema. Tools hidden for
+    /// code-mode that were never flat-activated create no such requirement.
+    pub fn validate_resume_tool_schemas(&self) -> anyhow::Result<()> {
+        let activated = self.activated.lock().unwrap();
+        let missing: Vec<_> =
+            self.resume_required
+                .iter()
+                .filter(|name| {
+                    !self.tools.get(*name).is_some_and(|entry| {
+                        entry.tier != Tier::Deferred || activated.contains(*name)
+                    })
+                })
+                .cloned()
+                .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "error.resume_tool_schema_missing: previously activated client tools lack current wire schemas: {}. Restore the intended permitted tool catalog and activation state, or start a fresh session using current policy.",
+                missing.join(", ")
+            );
+        }
+        Ok(())
     }
 
     fn spec_of(e: &Entry) -> ToolSpec {
