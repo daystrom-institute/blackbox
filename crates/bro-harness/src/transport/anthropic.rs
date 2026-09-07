@@ -287,6 +287,27 @@ fn inband_error_retryable(ev: &Value) -> bool {
     m.contains("network error") || m.contains("overloaded") || m.contains("try again")
 }
 
+/// Empty text/thinking starts are stream scaffolding. Other block starts can
+/// carry complete content or signal provider-side execution, so replaying the
+/// request after forwarding them can duplicate output or a native tool call.
+fn sse_event_has_content(ev: &Value) -> bool {
+    match ev["type"].as_str() {
+        Some("content_block_delta") => true,
+        Some("content_block_start") => {
+            let block = &ev["content_block"];
+            match block["type"].as_str() {
+                Some("text") => block["text"].as_str().is_some_and(|text| !text.is_empty()),
+                Some("thinking") => block["thinking"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                Some(_) => true,
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mut StopReason) {
     let ensure = |blocks: &mut Vec<SseBlock>, idx: usize| {
         while blocks.len() <= idx {
@@ -673,10 +694,9 @@ impl Transport for AnthropicTransport {
             let mut usage = Usage::default();
             let mut stop = StopReason::Done;
             let mut inband_error: Option<(String, bool)> = None;
-            // Once any content delta has been forwarded to the sink, retrying the
-            // turn would re-stream it and the daemon would render it twice — so a
-            // mid-stream fault is only retryable while nothing has streamed yet
-            // (mirrors the Responses transport's dedup-safe retry guard).
+            // Once content or a tool start has been forwarded, retrying can
+            // duplicate output or provider-side execution. Empty text/thinking
+            // starts alone still allow a retry before actual content arrives.
             let mut streamed_content = false;
 
             'consume: loop {
@@ -726,9 +746,7 @@ impl Transport for AnthropicTransport {
                                     Some((format!("{code}: {msg}"), inband_error_retryable(&ev)));
                                 break 'consume;
                             }
-                            if ev["type"].as_str() == Some("content_block_delta") {
-                                streamed_content = true;
-                            }
+                            streamed_content |= sse_event_has_content(&ev);
                             sink.stream_event(ev.clone());
                             fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
                             // Mirror the running usage onto the transport so a
@@ -2031,6 +2049,134 @@ mod tests {
         // take_interrupted_usage would return zeros, not a stale copy.
         assert_eq!(tx.take_interrupted_usage(), Usage::default());
         server.await.unwrap();
+    }
+
+    async fn assert_retry_after_stream_prefix(prefix: &[Value], should_retry: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoSink;
+        impl crate::transport::TurnSink for NoSink {
+            fn stream_event(&self, _event: Value) {}
+        }
+
+        let mut first_body = String::from(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        );
+        for event in prefix {
+            first_body.push_str(&format!("data: {event}\n\n"));
+        }
+        first_body.push_str(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}\n\n",
+        );
+        let recovered_body = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, mut stop) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut requests = 0;
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stop => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "request ended before its body");
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                            .unwrap();
+                        if request.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests += 1;
+                let body = if requests == 1 {
+                    first_body.as_str()
+                } else {
+                    recovered_body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let mut tx = AnthropicTransport {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            provider: Some("glm".into()),
+            auth: Auth::Bearer("token".into()),
+            version: "2023-06-01".into(),
+            messages: Vec::new(),
+            last_segment_usage: Usage::default(),
+        };
+        tx.push_user_text("hi");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tx.run_turn(&[], &opts(SystemPrompt::default()), &NoSink),
+        )
+        .await;
+        let _ = shutdown.send(());
+        let requests = server.await.unwrap();
+        let result = result.expect("turn must finish within the test deadline");
+        if should_retry {
+            assert_eq!(result.unwrap().text, "recovered");
+            assert_eq!(requests, 2, "precontent failure must retry once");
+        } else {
+            let error = result
+                .err()
+                .expect("content must make the failure terminal");
+            assert!(error.to_string().contains("overloaded_error"));
+            assert_eq!(requests, 1, "content must prevent a second HTTP request");
+            assert_eq!(tx.messages.len(), 1, "failed segment must not be committed");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_does_not_retry_after_inline_native_search() {
+        let call = json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"server_tool_use","id":"native-1","name":"web_search_prime",
+            "input":{"search_query":"synthetic"}
+        }});
+        let result = json!({"type":"content_block_start","index":1,"content_block":{
+            "type":"tool_result","tool_use_id":"native-1","content":"[]"
+        }});
+        // Each native block independently forbids replay, including before a
+        // result arrives and when only the result is observed in a segment.
+        assert_retry_after_stream_prefix(std::slice::from_ref(&call), false).await;
+        assert_retry_after_stream_prefix(std::slice::from_ref(&result), false).await;
+        assert_retry_after_stream_prefix(&[call, result], false).await;
+    }
+
+    #[tokio::test]
+    async fn run_turn_retries_after_empty_content_starts() {
+        assert_retry_after_stream_prefix(&[], true).await;
+        assert_retry_after_stream_prefix(
+            &[
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            ],
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
