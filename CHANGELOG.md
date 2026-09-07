@@ -10,6 +10,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Removed
 
+- Roadmap MCP mutations and promotion. Historical reads, exact export and
+  graph relations remain available; new planning uses the owning project's
+  planning graph, and active work uses threads.
+
 - Daemon workflows, atoms, application crons/pollers/webhooks, reaction delivery,
   Slack/Badgey consultants and whiteboard execution. Bro control and corpus
   capabilities remain; external callers own application orchestration.
@@ -87,6 +91,10 @@ out explicitly under `Changed` or `Removed`.
   to start another task.
 
 ### Fixed
+
+- Broadcast preserves explicit tool defaults and owner-managed session guards.
+  Refused admission no longer creates phantom task history; tracked setup and
+  provider failures remain recoverable by task ID.
 
 - Invalid prune providers, empty task selections and unrepresentable wait
   durations refuse before effects. Allocator updates preserve corrupt stores

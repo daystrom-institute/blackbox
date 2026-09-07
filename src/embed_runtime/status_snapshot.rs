@@ -104,13 +104,14 @@ impl EmbedStatusParams {
         {
             bail!("error.bad_input: diagnostic_deadline_ms requires diagnostics");
         }
-        if self
-            .recall_probe_route
-            .as_ref()
-            .is_some_and(|s| s.trim().is_empty() || s.len() > 256)
-        {
+        if self.recall_probe_route.as_ref().is_some_and(|s| {
+            s.trim().is_empty()
+                || s.len() > 256
+                || s.contains(['/', '\\'])
+                || matches!(s.as_str(), "." | "..")
+        }) {
             bail!(
-                "error.bad_input: recall_probe_route requires a nonempty name of at most 256 bytes"
+                "error.bad_input: recall_probe_route requires a nonempty partition name of at most 256 bytes, without path separators"
             );
         }
         if (self.probe_sample_every.is_some() || self.probe_k.is_some())
@@ -159,18 +160,21 @@ pub(crate) fn read_status(
     }
     let value = collect()?;
     let body = serde_json::to_string(&value)?;
-    // Budget both representations even though this adapter currently emits text.
-    let envelope = json!({"content":[{"type":"text","text": &body}],"structuredContent":value,"isError":false});
-    if p.body_limit.is_none()
-        && serde_json::to_vec(&envelope)?.len()
-            <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
-    {
-        return Ok(body);
-    }
     if body.len() > MAX_REPORT_BYTES {
         bail!(
             "error.snapshot_too_large: collection completed but the report exceeds the 8 MiB snapshot limit; no snapshot stored; explicitly narrow diagnostic_routes or scan/probe opt-ins before collecting again"
         );
+    }
+    // Large and explicitly paged reports need no duplicate envelope allocation.
+    // Budget both representations for the small ordinary shape even though
+    // this adapter currently emits text only.
+    if p.body_limit.is_none() && body.len() <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES {
+        let envelope = json!({"content":[{"type":"text","text": &body}],"structuredContent":&value,"isError":false});
+        if serde_json::to_vec(&envelope)?.len()
+            <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        {
+            return Ok(body);
+        }
     }
     let report = Snapshot {
         id: uuid::Uuid::new_v4().simple().to_string(),
@@ -410,6 +414,9 @@ mod tests {
             json!({"probe_k":10}),
             json!({"probe_sample_every":2}),
             json!({"recall_probe_route":""}),
+            json!({"recall_probe_route":"../outside"}),
+            json!({"recall_probe_route":"/absolute"}),
+            json!({"recall_probe_route":".."}),
         ] {
             let p: EmbedStatusParams = serde_json::from_value(params).unwrap();
             assert!(read_status(&cache, &p, || panic!("invalid input collected")).is_err());
