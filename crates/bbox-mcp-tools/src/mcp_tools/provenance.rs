@@ -122,6 +122,7 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
         );
         let note = note_from_edges(&commit, &edges, edge_index);
         let documents = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)
+            .map_err(anyhow::Error::from)
             .and_then(|parts| parts.iter().map(serialize_note).collect::<Result<Vec<_>>>())
             .map_err(|_| anyhow::anyhow!(
                 "error.provenance_export_prepare_failed: documents could not be prepared; no checkout mutation was attempted"
