@@ -11,7 +11,7 @@ use bbox_providers::providers::ProviderContext;
 
 const REF_CAP: usize = 500;
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct RefSizeParams {
     /// Entity refs to measure. Successful refs are returned in canonical form;
     /// unresolved refs retain the caller-supplied string for diagnosis.
@@ -20,6 +20,37 @@ pub struct RefSizeParams {
     /// selecting checkout authority for relative `file:` refs. This lower
     /// module never opens the directory directly.
     pub project_dir: Option<String>,
+    /// Continue exact result JSON with body.next_cursor and the same refs/project_dir.
+    /// Changed measurements or selection refuse continuation.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Exact response body bytes, 4..=4096. Oversized replies start paging automatically.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
+}
+
+/// Validate paging syntax before the adapter acquires checkout data.
+pub fn validate_response_params(p: &RefSizeParams) -> Result<()> {
+    anyhow::ensure!(p.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
+        "body_limit must be between 4 and 4096");
+    if let Some(cursor) = p.cursor.as_deref() {
+        let valid = cursor.split_once(':').is_some_and(|(hash, offset)|
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && offset.parse::<usize>().is_ok());
+        anyhow::ensure!(valid, "invalid cursor; use body.next_cursor");
+    }
+    Ok(())
+}
+
+/// Apply only after all measurement leases have been revalidated. Paging must
+/// never turn a refused checkout read into a successful partial measurement.
+pub fn page_response(p: &RefSizeParams, output: &str) -> Result<String> {
+    validate_response_params(p)?;
+    let scope = json!(["ref_size", p.refs, p.project_dir]).to_string();
+    let value = bbox_corpus_core::response_page::bounded_json_response(
+        &scope, serde_json::from_str(output)?, p.cursor.as_deref(), p.body_limit,
+    )?;
+    Ok(value.to_string())
 }
 
 /// Caller-resolved filesystem input for one `file:` ref. The daemon must keep
@@ -162,6 +193,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_pages_preserve_large_unresolved_refs_and_refuse_stale_selection() {
+        let ctx = ProviderContext::empty_for_tests();
+        let mut params = RefSizeParams {
+            refs: vec![format!("invalid-{}", "界\n\"".repeat(12000))],
+            ..Default::default()
+        };
+        let output = ref_size(&params, &ctx).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
+        assert_eq!(first["detail_limited"], true);
+        let next = first["body"]["next_cursor"].as_str().unwrap().to_owned();
+        params.cursor = Some(next);
+        assert!(page_response(&params, "{}" ).is_err());
+        params.project_dir = Some("/synthetic/other-checkout".into());
+        assert!(page_response(&params, &output).is_err());
+        params.project_dir = None;
+        params.cursor = None;
+        let mut recovered = String::new();
+        loop {
+            let page: serde_json::Value = serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
+            let envelope = json!({"content":[{"type":"text","text":page.to_string()}],"structuredContent":page});
+            assert!(serde_json::to_vec(&envelope).unwrap().len() <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES);
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            params.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if params.cursor.is_none() { break; }
+        }
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&recovered).unwrap(), expected);
+        assert_eq!(expected["degraded"]["unresolved_refs"][0]["ref"], params.refs[0]);
+        params.body_limit = Some(0);
+        assert!(validate_response_params(&params).is_err());
+        params.body_limit = None;
+        params.cursor = Some("bad-cursor".into());
+        assert!(validate_response_params(&params).is_err());
+    }
+
+    #[test]
     fn byte_len_counts_utf8_bytes_not_chars() {
         assert_eq!(byte_len("aé"), 3);
     }
@@ -173,6 +240,7 @@ mod tests {
             &RefSizeParams {
                 refs: Vec::new(),
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
         )
@@ -190,6 +258,7 @@ mod tests {
             &RefSizeParams {
                 refs: vec!["not-an-entity-ref".into()],
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
         )
@@ -216,6 +285,7 @@ mod tests {
             &RefSizeParams {
                 refs: vec![format!("file:{}", file.display())],
                 project_dir: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
             },
             &ctx,
         )
@@ -240,6 +310,7 @@ mod tests {
                     "artifact:packet/phase-decompose/triage@1".into(),
                 ],
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
         )
@@ -269,6 +340,7 @@ mod tests {
             &RefSizeParams {
                 refs,
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
         )
