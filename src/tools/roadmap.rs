@@ -171,7 +171,7 @@ pub(crate) struct RoadmapSearchParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_roadmap",
-        description = "Manage the operator-directed roadmap. Reads default to bounded summaries; list/search use limit (default 20, max 100) and offset with next_offset; next ranks n (default 5, max 100) and also accepts offset. detail=body returns exact JSON pages for get/list/search/next/render/default_template; concatenate body.text then parse JSON (render/template are JSON strings). Replay cursor with unchanged selectors; changes refuse continuation. Manage an operator-directed prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted."
+        description = "Manage the operator-directed roadmap; never use it to defer requested work. Reads return bounded summaries. list/search use limit/offset; next uses n/offset (max 100). detail=body and cursor recover exact JSON, including markdown as JSON strings. Paging controls are rejected for mutations."
     )]
     pub(crate) async fn bbox_roadmap(
         &self,
