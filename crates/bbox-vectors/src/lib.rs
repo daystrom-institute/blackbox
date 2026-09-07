@@ -936,15 +936,22 @@ impl VectorStore {
     /// Sampled self-recall diagnostic for one route (gap-1168b0bd c).
     /// O(sample × search) — operator-invoked probe, never a metrics()-path
     /// stat. Uses `try_read` so a probe issued during a long write-lock
-    /// rebuild errors with "busy" instead of hanging the caller; returns
-    /// Ok(None) when the partition has no graph yet.
+    /// rebuild errors with "busy" instead of hanging the caller. Only an
+    /// already-loaded partition may be probed; a missing partition errors
+    /// without opening paths or creating storage. Ok(None) means the loaded
+    /// partition has no graph yet.
     pub fn self_recall_probe(
         &self,
         route: &str,
         sample_every: usize,
         k: usize,
     ) -> Result<Option<f64>> {
-        let partition = self.partition(route)?;
+        let partition = self.partitions.try_read()
+            .ok_or_else(|| anyhow::anyhow!("vector partition inventory is busy; retry later"))?
+            .get(route).cloned()
+            .ok_or_else(|| anyhow::anyhow!(
+                "error.vector_partition_not_loaded: recall probe requires an already-loaded partition"
+            ))?;
         let guard = partition.try_read().ok_or_else(|| {
             anyhow::anyhow!("partition {route} is busy (rebuild/compaction in progress)")
         })?;
@@ -2893,6 +2900,49 @@ mod tests {
         assert!(
             !diagnostics_with_connectivity(50, 10).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
         );
+    }
+
+    #[test]
+    fn self_recall_probe_never_opens_missing_or_path_shaped_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let vectors = root.join("vectors");
+        let store = VectorStore::open(&vectors).unwrap();
+        let absolute = root.join("absolute-probe");
+        for route in ["missing", "../escaped-probe", absolute.to_str().unwrap()] {
+            let error = store.self_recall_probe(route, 1, 5).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("error.vector_partition_not_loaded")
+            );
+            assert!(store.partitions.read().is_empty());
+        }
+        assert!(!vectors.join("missing").exists());
+        assert!(!root.join("escaped-probe").exists());
+        assert!(!absolute.exists());
+    }
+
+    #[test]
+    fn self_recall_probe_distinguishes_loaded_empty_from_busy_inventory_and_partition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        // Explicit setup owns the creation; the probe only observes it.
+        let partition = store.partition("loaded-empty").unwrap();
+        assert_eq!(store.self_recall_probe("loaded-empty", 1, 5).unwrap(), None);
+        {
+            let _write = partition.write();
+            let error = store.self_recall_probe("loaded-empty", 1, 5).unwrap_err();
+            assert!(error.to_string().contains("busy"));
+            assert!(!error.to_string().contains("not_loaded"));
+        }
+        {
+            let _write = store.partitions.write();
+            let error = store.self_recall_probe("loaded-empty", 1, 5).unwrap_err();
+            assert!(error.to_string().contains("inventory is busy"));
+        }
+        assert_eq!(store.self_recall_probe("loaded-empty", 1, 5).unwrap(), None);
     }
 
     #[test]
