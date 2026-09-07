@@ -459,7 +459,7 @@ pub enum GapDetail {
     Full,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GapListParams {
     /// Exact gap id `gap-<8hex>` (bare 8-hex suffix accepted).
     #[serde(default)]
@@ -509,19 +509,23 @@ pub struct GapListParams {
     /// Summary previews identify omitted or shortened fields.
     #[serde(default)]
     pub detail: Option<GapDetail>,
-    /// Exact record JSON continuation from body.next_cursor. Requires id;
+    /// Exact JSON continuation from body.next_cursor. Requires id or diagnostics_detail;
     /// changed record, visibility or filter selection invalidates the cursor.
     #[serde(default)]
     pub body_cursor: Option<String>,
-    /// Select exact record JSON pages (default/max 4096 bytes). Requires id;
-    /// omit offset and limit. Full rows that need paging advertise this reader.
+    /// Select exact JSON pages (default/max 4096 bytes). Requires id or diagnostics_detail;
+    /// exact records omit offset and limit. Oversized rows advertise this reader.
     #[serde(default)]
     pub body_limit: Option<usize>,
+    /// Read exact visibility diagnostics for this filter/view scope using
+    /// body_limit/body_cursor instead of gap records. Omit id.
+    #[serde(default)]
+    pub diagnostics_detail: bool,
     /// Include addressed gaps (default: false for lists, true for exact id).
     #[serde(default)]
     pub include_addressed: Option<bool>,
     /// Include bounded source diagnostics (up to 10 previews). Default false
-    /// summarizes availability warnings; narrow project to inspect a scope.
+    /// summarizes availability warnings; diagnostics_detail recovers exact details.
     #[serde(default)]
     pub debug: bool,
     /// Emit machine-readable JSON records instead of the rendered text view.
@@ -2232,6 +2236,12 @@ impl GapStore {
                 }
                 row["exact_read"] =
                     serde_json::json!({"tool":"bbox_gaps","id":gap.id,"body_limit":4096});
+                if let Some(provisional) = &p.provisional {
+                    row["exact_read"]["provisional"] = serde_json::json!(provisional);
+                }
+                if let Some(project_id) = &gap.project_id {
+                    row["exact_read"]["project_id"] = serde_json::json!(project_id);
+                }
                 if let Some(checkout) = &gap.provisional_checkout_id {
                     row["exact_read"]["checkout_id"] = serde_json::json!(checkout);
                 }

@@ -45,7 +45,7 @@ fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
             .collect::<Vec<_>>();
         if diagnostics.len() > 10 {
             rows.push(format!(
-                "{} additional diagnostics omitted; narrow project",
+                "{} additional diagnostics omitted; use diagnostics_detail=true with the same filters",
                 diagnostics.len() - 10
             ));
         }
@@ -67,7 +67,7 @@ fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
         }
     }
     if availability > 0 {
-        rows.push(format!("{availability} source visibility warnings; results may be incomplete. Narrow project or use debug=true for bounded diagnostics."));
+        rows.push(format!("{availability} source visibility warnings; results may be incomplete. Use diagnostics_detail=true with the same filters for exact diagnostic pages."));
     }
     rows
 }
@@ -857,7 +857,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_gaps",
-        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail when it fits; oversized records keep previews and exact recovery hints. Use id with body_limit for exact JSON pages, then body_cursor=body.next_cursor with unchanged filters."
+        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail when it fits; oversized records keep previews and exact recovery hints. Use id with body_limit for exact record JSON pages, or diagnostics_detail=true for exact visibility diagnostics. Continue body_cursor=body.next_cursor with unchanged filters."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
@@ -916,7 +916,16 @@ impl BlackboxServer {
                     "gap store overlay skipped for project {project}: {error}"
                 ));
             }
-            let mut structured = view.gaps.list_page(&p)?;
+            let mut record_params = p.clone();
+            if p.diagnostics_detail {
+                anyhow::ensure!(
+                    p.id.is_none(),
+                    "diagnostics_detail and exact id select different readers"
+                );
+                record_params.body_cursor = None;
+                record_params.body_limit = None;
+            }
+            let mut structured = view.gaps.list_page(&record_params)?;
             let rows = structured["rows"]
                 .as_array()
                 .expect("gap page rows are an array");
@@ -928,6 +937,19 @@ impl BlackboxServer {
                 rows.iter().filter_map(|row| row["id"].as_str()),
             );
             view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
+            if p.diagnostics_detail {
+                let mut selection = serde_json::to_value(&p)?;
+                for field in ["body_cursor", "body_limit", "json", "debug"] {
+                    selection.as_object_mut().unwrap().remove(field);
+                }
+                let body = super::body_page::json_body_page(
+                    &serde_json::to_string(&selection)?,
+                    &serde_json::json!({"diagnostics":view.diagnostics,"degraded_overlays":view.degraded_overlays}),
+                    p.body_cursor.as_deref(),
+                    p.body_limit,
+                )?;
+                return Ok(("Exact gap visibility diagnostics are in structuredContent.body; continue body.next_cursor with body_cursor and unchanged filters.".into(),serde_json::json!({"body":body})));
+            }
             let mut built_from =
                 view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
             structured["built_from"] = serde_json::to_value(&built_from)?;
@@ -939,7 +961,16 @@ impl BlackboxServer {
             // responses keep their existing shape. `diagnostics` carries the
             // same facts as human text.
             if !view.degraded_overlays.is_empty() {
-                structured["degraded"] = serde_json::json!({ "overlays": &view.degraded_overlays });
+                let overlays = serde_json::to_value(&view.degraded_overlays)?;
+                if serde_json::to_vec(&overlays)?.len() <= 2048 {
+                    structured["degraded"] = serde_json::json!({ "overlays": overlays });
+                } else {
+                    structured["degraded"] = serde_json::json!({
+                        "overlays_total":view.degraded_overlays.len(),
+                        "overlays_omitted":true,
+                        "detail_hint":"Repeat this filter scope with diagnostics_detail=true and body_limit=4096 for exact diagnostic pages"
+                    });
+                }
             }
             structured = bbox_corpus_core::response_page::bound_page(structured, "rows")?;
             if structured.get("byte_limited").is_some() {
@@ -1675,6 +1706,35 @@ mod tests {
         let recovered: serde_json::Value = serde_json::from_str(&joined).unwrap();
         assert_eq!(recovered["notes"], large);
         assert_eq!(recovered["evidence"][0], large);
+        let mut diagnostics = String::new();
+        let mut cursor = None;
+        loop {
+            let page = server.bbox_gaps(Parameters(GapListParams {
+                diagnostics_detail: true,
+                body_limit: Some(4),
+                body_cursor: cursor,
+                ..Default::default()
+            }));
+            assert_ne!(page.is_error, Some(true), "{page:?}");
+            assert!(
+                serde_json::to_vec(&page).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let value = page.structured_content.unwrap();
+            diagnostics.push_str(value["body"]["text"].as_str().unwrap());
+            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let diagnostics: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert!(diagnostics["diagnostics"].is_array());
+        assert!(diagnostics["degraded_overlays"].is_array());
+        let invalid = server.bbox_gaps(Parameters(GapListParams {
+            id: Some("gap-1234abcd".into()),
+            diagnostics_detail: true,
+            ..Default::default()
+        }));
+        assert_eq!(invalid.is_error, Some(true));
         assert_eq!(
             serde_json::to_value(server.state.gaps.read().all()).unwrap(),
             before

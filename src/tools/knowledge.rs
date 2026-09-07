@@ -1352,10 +1352,6 @@ fn matches_system_memory_catalog(category: Option<&str>) -> bool {
     )
 }
 
-fn format_system_memory_catalog(query: Option<&str>) -> String {
-    system_memory::format_catalog_summary(query)
-}
-
 fn system_memory_catalog_response(p: &KnowledgeListParams) -> Option<String> {
     if has_runtime_knowledge_filter(p) {
         return None;
@@ -1553,6 +1549,12 @@ fn knowledge_row_ref(item: &crate::server::knowledge_view::KnowledgeViewItem) ->
 fn diagnostic_recovery_arguments(p: &KnowledgeListParams) -> serde_json::Value {
     let mut arguments = knowledge_query_scope(p);
     arguments["diagnostics_detail"] = json!(true);
+    if let Some(offset) = p.offset {
+        arguments["offset"] = json!(offset);
+    }
+    if let Some(limit) = p.limit {
+        arguments["limit"] = json!(limit);
+    }
     if let Some(limit) = p.detail_limit {
         arguments["detail_limit"] = json!(limit);
     }
