@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::orchestration;
 use crate::orchestration as orch;
+use crate::orchestration::brofile::store_identity;
 use crate::orchestration::providers::Provider;
 use crate::server::progress::extra_filters_from_params;
 use crate::server::state::BlackboxServer;
@@ -1109,12 +1110,6 @@ fn validate_brofile_params(p: &BrofileParams) -> anyhow::Result<()> {
         "name does not apply to this action"
     );
     Ok(())
-}
-
-fn store_identity(dir: &Path) -> String {
-    std::fs::canonicalize(dir)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| dir.to_string_lossy().into_owned())
 }
 
 /// Body-page selection for `bro_brofile get`. Binds scope, the selected
