@@ -488,6 +488,10 @@ pub struct GapListParams {
     /// Provisional visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
+    /// Select one provisional variant by its listed checkout identity. This
+    /// filters the already visible view and never widens authority.
+    #[serde(default)]
+    pub checkout_id: Option<String>,
     /// Free-text substring over title/domain/wanted_capability.
     #[serde(default)]
     pub query: Option<String>,
@@ -505,6 +509,14 @@ pub struct GapListParams {
     /// Summary previews identify omitted or shortened fields.
     #[serde(default)]
     pub detail: Option<GapDetail>,
+    /// Exact record JSON continuation from body.next_cursor. Requires id;
+    /// changed record, visibility or filter selection invalidates the cursor.
+    #[serde(default)]
+    pub body_cursor: Option<String>,
+    /// Select exact record JSON pages (default/max 4096 bytes). Requires id;
+    /// omit offset and limit. Full rows that need paging advertise this reader.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
     /// Include addressed gaps (default: false for lists, true for exact id).
     #[serde(default)]
     pub include_addressed: Option<bool>,
@@ -2064,6 +2076,12 @@ impl GapStore {
             .gaps
             .iter()
             .filter(|g| {
+                if p.checkout_id
+                    .as_deref()
+                    .is_some_and(|id| g.provisional_checkout_id.as_deref() != Some(id))
+                {
+                    return false;
+                }
                 if let Some(needle) = &id_needle {
                     if g.id
                         .strip_prefix("gap-")
@@ -2166,6 +2184,35 @@ impl GapStore {
         // Validate before selecting: an invalid enum must never broaden a query.
         self.validate_list_filters(p)?;
         let matched = self.matching(p);
+        if p.body_cursor.is_some() || p.body_limit.is_some() {
+            anyhow::ensure!(
+                p.id.is_some(),
+                "body_cursor and body_limit require an exact gap id"
+            );
+            anyhow::ensure!(
+                p.offset.is_none() && p.limit.is_none() && p.detail != Some(GapDetail::Summary),
+                "exact gap body reads do not accept offset, limit or summary detail"
+            );
+            anyhow::ensure!(
+                matched.len() == 1,
+                "exact gap selection did not match one visible record"
+            );
+            let exact = self.response_row(&matched[0], true)?;
+            let mut selection = serde_json::to_value(p)?;
+            for field in ["body_cursor", "body_limit", "json", "debug", "detail"] {
+                selection.as_object_mut().unwrap().remove(field);
+            }
+            let body = bbox_corpus_core::response_page::json_body_page(
+                &serde_json::to_string(&selection)?,
+                &exact,
+                p.body_cursor.as_deref(),
+                p.body_limit,
+            )?;
+            return Ok(serde_json::json!({
+                "rows":[{"id":matched[0].id,"built_from_ref":exact["built_from_ref"]}],
+                "body":body,"total":1,"offset":0,"next_offset":null,"detail":"body"
+            }));
+        }
         let total = matched.len();
         let offset = p.offset.unwrap_or(0);
         let detail = p.detail.unwrap_or(if p.id.is_some() {
@@ -2177,14 +2224,26 @@ impl GapStore {
             .iter()
             .skip(usize::try_from(offset).unwrap_or(usize::MAX))
             .take(p.limit.unwrap_or(20).clamp(1, 100) as usize)
-            .map(|gap| self.response_row(gap, detail == GapDetail::Full))
+            .map(|gap| {
+                let mut row = self.response_row(gap, detail == GapDetail::Full)?;
+                if serde_json::to_vec(&row)?.len() > 4096 {
+                    row = self.response_row(gap, false)?;
+                    row["full_detail_omitted"] = serde_json::json!(true);
+                }
+                row["exact_read"] =
+                    serde_json::json!({"tool":"bbox_gaps","id":gap.id,"body_limit":4096});
+                if let Some(checkout) = &gap.provisional_checkout_id {
+                    row["exact_read"]["checkout_id"] = serde_json::json!(checkout);
+                }
+                Ok(row)
+            })
             .collect::<Result<Vec<_>>>()?;
         let end = offset.saturating_add(rows.len() as u64);
         Ok(serde_json::json!({
             "rows": rows, "total": total, "offset": offset,
             "next_offset": (end < total as u64).then_some(end),
             "detail": detail,
-            "detail_hint": "Use id for one complete record, or detail=full for complete records on this page."
+            "detail_hint": "Use id with body_limit=4096 for exact stored JSON; continue body.next_cursor with body_cursor and keep visibility/filter selectors unchanged."
         }))
     }
 
@@ -2202,15 +2261,15 @@ impl GapStore {
             let mut omitted = Vec::new();
             for field in ["evidence", "notes", "missing_primitive", "fallback_used"] {
                 if object.remove(field).is_some() {
-                    omitted.push(field);
+                    omitted.push(field.to_string());
                 }
             }
-            for field in ["title", "wanted_capability", "resolution_note"] {
-                if let Some(value) = object.get_mut(field) {
+            for (field, value) in object.iter_mut() {
+                if !matches!(field.as_str(), "id" | "built_from_ref" | "project_id") {
                     if let Some(text) = value.as_str() {
                         if text.chars().count() > 240 {
                             *value = Value::String(text.chars().take(240).collect());
-                            omitted.push(field);
+                            omitted.push(field.clone());
                         }
                     }
                 }
@@ -2247,7 +2306,7 @@ impl GapStore {
     }
 
     pub fn render_page(page: &Value, json: bool) -> Result<String> {
-        if json {
+        if json || page.get("body").is_some() {
             return Ok(serde_json::to_string_pretty(page)?);
         }
         let rows = page["rows"].as_array().expect("gap page rows are an array");
@@ -2524,10 +2583,10 @@ mod tests {
                 .unwrap()
                 .chars()
                 .count(),
-            500
+            240
         );
-        assert!(exact["rows"][0].get("evidence").is_some());
-        assert!(exact["rows"][0].get("omitted_fields").is_none());
+        assert_eq!(exact["rows"][0]["full_detail_omitted"], true);
+        assert!(exact["rows"][0].get("evidence").is_none());
         let full = view
             .list_page(&GapListParams {
                 detail: Some(GapDetail::Full),
@@ -2545,6 +2604,54 @@ mod tests {
         assert_eq!(summary["detail"], "summary");
         assert!(
             serde_json::from_value::<GapListParams>(serde_json::json!({"detail": "typo"})).is_err()
+        );
+    }
+
+    #[test]
+    fn exact_gap_body_recovers_unicode_and_binds_selection_and_content() {
+        let mut view = projection_fixture(2);
+        view.data.gaps[0].notes = Some("界\n\"exact\"".repeat(4000));
+        let id = view.data.gaps[0].id.clone();
+        let source = view.response_row(&view.data.gaps[0], true).unwrap();
+        let mut joined = String::new();
+        let mut cursor = None;
+        let mut first_cursor = None;
+        loop {
+            let page = view
+                .list_page(&GapListParams {
+                    id: Some(id.clone()),
+                    body_limit: Some(512),
+                    body_cursor: cursor,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() < 8192);
+            joined.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if first_cursor.is_none() {
+                first_cursor = cursor.clone();
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(serde_json::from_str::<Value>(&joined).unwrap(), source);
+        assert!(
+            view.list_page(&GapListParams {
+                id: Some(view.data.gaps[1].id.clone()),
+                body_cursor: first_cursor.clone(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        view.data.gaps[0].title.push_str(" changed");
+        assert!(
+            view.list_page(&GapListParams {
+                id: Some(id),
+                body_cursor: first_cursor,
+                ..Default::default()
+            })
+            .is_err()
         );
     }
 

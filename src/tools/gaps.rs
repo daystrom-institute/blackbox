@@ -857,7 +857,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_gaps",
-        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail; detail=full expands a page. Omissions and continuation are explicit."
+        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail when it fits; oversized records keep previews and exact recovery hints. Use id with body_limit for exact JSON pages, then body_cursor=body.next_cursor with unchanged filters."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
@@ -1625,6 +1625,62 @@ mod tests {
     /// gap-40ab1102 (1): a `project` filter matches rows by their stamped
     /// project id, whatever path key the row carries, for the project id,
     /// a declared operator alias, and the registered path alike.
+    #[test]
+    fn gap_exact_pages_bound_both_mcp_representations_and_do_not_mutate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let large = "界\n\"gap metadata\"".repeat(4000);
+        let gap: crate::gaps::GapNote = serde_json::from_value(serde_json::json!({
+            "id":"gap-1234abcd","title":large,"gap_kind":"mcp_surface","domain":"synthetic",
+            "wanted_capability":large,"notes":large,"evidence":[large],
+            "dedupe_key":"mcp_surface/synthetic/exact","created_at":"2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        server.state.gaps.write().ingest(gap).unwrap();
+        let before = serde_json::to_value(server.state.gaps.read().all()).unwrap();
+        let summary = server.bbox_gaps(Parameters(GapListParams {
+            id: Some("gap-1234abcd".into()),
+            ..Default::default()
+        }));
+        assert_ne!(summary.is_error, Some(true), "{summary:?}");
+        assert!(
+            serde_json::to_vec(&summary).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        assert_eq!(
+            summary.structured_content.as_ref().unwrap()["rows"][0]["full_detail_omitted"],
+            true
+        );
+        let mut cursor = None;
+        let mut joined = String::new();
+        loop {
+            let page = server.bbox_gaps(Parameters(GapListParams {
+                id: Some("gap-1234abcd".into()),
+                body_cursor: cursor,
+                body_limit: Some(4096),
+                json: Some(true),
+                ..Default::default()
+            }));
+            assert_ne!(page.is_error, Some(true), "{page:?}");
+            assert!(
+                serde_json::to_vec(&page).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let value = page.structured_content.unwrap();
+            joined.push_str(value["body"]["text"].as_str().unwrap());
+            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let recovered: serde_json::Value = serde_json::from_str(&joined).unwrap();
+        assert_eq!(recovered["notes"], large);
+        assert_eq!(recovered["evidence"][0], large);
+        assert_eq!(
+            serde_json::to_value(server.state.gaps.read().all()).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn bbox_gaps_project_filter_matches_stamped_rows_by_id_alias_and_path() {
         let tmp = tempfile::tempdir().unwrap();
