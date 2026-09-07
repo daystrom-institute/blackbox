@@ -196,6 +196,25 @@ pub struct TurnOutput {
     pub usage: Usage,
 }
 
+/// Terminal response evidence, attached to an error instead of the replay
+/// buffer. These provider observations never authorize client tool dispatch.
+#[derive(Debug)]
+pub struct FailedTurnObservation {
+    pub native_blocks: Vec<Value>,
+    pub tool_diagnostics: Vec<Value>,
+}
+
+impl std::fmt::Display for FailedTurnObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed response retained {} native blocks and {} tool diagnostics",
+            self.native_blocks.len(),
+            self.tool_diagnostics.len()
+        )
+    }
+}
+
 /// A client tool definition, transport-agnostic. Each transport renders this
 /// into its own wire shape (Anthropic `input_schema`, OpenAI
 /// `function.parameters`, Responses flat `parameters`).

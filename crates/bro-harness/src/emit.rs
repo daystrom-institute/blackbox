@@ -178,6 +178,20 @@ impl Emitter {
         }));
     }
 
+    /// A failed response is a terminal observation, never an assistant message
+    /// or a revision of one. Keep native execution evidence durable even when
+    /// malformed client input prevents the transport from returning a turn.
+    pub fn failed_turn_observation(&self, observation: &crate::transport::FailedTurnObservation) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "failed_turn_observation",
+            "session_id": self.session_id,
+            "replayable": false,
+            "native_blocks": observation.native_blocks,
+            "tool_diagnostics": observation.tool_diagnostics,
+        }));
+    }
+
     /// The full assistant turn as an Anthropic content array (text + thinking +
     /// tool_use blocks). When the turn streamed, the daemon dedupes the text
     /// against what it already accumulated from `stream_event` deltas

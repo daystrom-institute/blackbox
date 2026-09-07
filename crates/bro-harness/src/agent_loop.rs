@@ -599,17 +599,9 @@ async fn run_prompt_with_controls(
             }
         }
     };
-    // A failed turn must not be swallowed. Surface it as a terminal `result`
-    // event with `is_error: true` (captured in the transcript and ingested by
-    // the daemon, which maps it to a failed task with the message preserved) in
-    // addition to the stderr log. Without this the controlled-session loop
-    // returns Ok and the dispatch looks like a silent successful completion
-    // with no result — the silent-completion hole tracked in gap-32113fd4.
+    // user_turn emits the durable terminal error in every entry mode.
     if let Err(e) = turn_result {
         tracing::error!("turn failed: {e:#}");
-        session
-            .emitter
-            .result_error(&format!("{e:#}"), session.turns);
     }
     for (subtype, raw) in deferred {
         session.apply_control(&subtype, &raw);
@@ -1175,6 +1167,26 @@ impl Session {
     async fn user_turn(
         &mut self,
         prompt: &str,
+        cancel: watch::Receiver<bool>,
+        mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+    ) -> Result<()> {
+        let result = self
+            .user_turn_inner(prompt, cancel, mid_turn_user_inputs)
+            .await;
+        if let Err(error) = &result {
+            if let Some(observation) = error.downcast_ref::<transport::FailedTurnObservation>() {
+                self.emitter.failed_turn_observation(observation);
+            }
+            self.emitter.result_error(&format!("{error:#}"), self.turns);
+            let log = self.event_log.clone();
+            let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
+        }
+        result
+    }
+
+    async fn user_turn_inner(
+        &mut self,
+        prompt: &str,
         mut cancel: watch::Receiver<bool>,
         mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
     ) -> Result<()> {
@@ -1319,6 +1331,8 @@ impl Session {
                     Ok(out) => break 'attempt out,
                     Err(e)
                         if !overflow_compacted
+                            && e.downcast_ref::<transport::FailedTurnObservation>()
+                                .is_none()
                             && crate::transport::is_context_window_exceeded(&e) =>
                     {
                         overflow_compacted = true;
@@ -2803,6 +2817,13 @@ mod tests {
     }
 
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
+        mk_session_with_store(scripts, None)
+    }
+
+    fn mk_session_with_store(
+        scripts: Vec<MockTurn>,
+        store: Option<SessionStore>,
+    ) -> (Session, MockShared) {
         let shared = MockShared::default();
         let mock = MockTransport {
             shared: shared.clone(),
@@ -2868,7 +2889,7 @@ mod tests {
             context_window: None,
             tool_result_cap: 0,
             dump_dir: std::env::temp_dir(),
-            store: SessionStore::open(Some(&id), None).unwrap(),
+            store: store.unwrap_or_else(|| SessionStore::open(Some(&id), None).unwrap()),
             event_log: Arc::new(EventLog::disabled()),
             seq_counter: Arc::new(AtomicU64::new(0)),
             prior_side: Value::Null,
@@ -2940,6 +2961,186 @@ mod tests {
         assert!(pushed[0][0].content.contains("FILE-BODY"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_native_search_response_is_durable_without_dispatch_or_replay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for malformed_client in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
+            let (mut session, shared) = mk_session_with_store(
+                vec![],
+                Some(SessionStore::for_test(root.join("session.json"))),
+            );
+            session.cx.root = root;
+            session.event_log = log.clone();
+            session.emitter = Emitter::new("failed-native-test".into()).with_event_log(log.clone());
+            session.base_opts.model = "glm-5.3".into();
+            session.base_opts.web_search = true;
+
+            let mut events = vec![json!({"type":"message_start","message":{
+                "id":"failed-message","role":"assistant","content":[]
+            }})];
+            let mut expected_native = Vec::new();
+            for (number, index) in [1, 5, 9, 13, 19].into_iter().enumerate() {
+                let id = format!("native-{number}");
+                let call = json!({"type":"server_tool_use","id":id,
+                    "name":"web_search_prime","input":{"search_query":"placeholder"}});
+                let result = json!({"type":"tool_result","tool_use_id":id,
+                    "content":"[[{\"title\":\"Synthetic result\",\"link\":\"https://example.com\"}]]"});
+                events
+                    .push(json!({"type":"content_block_start","index":index,"content_block":call}));
+                events.push(json!({"type":"content_block_stop","index":index}));
+                events.push(
+                    json!({"type":"content_block_start","index":index+2,"content_block":result}),
+                );
+                events.push(json!({"type":"content_block_stop","index":index+2}));
+                expected_native.extend([call, result]);
+            }
+            if malformed_client {
+                // The provider starts a client call, truncates its arguments,
+                // then reuses that ID for a differently named native call.
+                events.push(
+                    json!({"type":"content_block_start","index":23,"content_block":{
+                        "type":"tool_use","id":"duplicate-id","name":"tool_search","input":{}
+                    }}),
+                );
+                events.push(json!({"type":"content_block_delta","index":23,
+                    "delta":{"type":"input_json_delta","partial_json":"{\""}}));
+                let mislabeled = json!({"type":"server_tool_use","id":"duplicate-id",
+                    "name":"web_search_prime","input":{"query":"select:mcp__blackbox__bro_report"}});
+                events.push(
+                    json!({"type":"content_block_start","index":24,"content_block":mislabeled}),
+                );
+                expected_native.push(mislabeled);
+                events.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}));
+                events.push(json!({"type":"message_stop"}));
+            } else {
+                events.push(json!({"type":"error","error":{
+                    "type":"overloaded_error","message":"try again"
+                }}));
+            }
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                            .unwrap();
+                        if request.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let tx = transport::with_session_env(
+                BTreeMap::from([
+                    ("ANTHROPIC_BASE_URL".into(), format!("http://{addr}")),
+                    ("ANTHROPIC_AUTH_TOKEN".into(), "synthetic-token".into()),
+                    ("BRO_HARNESS_PROVIDER".into(), "glm".into()),
+                ]),
+                async { transport::anthropic::AnthropicTransport::from_env().unwrap() },
+            )
+            .await;
+            session.tx = Box::new(tx);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                session.user_turn(
+                    "Report the checkpoint without searching the web.",
+                    cancel_rx,
+                    Arc::new(StdMutex::new(VecDeque::new())),
+                ),
+            )
+            .await
+            .expect("failed response must terminate")
+            .expect_err("malformed or interrupted native response must fail");
+            assert!(
+                error
+                    .downcast_ref::<transport::FailedTurnObservation>()
+                    .is_some()
+            );
+            server.await.unwrap();
+
+            let rows: Vec<Value> = std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let observations: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"]["subtype"] == "failed_turn_observation")
+                .collect();
+            assert_eq!(observations.len(), 1);
+            let observation = &observations[0]["event"];
+            assert_eq!(observation["replayable"], false);
+            assert_eq!(observation["native_blocks"], json!(expected_native));
+            let diagnostics = observation["tool_diagnostics"].as_array().unwrap();
+            if malformed_client {
+                assert_eq!(diagnostics.len(), 3);
+                assert_eq!(diagnostics[0]["kind"], "incomplete_tool_input");
+                assert_eq!(diagnostics[0]["input_json"], "{\"");
+                assert_eq!(diagnostics[0]["client_dispatched"], false);
+                assert_eq!(diagnostics[1]["kind"], "duplicate_tool_id");
+                assert_eq!(diagnostics[1]["block_indices"], json!([23, 24]));
+                assert_eq!(diagnostics[2]["kind"], "native_result_missing");
+                assert_eq!(diagnostics[2]["id"], "duplicate-id");
+                assert_eq!(diagnostics[2]["execution_status"], "unknown");
+            } else {
+                assert!(diagnostics.is_empty());
+            }
+            let results: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"]["type"] == "result")
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["event"]["is_error"], true);
+            assert!(rows.iter().all(|row| row["event"]["type"] != "assistant"));
+            assert_eq!(session.turns, 0);
+            assert_eq!(shared.tool_started.load(Ordering::SeqCst), 0);
+            assert!(
+                session
+                    .reg
+                    .activation_state()
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let snapshot = session.tx.snapshot();
+            assert!(
+                snapshot
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|message| message["role"] == "user")
+            );
+            assert!(!snapshot.to_string().contains("native-"));
+            assert!(!snapshot.to_string().contains("duplicate-id"));
+        }
     }
 
     #[tokio::test]

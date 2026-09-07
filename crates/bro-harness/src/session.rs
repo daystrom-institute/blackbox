@@ -123,6 +123,15 @@ pub fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
 }
 
 impl SessionStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf) -> Self {
+        Self {
+            id: "isolated-test-session".into(),
+            path,
+            restored: None,
+        }
+    }
+
     // one-time session open/resume, before the loop serves turns.
     #[allow(clippy::disallowed_methods)]
     pub fn open(session_id: Option<&str>, resume: Option<&str>) -> Result<Self> {

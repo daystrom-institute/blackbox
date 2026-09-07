@@ -173,6 +173,29 @@ impl AnthropicTransport {
         body
     }
 
+    fn fail_response(
+        &mut self,
+        error: anyhow::Error,
+        blocks: &[SseBlock],
+        assistant_idx: Option<usize>,
+    ) -> anyhow::Error {
+        let prior_content = assistant_idx
+            .and_then(|index| self.messages[index]["content"].as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let observation = failed_turn_observation(blocks, prior_content);
+        // Earlier pause segments belong to this same failed response. Their
+        // native observations survive in the error, not in resumable history.
+        if let Some(index) = assistant_idx {
+            self.messages.truncate(index);
+        }
+        if observation.native_blocks.is_empty() && observation.tool_diagnostics.is_empty() {
+            error
+        } else {
+            error.context(observation)
+        }
+    }
+
     /// One-shot, non-streaming summarization over `transcript`. Does NOT touch
     /// the conversation buffer — the caller swaps the buffer afterward.
     async fn summarize_text(
@@ -355,6 +378,7 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
             match b.kind.as_str() {
                 // Both stream their input via `input_json_delta`.
                 "tool_use" | "server_tool_use" => {
+                    b.raw = Some(cb.clone());
                     b.tool_id = cb["id"].as_str().unwrap_or("").to_string();
                     b.tool_name = cb["name"].as_str().unwrap_or("").to_string();
                     if let Some(input) = cb.get("input").filter(|v| !v.is_null()) {
@@ -446,6 +470,91 @@ fn parse_tool_input(block: &SseBlock) -> Result<Value> {
             block.tool_json.len()
         )
     })
+}
+
+fn failed_turn_observation(
+    blocks: &[SseBlock],
+    prior_content: &[Value],
+) -> super::FailedTurnObservation {
+    let mut native_blocks: Vec<Value> = prior_content
+        .iter()
+        .filter(|block| {
+            block["type"] == "server_tool_use"
+                || block["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.ends_with("tool_result"))
+        })
+        .cloned()
+        .collect();
+    let mut tool_diagnostics = Vec::new();
+    let mut tool_ids = std::collections::HashMap::new();
+    for (index, block) in blocks.iter().enumerate() {
+        match block.kind.as_str() {
+            "tool_use" | "server_tool_use" => {
+                if let Some(previous) = tool_ids.insert(block.tool_id.as_str(), index) {
+                    tool_diagnostics.push(json!({
+                        "kind": "duplicate_tool_id", "id": block.tool_id,
+                        "block_indices": [previous, index],
+                    }));
+                }
+                match parse_tool_input(block) {
+                    Ok(input) if block.kind == "server_tool_use" => {
+                        let mut native = block.raw.clone().unwrap_or_else(|| {
+                            json!({
+                                "type": block.kind, "id": block.tool_id, "name": block.tool_name,
+                            })
+                        });
+                        native["input"] = input;
+                        native_blocks.push(native);
+                    }
+                    Ok(_) => tool_diagnostics.push(json!({
+                        "kind": "client_tool_not_dispatched", "block_index": index,
+                        "id": block.tool_id, "name": block.tool_name,
+                    })),
+                    Err(error) => tool_diagnostics.push(json!({
+                        "kind": "incomplete_tool_input", "block_index": index,
+                        "block_type": block.kind, "id": block.tool_id,
+                        "name": block.tool_name, "error": format!("{error:#}"),
+                        "input_json": block.tool_json,
+                        "client_dispatched": false,
+                    })),
+                }
+            }
+            kind if kind.ends_with("tool_result") => {
+                if let Some(raw) = &block.raw {
+                    native_blocks.push(raw.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let result_ids: std::collections::HashSet<&str> = native_blocks
+        .iter()
+        .filter(|block| {
+            block["type"]
+                .as_str()
+                .is_some_and(|kind| kind.ends_with("tool_result"))
+        })
+        .filter_map(|block| block["tool_use_id"].as_str())
+        .collect();
+    for block in &native_blocks {
+        if block["type"] == "server_tool_use"
+            && !block["id"]
+                .as_str()
+                .is_some_and(|id| result_ids.contains(id))
+        {
+            // An absent result does not prove that the provider did not run
+            // the tool. Keep that uncertainty distinct from completed pairs.
+            tool_diagnostics.push(json!({
+                "kind": "native_result_missing", "id": block["id"],
+                "name": block["name"], "execution_status": "unknown",
+            }));
+        }
+    }
+    super::FailedTurnObservation {
+        native_blocks,
+        tool_diagnostics,
+    }
 }
 
 /// Reconstruct one assistant segment from the SSE accumulators: the `content`
@@ -675,11 +784,16 @@ impl Transport for AnthropicTransport {
                 rb.json(&body).send()
             })
             .await
-            .context("messages request")?;
+            .context("messages request")
+            .map_err(|error| self.fail_response(error, &[], assistant_idx))?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("anthropic messages {status}: {text}");
+                return Err(self.fail_response(
+                    anyhow::anyhow!("anthropic messages {status}: {text}"),
+                    &[],
+                    assistant_idx,
+                ));
             }
 
             // Parse the SSE stream incrementally: forward each event to the sink and
@@ -782,12 +896,17 @@ impl Transport for AnthropicTransport {
                     tokio::time::sleep(wait).await;
                     continue;
                 }
-                anyhow::bail!("anthropic stream error ({msg})");
+                return Err(self.fail_response(
+                    anyhow::anyhow!("anthropic stream error ({msg})"),
+                    &blocks,
+                    assistant_idx,
+                ));
             }
 
             // Reconstruct this segment and merge it into the single assistant
             // message that represents the (possibly multi-segment) turn.
-            let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks)?;
+            let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks)
+                .map_err(|error| self.fail_response(error, &blocks, assistant_idx))?;
 
             // Spurious empty stop: some Anthropic-compatible endpoints (observed:
             // MiniMax-M3 — ~12% on history turns whose prior assistant message has
@@ -2144,7 +2263,7 @@ mod tests {
             let error = result
                 .err()
                 .expect("content must make the failure terminal");
-            assert!(error.to_string().contains("overloaded_error"));
+            assert!(format!("{error:#}").contains("overloaded_error"));
             assert_eq!(requests, 1, "content must prevent a second HTTP request");
             assert_eq!(tx.messages.len(), 1, "failed segment must not be committed");
         }
