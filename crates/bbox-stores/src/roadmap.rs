@@ -489,8 +489,12 @@ impl Roadmap {
             // Validate every refusal before changing the live in-memory item;
             // a later unrelated persistence request also writes this state.
             if let Some(next) = status.as_ref() {
-                anyhow::ensure!(item.status.can_transition_to(next),
-                    "cannot transition from {} to {}", item.status.as_str(), next.as_str());
+                anyhow::ensure!(
+                    item.status.can_transition_to(next),
+                    "cannot transition from {} to {}",
+                    item.status.as_str(),
+                    next.as_str()
+                );
             }
             if let Some(t) = title {
                 item.title = t;
@@ -1249,27 +1253,76 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let path = root.join("roadmap.json");
         let roadmap = Arc::new(RwLock::new(Roadmap::open(&path).unwrap()));
-        let persister = StorePersister::spawn("roadmap-refused-update", roadmap.clone(), path.clone());
-        let id = roadmap.write().create(
-            "Original title".into(), "Original body".into(), RoadmapCategory::Feature,
-            RoadmapPriority::High, "global".into(), None, None, None,
-        ).unwrap().id.clone();
-        roadmap.write().update(&id, None, None, Some(RoadmapStatus::Delivered), None, None, None, None).unwrap();
+        let persister =
+            StorePersister::spawn("roadmap-refused-update", roadmap.clone(), path.clone());
+        let id = roadmap
+            .write()
+            .create(
+                "Original title".into(),
+                "Original body".into(),
+                RoadmapCategory::Feature,
+                RoadmapPriority::High,
+                "global".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+            .clone();
+        roadmap
+            .write()
+            .update(
+                &id,
+                None,
+                None,
+                Some(RoadmapStatus::Delivered),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         persister.request_durable().await.unwrap();
         let before = serde_json::to_value(roadmap.read().item(&id).unwrap()).unwrap();
-        let error = roadmap.write().update(
-            &id, Some("Must not change".into()), Some("Neither body".into()),
-            Some(RoadmapStatus::Rejected), Some(RoadmapCategory::Refactor),
-            Some(RoadmapPriority::Low), Some("synthetic actor".into()), Some("synthetic source".into()),
-        ).unwrap_err();
+        let error = roadmap
+            .write()
+            .update(
+                &id,
+                Some("Must not change".into()),
+                Some("Neither body".into()),
+                Some(RoadmapStatus::Rejected),
+                Some(RoadmapCategory::Refactor),
+                Some(RoadmapPriority::Low),
+                Some("synthetic actor".into()),
+                Some("synthetic source".into()),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("cannot transition"));
-        assert_eq!(serde_json::to_value(roadmap.read().item(&id).unwrap()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(roadmap.read().item(&id).unwrap()).unwrap(),
+            before
+        );
         // A subsequent successful change causes a real durable flush.
-        roadmap.write().create("Unrelated".into(), String::new(), RoadmapCategory::Feature,
-            RoadmapPriority::Low, "global".into(), None, None, None).unwrap();
+        roadmap
+            .write()
+            .create(
+                "Unrelated".into(),
+                String::new(),
+                RoadmapCategory::Feature,
+                RoadmapPriority::Low,
+                "global".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         persister.request_durable().await.unwrap();
         let reopened = Roadmap::open(&path).unwrap();
-        assert_eq!(serde_json::to_value(reopened.item(&id).unwrap()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(reopened.item(&id).unwrap()).unwrap(),
+            before
+        );
     }
 
     // ── Template context ─────────────────────────────────────────────────

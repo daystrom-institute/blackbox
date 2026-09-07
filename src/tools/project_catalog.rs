@@ -738,14 +738,25 @@ fn publisher_auto_advance_summary(value: &serde_json::Value) -> serde_json::Valu
         serde_json::Value::String(text) if text.len() > 256 => json!({
             "total_bytes": text.len(), "omitted": true, "detail": "auto_advance",
         }),
-        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter()
-            .map(|(key, value)| {
-                let summary = if matches!(key.as_str(), "detail" | "granted_reason" | "message" | "error") {
-                    value.as_str().map(publisher_status_bounded_text)
-                        .unwrap_or_else(|| publisher_auto_advance_summary(value))
-                } else { publisher_auto_advance_summary(value) };
-                (key.clone(), summary)
-            }).collect()),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let summary = if matches!(
+                        key.as_str(),
+                        "detail" | "granted_reason" | "message" | "error"
+                    ) {
+                        value
+                            .as_str()
+                            .map(publisher_status_bounded_text)
+                            .unwrap_or_else(|| publisher_auto_advance_summary(value))
+                    } else {
+                        publisher_auto_advance_summary(value)
+                    };
+                    (key.clone(), summary)
+                })
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -2997,7 +3008,12 @@ mod tests {
             "full_ref":format!("refs/heads/{}", "d".repeat(120)),
             "producer_id":"界".repeat(1000), "detail":"diagnostic".repeat(100)});
         let summary = publisher_auto_advance_summary(&value);
-        for key in ["source_generation_id", "expected_generation_id", "expected_pointer_sha256", "full_ref"] {
+        for key in [
+            "source_generation_id",
+            "expected_generation_id",
+            "expected_pointer_sha256",
+            "full_ref",
+        ] {
             assert_eq!(summary[key], value[key]);
         }
         assert_eq!(summary["producer_id"]["omitted"], true);
@@ -3131,17 +3147,30 @@ mod tests {
         assert_eq!(body["catalog_detached"], true);
         assert_eq!(body["cleanup"]["watcher"], "failed");
         let snapshot = store.snapshot().unwrap();
-        assert_eq!(snapshot.attachments().attachments[&CatalogFixture::attachment()].status, AttachmentStatus::Detached);
-        let detached_at = snapshot.attachments().attachments[&CatalogFixture::attachment()].detached_at.clone();
+        assert_eq!(
+            snapshot.attachments().attachments[&CatalogFixture::attachment()].status,
+            AttachmentStatus::Detached
+        );
+        let detached_at = snapshot.attachments().attachments[&CatalogFixture::attachment()]
+            .detached_at
+            .clone();
         server.state.bbox_watcher.clear_poison();
-        let stale = server.bbox_project_detach(Parameters(ProjectDetachParams {
-            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: epoch, audit_reason: "stale cleanup retry".into(),
-        })).await;
+        let stale = server
+            .bbox_project_detach(Parameters(ProjectDetachParams {
+                attachment_id: CatalogFixture::attachment().to_string(),
+                expected_catalog_epoch: epoch,
+                audit_reason: "stale cleanup retry".into(),
+            }))
+            .await;
         assert_eq!(stale.is_error, Some(true));
         assert!(error_text(&stale).contains("error.project_catalog_stale_epoch"));
-        let retry = server.bbox_project_detach(Parameters(ProjectDetachParams {
-            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: snapshot.epoch(), audit_reason: "cleanup retry".into(),
-        })).await;
+        let retry = server
+            .bbox_project_detach(Parameters(ProjectDetachParams {
+                attachment_id: CatalogFixture::attachment().to_string(),
+                expected_catalog_epoch: snapshot.epoch(),
+                audit_reason: "cleanup retry".into(),
+            }))
+            .await;
         assert_ne!(retry.is_error, Some(true));
         let retry: serde_json::Value = serde_json::from_str(&error_text(&retry)).unwrap();
         assert_eq!(retry["status"], "ok");

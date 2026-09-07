@@ -287,15 +287,21 @@ fn project_roadmap_response(p: &RoadmapParams, output: &str) -> anyhow::Result<S
         for field in ["title", "message"] {
             bbox_corpus_core::response_page::preview_field(&mut receipt, field, 256);
         }
-        let id = receipt.get("id").or_else(|| receipt.get("existing_id"))
-            .cloned().or_else(|| p.id.as_ref().map(|id| serde_json::json!(id)));
+        let id = receipt
+            .get("id")
+            .or_else(|| receipt.get("existing_id"))
+            .cloned()
+            .or_else(|| p.id.as_ref().map(|id| serde_json::json!(id)));
         if let Some(id) = id {
             receipt["exact_reader"] = serde_json::json!({"action":"get", "id":id, "detail":"body"});
         }
         return Ok(receipt.to_string());
     }
     // Exact reads never rerun a mutation or link repair.
-    if !matches!(p.action.as_str(), "get" | "list" | "search" | "next" | "render" | "default_template") {
+    if !matches!(
+        p.action.as_str(),
+        "get" | "list" | "search" | "next" | "render" | "default_template"
+    ) {
         return Ok(output.to_owned());
     }
     let markdown = matches!(p.action.as_str(), "render" | "default_template");
@@ -1109,38 +1115,67 @@ mod projection_tests {
         })))).await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
         assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let receipt: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        let receipt: Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         let id = receipt["id"].as_str().unwrap().to_owned();
         assert_eq!(receipt["title_truncated"], true);
         assert_eq!(receipt["exact_reader"]["id"], id);
         let title = format!("Updated {}", "界\n\"".repeat(20000));
-        let result = server.bbox_roadmap(Parameters(params(json!({
-            "action":"update", "id":id, "title":title
-        })))).await;
+        let result = server
+            .bbox_roadmap(Parameters(params(json!({
+                "action":"update", "id":id, "title":title
+            }))))
+            .await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
         assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let result = server.bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id})))).await;
+        let result = server
+            .bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id}))))
+            .await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
         assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let promoted: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        let promoted: Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         let thread_id = promoted["thread_id"].as_str().unwrap();
-        assert!(server.state.threads.read().all().iter().any(|thread| thread.id == thread_id));
-        assert_eq!(server.state.roadmap.read().spawned_thread_ids(&id), vec![format!("thread:{thread_id}")]);
-        let result = server.bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id})))).await;
-        let repeated: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        assert!(
+            server
+                .state
+                .threads
+                .read()
+                .all()
+                .iter()
+                .any(|thread| thread.id == thread_id)
+        );
+        assert_eq!(
+            server.state.roadmap.read().spawned_thread_ids(&id),
+            vec![format!("thread:{thread_id}")]
+        );
+        let result = server
+            .bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id}))))
+            .await;
+        let repeated: Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(repeated["already_promoted"], true);
-        assert_eq!(repeated["existing_thread_ids"], json!([format!("thread:{thread_id}")]));
+        assert_eq!(
+            repeated["existing_thread_ids"],
+            json!([format!("thread:{thread_id}")])
+        );
         let mut read = json!({"action":"get", "id":id, "detail":"body"});
         let mut recovered = String::new();
         loop {
             let result = server.bbox_roadmap(Parameters(params(read.clone()))).await;
             assert_ne!(result.is_error, Some(true), "{result:?}");
-            let page: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            let page: Value =
+                serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
             recovered.push_str(page["body"]["text"].as_str().unwrap());
-            let Some(next) = page["body"]["next_cursor"].as_str() else { break; };
+            let Some(next) = page["body"]["next_cursor"].as_str() else {
+                break;
+            };
             read["cursor"] = json!(next);
         }
-        assert_eq!(serde_json::from_str::<Value>(&recovered).unwrap()["title"], title);
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovered).unwrap()["title"],
+            title
+        );
     }
 
     #[test]

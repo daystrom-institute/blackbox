@@ -1514,7 +1514,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_ref_size",
-        description = "Measure the byte payload size of entity refs. file refs resolve through a validated current checkout attachment selected by exact project_dir, authoritative session checkout, or an unambiguous registered project; project_file and project_file_v2 refs resolve to full indexed chunk content without checkout access; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
+        description = "Measure entity payload bytes using authoritative indexed or checkout reads. body_limit/cursor recovers exact result JSON; oversized replies start body pages automatically. Each page remeasures the selected refs, and changed evidence refuses continuation."
     )]
     pub(crate) async fn bbox_ref_size(
         &self,
@@ -4785,7 +4785,10 @@ mod tests {
             false
         );
         assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["source"], "provisional");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["source"],
+            "provisional"
+        );
 
         let published = server
             .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {

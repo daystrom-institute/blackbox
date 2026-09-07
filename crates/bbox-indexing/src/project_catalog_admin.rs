@@ -5443,10 +5443,14 @@ mod tests {
             epoch,
             &receipt.attachment_id,
             "2026-07-24T00:00:02Z",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(retry.epoch, epoch + 1);
         let state = store.snapshot().unwrap();
-        assert_eq!(serde_json::to_value(&state.attachments().attachments[&receipt.attachment_id]).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(&state.attachments().attachments[&receipt.attachment_id]).unwrap(),
+            before
+        );
         let error = detach_attachment(&store, 1, &receipt.attachment_id, "t").unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_stale_epoch");
     }

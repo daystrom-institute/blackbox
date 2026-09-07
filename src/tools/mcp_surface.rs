@@ -64,19 +64,28 @@ pub struct McpSurfaceParams {
 impl McpSurfaceParams {
     fn validate(&self) -> anyhow::Result<()> {
         let exact = self.cursor.is_some() || self.body_limit.is_some();
-        anyhow::ensure!(!exact || (self.limit.is_none() && self.offset.is_none()),
-            "exact body reads use cursor/body_limit; omit limit and offset");
-        anyhow::ensure!(self.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
-            "body_limit must be between 4 and 4096");
+        anyhow::ensure!(
+            !exact || (self.limit.is_none() && self.offset.is_none()),
+            "exact body reads use cursor/body_limit; omit limit and offset"
+        );
+        anyhow::ensure!(
+            self.body_limit
+                .is_none_or(|limit| (4..=4096).contains(&limit)),
+            "body_limit must be between 4 and 4096"
+        );
         if let Some(cursor) = self.cursor.as_deref() {
-            let valid = cursor.split_once(':').is_some_and(|(hash, offset)|
-                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-                    && offset.parse::<usize>().is_ok());
+            let valid = cursor.split_once(':').is_some_and(|(hash, offset)| {
+                hash.len() == 64
+                    && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    && offset.parse::<usize>().is_ok()
+            });
             anyhow::ensure!(valid, "invalid cursor; use body.next_cursor");
         }
-        anyhow::ensure!(!matches!(self.action, McpSurfaceAction::List)
-            || (self.surface.is_none() && self.project.is_none() && self.detail.is_none()),
-            "action=list accepts limit/offset or cursor/body_limit; surface, project, and detail are replay/describe selectors");
+        anyhow::ensure!(
+            !matches!(self.action, McpSurfaceAction::List)
+                || (self.surface.is_none() && self.project.is_none() && self.detail.is_none()),
+            "action=list accepts limit/offset or cursor/body_limit; surface, project, and detail are replay/describe selectors"
+        );
         Ok(())
     }
 }
@@ -85,7 +94,7 @@ impl McpSurfaceParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_mcp_surface",
-        description = "Inspect MCP surface routing compactly. Replay pages visible tools and reports policy counts; describe pages rule summaries; list pages installed packets. Use detail=policy for exact allow/disallow patterns. body_limit/cursor reads all projected rows as exact JSON; omit limit/offset."
+        description = "Inspect MCP routing: replay pages visible tools, describe pages rules, list pages surface packets. detail=policy expands allow/disallow patterns. body_limit/cursor without limit/offset recovers complete projected JSON; changed policy or selection refuses continuation."
     )]
     pub(crate) async fn bbox_mcp_surface(
         &self,
@@ -213,10 +222,19 @@ impl BlackboxServer {
                 page["total"] = serde_json::json!(rows.len());
                 page["count"] = serde_json::json!(rows.len());
                 let scope = serde_json::json!([
-                    "mcp_surface", p.action, p.surface, p.project, p.detail, field
-                ]).to_string();
+                    "mcp_surface",
+                    p.action,
+                    p.surface,
+                    p.project,
+                    p.detail,
+                    field
+                ])
+                .to_string();
                 let body = bbox_corpus_core::response_page::json_body_page(
-                    &scope, &page, p.cursor.as_deref(), p.body_limit,
+                    &scope,
+                    &page,
+                    p.cursor.as_deref(),
+                    p.body_limit,
                 )?;
                 return Ok(serde_json::json!({
                     "body": body,
@@ -328,7 +346,12 @@ impl BlackboxServer {
         self.surface_page(page, "visible_tools", rows, offset, limit, Some(p))
     }
 
-    fn handle_mcp_surface_list(&self, limit: usize, offset: usize, params: Option<&McpSurfaceParams>) -> anyhow::Result<String> {
+    fn handle_mcp_surface_list(
+        &self,
+        limit: usize,
+        offset: usize,
+        params: Option<&McpSurfaceParams>,
+    ) -> anyhow::Result<String> {
         let packets = self.state.packets.read();
         let mut all = packets.list_all()?;
         all.retain(|packet| packet.domain == surface::SURFACE_ROUTING_DOMAIN);
@@ -515,8 +538,15 @@ mod tests {
         let pattern = format!("bbox_{}", "界\n\"".repeat(10000));
         compile_surface_packet(
             &server.state.packets.read(),
-            vec![surface_rule("huge", "readonly", &[&pattern], &[], "tool_surface")],
-            "global", None,
+            vec![surface_rule(
+                "huge",
+                "readonly",
+                &[&pattern],
+                &[],
+                "tool_surface",
+            )],
+            "global",
+            None,
         );
         let mut args = serde_json::json!({
             "action":"replay", "surface":"readonly", "detail":"policy", "body_limit":4096
@@ -524,16 +554,17 @@ mod tests {
         let mut recovered = String::new();
         let mut first_cursor = None;
         loop {
-            let result = server.bbox_mcp_surface(Parameters(
-                serde_json::from_value(args.clone()).unwrap()
-            )).await;
+            let result = server
+                .bbox_mcp_surface(Parameters(serde_json::from_value(args.clone()).unwrap()))
+                .await;
             assert_ne!(result.is_error, Some(true), "{result:?}");
             assert!(serde_json::to_vec(&result).unwrap().len() < 24 * 1024);
-            let page: serde_json::Value = serde_json::from_str(
-                &result.content[0].as_text().unwrap().text
-            ).unwrap();
+            let page: serde_json::Value =
+                serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
             recovered.push_str(page["body"]["text"].as_str().unwrap());
-            let Some(next) = page["body"]["next_cursor"].as_str() else { break; };
+            let Some(next) = page["body"]["next_cursor"].as_str() else {
+                break;
+            };
             first_cursor.get_or_insert_with(|| next.to_owned());
             args["cursor"] = serde_json::json!(next);
         }
@@ -542,26 +573,39 @@ mod tests {
         assert_eq!(recovered["total"], 1);
         args["cursor"] = serde_json::json!(first_cursor.unwrap());
         args["action"] = serde_json::json!("describe");
-        let stale_selection = server.bbox_mcp_surface(Parameters(
-            serde_json::from_value(args.clone()).unwrap()
-        )).await;
+        let stale_selection = server
+            .bbox_mcp_surface(Parameters(serde_json::from_value(args.clone()).unwrap()))
+            .await;
         assert_eq!(stale_selection.is_error, Some(true));
         args["action"] = serde_json::json!("replay");
         compile_surface_packet(
             &server.state.packets.read(),
-            vec![surface_rule("changed", "readonly", &["bbox_search"], &[], "tool_surface")],
-            "global", None,
+            vec![surface_rule(
+                "changed",
+                "readonly",
+                &["bbox_search"],
+                &[],
+                "tool_surface",
+            )],
+            "global",
+            None,
         );
-        let stale_evidence = server.bbox_mcp_surface(Parameters(
-            serde_json::from_value(args).unwrap()
-        )).await;
+        let stale_evidence = server
+            .bbox_mcp_surface(Parameters(serde_json::from_value(args).unwrap()))
+            .await;
         assert_eq!(stale_evidence.is_error, Some(true));
     }
 
     #[test]
     fn complex_surface_predicate_is_not_reported_as_unconditional() {
         let (_tmp, server) = make_server();
-        let mut rule = surface_rule("conditional", "readonly", &["bbox_search"], &[], "tool_surface");
+        let mut rule = surface_rule(
+            "conditional",
+            "readonly",
+            &["bbox_search"],
+            &[],
+            "tool_surface",
+        );
         rule["antecedent"] = serde_json::json!({"op":"All", "args":[
             {"op":"Eq", "field":"surface", "value":"readonly"},
             {"op":"True"}
@@ -569,11 +613,15 @@ mod tests {
         compile_surface_packet(&server.state.packets.read(), vec![rule], "global", None);
         let params = serde_json::from_value(serde_json::json!({
             "action":"describe", "surface":"readonly"
-        })).unwrap();
+        }))
+        .unwrap();
         let output = server.handle_mcp_surface_describe(&params, None).unwrap();
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(value["rules"][0]["matches_surface"].is_null());
-        assert_eq!(value["rules"][0]["surface_match_kind"], "requires_predicate_evaluation");
+        assert_eq!(
+            value["rules"][0]["surface_match_kind"],
+            "requires_predicate_evaluation"
+        );
         assert_eq!(value["verdict_for_selected"]["route"], "tool_surface");
         assert_eq!(value["verdict_for_selected"]["allow_count"], 1);
     }
@@ -587,11 +635,17 @@ mod tests {
             serde_json::json!({"action":"describe", "cursor":"malformed"}),
             serde_json::json!({"action":"list", "body_limit":4096, "project":"synthetic"}),
         ] {
-            let result = server.bbox_mcp_surface(Parameters(
-                serde_json::from_value(args).unwrap()
-            )).await;
+            let result = server
+                .bbox_mcp_surface(Parameters(serde_json::from_value(args).unwrap()))
+                .await;
             assert_eq!(result.is_error, Some(true));
-            assert!(!result.content[0].as_text().unwrap().text.contains("no mcp-surface/routing packet"));
+            assert!(
+                !result.content[0]
+                    .as_text()
+                    .unwrap()
+                    .text
+                    .contains("no mcp-surface/routing packet")
+            );
         }
     }
 
@@ -1035,7 +1089,14 @@ mod tests {
         let mut indexes = Vec::new();
         loop {
             let page = server
-                .surface_page(serde_json::Value::Null, "rows", rows.clone(), offset, 100, None)
+                .surface_page(
+                    serde_json::Value::Null,
+                    "rows",
+                    rows.clone(),
+                    offset,
+                    100,
+                    None,
+                )
                 .unwrap();
             let page: serde_json::Value = serde_json::from_str(&page).unwrap();
             let returned = page["rows"].as_array().unwrap();
