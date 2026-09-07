@@ -187,7 +187,7 @@ pub(crate) struct RoadmapSearchParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_roadmap",
-        description = "Read historical roadmap records. Writes and promotion are retired. get/list/search/next/render/default_template remain read-only; next ranks retained accepted items. list/search use limit/offset; next uses n/offset. detail=body with cursor recovers exact JSON. Use the owning project's planning graph for new concepts/inquiries and bbox_thread for active work."
+        description = "Read historical roadmap records. All mutation actions, including promotion and repair_links, are retired. Bounded reads and exact JSON recovery remain available; stored data and graph relations are preserved."
     )]
     pub(crate) async fn bbox_roadmap(
         &self,
@@ -1243,7 +1243,7 @@ mod projection_tests {
 
     #[test]
     fn roadmap_schema_advertises_only_historical_read_actions() {
-        let schema = serde_json::to_value(schemars::schema_for!(RoadmapReadAction)).unwrap();
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(RoadmapReadAction)).unwrap();
         assert_eq!(
             schema["enum"],
             json!([
