@@ -54,7 +54,6 @@ fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
         state.join("projects.json"),
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
-        state.join("blackbox-roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -76,10 +75,6 @@ fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
         ("blackbox-threads.json", r#"{"version":1,"threads":[]}"#),
         ("blackbox-notes.json", r#"{"version":1,"notes":[]}"#),
         ("blackbox-pins.json", r#"{"version":1,"pins":[]}"#),
-        (
-            "blackbox-roadmap.json",
-            r#"{"version":1,"items":[],"edges":[]}"#,
-        ),
     ] {
         write(&state.join(name), body.as_bytes());
     }

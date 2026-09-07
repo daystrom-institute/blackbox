@@ -215,7 +215,6 @@ pub struct ProjectCatalogRebuildIndexPathsV1 {
     pub code_source_root: PathBuf,
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
-    pub roadmap_path: PathBuf,
     /// The RESOLVED vector root (R33F1). The Equality proof recomputes a
     /// fingerprint over exactly this store, so a caller that derived it
     /// elsewhere would compare against a different store.
@@ -236,7 +235,6 @@ pub struct ProjectCatalogStamperOwnerPathsV1 {
     pub thread_store_path: PathBuf,
     pub note_store_path: PathBuf,
     pub pin_store_path: PathBuf,
-    pub roadmap_store_path: PathBuf,
     pub packet_root: PathBuf,
     pub proposal_root: PathBuf,
     pub slack_store_root: PathBuf,
@@ -283,7 +281,6 @@ pub struct ProjectCatalogMigrationResolvedLayoutV1 {
     pub(crate) threads_path: PathBuf,
     pub(crate) notes_path: PathBuf,
     pub(crate) pins_path: PathBuf,
-    pub(crate) roadmap_path: PathBuf,
     pub(crate) packets_dir: PathBuf,
     pub(crate) artifacts_dir: PathBuf,
     pub(crate) bro_home: PathBuf,
@@ -347,7 +344,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             thread_store_path: inventory.thread_store_path,
             note_store_path: inventory.note_store_path,
             pin_store_path: inventory.pin_store_path,
-            roadmap_store_path: inventory.roadmap_store_path,
             packet_root: inventory.packet_root,
             proposal_root: inventory.proposal_root,
             slack_store_root: inventory.slack_store_root,
@@ -371,7 +367,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             code_source_root: self.code_source_root.clone(),
             knowledge_path: self.knowledge_path.clone(),
             threads_path: self.threads_path.clone(),
-            roadmap_path: self.roadmap_path.clone(),
             vector_root: self.vector_root.clone(),
         }
     }
@@ -492,7 +487,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
                     threads_path: config.paths.threads_path.clone(),
                     notes_path: config.paths.notes_path.clone(),
                     pins_path: config.paths.pins_path.clone(),
-                    roadmap_path: config.paths.roadmap_path.clone(),
                     packets_dir: config.paths.packets_dir.clone(),
                     artifacts_dir: config.paths.artifacts_dir.clone(),
                     bro_home: config.paths.bro_home.clone(),
@@ -564,7 +558,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             threads_path: state_dir.join("blackbox-threads.json"),
             notes_path: state_dir.join("blackbox-notes.json"),
             pins_path: state_dir.join("blackbox-pins.json"),
-            roadmap_path: state_dir.join("blackbox-roadmap.json"),
             packets_dir: state_dir.join("packets"),
             artifacts_dir: state_dir.join("artifacts"),
             backup_dir: state_dir.join("backups"),
@@ -609,7 +602,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             &self.threads_path,
             &self.notes_path,
             &self.pins_path,
-            &self.roadmap_path,
         ];
         if exact_roles.iter().copied().collect::<BTreeSet<_>>().len() != exact_roles.len() {
             return Err(unsafe_layout(
@@ -666,7 +658,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             self.threads_path.as_path(),
             self.notes_path.as_path(),
             self.pins_path.as_path(),
-            self.roadmap_path.as_path(),
             self.packets_dir.as_path(),
             self.artifacts_dir.as_path(),
             self.bro_home.as_path(),
@@ -5187,7 +5178,6 @@ pub(crate) fn owner_inventory_paths(
         thread_store_path: layout.threads_path.clone(),
         note_store_path: layout.notes_path.clone(),
         pin_store_path: layout.pins_path.clone(),
-        roadmap_store_path: layout.roadmap_path.clone(),
         packet_root: layout.packets_dir.clone(),
         task_store_path: layout.bro_home.join("tasks.json"),
         proposal_root: layout.bro_home.join("badgey").join("proposals"),

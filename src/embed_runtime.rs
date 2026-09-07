@@ -653,21 +653,6 @@ pub(crate) fn route_coverage(
                 &crate::index::knowledge_chunk_hash(entry),
             )?;
         }
-        for item in stores.roadmap.read().all_items() {
-            // Rejected items are not indexed — skip
-            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
-                continue;
-            }
-            record_coverage(
-                &router,
-                &mut coverage,
-                &mut active_by_route,
-                Bucket::Knowledge,
-                None,
-                &crate::index::roadmap_entity_id(&item.id),
-                &crate::index::roadmap_chunk_hash(item),
-            )?;
-        }
     }
     if buckets.contains(&Bucket::Notes) {
         for note in stores.notes.read().all() {
@@ -1013,19 +998,6 @@ fn enqueue_reembed_routes(
             let entity_id = crate::index::knowledge_entity_id(&entry.id);
             let chunk_hash = crate::index::knowledge_chunk_hash(entry);
             if crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash) {
-                enqueued += 1;
-            }
-        }
-        for item in state.roadmap.read().all_items() {
-            if limit_reached(max_entities, enqueued) {
-                return Ok(enqueued);
-            }
-            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
-                continue;
-            }
-            let entity_id = crate::index::roadmap_entity_id(&item.id);
-            let chunk_hash = crate::index::roadmap_chunk_hash(item);
-            if crate::embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash) {
                 enqueued += 1;
             }
         }
@@ -1601,7 +1573,7 @@ fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
         "commit" if doc.chunk_kind == "git_message" && !doc.content.is_empty() => {
             Some(Bucket::GitMessage)
         }
-        "knowledge" | "roadmap" => Some(Bucket::Knowledge),
+        "knowledge" => Some(Bucket::Knowledge),
         "project_file" => {
             // Mirror enqueue_project_file's routing EXACTLY (language /
             // chunk_kind on the stored doc, not path extension). The old
@@ -3142,6 +3114,16 @@ image = "voyage_visual"
             )),
             content: "pub struct Helper;".into(),
         }
+    }
+
+    #[test]
+    fn retired_roadmap_index_rows_are_not_embedding_sources() {
+        let mut doc = code_embedding_source_doc();
+        doc.doc_type = "roadmap".into();
+        doc.entity_id = Some("roadmap_item:retired-item".into());
+        assert_eq!(reembed_index_doc_bucket(&doc), None);
+        doc.doc_type = "knowledge".into();
+        assert_eq!(reembed_index_doc_bucket(&doc), Some(Bucket::Knowledge));
     }
 
     fn code_route(router: &EmbeddingRouter) -> (String, String) {

@@ -85,7 +85,6 @@ impl BlackboxServer {
                 + crate::tools::sessions::router()
                 + crate::tools::knowledge::router()
                 + crate::tools::render::router()
-                + crate::tools::roadmap::router()
                 + crate::tools::agents::router()
                 + crate::tools::roster::router()
                 + crate::tools::config::router()

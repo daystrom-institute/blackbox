@@ -17,7 +17,7 @@ transcripts, registered projects, git history, and durable JSON stores.
 | `~/.local/state/blackbox/edges/` | Project edge sidecars | No |
 | `~/.local/state/blackbox/git_meta/` | Git indexing fingerprints | No |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and IDs | Yes |
-| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads, pins, roadmap | Yes |
+| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads, pins | Yes |
 
 ## Tantivy index
 
@@ -299,7 +299,7 @@ vector partition compaction failed; will retry
 EdgeIndex combines:
 
 - per-project sidecars from project indexing;
-- live edges from knowledge, thread, note, and roadmap stores;
+- live edges from knowledge, thread, and note stores;
 - virtual edges for tasks and tool calls.
 
 The watcher rebuilds EdgeIndex when Tantivy's document count grows.

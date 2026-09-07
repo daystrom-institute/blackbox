@@ -388,13 +388,6 @@ fn census_owner_stores(
             ),
         ),
         (
-            "roadmap-rows",
-            bbox_stores::roadmap::capture_project_catalog_owner_snapshot(
-                &owners.roadmap_store_path,
-                limits.durable_owners,
-            ),
-        ),
-        (
             "packet-rows",
             bbox_packets::capture_project_catalog_owner_snapshot(
                 &owners.packet_root,

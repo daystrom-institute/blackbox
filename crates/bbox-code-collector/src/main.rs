@@ -227,7 +227,7 @@ fn init_project_scaffolding(path: &Path) -> Result<()> {
     if !config_path.exists() {
         fs::write(
             &config_path,
-            "# Project-local blackbox configuration.\n[roadmap]\n[mcp]\n[artifacts]\n",
+            "# Project-local blackbox configuration.\n[mcp]\n[artifacts]\n",
         )?;
     }
     let mcp_path = bbox_dir.join("mcp.json");

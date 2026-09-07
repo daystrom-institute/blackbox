@@ -15,7 +15,6 @@ bbox-packets = { path = "../bbox-packets" }
 bbox-system-memory = { path = "../bbox-system-memory" }
 parking_lot = "0.12"
 bbox-whiteboards = { path = "../bbox-whiteboards" }
-bbox-stores = { path = "../bbox-stores" }
 bbox-artifacts = { path = "../bbox-artifacts" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }

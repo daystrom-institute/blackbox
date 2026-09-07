@@ -650,7 +650,7 @@ pub fn find_json_array_row_mut<'a>(
 
 /// Stamp one row of an owner whose source is a top-level object holding an
 /// array of row objects keyed by an id field. This covers most central JSON
-/// stores (knowledge entries, gaps, threads, notes, pins, roadmap items).
+/// stores (knowledge entries, gaps, threads, notes, pins).
 pub fn stamp_json_array_row(
     bytes: &[u8],
     array_field: &str,

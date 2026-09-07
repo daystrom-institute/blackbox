@@ -1970,7 +1970,6 @@ pub(crate) struct ProjectCatalogOwnerInventoryPathsV1 {
     pub(crate) thread_store_path: PathBuf,
     pub(crate) note_store_path: PathBuf,
     pub(crate) pin_store_path: PathBuf,
-    pub(crate) roadmap_store_path: PathBuf,
     pub(crate) packet_root: PathBuf,
     pub(crate) task_store_path: PathBuf,
     pub(crate) proposal_root: PathBuf,
@@ -2544,7 +2543,6 @@ struct AuthorizedProjectCatalogOwnerInventoryPathsV1 {
     thread_store_path: AuthorizedInventoryPath,
     note_store_path: AuthorizedInventoryPath,
     pin_store_path: AuthorizedInventoryPath,
-    roadmap_store_path: AuthorizedInventoryPath,
     packet_root: AuthorizedInventoryPath,
     task_store_path: AuthorizedInventoryPath,
     proposal_root: AuthorizedInventoryPath,
@@ -2593,7 +2591,6 @@ fn authorize_owner_paths(
         thread_store_path: AuthorizedInventoryPath::new(paths.thread_store_path)?,
         note_store_path: AuthorizedInventoryPath::new(paths.note_store_path)?,
         pin_store_path: AuthorizedInventoryPath::new(paths.pin_store_path)?,
-        roadmap_store_path: AuthorizedInventoryPath::new(paths.roadmap_store_path)?,
         packet_root: AuthorizedInventoryPath::new(paths.packet_root)?,
         task_store_path: AuthorizedInventoryPath::new(paths.task_store_path)?,
         proposal_root: AuthorizedInventoryPath::new(paths.proposal_root)?,
@@ -2815,7 +2812,6 @@ struct DurableOwnerSnapshotsV1 {
     thread: Vec<OwnerSnapshotV1>,
     note: Vec<OwnerSnapshotV1>,
     pin: Vec<OwnerSnapshotV1>,
-    roadmap: Vec<OwnerSnapshotV1>,
     packet: Vec<OwnerSnapshotV1>,
     task: Vec<OwnerSnapshotV1>,
     proposal: Vec<OwnerSnapshotV1>,
@@ -2994,9 +2990,6 @@ fn capture_durable_owner_snapshots(
     let pin = capture_owner_snapshot_path(&paths.pin_store_path, |path| {
         bbox_stores::pins::capture_project_catalog_owner_snapshot(path, limits)
     })?;
-    let roadmap = capture_owner_snapshot_path(&paths.roadmap_store_path, |path| {
-        bbox_stores::roadmap::capture_project_catalog_owner_snapshot(path, limits)
-    })?;
     let packet = capture_owner_snapshot_path(&paths.packet_root, |path| {
         bbox_packets::capture_project_catalog_owner_snapshot(path, limits)
     })?;
@@ -3041,7 +3034,6 @@ fn capture_durable_owner_snapshots(
         thread: vec![thread],
         note: vec![note],
         pin: vec![pin],
-        roadmap: vec![roadmap],
         packet: vec![packet],
         task: vec![task],
         proposal: vec![proposal],
@@ -3775,7 +3767,6 @@ fn owner_kind_token(kind: ImmutableInventoryOwnerKindV1) -> &'static str {
         ImmutableInventoryOwnerKindV1::Thread => "thread",
         ImmutableInventoryOwnerKindV1::Note => "note",
         ImmutableInventoryOwnerKindV1::Pin => "pin",
-        ImmutableInventoryOwnerKindV1::Roadmap => "roadmap",
         ImmutableInventoryOwnerKindV1::Packet => "packet",
         ImmutableInventoryOwnerKindV1::Task => "task",
         ImmutableInventoryOwnerKindV1::Proposal => "proposal",
@@ -3796,7 +3787,6 @@ fn legacy_owner_kind(kind: LegacyPathStoreKindV1) -> ImmutableInventoryOwnerKind
         LegacyPathStoreKindV1::Thread => ImmutableInventoryOwnerKindV1::Thread,
         LegacyPathStoreKindV1::Note => ImmutableInventoryOwnerKindV1::Note,
         LegacyPathStoreKindV1::Pin => ImmutableInventoryOwnerKindV1::Pin,
-        LegacyPathStoreKindV1::Roadmap => ImmutableInventoryOwnerKindV1::Roadmap,
         LegacyPathStoreKindV1::Packet => ImmutableInventoryOwnerKindV1::Packet,
         LegacyPathStoreKindV1::Task => ImmutableInventoryOwnerKindV1::Task,
         LegacyPathStoreKindV1::Proposal => ImmutableInventoryOwnerKindV1::Proposal,
@@ -3818,7 +3808,6 @@ fn legacy_owner_snapshots(
         LegacyPathStoreKindV1::Thread => &durable.thread,
         LegacyPathStoreKindV1::Note => &durable.note,
         LegacyPathStoreKindV1::Pin => &durable.pin,
-        LegacyPathStoreKindV1::Roadmap => &durable.roadmap,
         LegacyPathStoreKindV1::Packet => &durable.packet,
         LegacyPathStoreKindV1::Task => &durable.task,
         LegacyPathStoreKindV1::Proposal => &durable.proposal,
@@ -3875,7 +3864,6 @@ fn capture_legacy_path_observations_lane(
         LegacyPathStoreKindV1::Thread,
         LegacyPathStoreKindV1::Note,
         LegacyPathStoreKindV1::Pin,
-        LegacyPathStoreKindV1::Roadmap,
         LegacyPathStoreKindV1::Packet,
         LegacyPathStoreKindV1::Task,
         LegacyPathStoreKindV1::Proposal,
@@ -5007,7 +4995,6 @@ mod tests {
             thread: Vec::new(),
             note: Vec::new(),
             pin: Vec::new(),
-            roadmap: Vec::new(),
             packet: Vec::new(),
             task: Vec::new(),
             proposal: Vec::new(),

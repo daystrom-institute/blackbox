@@ -1108,7 +1108,6 @@ mod tests {
             projects_path,
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1238,7 +1237,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1293,7 +1291,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1338,7 +1335,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

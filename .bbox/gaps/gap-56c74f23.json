@@ -1,24 +1,23 @@
 {
   "id": "gap-56c74f23",
-  "title": "Historical roadmap retirement: owning-project disposition and migration",
+  "title": "Elide the unused roadmap surface and runtime wiring",
   "gap_kind": "mcp_surface",
   "domain": "roadmap",
-  "wanted_capability": "Obtain per-owner disposition for surviving historical roadmap records, preserve exact recovery and relations, and migrate or archive only with an established destination and explicit owner approval before removing retained storage or graph adapters.",
-  "missing_primitive": "Owner-approved historical record mapping and archival disposition; Campaign/Inquiry/Concept schema and guarded planning-graph authoring already exist.",
-  "fallback_used": "Abandoned a gap-to-roadmap migration mid-flight (2026-08-18 grounding pass, Blackbox Janny session); the 19 candidate gaps stay open in the gap store until a campaign-layer graph extension exists in this repo.",
+  "wanted_capability": "Remove the roadmap MCP tool, store loading, indexing, graph provider and schema, ownership adapters, configuration and active documentation. No historical reader, data migration, archival workflow, replacement planning graph or owner-disposition prerequisite is required.",
+  "missing_primitive": "Complete removal of the unused roadmap abstraction and runtime wiring.",
+  "fallback_used": "None required. Legacy stored bytes may remain inert; stale records do not require a supported reader or replacement workflow.",
   "evidence": [
     "thread:thread-c749d06c",
-    "design/surfaces/mcp/roadmap-retirement.md",
-    "docs/roadmap-tool.md",
-    "docs/design-graph.md",
-    "design/surfaces/mcp/mcp-survivor-closure-verification.json"
+    "design/surfaces/mcp/roadmap-retirement.md"
   ],
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "mcp_surface/roadmap/retire-roadmap-surface",
-  "notes": "Roadmap MCP mutation retirement is implemented and deployed at source 38eaf3738606fae164900fcb896f36b5d42ebf12. All seven mutation actions refuse before effects. Six historical reads, exact JSON export, indexing, ownership adapters and all eight graph relation types remain. The repository design graph already supports Campaign, Inquiry and Concept vertices, guarded CLI authoring and planning reads; the older missing-replacement claim is superseded. Read-only inspection found one retained record belonging to another project, with no links. Its title/body/identifiers are not copied into this public repo, and no record was moved, deleted or status-changed. The owning project's operator must determine archival or an exact planning-graph destination. Keep unresolved for that data-disposition work; do not remove the historical store/edges before recovery and mapped relations are preserved. See design/surfaces/mcp/roadmap-retirement.md and mcp-survivor-closure-verification.json.",
-  "resolution": "unresolved",
+  "notes": "Completed roadmap elision at source eeb138e7a566. Removed the MCP tool and every action, store/runtime/persistence/config, entity/provider/schema/index/embedding/ownership adapters, templates and stale docs. No historical reader or data migration remains. Only inert decoding/exclusion at shared catalog, edge and index boundaries protects surviving product state. Full workspace verification passed 6731 tests with 19 skipped; clippy, pinned formatting, 108-handler concurrency lint and binary builds passed. Corrected HTTP probe 43695d09b821 passed 285 checks against the same runtime, including startup with malformed former roadmap files and ordinary unavailable-tool routing. Image sha256:8c0e1d445df11b0149d572fc8813fc662458be0dda0890a80f1ecfdf8cb3a68c deployed with ready generation 23; read-only production checks confirm 108 tools, absent roadmap/schema, and surviving snapshot/thread readers. Evidence: design/surfaces/mcp/roadmap-elision-verification.json.",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-18T22:27:22Z",
-  "updated_at": "2026-09-07T01:26:37Z"
+  "updated_at": "2026-09-07T01:57:45Z",
+  "resolved_at": "2026-09-07T01:57:45Z",
+  "resolution_note": "Roadmap is elided and deployed. Operator explicitly rejected stale-history retention and migration; no owner-disposition or replacement-workflow follow-up remains. Verification is recorded in design/surfaces/mcp/roadmap-elision-verification.json."
 }

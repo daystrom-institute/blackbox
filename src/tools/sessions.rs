@@ -54,7 +54,7 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_reindex", move || {
             // Runs on the writer actor: unified with the background pass
-            // (which also picks up thread/roadmap store docs the old manual
+            // (which also picks up thread store docs the old manual
             // path skipped) and never contends for the writer lock.
             // `accept_empty_projects` is operator authority passed straight
             // through (RX-V1): never defaulted, never inferred from a prior

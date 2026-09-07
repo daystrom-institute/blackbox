@@ -223,7 +223,6 @@ pub struct ReindexConfig {
     pub code_source_record_mode: bbox_code_source_store::RuntimeRecordMode,
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
-    pub roadmap_path: PathBuf,
     /// Standalone harness process sessions dir (`$BRO_HOME/harness-sessions`) whose
     /// sidecar event logs are indexed via the transcript adapter registry.
     /// `None` (the default, and what hermetic tests get) disables the
@@ -393,7 +392,6 @@ impl TranscriptIndex {
         projects_path: PathBuf,
         knowledge_path: PathBuf,
         threads_path: PathBuf,
-        roadmap_path: PathBuf,
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
     ) -> Result<Self> {
         Self::open_or_create_guarded(
@@ -403,7 +401,6 @@ impl TranscriptIndex {
             projects_path,
             knowledge_path,
             threads_path,
-            roadmap_path,
             records_provider,
             None,
         )
@@ -420,7 +417,6 @@ impl TranscriptIndex {
         projects_path: PathBuf,
         knowledge_path: PathBuf,
         threads_path: PathBuf,
-        roadmap_path: PathBuf,
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
@@ -436,7 +432,6 @@ impl TranscriptIndex {
             code_source_store_path,
             knowledge_path,
             threads_path,
-            roadmap_path,
             records_provider,
             schema_replacement_guard,
         )
@@ -451,7 +446,6 @@ impl TranscriptIndex {
         code_source_store_path: PathBuf,
         knowledge_path: PathBuf,
         threads_path: PathBuf,
-        roadmap_path: PathBuf,
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
@@ -463,7 +457,6 @@ impl TranscriptIndex {
             code_source_store_path,
             knowledge_path,
             threads_path,
-            roadmap_path,
             records_provider,
             schema_replacement_guard,
             schema_replacement::CatalogReplacementIntentV1::MismatchOnly,
@@ -486,7 +479,6 @@ impl TranscriptIndex {
         code_source_store_path: PathBuf,
         knowledge_path: PathBuf,
         threads_path: PathBuf,
-        roadmap_path: PathBuf,
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
         replacement_intent: schema_replacement::CatalogReplacementIntentV1,
@@ -570,7 +562,6 @@ impl TranscriptIndex {
             code_source_record_mode,
             knowledge_path,
             threads_path,
-            roadmap_path,
             harness_sessions_dir: None,
             gemini_tmp_root: None,
             conversation_source_root: None,
@@ -913,6 +904,20 @@ impl TranscriptIndex {
         self.reader.searcher().num_docs()
     }
 
+    /// Retired entity documents remain inert until an ordinary index rebuild.
+    fn live_documents_query(&self, query: Box<dyn QueryTrait>) -> BooleanQuery {
+        BooleanQuery::new(vec![
+            (Occur::Must, query),
+            (
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_type, "roadmap"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ])
+    }
+
     /// Cheap count of docs matching a single `doc_type` term, via a
     /// `TermQuery` + `Count` collector -- no stored-doc streaming. Used by
     /// `bbox_describe_schema`'s transcript vertex count: transcript entities
@@ -921,6 +926,9 @@ impl TranscriptIndex {
     /// graph), so describe_schema needs a tantivy-backed count instead of an
     /// edge-index one.
     pub fn doc_type_count(&self, doc_type: &str) -> Result<usize> {
+        if doc_type == "roadmap" {
+            return Ok(0);
+        }
         let searcher = self.reader.searcher();
         let query = TermQuery::new(
             Term::from_field_text(self.fields.doc_type, doc_type),
@@ -1014,6 +1022,7 @@ impl TranscriptIndex {
                 (Occur::Must, active),
             ]));
         }
+        query = Box::new(self.live_documents_query(query));
         let limit = match max_docs {
             Some(n) => n,
             None => searcher.search(&*query, &Count)?,
@@ -1052,10 +1061,10 @@ impl TranscriptIndex {
         entity_id: &str,
     ) -> Result<Option<EmbeddingSourceDoc>> {
         let searcher = self.reader.searcher();
-        let query = TermQuery::new(
+        let query = self.live_documents_query(Box::new(TermQuery::new(
             Term::from_field_text(self.fields.entity_id, entity_id),
             IndexRecordOption::Basic,
-        );
+        )));
         let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(1))?;
         let Some((_score, addr)) = top_docs.into_iter().next() else {
             return Ok(None);
@@ -1113,10 +1122,10 @@ impl TranscriptIndex {
         searcher: &tantivy::Searcher,
         include_content: bool,
     ) -> Result<Option<BTreeMap<String, String>>> {
-        let query = TermQuery::new(
+        let query = self.live_documents_query(Box::new(TermQuery::new(
             Term::from_field_text(self.fields.entity_id, entity_id),
             IndexRecordOption::Basic,
-        );
+        )));
         let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(1))?;
         let Some((_score, addr)) = top_docs.into_iter().next() else {
             return Ok(None);
@@ -1693,6 +1702,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_retired_documents_are_inert_across_search_and_exact_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = TranscriptIndex::open_or_create_with_records(
+            &root.join("index"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        for (kind, id) in [("roadmap", "roadmap_item:old"), ("thread", "thread:live")] {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(index.fields.doc_type, kind);
+            doc.add_text(index.fields.entity_id, id);
+            doc.add_text(index.fields.content, "retirementneedle");
+            doc.add_text(index.fields.file_path, "retained-source");
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader.reload().unwrap();
+        assert_eq!(
+            index.searcher().num_docs(),
+            2,
+            "stored bytes are left intact"
+        );
+        let hits = index.hybrid_bm25_hits("retirementneedle", 1, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].entity_id, "thread:live",
+            "retired hits cannot consume top-k"
+        );
+        assert!(
+            index
+                .hybrid_bm25_hits("retirementneedle", 10, Some("roadmap"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(index.doc_type_count("roadmap").unwrap(), 0);
+        assert!(
+            index
+                .entity_properties("roadmap_item:old")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            index
+                .entity_properties_with_content("roadmap_item:old", &index.searcher())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            index
+                .embedding_source_doc_for_entity_id("roadmap_item:old")
+                .unwrap()
+                .is_none()
+        );
+        let docs = index
+            .embedding_source_docs_for_doc_types(&["roadmap", "thread"], None)
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_type, "thread");
+        assert!(index.entity_properties("thread:live").unwrap().is_some());
+    }
+
+    #[test]
     fn interrupted_replacement_with_absent_index_keeps_marker_withheld() {
         let dir = tempfile::tempdir().unwrap();
         let outcome = reset_index_on_schema_mismatch(
@@ -1721,7 +1799,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1744,7 +1821,6 @@ mod tests {
             code_source_store_path.clone(),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::new(
                 ProjectRecordsSnapshot::empty(),
             )),
@@ -1767,7 +1843,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1819,7 +1894,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1861,7 +1935,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -1937,7 +2010,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(test_authorizing_guard()),
         )
@@ -1979,7 +2051,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .err()
@@ -2020,7 +2091,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
@@ -2068,7 +2138,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
@@ -2103,7 +2172,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
@@ -2121,7 +2189,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2190,7 +2257,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2259,7 +2325,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2305,7 +2370,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2350,7 +2414,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2378,7 +2441,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2483,7 +2545,6 @@ mod tests {
             projects_path,
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             // The SAME record the file above carries. Injected explicitly
             // rather than read back off `projects_path`: the assertion below
             // is that a registered record never resolves an id inside this
@@ -2597,7 +2658,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2683,7 +2743,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -2753,7 +2812,6 @@ mod tests {
             root.join("projects.json"),
             root.join("knowledge.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

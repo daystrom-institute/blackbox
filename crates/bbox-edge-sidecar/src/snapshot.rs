@@ -6801,8 +6801,8 @@ fn validate_overlay_provenance(overlay_dir: &fs::File) -> Result<OverlayValidati
             if trimmed.is_empty() {
                 continue;
             }
-            let edge: Edge = serde_json::from_str(trimmed)?;
-            if edge.provenance != EdgeProvenance::Derived {
+            let (_, provenance) = crate::edge_sidecar::decode_live_edge_row(trimmed.as_bytes())?;
+            if provenance != EdgeProvenance::Derived {
                 found_bad = true;
                 break;
             }
@@ -6899,8 +6899,8 @@ fn validate_overlay_provenance_path(overlay_dir: &Path) -> Result<OverlayValidat
             if trimmed.is_empty() {
                 continue;
             }
-            let edge: Edge = serde_json::from_str(trimmed)?;
-            if edge.provenance != EdgeProvenance::Derived {
+            let (_, provenance) = crate::edge_sidecar::decode_live_edge_row(trimmed.as_bytes())?;
+            if provenance != EdgeProvenance::Derived {
                 found_bad = true;
                 break;
             }

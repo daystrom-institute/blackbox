@@ -148,7 +148,6 @@ Prerequisites:
        pub providers: ProviderOverrides,
        pub lsp: LspOverrides,
        pub transcripts: TranscriptOverrides,
-       pub roadmap: RoadmapOverrides,
    }
 
    #[derive(Debug, Clone)]
@@ -160,7 +159,6 @@ Prerequisites:
        pub lsp: LspConfig,
        pub transcripts: TranscriptConfig,
        pub paths: ResolvedPathConfig,
-       pub roadmap: RoadmapConfig,
    }
 
    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -219,7 +217,6 @@ Prerequisites:
        pub state_dir: PathBuf,
        pub knowledge_path: PathBuf,
        pub threads_path: PathBuf,
-       pub roadmap_path: PathBuf,
        pub notes_path: PathBuf,
        pub pins_path: PathBuf,
        pub projects_path: PathBuf,
@@ -234,11 +231,6 @@ Prerequisites:
        pub global_gemini_md: PathBuf,
    }
 
-   #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-   pub struct RoadmapConfig {
-       pub write_path: Option<PathBuf>,
-       pub template_path: Option<PathBuf>,
-   }
    ```
 
    Notes:
@@ -447,23 +439,7 @@ Prerequisites:
    - An explicitly populated env var named by CLI args still wins because the
      sidecar flag is an operator override.
 
-10. Wire `[roadmap]` fallback.
-
-    Targets:
-
-    - `src/tools/roadmap.rs:46-56`
-    - `src/tools/roadmap.rs:738-800`
-
-    Implementation:
-
-    - If `write_path` is absent from the tool params, read
-      `config.roadmap.write_path`.
-    - If `template_path` is absent and no inline `template` is supplied, read
-      `config.roadmap.template_path`.
-    - Project `.bbox/config.toml` fallback is Phase 3; Phase 1 uses global
-      config only.
-
-11. Update systemd units for config-first operation.
+10. Update systemd units for config-first operation.
 
     `deploy/blackbox.service:11-19`:
 
@@ -494,7 +470,7 @@ Prerequisites:
       `port = 7265`, `bind = "0.0.0.0"`, `mcp_name = "blackbox-dev"`,
       `state_dir = "%h/.local/state/blackbox-dev"`, and the dev render targets.
 
-12. Add sample config files.
+11. Add sample config files.
 
     New files:
 
@@ -560,7 +536,7 @@ Prerequisites:
 - Store save methods are unchanged and still use fixed tmp paths at:
   `src/knowledge.rs:700-710`, `src/threads.rs:213-224`,
   `src/notes.rs:210-221`, `src/pins.rs:122-131`,
-  `src/roadmap.rs:275-285`, `src/projects.rs:285-308`,
+  `src/projects.rs:285-308`,
   `src/packets/mod.rs:315-326`, and `src/orchestration/mcp.rs:221-232`.
 
 ### Ordered task list
@@ -714,7 +690,6 @@ Prerequisites:
    - `src/threads.rs:213-224`
    - `src/notes.rs:210-221`
    - `src/pins.rs:122-131`
-   - `src/roadmap.rs:275-285`
    - `src/projects.rs:285-308`
    - `src/packets/mod.rs:315-326`
    - `src/orchestration/mcp.rs:221-232`
@@ -817,12 +792,9 @@ Prerequisites:
 
    ```rust
    pub fn load_project(project_root: &std::path::Path) -> anyhow::Result<ProjectConfig>;
-   pub fn merge_project(base: &Config, project: &ProjectConfig) -> Config;
 
    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
    pub struct ProjectConfig {
-       #[serde(default)]
-       pub roadmap: RoadmapConfig,
        #[serde(default)]
        pub mcp: ProjectMcpConfig,
        #[serde(default)]
@@ -964,17 +936,6 @@ Prerequisites:
        restart is required for port/bind changes to take effect.
    - On non-Unix, compile a no-op task.
 
-8. Update roadmap project fallback.
-
-   Target: `src/tools/roadmap.rs:738-800`.
-
-   Resolution order:
-
-   - Explicit params.
-   - `<project>/.bbox/config.toml` `[roadmap]`.
-   - Global config `[roadmap]`.
-   - Return markdown without writing.
-
 ### Test plan
 
 Unit tests:
@@ -992,7 +953,6 @@ Integration tests under `tests/`:
 - `tests/project_bbox.rs`
   - `bbox_project_init_then_register_reads_project_config`
   - `project_mcp_disabled_ignores_bbox_mcp_json`
-  - `sighup_reloads_global_roadmap_config`
 
 Manual smoke:
 

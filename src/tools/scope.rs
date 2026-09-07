@@ -1,7 +1,7 @@
 //! Shared project write-scope resolution for store tool adapters.
 //!
-//! Stores that key durable state by project path (knowledge, gaps, and —
-//! progressively — pins/notes/whiteboards/roadmap) must agree on what a
+//! Stores that key durable state by project path (knowledge, gaps, pins,
+//! notes, and whiteboards) must agree on what a
 //! caller-supplied `project` value means when the caller works inside a
 //! worktree: the durable scope is the registered BASE project, while
 //! repo-owned committed files belong in the WORKTREE checkout so they travel
@@ -269,21 +269,6 @@ impl BlackboxServer {
                 "project filter `{raw}` resolved to no registered project (tried project_id, operator alias, and registered path); only a literal substring match on a row's stored project path can return rows"
             )),
         }
-    }
-
-    /// Tuple wrapper variant that also carries the resolved project id for
-    /// dual-read stamping (phase-2 §8.1).
-    pub(crate) fn resolve_project_write_scope_with_id(
-        &self,
-        raw: &str,
-    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
-        self.resolve_project_write(raw).map(|resolution| {
-            let write_dir = resolution
-                .checkout_scope
-                .as_ref()
-                .map(|checkout| checkout.checkout_project_dir.clone());
-            (resolution.durable_scope, resolution.project_id, write_dir)
-        })
     }
 
     /// Hybrid/graph-search project filter resolution (phase-2 §9.2 B2):
@@ -735,12 +720,11 @@ mod tests {
         );
     }
 
-    /// Cross-store contract for the shared write-scope resolver: notes,
-    /// roadmap items, and whiteboards authored from an in-tree linked
-    /// worktree all key to the registered BASE project, and the notes list
+    /// Notes authored from an in-tree linked worktree key to the registered
+    /// BASE project, and the notes list
     /// filter maps a worktree path back to that scope.
     #[tokio::test]
-    async fn worktree_callers_key_notes_roadmap_and_whiteboards_to_base() {
+    async fn worktree_callers_key_notes_to_base() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("repo");
         std::fs::create_dir_all(&base).unwrap();
@@ -817,27 +801,6 @@ mod tests {
             format!("{:?}", listed.content).contains("WORKTREE_NOTE_MARKER"),
             "worktree-path note filter should map to the base scope: {listed:?}"
         );
-
-        // Roadmap: item created from the worktree keys base.
-        let created = server
-            .roadmap_create(super::super::roadmap::RoadmapCreateParams {
-                title: "worktree-authored item".into(),
-                body: "scoping check".into(),
-                category: "feature".into(),
-                priority: None,
-                scope: Some("project".into()),
-                project: Some(wt.clone()),
-            })
-            .await
-            .expect("roadmap create");
-        assert!(created.contains("\"id\""), "create response: {created}");
-        {
-            let rm = server.state.roadmap.read();
-            let item = rm
-                .find_by_title("worktree-authored item")
-                .expect("item stored");
-            assert_eq!(item.project.as_deref(), Some(base_str.as_str()));
-        }
     }
 }
 

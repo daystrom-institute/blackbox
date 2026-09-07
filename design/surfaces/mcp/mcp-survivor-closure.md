@@ -70,15 +70,17 @@ failure retains exact task recovery. A refused reservation reports a member
 error and preserves the original team and corrupt store bytes. Reservation
 refusal releases the task-store write lock before its readback.
 
-## Roadmap retirement
+## Roadmap elision
 
-[Roadmap retirement](roadmap-retirement.md) records actual consumers and
-replacement instructions. All seven MCP mutation actions refuse before
-side effects. Six historical read actions, exact JSON export, stored items and
-graph relations remain. The public project design graph already supports
-Campaign, Inquiry and Concept vertices with guarded CLI authoring. Historical
-records belonging to other projects are not automatically moved into it;
-per-owner archival or migration is the remaining data-disposition boundary.
+[Roadmap elision](roadmap-retirement.md) records the operator's 2026-09-07
+removal contract. The MCP tool, historical readers, runtime store, config,
+entity/edge vocabulary, indexing and templates are removed. Calls use the
+ordinary unknown-tool error. There is no historical migration, per-owner
+archival obligation or replacement workflow. The earlier mutation-only
+retirement was superseded by this direction. Elision is now verified and
+deployed; [its acceptance record](roadmap-elision-verification.json) contains
+the exact source, image, 6,731 passing full-workspace tests and 285 isolated
+HTTP checks. `gap-56c74f23` is addressed without migration follow-up.
 
 ## Recall probes are reads
 
@@ -88,7 +90,10 @@ HNSW state and measured recall remain distinct outcomes. Tempdir regressions
 prove unknown, parent-relative and absolute routes leave storage and the
 loaded-partition inventory unchanged.
 
-## Verified rollout
+## Verified rollout before roadmap elision
+
+The measurements in this section describe the earlier retained-reader revision.
+They remain historical evidence; roadmap elision requires its own verification.
 
 Final tested source: `38eaf3738606fae164900fcb896f36b5d42ebf12`, including the concurrent Anthropic retry fix.
 All 6,753 workspace tests passed in 157.814 seconds, with
@@ -105,7 +110,7 @@ recall probe, task dispatch or historical-data mutation was used for validation.
 
 [Verification evidence](mcp-survivor-closure-verification.json) records the
 commands, measurements, image digest and limits. Remaining acceptance work is
-live remote-executor/provider failure certification and any owner-approved
-historical roadmap migration. Backend delivery/readiness repair and GLM
+live remote-executor/provider failure certification. Historical roadmap
+migration is not an acceptance obligation. Backend delivery/readiness repair and GLM
 experiments remain separately owned. No source defect is inferred solely from
 an unexecuted provider combination.

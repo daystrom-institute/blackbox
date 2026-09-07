@@ -3,7 +3,7 @@
 //!
 //! This lives root-side because the production `LegacyRowStamperV1` does: the
 //! write half needs the owner crates' real schemas, and only the root crate
-//! sees all fourteen owners alongside the facade. Every other backfill test is
+//! sees all active owners alongside the facade. Every other backfill test is
 //! a unit test against a synthetic stamper; this is the one that proves the
 //! real one reaches real owner stores through the real facade.
 //!
@@ -159,7 +159,6 @@ fn initialize_empty_owner_state(root: &Path) {
         state.join("projects.json"),
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
-        state.join("blackbox-roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -181,10 +180,6 @@ fn initialize_empty_owner_state(root: &Path) {
         ("blackbox-threads.json", r#"{"version":1,"threads":[]}"#),
         ("blackbox-notes.json", r#"{"version":1,"notes":[]}"#),
         ("blackbox-pins.json", r#"{"version":1,"pins":[]}"#),
-        (
-            "blackbox-roadmap.json",
-            r#"{"version":1,"items":[],"edges":[]}"#,
-        ),
     ] {
         write(&state.join(name), body.as_bytes());
     }
@@ -739,7 +734,6 @@ impl Fixture {
             &owners.thread_store_path,
             &owners.note_store_path,
             &owners.pin_store_path,
-            &owners.roadmap_store_path,
             &owners.packet_root,
             &owners.proposal_root,
             &owners.slack_store_root,
@@ -887,7 +881,6 @@ impl Fixture {
                     thread_store_path: owners.thread_store_path,
                     note_store_path: owners.note_store_path,
                     pin_store_path: owners.pin_store_path,
-                    roadmap_store_path: owners.roadmap_store_path,
                     packet_root: owners.packet_root,
                     proposal_root: owners.proposal_root,
                     slack_store_root: owners.slack_store_root,
@@ -914,7 +907,6 @@ impl Fixture {
                     thread_store_path: owners.thread_store_path,
                     note_store_path: owners.note_store_path,
                     pin_store_path: owners.pin_store_path,
-                    roadmap_store_path: owners.roadmap_store_path,
                     packet_root: owners.packet_root,
                     proposal_root: owners.proposal_root,
                     slack_store_root: owners.slack_store_root,
@@ -1116,7 +1108,7 @@ impl Fixture {
 
     /// Populate every remaining writable owner with one mapped singleton row.
     /// Together with the fixture's knowledge/thread rows and the aggregate
-    /// transcript-edge row, this drives all thirteen production stamp/read
+    /// transcript-edge row, this drives all twelve production stamp/read
     /// dispatches (provenance is the sole by-construction exemption).
     fn seed_every_remaining_writable_owner(&self) {
         let owners = self.layout.stamper_owner_paths();
@@ -1129,11 +1121,6 @@ impl Fixture {
             &owners.pin_store_path,
             "pins",
             serde_json::json!({"id": "pin1", "project": "/legacy/pin"}),
-        );
-        write_owner(
-            &owners.roadmap_store_path,
-            "items",
-            serde_json::json!({"id": "road1", "project": "/legacy/roadmap"}),
         );
 
         // The base note is quarantined to force a pair mutation. Add a second,
@@ -1220,11 +1207,6 @@ impl Fixture {
                 LegacyPathStoreKindV1::Pin,
                 "pin1".to_string(),
                 "/legacy/pin",
-            ),
-            (
-                LegacyPathStoreKindV1::Roadmap,
-                "road1".to_string(),
-                "/legacy/roadmap",
             ),
             (
                 LegacyPathStoreKindV1::Note,
@@ -1604,11 +1586,11 @@ fn every_writable_owner_stamps_and_reads_back_through_the_durable_facade() {
     );
     let verify = fixture.verify().unwrap();
 
-    // 2 base mapped rows + 10 singleton owners + 1 aggregate owner. The
+    // 2 base mapped rows + 9 singleton owners + 1 aggregate owner. The
     // quarantined base note is not a stamping obligation; the separately
     // mapped note above proves its owner.
-    assert_eq!(verify.journal_stamp_total, 13);
-    assert_eq!(verify.observed_mappable_total, 13);
+    assert_eq!(verify.journal_stamp_total, 12);
+    assert_eq!(verify.observed_mappable_total, 12);
 }
 
 /// R2-2. A host that has ever RELOCATED an attachment can still run its
@@ -2491,7 +2473,6 @@ fn the_torn_stamper_delegates_coverage() {
                 thread_store_path: root.join("threads.json"),
                 note_store_path: root.join("notes.json"),
                 pin_store_path: root.join("pins.json"),
-                roadmap_store_path: root.join("roadmap.json"),
                 packet_root: root.join("packets"),
                 proposal_root: root.join("proposals"),
                 slack_store_root: root.join("slack"),
@@ -2735,7 +2716,6 @@ impl RebuildFixture {
                 paths.code_source_root.clone(),
                 paths.knowledge_path.clone(),
                 paths.threads_path.clone(),
-                paths.roadmap_path.clone(),
                 records.clone(),
                 Some(guard),
                 intent,
@@ -4321,7 +4301,6 @@ fn the_forced_replacement_refuses_a_stale_predecessor_marker() {
         paths.code_source_root.clone(),
         paths.knowledge_path.clone(),
         paths.threads_path.clone(),
-        paths.roadmap_path.clone(),
         records,
         Some(guard),
         CatalogReplacementIntentV1::ForceSameSchema,
@@ -4460,7 +4439,6 @@ fn a_fresh_v2_root_boots_twice_without_a_manifest() {
             root.join("code-sources"),
             root.join("blackbox-knowledge.json"),
             root.join("blackbox-threads.json"),
-            root.join("blackbox-roadmap.json"),
             Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
             None,
             intent,

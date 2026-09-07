@@ -232,7 +232,7 @@ impl LegacyRowClassificationV1 {
 /// Map a ledger `source_store` token back to its owner variant.
 ///
 /// The token vocabulary is the migration's; this is its inverse and must stay
-/// exhaustive over the 14-variant owner set. An unknown token is a ledger the
+/// exhaustive over the 13-variant owner set. An unknown token is a ledger the
 /// backfill cannot act on, not a row to skip silently.
 pub fn legacy_store_kind_from_token(token: &str) -> Option<LegacyPathStoreKindV1> {
     Some(match token {
@@ -241,7 +241,6 @@ pub fn legacy_store_kind_from_token(token: &str) -> Option<LegacyPathStoreKindV1
         "thread" => LegacyPathStoreKindV1::Thread,
         "note" => LegacyPathStoreKindV1::Note,
         "pin" => LegacyPathStoreKindV1::Pin,
-        "roadmap" => LegacyPathStoreKindV1::Roadmap,
         "packet" => LegacyPathStoreKindV1::Packet,
         "task" => LegacyPathStoreKindV1::Task,
         "proposal" => LegacyPathStoreKindV1::Proposal,
@@ -264,7 +263,7 @@ pub const ATTACHMENT_RELOCATION_SOURCE: &str = "attachment-relocation";
 
 /// What one ledger binding's `source_store` names.
 ///
-/// The fourteen owners are the STAMPABLE universe, but they were never the
+/// The thirteen owners are the STAMPABLE universe, but they were never the
 /// whole ledger. Treating every non-owner token as a defect meant that any host
 /// which had ever relocated an attachment refused its own backfill, in
 /// planning and again in verification, over a record that carries no obligation
@@ -281,6 +280,8 @@ pub enum LegacyLedgerSourceV1 {
     Owner(LegacyPathStoreKindV1),
     /// A host-local attachment relocation record.
     AttachmentRelocation,
+    /// Retained ledger evidence for an owner no longer in the product.
+    RetiredOwner,
 }
 
 /// Classify a ledger `source_store` token. `None` is a token no version of this
@@ -288,6 +289,9 @@ pub enum LegacyLedgerSourceV1 {
 pub fn classify_legacy_ledger_source(token: &str) -> Option<LegacyLedgerSourceV1> {
     if token == ATTACHMENT_RELOCATION_SOURCE {
         return Some(LegacyLedgerSourceV1::AttachmentRelocation);
+    }
+    if token == "roadmap" {
+        return Some(LegacyLedgerSourceV1::RetiredOwner);
     }
     legacy_store_kind_from_token(token).map(LegacyLedgerSourceV1::Owner)
 }
@@ -748,10 +752,10 @@ pub trait LegacyRowStamperV1: Send + Sync {
     /// Whether this stamper can write the owner behind `store_kind`.
     ///
     /// Deliberately a probe rather than a registry lookup: an implementation
-    /// answers with an exhaustive `match` over the 14-variant owner set, so
+    /// answers with an exhaustive `match` over the 13-variant owner set, so
     /// the compiler forces it to answer for every store and polices any
     /// variant added later. A registry of optional per-store stampers would
-    /// let three-of-fourteen coverage pass as silent absence, which is the
+    /// let three-of-thirteen coverage pass as silent absence, which is the
     /// exact failure this shape exists to make impossible.
     ///
     /// Preflight probes every store with planned stamps and records the answer
@@ -800,7 +804,7 @@ pub enum LegacyRowObservationV1 {
 /// so a stamper that returned `Stamped` without writing anything produced a
 /// journal that verified perfectly against rows that had never been touched.
 ///
-/// Implementations answer `coverage` by exhaustive `match` over the 14-variant
+/// Implementations answer `coverage` by exhaustive `match` over the 13-variant
 /// owner set, for the reason spelled out on [`LegacyRowStamperV1::coverage`].
 pub trait LegacyRowOwnerReaderV1: Send + Sync {
     fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1;
@@ -1012,7 +1016,6 @@ pub fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
         LegacyPathStoreKindV1::Thread => "thread",
         LegacyPathStoreKindV1::Note => "note",
         LegacyPathStoreKindV1::Pin => "pin",
-        LegacyPathStoreKindV1::Roadmap => "roadmap",
         LegacyPathStoreKindV1::Packet => "packet",
         LegacyPathStoreKindV1::Task => "task",
         LegacyPathStoreKindV1::Proposal => "proposal",
@@ -1213,7 +1216,9 @@ fn plan_backfill(
             // plan is bound to), but it names no owner row, so it plans
             // nothing: no stamp, no classification count, and emphatically not
             // an unmappable one.
-            Some(LegacyLedgerSourceV1::AttachmentRelocation) => continue,
+            Some(
+                LegacyLedgerSourceV1::AttachmentRelocation | LegacyLedgerSourceV1::RetiredOwner,
+            ) => continue,
             None => {
                 return Err(refuse(
                     ERROR_RESOLUTION_INVALID,
@@ -1724,7 +1729,7 @@ pub struct DurableBackfillVerifyRequestV1 {
     /// selection rules as apply (section 3.1).
     pub target_selection: ProjectCatalogTargetSelectionV1,
     /// Reads the durable owner rows the applied plan claims to have stamped.
-    /// Injected for the same reason the stamper is: the fourteen owners live in
+    /// Injected for the same reason the stamper is: the thirteen owners live in
     /// their own crates and only the root crate sees them all.
     pub owner_reader: Arc<dyn LegacyRowOwnerReaderV1>,
 }
@@ -2298,7 +2303,9 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 // in the same order. If these two disagreed about which
                 // bindings are obligations, every count verify compares against
                 // the journal would be off by the relocations.
-                Some(LegacyLedgerSourceV1::AttachmentRelocation) => continue,
+                Some(
+                    LegacyLedgerSourceV1::AttachmentRelocation | LegacyLedgerSourceV1::RetiredOwner,
+                ) => continue,
                 None => {
                     return Err(refuse(
                         ERROR_STALE_POST_IMAGE,
@@ -2369,7 +2376,9 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 // from operator dispositions over QUARANTINED owner rows, and a
                 // relocation is neither owned nor quarantinable. A journal
                 // naming one describes a state this system cannot produce.
-                Some(LegacyLedgerSourceV1::AttachmentRelocation) => {
+                Some(
+                    LegacyLedgerSourceV1::AttachmentRelocation | LegacyLedgerSourceV1::RetiredOwner,
+                ) => {
                     return Err(refuse(
                         ERROR_STALE_POST_IMAGE,
                         "the journal names a conversion whose binding is a host-local \
@@ -3341,7 +3350,7 @@ mod tests {
         assert_ne!(here, later);
     }
 
-    /// The 14-variant owner token mapping round-trips in both directions.
+    /// The 13-variant owner token mapping round-trips in both directions.
     #[test]
     fn every_owner_token_round_trips() {
         for kind in [
@@ -3350,7 +3359,6 @@ mod tests {
             LegacyPathStoreKindV1::Thread,
             LegacyPathStoreKindV1::Note,
             LegacyPathStoreKindV1::Pin,
-            LegacyPathStoreKindV1::Roadmap,
             LegacyPathStoreKindV1::Packet,
             LegacyPathStoreKindV1::Task,
             LegacyPathStoreKindV1::Proposal,
@@ -3462,6 +3470,44 @@ mod tests {
             plan.planned_stamps.values().sum::<u64>(),
             1,
             "the relocation adds no planned stamp"
+        );
+        assert!(
+            plan.unscoped_legacy_counts.is_empty(),
+            "and it is not unscoped either"
+        );
+    }
+
+    #[test]
+    fn a_retired_owner_binding_survives_decode_and_plans_no_obligation() {
+        let attachments = attachments_with(vec![
+            entry("a1", 1, mapped(project('a')), "knowledge"),
+            entry("a2", 1, mapped(project('a')), "roadmap"),
+        ]);
+        let bytes = serde_json::to_vec(&attachments).unwrap();
+        let attachments: AttachmentSnapshotV1 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&attachments).unwrap(), bytes);
+        let effective = effective_legacy_bindings(&attachments.legacy_path_bindings).unwrap();
+        let inventory_hash = backfill_inventory_hash(7, &hash(1), &hash(2), &effective);
+        let plan = plan_backfill(
+            &attachments,
+            7,
+            &hash(1),
+            &hash(2),
+            &DurableBackfillResolutionV1::empty(inventory_hash),
+        )
+        .unwrap();
+
+        assert_eq!(plan.stamps.len(), 1);
+        assert_eq!(
+            plan.stamps[0].store_kind,
+            LegacyPathStoreKindV1::Knowledge,
+            "only the owner row is an obligation"
+        );
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(
+            plan.planned_stamps.values().sum::<u64>(),
+            1,
+            "the retired owner adds no planned stamp"
         );
         assert!(
             plan.unscoped_legacy_counts.is_empty(),
@@ -4209,7 +4255,6 @@ mod tests {
                 LegacyPathStoreKindV1::Thread
                 | LegacyPathStoreKindV1::Note
                 | LegacyPathStoreKindV1::Pin
-                | LegacyPathStoreKindV1::Roadmap
                 | LegacyPathStoreKindV1::Packet
                 | LegacyPathStoreKindV1::Task
                 | LegacyPathStoreKindV1::Proposal
@@ -4305,7 +4350,7 @@ mod tests {
             .into_iter()
             .map(|kind| (kind, ExemptProvenanceStamper.coverage(kind)))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(stamp_coverage.len(), 14, "every owner gets a verdict");
+        assert_eq!(stamp_coverage.len(), 13, "every owner gets a verdict");
         assert_eq!(
             stamp_coverage.get(&LegacyPathStoreKindV1::Provenance),
             Some(&LegacyRowStampCoverageV1::ExemptByConstruction)
@@ -4370,7 +4415,7 @@ mod tests {
     }
 
     /// An owner with planned stamps and no write-back is NAMED, not skipped.
-    /// This is the three-of-fourteen failure the coverage probe exists to stop.
+    /// This is the three-of-thirteen failure the coverage probe exists to stop.
     #[test]
     fn a_planned_store_without_a_write_back_is_named() {
         let planned = BTreeMap::from([

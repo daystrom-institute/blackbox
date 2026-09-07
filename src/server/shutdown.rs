@@ -176,9 +176,6 @@ fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     if let Err(err) = shared.pins_persister.flush_blocking() {
         tracing::warn!(error = %err, "pins persister flush on shutdown failed");
     }
-    if let Err(err) = shared.roadmap_persister.flush_blocking() {
-        tracing::warn!(error = %err, "roadmap persister flush on shutdown failed");
-    }
     if let crate::server::state::ProjectAuthority::Bridge { persister, .. } =
         &shared.project_authority
         && let Err(err) = persister.flush_blocking()

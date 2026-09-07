@@ -65,7 +65,6 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 tempfile = "3"
-bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-indexing = { path = "../bbox-indexing" }

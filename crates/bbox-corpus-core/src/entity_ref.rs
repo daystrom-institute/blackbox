@@ -35,11 +35,10 @@ pub enum EntityType {
     Agent,
     Packet,
     Artifact,
-    RoadmapItem,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 23] = [
+    pub const ALL: [EntityType; 22] = [
         EntityType::Knowledge,
         EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
@@ -62,7 +61,6 @@ impl EntityType {
         EntityType::Agent,
         EntityType::Packet,
         EntityType::Artifact,
-        EntityType::RoadmapItem,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -89,7 +87,6 @@ impl EntityType {
             EntityType::Agent => "agent",
             EntityType::Packet => "packet",
             EntityType::Artifact => "artifact",
-            EntityType::RoadmapItem => "roadmap_item",
         }
     }
 
@@ -131,7 +128,6 @@ impl EntityType {
             EntityType::Agent => "agent:<name>@v<version>",
             EntityType::Packet => "packet:domain:<domain>",
             EntityType::Artifact => "artifact:<kind>/<name>@<version>",
-            EntityType::RoadmapItem => "roadmap_item:<id>",
         }
     }
 
@@ -254,9 +250,6 @@ pub enum EntityRef {
         name: String,
         version: Option<String>,
     },
-    RoadmapItem {
-        id: String,
-    },
 }
 
 impl EntityRef {
@@ -335,9 +328,6 @@ impl EntityRef {
             EntityType::Agent => parse_agent(input, rest),
             EntityType::Packet => parse_packet(input, rest),
             EntityType::Artifact => parse_artifact(input, rest),
-            EntityType::RoadmapItem => parse_single(input, rest, EntityType::RoadmapItem, |id| {
-                EntityRef::RoadmapItem { id }
-            }),
         }
     }
 
@@ -478,7 +468,6 @@ impl EntityRef {
                 Some(version) => Ok(format!("artifact:{kind}/{name}@{version}")),
                 None => Ok(format!("artifact:{kind}/{name}")),
             },
-            EntityRef::RoadmapItem { id } => Ok(format!("roadmap_item:{id}")),
         }
     }
 
@@ -508,7 +497,6 @@ impl EntityRef {
             EntityRef::Agent { .. } => EntityType::Agent,
             EntityRef::Packet { .. } => EntityType::Packet,
             EntityRef::Artifact { .. } => EntityType::Artifact,
-            EntityRef::RoadmapItem { .. } => EntityType::RoadmapItem,
         }
     }
 
@@ -1089,6 +1077,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_entity_refs_are_not_supported() {
+        assert!(super::EntityRef::parse("roadmap_item:legacy").is_err());
+        assert!(super::EntityType::from_prefix("roadmap_item").is_none());
+    }
+
     use super::*;
     use std::process::Command;
 
@@ -1571,9 +1565,6 @@ mod tests {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),
-            },
-            22 => EntityRef::RoadmapItem {
-                id: rng.token("roadmap-"),
             },
             _ => unreachable!(),
         }

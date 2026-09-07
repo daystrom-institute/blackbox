@@ -319,9 +319,6 @@ pub fn scan_non_project_source_files(config: &ReindexConfig) -> Vec<(String, u64
     if config.threads_path.exists() {
         scan_single_file(&config.threads_path, &mut files);
     }
-    if config.roadmap_path.exists() {
-        scan_single_file(&config.roadmap_path, &mut files);
-    }
     scan_adapter_source_files(config, &mut files);
     // Adapter-owned files can overlap the roots walk (interactive claude/codex
     // adapters discover the same jsonl files); purge and needs_reindex both

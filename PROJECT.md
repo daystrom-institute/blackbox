@@ -45,7 +45,7 @@ Major code ownership boundaries:
   `find_paths`, evidence bundling, provenance).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
-- `threads.rs`, `notes.rs`, `inbox.rs`, `pins.rs`, `roadmap.rs`,
+- `threads.rs`, `notes.rs`, `inbox.rs`, `pins.rs`,
   `whiteboards.rs` - coordination stores.
 - `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
   injection and recursion guard.
@@ -260,7 +260,7 @@ Important state/config env vars:
   wait and dashboard replies omit context telemetry. Explicit status debug
   reads retain last-request measurements for diagnosis.
 - Stores/paths: `BLACKBOX_STATE_DIR`, `BLACKBOX_KNOWLEDGE_PATH`,
-  `BLACKBOX_THREADS_PATH`, `BLACKBOX_NOTES_PATH`, `BLACKBOX_ROADMAP_PATH`,
+  `BLACKBOX_THREADS_PATH`, `BLACKBOX_NOTES_PATH`,
   `BLACKBOX_PINS_PATH`, `BLACKBOX_PROJECTS_PATH`, `BLACKBOX_PACKETS_DIR`,
   `BLACKBOX_ARTIFACTS_DIR`, `BLACKBOX_VECTORS_PATH`, `BRO_HOME`
 - Render targets: `BLACKBOX_GLOBAL_COMMON_MD`, `BLACKBOX_GLOBAL_CLAUDE_MD`,
@@ -402,7 +402,7 @@ or system memories and link/pointer from here.
   (Google Drive, OneDrive/SharePoint, Xero, Slack) publishing into the
   corpus over the collector-style transport.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
-  storage, code navigation, provenance, roadmap, and Badgey designs.
+  storage, code navigation, provenance, and Badgey designs.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
   supervision, phase decomposition, runtime allocation, and live handoff
   designs.

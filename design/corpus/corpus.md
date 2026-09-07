@@ -22,7 +22,6 @@ edges, storage, and corpus-facing assistants.
 - [Badgey](badgey.md)
 - [Badgey - Implementation Skeleton](badgey-impl.md)
 - [Commit Work Provenance](commit-work-provenance.md)
-- [Roadmap](roadmap.md)
 
 ## Knowledge And Memory
 

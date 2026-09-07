@@ -11,6 +11,11 @@ brief: "Current per-action dispositions, evidence limits, and prioritized residu
 
 # Surviving MCP action audit
 
+2026-09-07 supersession: [roadmap elision](roadmap-retirement.md) removes the
+roadmap subsystem completely. Historical-reader, preservation and migration
+obligations below describe this earlier checkpoint and no longer apply.
+Measured evidence and original counts remain unchanged.
+
 Current owner: thread-c749d06c. The audit below is the reconciliation baseline
 at source 004822640975f19f90dc4d50dd16d7fc9efc42e8, committed as fdd0180c.
 The subsequent [fix checkpoint](mcp-survivor-fix-checkpoint.md) is authoritative

@@ -1,5 +1,5 @@
 //! Tera-based template rendering. Single entry point for all template
-//! evaluation in the stack — roadmap render, workflow Render nodes,
+//! evaluation in the stack: workflow Render nodes,
 //! lens/prompt assembly, Badgey Slack posts, etc.
 
 use anyhow::Result;

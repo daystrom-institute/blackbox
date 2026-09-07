@@ -23,7 +23,6 @@ The XDG path migration has run for the JSON state stores, but **the migration is
 ~/.local/state/blackbox/          # blackbox_state_dir ($BLACKBOX_STATE_DIR)
     blackbox-knowledge.json
     blackbox-threads.json
-    blackbox-roadmap.json
     blackbox-notes.json
     blackbox-pins.json
     projects.json
@@ -136,7 +135,7 @@ The prior draft listed four env vars in a single table. The actual surface is ~3
 | Tier-0 cosine threshold | `BBOX_TIER0_COSINE_THRESHOLD` | env-only (research/tuning knob) |
 | Git notes namespace | `BBOX_GIT_NOTES_NAMESPACE` | TOML `[provenance].git_notes_namespace` |
 | State dir | `BLACKBOX_STATE_DIR` | env-only (relocation override) |
-| Per-store path overrides | `BLACKBOX_KNOWLEDGE_PATH` / `THREADS_PATH` / `NOTES_PATH` / `PINS_PATH` / `ROADMAP_PATH` / `PROJECTS_PATH` / `ARTIFACTS_DIR` / `PACKETS_DIR` | env-only (test/relocation only); document that `state_dir` is the only intended user-facing knob |
+| Per-store path overrides | `BLACKBOX_KNOWLEDGE_PATH` / `THREADS_PATH` / `NOTES_PATH` / `PINS_PATH` / `PROJECTS_PATH` / `ARTIFACTS_DIR` / `PACKETS_DIR` | env-only (test/relocation only); document that `state_dir` is the only intended user-facing knob |
 | Backup dir | `BLACKBOX_BACKUP_DIR` | env-only |
 | Index path | `TRANSCRIPT_SEARCH_INDEX_PATH` | env-only |
 | Transcript roots | `TRANSCRIPT_SEARCH_ROOTS`, `TRANSCRIPT_SEARCH_CODEX_ROOT` | TOML `[transcripts]` table |
@@ -202,9 +201,6 @@ git_notes_namespace           = "bbox-provenance"
 # roots      = "claude=/path,zai=/path2"
 # codex_root = "~/.codex"
 
-[roadmap]
-write_path    = ""
-template_path = ""
 ```
 
 #### Implementation
@@ -312,11 +308,6 @@ A single directory per project for blackbox-managed definitions:
 #### `.bbox/config.toml`
 
 ```toml
-[roadmap]
-write_path    = "docs/roadmap.md"
-template_path = "roadmap.tera"
-scope         = "project"
-
 [brofiles]
 default = "executor"
 ```
@@ -381,7 +372,7 @@ The daemon refuses to dispatch if a referenced secret is missing. Inline secrets
 
 Two daemons (prod + dev) sharing `state_dir` is a real configuration. The previous draft asserted "config file reads are read-only so no lock is needed" — true for config.toml, irrelevant for the JSON state stores both daemons read-write.
 
-**There is no central `JsonStore::write` today.** Each store (`Knowledge`, `Threads`, `Notes`, `Pins`, `Roadmap`, `Projects`, plus the per-packet writer) has its own `save()` method, typically writing to a fixed temp path then renaming. The lock has to wrap the **read-modify-write** sequence per store — not just the final rename — or two daemons can both read, both compute updates, and the second write clobbers the first's intervening update.
+**There is no central `JsonStore::write` today.** Each store (`Knowledge`, `Threads`, `Notes`, `Pins`, `Projects`, plus the per-packet writer) has its own `save()` method, typically writing to a fixed temp path then renaming. The lock has to wrap the **read-modify-write** sequence per store, or two daemons can both read, both compute updates, and the second write clobbers the first's intervening update.
 
 Choose one:
 
@@ -419,14 +410,6 @@ If a future ask is "manage Codex's `~/.codex/config.toml` from blackbox," that's
 
 **One required coupling:** `self_register_blackbox` (`main.rs:1462-1474`) builds the URL it hands to provider CLIs from the resolved `BBOX_PORT`. After Phase 1, that resolution must come from the config loader, not a direct env read — otherwise setting `[daemon].port` in config.toml will start the daemon on the configured port but register the *default* port with providers. The fix is a one-line swap: `bbox_port` is set from `config.daemon.port` (which still honors env > file > default). No new behavior; just plumbing the source.
 
-### 13. Render target config
-
-`bbox_roadmap action=render` with no explicit `write_path` / `template_path` resolves in order:
-
-1. `<project>/.bbox/config.toml` `[roadmap]` (project-scoped render)
-2. `dirs::config_dir()/blackbox/config.toml` `[roadmap]` (global fallback)
-3. No write — return text only.
-
 ---
 
 ## Open Questions
@@ -454,7 +437,6 @@ If a future ask is "manage Codex's `~/.codex/config.toml` from blackbox," that's
 - Extract modules from `main.rs` into `lib.rs` (lib target already exists); add `pub mod config` with `figment`-based loader.
 - Parse `dirs::config_dir()/blackbox/config.toml` on daemon startup. All fields optional. Precedence: `flag > env > file > default`.
 - Implement secrets resolution: `LoadCredential` → `dirs::data_dir()/blackbox/secrets/` → env. 0600/0700 enforcement.
-- Wire `[roadmap]` section into `roadmap_render()` as fallback when no explicit params.
 - `bro` CLI reads the same config (via the lib); sweep cli.rs bare `BRO_PORT` reads (§4G).
 - Retrofit existing util tests to acquire `TEST_ENV_LOCK` (§11). Add new config-loader tests under the same discipline.
 - No filesystem migration in this phase.

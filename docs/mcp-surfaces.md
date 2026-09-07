@@ -160,8 +160,6 @@ recursion guard is a mechanical invariant applied at argument construction.
 
 MCP surfaces are designed and the packet machinery is in place, but the surface
 binding at `initialize` and the `call_tool` enforcement layer are still in progress.
-The feature is tracked as **MCP surfaces implementation** on the roadmap
-(thread `thread-1bf496fc`, priority: medium).
 
 The `bbox_mcp_surface(action="replay")` debug tool is available now and will correctly
 simulate the packet evaluation as the enforcement layer lands.

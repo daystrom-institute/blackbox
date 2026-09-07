@@ -37,7 +37,6 @@ use bbox_corpus_core::code_project_identity::{CodeProjectIdentity, IdentityOrigi
 use bbox_corpus_core::project_catalog::ProjectScope;
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_knowledge::knowledge::KnowledgeEntry;
-use bbox_stores::roadmap::RoadmapItem;
 use bbox_threads::threads::Thread;
 
 use super::knowledge_docs::KnowledgeIndexDocument;
@@ -103,8 +102,6 @@ pub enum IndexWriteOp {
         graph_id: String,
         graph_source: String,
     },
-    UpsertRoadmap(Box<RoadmapItem>),
-    DeleteRoadmap(String),
     UpsertThread(Box<Thread>),
     /// Full thread-store replacement from a point-in-time snapshot.
     UpsertThreadsStore(Vec<Thread>),
@@ -2808,19 +2805,6 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &graph_source,
             ),
         ),
-        IndexWriteOp::UpsertRoadmap(item) => (
-            "upsert_roadmap",
-            super::roadmap_docs::apply_roadmap_upsert(
-                writer,
-                ctx.fields,
-                &ctx.config.roadmap_path,
-                &item,
-            ),
-        ),
-        IndexWriteOp::DeleteRoadmap(id) => (
-            "delete_roadmap",
-            super::roadmap_docs::apply_roadmap_delete(writer, ctx.fields, &id),
-        ),
         IndexWriteOp::UpsertThread(thread) => (
             "upsert_thread",
             super::thread_docs::apply_thread_upsert(
@@ -3012,7 +2996,6 @@ mod tests {
             dir.join("projects.json"),
             dir.join("kb.json"),
             dir.join("threads.json"),
-            dir.join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()
@@ -4282,7 +4265,7 @@ mod tests {
         let actor = IndexWriterActor::spawn_for(&index);
 
         // A burst of ops lands in one batch: upserts, a delete of one of
-        // them, and a roadmap-style overwrite of the same entity id.
+        // them, and a store overwrite of the same entity id.
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
             "aaaa1111",
             "ferrocene compliance baseline",
@@ -4824,7 +4807,6 @@ mod source_planning_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -5291,7 +5273,6 @@ mod source_planning_tests {
             fixture.config.projects_path.clone(),
             fixture.config.knowledge_path.clone(),
             fixture.config.threads_path.clone(),
-            fixture.config.roadmap_path.clone(),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -5457,7 +5438,6 @@ mod source_planning_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

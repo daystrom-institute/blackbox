@@ -740,22 +740,11 @@ pub(super) fn execute_reindex_pass(
         &mut *writer,
     )?;
     indexed_docs += record_docs;
-    let roadmap_docs = super::roadmap_docs::reindex_roadmap_store_standalone(
-        &config.roadmap_path,
-        fields,
-        &mut *writer,
-        &mut meta,
-    )?;
-    if roadmap_docs > 0 {
-        indexed_files += 1;
-        indexed_docs += roadmap_docs;
-    }
     tracing::info!(
         full,
         elapsed_ms = stores_phase.elapsed().as_millis(),
         knowledge_docs,
         thread_docs,
-        roadmap_docs,
         "auto-reindex: store-doc phase complete"
     );
 
@@ -1414,7 +1403,6 @@ mod tests {
             code_source_record_mode: bbox_code_source_store::RuntimeRecordMode::BridgeV1,
             knowledge_path: root.join("kb.json"),
             threads_path: root.join("threads.json"),
-            roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
             conversation_source_root: None,
@@ -1517,7 +1505,6 @@ mod tests {
             code_source_record_mode: bbox_code_source_store::RuntimeRecordMode::BridgeV1,
             knowledge_path: root.join("kb.json"),
             threads_path: root.join("threads.json"),
-            roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
             conversation_source_root: None,

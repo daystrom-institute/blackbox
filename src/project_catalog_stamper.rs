@@ -3,7 +3,7 @@
 //! PLACEMENT. This implements [`LegacyRowStamperV1`], a trait declared in
 //! `bbox-indexing`, but it lives in the ROOT crate on purpose. The write side
 //! needs the owner crates' REAL schemas, and the root crate is the only place
-//! that sees all fourteen owners at once alongside the trait; `bbox-indexing`
+//! that sees all active owners at once alongside the trait; `bbox-indexing`
 //! cannot, because the task owner lives root-side and would invert the
 //! dependency. This is the same root-composition principle the rebuild
 //! placement ruling settled, and the facade's injected `Arc<dyn
@@ -53,7 +53,6 @@ pub struct ProjectCatalogStamperPathsV1 {
     pub thread_store_path: PathBuf,
     pub note_store_path: PathBuf,
     pub pin_store_path: PathBuf,
-    pub roadmap_store_path: PathBuf,
     pub packet_root: PathBuf,
     pub proposal_root: PathBuf,
     pub slack_store_root: PathBuf,
@@ -101,7 +100,6 @@ impl ProjectCatalogOwnerRowStamperV1 {
             &paths.thread_store_path,
             &paths.note_store_path,
             &paths.pin_store_path,
-            &paths.roadmap_store_path,
             &paths.packet_root,
             &paths.proposal_root,
             &paths.slack_store_root,
@@ -231,7 +229,6 @@ impl ProjectCatalogOwnerRowStamperV1 {
             | LegacyPathStoreKindV1::Thread
             | LegacyPathStoreKindV1::Note
             | LegacyPathStoreKindV1::Pin
-            | LegacyPathStoreKindV1::Roadmap
             | LegacyPathStoreKindV1::Packet
             | LegacyPathStoreKindV1::Proposal
             | LegacyPathStoreKindV1::SlackBinding
@@ -333,20 +330,6 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                 &self.paths.pin_store_path,
                 |path| {
                     bbox_stores::pins::stamp_project_catalog_owner_row(
-                        path,
-                        source_row_id,
-                        expected_members,
-                        project_id,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::Roadmap => self.stamp_owner_path(
-                store_kind,
-                source_row_id,
-                &self.paths.roadmap_store_path,
-                |path| {
-                    bbox_stores::roadmap::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
                         expected_members,
@@ -478,7 +461,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
 /// that the durable owner rows really carry the ids the ledger binds them to.
 ///
 /// It sits beside the stamper, shares its path type, and dispatches through the
-/// same fourteen-arm match, because the three halves of the owner contract -
+/// same owner match, because the three halves of the owner contract -
 /// capture, stamp, and read - must agree on ONE row identity. Separated from
 /// the stamper as a distinct trait rather than added to it so that a verify
 /// cannot write: the type system, not a convention, is what stops a verifier
@@ -499,7 +482,6 @@ impl ProjectCatalogOwnerRowReaderV1 {
             &paths.thread_store_path,
             &paths.note_store_path,
             &paths.pin_store_path,
-            &paths.roadmap_store_path,
             &paths.packet_root,
             &paths.proposal_root,
             &paths.slack_store_root,
@@ -582,7 +564,7 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
         ProjectCatalogOwnerRowStamperV1::coverage_verdict(store_kind)
     }
 
-    /// ONE batched read per owner, dispatched through the SAME fourteen-arm
+    /// ONE batched read per owner, dispatched through the SAME owner
     /// match the stamper writes through.
     ///
     /// Every arm hands the whole requested set to its owner's batch reader, so
@@ -622,11 +604,6 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
             LegacyPathStoreKindV1::Pin => {
                 self.read_owner_path(store_kind, rows, &self.paths.pin_store_path, |path| {
                     bbox_stores::pins::read_project_catalog_owner_rows(path, rows, limits)
-                })
-            }
-            LegacyPathStoreKindV1::Roadmap => {
-                self.read_owner_path(store_kind, rows, &self.paths.roadmap_store_path, |path| {
-                    bbox_stores::roadmap::read_project_catalog_owner_rows(path, rows, limits)
                 })
             }
             LegacyPathStoreKindV1::Packet => {
@@ -743,7 +720,6 @@ mod owner_row_stamper_dispatch {
                 thread_store_path: root.join("threads.json"),
                 note_store_path: root.join("notes.json"),
                 pin_store_path: root.join("pins.json"),
-                roadmap_store_path: root.join("roadmap.json"),
                 packet_root: root.join("packets"),
                 proposal_root: root.join("proposals"),
                 slack_store_root: root.join("slack"),
@@ -907,7 +883,6 @@ mod owner_row_stamper_dispatch {
                 thread_store_path: root.join("threads.json"),
                 note_store_path: root.join("notes.json"),
                 pin_store_path: root.join("pins.json"),
-                roadmap_store_path: root.join("roadmap.json"),
                 packet_root: root.join("packets"),
                 proposal_root: root.join("proposals"),
                 slack_store_root: root.join("slack"),
@@ -1340,7 +1315,6 @@ mod owner_row_stamper_dispatch {
             (LegacyPathStoreKindV1::Thread, Covered),
             (LegacyPathStoreKindV1::Note, Covered),
             (LegacyPathStoreKindV1::Pin, Covered),
-            (LegacyPathStoreKindV1::Roadmap, Covered),
             (LegacyPathStoreKindV1::Packet, Covered),
             (LegacyPathStoreKindV1::Proposal, Covered),
             (LegacyPathStoreKindV1::SlackBinding, Covered),

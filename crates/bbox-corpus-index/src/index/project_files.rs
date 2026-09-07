@@ -4588,7 +4588,6 @@ mod purge_exemption_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -4736,7 +4735,6 @@ mod purge_exemption_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(CatalogRecords),
         )
         .unwrap();

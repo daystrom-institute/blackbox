@@ -179,7 +179,6 @@ fn fixture(namespace: &str, commits: usize) -> Fixture {
             state.join("legacy-projects.json"),
             state.join("knowledge.json"),
             state.join("threads.json"),
-            state.join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -354,7 +353,6 @@ fn the_catalog_guard_prepares_a_manifest_and_reemission_preserves_every_commit()
             .unwrap()
             .join("knowledge.json"),
         fixture.projects_path.parent().unwrap().join("threads.json"),
-        fixture.projects_path.parent().unwrap().join("roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -897,7 +895,6 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
             index_projects_path.clone(),
             state.join("knowledge.json"),
             state.join("threads.json"),
-            state.join("roadmap.json"),
             records.clone(),
         )
         .unwrap();
@@ -998,7 +995,6 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
         index_projects_path.clone(),
         state.join("knowledge.json"),
         state.join("threads.json"),
-        state.join("roadmap.json"),
         records.clone(),
     )
     .unwrap();
@@ -1160,7 +1156,6 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         state.join("legacy-projects.json"),
         state.join("knowledge.json"),
         state.join("threads.json"),
-        state.join("roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -1247,7 +1242,6 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         bridge_state.join("legacy-projects.json"),
         bridge_state.join("knowledge.json"),
         bridge_state.join("threads.json"),
-        bridge_state.join("roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -1346,7 +1340,6 @@ fn an_index_with_no_history_still_authorizes_both_guards() {
             state.join("legacy-projects.json"),
             state.join("knowledge.json"),
             state.join("threads.json"),
-            state.join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

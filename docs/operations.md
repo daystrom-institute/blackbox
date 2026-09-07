@@ -21,7 +21,6 @@ will run.
 | `~/.local/state/blackbox/blackbox-notes.json` | All side-channel notes (done/dispute/blocked/etc) | ~6MB |
 | `~/.local/state/blackbox/blackbox-threads.json` | Work threads and their session/edge linkage | ~500KB |
 | `~/.local/state/blackbox/blackbox-pins.json` | Scoped active-arc pins | ~5KB |
-| `~/.local/state/blackbox/blackbox-roadmap.json` | Roadmap items, transitions, and edges | ~18KB |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Compiled rule packets (packet JSON + audit examples) | varies |
 | `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed workflows, agents, brofiles) | varies |
@@ -191,7 +190,6 @@ old inode until systemd restarts it.
     ├── blackbox-notes.json      ← PROTECT
     ├── blackbox-threads.json    ← PROTECT
     ├── blackbox-pins.json       ← PROTECT
-    ├── blackbox-roadmap.json    ← PROTECT
     ├── projects.json            ← PROTECT
     ├── packets/                 ← PROTECT
     ├── artifacts/               ← PROTECT
@@ -547,7 +545,6 @@ tar -czf blackbox-backup-$(date +%F).tar.gz \
   ~/.local/state/blackbox/blackbox-notes.json \
   ~/.local/state/blackbox/blackbox-threads.json \
   ~/.local/state/blackbox/blackbox-pins.json \
-  ~/.local/state/blackbox/blackbox-roadmap.json \
   ~/.local/state/blackbox/projects.json \
   ~/.local/state/blackbox/packets/ \
   ~/.local/state/blackbox/artifacts/ \
