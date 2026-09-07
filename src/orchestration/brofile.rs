@@ -74,43 +74,42 @@ pub struct Brofile {
 }
 
 /// Bounded discovery view. Full persona and dispatch policy belong to `get`.
+pub fn summary_row(bf: &Brofile) -> serde_json::Value {
+    let mut value = serde_json::json!({"name":bf.name, "provider":bf.provider,
+        "account":bf.account, "model":bf.model, "effort":bf.effort,
+        "has_lens":bf.lens.as_ref().is_some_and(|lens| !lens.is_empty())});
+    for key in ["account", "model", "effort"] {
+        if let Some(text) = value[key].as_str().filter(|s| s.len() > 256) {
+            value[key] = serde_json::json!({"preview":text.chars().take(64).collect::<String>(),
+                "bytes":text.len(),"truncated":true});
+        }
+    }
+    value
+}
+
 pub fn list_summary_page(
     mut brofiles: Vec<Brofile>,
     provider: Option<Provider>,
     name: Option<&str>,
     offset: usize,
     limit: usize,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     brofiles.retain(|bf| {
         provider.is_none_or(|provider| bf.provider == provider)
             && name.is_none_or(|name| bf.name.contains(name))
     });
     brofiles.sort_by(|a, b| a.name.cmp(&b.name));
-    let total = brofiles.len();
-    let limit = limit.clamp(1, 100);
-    let rows: Vec<_> = brofiles
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|bf| {
-            serde_json::json!({
-                "name": bf.name,
-                "provider": bf.provider,
-                "account": bf.account,
-                "model": bf.model,
-                "effort": bf.effort,
-                "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
-            })
-        })
-        .collect();
-    let next = offset.saturating_add(rows.len());
-    serde_json::json!({
-        "brofiles": rows,
-        "total": total,
-        "offset": offset,
-        "next_offset": (next < total).then_some(next),
-        "detail_hint": "Use action=get with name for the full lens and dispatch configuration.",
-    })
+    let rows = brofiles.iter().map(summary_row).collect();
+    let mut page = bbox_corpus_core::response_page::collection_page(
+        rows,
+        "brofiles",
+        Some(limit),
+        Some(offset),
+    )?;
+    page["detail_hint"] = serde_json::json!(
+        "Use action=get with name and the same scope/project_dir for exact stored dispatch configuration."
+    );
+    Ok(page)
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +316,79 @@ pub fn save_brofile(
     Ok(file)
 }
 
+fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            anyhow::anyhow!(
+                "Stored configuration is invalid at line {}, column {}; existing bytes retained",
+                error.line(),
+                error.column()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn read_brofile(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<Option<Brofile>> {
+    let dir = if scope == "project" {
+        project_brofiles_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        brofiles_dir(store_dir)
+    };
+    read_optional_json(&dir.join(format!("{name}.json")))
+}
+
+pub fn read_brofiles(
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<Vec<Brofile>> {
+    let dir = if scope == "project" {
+        project_brofiles_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        brofiles_dir(store_dir)
+    };
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error.into()),
+    };
+    let mut rows = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            if let Some(row) = read_optional_json(&path)? {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub fn remove_brofile(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> std::io::Result<bool> {
+    let dir = if scope == "project" {
+        project_brofiles_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        brofiles_dir(store_dir)
+    };
+    match fs::remove_file(dir.join(format!("{name}.json"))) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn load_brofile(name: &str, dir: &Path) -> Option<Brofile> {
     let file = dir.join(format!("{name}.json"));
     let data = fs::read_to_string(&file).ok()?;
@@ -497,6 +569,10 @@ pub fn delete_brofile(
 
 fn config_file(store_dir: &Path) -> PathBuf {
     store_dir.join("config.json")
+}
+
+pub fn read_config(store_dir: &Path) -> anyhow::Result<BroConfig> {
+    Ok(read_optional_json(&config_file(store_dir))?.unwrap_or_default())
 }
 
 pub fn load_config(store_dir: &Path) -> BroConfig {
@@ -969,7 +1045,7 @@ mod tests {
             .unwrap()
         };
         let rows = vec![make("c", "brodex"), make("b", "glm"), make("a", "brodex")];
-        let first = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 0, 1);
+        let first = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 0, 1).unwrap();
         assert_eq!(first["total"], 2);
         assert_eq!(first["brofiles"][0]["name"], "a");
         assert_eq!(first["next_offset"], 1);
@@ -977,13 +1053,13 @@ mod tests {
         for field in ["lens", "filters", "tool_defaults"] {
             assert!(first["brofiles"][0].get(field).is_none());
         }
-        let second = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 1, 1);
+        let second = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 1, 1).unwrap();
         assert_eq!(second["brofiles"][0]["name"], "c");
         assert!(second["next_offset"].is_null());
-        let beyond = list_summary_page(rows.clone(), None, None, usize::MAX, 0);
+        let beyond = list_summary_page(rows.clone(), None, None, usize::MAX, 0).unwrap();
         assert_eq!(beyond["brofiles"], serde_json::json!([]));
         assert!(beyond["next_offset"].is_null());
-        let named = list_summary_page(rows, None, Some("b"), 0, 20);
+        let named = list_summary_page(rows, None, Some("b"), 0, 20).unwrap();
         assert_eq!(named["total"], 1);
         assert_eq!(named["brofiles"][0]["name"], "b");
     }

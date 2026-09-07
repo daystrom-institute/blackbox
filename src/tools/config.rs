@@ -21,6 +21,15 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bro_mcp", || {
             let mut p = p;
+            orchestration::mcp::validate_selection(&p)?;
+            if p.action == orchestration::mcp::McpAction::Sync {
+                return orchestration::mcp::handle(&p).and_then(|reply| page_mcp_reply(reply, &p));
+            }
+            if p.scope.as_deref() == Some("project") && !self.state.project_authority.is_bridge() {
+                anyhow::bail!(
+                    "error.mcp_config_locality_required: project MCP configuration has no remote owner transport; use the checkout owner's file tools or scope=global with no project. No project configuration was read or changed"
+                );
+            }
             // Project selectors are meaningful only for scope=project; the
             // tool layer rejects the global+project combination explicitly,
             // so an ambiguous call never resolves a selector it would then
@@ -76,6 +85,36 @@ pub(crate) fn page_mcp_reply(
                 "scope": scope,
                 "body": body,
             }))?)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_project_mcp_refuses_without_owner_transport_and_sync_stays_retired() {
+        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        let server = fixture.server();
+        for action in ["list", "get", "add", "remove", "get_filters", "sync"] {
+            let mut value =
+                serde_json::json!({"action":action,"scope":"project","project":"/synthetic/owner"});
+            if matches!(action, "get" | "add" | "remove") {
+                value["name"] = serde_json::json!("synthetic");
+            }
+            if action == "add" {
+                value["url"] = serde_json::json!("https://unit.test/mcp");
+            }
+            let response = server.bro_mcp(Parameters(serde_json::from_value(value).unwrap()));
+            assert_eq!(response.is_error, Some(true));
+            let wire = serde_json::to_value(response).unwrap();
+            let text = wire["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(if action == "sync" {
+                "mcp_sync_retired"
+            } else {
+                "mcp_config_locality_required"
+            }));
         }
     }
 }
