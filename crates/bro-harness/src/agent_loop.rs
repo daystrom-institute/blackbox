@@ -3436,6 +3436,20 @@ mod tests {
                 *expected_counts.last().unwrap(),
                 "{label}"
             );
+            // Wire requests add rolling cache breakpoints to recent blocks;
+            // this metadata is intentionally absent from durable replay state.
+            let replay_messages: Vec<Vec<Value>> = requests
+                .iter()
+                .map(|(request, _)| {
+                    let mut messages = request["messages"].as_array().unwrap().clone();
+                    for message in &mut messages {
+                        for block in message["content"].as_array_mut().unwrap() {
+                            block.as_object_mut().unwrap().remove("cache_control");
+                        }
+                    }
+                    messages
+                })
+                .collect();
             let snapshot = session.tx.snapshot();
             let messages = snapshot.as_array().unwrap();
             for blocks in expected_responses
@@ -3464,21 +3478,21 @@ mod tests {
                             .contains("None of the client tools in this batch were executed")
                     );
                 }
-                let replay_request = requests.iter().find(|(request, _)| {
-                    request["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|m| m == &messages[pos])
-                });
                 if blocks == &expected_responses[0] && label != "no-budget" {
+                    let correction = &replay_messages[1];
                     assert!(
-                        replay_request.is_some(),
-                        "correction must replay the original response"
+                        correction.contains(&messages[pos]),
+                        "immediate correction must replay the original response"
+                    );
+                    assert!(
+                        correction.contains(&messages[pos + 1]),
+                        "immediate correction must replay every paired rejection"
                     );
                 }
-                if let Some((request, _)) = replay_request {
-                    let replay = request["messages"].as_array().unwrap();
+                for replay in replay_messages
+                    .iter()
+                    .filter(|replay| replay.contains(&messages[pos]))
+                {
                     assert!(replay.contains(&messages[pos + 1]));
                 }
             }
