@@ -1,25 +1,24 @@
 {
   "id": "gap-7a2513c9",
-  "title": "Remaining MCP surface audit: mutation selectors, partial outcomes, exact recovery and simplification",
+  "title": "Remaining MCP surface audit: expensive diagnostics, failure coverage and retirement decisions",
   "gap_kind": "mcp_surface",
   "domain": "survivor-audit",
   "wanted_capability": "A current per-action closure record for the 109 served MCP tools, with fail-closed mutation selectors, honest partial effects, bounded complete replies and exact recovery, chooser/schema parity, and consumer-backed retirement decisions.",
   "evidence": [
     "thread:thread-c749d06c",
+    "design/surfaces/mcp/mcp-survivor-fix-checkpoint.md",
+    "design/surfaces/mcp/mcp-survivor-fix-verification.json",
     "design/surfaces/mcp/mcp-survivor-action-audit.md",
     "design/surfaces/mcp/mcp-survivor-reconciliation-evidence.json",
-    "design/surfaces/mcp/mcp-survivor-action-audit-initial-checkpoint.md",
-    "src/tools/dispatch.rs::bro_prune",
-    "src/tools/threads.rs::bbox_thread",
-    "src/tools/artifacts.rs::bbox_artifact_supersede"
+    "gap:gap-56c74f23"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/survivor-audit/caller-contract-residuals",
-  "notes": "Reconciled for thread-c749d06c at source 004822640975 on 2026-09-06. Original pre-fix examples are historical, not current failure claims. Fresh read-only production probes confirm unknown-only aggregate waits refuse, registered-project pin filtering works, invalid pin scopes and surface action-mismatched selectors refuse, and full thread note recovery works across bounded pages. Existing source/tests implement additional MCP/account/agent/allocator/packet/graph/review detail and validation fixes; prior integration gates remain checkpoint evidence, not exhaustive action acceptance. Live-confirmed residual: explicit bbox_thread detail=summary is rejected although default summary works. Source-confirmed priorities: bro_prune drops invalid provider and empty task_ids filters; allocator/review can validate detail fields after admission/effects; broadcast/admin paths can lose completed-effect receipts; artifact supersede exposes raw metadata requiring a synthetic disclosure probe; some exact readers page already-truncated data and remaining default/fanout replies lack complete-envelope recovery. Current dispositions and ordered acceptance work live in design/surfaces/mcp/mcp-survivor-action-audit.md; sanitized fresh observations in mcp-survivor-reconciliation-evidence.json. Keep unresolved. GLM experiments and backend delivery/readiness repair remain separately owned.",
+  "notes": "Implementation checkpoint for thread-c749d06c at tested source 7e98006e851260a5734ffa13b341b4aed8ea5eba. Fixed the reconciled mutation-selector, pre-effect validation, partial-outcome, artifact projection, exact recovery and served-description defects detailed in design/surfaces/mcp/mcp-survivor-fix-checkpoint.md. Final lane gates passed: 6733 workspace full-profile tests, 19 skipped; workspace clippy, binary build, pinned formatting and concurrency lint; isolated HTTP probe 268 checks against a 109-tool catalog, largest complete result 8321 bytes. Evidence: mcp-survivor-fix-verification.json. These are source and isolated-daemon results, not a production deployment or exhaustive acceptance of every action/provider combination. Keep unresolved for expensive embedding debug/diagnostic snapshot paging, remaining authority/provider failure combinations, and consumer-backed retirement decisions including gap-56c74f23. Oversized native transcript locators still report recovery unavailable; storage-health scans and changing detail recollection costs remain disclosed. Backend delivery/readiness repair and GLM experiments remain separately owned. Earlier pre-fix examples are historical, not claims about this tested revision.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T19:05:09Z",
-  "updated_at": "2026-09-06T23:13:07Z"
+  "updated_at": "2026-09-07T00:49:30Z"
 }

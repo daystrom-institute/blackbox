@@ -72,8 +72,14 @@ comparison after this reviewed update; no fields or normalizations are removed.
 
 ## Verification
 
-Final code revision, gate outcomes, isolated HTTP checks and maximum complete
-MCP result size are recorded in the accompanying fix verification evidence.
+Tested code revision: `7e98006e851260a5734ffa13b341b4aed8ea5eba`. The full
+workspace nextest profile passed all 6,733 tests in 144.975 seconds, with
+19 skipped and no scheduling overrides. Workspace clippy, binary build,
+pinned formatting and concurrency lint also passed. The isolated HTTP probe
+passed 268 checks against the 109-tool catalog; the largest measured complete
+MCP result was 8,321 bytes. The catalog count does not imply every tool or
+action was exercised by HTTP. Commands, per-call measurements and evidence
+boundaries are recorded in [fix verification evidence](mcp-survivor-fix-verification.json).
 Earlier failed runs are correction-loop evidence, not passing gates. The
 production service is outside this implementation checkpoint; no deployment
 is inferred from a source push or a successful isolated daemon probe.
