@@ -2,7 +2,7 @@
 title: "Roadmap elision"
 kind: design
 corpus: blackbox-design
-lifecycle: partial
+lifecycle: implemented
 topic:
   - surfaces
   - mcp
@@ -56,6 +56,10 @@ or migration requirements.
   index/provider or template dependency. Active documentation has no roadmap
   reader, planning or migration guidance.
 
-The parent integration owns build, workspace verification and served-probe
-results. Historical counts in earlier audit evidence are not rewritten to
-represent this smaller surface.
+Verification is recorded in [the elision acceptance record](roadmap-elision-verification.json).
+Runtime source `eeb138e7a566` passed 6,731 full-workspace tests (19 skipped),
+clippy, pinned formatting, concurrency checks and daemon/admin builds. The
+isolated HTTP probe passed 285 checks with 108 catalog tools, including ignored
+malformed legacy storage. The same runtime image is deployed and production
+read checks confirm roadmap absence and surviving snapshot/thread readers.
+Historical counts in earlier audit evidence remain tied to their tested source.

@@ -77,7 +77,10 @@ removal contract. The MCP tool, historical readers, runtime store, config,
 entity/edge vocabulary, indexing and templates are removed. Calls use the
 ordinary unknown-tool error. There is no historical migration, per-owner
 archival obligation or replacement workflow. The earlier mutation-only
-retirement was superseded by this direction.
+retirement was superseded by this direction. Elision is now verified and
+deployed; [its acceptance record](roadmap-elision-verification.json) contains
+the exact source, image, 6,731 passing full-workspace tests and 285 isolated
+HTTP checks. `gap-56c74f23` is addressed without migration follow-up.
 
 ## Recall probes are reads
 
