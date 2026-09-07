@@ -294,9 +294,10 @@ impl BlackboxServer {
                     .ok_or_else(|| anyhow::anyhow!("metadata requires name"))?;
                 let store = self.state.artifacts.read();
                 let meta = match p.version.as_deref() {
-                    Some(version) => store.metadata_for_version(kind, name, version)?,
-                    None => store.metadata_for(kind, name)?,
+                    Some(version) => store.metadata_for_version(kind, name, version),
+                    None => store.metadata_for(kind, name),
                 }
+                .map_err(|_| anyhow::anyhow!("error.artifact_metadata_unavailable: installation metadata could not be read"))?
                 .ok_or_else(|| anyhow::anyhow!("artifact metadata not found"))?;
                 let body = bbox_corpus_core::response_page::json_body_page(
                     &serde_json::json!(["artifact-metadata", kind, name, p.version]).to_string(),
@@ -309,7 +310,8 @@ impl BlackboxServer {
             if p.version.is_some() {
                 anyhow::bail!("version requires metadata=true");
             }
-            let rows = self.state.artifacts.read().list(&p.filters)?;
+            let rows = self.state.artifacts.read().list(&p.filters)
+                .map_err(|_| anyhow::anyhow!("error.artifact_inventory_unavailable: installation inventory could not be read"))?;
             Ok(serde_json::to_string(&artifact_list_page(rows, &p)?)?)
         })
     }
@@ -332,7 +334,8 @@ impl BlackboxServer {
                     .state
                     .artifacts
                     .write()
-                    .supersede(p.kind, &p.name, &p.superseded_by)?;
+                    .supersede(p.kind, &p.name, &p.superseded_by)
+                    .map_err(|_| anyhow::anyhow!("error.artifact_supersede_failed: catalog supersession failed; inspect both installed names with bbox_artifact_list before retrying"))?;
             let mut response = installed_artifact_response(&meta);
             response["catalog_updated"] = serde_json::json!(true);
             match deactivate_artifact(&server.state, kind, &name) {
@@ -397,6 +400,28 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn artifact_fetch_failure_withholds_url_credentials_in_complete_reply() {
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let result = server.bbox_artifact_install(Parameters(serde_json::from_value(json!({
+            "kind":"brofile", "source":format!("http://synthetic-user:synthetic-password@{addr}/private-artifact?token=synthetic-query")
+        })).unwrap())).await;
+        responder.await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let encoded = serde_json::to_string(&result).unwrap();
+        for secret in ["synthetic-user","synthetic-password","synthetic-query","private-artifact"] {
+            assert!(!encoded.contains(secret), "{encoded}");
+        }
+    }
+
+    #[tokio::test]
     async fn artifact_supersede_and_metadata_withhold_source_credentials() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -421,6 +446,10 @@ mod tests {
                 .to_string()
                 .contains("synthetic-password")
         );
+        server.state.artifacts.write().install_value(
+            artifacts::ArtifactKind::Brofile, "inline".into(),
+            &json!({"name":"replacement","version":1,"provider":"glm"}),
+            None, None, None).unwrap();
         let result = server
             .bbox_artifact_supersede(Parameters(
                 serde_json::from_value(json!({

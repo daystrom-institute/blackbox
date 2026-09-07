@@ -177,7 +177,9 @@ pub(crate) async fn read_artifact_source(source: &str) -> anyhow::Result<Value> 
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()?;
-        let response = client.get(source).send().await?.error_for_status()?;
+        let response = client.get(source).send().await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status().map_err(reqwest::Error::without_url)?;
         let scheme = response.url().scheme();
         if scheme != "http" && scheme != "https" {
             anyhow::bail!("artifact source redirected to unsupported scheme `{scheme}`");
@@ -202,7 +204,7 @@ pub(crate) async fn read_artifact_source(source: &str) -> anyhow::Result<Value> 
         let mut bytes = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(reqwest::Error::without_url)?;
             if bytes.len() + chunk.len() > MAX_ARTIFACT_BYTES {
                 anyhow::bail!("artifact source too large; limit is {MAX_ARTIFACT_BYTES} bytes");
             }

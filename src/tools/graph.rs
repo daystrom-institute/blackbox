@@ -2012,6 +2012,8 @@ mod tests {
             serde_json::to_string(&edge).unwrap()
         );
         std::fs::write(edges_dir.join("synthetic.jsonl"), &original).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(&edges_dir,
+            "active", "synthetic-repo", Some("main"), "head", vec![edge], vec![], vec![]).unwrap();
         env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let result = server
             .bbox_edge_compact(Parameters(EdgeCompactParams {
