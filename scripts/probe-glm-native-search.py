@@ -503,12 +503,24 @@ def summarize(root, requests, cases, mcp_calls, aborted):
                    client_calls=client, duplicate_client_emissions=duplicate_calls(client),
                    native_search_enabled=any(t.get("type") == "web_search_20250305" for t in tools),
                    report_loaded=any(t.get("name") == REPORT_NAME for t in tools))
+        native_results = [b for b in completed_native if b.get("type") in ("tool_result", "web_search_tool_result")]
+        row["native_result_pairing"] = [
+            {"id": call.get("id"), "result_count": sum(
+                bool(call.get("id")) and result.get("tool_use_id") == call.get("id")
+                for result in native_results)} for call in row["native_calls"]]
+        row["native_unmatched_start_ids"] = [pair["id"] for pair in row["native_result_pairing"]
+                                              if pair["result_count"] == 0]
+        row["native_start_count"] = len(row["native_calls"])
+        # A matching result can itself report an error; this count is not a success count.
+        row["native_result_count"] = len(native_results)
         row["queries"] = [b.get("input", {}).get("search_query", b.get("input", {}).get("query"))
                           for b in row["native_calls"] if isinstance(b.get("input"), dict)]
         failed_response = (meta.get("http_status") != 200 or not meta.get("complete") or response["errors"]
                            or not response["message_stop"] or not response["observed"])
         if failed_response:
             unknown.append(f"request {meta['n']}: missing, failed, or incomplete provider response")
+        elif row["native_unmatched_start_ids"]:
+            unknown.append(f"request {meta['n']}: native search starts lack matching completed result blocks; execution status unknown")
         if "max_tokens" in response["stop_reasons"]:
             unknown.append(f"request {meta['n']}: model output token budget exhausted")
         if not row["native_search_enabled"]:
@@ -573,6 +585,8 @@ def summarize(root, requests, cases, mcp_calls, aborted):
         case_mcp_calls = [c for c in mcp_calls if c["case"] == case["case"]]
         reports = [c["params"] for c in case_mcp_calls if c["success"]]
         result = dict(case, request_count=len(rows), native_call_count=len(native),
+                      native_start_count=len(native), native_result_count=sum(r["native_result_count"] for r in rows),
+                      native_unmatched_start_count=sum(len(r["native_unmatched_start_ids"]) for r in rows),
                       executed_reports=reports, duplicate_executed_reports=duplicate_calls(reports))
         if case.get("expects_local_refusal"):
             result["evaluation_source"] = "local admission result; provider evidence intentionally absent"
@@ -598,7 +612,12 @@ def summarize(root, requests, cases, mcp_calls, aborted):
         results.append(result)
     return {"status": "fail" if failures else "inconclusive" if unknown else "pass",
             "failures": failures, "inconclusive_reasons": unknown, "cases": results, "wire": wire,
+            "native_start_count": sum(r["native_start_count"] for r in wire),
+            "native_result_count": sum(r["native_result_count"] for r in wire),
+            "native_unmatched_start_count": sum(len(r["native_unmatched_start_ids"]) for r in wire),
             "interpretation": "Provider-emitted client calls and locally executed MCP calls are counted separately. "
+                              "Native starts and matching completed result blocks are counted separately; a result "
+                              "can report an error, and unmatched starts have unknown execution status. "
                               "Observed model names are provider claims. Native IDs, queries, replay and durable "
                               "blocks are wire observations; they do not establish quota attribution."}
 
