@@ -371,7 +371,7 @@ def sse_events(path):
 
 
 def parse_response(path):
-    blocks, active = [], {}
+    blocks, active, stopped = [], {}, []
     models, errors, stop_reasons = [], [], []
     complete = False
     try:
@@ -394,6 +394,8 @@ def parse_response(path):
                 elif delta_type in ("text_delta", "thinking_delta", "signature_delta"):
                     key = delta_type.removesuffix("_delta")
                     block[key] = block.get(key, "") + delta.get(key, "")
+            elif kind == "content_block_stop":
+                stopped.append(active[index])
             elif kind == "message_delta":
                 stop_reasons.append(event.get("delta", {}).get("stop_reason"))
             elif kind == "message_stop":
@@ -413,7 +415,8 @@ def parse_response(path):
                 errors.append({"parse_error": "invalid tool input JSON", "id": block.get("id"),
                                "partial_input": partial})
                 block["input"] = {"_malformed_partial_json": partial}
-    return {"blocks": blocks, "observed": models, "errors": errors,
+    return {"blocks": blocks, "completed_native_blocks": native_blocks(stopped),
+            "observed": models, "errors": errors,
             "message_stop": complete, "stop_reasons": stop_reasons}
 
 
@@ -460,6 +463,7 @@ def summarize(root, requests, cases, mcp_calls, aborted):
         request = json.loads((root / f"{stem}-request.json").read_text())
         response = parse_response(root / f"{stem}-response.sse")
         blocks = response.pop("blocks")
+        completed_native = response.pop("completed_native_blocks")
         native = native_blocks(blocks)
         client = [b for b in blocks if b.get("type") == "tool_use"]
         tools = request.get("tools", [])
@@ -469,8 +473,9 @@ def summarize(root, requests, cases, mcp_calls, aborted):
                    report_loaded=any(t.get("name") == REPORT_NAME for t in tools))
         row["queries"] = [b.get("input", {}).get("search_query", b.get("input", {}).get("query"))
                           for b in row["native_calls"] if isinstance(b.get("input"), dict)]
-        if (meta.get("http_status") != 200 or not meta.get("complete") or response["errors"]
-                or not response["message_stop"] or not response["observed"]):
+        failed_response = (meta.get("http_status") != 200 or not meta.get("complete") or response["errors"]
+                           or not response["message_stop"] or not response["observed"])
+        if failed_response:
             unknown.append(f"request {meta['n']}: missing, failed, or incomplete provider response")
         if "max_tokens" in response["stop_reasons"]:
             unknown.append(f"request {meta['n']}: model output token budget exhausted")
@@ -482,7 +487,11 @@ def summarize(root, requests, cases, mcp_calls, aborted):
             sid = by_case[meta["case"]]["session_id"]
             following = [r for r in requests if r["n"] > meta["n"]
                          and by_case[r["case"]]["session_id"] == sid]
-            if following:
+            if failed_response:
+                row["replay_checks"] = []
+                row["durability_contract"] = "failed response: completed native observations only; no replay required"
+            elif following:
+                row["durability_contract"] = "successful response: exact replay, snapshot and observation"
                 row["replay_checks"] = []
                 for next_row in following:
                     replay = json.loads((root / f"{next_row['n']:03}-request.json").read_text())
@@ -499,9 +508,11 @@ def summarize(root, requests, cases, mcp_calls, aborted):
             event_file = root / "bro" / "harness-sessions" / f"{sid}.events.jsonl"
             snapshot_data = json.loads(snapshot.read_text()) if snapshot.exists() else None
             events = [json.loads(line) for line in event_file.read_text().splitlines()] if event_file.exists() else None
-            row["durable_snapshot_equal"] = matching_native(snapshot_data, native) == native
-            row["durable_observation_equal"] = matching_native(events, native) == native
-            if not row["durable_snapshot_equal"] or not row["durable_observation_equal"]:
+            expected_observation = completed_native if failed_response else native
+            row["completed_native_block_count"] = len(completed_native)
+            row["durable_snapshot_equal"] = None if failed_response else matching_native(snapshot_data, native) == native
+            row["durable_observation_equal"] = matching_native(events, expected_observation) == expected_observation
+            if row["durable_snapshot_equal"] is False or not row["durable_observation_equal"]:
                 failures.append(f"request {meta['n']}: native blocks missing or changed in durable state")
         wire.append(row)
     results = []
