@@ -89,6 +89,7 @@ class Probe:
         self.opener = urllib.request.build_opener(COMMON["NoRedirect"]())
         self.rows = []
         self.mutations = []
+        self.mcp_attempts = []
         self.results = []
         self.case = None
         self.step = 0
@@ -151,10 +152,18 @@ class Probe:
                         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}},
                                         "required": ["message"]}}]}
                 elif method == "tools/call":
-                    probe.mutations.append({"case": probe.case, "after_response_n": len(probe.rows),
-                                            "params": body.get("params", {})})
+                    params = body.get("params", {})
+                    arguments = params.get("arguments") if isinstance(params, dict) else None
+                    valid = (isinstance(params, dict) and params.get("name") == "bro_report"
+                             and isinstance(arguments, dict) and isinstance(arguments.get("message"), str))
+                    attempt = {"case": probe.case, "after_response_n": len(probe.rows),
+                               "params": params, "success": valid}
+                    probe.mcp_attempts.append(attempt)
+                    probe.save("mcp-attempts.json", probe.mcp_attempts)
+                    if valid:
+                        probe.mutations.append(attempt)
                     probe.save("mutator-calls.json", probe.mutations)
-                    result = {"content": [{"type": "text", "text": json.dumps({"ok": True})}], "isError": False}
+                    result = {"content": [{"type": "text", "text": json.dumps({"ok": valid})}], "isError": not valid}
                 else:
                     self.reply(200, json.dumps({"jsonrpc": "2.0", "id": ident,
                         "error": {"code": -32601, "message": "Unknown method"}}).encode())
@@ -169,6 +178,9 @@ class Probe:
                 probe.rows.append(row)
                 stem = f"{row['n']:03}"
                 probe.save(stem + "-request.json", body)
+                # Verify the actual wire surface before forwarding any correction.
+                assert all(t.get("name") in ("tool_search", REPORT)
+                           or t.get("type") == "web_search_20250305" for t in body.get("tools", [])), "unexpected tool schema"
                 if step > 8:
                     raise ValueError("provider request budget exceeded")
                 if step == 1:
@@ -256,6 +268,7 @@ class Probe:
         snapshot = json.loads(events_path.with_name(sid + ".json").read_text())
         rows = [row for row in self.rows if row["case"] == name]
         mutations = [call for call in self.mutations if call["case"] == name]
+        assert all(call["success"] for call in self.mcp_attempts if call["case"] == name), "invalid MCP call attempted"
         checks = []
         for index, row in enumerate(rows):
             response = row["response"]
@@ -303,11 +316,13 @@ class Probe:
         url = f"http://127.0.0.1:{server.server_port}"
         self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "TMPDIR", "SYSTEMROOT")}
         self.env.update({"HOME": str(self.root / "home"), "BRO_HOME": str(self.root / "bro"),
+            "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_DATA_HOME": str(self.root / "data"), "XDG_CACHE_HOME": str(self.root / "cache"),
             "BRO_HARNESS_PROVIDER": "glm", "BRO_HARNESS_TRANSPORT": "anthropic",
             "BRO_HARNESS_WEB_SEARCH": "1", "BRO_HARNESS_MAX_TURNS": "8", "BRO_HARNESS_MAX_TOKENS": "4096",
             "ANTHROPIC_AUTH_TOKEN": "synthetic", "ANTHROPIC_BASE_URL": url})
         self.base = [str(self.args.binary.resolve(strict=True)), "--cwd", str(self.root), "--system-prompt", "",
-            "--model", self.args.model, "--code-mode", "only", "--mcp-config",
+            "--model", self.args.model, "--code-mode", "off", "--allow-tools", "tool_search," + REPORT, "--mcp-config",
             json.dumps({"mcpServers": {"blackbox": {"type": "http", "url": url + "/mcp"}}})]
         print("EVIDENCE " + str(self.root), flush=True)
         status = "fail"
