@@ -109,43 +109,78 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
     }
 
     let notes_ref = bbox_corpus_core::git::notes_ref("provenance")?;
-    let mut notes_written = 0u64;
-    // Track which roots we've already configured to avoid redundant git calls.
-    let mut configured_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Prepare every document before the first checkout mutation. A malformed
+    // later note must not leave earlier targets applied without a receipt.
+    let mut prepared = Vec::with_capacity(grouped.len());
     for ((project_id, commit), edges) in grouped {
-        let Some(project) = project_map.get(&project_id) else {
-            continue;
-        };
-        let root = project.project_root.as_path();
-        // Auto-configure notes.mergeStrategy=union once per repo so
-        // cross-machine provenance merges union rather than abort.
-        if configured_roots.insert(project.project_root.clone()) {
-            if bbox_corpus_core::git::ensure_notes_merge_strategy_union(root).is_err() {
-                tracing::warn!(
-                    "error.checkout_io_failed: could not set provenance note merge strategy"
-                );
+        let Some(project) = project_map.get(&project_id) else { continue; };
+        anyhow::ensure!(project_id.len() <= 256 && commit.len() <= 128,
+            "error.provenance_export_invalid_target: oversized target identity; no checkout mutation was attempted");
+        let note = note_from_edges(&commit, &edges, edge_index);
+        let documents = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)
+            .and_then(|parts| parts.iter().map(serialize_note).collect::<Result<Vec<_>>>())
+            .map_err(|_| anyhow::anyhow!(
+                "error.provenance_export_prepare_failed: documents could not be prepared; no checkout mutation was attempted"
+            ))?;
+        prepared.push(PreparedExportTarget {
+            project_id, commit, root: project.project_root.clone(), documents,
+        });
+    }
+    let mut configured_roots = std::collections::HashSet::new();
+    export_prepared_targets(&prepared, &notes_ref, |target| {
+        if configured_roots.insert(target.root.clone())
+            && bbox_corpus_core::git::ensure_notes_merge_strategy_union(&target.root).is_err()
+        {
+            tracing::warn!("error.checkout_io_failed: could not set provenance note merge strategy");
+        }
+        bbox_provenance::append_note_documents_dedup(
+            &target.root, &notes_ref, &target.commit, &target.documents,
+        ).map(|outcome| outcome.written)
+    })
+}
+
+struct PreparedExportTarget {
+    project_id: String,
+    commit: String,
+    root: PathBuf,
+    documents: Vec<String>,
+}
+
+fn export_prepared_targets(
+    targets: &[PreparedExportTarget],
+    notes_ref: &str,
+    mut write: impl FnMut(&PreparedExportTarget) -> Result<u64>,
+) -> Result<String> {
+    let mut notes_written = 0u64;
+    for (index, target) in targets.iter().enumerate() {
+        match write(target) {
+            Ok(written) => notes_written = notes_written.saturating_add(written),
+            Err(_) => {
+                // The writer may append some fragments before failing. Only
+                // previous complete targets contribute to the known count.
+                // Do not project raw process errors or local checkout paths.
+                let failed_target = json!({
+                    "index": index, "project_id": target.project_id, "commit": target.commit,
+                    "may_have_written": true,
+                });
+                return Ok(serde_json::to_string_pretty(&json!({
+                    "status": "partial",
+                    "error": "error.checkout_io_failed",
+                    "message": "Provenance export stopped after a note-write failure. Earlier completed targets remain applied; the failed target may contain appended fragments.",
+                    "notes_written": notes_written,
+                    "notes_written_scope": "completed_targets_only",
+                    "completed_targets": index,
+                    "total_targets": targets.len(),
+                    "unattempted_targets": targets.len() - index - 1,
+                    "failed_target": failed_target,
+                    "notes_ref": notes_ref,
+                }))?);
             }
         }
-        let note = note_from_edges(&commit, &edges, edge_index);
-        let documents = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)?
-            .into_iter()
-            .map(|part| serialize_note(&part))
-            .collect::<Result<Vec<_>>>()?;
-        let applied = bbox_provenance::append_note_documents_dedup(
-            root, &notes_ref, &commit, &documents,
-        )
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "error.checkout_io_failed: provenance note could not be written to the validated checkout"
-            )
-        })?;
-        notes_written += applied.written;
     }
-
     Ok(serde_json::to_string_pretty(&json!({
-        "status": "ok",
-        "notes_written": notes_written,
-        "notes_ref": notes_ref,
+        "status": "ok", "notes_written": notes_written, "notes_ref": notes_ref,
+        "completed_targets": targets.len(), "total_targets": targets.len(),
     }))?)
 }
 
@@ -464,6 +499,36 @@ fn authenticated_edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
 mod tests {
     use super::*;
     use bbox_provenance::ProducedBy;
+
+    #[test]
+    fn export_failure_preserves_completed_counts_and_current_uncertainty() {
+        let targets = (0..4).map(|index| PreparedExportTarget {
+            project_id: format!("project-{index}"), commit: format!("commit-{index}"),
+            root: PathBuf::from("unused-synthetic-root"), documents: vec!["synthetic-note".into()],
+        }).collect::<Vec<_>>();
+        let mut attempted = Vec::new();
+        let reply = export_prepared_targets(&targets, "refs/notes/bbox", |target| {
+            attempted.push(target.commit.clone());
+            if attempted.len() == 2 { anyhow::bail!("synthetic-secret-process-output"); }
+            Ok(3)
+        }).unwrap();
+        assert_eq!(attempted, ["commit-0", "commit-1"]);
+        assert!(!reply.contains("synthetic-secret-process-output"));
+        assert!(!reply.contains("unused-synthetic-root"));
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["notes_written"], 3);
+        assert_eq!(value["completed_targets"], 1);
+        assert_eq!(value["unattempted_targets"], 2);
+        assert_eq!(value["failed_target"]["commit"], "commit-1");
+        assert_eq!(value["failed_target"]["may_have_written"], true);
+        let success: serde_json::Value = serde_json::from_str(
+            &export_prepared_targets(&targets, "refs/notes/bbox", |_| Ok(2)).unwrap()
+        ).unwrap();
+        assert_eq!(success["status"], "ok");
+        assert_eq!(success["notes_written"], 8);
+        assert_eq!(success["completed_targets"], 4);
+    }
 
     #[test]
     fn provenance_note_json_round_trips() {
