@@ -900,6 +900,7 @@ mod harness {
                 bbox_mcp_tools::mcp_tools::ref_size::RefSizeParams {
                     refs: vec!["file:README.md".into(), "file:missing.md".into()],
                     project_dir: Some(fixture.base.to_string_lossy().into_owned()),
+                    ..Default::default()
                 },
             ))
             .await;

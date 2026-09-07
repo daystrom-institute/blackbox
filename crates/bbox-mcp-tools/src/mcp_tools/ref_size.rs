@@ -31,12 +31,16 @@ pub struct RefSizeParams {
 
 /// Validate paging syntax before the adapter acquires checkout data.
 pub fn validate_response_params(p: &RefSizeParams) -> Result<()> {
-    anyhow::ensure!(p.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
-        "body_limit must be between 4 and 4096");
+    anyhow::ensure!(
+        p.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
+        "body_limit must be between 4 and 4096"
+    );
     if let Some(cursor) = p.cursor.as_deref() {
-        let valid = cursor.split_once(':').is_some_and(|(hash, offset)|
-            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-                && offset.parse::<usize>().is_ok());
+        let valid = cursor.split_once(':').is_some_and(|(hash, offset)| {
+            hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && offset.parse::<usize>().is_ok()
+        });
         anyhow::ensure!(valid, "invalid cursor; use body.next_cursor");
     }
     Ok(())
@@ -48,7 +52,10 @@ pub fn page_response(p: &RefSizeParams, output: &str) -> Result<String> {
     validate_response_params(p)?;
     let scope = json!(["ref_size", p.refs, p.project_dir]).to_string();
     let value = bbox_corpus_core::response_page::bounded_json_response(
-        &scope, serde_json::from_str(output)?, p.cursor.as_deref(), p.body_limit,
+        &scope,
+        serde_json::from_str(output)?,
+        p.cursor.as_deref(),
+        p.body_limit,
     )?;
     Ok(value.to_string())
 }
@@ -201,26 +208,39 @@ mod tests {
         };
         let output = ref_size(&params, &ctx).unwrap();
         let expected: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let first: serde_json::Value = serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
         assert_eq!(first["detail_limited"], true);
         let next = first["body"]["next_cursor"].as_str().unwrap().to_owned();
         params.cursor = Some(next);
-        assert!(page_response(&params, "{}" ).is_err());
+        assert!(page_response(&params, "{}").is_err());
         params.project_dir = Some("/synthetic/other-checkout".into());
         assert!(page_response(&params, &output).is_err());
         params.project_dir = None;
         params.cursor = None;
         let mut recovered = String::new();
         loop {
-            let page: serde_json::Value = serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
+            let page: serde_json::Value =
+                serde_json::from_str(&page_response(&params, &output).unwrap()).unwrap();
             let envelope = json!({"content":[{"type":"text","text":page.to_string()}],"structuredContent":page});
-            assert!(serde_json::to_vec(&envelope).unwrap().len() <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES);
+            assert!(
+                serde_json::to_vec(&envelope).unwrap().len()
+                    <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+            );
             recovered.push_str(page["body"]["text"].as_str().unwrap());
             params.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
-            if params.cursor.is_none() { break; }
+            if params.cursor.is_none() {
+                break;
+            }
         }
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&recovered).unwrap(), expected);
-        assert_eq!(expected["degraded"]["unresolved_refs"][0]["ref"], params.refs[0]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected["degraded"]["unresolved_refs"][0]["ref"],
+            params.refs[0]
+        );
         params.body_limit = Some(0);
         assert!(validate_response_params(&params).is_err());
         params.body_limit = None;

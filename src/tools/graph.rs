@@ -1522,6 +1522,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
+            mcp_tools::ref_size::validate_response_params(&p)?;
             let read_view = server.state.complete_code_read_view()?;
             let projects = server.state.records_provider.records_snapshot().records;
             let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
@@ -1591,7 +1592,7 @@ impl BlackboxServer {
                     .map_err(checkout_access_error)?;
             }
             drop(acquired_files);
-            Ok(output)
+            mcp_tools::ref_size::page_response(&p, &output)
         })
         .await
     }
@@ -2012,8 +2013,17 @@ mod tests {
             serde_json::to_string(&edge).unwrap()
         );
         std::fs::write(edges_dir.join("synthetic.jsonl"), &original).unwrap();
-        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(&edges_dir,
-            "active", "synthetic-repo", Some("main"), "head", vec![edge], vec![], vec![]).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "active",
+            "synthetic-repo",
+            Some("main"),
+            "head",
+            vec![edge],
+            vec![],
+            vec![],
+        )
+        .unwrap();
         env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let result = server
             .bbox_edge_compact(Parameters(EdgeCompactParams {
@@ -4535,7 +4545,11 @@ mod tests {
                 expected_view_stamp: None,
             }))
             .await;
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&extract_text(&validated)).unwrap()["graphs"][0]["valid"], true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&extract_text(&validated)).unwrap()["graphs"]
+                [0]["valid"],
+            true
+        );
 
         let vertex_ref =
             format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
@@ -4766,12 +4780,12 @@ mod tests {
             }))
             .await;
         let own_text = extract_text(&own);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["valid"], false);
-        assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
-        assert!(
-            own_text.contains("\"source\": \"provisional\""),
-            "{own_text}"
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["valid"],
+            false
         );
+        assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["source"], "provisional");
 
         let published = server
             .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
@@ -4792,7 +4806,11 @@ mod tests {
                 expected_view_stamp: None,
             }))
             .await;
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&extract_text(&published)).unwrap()["graphs"][0]["valid"], true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&extract_text(&published)).unwrap()["graphs"]
+                [0]["valid"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -5745,6 +5763,7 @@ mod tests {
             .bbox_ref_size(Parameters(RefSizeParams {
                 refs: Vec::new(),
                 project_dir: None,
+                ..Default::default()
             }))
             .await;
         assert_eq!(ref_size.is_error, Some(true));

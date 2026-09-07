@@ -177,9 +177,13 @@ pub(crate) async fn read_artifact_source(source: &str) -> anyhow::Result<Value> 
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()?;
-        let response = client.get(source).send().await
+        let response = client
+            .get(source)
+            .send()
+            .await
             .map_err(reqwest::Error::without_url)?
-            .error_for_status().map_err(reqwest::Error::without_url)?;
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         let scheme = response.url().scheme();
         if scheme != "http" && scheme != "https" {
             anyhow::bail!("artifact source redirected to unsupported scheme `{scheme}`");

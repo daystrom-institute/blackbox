@@ -105,6 +105,7 @@ mod tests {
             &RefSizeParams {
                 refs: vec!["task:task-123".into()],
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
         )
@@ -144,6 +145,7 @@ mod tests {
             &RefSizeParams {
                 refs: vec!["file:docs/design.md".into()],
                 project_dir: None,
+                ..Default::default()
             },
             &ctx,
             &files,
@@ -188,6 +190,7 @@ mod tests {
             &RefSizeParams {
                 refs: vec!["file:scripts/guard.py".into()],
                 project_dir: Some(worktree.path().to_string_lossy().into_owned()),
+                ..Default::default()
             },
             &ctx,
             &files,

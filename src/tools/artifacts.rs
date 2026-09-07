@@ -97,7 +97,9 @@ fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> ser
 fn artifact_metadata_view(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
     serde_json::json!({
         "kind": meta.kind, "name": meta.name, "version": meta.version,
-        "active": meta.active, "installed_at": meta.installed_at,
+        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "installed_at": meta.installed_at,
         "content_sha256": meta.content_sha256, "project_id": meta.project_id,
         "local": meta.local, "supersedes": meta.supersedes,
         "supersedes_chain": meta.supersedes_chain, "superseded_by": meta.superseded_by,
@@ -310,8 +312,11 @@ impl BlackboxServer {
             if p.version.is_some() {
                 anyhow::bail!("version requires metadata=true");
             }
-            let rows = self.state.artifacts.read().list(&p.filters)
-                .map_err(|_| anyhow::anyhow!("error.artifact_inventory_unavailable: installation inventory could not be read"))?;
+            let rows = self.state.artifacts.read().list(&p.filters).map_err(|_| {
+                anyhow::anyhow!(
+                    "error.artifact_inventory_unavailable: installation inventory could not be read"
+                )
+            })?;
             Ok(serde_json::to_string(&artifact_list_page(rows, &p)?)?)
         })
     }
@@ -408,7 +413,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let responder = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
         });
         let result = server.bbox_artifact_install(Parameters(serde_json::from_value(json!({
             "kind":"brofile", "source":format!("http://synthetic-user:synthetic-password@{addr}/private-artifact?token=synthetic-query")
@@ -416,7 +426,12 @@ mod tests {
         responder.await.unwrap();
         assert_eq!(result.is_error, Some(true));
         let encoded = serde_json::to_string(&result).unwrap();
-        for secret in ["synthetic-user","synthetic-password","synthetic-query","private-artifact"] {
+        for secret in [
+            "synthetic-user",
+            "synthetic-password",
+            "synthetic-query",
+            "private-artifact",
+        ] {
             assert!(!encoded.contains(secret), "{encoded}");
         }
     }
@@ -446,10 +461,19 @@ mod tests {
                 .to_string()
                 .contains("synthetic-password")
         );
-        server.state.artifacts.write().install_value(
-            artifacts::ArtifactKind::Brofile, "inline".into(),
-            &json!({"name":"replacement","version":1,"provider":"glm"}),
-            None, None, None).unwrap();
+        server
+            .state
+            .artifacts
+            .write()
+            .install_value(
+                artifacts::ArtifactKind::Brofile,
+                "inline".into(),
+                &json!({"name":"replacement","version":1,"provider":"glm"}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         let result = server
             .bbox_artifact_supersede(Parameters(
                 serde_json::from_value(json!({
