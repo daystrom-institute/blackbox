@@ -1,0 +1,23 @@
+{
+  "id": "gap-13d2f1e6",
+  "title": "GLM mixed native search responses emit duplicate client calls with distinct IDs",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/provider-glm-builtins",
+  "wanted_capability": "Reliable mixed provider-native search and client tool continuations without duplicated client execution; attribute provider emission separately from harness replay.",
+  "fallback_used": "Capture/count emitted calls and executed MCP calls separately; use synthetic idempotent report sink for probes.",
+  "evidence": [
+    "thread-c130128f",
+    "design/bro-harness/glm-native-search-validation.md",
+    "Flash prototype request011: duplicate tool_search; request016: duplicate bro_report and two synthetic MCP executions",
+    "checked-in runner Flash request009: duplicate tool_search, summary fails this criterion with no inconclusive checks"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/glm-mixed-native-client-duplicates",
+  "notes": "Captured duplicates already exist inside single HTTP200 raw SSE responses under distinct call IDs, before harness client dispatch. Normal tool-only turns do not duplicate. Native calls/results replay exactly. No arbitrary same-argument dedupe added because distinct legitimate calls may intentionally repeat. Search remains enabled. Provider causality beyond mixed native/client response association remains unknown.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-c130128f",
+  "created_at": "2026-09-07T01:26:27Z",
+  "updated_at": "2026-09-07T01:26:27Z"
+}

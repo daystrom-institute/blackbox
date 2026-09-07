@@ -1,0 +1,23 @@
+{
+  "id": "gap-0ab38ab1",
+  "title": "Anthropic retry guard misses inline native search execution before deltas",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/anthropic-retry",
+  "wanted_capability": "Prevent automatic request retry after a provider-native search call or result has streamed, including inline content_block_start payloads before any content_block_delta.",
+  "evidence": [
+    "thread-c130128f",
+    "crates/bro-harness/src/transport/anthropic.rs:729",
+    "crates/bro-harness/src/transport/anthropic.rs:755"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/native-search-start-retry",
+  "notes": "Code audit demonstrated guard only becomes non-retryable on deltas; native server_tool_use and result blocks can execute/arrive entirely on starts. A transient in-band fault then retries the original request. Regression and repair in progress. Separate from unproven historical placeholder-query initiation.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "thread_id": "thread-c130128f",
+  "created_at": "2026-09-07T01:13:22Z",
+  "updated_at": "2026-09-07T01:31:05Z",
+  "resolved_at": "2026-09-07T01:31:05Z",
+  "resolution_note": "ed905a53 prevents request retry after meaningful native tool/content starts; precontent retries retained. HTTP request-count regressions passed, then final11dc7105 full-profile bro-harness filter520 passed/3skipped. Native release binary built. This is source repair, not a shared-runtime deployment receipt. Single-response placeholder searches have a separate missing-schema trigger documented in thread-c130128f."
+}

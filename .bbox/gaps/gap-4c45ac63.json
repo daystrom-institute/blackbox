@@ -1,0 +1,25 @@
+{
+  "id": "gap-4c45ac63",
+  "title": "Completed native searches disappear from durable transcript when later tool input is malformed",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/provider-observations",
+  "wanted_capability": "Persist provider-native execution observations on terminal response failure without admitting malformed client calls or contaminating replay state.",
+  "fallback_used": "Private capture proxy preserves raw response and request evidence.",
+  "evidence": [
+    "thread-c130128f",
+    "capture flagship request011 at 2026-09-07T01:14:47Z: five placeholder native call/result pairs then malformed client tool_search input",
+    "crates/bro-harness/src/transport/anthropic.rs reconstruct_segment",
+    "crates/bro-harness/src/agent_loop.rs one-shot error return"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/native-observations-on-terminal-failure",
+  "notes": "Controlled lost-activation live run had five completed search results in raw SSE but zero native observations in durable session log; no one-shot terminal error event. Sixth native start reused malformed client ID. Repair in progress; keep failure observation separate from replay and never infer client args from colliding native call.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "thread_id": "thread-c130128f",
+  "created_at": "2026-09-07T01:20:38Z",
+  "updated_at": "2026-09-07T01:31:05Z",
+  "resolved_at": "2026-09-07T01:31:05Z",
+  "resolution_note": "11dc7105 preserves failed native observations separately from replay state and emits terminal errors in all entry modes. Isolated HTTP regression covers malformed captured shape and in-band overload. Final lane bro-harness full-profile filter520passed/3skipped. Actual captured SSE replay through rebuilt arm64 harness verified1request,1failure observation,1terminal error,0assistant messages,6native starts/5results, malformed/duplicate-ID/missing-result diagnostics, replayable=false. Native executable built, no shared-runtime replacement performed."
+}

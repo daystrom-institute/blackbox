@@ -23,6 +23,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Anthropic-compatible streams stop automatic retries after native tool starts
+  or inline content, preventing a transient error from repeating provider-side
+  execution. Empty precontent text/thinking starts remain retryable.
+- Failed provider responses retain native search observations and malformed-tool
+  diagnostics in a durable, nonreplayable event. One-shot harness failures emit
+  a terminal error instead of leaving the transcript at the submitted user turn.
+
 - Embedding health reports now support immutable session snapshots. Exact
   continuation reuses captured bytes instead of repeating scans or recall
   probes; invalid diagnostic/probe selectors refuse before collection.
