@@ -416,17 +416,19 @@ impl BlackboxServer {
             .rules
             .iter()
             .map(|rule| {
-                let matching_surface = match &rule.antecedent {
-                    packets::Predicate::Eq { field, value } if field == "surface" => match value {
-                        packets::Value::String(value) => value.clone(),
-                        other => format!("{other:?}"),
-                    },
-                    _ => "*".to_string(),
+                let (matching_surface, match_kind) = match &rule.antecedent {
+                    packets::Predicate::Eq {
+                        field,
+                        value: packets::Value::String(value),
+                    } if field == "surface" => (Some(value.as_str()), "exact_surface"),
+                    packets::Predicate::True => (Some("*"), "unconditional"),
+                    _ => (None, "requires_predicate_evaluation"),
                 };
                 serde_json::json!({
                     "id": rule.id,
                     "classification": rule.classification,
                     "matches_surface": matching_surface,
+                    "surface_match_kind": match_kind,
                 })
             })
             .collect();
@@ -554,6 +556,26 @@ mod tests {
             serde_json::from_value(args).unwrap()
         )).await;
         assert_eq!(stale_evidence.is_error, Some(true));
+    }
+
+    #[test]
+    fn complex_surface_predicate_is_not_reported_as_unconditional() {
+        let (_tmp, server) = make_server();
+        let mut rule = surface_rule("conditional", "readonly", &["bbox_search"], &[], "tool_surface");
+        rule["antecedent"] = serde_json::json!({"op":"All", "args":[
+            {"op":"Eq", "field":"surface", "value":"readonly"},
+            {"op":"True"}
+        ]});
+        compile_surface_packet(&server.state.packets.read(), vec![rule], "global", None);
+        let params = serde_json::from_value(serde_json::json!({
+            "action":"describe", "surface":"readonly"
+        })).unwrap();
+        let output = server.handle_mcp_surface_describe(&params, None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(value["rules"][0]["matches_surface"].is_null());
+        assert_eq!(value["rules"][0]["surface_match_kind"], "requires_predicate_evaluation");
+        assert_eq!(value["verdict_for_selected"]["route"], "tool_surface");
+        assert_eq!(value["verdict_for_selected"]["allow_count"], 1);
     }
 
     #[tokio::test]
