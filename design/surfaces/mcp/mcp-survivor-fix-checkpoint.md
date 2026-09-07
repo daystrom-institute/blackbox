@@ -11,6 +11,11 @@ brief: "Implemented caller-contract corrections, verification evidence, and deli
 
 # MCP survivor caller-contract fixes
 
+2026-09-07 supersession: [roadmap elision](roadmap-retirement.md) removes the
+roadmap subsystem completely. Historical-reader, preservation and migration
+obligations below describe this earlier checkpoint and no longer apply.
+Measured evidence and original counts remain unchanged.
+
 This is the implementation checkpoint for thread-c749d06c following the
 [reconciled audit](mcp-survivor-action-audit.md) at fdd0180c. The complete
 109-tool matrix remains a coverage inventory, not a claim that every action,

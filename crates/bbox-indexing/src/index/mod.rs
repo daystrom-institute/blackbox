@@ -20,7 +20,6 @@ pub mod history_refresh;
 pub mod history_transport;
 mod knowledge_docs;
 mod reindex;
-mod roadmap_docs;
 pub mod schema_rebuild;
 #[cfg(test)]
 mod store_integration_tests;
@@ -37,5 +36,4 @@ pub use knowledge_docs::{
 };
 pub use reindex::backfill_tool_edges_for_project;
 pub use reindex::spawn_reindex_thread;
-pub use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use writer_actor::{IndexWriteOp, IndexWriterActor, ProducerAssignmentSource};

@@ -18,7 +18,6 @@ tracing = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 tempfile = "3"
-bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }
 

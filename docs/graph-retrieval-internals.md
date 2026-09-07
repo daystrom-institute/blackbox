@@ -133,7 +133,6 @@ types are:
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
 | `bash_call` | One shell invocation in a transcript | "what did this command emit?" |
-| `roadmap_item` | Prospective work items | "what is planned or deferred?" |
 | `project_graph_vertex` | A project-graph vertex (provisional refs cover working generations) | "what does the graph say about X?" |
 
 One Tantivy document is indexed per content block, not per session. A
@@ -151,17 +150,16 @@ Edges are directional and typed.
 | Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `RelatesTo`, `TensionWith`, `Supports`, `DependsOn`, `REFERENCES`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
-| Roadmap | `ROADMAP_SPAWNS`, `ROADMAP_DEFERRED_FROM`, `ROADMAP_DESIGNED_IN`, `ROADMAP_DEPENDS_ON`, `ROADMAP_BLOCKED_BY`, `ROADMAP_SUPERSEDES`, `ROADMAP_SUBSUMES`, `ROADMAP_RELATED_TO` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
 | Tool-call | `EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH` |
 
 `bbox_describe_schema`'s edge catalog is currently narrower than this
-table (no Roadmap family; Knowledge limited to `SUPERSEDES`,
+table (Knowledge limited to `SUPERSEDES`,
 `DERIVED_FROM`, `Contradicts`, `KNOWLEDGE_FROM_SESSION`,
 `KNOWLEDGE_FROM_BOARD`), so its output can omit families listed here.
 
 The EdgeIndex is built from per-project JSONL sidecars plus live
-knowledge, thread, note, and roadmap stores, with virtual edges for
+knowledge, thread, and note stores, with virtual edges for
 tasks and tool calls.
 
 ## Hybrid search mechanics

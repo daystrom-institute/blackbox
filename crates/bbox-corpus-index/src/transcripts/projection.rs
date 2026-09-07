@@ -221,9 +221,7 @@ fn split_tool_server(name: &str) -> (String, String) {
 fn is_blackbox_tool_name(name: &str) -> bool {
     matches!(
         name.split_once('_').map(|(prefix, _)| prefix),
-        Some(
-            "bbox" | "bro" | "work" | "whiteboard" | "badgey" | "roadmap" | "artifact" | "council"
-        )
+        Some("bbox" | "bro" | "work" | "whiteboard" | "badgey" | "artifact" | "council")
     )
 }
 

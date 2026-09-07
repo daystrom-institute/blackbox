@@ -1169,6 +1169,25 @@ mod tests {
     }
 
     #[test]
+    fn retired_roadmap_is_not_registered_and_legacy_bytes_are_inert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let legacy_path = root.join("roadmap.json");
+        let legacy_bytes = b"invalid legacy data that must never be opened or rewritten";
+        std::fs::write(&legacy_path, legacy_bytes).unwrap();
+        let srv = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(&root)));
+        assert!(srv.get_tool("bbox_roadmap").is_none());
+        assert!(
+            srv.tool_router
+                .list_all()
+                .iter()
+                .all(|tool| tool.name != "bbox_roadmap")
+        );
+        drop(srv);
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
     fn surface_get_tool_with_packet_restricts_visibility() {
         let tmp = tempfile::TempDir::new().unwrap();
         let srv = test_server(&tmp);

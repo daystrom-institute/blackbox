@@ -31,7 +31,6 @@ mod tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap()

@@ -676,7 +676,12 @@ fn retain_active_code_vectors(
     searcher: &tantivy::Searcher,
 ) {
     list.hits.retain(|hit| {
-        index.is_active_code_entity_for_with_searcher(&hit.entity_id, active_selectors, searcher)
+        !hit.entity_id.starts_with("roadmap_item:")
+            && index.is_active_code_entity_for_with_searcher(
+                &hit.entity_id,
+                active_selectors,
+                searcher,
+            )
     });
 }
 
@@ -2575,6 +2580,29 @@ mod graph_word_lane_pipeline {
         }
     }
 
+    #[test]
+    fn retired_vectors_are_removed_before_fusion_without_filtering_live_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with_documents(dir.path(), &[]);
+        let mut list = RankedList {
+            source: "vector:test".into(),
+            weight: 1.0,
+            hits: ["roadmap_item:old", "thread:live"]
+                .into_iter()
+                .enumerate()
+                .map(|(rank, id)| RankedHit {
+                    entity_id: id.into(),
+                    rank: rank + 1,
+                    score: 1.0,
+                    source: "vector:test".into(),
+                })
+                .collect(),
+        };
+        retain_active_code_vectors(&mut list, &index, &BTreeMap::new(), &index.searcher());
+        assert_eq!(list.hits.len(), 1);
+        assert_eq!(list.hits[0].entity_id, "thread:live");
+    }
+
     /// A real TranscriptIndex on a caller-held tempdir (the reader keeps
     /// files open, so the directory must outlive the index). No roots, no
     /// records: the graph documents are added directly through the writer,
@@ -2591,7 +2619,6 @@ mod graph_word_lane_pipeline {
             state.join("projects.json"),
             state.join("knowledge.json"),
             state.join("threads.json"),
-            state.join("roadmap.json"),
             Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

@@ -1132,7 +1132,7 @@ impl TranscriptIndex {
             }
         }
 
-        let query = BooleanQuery::new(clauses);
+        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
 
         if top_docs.is_empty() {
@@ -1531,7 +1531,7 @@ impl TranscriptIndex {
         if let Some(authority) = graph_authority.filter(|authority| !authority.is_empty()) {
             clauses.push((Occur::Must, self.graph_authority_clause(authority)));
         }
-        let query = BooleanQuery::new(clauses);
+        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
         if top_docs.is_empty() {
             return Ok(Vec::new());
@@ -1887,7 +1887,7 @@ impl TranscriptIndex {
             self.push_project_filter_clause(&mut clauses, filter);
         }
 
-        let query = BooleanQuery::new(clauses);
+        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
         // Pull a generous top-N by score, then resort by timestamp ascending
         // so the oldest citation (most likely the origin) shows first.
         let fetch = (limit * 4).max(20);
@@ -3103,7 +3103,6 @@ mod agentic_project_file_tests {
             projects_path,
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(
                 crate::index::StaticProjectRecordsProvider::from_bridge_records(
                     vec![project.clone()],
@@ -3220,7 +3219,6 @@ mod agentic_project_file_tests {
             projects_path,
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(
                 crate::index::StaticProjectRecordsProvider::from_bridge_records(
                     vec![project.clone()],
@@ -3334,7 +3332,6 @@ mod project_filter_lane_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -3460,7 +3457,6 @@ mod project_filter_lane_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -3540,7 +3536,6 @@ mod legacy_purge_exemption_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -3733,7 +3728,6 @@ mod conversation_channel_search_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -3985,7 +3979,6 @@ mod conversation_read_plane_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -4199,7 +4192,6 @@ mod search_recovery_hint_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()
@@ -4498,7 +4490,6 @@ mod native_drilldown_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
@@ -4791,7 +4782,6 @@ mod graph_word_lane_tests {
             root.join("projects.json"),
             root.join("kb.json"),
             root.join("threads.json"),
-            root.join("roadmap.json"),
             std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()

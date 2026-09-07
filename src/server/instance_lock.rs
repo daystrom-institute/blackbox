@@ -235,11 +235,6 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
             paths.threads_path.clone(),
         ),
         InstanceRoot::file(
-            "roadmap store",
-            "BLACKBOX_ROADMAP_PATH",
-            paths.roadmap_path.clone(),
-        ),
-        InstanceRoot::file(
             "notes store",
             "BLACKBOX_NOTES_PATH",
             paths.notes_path.clone(),
@@ -570,7 +565,6 @@ mod tests {
             "BLACKBOX_KNOWLEDGE_PATH",
             "BLACKBOX_GAPS_PATH",
             "BLACKBOX_THREADS_PATH",
-            "BLACKBOX_ROADMAP_PATH",
             "BLACKBOX_NOTES_PATH",
             "BLACKBOX_PINS_PATH",
             "BLACKBOX_PROJECTS_PATH",
@@ -877,7 +871,6 @@ mod tests {
             "global Gemini render target",
             "gap store",
             "thread store",
-            "roadmap store",
             "notes store",
             "pin store",
             "project store",

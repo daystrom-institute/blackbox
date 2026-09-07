@@ -960,6 +960,7 @@ const RECONSTRUCTABLE_LEDGER_SOURCES: &[&str] = &[
     "thread",
     "note",
     "pin",
+    // Inert legacy ledger evidence must not make surviving catalogs unreadable.
     "roadmap",
     "packet",
     "task",

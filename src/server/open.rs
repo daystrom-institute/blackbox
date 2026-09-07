@@ -16,7 +16,6 @@ use crate::orchestration::tail::TailEvent;
 use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
-use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
@@ -285,7 +284,6 @@ pub(super) fn open_shared_state(
     let projects_path = cfg.paths.projects_path.clone();
     let kb_path = cfg.paths.knowledge_path.clone();
     let th_path = cfg.paths.threads_path.clone();
-    let rm_path = cfg.paths.roadmap_path.clone();
     let store_dir = cfg.paths.bro_home.clone();
     // Store-version mode selection (phase-2 §4.1): one strict probe decides
     // the runtime authority for the process lifetime, before any
@@ -503,7 +501,6 @@ pub(super) fn open_shared_state(
         cfg.paths.state_dir.join("code-sources"),
         kb_path.clone(),
         th_path.clone(),
-        rm_path.clone(),
         records_provider.clone(),
         Some(schema_replacement_guard),
         replacement_intent,
@@ -681,11 +678,6 @@ pub(super) fn open_shared_state(
     let threads_store = Arc::new(RwLock::new(th));
     let threads_persister =
         StorePersister::spawn("threads", threads_store.clone(), th_path.clone());
-
-    let roadmap_store = Arc::new(RwLock::new(Roadmap::open(&rm_path)?));
-    let roadmap_persister =
-        StorePersister::spawn("roadmap", roadmap_store.clone(), rm_path.clone());
-    tracing::info!("Roadmap store: {}", rm_path.display());
 
     let notes_path = cfg.paths.notes_path.clone();
     let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path)?));
@@ -919,7 +911,6 @@ pub(super) fn open_shared_state(
         &threads_store.read(),
         &notes_store.read(),
         &task_store,
-        &roadmap_store.read(),
         &records_provider.records_snapshot(),
         &pending_first_republish,
     )?;
@@ -955,8 +946,6 @@ pub(super) fn open_shared_state(
         kb: kb_store,
         kb_persister,
         gaps: RwLock::new(gaps_store),
-        roadmap: roadmap_store,
-        roadmap_persister,
         threads: threads_store,
         threads_persister,
         notes: notes_store,
@@ -1198,7 +1187,6 @@ fn build_startup_edge_index(
     th: &Threads,
     notes_store: &Notes,
     task_store: &TaskStore,
-    roadmap_store: &Roadmap,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
     pending_first_republish: &BTreeSet<String>,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
@@ -1210,7 +1198,6 @@ fn build_startup_edge_index(
                 threads: th,
                 notes: notes_store,
                 session_brofile_rows: task_store.session_brofile_rows(),
-                roadmap: roadmap_store,
                 edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
                     &idx.reindex_config().projects_path,
                 ),

@@ -1234,7 +1234,6 @@ fn owner_store_paths(
         thread_store_path: owners.thread_store_path,
         note_store_path: owners.note_store_path,
         pin_store_path: owners.pin_store_path,
-        roadmap_store_path: owners.roadmap_store_path,
         packet_root: owners.packet_root,
         proposal_root: owners.proposal_root,
         slack_store_root: owners.slack_store_root,
@@ -2729,36 +2728,6 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(value[field][0]["id"], "keep");
         }
-
-        let roadmap = root.join("roadmap.json");
-        std::fs::write(
-            &roadmap,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "items": [
-                    {"project_id": project},
-                    {"project_id": "project-retained", "project": "/repo/shared"}
-                ],
-                "edges": [
-                    {"project_id": project},
-                    {"project_id": "project-retained", "project": "/repo/shared"}
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        clear_wrapped_project_rows(
-            &roadmap,
-            &["items", "edges"],
-            &PROJECT_ROW_KEYS,
-            &project,
-            &selectors,
-        )
-        .unwrap();
-        assert!(matches!(
-            count_project_rows(&roadmap, &project, &selectors, &PROJECT_ROW_KEYS),
-            ClassProbe::Committed(rows) if rows.is_empty()
-        ));
 
         let slack = root.join("slack-channel-bindings.json");
         std::fs::write(
@@ -4578,7 +4547,7 @@ fn validate_retirement_targets_absent(
 /// audit history. Slack rows are the opposite case and are included: both
 /// slack stores key their rows to a project by id and by project directory,
 /// so they are logical-identity references like any other coordination row.
-const RETIRE_REFERENCE_CLASSES: [&str; 20] = [
+const RETIRE_REFERENCE_CLASSES: [&str; 19] = [
     "code_source_activation",
     "code_source_generations",
     "producer_assignments",
@@ -4588,7 +4557,6 @@ const RETIRE_REFERENCE_CLASSES: [&str; 20] = [
     "thread_rows",
     "note_rows",
     "pin_rows",
-    "roadmap_rows",
     "artifact_rows",
     "whiteboard_rows",
     "packet_rows",
@@ -4824,7 +4792,6 @@ fn probe_retire_evidence(
         ("thread_rows", &config.paths.threads_path),
         ("note_rows", &config.paths.notes_path),
         ("pin_rows", &config.paths.pins_path),
-        ("roadmap_rows", &config.paths.roadmap_path),
     ] {
         probe.record(
             class,
@@ -5720,11 +5687,6 @@ fn coordination_row_paths(
             &PROJECT_ROW_KEYS,
         ),
         (config.paths.pins_path.clone(), &["pins"], &PROJECT_ROW_KEYS),
-        (
-            config.paths.roadmap_path.clone(),
-            &["items", "edges"],
-            &PROJECT_ROW_KEYS,
-        ),
     ]
 }
 

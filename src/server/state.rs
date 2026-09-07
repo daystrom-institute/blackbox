@@ -17,7 +17,6 @@ use crate::orchestration::{self, TaskStore};
 use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
-use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
@@ -94,8 +93,6 @@ pub(crate) struct SharedState {
     /// (one file per gap under `<project>/.bbox/gaps/`); global gaps live in the
     /// central host store. Mirrors the `kb` repo-owned model.
     pub(crate) gaps: RwLock<GapStore>,
-    pub(crate) roadmap: Arc<RwLock<Roadmap>>,
-    pub(crate) roadmap_persister: StorePersister<Roadmap>,
     pub(crate) threads: Arc<RwLock<Threads>>,
     pub(crate) threads_persister: StorePersister<Threads>,
     pub(crate) notes: Arc<RwLock<Notes>>,
@@ -567,10 +564,6 @@ impl SharedState {
         self.notes_persister.request_durable().await
     }
 
-    pub(crate) async fn persist_roadmap_durable(&self) -> anyhow::Result<()> {
-        self.roadmap_persister.request_durable().await
-    }
-
     pub(crate) async fn persist_threads_durable(&self) -> anyhow::Result<()> {
         self.threads_persister.request_durable().await
     }
@@ -637,7 +630,6 @@ impl SharedState {
         crate::providers::CorpusStores {
             idx: &self.idx,
             kb: self.kb.as_ref(),
-            roadmap: self.roadmap.as_ref(),
             threads: self.threads.as_ref(),
             notes: self.notes.as_ref(),
             projects: self.records_provider.as_ref(),
@@ -701,7 +693,6 @@ impl SharedState {
             store_dir.join("code-sources"),
             store_dir.join("kb.json"),
             store_dir.join("threads.json"),
-            store_dir.join("roadmap.json"),
             records_provider.clone(),
             // Bridge authority here, so the bridge spill guard: this path opens
             // real state directories in tests, and an absent guard would refuse
@@ -759,10 +750,6 @@ impl SharedState {
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);
-        let roadmap_path = store_dir.join("roadmap.json");
-        let roadmap_store = Arc::new(RwLock::new(Roadmap::open(&roadmap_path).unwrap()));
-        let roadmap_persister =
-            StorePersister::spawn("roadmap-test", roadmap_store.clone(), roadmap_path);
         let threads_path = store_dir.join("threads.json");
         let threads_store = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
         let threads_persister =
@@ -798,8 +785,6 @@ impl SharedState {
             kb: kb_store,
             kb_persister,
             gaps: RwLock::new(gaps),
-            roadmap: roadmap_store,
-            roadmap_persister,
             threads: threads_store,
             threads_persister,
             notes: notes_store,

@@ -7,10 +7,14 @@ repo=parser.parse_args().repo.resolve()
 root=pathlib.Path(tempfile.mkdtemp(prefix='bbox-mcp-http-'))
 print('evidence',root,flush=True)
 for name in ['state','home','config','cache','data','xdg-state','transcripts','codex']:(root/name).mkdir()
+# Removed roadmap storage must not become a startup or persistence dependency.
+legacy_roadmap_files={path:b'malformed retired state\x00{' for path in [root/'state/roadmap.json',root/'state/blackbox-roadmap.json',root/'retired-roadmap-env.json']}
+for path,content in legacy_roadmap_files.items():path.write_bytes(content)
 token=root/'synthetic.token'; token.write_text(uuid.uuid4().hex+uuid.uuid4().hex); token.chmod(0o600)
 config=root/'daemon.toml'; config.write_text('[code_collection]\nenabled = true\nknowledge_transport_enabled = true\n[[code_collection.producers]]\nproducer_id = \"synthetic-audit\"\ntoken_file = '+json.dumps(str(token))+'\nscopes = [{ repo_id = \"synthetic-audit-repo\", bbox_root_relpath = \".\" }]\n')
 sock=socket.socket(); sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
 env={'PATH':os.environ['PATH'],'HOME':str(root/'home'),'XDG_CONFIG_HOME':str(root/'config'),'XDG_CACHE_HOME':str(root/'cache'),'XDG_DATA_HOME':str(root/'data'),'XDG_STATE_HOME':str(root/'xdg-state'),'BLACKBOX_CONFIG':str(config),'BLACKBOX_STATE_DIR':str(root/'state'),'BLACKBOX_DEFAULTS_DIR':str(repo/'system-defaults'),'BLACKBOX_VECTORS_PATH':str(root/'state/vectors'),'TRANSCRIPT_SEARCH_INDEX_PATH':str(root/'index'),'TRANSCRIPT_SEARCH_ROOTS':'throwaway='+str(root/'transcripts'),'TRANSCRIPT_SEARCH_CODEX_ROOT':str(root/'codex'),'BLACKBOX_REINDEX_INTERVAL_SECS':'999999','BLACKBOX_EDGE_INDEX_BOOT_REBUILD':'false','BBOX_BIND':'127.0.0.1','BBOX_PORT':str(port),'BLACKBOX_MCP_NAME':'mcp-audit-isolated','RUST_LOG':'blackbox=info'}
+env['BLACKBOX_ROADMAP_PATH']=str(root/'retired-roadmap-env.json')
 with (root/'genesis.log').open('w') as log:
  subprocess.run([str(repo/'target/debug/blackbox'),'project-catalog','genesis','--config',str(config),'--state-dir',str(root/'state')],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
 # Synthetic dispatches use an inert executable; no provider API is contacted.
@@ -52,6 +56,11 @@ try:
  rpc('initialize',{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'mcp-audit-isolated','version':'1'}})
  rpc('notifications/initialized',{},True)
  catalog=rpc('tools/list',{})['result']['tools']; names={t['name'] for t in catalog}; (root/'catalog.json').write_text(json.dumps(catalog,indent=2)); print('catalog',len(names),flush=True)
+ assert 'bbox_roadmap' not in names
+ assert all(path.read_bytes()==content for path,content in legacy_roadmap_files.items())
+ unknown=rpc('tools/call',{'name':'bbox_roadmap','arguments':{}})
+ assert unknown.get('error',{}).get('code')==-32602 and 'tool not found' in unknown['error']['message'].lower(),unknown
+ rows.append({'tool':'bbox_roadmap','case':'unknown_tool','result_bytes':len(json.dumps(unknown).encode()),'expected_error':True})
  providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; assert isinstance(providers['glm']['peak_usage'],bool); print('Flash catalog and peak advisory PASS',flush=True)
  summaries=call('bro_providers',{})
  assert all(isinstance(summaries[p]['peak_usage'],bool) for p in ['glm','deepseek'])
@@ -183,6 +192,7 @@ try:
  assert [r['entity_type'] for r in orientation['vertex_types']]==[r['entity_type'] for r in schema['vertex_types']]
  assert all('key_fields' not in r for r in orientation['vertex_types'])
  assert all('key_fields' in r for r in schema['vertex_types'])
+ assert 'roadmap' not in json.dumps(schema).lower()
  long_ref='knowledge:'+('synthetic-missing-界'*1500)
  bundle=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[]},True)
  assert bundle['detail_limited']
@@ -197,24 +207,12 @@ try:
  call('bbox_artifact_list',{'kind':'agent','body_limit':512,'limit':1},True)
  call('bro_allocator_probe',{'provider':'glm','clear':True,'raw_summary':'contradictory'},True)
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
- call('bbox_roadmap',{'action':'list'})
- roadmap_template=exact('bbox_roadmap',{'action':'default_template','detail':'body','body_limit':512})
- assert isinstance(roadmap_template,str) and roadmap_template
- call('bbox_roadmap',{'action':'create','title':'must not be created','category':'feature','scope':'global','detail':'body'},True)
  measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
  assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
  surface=exact('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024})
  assert {row['name'] for row in surface['visible_tools']}==names
  call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
- # Retired roadmap calls preserve the complete historical inventory.
- historical=call('bbox_roadmap',{'action':'list'})
- assert historical['lifecycle']=='historical_read_only'
- for action in ['create','update','delete','promote','link','unlink','repair_links']:
-  refusal=call('bbox_roadmap',{'action':action,'id':'roadmap-00000000','title':'must not change','body':'synthetic rejected mutation'},True)
-  assert 'error.roadmap_mutation_retired' in str(refusal)
- assert call('bbox_roadmap',{'action':'list'})==historical
- print('roadmap historical reads and seven mutation refusals PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
  for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:
   call('bbox_embed_status',args,True)
@@ -236,6 +234,8 @@ try:
   joined+=page['body']['text']; cursor=page['body']['next_cursor']
  assert isinstance(json.loads(joined)['routes'],dict)
  print('embedding session snapshot recovery and selector refusal PASS',flush=True)
+ assert all(path.read_bytes()==content for path,content in legacy_roadmap_files.items())
+ print('roadmap elision: absent catalog/schema, unknown tool, ignored malformed storage PASS',flush=True)
  result={'revision':subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip(),'catalog_tools':len(names),'checks':rows,'max_result_bytes':max(r['result_bytes'] for r in rows),'thread_note_bytes':len(note.encode()),'passed':True}
  (root/'summary.json').write_text(json.dumps(result,indent=2)); print(json.dumps({k:v for k,v in result.items() if k!='checks'}),flush=True)
 finally:

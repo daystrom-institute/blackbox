@@ -34,7 +34,6 @@ pub enum ToolCategory {
     Artifacts,
     Packets,
     Orchestration,
-    Roadmap,
     StorageHealth,
     Workspace,
     Operations,
@@ -56,7 +55,6 @@ impl ToolCategory {
             Self::Artifacts => "Artifact catalog",
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
-            Self::Roadmap => "Roadmap",
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Tool-call history",
             Self::Operations => "Operations",
@@ -98,9 +96,6 @@ impl ToolCategory {
             Self::Orchestration => {
                 "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
-            Self::Roadmap => {
-                "Historical roadmap records are read-only. Use bbox_roadmap to inspect or export retained items; never use the roadmap to defer requested implementation. New prospective concepts and inquiries belong in the owning project's planning graph; active execution belongs in bbox_thread."
-            }
             Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
                 "Search indexed historical tool calls with bbox_tool_calls. Execute file, shell and Git operations in the caller harness."
@@ -134,7 +129,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Artifacts,
     ToolCategory::Packets,
     ToolCategory::Orchestration,
-    ToolCategory::Roadmap,
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -971,14 +965,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Rows preview long fields with explicit truncation markers. When context is present, pass it as the arguments to bbox_context for the surrounding indexed source events. exact_read arguments instead recover the stored call's complete fields through bounded bbox_context body pages, including target/outcome and omitted identifiers. Native recovery uses an indexed-transcript handle when the original locator is oversized or names a source-host path; handles are corpus/content-bound and require rediscovery after deletion or segment replacement. outcome=requested records invocation, not successful completion. Default limit 20, maximum 100. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. Offsets stop at 100000; narrow filters beyond that window. since requires RFC 3339 with timezone. No automatic reindex or local file read occurs.",
         example: Some(r#"bbox_tool_calls(server="blackbox", tool_name="bro_exec", limit=20)"#),
     },
-    // ── Roadmap ─────────────────────────────────────────────────────
-    ToolDoc {
-        name: "bbox_roadmap",
-        category: ToolCategory::Roadmap,
-        summary: "Read historical roadmap records. All mutation actions, including promotion and repair_links, are retired. Bounded reads and exact JSON recovery remain available; stored data and graph relations are preserved.",
-        when_to_use: "Use get/list/search to recover historical items. next only ranks retained accepted items; it does not create work. list/search accept limit/offset; next uses n/offset. render/default_template export inline projections for caller-owned application. detail=body plus cursor recovers exact JSON with unchanged selectors, including markdown as JSON strings. create/update/delete/promote/link/unlink/repair_links refuse before effects with error.roadmap_mutation_retired. For new prospective concepts/inquiries use the owning project's planning graph and its authorized writer; this repository documents scripts/design-graph in docs/design-graph.md. For active work, read the old item first and explicitly open bbox_thread; no automatic migration or new roadmap edge is implied. Historical roadmap_item refs and ROADMAP_* edges remain inspectable.",
-        example: Some(r#"bbox_roadmap(action="get", id="roadmap-a1b2c3d4", detail="body")"#),
-    },
     // ── Operations ──────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_doctor",
@@ -1388,15 +1374,15 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_guidance_describes_historical_reads_and_actual_replacements() {
-        let md = render_markdown();
-        let doc = TOOL_DOCS.iter().find(|d| d.name == "bbox_roadmap").unwrap();
-        assert!(md.contains("Historical roadmap records are read-only"));
-        assert!(doc.summary.contains("All mutation actions"));
-        assert!(doc.when_to_use.contains("error.roadmap_mutation_retired"));
-        assert!(doc.when_to_use.contains("scripts/design-graph"));
-        assert!(doc.when_to_use.contains("no automatic migration"));
-        assert!(doc.example.unwrap().contains("action=\"get\""));
+    fn retired_roadmap_is_absent_from_discovery_and_rendered_guidance() {
+        assert!(TOOL_DOCS.iter().all(|doc| doc.name != "bbox_roadmap"));
+        assert!(!render_markdown().contains("bbox_roadmap"));
+        assert!(!render_markdown().contains("## Roadmap"));
+        assert!(
+            parse_registered_tools()
+                .iter()
+                .all(|(name, _)| name != "bbox_roadmap")
+        );
     }
 
     #[test]

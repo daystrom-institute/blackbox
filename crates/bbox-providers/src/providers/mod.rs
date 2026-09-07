@@ -8,7 +8,6 @@ pub mod knowledge;
 pub mod note;
 pub mod packet;
 pub mod project_file;
-pub mod roadmap_item;
 pub mod session;
 pub mod symbol;
 pub mod system_memory;
@@ -28,7 +27,6 @@ use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_index::edge_index::Edge;
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_packets::Packets;
-use bbox_stores::roadmap::Roadmap;
 use bbox_threads::notes::Notes;
 use bbox_threads::threads::Threads;
 use bbox_whiteboards::whiteboards::WhiteboardRegistry;
@@ -136,7 +134,6 @@ pub struct CorpusStores<'a> {
     /// `src/server/routes.rs`.
     pub idx: &'a RwLock<TranscriptIndex>,
     pub kb: &'a RwLock<Knowledge>,
-    pub roadmap: &'a RwLock<Roadmap>,
     pub threads: &'a RwLock<Threads>,
     pub notes: &'a RwLock<Notes>,
     /// Injected project authority. Providers enumerate records through it
@@ -470,7 +467,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(agent::AgentProvider),
             Box::new(packet::PacketProvider),
             Box::new(artifact::ArtifactProvider),
-            Box::new(roadmap_item::RoadmapItemProvider),
         ];
         providers.append(
             &mut EXTRA_PROVIDERS

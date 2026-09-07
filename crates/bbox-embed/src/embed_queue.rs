@@ -62,33 +62,6 @@ pub fn tombstone_knowledge(entity_id: &str) {
     }
 }
 
-pub fn enqueue_roadmap(
-    item: &bbox_stores::roadmap::RoadmapItem,
-    entity_id: &str,
-    chunk_hash: &str,
-) -> bool {
-    enqueue(EmbedRequest {
-        bucket: Bucket::Knowledge, // reuses knowledge bucket for vector search
-        project_id: None,
-        entity_id: entity_id.to_string(),
-        chunk_hash: chunk_hash.to_string(),
-        text: format!("{}\n\n{}", item.title, item.body),
-        visual_kind: None,
-        visual_payload: None,
-    })
-}
-
-pub fn tombstone_roadmap(entity_id: &str) {
-    if let Some(queue) = queue_slot().read().as_ref() {
-        queue.tombstone(entity_id);
-    } else {
-        tracing::debug!(
-            entity_id,
-            "embedding queue not installed; accepted roadmap tombstone as no-op"
-        );
-    }
-}
-
 /// Register this module's enqueue functions as the index engine's embed
 /// hooks (`index::embed_hook`). Called from the daemon's writer-actor spawn
 /// path; idempotent.

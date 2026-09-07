@@ -305,8 +305,7 @@ The duplication boundary, stated once and held:
   needed, files drift between docs and tree and cites evidence; it does not
   replace gap notes).
 - Prospective concepts and inquiries -> the campaign layer; active execution
-  -> threads. Roadmap records are retained as read-only history; see
-  [the retirement contract](../../surfaces/mcp/roadmap-retirement.md).
+  -> threads.
 - Normative clause-level content -> `specs/` stays; this graph links.
 
 ## What this design refuses

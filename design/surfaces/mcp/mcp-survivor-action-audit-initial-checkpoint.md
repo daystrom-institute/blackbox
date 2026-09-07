@@ -11,6 +11,11 @@ brief: "Current served-tool dispositions, live caller-contract findings, and exp
 
 # Surviving MCP action audit: historical checkpoints
 
+2026-09-07 supersession: [roadmap elision](roadmap-retirement.md) removes the
+roadmap subsystem completely. Historical-reader, preservation and migration
+obligations below describe this earlier checkpoint and no longer apply.
+Measured evidence and original counts remain unchanged.
+
 Preserved from source 004822640975 on 2026-09-06. The findings and matrix below
 record the initial audit, followed by integration checkpoints. Their present-tense
 claims and final next steps are historical. Use the [current reconciliation](mcp-survivor-action-audit.md)

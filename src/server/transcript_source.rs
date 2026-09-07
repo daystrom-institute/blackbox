@@ -379,7 +379,6 @@ mod tests {
             root.join("verify-projects.json"),
             root.join("verify-kb.json"),
             root.join("verify-threads.json"),
-            root.join("verify-roadmap.json"),
             Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

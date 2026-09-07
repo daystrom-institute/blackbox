@@ -11,7 +11,6 @@ use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::{EdgeProjectionDoc, TranscriptIndex};
 pub use bbox_edge_sidecar::edge_sidecar::*;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEdgeKind};
-use bbox_stores::roadmap::Roadmap;
 use bbox_threads::notes::Notes;
 use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
 
@@ -56,7 +55,6 @@ pub struct EdgeStoreRefs<'a> {
     /// store by the caller — dependency inversion keeping this store
     /// below orchestration in the crate DAG.
     pub session_brofile_rows: Vec<(String, String, String)>,
-    pub roadmap: &'a Roadmap,
     pub edges_dir: PathBuf,
     pub registered_project_ids: Option<HashSet<String>>,
     pub include_tantivy_projection: bool,
@@ -118,7 +116,7 @@ impl EdgeIndex {
 
     /// Store-projection half of `rebuild`: walks the in-memory stores only.
     /// Callers holding store read guards (knowledge/threads/notes/tasks/
-    /// roadmap/idx) run just this half under them, then drop the guards
+    /// idx) run just this half under them, then drop the guards
     /// before `load_sidecar_edges` — the sidecar load is a multi-GB disk
     /// parse that needs no store access, and parking_lot fairness means one
     /// writer queued behind a guard held that long blocks all new readers.
@@ -132,7 +130,6 @@ impl EdgeIndex {
         index.project_thread_edges(stores.threads, &mut seen);
         index.project_note_edges(stores.notes, &mut seen);
         index.project_task_edges(&stores.session_brofile_rows, &mut seen);
-        index.project_roadmap_edges(stores.roadmap, &mut seen);
         if stores.include_tantivy_projection {
             index.project_tantivy_edges(stores.index, &mut seen);
         } else {
@@ -421,7 +418,7 @@ impl EdgeIndex {
     }
 
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<EdgeKey>) {
-        if !seen.insert(edge.dedup_key()) {
+        if edge.kind.starts_with("ROADMAP_") || !seen.insert(edge.dedup_key()) {
             return;
         }
         let edge_id = self.edges.len();
@@ -660,33 +657,6 @@ impl EdgeIndex {
         }
     }
 
-    fn project_roadmap_edges(&mut self, roadmap: &Roadmap, seen: &mut HashSet<EdgeKey>) {
-        for edge in roadmap.all_edges() {
-            let source = match EntityRef::parse(&edge.from) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let target = match EntityRef::parse(&edge.to) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let kind = match edge.kind {
-                bbox_stores::roadmap::RoadmapEdgeKind::Spawns => "ROADMAP_SPAWNS",
-                bbox_stores::roadmap::RoadmapEdgeKind::DeferredFrom => "ROADMAP_DEFERRED_FROM",
-                bbox_stores::roadmap::RoadmapEdgeKind::DesignedIn => "ROADMAP_DESIGNED_IN",
-                bbox_stores::roadmap::RoadmapEdgeKind::DependsOn => "ROADMAP_DEPENDS_ON",
-                bbox_stores::roadmap::RoadmapEdgeKind::BlockedBy => "ROADMAP_BLOCKED_BY",
-                bbox_stores::roadmap::RoadmapEdgeKind::Supersedes => "ROADMAP_SUPERSEDES",
-                bbox_stores::roadmap::RoadmapEdgeKind::Subsumes => "ROADMAP_SUBSUMES",
-                bbox_stores::roadmap::RoadmapEdgeKind::RelatedTo => "ROADMAP_RELATED_TO",
-            };
-            self.insert(
-                exact_edge(source, kind, target, EdgeProvenance::Derived),
-                seen,
-            );
-        }
-    }
-
     fn project_tantivy_edges(&mut self, index: &TranscriptIndex, seen: &mut HashSet<EdgeKey>) {
         // Docs stream off the segment doc stores one at a time
         // (for_each_edge_projection_doc): transcript docs project straight to
@@ -865,10 +835,11 @@ impl EdgeIndex {
             if skip_derived && line_provenance_is_derived(trimmed) {
                 continue;
             }
-            match serde_json::from_str::<Edge>(trimmed) {
-                Ok(edge) => {
+            match decode_live_edge_row(trimmed.as_bytes()) {
+                Ok((Some(edge), _)) => {
                     self.insert_sidecar_edge(edge, seen);
                 }
+                Ok((None, _)) => {}
                 Err(err) => {
                     tracing::warn!(path = %path.display(), error = %err, "failed to parse edge sidecar line");
                 }
@@ -927,12 +898,13 @@ impl EdgeIndex {
             if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Edge>(trimmed) {
-                Ok(edge) => {
+            match decode_live_edge_row(trimmed.as_bytes()) {
+                Ok((Some(edge), _)) => {
                     if !edge_touches_any_path_hash(&edge, suppressed_hashes) {
                         self.insert_sidecar_edge(edge, seen);
                     }
                 }
+                Ok((None, _)) => {}
                 Err(err) => anyhow::bail!(
                     "selected active edge file {} has malformed JSONL at line {}: {err}",
                     path.display(),
@@ -961,8 +933,9 @@ impl EdgeIndex {
             if skip_derived && line_provenance_is_derived(trimmed) {
                 continue;
             }
-            match serde_json::from_str::<Edge>(trimmed) {
-                Ok(edge) => self.insert_sidecar_edge(edge, seen),
+            match decode_live_edge_row(trimmed.as_bytes()) {
+                Ok((Some(edge), _)) => self.insert_sidecar_edge(edge, seen),
+                Ok((None, _)) => {}
                 Err(err) => anyhow::bail!(
                     "selected active edge file {} has malformed JSONL at line {}: {err}",
                     path.display(),
@@ -1062,7 +1035,6 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

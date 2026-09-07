@@ -396,7 +396,6 @@ pub fn apply(
         paths.code_source_root.clone(),
         paths.knowledge_path.clone(),
         paths.threads_path.clone(),
-        paths.roadmap_path.clone(),
         records.clone(),
         Some(guard),
         intent,
@@ -677,7 +676,6 @@ mod tests {
             projects_path.clone(),
             root.join("blackbox-knowledge.json"),
             root.join("blackbox-threads.json"),
-            root.join("blackbox-roadmap.json"),
             Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();

@@ -961,14 +961,12 @@ fn build_edge_index_from_shared_at_authority(
         let threads = state.threads.read();
         let notes = state.notes.read();
         let task_store = state.task_store.read();
-        let roadmap = state.roadmap.read();
         edge_index::EdgeIndex::project_store_edges(&edge_index::EdgeStoreRefs {
             index: &idx,
             knowledge: &kb,
             threads: &threads,
             notes: &notes,
             session_brofile_rows: task_store.session_brofile_rows(),
-            roadmap: &roadmap,
             edges_dir: edges_dir.to_path_buf(),
             registered_project_ids: Some(registered_project_ids.clone()),
             include_tantivy_projection,
@@ -1438,14 +1436,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|gap| gap.project.as_deref() == Some(project))
         .count();
-    let roadmap = state
-        .roadmap
-        .read()
-        .all_items()
-        .iter()
-        .filter(|item| item.project.as_deref() == Some(project))
-        .count();
-
     Ok(json!({
         "knowledge": knowledge,
         "threads": threads,
@@ -1457,7 +1447,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "teams": teams,
         "whiteboards": whiteboards,
         "gaps": gaps,
-        "roadmap": roadmap,
     }))
 }
 
@@ -1718,21 +1707,10 @@ pub(crate) fn migrate_project_refs(
         .whiteboards
         .rename_project_refs(old_project, new_project)?;
 
-    // Phase-2 §8.4 coverage fixes: gaps and roadmap rows previously
-    // orphaned silently on rename, and webhooks kept a stale execution
-    // target. Same write-behind persistence discipline as their siblings.
     let gaps = state
         .gaps
         .write()
         .rename_project_refs(old_project, new_project)?;
-    let roadmap = state
-        .roadmap
-        .write()
-        .rename_project_refs(old_project, new_project)?;
-    if roadmap > 0 {
-        state.roadmap_persister.request();
-    }
-
     Ok(json!({
         "knowledge": knowledge,
         "threads": threads,
@@ -1744,7 +1722,6 @@ pub(crate) fn migrate_project_refs(
         "teams": teams,
         "whiteboards": whiteboards,
         "gaps": gaps,
-        "roadmap": roadmap,
     }))
 }
 

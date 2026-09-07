@@ -131,10 +131,10 @@ checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	
 checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn attachment_row_governing	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	4	collapse into the lease confined readers
-checkout_root_path	src/tools/project_catalog.rs	fn project_catalog_get_page	1	response-only recorded attachment coordinate; does not access the checkout
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_advance	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_bind	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn probe_migration_attachments	2	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn project_catalog_get_page	1	response-only recorded attachment coordinate; does not access the checkout
 checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_eject	2	collapse into the lease confined readers
@@ -143,7 +143,6 @@ checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	7	collaps
 checkout_root_path	src/tools/render.rs	fn bbox_render	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope	1	collapse into the lease confined readers
-checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope_with_id	1	collapse into the lease confined readers
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_strings	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_with_alternate	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn read_stable_repository_object_format	1	route through the verified-commit git wrapper
@@ -195,10 +194,10 @@ project_record_import	crates/bbox-indexing/src/project_resolver.rs	<file scope>	
 project_record_import	crates/bbox-indexing/src/projects.rs	<file scope>	1	delete with the v1 record type
 project_record_import	crates/bbox-indexing/src/publisher.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/code_source.rs	<file scope>	1	delete with the v1 record type
-project_record_import	src/server/producer_auth.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/gap_view.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/knowledge_lifecycle.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/knowledge_view.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/producer_auth.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/repo_io.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/tools/graph.rs	<file scope>	1	delete with the v1 record type
 repo_io_selected_target	src/server/repo_io.rs	fn base_carrier_target	1	delete Selected/Checkout; Attachment remains

@@ -58,14 +58,12 @@ nav:
     - Badgey: badgey.md
     - Councils & Whiteboards: councils-whiteboards.md
     - MCP Surfaces: mcp-surfaces.md
-    - Roadmap Tool: roadmap-tool.md
   - Integrations:
     - Ingress Paths: ingress-paths.md
     - Slack Bridge: slack-bridge.md
     - IRC Bridge: irc-bridge.md
   - Reference:
     - Examples: examples.md
-    - Project Roadmap: roadmap.md
 
 plugins:
   - search

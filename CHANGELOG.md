@@ -10,9 +10,9 @@ out explicitly under `Changed` or `Removed`.
 
 ### Removed
 
-- Roadmap MCP mutations and promotion. Historical reads, exact export and
-  graph relations remain available; new planning uses the owning project's
-  planning graph, and active work uses threads.
+- Roadmap support in full: MCP tool, store, entity and edge types, indexing,
+  configuration, templates and documentation. No historical reader, migration
+  or replacement workflow remains.
 
 - Daemon workflows, atoms, application crons/pollers/webhooks, reaction delivery,
   Slack/Badgey consultants and whiteboard execution. Bro control and corpus
@@ -34,7 +34,7 @@ out explicitly under `Changed` or `Removed`.
   continuation reuses captured bytes instead of repeating scans or recall
   probes; invalid diagnostic/probe selectors refuse before collection.
 
-- MCP discovery now keeps ordinary schema, knowledge, artifact, roadmap and
+- MCP discovery now keeps ordinary schema, knowledge, artifact and
   health reads compact, with exact JSON pages for oversized evidence and
   metadata. Graph validation pages variants separately from error rows.
 - MCP configuration and project tools state their supported owner/locality
@@ -190,8 +190,8 @@ out explicitly under `Changed` or `Removed`.
 - Team creation rejects empty or more than 256 expanded members before
   allocation. Team/template exact reads use JSON body pages. Unsupported
   project-template operations refuse rather than accessing daemon-local paths.
-- Artifact install accepts inline JSON or HTTP(S), and roadmap rendering returns
-  content with inline templates. Unsupported checkout operations refuse before
+- Artifact install accepts inline JSON or HTTP(S). Unsupported checkout operations
+  refuse before
   mutation; legacy bootstrap/absorb surfaces leave ordinary discovery.
 - Trigger install schemas describe nested specs and required selectors instead
   of opaque JSON objects. Doctor encoding is independent of detail level.

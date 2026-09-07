@@ -170,11 +170,6 @@ pub fn blackbox_threads_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-threads.json"))
 }
 
-pub fn blackbox_roadmap_path(home: &Path) -> PathBuf {
-    env_path("BLACKBOX_ROADMAP_PATH")
-        .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-roadmap.json"))
-}
-
 pub fn blackbox_notes_path(home: &Path) -> PathBuf {
     env_path("BLACKBOX_NOTES_PATH")
         .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-notes.json"))

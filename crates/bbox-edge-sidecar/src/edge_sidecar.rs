@@ -84,6 +84,41 @@ pub struct Edge {
     pub project_id: Option<String>,
 }
 
+/// Decode surviving edges while allowing retired rows to remain inert on disk.
+/// Provenance is retained only for the overlay deletion guard.
+pub fn decode_live_edge_row(bytes: &[u8]) -> Result<(Option<Edge>, EdgeProvenance)> {
+    match serde_json::from_slice::<Edge>(bytes) {
+        Ok(edge) => {
+            let provenance = edge.provenance;
+            if edge.kind.starts_with("ROADMAP_") {
+                return Ok((None, provenance));
+            }
+            Ok((Some(edge), provenance))
+        }
+        Err(error) => {
+            let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+            let mut retired = false;
+            for field in ["source", "target"] {
+                if value[field]["type"] == "roadmap_item" {
+                    anyhow::ensure!(
+                        value[field]["id"].is_string(),
+                        "invalid retired edge endpoint"
+                    );
+                    retired = true;
+                    // Validate the rest of the row using the existing wire contract.
+                    // This placeholder never leaves this decoder or reaches a writer.
+                    value[field] = serde_json::json!({"type": "knowledge", "id": "retired"});
+                }
+            }
+            if !retired {
+                return Err(error.into());
+            }
+            let edge: Edge = serde_json::from_value(value)?;
+            Ok((None, edge.provenance))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedEdgeLaneSnapshotV1 {
     /// Cheap identity used to invalidate an in-memory export plan. It binds
@@ -177,9 +212,12 @@ pub fn visit_explicit_edge_lane(
     let mut callback_error = None;
     let mut on_line = |content: &[u8], _terminator: &[u8]| {
         lines_seen = lines_seen.saturating_add(1);
-        let parsed = serde_json::from_slice::<Edge>(content)
+        let parsed = decode_live_edge_row(content)
             .context("decoding explicit edge lane row")
-            .and_then(&mut visitor);
+            .and_then(|(edge, _)| match edge {
+                Some(edge) => visitor(edge),
+                None => Ok(()),
+            });
         if let Err(error) = parsed {
             callback_error = Some(error);
             return Err("explicit_edge_lane_row_invalid");
@@ -285,9 +323,12 @@ pub fn visit_observed_edge_lane(
     let mut callback_error = None;
     let mut on_line = |content: &[u8], _terminator: &[u8]| {
         lines_seen = lines_seen.saturating_add(1);
-        let parsed = serde_json::from_slice::<Edge>(content)
+        let parsed = decode_live_edge_row(content)
             .context("decoding observed edge lane row")
-            .and_then(&mut visitor);
+            .and_then(|(edge, _)| match edge {
+                Some(edge) => visitor(edge),
+                None => Ok(()),
+            });
         if let Err(error) = parsed {
             callback_error = Some(error);
             return Err("observed_edge_lane_row_invalid");
@@ -643,6 +684,15 @@ impl TranscriptEdgeLaneWalk {
         }
         let value: serde_json::Value =
             serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
+        if value["source"]["type"] == "roadmap_item"
+            || value["target"]["type"] == "roadmap_item"
+            || value["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("ROADMAP_"))
+        {
+            decode_live_edge_row(content.as_bytes()).map_err(|_| "transcript_edge_invalid")?;
+            return Ok(None);
+        }
         // Validated as a typed Edge to keep capture's existing validity
         // contract - a lane line that is not an edge is a corrupt owner, not a
         // row to skip - but deserialized from the value already parsed, because
@@ -2443,6 +2493,58 @@ mod project_catalog_snapshot_tests {
             metadata: BTreeMap::new(),
             project_id: None,
         }
+    }
+
+    #[test]
+    fn retired_edge_rows_do_not_block_surviving_lane_reads_or_change_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = "p_00000000000000000000000000000001";
+        let live = explicit_edge("task:surviving");
+        let mut retired = serde_json::to_value(&live).unwrap();
+        retired["source"] = serde_json::json!({"type": "roadmap_item", "id": "stale"});
+        retired["kind"] = serde_json::json!("ROADMAP_RELATED_TO");
+        let bytes = format!("{}\n{}\n", retired, serde_json::to_string(&live).unwrap());
+        for lane in ["explicit", "observed"] {
+            let path = root.join(lane).join(format!("{project}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut seen = Vec::new();
+            if lane == "explicit" {
+                let snapshot = visit_explicit_edge_lane(&root, project, 4096, 4096, |edge| {
+                    seen.push(edge);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(snapshot.lines_seen, 2);
+            } else {
+                let snapshot = visit_observed_edge_lane(&root, project, 4096, 4096, |edge| {
+                    seen.push(edge);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(snapshot.lines_seen, 2);
+            }
+            assert_eq!(seen, vec![live.clone()]);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+        }
+        let (edge, provenance) = decode_live_edge_row(retired.to_string().as_bytes()).unwrap();
+        assert!(edge.is_none());
+        assert_eq!(provenance, EdgeProvenance::Explicit);
+        let mut walk = TranscriptEdgeLaneWalk::new();
+        assert!(walk.accept(&retired.to_string()).unwrap().is_none());
+        let mut surviving = live.clone();
+        surviving.metadata.insert("cwd".into(), "/synthetic".into());
+        assert_eq!(
+            walk.accept(&serde_json::to_string(&surviving).unwrap())
+                .unwrap()
+                .unwrap()
+                .ordinal,
+            1
+        );
+        retired["provenance"] = serde_json::json!("invalid");
+        assert!(decode_live_edge_row(retired.to_string().as_bytes()).is_err());
+        assert!(decode_live_edge_row(b"{broken").is_err());
     }
 
     #[test]

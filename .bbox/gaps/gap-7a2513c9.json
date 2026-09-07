@@ -3,7 +3,7 @@
   "title": "Remaining MCP acceptance: live remote-executor and provider failure combinations",
   "gap_kind": "mcp_surface",
   "domain": "survivor-audit",
-  "wanted_capability": "Complete the remaining live remote fleetd and provider authentication/throttling/failure acceptance cases, preserving the verified MCP caller contracts and keeping historical roadmap disposition with its owning projects.",
+  "wanted_capability": "Complete the remaining live remote fleetd and provider authentication/throttling/failure acceptance cases, preserving the verified MCP caller contracts. Roadmap elision is separate source-removal work tracked in gap-56c74f23 and imposes no historical migration or owner-disposition obligation.",
   "evidence": [
     "thread:thread-c749d06c",
     "design/surfaces/mcp/mcp-survivor-closure.md",
@@ -20,5 +20,5 @@
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T19:05:09Z",
-  "updated_at": "2026-09-07T01:26:37Z"
+  "updated_at": "2026-09-07T01:37:55Z"
 }

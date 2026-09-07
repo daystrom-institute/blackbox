@@ -62,8 +62,7 @@ The graph holds STATE; the design docs hold STORY.
 
 If it is about agent behavior or cross-project operating rules, it belongs in
 knowledge (`bbox_learn` / `bbox_decide`), not here. Prospective concepts and inquiries belong in the campaign layer described
-below; active execution belongs in threads. Roadmap records are now
-[historical read-only data](roadmap-tool.md), not a destination for new work.
+below; active execution belongs in threads.
 If it is normative clause content, it belongs in `specs/`. The graph links
 to other stores without automatically absorbing their historical records.
 The one traversable exception is the gap log: a `dsg:GapRef` mirrors a gap

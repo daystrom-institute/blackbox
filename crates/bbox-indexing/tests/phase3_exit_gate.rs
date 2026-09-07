@@ -220,7 +220,6 @@ fn initialize_empty_owner_state(root: &Path) {
         state.join("projects.json"),
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
-        state.join("blackbox-roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -242,10 +241,6 @@ fn initialize_empty_owner_state(root: &Path) {
         ("blackbox-threads.json", r#"{"version":1,"threads":[]}"#),
         ("blackbox-notes.json", r#"{"version":1,"notes":[]}"#),
         ("blackbox-pins.json", r#"{"version":1,"pins":[]}"#),
-        (
-            "blackbox-roadmap.json",
-            r#"{"version":1,"items":[],"edges":[]}"#,
-        ),
     ] {
         write(&state.join(name), body.as_bytes());
     }
@@ -889,7 +884,6 @@ fn activate_remote_only_collected_generation(fixture: &ExitGateFixture) -> Remot
         state.join("code-sources"),
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
-        state.join("blackbox-roadmap.json"),
         records.clone(),
         None,
     )
@@ -1281,7 +1275,6 @@ fn the_forced_replacement_rematerializes_every_bucket_of_the_fixture() {
         fixture.state().join("legacy-projects.json"),
         fixture.state().join("blackbox-knowledge.json"),
         fixture.state().join("blackbox-threads.json"),
-        fixture.state().join("blackbox-roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();

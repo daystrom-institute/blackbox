@@ -48,7 +48,6 @@ pub struct ConfigOverrides {
     pub providers: ProviderOverrides,
     pub lsp: LspOverrides,
     pub transcripts: TranscriptOverrides,
-    pub roadmap: RoadmapOverrides,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,12 +101,6 @@ pub struct TranscriptOverrides {
     pub codex_root: Option<Option<PathBuf>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RoadmapOverrides {
-    pub write_path: Option<Option<PathBuf>>,
-    pub template_path: Option<Option<PathBuf>>,
-}
-
 /// Raw configuration as read from file (with Options for missing fields)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawConfig {
@@ -123,7 +116,6 @@ struct RawConfig {
     pub transcripts: RawTranscriptConfig,
     #[serde(default)]
     pub paths: RawPathsConfig,
-    pub roadmap: RawRoadmapConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,16 +518,8 @@ struct RawPathsConfig {
     pub memory_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct RawRoadmapConfig {
-    pub write_path: Option<PathBuf>,
-    pub template_path: Option<PathBuf>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ProjectConfig {
-    #[serde(default)]
-    pub roadmap: RoadmapConfig,
     #[serde(default)]
     pub mcp: ProjectMcpConfig,
     #[serde(default)]
@@ -592,7 +576,6 @@ pub struct ResolvedPathConfig {
     pub knowledge_path: PathBuf,
     pub gaps_path: PathBuf,
     pub threads_path: PathBuf,
-    pub roadmap_path: PathBuf,
     pub notes_path: PathBuf,
     pub pins_path: PathBuf,
     pub checkout_mutations_path: PathBuf,
@@ -1031,13 +1014,6 @@ pub struct TranscriptConfig {
     pub codex_root: Option<PathBuf>,
 }
 
-/// Roadmap configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct RoadmapConfig {
-    pub write_path: Option<PathBuf>,
-    pub template_path: Option<PathBuf>,
-}
-
 /// Main configuration structure with all resolved values
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -1050,7 +1026,6 @@ pub struct Config {
     pub lsp: LspConfig,
     pub transcripts: TranscriptConfig,
     pub paths: ResolvedPathConfig,
-    pub roadmap: RoadmapConfig,
 }
 
 impl Config {
@@ -1117,10 +1092,6 @@ impl Config {
                 vectors_dir: None,
                 defaults_dir: None,
                 memory_dir: None,
-            },
-            roadmap: RawRoadmapConfig {
-                write_path: None,
-                template_path: None,
             },
         }
     }
@@ -1511,10 +1482,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             codex_root: raw.transcripts.codex_root,
         },
         paths,
-        roadmap: RoadmapConfig {
-            write_path: raw.roadmap.write_path,
-            template_path: raw.roadmap.template_path,
-        },
     })
 }
 
@@ -1772,17 +1739,6 @@ fn repo_id_inputs(
     }
 }
 
-pub fn merge_project(base: &Config, project: &ProjectConfig) -> Config {
-    let mut merged = base.clone();
-    if let Some(write_path) = project.roadmap.write_path.clone() {
-        merged.roadmap.write_path = Some(write_path);
-    }
-    if let Some(template_path) = project.roadmap.template_path.clone() {
-        merged.roadmap.template_path = Some(template_path);
-    }
-    merged
-}
-
 fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawConfig {
     // Apply flag overrides to raw config
     if let Some(port) = overrides.daemon.port {
@@ -1880,14 +1836,6 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
         raw.transcripts.codex_root = codex_root;
     }
 
-    // Apply roadmap overrides
-    if let Some(write_path) = overrides.roadmap.write_path {
-        raw.roadmap.write_path = write_path;
-    }
-    if let Some(template_path) = overrides.roadmap.template_path {
-        raw.roadmap.template_path = template_path;
-    }
-
     raw
 }
 
@@ -1968,12 +1916,6 @@ fn resolve_paths(
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-threads.json"));
-
-    let roadmap_path = std::env::var("BLACKBOX_ROADMAP_PATH")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir.join("blackbox-roadmap.json"));
 
     let notes_path = std::env::var("BLACKBOX_NOTES_PATH")
         .ok()
@@ -2112,7 +2054,6 @@ fn resolve_paths(
         knowledge_path,
         gaps_path,
         threads_path,
-        roadmap_path,
         notes_path,
         pins_path,
         checkout_mutations_path,
@@ -3884,28 +3825,6 @@ remote_authority = "workspace.example"
             producers: raw.producers,
         })
         .expect("the disabled default is a valid config");
-    }
-
-    #[test]
-    fn merge_project_overrides_roadmap_fields() {
-        let mut base = load().unwrap();
-        base.roadmap.write_path = Some(PathBuf::from("/tmp/base-roadmap.json"));
-        base.roadmap.template_path = Some(PathBuf::from("/tmp/base-template.md"));
-
-        let mut project = ProjectConfig::default();
-        project.roadmap.write_path = Some(PathBuf::from("/tmp/project-roadmap.json"));
-        project.roadmap.template_path = Some(PathBuf::from("/tmp/project-template.md"));
-
-        let merged = merge_project(&base, &project);
-        assert_eq!(
-            merged.roadmap.write_path,
-            Some(PathBuf::from("/tmp/project-roadmap.json"))
-        );
-        assert_eq!(
-            merged.roadmap.template_path,
-            Some(PathBuf::from("/tmp/project-template.md"))
-        );
-        assert_eq!(merged.daemon.port, base.daemon.port);
     }
 
     #[test]

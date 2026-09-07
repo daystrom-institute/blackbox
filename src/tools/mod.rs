@@ -28,7 +28,6 @@ pub mod packets;
 pub mod project_catalog;
 pub mod projects;
 pub mod render;
-pub mod roadmap;
 pub mod roster;
 pub mod scope;
 pub mod sessions;

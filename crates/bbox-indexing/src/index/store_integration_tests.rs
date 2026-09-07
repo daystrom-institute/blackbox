@@ -19,7 +19,6 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
         dir.path().join("projects.json"),
         knowledge_path.clone(),
         dir.path().join("threads.json"),
-        dir.path().join("roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
@@ -136,7 +135,6 @@ fn knowledge_entries_are_searchable_after_reindex() {
         dir.path().join("projects.json"),
         knowledge_path,
         dir.path().join("threads.json"),
-        dir.path().join("roadmap.json"),
         std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();

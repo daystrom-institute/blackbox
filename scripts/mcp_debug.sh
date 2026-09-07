@@ -79,7 +79,6 @@ daemon_env() {
     BLACKBOX_KNOWLEDGE_PATH="$STATE_DIR/blackbox-knowledge.json" \
     BLACKBOX_GAPS_PATH="$STATE_DIR/blackbox-gaps.json" \
     BLACKBOX_THREADS_PATH="$STATE_DIR/blackbox-threads.json" \
-    BLACKBOX_ROADMAP_PATH="$STATE_DIR/blackbox-roadmap.json" \
     BLACKBOX_NOTES_PATH="$STATE_DIR/blackbox-notes.json" \
     BLACKBOX_PINS_PATH="$STATE_DIR/blackbox-pins.json" \
     BLACKBOX_PROJECTS_PATH="$STATE_DIR/projects.json" \
