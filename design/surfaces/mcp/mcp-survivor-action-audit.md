@@ -2,11 +2,11 @@
 title: "Surviving MCP action audit"
 kind: design
 corpus: blackbox-design
-lifecycle: partial
+lifecycle: implemented
 topic:
   - surfaces
   - mcp
-brief: "Current per-action dispositions, evidence limits, and prioritized residual caller-contract work."
+brief: "Historical per-action audit baseline, reconciled through the completed MCP closure milestones."
 ---
 
 # Surviving MCP action audit
@@ -16,14 +16,17 @@ roadmap subsystem completely. Historical-reader, preservation and migration
 obligations below describe this earlier checkpoint and no longer apply.
 Measured evidence and original counts remain unchanged.
 
-Current owner: thread-c749d06c. The audit below is the reconciliation baseline
+Resolved owner: thread-c749d06c. The [closeout](mcp-survivor-closure.md)
+records completed MCP scope and the separate residual thread `thread-87b1eb39`.
+The audit below is the reconciliation baseline
 at source 004822640975f19f90dc4d50dd16d7fc9efc42e8, committed as fdd0180c.
 The subsequent [fix checkpoint](mcp-survivor-fix-checkpoint.md) is authoritative
-for implemented corrections, current verification and retained obligations.
+for that implementation checkpoint; the closure record determines final status.
 Remaining/future wording in the baseline matrix describes the queue that drove
 those fixes, not a claim that each original defect still exists.
 
-The source declarations and complete ops replay still agree on 109 named tools.
+At the baseline revision, source declarations and complete ops replay agreed
+on 109 named tools.
 Default replay exposes 96; this connected client exposes 101, with the five
 agent and three allocator tools absent. Policy discovery is not callable client
 access. The table covers all 256 original branch rows and explicitly lists the
@@ -380,11 +383,11 @@ the named ownership references from the handoff. Their present failure state
 was not re-tested in this pass, so none is asserted as a current blocker. Inspect
 the precise dependency only when a surface claim requires it.
 
-Roadmap gap-56c74f23 was read live: unresolved, blocking_level=none. It owns a
-consumer/data decision, not a prerequisite blocking unrelated caller fixes.
-The broad audit gap-7a2513c9 is updated in place and stays unresolved; original
-pre-fix examples are preserved in the historical checkpoint. The thread remains
-open for implementation and branch acceptance, with R01 first.
+The subsequent closeout addresses roadmap gap-56c74f23 through complete elision
+and addresses audit gap-7a2513c9 through the shipped caller-contract fixes.
+Thread-c749d06c is resolved. Fleet/provider and backend residuals continue in
+thread-87b1eb39 outside this audit. Original pre-fix rows remain historical
+evidence, not current implementation requirements.
 
 Close rows on evidence for that branch. Retention rationale, green suites,
 catalog counts, safe refusal and working summary pagination alone do not prove

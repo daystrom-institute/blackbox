@@ -2,11 +2,11 @@
 title: "MCP survivor caller-contract fixes"
 kind: design
 corpus: blackbox-design
-lifecycle: partial
+lifecycle: implemented
 topic:
   - surfaces
   - mcp
-brief: "Implemented caller-contract corrections, verification evidence, and deliberately open audit obligations."
+brief: "Historical caller-contract implementation checkpoint with evidence and a completed audit closeout."
 ---
 
 # MCP survivor caller-contract fixes
@@ -58,14 +58,12 @@ daemon-owned metadata paths are withheld by the relevant projections. Opaque
 operator diagnostic prose is not promised to be secret-free or automatically
 credential-sanitized.
 
-The broader audit stays open for expensive embedding debug/diagnostic snapshot
-paging, exhaustive remaining authority/provider failure combinations, and
-consumer-backed retirement decisions. Embedding scans/probes need a recovery
-contract that does not silently repeat expensive work per page. Existing
-storage-health scans and changing doctor/publisher detail recollection remain
-disclosed costs. Oversized native transcript locators retain their explicit
-recovery-unavailable outcome. Backend delivery/readiness repair and GLM
-experiments keep their existing separate owners.
+The later [closure milestones](mcp-survivor-closure.md) complete diagnostic
+snapshot paging and native locator recovery, and remove roadmap entirely.
+Thread-c749d06c and gap-7a2513c9 are closed on their MCP scope. Fleet/provider
+execution acceptance and backend delivery residuals continue separately in
+thread-87b1eb39; they do not keep this audit open. Storage-health scans and
+changing doctor/publisher detail recollection remain disclosed costs.
 
 ## Bridge presentation amendment
 

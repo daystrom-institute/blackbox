@@ -1,24 +1,26 @@
 {
   "id": "gap-7a2513c9",
-  "title": "Remaining MCP acceptance: live remote-executor and provider failure combinations",
+  "title": "MCP survivor caller-contract audit completed",
   "gap_kind": "mcp_surface",
   "domain": "survivor-audit",
-  "wanted_capability": "Complete the remaining live remote fleetd and provider authentication/throttling/failure acceptance cases, preserving the verified MCP caller contracts. Roadmap elision is separate source-removal work tracked in gap-56c74f23 and imposes no historical migration or owner-disposition obligation.",
+  "wanted_capability": "Reconcile and complete the surviving MCP tools' exposed schemas, selectors, response bounds, exact recovery, error contracts and capability dispositions.",
   "evidence": [
     "thread:thread-c749d06c",
+    "thread:thread-87b1eb39",
     "design/surfaces/mcp/mcp-survivor-closure.md",
+    "design/surfaces/mcp/mcp-survivor-fix-verification.json",
     "design/surfaces/mcp/mcp-survivor-closure-verification.json",
-    "design/surfaces/mcp/mcp-v01-dispatch-acceptance.json",
-    "design/surfaces/mcp/roadmap-retirement.md",
-    "gap:gap-56c74f23"
+    "design/surfaces/mcp/roadmap-elision-verification.json"
   ],
   "impact": "high",
-  "blocking_level": "workaround_available",
+  "blocking_level": "none",
   "dedupe_key": "mcp_surface/survivor-audit/caller-contract-residuals",
-  "notes": "The MCP closure checkpoint is recorded in design/surfaces/mcp/mcp-survivor-closure-verification.json: immutable session snapshots, loaded-only recall, bounded native indexed-record recovery, compact citations, and broadcast authority/admission fixes passed full workspace and isolated HTTP checks and were deployed. Keep this gap unresolved for remaining live remote fleetd and provider HTTP authentication/throttling/failure combinations; no current source defect is asserted by that missing acceptance. Fixture tests and the full suite are not live provider certification. Roadmap elision is complete and deployed at eeb138e7a566; gap-56c74f23 is addressed. The previous historical-reader, migration and owner-disposition requirements are superseded, with no follow-up obligation. Evidence: design/surfaces/mcp/roadmap-elision-verification.json. Backend delivery/readiness repair and GLM experiments remain separately owned.",
-  "resolution": "unresolved",
+  "notes": "MCP surface work is complete: caller-contract corrections and roadmap elision are implemented, committed, pushed and deployed. Evidence lives in design/surfaces/mcp/mcp-survivor-fix-verification.json, mcp-survivor-closure-verification.json and roadmap-elision-verification.json. Thread thread-c749d06c is closing on this scope. Keeping this MCP gap open for remote fleetd/provider failure combinations was scope drift; those acceptance tasks now belong to thread-87b1eb39 (fleet-delivery-residuals), alongside references to existing checkout delivery/publication/backend gaps. They are not demonstrated remaining MCP defects or prerequisites for audit closure. Existing fixture and production evidence limits remain accurate; closure does not claim exhaustive provider certification. Roadmap has no historical reader, migration or owner-disposition obligation.",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T19:05:09Z",
-  "updated_at": "2026-09-07T01:57:45Z"
+  "updated_at": "2026-09-07T02:07:32Z",
+  "resolved_at": "2026-09-07T02:07:32Z",
+  "resolution_note": "Completed the MCP caller-contract scope. Fleet/provider execution acceptance and backend delivery residuals are transferred to thread-87b1eb39, not treated as unfinished MCP surface work."
 }

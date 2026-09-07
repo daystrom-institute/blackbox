@@ -2,11 +2,11 @@
 title: "MCP survivor closure milestones"
 kind: design
 corpus: blackbox-design
-lifecycle: partial
+lifecycle: implemented
 topic:
   - surfaces
   - mcp
-brief: "Evidence-backed closure of diagnostic paging, native recovery, retirement and remaining adverse caller paths."
+brief: "Completed MCP caller-contract audit, verified roadmap elision, and separate ownership of runtime residuals."
 ---
 
 # MCP survivor closure milestones
@@ -15,6 +15,24 @@ Continuation of thread-c749d06c after the
 [caller-contract fix checkpoint](mcp-survivor-fix-checkpoint.md) at b6189fbf.
 Milestones record the changed contract and its acceptance evidence. A catalog
 count or full-suite pass does not substitute for branch-specific evidence.
+
+## Reconciled closeout
+
+The MCP surface audit is complete. Its scope is the exposed tools, schemas,
+selectors, response bounds, exact recovery, errors and capability dispositions.
+The implemented corrections and roadmap elision are verified and deployed.
+`gap-7a2513c9` is addressed and `thread-c749d06c` is resolved.
+
+Remote fleetd/provider acceptance and backend delivery work were incorrectly
+carried as remaining MCP obligations. They now belong to
+`thread-87b1eb39` (`fleet-delivery-residuals`). That thread references the existing
+checkout replay, publication latency, readiness, onboarding and missing-checkout
+gaps; it does not duplicate them. GLM work retains its existing owner,
+`thread-c130128f`.
+
+The evidence below keeps its measured scope. Audit closure does not claim
+exhaustive provider execution certification. Earlier audit matrices and
+checkpoint counts describe their source revisions, not a current open queue.
 
 ## Embedding report snapshots
 
@@ -93,7 +111,8 @@ loaded-partition inventory unchanged.
 ## Verified rollout before roadmap elision
 
 The measurements in this section describe the earlier retained-reader revision.
-They remain historical evidence; roadmap elision requires its own verification.
+Roadmap elision has separate completed verification in
+[its acceptance record](roadmap-elision-verification.json).
 
 Final tested source: `38eaf3738606fae164900fcb896f36b5d42ebf12`, including the concurrent Anthropic retry fix.
 All 6,753 workspace tests passed in 157.814 seconds, with
@@ -109,8 +128,7 @@ historical roadmap search and explicit thread summary. No production scan,
 recall probe, task dispatch or historical-data mutation was used for validation.
 
 [Verification evidence](mcp-survivor-closure-verification.json) records the
-commands, measurements, image digest and limits. Remaining acceptance work is
-live remote-executor/provider failure certification. Historical roadmap
-migration is not an acceptance obligation. Backend delivery/readiness repair and GLM
-experiments remain separately owned. No source defect is inferred solely from
-an unexecuted provider combination.
+commands, measurements, image digest and limits. Live remote-executor/provider
+acceptance and backend delivery residuals continue in `thread-87b1eb39` outside
+the completed MCP audit. Roadmap has no migration obligation. No source defect
+is inferred solely from an unexecuted provider combination.
