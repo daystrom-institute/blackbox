@@ -287,16 +287,31 @@ impl BlackboxServer {
             reported_at: orch::now_ms(),
         };
 
+        if serde_json::to_vec(&report.to_json()).map_or(true, |bytes| bytes.len() > 32 * 1024) {
+            return Self::err_text(
+                "Report exceeds 32 KiB; send a concise milestone or smaller structured data. The previous report is unchanged",
+            );
+        }
+        let value = report.to_json();
+        let projected = if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 2048) {
+            value
+        } else {
+            json!({"message":super::agents::preview_text(&report.message,256),
+            "has_needs":report.needs.is_some(),"has_data":report.data.is_some(),"reportedAt":report.reported_at,
+            "detail_hint":"bro_status(task_id, detail=report) pages the exact stored report"})
+        };
+        let response = Self::ok_json(
+            &json!({"taskId":p.task_id,"report":projected,"persistence":"requested"}),
+        );
+        if response.is_error == Some(true) {
+            return response;
+        }
         {
             let mut inner = task.inner.lock();
-            inner.report = Some(report.clone());
+            inner.report = Some(report);
         }
         crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
-
-        Self::ok_json(&json!({
-            "taskId": p.task_id,
-            "report": report.to_json(),
-        }))
+        response
     }
 
     #[tool(
@@ -840,10 +855,15 @@ impl BlackboxServer {
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
-                if team::delete_teamplate(name, scope, store_dir, p.project_dir.as_deref()) {
-                    Self::ok_json(&json!({"deleted": name}))
-                } else {
-                    Self::err_text(&format!("Teamplate not found: {name}"))
+                match team::remove_teamplate_checked(
+                    name,
+                    scope,
+                    store_dir,
+                    p.project_dir.as_deref(),
+                ) {
+                    Ok(true) => Self::ok_json(&json!({"deleted":name})),
+                    Ok(false) => Self::err_text(&format!("Teamplate not found: {name}")),
+                    Err(error) => Self::err_text(&format!("Template removal failed: {error}")),
                 }
             }
             "create" => {
@@ -901,26 +921,72 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                let loaded_team = match team::load_team(name, store_dir) {
-                    Some(t) => t,
-                    None => return Self::err_text(&format!("Unknown team: {name}")),
+                let loaded_team = match team::load_team_checked(name, store_dir) {
+                    Ok(Some(team)) => team,
+                    Ok(None) => return Self::err_text(&format!("Unknown team: {name}")),
+                    Err(error) => return Self::err_text(&format!("Team unavailable: {error}")),
                 };
+                let mut targets = Vec::new();
+                let mut skipped_terminal = 0;
+                let mut skipped_missing = 0;
                 if p.cancel_running.unwrap_or(false) {
-                    let task_store = self.state.task_store.read();
-                    for member in &loaded_team.members {
-                        for tid in &member.task_history {
-                            if let Some(task) = task_store.get(tid) {
-                                let _ = orch::cancel_task(
-                                    &task,
-                                    &self.state.task_store,
-                                    &self.state.store_dir,
-                                );
+                    let store = self.state.task_store.read();
+                    let ids: std::collections::BTreeSet<_> = loaded_team
+                        .members
+                        .iter()
+                        .flat_map(|member| member.task_history.iter())
+                        .collect();
+                    for id in ids {
+                        match store.get(id) {
+                            Some(task) if task.inner.lock().status == orch::TaskStatus::Running => {
+                                targets.push(task)
                             }
+                            Some(_) => skipped_terminal += 1,
+                            None => skipped_missing += 1,
                         }
                     }
                 }
-                team::remove_team(name, store_dir);
-                Self::ok_json(&json!({"dissolved": name}))
+                let ids: Vec<_> = targets.iter().map(|task| task.id()).collect();
+                if ids.len() > 64
+                    || serde_json::to_vec(&ids).map_or(true, |bytes| bytes.len() > 16 * 1024)
+                {
+                    return Self::err_text(
+                        "Team cancellation receipt exceeds 64 tasks / 16 KiB IDs; cancel in explicit batches, then dissolve. No task or team was changed",
+                    );
+                }
+                let mut cancellations = Vec::new();
+                let mut failed = false;
+                for task in targets {
+                    let id = task.id();
+                    match orch::cancel_task(&task, &self.state.task_store, store_dir) {
+                        Ok(()) => cancellations
+                            .push(json!({"taskId":id,"outcome":"cancellation_requested"})),
+                        Err(error) => {
+                            failed = true;
+                            cancellations.push(json!({"taskId":id,"outcome":"not_cancelled", "message":orch::truncated_chars(&error,256)}));
+                        }
+                    }
+                }
+                let removal = if failed {
+                    json!({"status":"retained_after_cancel_failure"})
+                } else {
+                    match team::remove_team_checked(name, store_dir) {
+                        Ok(true) => json!({"status":"removed"}),
+                        Ok(false) => json!({"status":"already_absent"}),
+                        Err(error) => {
+                            json!({"status":"failed","message":orch::truncated_chars(&error.to_string(),256)})
+                        }
+                    }
+                };
+                let removed = matches!(
+                    removal["status"].as_str(),
+                    Some("removed" | "already_absent")
+                );
+                Self::ok_json(
+                    &json!({"team":name,"dissolved":if removed { json!(name) } else { Value::Null },
+                    "removal":removal,"cancellations":cancellations,"skipped_terminal":skipped_terminal,
+                    "skipped_missing":skipped_missing}),
+                )
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
@@ -1119,6 +1185,22 @@ fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
     anyhow::ensure!(
         p.advisor.is_none(),
         "error.team_advisor_retired: automatic team advisors are retired; omit advisor and dispatch any review explicitly with bro_exec/bro_resume. Existing advisor configuration remains readable but is never executed"
+    );
+    anyhow::ensure!(
+        p.members.is_none() || p.action == "save_template",
+        "members require action=save_template"
+    );
+    anyhow::ensure!(
+        p.template.is_none() || p.action == "create",
+        "template requires action=create"
+    );
+    anyhow::ensure!(
+        p.cancel_running.is_none() || p.action == "dissolve",
+        "cancel_running requires action=dissolve"
+    );
+    anyhow::ensure!(
+        p.action != "dissolve" || p.project_dir.is_none(),
+        "dissolve selects an exact name; project_dir is not a filter for this mutation"
     );
     let template_action = matches!(
         p.action.as_str(),
@@ -1756,6 +1838,102 @@ mod tests {
                 .to_string()
                 .contains("broken")
         );
+    }
+
+    #[test]
+    fn report_admission_bounds_receipts_and_preserves_previous_on_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let task = orch::test_task(
+            "synthetic-report",
+            orch::TaskStatus::Running,
+            Provider::Brodex,
+        );
+        server
+            .state
+            .task_store
+            .write()
+            .insert("synthetic-report".into(), task.clone())
+            .unwrap();
+        let message = "界\"".repeat(2000);
+        let result = server.bro_report(Parameters(ReportParams {
+            task_id: "synthetic-report".into(),
+            message: message.clone(),
+            needs: None,
+            data: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let mut recovered = String::new();
+        let mut cursor = None;
+        loop {
+            let page = server.bro_status(Parameters(
+                serde_json::from_value(json!({
+                    "task_id":"synthetic-report","detail":"report","cursor":cursor
+                }))
+                .unwrap(),
+            ));
+            assert_ne!(page.is_error, Some(true));
+            let value: Value = serde_json::from_str(&extract_text(&page)).unwrap();
+            recovered.push_str(value["body"]["text"].as_str().unwrap());
+            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(value["message"], message);
+        let result = server.bro_report(Parameters(ReportParams {
+            task_id: "synthetic-report".into(),
+            message: "x".repeat(40_000),
+            needs: None,
+            data: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(task.inner.lock().report.as_ref().unwrap().message, message);
+    }
+
+    #[tokio::test]
+    async fn team_dissolve_reports_requested_cancellation_and_skipped_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let running = orch::test_task("running", orch::TaskStatus::Running, Provider::Brodex);
+        let terminal = orch::test_task("terminal", orch::TaskStatus::Completed, Provider::Brodex);
+        server
+            .state
+            .task_store
+            .write()
+            .insert("running".into(), running.clone())
+            .unwrap();
+        server
+            .state
+            .task_store
+            .write()
+            .insert("terminal".into(), terminal)
+            .unwrap();
+        let mut team = fixture_team("synthetic", "/synthetic/worker");
+        team.members.push(orchestration::team::TeamMember {
+            name: "synthetic-member".into(),
+            brofile: "synthetic".into(),
+            session_id: None,
+            task_history: vec!["running".into(), "terminal".into(), "missing".into()],
+        });
+        orchestration::team::save_team(&team, &server.state.store_dir);
+        let result = server
+            .bro_team(Parameters(team_params(
+                json!({"action":"dissolve","name":"synthetic","cancel_running":true}),
+            )))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let value: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            value["cancellations"][0]["outcome"],
+            "cancellation_requested"
+        );
+        assert_eq!(value["skipped_terminal"], 1);
+        assert_eq!(value["skipped_missing"], 1);
+        assert_eq!(value["removal"]["status"], "removed");
+        assert_eq!(running.inner.lock().status, orch::TaskStatus::Cancelled);
     }
 
     #[test]

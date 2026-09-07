@@ -328,6 +328,82 @@ fn teams_dir(store_dir: &Path) -> PathBuf {
     store_dir.join("teams")
 }
 
+/// Publish only newly admitted member history over the latest team snapshot.
+/// A concurrently removed or changed team refuses instead of being recreated.
+pub fn persist_broadcast_history(
+    before: &Team,
+    after: &Team,
+    store_dir: &Path,
+) -> anyhow::Result<()> {
+    let _guard = lock_teams();
+    let path = teams_dir(store_dir).join(format!("{}.json", before.name));
+    crate::json_store::with_store_lock(&path, || {
+        let mut current = load_team_checked(&before.name, store_dir)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "team was removed while dispatching; admitted tasks remain available by task ID"
+            )
+        })?;
+        for (previous, updated) in before.members.iter().zip(&after.members) {
+            let added = updated
+                .task_history
+                .get(previous.task_history.len()..)
+                .ok_or_else(|| anyhow::anyhow!("invalid member history delta"))?;
+            if added.is_empty() {
+                continue;
+            }
+            let matches: Vec<_> = current
+                .members
+                .iter_mut()
+                .filter(|member| member.name == previous.name)
+                .collect();
+            anyhow::ensure!(
+                matches.len() == 1,
+                "team member changed while dispatching; admitted tasks remain available by task ID"
+            );
+            let member = matches.into_iter().next().unwrap();
+            anyhow::ensure!(
+                member.brofile == previous.brofile,
+                "member configuration changed while dispatching"
+            );
+            anyhow::ensure!(
+                member.task_history == previous.task_history
+                    && member.session_id == previous.session_id,
+                "member session/history changed while dispatching; inspect admitted tasks before reconciling the team"
+            );
+            for id in added {
+                if !member.task_history.contains(id) {
+                    member.task_history.push(id.clone());
+                }
+            }
+            member.session_id = updated.session_id.clone();
+        }
+        crate::json_store::atomic_write_json_locked(&path, &current)
+    })
+}
+
+pub fn remove_team_checked(name: &str, store_dir: &Path) -> std::io::Result<bool> {
+    let _guard = lock_teams();
+    match fs::remove_file(teams_dir(store_dir).join(format!("{name}.json"))) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn remove_teamplate_checked(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> anyhow::Result<bool> {
+    let dir = checked_teamplates_dir(scope, store_dir, project_dir)?;
+    match fs::remove_file(dir.join(format!("{name}.json"))) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn save_team(team: &Team, store_dir: &Path) {
     atomic_write_json(&teams_dir(store_dir), &team.name, team);
 }
@@ -579,6 +655,35 @@ mod tests {
 
     fn temp_store() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn broadcast_history_preserves_peer_changes_and_refuses_lost_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let before: Team = serde_json::from_value(serde_json::json!({"name":"synthetic","teamplate":"test","created_at":0,
+            "members":[{"name":"one","brofile":"one","task_history":[]},{"name":"two","brofile":"two","task_history":[]}]})).unwrap();
+        save_team(&before, &root);
+        let mut peer = before.clone();
+        peer.members[1].task_history.push("peer-task".into());
+        peer.members[1].session_id = Some("peer-session".into());
+        persist_broadcast_history(&before, &peer, &root).unwrap();
+        let mut own = before.clone();
+        own.members[0].task_history.push("own-task".into());
+        own.members[0].session_id = Some("own-session".into());
+        persist_broadcast_history(&before, &own, &root).unwrap();
+        let current = load_team_checked("synthetic", &root).unwrap().unwrap();
+        assert_eq!(current.members[0].task_history, vec!["own-task"]);
+        assert_eq!(current.members[1].task_history, vec!["peer-task"]);
+        let bytes = fs::read(teams_dir(&root).join("synthetic.json")).unwrap();
+        assert!(persist_broadcast_history(&before, &own, &root).is_err());
+        assert_eq!(
+            fs::read(teams_dir(&root).join("synthetic.json")).unwrap(),
+            bytes
+        );
+        remove_team_checked("synthetic", &root).unwrap();
+        assert!(persist_broadcast_history(&before, &own, &root).is_err());
+        assert!(!teams_dir(&root).join("synthetic.json").exists());
     }
 
     #[test]
