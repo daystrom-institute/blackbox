@@ -184,12 +184,12 @@ try:
  assert all('key_fields' not in r for r in orientation['vertex_types'])
  assert all('key_fields' in r for r in schema['vertex_types'])
  long_ref='knowledge:'+('synthetic-missing-界'*1500)
- bundle=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref]},True)
+ bundle=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[]},True)
  assert bundle['detail_limited']
- recovered_bundle=exact('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'body_limit':4096},expect_error=True)
+ recovered_bundle=exact('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[],'body_limit':4096},expect_error=True)
  assert long_ref in json.dumps(recovered_bundle,ensure_ascii=False)
- first=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'body_limit':128},True)
- call('bbox_bundle_evidence',{'question':'Changed selection','entity_refs':[long_ref],'body_limit':128,'cursor':first['body']['next_cursor']},True)
+ first=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[],'body_limit':128},True)
+ call('bbox_bundle_evidence',{'question':'Changed selection','entity_refs':[long_ref],'path_ids':[],'body_limit':128,'cursor':first['body']['next_cursor']},True)
  artifact_metadata=exact('bbox_artifact_list',{'kind':'agent','name':'synthetic-summary-agent','metadata':True,'body_limit':128})
  assert artifact_metadata['name']=='synthetic-summary-agent' and 'source' not in artifact_metadata and 'project_path' not in artifact_metadata
  artifact_inventory=exact('bbox_artifact_list',{'kind':'agent','body_limit':512})
@@ -201,6 +201,11 @@ try:
  roadmap_template=exact('bbox_roadmap',{'action':'default_template','detail':'body','body_limit':512})
  assert isinstance(roadmap_template,str) and roadmap_template
  call('bbox_roadmap',{'action':'create','title':'must not be created','category':'feature','scope':'global','detail':'body'},True)
+ measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
+ assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
+ surface=exact('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024})
+ assert {row['name'] for row in surface['visible_tools']}==names
+ call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
  result={'revision':subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip(),'catalog_tools':len(names),'checks':rows,'max_result_bytes':max(r['result_bytes'] for r in rows),'thread_note_bytes':len(note.encode()),'passed':True}
  (root/'summary.json').write_text(json.dumps(result,indent=2)); print(json.dumps({k:v for k,v in result.items() if k!='checks'}),flush=True)
