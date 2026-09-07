@@ -316,6 +316,15 @@ pub fn save_brofile(
     Ok(file)
 }
 
+/// Filesystem identity for configuration body-page cursors. This performs
+/// blocking I/O; MCP callers use it inside the bro_brofile spawn_blocking lane.
+/// Missing or inaccessible directories retain their supplied identity.
+pub(crate) fn store_identity(dir: &Path) -> String {
+    fs::canonicalize(dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dir.to_string_lossy().into_owned())
+}
+
 fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
