@@ -1248,7 +1248,7 @@ impl Session {
         let mut last_step_text = String::new();
         // One-shot guard for the empty-output nudge below.
         let mut empty_output_nudged = false;
-        let mut tool_batch_correction_used = false;
+        let mut tool_batch_correction_reason: Option<String> = None;
         let mut turn_steps = 0u64;
         let mut last_model_stop: Option<StopReason> = None;
         let mut last_model_tool_call_count = 0usize;
@@ -1474,7 +1474,17 @@ impl Session {
             // A rejected batch stays visible and replayable, but no client
             // action (including final_result) runs. Supply a result for every
             // ID before either requesting correction or terminating.
-            if let Some(reason) = self.tx.tool_batch_rejection(&out) {
+            let batch_rejection = if let Some(original_reason) = &tool_batch_correction_reason
+                && out.tool_calls.len() > 1
+            {
+                Some(format!(
+                    "{original_reason} Correction protocol violation: this response contains {} client calls; at most one client call per response is permitted for the remainder of this user turn. None of the client tools in this correction batch were executed.",
+                    out.tool_calls.len()
+                ))
+            } else {
+                self.tx.tool_batch_rejection(&out)
+            };
+            if let Some(reason) = batch_rejection {
                 last_tool_results = out
                     .tool_calls
                     .iter()
@@ -1502,7 +1512,7 @@ impl Session {
                 if *cancel.borrow() {
                     break 'turn "cancelled";
                 }
-                if tool_batch_correction_used {
+                if tool_batch_correction_reason.is_some() {
                     anyhow::bail!(
                         "{reason} Automatic correction was already attempted for this user turn; stopping."
                     );
@@ -1512,7 +1522,7 @@ impl Session {
                         "{reason} No correction turn remains within the configured turn limit; stopping."
                     );
                 }
-                tool_batch_correction_used = true;
+                tool_batch_correction_reason = Some(reason);
                 self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
                 continue;
             }
@@ -3289,12 +3299,49 @@ mod tests {
                 None,
             ),
             (
+                "serial-correction-repeats",
+                vec![
+                    ambiguous_native_batch("a"),
+                    corrected.clone(),
+                    vec![
+                        json!({"type":"tool_use","id":"corrected-again","name":"count_action","input":{"value":1}}),
+                    ],
+                    done.clone(),
+                ],
+                10,
+                1,
+                vec![0, 0, 1, 2],
+                None,
+            ),
+            (
                 "recurrent",
                 vec![ambiguous_native_batch("a"), ambiguous_native_batch("b")],
                 10,
                 1,
                 vec![0, 0],
                 Some("Automatic correction was already attempted"),
+            ),
+            (
+                "multi-call-correction",
+                vec![ambiguous_native_batch("a"), ordinary.clone()],
+                10,
+                1,
+                vec![0, 0],
+                Some("Correction protocol violation"),
+            ),
+            (
+                "distinct-call-correction",
+                vec![
+                    ambiguous_native_batch("a"),
+                    vec![
+                        corrected[0].clone(),
+                        json!({"type":"tool_use","id":"correction-final","name":"final_result","input":{"done":true}}),
+                    ],
+                ],
+                10,
+                1,
+                vec![0, 0],
+                Some("Correction protocol violation"),
             ),
             (
                 "no-budget",
@@ -3452,10 +3499,10 @@ mod tests {
                 .collect();
             let snapshot = session.tx.snapshot();
             let messages = snapshot.as_array().unwrap();
-            for blocks in expected_responses
-                .iter()
-                .filter(|blocks| blocks.iter().any(|b| b["type"] == "server_tool_use"))
-            {
+            for blocks in expected_responses.iter().filter(|blocks| {
+                blocks.iter().any(|b| b["type"] == "server_tool_use")
+                    || (expected_error.is_some() && blocks.iter().any(|b| b["type"] == "tool_use"))
+            }) {
                 let pos = messages
                     .iter()
                     .position(|message| {
