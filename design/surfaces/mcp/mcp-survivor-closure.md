@@ -87,3 +87,25 @@ or creates a partition. Missing names, busy inventory/partition locks, empty
 HNSW state and measured recall remain distinct outcomes. Tempdir regressions
 prove unknown, parent-relative and absolute routes leave storage and the
 loaded-partition inventory unchanged.
+
+## Verified rollout
+
+Final tested source: `38eaf3738606fae164900fcb896f36b5d42ebf12`, including the concurrent Anthropic retry fix.
+All 6,753 workspace tests passed in 157.814 seconds, with
+19 skipped and no scheduling overrides. Clippy, binary build, pinned
+formatting and concurrency lint passed. The isolated HTTP probe passed
+297 checks over 29 distinct tools in a 109-tool catalog;
+its largest complete result was 8,321 bytes.
+
+The image for that exact source was converged to production and deployment
+readiness was observed. Read-only production probes verified the new schemas,
+cheap immutable snapshot reconstruction, session isolation, selector refusal,
+historical roadmap search and explicit thread summary. No production scan,
+recall probe, task dispatch or historical-data mutation was used for validation.
+
+[Verification evidence](mcp-survivor-closure-verification.json) records the
+commands, measurements, image digest and limits. Remaining acceptance work is
+live remote-executor/provider failure certification and any owner-approved
+historical roadmap migration. Backend delivery/readiness repair and GLM
+experiments remain separately owned. No source defect is inferred solely from
+an unexecuted provider combination.

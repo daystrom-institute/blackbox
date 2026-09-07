@@ -1,0 +1,1922 @@
+{
+  "tested_code_revision": "38eaf3738606fae164900fcb896f36b5d42ebf12",
+  "base_revision": "b6189fbfb74fd193f6f3247ad5e9494e52c0c207",
+  "merged_peer_revision": "ed905a53afd76e99a3ea643b969bde37cd4a11ca",
+  "thread": "thread-c749d06c",
+  "gates": [
+    {
+      "command": "cargo nextest run --workspace --profile full --no-fail-fast",
+      "passed": true,
+      "tests_run": 6753,
+      "tests_passed": 6753,
+      "skipped": 19,
+      "duration_seconds": 157.814,
+      "scheduling_overrides": false
+    },
+    {
+      "command": "cargo clippy --workspace",
+      "passed": true,
+      "notes": "Warnings reported; no errors."
+    },
+    {
+      "command": "scripts/fmt.sh --check",
+      "passed": true
+    },
+    {
+      "command": "scripts/lint-concurrency.sh",
+      "passed": true,
+      "handlers_checked": 109
+    },
+    {
+      "command": "cargo build -p blackbox --bin blackbox --bin blackboxd",
+      "passed": true
+    },
+    {
+      "command": "python3 scripts/probe-mcp-survivor.py",
+      "passed": true,
+      "checks": 297
+    }
+  ],
+  "isolated_http": {
+    "revision": "38eaf3738606fae164900fcb896f36b5d42ebf12",
+    "catalog_tools": 109,
+    "checks": [
+      {
+        "tool": "bro_providers",
+        "case": "read",
+        "result_bytes": 2313,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_providers",
+        "case": "read",
+        "result_bytes": 895,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_dashboard",
+        "case": "read",
+        "result_bytes": 120,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_exec",
+        "case": "read",
+        "result_bytes": 207,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_wait",
+        "case": "read",
+        "result_bytes": 510,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_exec",
+        "case": "read",
+        "result_bytes": 248,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_resume",
+        "case": "read",
+        "result_bytes": 207,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_wait",
+        "case": "read",
+        "result_bytes": 510,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_resume",
+        "case": "read",
+        "result_bytes": 248,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_when_any",
+        "case": "read",
+        "result_bytes": 128,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_when_all",
+        "case": "read",
+        "result_bytes": 128,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_brofile",
+        "case": "list",
+        "result_bytes": 104,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 102,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 102,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_partitions",
+        "case": "explode",
+        "result_bytes": 123,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 141,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_brofile",
+        "case": "list_accounts",
+        "result_bytes": 283,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_brofile",
+        "case": "set_account",
+        "result_bytes": 448,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_brofile",
+        "case": "list_accounts",
+        "result_bytes": 221,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread_list",
+        "case": "read",
+        "result_bytes": 427,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "open",
+        "result_bytes": 120,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "continue",
+        "result_bytes": 123,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 935,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 739,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1127,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1149,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1141,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1149,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1141,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1149,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1141,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1149,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1141,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1149,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1141,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1146,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1150,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1148,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 1151,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 375,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 4226,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_knowledge",
+        "case": "read",
+        "result_bytes": 382,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_dashboard",
+        "case": "read",
+        "result_bytes": 557,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 263,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "add",
+        "result_bytes": 492,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 584,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 2509,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 2593,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 2585,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 2585,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_mcp",
+        "case": "list",
+        "result_bytes": 2374,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 354,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_install",
+        "case": "read",
+        "result_bytes": 146,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 1521,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2628,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2551,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2543,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2549,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2550,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2553,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2550,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2586,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2547,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2551,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2551,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2553,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2550,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2549,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 2392,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_agent_describe",
+        "case": "read",
+        "result_bytes": 496,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 180,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 5513,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3172,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3328,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3327,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3323,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 3324,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 1911,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_status",
+        "case": "probes",
+        "result_bytes": 2415,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 825,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_status",
+        "case": "preview",
+        "result_bytes": 1382,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 852,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_status",
+        "case": "preview",
+        "result_bytes": 1723,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 788,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_allocator_status",
+        "case": "preview",
+        "result_bytes": 1364,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_packet_list",
+        "case": "read",
+        "result_bytes": 494,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_compile",
+        "case": "read",
+        "result_bytes": 143,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 810,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2509,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2606,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_apply",
+        "case": "read",
+        "result_bytes": 1369,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 1650,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2478,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2613,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2605,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2606,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 2607,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_audit",
+        "case": "read",
+        "result_bytes": 1487,
+        "expected_error": false
+      },
+      {
+        "tool": "bro_prune",
+        "case": "read",
+        "result_bytes": 128,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_prune",
+        "case": "read",
+        "result_bytes": 104,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_wait",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_wait",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_when_all",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_when_all",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_when_any",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_when_any",
+        "case": "read",
+        "result_bytes": 116,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 935,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 87,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_thread",
+        "case": "get",
+        "result_bytes": 489,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 4226,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 3029,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 3341,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 3293,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_describe_schema",
+        "case": "read",
+        "result_bytes": 4075,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4981,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4981,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4915,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4919,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4917,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4921,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4939,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 4923,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 8321,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 1131,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_bundle_evidence",
+        "case": "read",
+        "result_bytes": 114,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 378,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 407,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 237,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 405,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_artifact_list",
+        "case": "read",
+        "result_bytes": 122,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_allocator_probe",
+        "case": "read",
+        "result_bytes": 112,
+        "expected_error": true
+      },
+      {
+        "tool": "bro_allocator_status",
+        "case": "probes",
+        "result_bytes": 117,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "list",
+        "result_bytes": 441,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "default_template",
+        "result_bytes": 910,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "default_template",
+        "result_bytes": 590,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "create",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2514,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2484,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2484,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2484,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2485,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2498,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 2486,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_ref_size",
+        "case": "read",
+        "result_bytes": 4170,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "case": "replay",
+        "result_bytes": 1832,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "case": "replay",
+        "result_bytes": 1826,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "case": "replay",
+        "result_bytes": 1862,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "case": "replay",
+        "result_bytes": 723,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_mcp_surface",
+        "case": "replay",
+        "result_bytes": 122,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "list",
+        "result_bytes": 441,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "create",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "update",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "delete",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "promote",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "link",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "unlink",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "repair_links",
+        "result_bytes": 349,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_roadmap",
+        "case": "list",
+        "result_bytes": 441,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 147,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 133,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 119,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 121,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 105,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 177,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 177,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1323,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 135,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 201,
+        "expected_error": true
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1308,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1327,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1309,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1339,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1336,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1327,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1324,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1312,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 1318,
+        "expected_error": false
+      },
+      {
+        "tool": "bbox_embed_status",
+        "case": "read",
+        "result_bytes": 912,
+        "expected_error": false
+      }
+    ],
+    "max_result_bytes": 8321,
+    "thread_note_bytes": 16522,
+    "passed": true
+  },
+  "isolated_http_distinct_tools": 29,
+  "production_read_only_http": {
+    "passed": true,
+    "catalog_tools": 109,
+    "checks": [
+      {
+        "route": "/healthz",
+        "http_status": 200
+      },
+      {
+        "route": "/readyz",
+        "http_status": 200
+      },
+      {
+        "tool": "bbox_embed_status",
+        "expected_error": false,
+        "result_bytes": 1352
+      },
+      {
+        "tool": "bbox_embed_status",
+        "expected_error": true,
+        "result_bytes": 201
+      },
+      {
+        "tool": "bbox_embed_status",
+        "expected_error": true,
+        "result_bytes": 135
+      },
+      {
+        "tool": "bbox_embed_status",
+        "expected_error": false,
+        "result_bytes": 1177
+      },
+      {
+        "tool": "bbox_roadmap",
+        "expected_error": false,
+        "result_bytes": 441
+      },
+      {
+        "tool": "bbox_embed_status",
+        "expected_error": true,
+        "result_bytes": 177
+      },
+      {
+        "tool": "bbox_thread",
+        "expected_error": false,
+        "result_bytes": 990
+      }
+    ],
+    "max_result_bytes": 1352,
+    "scope": "Read-only production MCP schema, cheap snapshot, session isolation, selector refusal, historical search and explicit thread summary; no scans/probes, mutations or provider calls."
+  },
+  "deployment": {
+    "service": "blackboxd",
+    "namespace": "blackbox",
+    "source_revision": "38eaf3738606fae164900fcb896f36b5d42ebf12",
+    "image_digest": "sha256:07d124ef2e18dce8ce3b1de1230922f69e922dc9a7123619743368468b22a5e0",
+    "build_workflow": "build-bbox-image-b9npf",
+    "build_phase": "Succeeded",
+    "ready": true,
+    "replicas": 1,
+    "observed_generation": 22,
+    "convergence": {
+      "updated_resources": 1,
+      "unchanged_resources": 16
+    },
+    "validation": "Deployment image and init-container image match the built digest; observed generation and updated/available/ready replica counts agree."
+  },
+  "prior_green_milestone": {
+    "revision": "30a699c2e5f915e9d271c87a5c451a290a3a3fc8",
+    "tests_passed": 6751,
+    "skipped": 19,
+    "duration_seconds": 153.998,
+    "http_checks": 297,
+    "image_built_but_not_deployed": true,
+    "superseded_by_peer_integration": true
+  },
+  "correction_loop": [
+    "Qualified the roadmap schema regression macro and aligned served/doc descriptions.",
+    "Restored legacy Slack bucket recovery and conditional permalink hints; the existing regression caught the selector loss.",
+    "The corrupt-store broadcast regression timed out at 120 seconds; the harness spawn reservation now drops its write guard before readback.",
+    "Independent review added citation aggregate budgets, loaded-only recall lookup, and bounded snapshot allocation."
+  ],
+  "boundaries": [
+    "Catalog count is inventory; isolated HTTP does not execute every tool/action/provider combination.",
+    "New diagnostic, broadcast and native recovery regressions use synthetic isolated state. Provider authentication/throttle and remote fleetd failure combinations are not live-certified by these probes.",
+    "Native exact reads recover stored projections, not parser-truncated or newer uncollected source content. Reindex/segment replacement can invalidate handles.",
+    "Embedding snapshots are session-local, capped and expiring. Reports over 8 MiB explicitly refuse storage after collection.",
+    "Roadmap mutation retirement is complete; per-owner disposition of retained historical records remains open. No private record was migrated or deleted.",
+    "After this tested revision, a peer added a standalone GLM probe script; the final publication also adds documentation, evidence and gap state. Runtime source matches the deployed revision."
+  ]
+}

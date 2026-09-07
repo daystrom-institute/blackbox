@@ -16,6 +16,10 @@ This is the implementation checkpoint for thread-c749d06c following the
 109-tool matrix remains a coverage inventory, not a claim that every action,
 source mode, failure injection and provider path has been executed.
 
+Subsequent corrections, retirement and production rollout are recorded in the
+[closure milestones](mcp-survivor-closure.md). This earlier checkpoint remains
+a record of its tested revision.
+
 ## Implemented contracts
 
 | Queue | Result | Regression evidence |

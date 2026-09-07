@@ -1,7 +1,7 @@
 {
   "base_revision": "b6189fbf",
   "scope": "V01 broadcast authority, reservation and provider failure branches",
-  "execution_status": "Authored and source-reviewed; awaiting orchestrator lane gates. No cold-worktree builds or tests were run.",
+  "execution_status": "Passed in the full workspace gate at 38eaf3738606fae164900fcb896f36b5d42ebf12",
   "cases": [
     {
       "test": "tools::dispatch::tests::broadcast_fresh_and_resume_preserve_authority_and_failed_child_receipts",
@@ -93,11 +93,7 @@
     "Provider HTTP authentication, throttling and transport failure combinations remain outside this milestone.",
     "Broadcast filter resolution currently returns Ok after composing filters; later filter-error branches are source-reviewed, not claimed executed.",
     "Concurrent team-history persistence failure has existing domain tests; this milestone does not inject a remote filesystem failure during fanout.",
-    "Allocator/config strict read, transaction and locality tests remain prior checkpoint evidence, not newly executed here."
+    "Allocator/config strict read, transaction and locality tests also passed in the final full workspace gate; this milestone adds no new live provider certification."
   ],
-  "tool_docs_changes_for_parent": [
-    "bro_broadcast: fresh and resumed members preserve explicit brofile tool defaults; no authority opt-out is inferred.",
-    "bro_broadcast: workflow/atom-owned sessions refuse ordinary takeover, including legacy team history identity.",
-    "bro_broadcast: only tracked admissions produce taskId/history; a tracked failed setup remains recoverable through bro_status."
-  ]
+  "verification": "mcp-survivor-closure-verification.json"
 }

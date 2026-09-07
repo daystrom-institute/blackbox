@@ -1,24 +1,24 @@
 {
   "id": "gap-7a2513c9",
-  "title": "Remaining MCP surface audit: expensive diagnostics, failure coverage and retirement decisions",
+  "title": "Remaining MCP acceptance: live remote-executor and provider failure combinations",
   "gap_kind": "mcp_surface",
   "domain": "survivor-audit",
-  "wanted_capability": "A current per-action closure record for the 109 served MCP tools, with fail-closed mutation selectors, honest partial effects, bounded complete replies and exact recovery, chooser/schema parity, and consumer-backed retirement decisions.",
+  "wanted_capability": "Complete the remaining live remote fleetd and provider authentication/throttling/failure acceptance cases, preserving the verified MCP caller contracts and keeping historical roadmap disposition with its owning projects.",
   "evidence": [
     "thread:thread-c749d06c",
-    "design/surfaces/mcp/mcp-survivor-fix-checkpoint.md",
-    "design/surfaces/mcp/mcp-survivor-fix-verification.json",
-    "design/surfaces/mcp/mcp-survivor-action-audit.md",
-    "design/surfaces/mcp/mcp-survivor-reconciliation-evidence.json",
+    "design/surfaces/mcp/mcp-survivor-closure.md",
+    "design/surfaces/mcp/mcp-survivor-closure-verification.json",
+    "design/surfaces/mcp/mcp-v01-dispatch-acceptance.json",
+    "design/surfaces/mcp/roadmap-retirement.md",
     "gap:gap-56c74f23"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/survivor-audit/caller-contract-residuals",
-  "notes": "Implementation checkpoint for thread-c749d06c at tested source 7e98006e851260a5734ffa13b341b4aed8ea5eba. Fixed the reconciled mutation-selector, pre-effect validation, partial-outcome, artifact projection, exact recovery and served-description defects detailed in design/surfaces/mcp/mcp-survivor-fix-checkpoint.md. Final lane gates passed: 6733 workspace full-profile tests, 19 skipped; workspace clippy, binary build, pinned formatting and concurrency lint; isolated HTTP probe 268 checks against a 109-tool catalog, largest complete result 8321 bytes. Evidence: mcp-survivor-fix-verification.json. These are source and isolated-daemon results, not a production deployment or exhaustive acceptance of every action/provider combination. Keep unresolved for expensive embedding debug/diagnostic snapshot paging, remaining authority/provider failure combinations, and consumer-backed retirement decisions including gap-56c74f23. Oversized native transcript locators still report recovery unavailable; storage-health scans and changing detail recollection costs remain disclosed. Backend delivery/readiness repair and GLM experiments remain separately owned. Earlier pre-fix examples are historical, not claims about this tested revision.",
+  "notes": "Closure milestone for thread-c749d06c: source 38eaf3738606fae164900fcb896f36b5d42ebf12 passed 6753 full-profile workspace tests (19 skipped), clippy, pinned formatting, concurrency lint, binary build and 297 isolated HTTP checks. That exact source image was converged to production and verified ready; read-only production schema/snapshot/session/refusal/history probes passed. Implemented session-owned immutable diagnostic snapshots, loaded-only recall reads with no partition creation, native indexed-record handles and exact recovery, bounded citation replies, broadcast tool-default/ownership/admission preservation and both reservation lock corrections. All seven roadmap mutation actions are retired while historical reads/data/graph relations remain. Current evidence: design/surfaces/mcp/mcp-survivor-closure-verification.json; branch acceptance: mcp-v01-dispatch-acceptance.json. Keep unresolved only for remaining live remote fleetd and provider HTTP authentication/throttling/failure combinations, not because a current source defect is known. Inert-harness tests and the full suite are not live provider certification. Historical roadmap item disposition remains gap-56c74f23. Snapshot expiration/8 MiB capture cap, native index-handle invalidation, source freshness and parser projection are explicit supported limits. Backend delivery/readiness repair and GLM experiments remain separately owned.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T19:05:09Z",
-  "updated_at": "2026-09-07T00:49:30Z"
+  "updated_at": "2026-09-07T01:26:37Z"
 }
