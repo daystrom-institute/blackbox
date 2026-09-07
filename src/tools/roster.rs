@@ -1588,7 +1588,12 @@ mod tests {
         let path = Path::new(project).join(".bro/teamplates/panel.json");
         let before = std::fs::read(&path).unwrap();
         for action in ["save_template", "delete_template"] {
-            let result=server.bro_team(Parameters(team_params(json!({"action":action,"name":"panel","scope":"project","project_dir":project,"members":[{"brofile":"reviewer"}]})))).await;
+            let mut request =
+                json!({"action":action,"name":"panel","scope":"project","project_dir":project});
+            if action == "save_template" {
+                request["members"] = json!([{"brofile":"reviewer"}]);
+            }
+            let result = server.bro_team(Parameters(team_params(request))).await;
             assert_eq!(result.is_error, Some(true));
             assert!(extract_text(&result).contains("error.team_template_locality_required"));
             assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2148,20 +2153,17 @@ mod tests {
         std::fs::write(&blocked, "existing-file").unwrap();
         state.store_dir = blocked.clone();
         let server = BlackboxServer::new(Arc::new(state));
-        for action in [
-            "set_account",
-            "set_provider_default",
-            "clear_provider_default",
+        for request in [
+            json!({"action":"set_account", "name":"synthetic", "env":{"TOKEN":"synthetic-secret"}}),
+            json!({"action":"set_provider_default", "provider":"brodex", "account":"synthetic"}),
+            json!({"action":"clear_provider_default", "provider":"brodex"}),
         ] {
-            let params: BrofileParams = serde_json::from_value(json!({
-                "action": action, "name": "synthetic", "provider": "brodex",
-                "account": "synthetic", "env": {"TOKEN": "synthetic-secret"},
-            }))
-            .unwrap();
+            let action = request["action"].as_str().unwrap().to_string();
+            let params: BrofileParams = serde_json::from_value(request).unwrap();
             let result = server.bro_brofile_sync(Parameters(params));
             assert_eq!(result.is_error, Some(true), "{action} claimed success");
             let response = extract_text(&result);
-            assert!(response.contains("not saved"));
+            assert!(response.contains("not saved"), "{action}: {response}");
             assert!(!response.contains("synthetic-secret"));
             assert!(!response.contains("\"updated\": true"));
         }

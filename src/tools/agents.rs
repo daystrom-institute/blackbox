@@ -2161,7 +2161,7 @@ mod tests {
             .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
-            debug: false,
+            debug: true,
             query: "orthogonal words".into(),
             limit: Some(5),
             cost_class: None,
