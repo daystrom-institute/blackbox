@@ -3299,7 +3299,9 @@ pub async fn spawn_task_with_tool_placement(
     // points into `spawn_reserved_dispatch` agree on when the id is claimed
     // and each can keep its own duplicate policy. This entry is idempotent:
     // a duplicate dispatch returns the task that already exists.
-    if let Err(err) = task_store.write().reserve_id(&task_id) {
+    // Release the reservation write guard before the refusal readback.
+    let reservation = task_store.write().reserve_id(&task_id);
+    if let Err(err) = reservation {
         if let Some(existing) = task_store.read().get(&task_id) {
             return existing;
         }
