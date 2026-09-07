@@ -59,7 +59,7 @@ try:
  assert 'bbox_roadmap' not in names
  assert all(path.read_bytes()==content for path,content in legacy_roadmap_files.items())
  unknown=rpc('tools/call',{'name':'bbox_roadmap','arguments':{}})
- assert unknown.get('error',{}).get('code')==-32602 and 'tool not found' in unknown['error']['message'].lower(),unknown
+ assert unknown.get('error',{}).get('code')==-32601 and 'tool not available on surface' in unknown['error']['message'].lower(),unknown
  rows.append({'tool':'bbox_roadmap','case':'unknown_tool','result_bytes':len(json.dumps(unknown).encode()),'expected_error':True})
  providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; assert isinstance(providers['glm']['peak_usage'],bool); print('Flash catalog and peak advisory PASS',flush=True)
  summaries=call('bro_providers',{})
