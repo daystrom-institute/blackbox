@@ -2839,7 +2839,10 @@ pub fn spawn_in_process_task(
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
-    if let Err(err) = task_store.write().reserve_id(&task_id) {
+    // Drop the write guard before consulting an existing task on refusal.
+    // An if-let scrutinee temporary otherwise survives into the error arm.
+    let reservation = task_store.write().reserve_id(&task_id);
+    if let Err(err) = reservation {
         if let Some(existing) = task_store.read().get(&task_id) {
             return existing;
         }

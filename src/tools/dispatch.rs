@@ -1814,6 +1814,15 @@ impl BlackboxServer {
             extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
 
         for (i, member) in team.members.iter().enumerate() {
+            if let Some(sid) = member.session_id.as_deref().filter(|sid| *sid != "pending") {
+                if let Err(error) = self.ensure_ordinary_resume_ownership(
+                    sid,
+                    member.task_history.last().map(String::as_str),
+                ) {
+                    launched.push(json!({"bro":member.name,"error":error}));
+                    continue;
+                }
+            }
             let brofile = match orchestration::brofile::resolve_brofile(
                 &member.brofile,
                 &store_dir,
@@ -1920,33 +1929,31 @@ impl BlackboxServer {
             // Per-member dispatch context: full payload — persona included —
             // on BOTH the fresh and resume branches (the old resume branch
             // sent the raw prompt with no ambient at all; design §6 audit).
-            let build_dispatch_context =
-                |task_id: &str, session_id: &str| -> bro_protocol::DispatchContext {
-                    let ctx = orch::AmbientContext {
-                        task_id: Some(task_id.to_string()),
-                        session_id: Some(session_id.to_string()),
-                        project_dir: cwd.clone(),
-                        bro_name: Some(member.name.clone()),
-                        thread_id: None,
-                        work_item_id: None,
-                        pin_block: self.ambient_pin_block(
-                            cwd.as_deref(),
-                            Some(member.name.as_str()),
-                            Some(session_id),
-                            None,
-                            None,
-                        ),
-                        completion_contract: if allow_recursion {
-                            None
-                        } else {
-                            Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
-                        },
-                        allow_recursion,
-                        provider: Some(brofile.provider),
-                        coerce_workspace: member_coerce_workspace,
-                    };
-                    ctx.dispatch_context(brofile.lens.as_deref())
-                };
+            let build_ambient_context = |task_id: &str, session_id: &str| -> orch::AmbientContext {
+                orch::AmbientContext {
+                    task_id: Some(task_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    project_dir: cwd.clone(),
+                    bro_name: Some(member.name.clone()),
+                    thread_id: None,
+                    work_item_id: None,
+                    pin_block: self.ambient_pin_block(
+                        cwd.as_deref(),
+                        Some(member.name.as_str()),
+                        Some(session_id),
+                        None,
+                        None,
+                    ),
+                    completion_contract: if allow_recursion {
+                        None
+                    } else {
+                        Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+                    },
+                    allow_recursion,
+                    provider: Some(effective_provider),
+                    coerce_workspace: member_coerce_workspace,
+                }
+            };
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
@@ -1976,7 +1983,8 @@ impl BlackboxServer {
                             continue;
                         }
                     };
-                    let dispatch_context = build_dispatch_context(&task_id, sid);
+                    let ambient_ctx = build_ambient_context(&task_id, sid);
+                    let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
                     let mut args = effective_provider.build_resume_args(
                         sid,
                         &p.prompt,
@@ -1997,7 +2005,7 @@ impl BlackboxServer {
                         }
                     };
                     args.extend(df.args);
-                    let t = orch::spawn_task(
+                    let t = orch::spawn_task_with_tool_placement(
                         task_id,
                         effective_provider,
                         args,
@@ -2010,6 +2018,12 @@ impl BlackboxServer {
                         Some(self.state.roster_events()),
                         None,
                         None,
+                        None,
+                        orch::merge_tool_arg_defaults(
+                            ambient_ctx.tool_arg_defaults(),
+                            brofile.tool_defaults.as_ref(),
+                            None,
+                        ),
                         Some(self.state.system_events.clone()),
                         // bro_broadcast fans out a single prompt to
                         // every team member; each per-member spawn
@@ -2031,7 +2045,8 @@ impl BlackboxServer {
             } else {
                 let task_id = uuid::Uuid::new_v4().to_string();
                 let session_id = "pending".to_string();
-                let dispatch_context = build_dispatch_context(&task_id, &session_id);
+                let ambient_ctx = build_ambient_context(&task_id, &session_id);
+                let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
                 let mut args = brofile.provider.build_exec_args(
                     &p.prompt,
                     Some(&dispatch_context),
@@ -2053,7 +2068,7 @@ impl BlackboxServer {
                     }
                 };
                 args.extend(df.args);
-                let t = orch::spawn_task(
+                let t = orch::spawn_task_with_tool_placement(
                     task_id,
                     brofile.provider,
                     args,
@@ -2066,6 +2081,12 @@ impl BlackboxServer {
                     Some(self.state.roster_events()),
                     None,
                     None,
+                    None,
+                    orch::merge_tool_arg_defaults(
+                        ambient_ctx.tool_arg_defaults(),
+                        brofile.tool_defaults.as_ref(),
+                        None,
+                    ),
                     Some(self.state.system_events.clone()),
                     // bro_broadcast per-member fresh-spawn branch
                     // — same source class as the resume branch above.
@@ -2073,11 +2094,19 @@ impl BlackboxServer {
                 )
                 .await;
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
-                updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                 t
             };
 
             let tid = task.id();
+            // Reservation refusal returns an untracked failed task. It has no
+            // exact status reader and must not become durable team history.
+            if self.state.task_store.read().get(&tid).is_none() {
+                launched.push(json!({"bro":member.name,"error":task.inner.lock().stderr.clone()}));
+                continue;
+            }
+            if member.session_id.is_none() {
+                updated_team.members[i].session_id = Some(task.inner.lock().session_id.clone());
+            }
             updated_team.members[i].task_history.push(tid.clone());
             let sid = task.inner.lock().session_id.clone();
             launched.push(json!({"bro": member.name, "taskId": tid, "sessionId": sid}));
@@ -2878,7 +2907,7 @@ impl BlackboxServer {
             {
                 return Err(format!(
                     "error.owner_managed_session: task {} belongs to a workflow or atom; \
-                     ordinary bro_resume cannot take over its session. Inspect the existing \
+                     ordinary bro resume operations cannot take over its session. Inspect the existing \
                      task with bro_status; recovery requires its owning runtime's explicit path.",
                     inner.id
                 ));
@@ -3846,6 +3875,334 @@ mod tests {
 
         client.cancel().await.unwrap();
         serving.await.unwrap();
+    }
+
+    fn isolated_broadcast_env(root: &Path) -> crate::util::TestEnvGuard {
+        let mut env = crate::util::TestEnvGuard::new();
+        for key in ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "BRO_HOME"] {
+            env.set(key, root);
+        }
+        env.set("BLACKBOX_CONFIG", root.join("absent-config.toml"));
+        env.remove("BLACKBOX_MCP_URL");
+        env
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // The single-threaded test owns env through child completion.
+    async fn broadcast_fresh_and_resume_preserve_authority_and_failed_child_receipts() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut env = isolated_broadcast_env(&root);
+        let harness = root.join("inert-harness");
+        // Capture only daemon-authored argv, never environment/credentials.
+        // This fixture has no provider implementation or network client.
+        std::fs::write(
+            &harness,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$BRO_HOME/capture.$$.args"
+IFS= read -r input
+printf '%s\n' '{"type":"result","is_error":true,"result":"synthetic provider refusal"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("BRO_HARNESS_BIN", &harness);
+        let server = test_server(&tmp);
+        let grant = "default:rust.moveStructFields.acknowledge_repr";
+        for (name, authority) in [
+            ("fresh", Some("true")),
+            ("resumed", Some("false")),
+            ("ordinary", None),
+        ] {
+            let mut value = json!({"name":name,"provider":"brodex","lens":"synthetic lens"});
+            if let Some(authority) = authority {
+                value["tool_defaults"] =
+                    serde_json::to_value(BTreeMap::from([(grant, authority)])).unwrap();
+            }
+            let bf = serde_json::from_value(value).unwrap();
+            orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None)
+                .unwrap();
+        }
+        save_when_team(
+            &server,
+            "authority-panel",
+            json!([
+                {"name":"fresh","brofile":"fresh","task_history":[]},
+                {"name":"resumed","brofile":"resumed","session_id":"synthetic-resume","task_history":[]},
+                {"name":"ordinary","brofile":"ordinary","task_history":[]},
+                {"name":"pending","brofile":"fresh","session_id":"pending","task_history":[]},
+                {"name":"missing","brofile":"missing","task_history":[]}
+            ]),
+        );
+        let result = server
+            .bro_broadcast(Parameters(
+                serde_json::from_value(json!({
+                    "team":"authority-panel","prompt":"synthetic task","cwd":root
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(value["team_persistence"]["status"], "persisted");
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        let saved =
+            orchestration::team::load_team_checked("authority-panel", &server.state.store_dir)
+                .unwrap()
+                .unwrap();
+        for row in rows {
+            let name = row["bro"].as_str().unwrap();
+            let member = saved.members.iter().find(|m| m.name == name).unwrap();
+            if matches!(name, "pending" | "missing") {
+                assert!(row["error"].is_string());
+                assert!(row.get("taskId").is_none());
+                assert!(member.task_history.is_empty());
+                continue;
+            }
+            let id = row["taskId"].as_str().unwrap();
+            assert_eq!(member.task_history, [id]);
+            let task = server.state.task_store.read().get(id).unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                orch::wait_for_task(&task),
+            )
+            .await
+            .unwrap();
+            assert_eq!(task.inner.lock().status, orch::TaskStatus::Failed);
+            let exact_status = server.bro_status(Parameters(
+                serde_json::from_value(json!({"task_id":id})).unwrap(),
+            ));
+            assert_ne!(exact_status.is_error, Some(true), "{exact_status:?}");
+            let status: Value = serde_json::from_str(&call_result_text(&exact_status)).unwrap();
+            assert_eq!(status["status"], "failed");
+        }
+        let mut captured = BTreeMap::new();
+        for entry in std::fs::read_dir(&server.state.store_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("capture.")
+            {
+                continue;
+            }
+            let args = std::fs::read_to_string(path).unwrap();
+            let args = args.lines().collect::<Vec<_>>();
+            let argument = |flag: &str| args.windows(2).find(|pair| pair[0] == flag).unwrap()[1];
+            let context: Value = serde_json::from_str(argument("--dispatch-context")).unwrap();
+            let defaults: Value = serde_json::from_str(argument("--additional-context")).unwrap();
+            assert_eq!(
+                defaults["default:mcp.bro_report.task_id"],
+                context["scope"]["task"]
+            );
+            assert_eq!(context["persona"], "synthetic lens");
+            let name = context["scope"]["bro"].as_str().unwrap().to_string();
+            if name == "resumed" {
+                assert_eq!(context["scope"]["session"], "synthetic-resume");
+            }
+            captured.insert(name, defaults);
+        }
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured["fresh"][grant], "true");
+        assert_eq!(captured["resumed"][grant], "false");
+        assert!(
+            captured["ordinary"].get(grant).is_none(),
+            "authority must never be invented"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // The single-threaded test owns isolated env through dispatch refusal.
+    async fn broadcast_unavailable_task_store_preserves_team_without_phantom_task_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut env = isolated_broadcast_env(&root);
+        env.set("BRO_HARNESS_BIN", root.join("must-not-execute"));
+        let server = test_server(&tmp);
+        let bf = serde_json::from_value(json!({"name":"synthetic","provider":"brodex"})).unwrap();
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
+        save_when_team(
+            &server,
+            "blocked-panel",
+            json!([
+                {"name":"fresh","brofile":"synthetic","task_history":[]},
+                {"name":"resumed","brofile":"synthetic","session_id":"synthetic-existing","task_history":["prior-task"]}
+            ]),
+        );
+        let team_path = server.state.store_dir.join("teams/blocked-panel.json");
+        let team_before = std::fs::read(&team_path).unwrap();
+        let tasks_path = server.state.store_dir.join("tasks.json");
+        let corrupt = b"{synthetic corrupt snapshot";
+        std::fs::write(&tasks_path, corrupt).unwrap();
+        *server.state.task_store.write() = orch::TaskStore::load(&server.state.store_dir, u64::MAX);
+        let result = server
+            .bro_broadcast(Parameters(
+                serde_json::from_value(json!({
+                    "team":"blocked-panel","prompt":"must not dispatch","cwd":root
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(value["team_persistence"]["status"], "unchanged");
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(
+                row.get("taskId").is_none(),
+                "untracked task has no exact recovery: {row}"
+            );
+            assert!(
+                row["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("task admission refused"),
+                "{row}"
+            );
+        }
+        assert_eq!(std::fs::read(&team_path).unwrap(), team_before);
+        assert_eq!(std::fs::read(&tasks_path).unwrap(), corrupt);
+        assert!(server.state.task_store.read().all_tasks().is_empty());
+        assert!(!server.state.store_dir.join("scratch").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // The single-threaded test owns env through failed spawn admission.
+    async fn broadcast_setup_failure_retains_tracked_task_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut env = isolated_broadcast_env(&root);
+        env.set("BRO_HARNESS_BIN", root.join("absent-harness"));
+        let server = test_server(&tmp);
+        let bf = serde_json::from_value(json!({"name":"synthetic","provider":"brodex"})).unwrap();
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
+        save_when_team(
+            &server,
+            "failed-panel",
+            json!([
+                {"name":"fresh","brofile":"synthetic","task_history":[]},
+                {"name":"resumed","brofile":"synthetic","session_id":"synthetic-existing","task_history":[]}
+            ]),
+        );
+        let result = server
+            .bro_broadcast(Parameters(
+                serde_json::from_value(json!({
+                    "team":"failed-panel","prompt":"setup must fail","cwd":root
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(value["team_persistence"]["status"], "persisted");
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let saved = orchestration::team::load_team_checked("failed-panel", &server.state.store_dir)
+            .unwrap()
+            .unwrap();
+        for row in rows {
+            let id = row["taskId"].as_str().unwrap();
+            let task = server.state.task_store.read().get(id).unwrap();
+            assert_eq!(task.inner.lock().status, orch::TaskStatus::Failed);
+            assert!(
+                task.inner
+                    .lock()
+                    .stderr
+                    .contains("harness child setup failed")
+            );
+            let status = server.bro_status(Parameters(
+                serde_json::from_value(json!({"task_id":id})).unwrap(),
+            ));
+            assert_ne!(status.is_error, Some(true), "{status:?}");
+            let status: Value = serde_json::from_str(&call_result_text(&status)).unwrap();
+            assert_eq!(status["status"], "failed");
+            let member = saved
+                .members
+                .iter()
+                .find(|member| member.name == row["bro"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(member.task_history, [id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_refuses_owner_managed_session_and_history_before_brofile_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut members = Vec::new();
+        for (index, (provider, origin, owned)) in [
+            (Provider::Brodex, bro_core::Origin::AgentDispatch, true),
+            (Provider::Brodex, bro_core::Origin::Workflow, false),
+            (Provider::Brodex, bro_core::Origin::Atom, false),
+            (Provider::Workflow, bro_core::Origin::Unknown, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("protected-{index}");
+            let task = orch::test_task(&id, orch::TaskStatus::Failed, provider);
+            {
+                let mut inner = task.inner.lock();
+                inner.origin = origin;
+                inner.workflow_owned = owned;
+                inner.recoverable = true;
+            }
+            let session = task.inner.lock().session_id.clone();
+            server
+                .state
+                .task_store
+                .write()
+                .insert(id.clone(), task)
+                .unwrap();
+            // Alternate matching the stored session and legacy history whose
+            // recorded session spelling differs from the task's identity.
+            members.push(json!({"name":id,"brofile":"must-not-resolve",
+                "session_id":if index % 2 == 0 { session } else { format!("legacy-{index}") },
+                "task_history":[id]}));
+        }
+        save_when_team(&server, "protected-panel", json!(members));
+        let team_path = server.state.store_dir.join("teams/protected-panel.json");
+        let before = std::fs::read(&team_path).unwrap();
+        let result = server
+            .bro_broadcast(Parameters(
+                serde_json::from_value(json!({
+                    "team":"protected-panel","prompt":"cannot take over"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(value["team_persistence"]["status"], "unchanged");
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert!(
+                row["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("error.owner_managed_session"),
+                "{row}"
+            );
+            assert!(row.get("taskId").is_none());
+        }
+        assert_eq!(std::fs::read(&team_path).unwrap(), before);
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 4);
+        for task in server.state.task_store.read().all_tasks() {
+            assert_eq!(task.inner.lock().status, orch::TaskStatus::Failed);
+            assert!(task.inner.lock().recoverable);
+        }
     }
 
     #[tokio::test]

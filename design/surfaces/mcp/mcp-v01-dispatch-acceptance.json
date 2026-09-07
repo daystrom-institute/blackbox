@@ -1,0 +1,103 @@
+{
+  "base_revision": "b6189fbf",
+  "scope": "V01 broadcast authority, reservation and provider failure branches",
+  "execution_status": "Authored and source-reviewed; awaiting orchestrator lane gates. No cold-worktree builds or tests were run.",
+  "cases": [
+    {
+      "test": "tools::dispatch::tests::broadcast_fresh_and_resume_preserve_authority_and_failed_child_receipts",
+      "branches": [
+        "fresh member with explicit true authority default",
+        "resumed member with explicit false authority default",
+        "fresh member without authority default",
+        "pending session refusal",
+        "missing brofile refusal",
+        "inert child result reports failure"
+      ],
+      "assertions": [
+        "captured harness argv preserves explicit authority exactly and never invents absent authority",
+        "ambient task default matches typed dispatch context task",
+        "persona and resumed session identity cross the child boundary",
+        "all five member outcomes remain in a complete bounded MCP envelope",
+        "three admitted task IDs remain in team history and resolve through bro_status as failed"
+      ],
+      "dependencies": [
+        "Unix /bin/sh fixture only",
+        "local executor",
+        "isolated HOME/XDG/BRO_HOME/config",
+        "no provider implementation or network calls"
+      ]
+    },
+    {
+      "test": "tools::dispatch::tests::broadcast_unavailable_task_store_preserves_team_without_phantom_task_ids",
+      "branches": [
+        "fresh reservation refused by corrupt task snapshot",
+        "resume reservation refused by corrupt task snapshot"
+      ],
+      "assertions": [
+        "no untracked task IDs advertised",
+        "team_persistence is unchanged",
+        "team and corrupt snapshot bytes preserved",
+        "no tasks or scratch dispatch directory created"
+      ],
+      "dependencies": [
+        "isolated environment",
+        "nonexistent harness path provides fail-safe against accidental dispatch"
+      ]
+    },
+    {
+      "test": "tools::dispatch::tests::broadcast_setup_failure_retains_tracked_task_recovery",
+      "branches": [
+        "fresh harness executable unavailable",
+        "resume harness executable unavailable"
+      ],
+      "assertions": [
+        "tracked failed tasks keep task IDs and team history",
+        "exact bro_status can recover both failed tasks",
+        "complete receipt remains bounded"
+      ],
+      "dependencies": [
+        "isolated environment",
+        "missing local harness executable",
+        "no provider calls"
+      ]
+    },
+    {
+      "test": "tools::dispatch::tests::broadcast_refuses_owner_managed_session_and_history_before_brofile_lookup",
+      "branches": [
+        "explicit workflow_owned flag",
+        "Workflow origin",
+        "Atom origin",
+        "Workflow pseudo-provider",
+        "matching stored session ID",
+        "legacy team history with differing session spelling"
+      ],
+      "assertions": [
+        "each member reports owner_managed_session before brofile lookup",
+        "no task IDs advertised",
+        "team bytes and existing failed tasks/recoverable flags preserved"
+      ],
+      "dependencies": [
+        "synthetic in-memory tasks and local team fixture",
+        "no executor or provider access"
+      ]
+    }
+  ],
+  "fixes": [
+    "Broadcast forwards ambient plus explicit brofile tool defaults on fresh and resume spawns.",
+    "Broadcast applies the existing ordinary-resume ownership guard before brofile resolution.",
+    "Broadcast persists history only for tracked tasks; reservation failures remain member errors.",
+    "Spawn reservation refusal drops its store write guard before attempting existing-task readback."
+  ],
+  "restrictions": [
+    "These cases do not establish coverage of every provider or remote fleetd executor.",
+    "Provider HTTP authentication, throttling and transport failure combinations remain outside this milestone.",
+    "Broadcast filter resolution currently returns Ok after composing filters; later filter-error branches are source-reviewed, not claimed executed.",
+    "Concurrent team-history persistence failure has existing domain tests; this milestone does not inject a remote filesystem failure during fanout.",
+    "Allocator/config strict read, transaction and locality tests remain prior checkpoint evidence, not newly executed here."
+  ],
+  "tool_docs_changes_for_parent": [
+    "bro_broadcast: fresh and resumed members preserve explicit brofile tool defaults; no authority opt-out is inferred.",
+    "bro_broadcast: workflow/atom-owned sessions refuse ordinary takeover, including legacy team history identity.",
+    "bro_broadcast: only tracked admissions produce taskId/history; a tracked failed setup remains recoverable through bro_status."
+  ]
+}
