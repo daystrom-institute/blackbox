@@ -33,6 +33,7 @@ import uuid
 MAX_BODY_BYTES = 16 * 1024 * 1024
 SAFE_RESPONSE_HEADERS = {"request-id", "x-request-id", "x-log-id", "content-type"}
 REPORT_NAME = "mcp__blackbox__bro_report"
+RESUME_ERROR = "error.resume_tool_schema_missing"
 
 
 def arguments():
@@ -45,6 +46,8 @@ def arguments():
     parser.add_argument("--cases", choices=("all", "tools", "search"), default="all")
     parser.add_argument("--lost-activation", action="store_true",
                         help="clear activations in this probe's own report session before resume")
+    parser.add_argument("--expect-resume-refusal", action="store_true",
+                        help="expect lost activation to produce a local guard error and zero provider requests")
     parser.add_argument("--report-resumes", type=int, default=3)
     parser.add_argument("--max-requests", type=int, default=40, help="total upstream request limit")
     parser.add_argument("--max-turns", type=int, default=8, help="model turns per harness process")
@@ -61,6 +64,8 @@ def arguments():
             parser.error(f"--{key.replace('_', '-')} must be between 1 and {maximum}")
     if args.lost_activation and args.cases == "search":
         parser.error("--lost-activation requires tools or all cases")
+    if args.expect_resume_refusal and not args.lost_activation:
+        parser.error("--expect-resume-refusal requires --lost-activation")
     args.binary = args.binary.expanduser().resolve(strict=True)
     if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("--binary must be an executable file")
@@ -252,8 +257,11 @@ class Probe:
         fresh = sid is None
         sid = sid or str(uuid.uuid4())
         self.case = label
+        first_request = len(self.requests)
+        expects_refusal = label == "resume-lost-activation" and self.args.expect_resume_refusal
         row = {"case": label, "session_id": sid, "fresh": fresh,
-               "expects_search": search, "expects_report": report}
+               "expects_search": search, "expects_report": report,
+               "expects_local_refusal": expects_refusal}
         self.cases.append(row)
         command = self.base + ["--session-id" if fresh else "--resume", sid, "--prompt", prompt]
         process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
@@ -277,11 +285,18 @@ class Probe:
             if event.get("type") == "result":
                 results.append(event)
         row["harness_results"] = results
+        row["local_refusal_observed"] = any(
+            event.get("is_error") is True and event.get("subtype") == "error"
+            and RESUME_ERROR in event.get("result", "") for event in results)
         # A killed child may leave one in-flight proxy request. Do not attribute it to a new case.
         deadline = time.monotonic() + self.args.request_timeout + 1
         while self.active and time.monotonic() < deadline:
             time.sleep(0.05)
-        if self.active or row.get("exit_code") != 0:
+        expected_refusal_verified = (expects_refusal and row["local_refusal_observed"]
+                                     and len(self.requests) == first_request and not row.get("timeout"))
+        if self.active or (row.get("exit_code") != 0 and not expected_refusal_verified):
+            self.aborted = True
+        if expects_refusal and not expected_refusal_verified:
             self.aborted = True
         snapshot = self.snapshot_path(sid)
         if snapshot.is_file():
@@ -519,9 +534,16 @@ def summarize(root, requests, cases, mcp_calls, aborted):
     for case in cases:
         rows = [r for r in wire if r["case"] == case["case"]]
         native = [c for r in rows for c in r["native_calls"]]
-        reports = [c["params"] for c in mcp_calls if c["case"] == case["case"] and c["success"]]
+        case_mcp_calls = [c for c in mcp_calls if c["case"] == case["case"]]
+        reports = [c["params"] for c in case_mcp_calls if c["success"]]
         result = dict(case, request_count=len(rows), native_call_count=len(native),
                       executed_reports=reports, duplicate_executed_reports=duplicate_calls(reports))
+        if case.get("expects_local_refusal"):
+            result["evaluation_source"] = "local admission result; provider evidence intentionally absent"
+            if rows or case_mcp_calls or case.get("timeout") or not case.get("local_refusal_observed"):
+                failures.append(f"{case['case']}: expected local guard refusal with zero provider requests")
+            results.append(result)
+            continue
         if not rows or case.get("exit_code") != 0:
             unknown.append(f"{case['case']}: process did not complete successfully with wire evidence")
         outcomes = case.get("harness_results", [])
