@@ -22,6 +22,7 @@ use bbox_corpus_core::query::smart_query_to_tantivy;
 #[derive(Debug)]
 struct IndexedTranscriptMessage {
     locator: String,
+    reader_handle: Option<String>,
     session_id: String,
     source: String,
     entity_ref: String,
@@ -55,8 +56,7 @@ enum SearchRecovery {
 }
 
 fn non_blank(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    (!value.trim().is_empty()).then(|| value.to_string())
 }
 
 fn canonical_entity_ref(value: &str) -> Option<String> {
@@ -69,6 +69,18 @@ fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("UTF-8 string serialization cannot fail")
 }
 
+fn display_fragment(value: &str, max_bytes: usize) -> String {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < value.len() {
+        format!("{} [preview; use exact reader]", &value[..end])
+    } else {
+        value.to_owned()
+    }
+}
+
 impl SearchRecovery {
     fn new(
         doc_type: &str,
@@ -77,10 +89,11 @@ impl SearchRecovery {
         session_id: &str,
         raw_byte_offset: Option<u64>,
         message_ts: &str,
+        source: &str,
     ) -> Self {
         let locator = non_blank(locator);
         let session_id = non_blank(session_id);
-        if doc_type == "transcript" {
+        if matches!(doc_type, "transcript" | "tool_call") {
             if locator
                 .as_deref()
                 .is_some_and(|value| value.starts_with("slack:"))
@@ -97,6 +110,13 @@ impl SearchRecovery {
                     locator,
                     byte_offset,
                     session_id,
+                };
+            }
+            if source == "slack" {
+                // Retained conversation rows need a landing-store selector;
+                // a native-looking locator never changes that authority.
+                return Self::Unavailable {
+                    doc_type: "retained conversation".into(),
                 };
             }
             let has_context = locator.is_some() && raw_byte_offset.is_some();
@@ -228,6 +248,27 @@ impl IndexedTranscriptMessage {
         }
         if !self.timestamp.is_empty() {
             row["timestamp"] = Value::String(self.timestamp.clone());
+        }
+        if let Some(handle) = &self.reader_handle {
+            if !super::native_reader::compact_locator(&self.locator) {
+                row["locator"] = Value::String(handle.clone());
+            }
+            row["exact_read"] = serde_json::json!({"tool":"bbox_context", "arguments":{
+                "file_path":handle, "byte_offset":self.byte_offset, "body_limit":4096
+            }});
+            // Identity remains recoverable verbatim; shortened display text
+            // must never masquerade as a usable selector.
+            for key in ["session_id", "entity_ref"] {
+                if row.get(key).is_some_and(|value| {
+                    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() > 256)
+                }) {
+                    row.as_object_mut().unwrap().remove(key);
+                    row[format!("{key}_omitted")] = Value::Bool(true);
+                }
+            }
+            for key in ["source", "role", "timestamp"] {
+                bbox_corpus_core::response_page::preview_field(&mut row, key, 256);
+            }
         }
         row
     }
@@ -1100,6 +1141,7 @@ impl TranscriptIndex {
         // Transcript hints are selected only from the indexed reader coordinates
         // that actually survive the read tools' validation.
         let mut top_recovery: Option<SearchRecovery> = None;
+        let mut rendered_bytes = 0;
         for (score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
@@ -1118,15 +1160,32 @@ impl TranscriptIndex {
                         tantivy::schema::OwnedValue::U64(value) => Some(*value),
                         _ => None,
                     });
+            let reader_handle = self.native_reader_handle(&searcher, *addr, &doc);
+            let file_path = if !super::native_reader::compact_locator(&file_path) {
+                reader_handle.as_deref().unwrap_or(&file_path).to_owned()
+            } else {
+                file_path
+            };
+            let source = self.doc_text(&doc, self.fields.source);
+            let recovery_session = if serde_json::to_vec(&session_id)?.len() <= 1024
+                && (source == "slack"
+                    || crate::transcripts::conversation::parse_session_bucket(&session_id)
+                        .is_none())
+            {
+                session_id.as_str()
+            } else {
+                ""
+            };
             if top_recovery.is_none() {
                 let message_ts = self.doc_text(&doc, self.fields.conversation_message_ts);
                 top_recovery = Some(SearchRecovery::new(
                     &doc_type,
                     &entity_id,
                     &file_path,
-                    &session_id,
+                    recovery_session,
                     byte_offset,
                     &message_ts,
+                    &source,
                 ));
             }
 
@@ -1160,13 +1219,16 @@ impl TranscriptIndex {
                 channel
             };
             if !author.is_empty() {
-                provenance.push_str(&format!("\nAuthor: {author}"));
+                provenance.push_str(&format!("\nAuthor: {}", display_fragment(&author, 256)));
             }
             if !channel.is_empty() {
-                provenance.push_str(&format!("\nChannel: {channel}"));
+                provenance.push_str(&format!("\nChannel: {}", display_fragment(&channel, 256)));
             }
             if !permalink.is_empty() {
-                provenance.push_str(&format!("\nPermalink: {permalink}"));
+                provenance.push_str(&format!(
+                    "\nPermalink: {}",
+                    display_fragment(&permalink, 1024)
+                ));
             }
 
             let identity = if matches!(
@@ -1181,7 +1243,7 @@ impl TranscriptIndex {
                 format!("Entity type: {doc_type}")
             };
 
-            results.push(format!(
+            let mut rendered = format!(
                 "Score: {score:.2} | mode={} | {account} | {role}\n\
                  Session: {session_id}\n\
                  Project: {project}\n\
@@ -1191,8 +1253,36 @@ impl TranscriptIndex {
                 match mode {
                     TranscriptSearchMode::Smart => "smart",
                     TranscriptSearchMode::Fulltext => "fulltext",
-                }
-            ));
+                },
+                account = display_fragment(&account, 128),
+                role = display_fragment(&role, 128),
+                session_id = if session_id.len() <= 256 {
+                    session_id.clone()
+                } else {
+                    "[omitted; use exact reader]".into()
+                },
+                project = display_fragment(&project, 256),
+                ts = display_fragment(&ts, 128),
+                excerpt = display_fragment(&excerpt, 600),
+            );
+            if let (Some(handle), Some(offset)) = (&reader_handle, byte_offset) {
+                rendered.push_str(&format!(
+                    "\nExact read: {}",
+                    serde_json::json!({"tool":"bbox_context","arguments":{
+                        "file_path":handle,"byte_offset":offset,"body_limit":4096
+                    }})
+                ));
+            }
+            let bytes = serde_json::to_vec(&rendered)?.len();
+            if rendered_bytes + bytes > 32_000 {
+                anyhow::ensure!(
+                    !results.is_empty(),
+                    "search hit identity exceeds the response budget"
+                );
+                break;
+            }
+            rendered_bytes += bytes;
+            results.push(rendered);
         }
 
         let mut out = format!(
@@ -1200,6 +1290,9 @@ impl TranscriptIndex {
             results.len(),
             results.join("\n\n---\n\n")
         );
+        if results.len() < top_docs.len() {
+            out.push_str(&format!("\n\nResponse byte limit: showing {} of {} ranked hits; narrow query or filters to inspect remaining hits.\n", results.len(), top_docs.len()));
+        }
         if let Some(recovery) = top_recovery {
             let transcript_hit = matches!(
                 recovery,
@@ -1790,27 +1883,46 @@ impl TranscriptIndex {
         let top_docs = searcher.search(&query, &TopDocs::with_limit(fetch))?;
 
         if top_docs.is_empty() {
-            return Ok(format!("No citations found for: {claim}"));
+            return Ok(format!(
+                "No citations found for: {}",
+                display_fragment(claim, 256)
+            ));
         }
 
         let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
 
-        let mut rows: Vec<(String, String, String, String, String, String, u64, String)> =
-            Vec::new();
+        let mut rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            u64,
+            String,
+            Option<String>,
+        )> = Vec::new();
         for (_score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
-
+            let handle = self.native_reader_handle(&searcher, *addr, &doc);
+            let locator = self.doc_text(&doc, self.fields.file_path);
+            let locator = if super::native_reader::compact_locator(&locator) {
+                locator
+            } else {
+                handle.clone().unwrap_or(locator)
+            };
             rows.push((
                 self.doc_text(&doc, self.fields.timestamp),
                 self.doc_text(&doc, self.fields.account),
                 self.doc_text(&doc, self.fields.project),
                 self.doc_text(&doc, self.fields.session_id),
                 self.doc_text(&doc, self.fields.role),
-                self.doc_text(&doc, self.fields.file_path),
+                locator,
                 first_u64(&doc, self.fields.byte_offset),
                 excerpt,
+                handle,
             ));
         }
 
@@ -1819,11 +1931,27 @@ impl TranscriptIndex {
         rows.truncate(limit);
 
         let mut out = String::new();
-        out.push_str(&format!("{} citation(s) for: {claim}\n\n", rows.len()));
-        for (ts, account, project, sid, r, locator, offset, excerpt) in &rows {
+        out.push_str(&format!(
+            "{} citation(s) for: {}\n\n",
+            rows.len(),
+            display_fragment(claim, 256)
+        ));
+        for (ts, account, project, sid, r, locator, offset, excerpt, handle) in &rows {
             out.push_str(&format!(
-                "[{ts}] {account}/{r} — {project}\n  session: {sid}\n  locator: {locator}\n  byte_offset: {offset}\n  > {excerpt}\n\n"
+                "[{}] {}/{}: {}\n  session: {}\n  locator: {locator}\n  byte_offset: {offset}\n  > {}\n",
+                display_fragment(ts,128), display_fragment(account,128), display_fragment(r,128),
+                display_fragment(project,256), if sid.len() <= 256 { sid.as_str() } else { "[omitted; use exact reader]" },
+                display_fragment(excerpt,600),
             ));
+            if let Some(handle) = handle {
+                out.push_str(&format!(
+                    "  Exact read: {}\n",
+                    serde_json::json!({"tool":"bbox_context","arguments":{
+                        "file_path":handle,"byte_offset":offset,"body_limit":4096
+                    }})
+                ));
+            }
+            out.push('\n');
         }
 
         Ok(out)
@@ -1873,7 +2001,7 @@ impl TranscriptIndex {
                     row
                 })
                 .collect::<Vec<_>>();
-            if serde_json::to_vec(&rows)?.len() <= 40_000 {
+            if serde_json::to_vec(&serde_json::to_string(&rows)?)?.len() <= 40_000 {
                 break rows;
             }
             if end - start == 1 {
@@ -1889,7 +2017,7 @@ impl TranscriptIndex {
         };
         serde_json::to_string(&serde_json::json!({
             "view": "indexed_transcript", "completeness": "indexed_projection_only",
-            "source_freshness": self.native_source_observations(std::iter::once(file_path)), "total_indexed_messages": messages.len(),
+            "source_freshness": self.native_source_observations(messages[start..end].iter().map(|message| message.locator.as_str())), "total_indexed_messages": messages.len(),
             "offset": start, "next_offset": (end < messages.len()).then_some(end),
             "page_limited_by_bytes": rows.len() < requested,
             "messages": rows,
@@ -2026,9 +2154,17 @@ impl TranscriptIndex {
         };
         let mut rows = Vec::new();
         let mut bytes = 0usize;
+        let mut selected_locators = Vec::new();
         for index in candidates {
-            let row = messages[index].response(max_length);
-            let size = serde_json::to_vec(&row)?.len();
+            let mut preview = max_length;
+            let (row, size) = loop {
+                let row = messages[index].response(preview);
+                let size = serde_json::to_vec(&serde_json::to_string(&row)?)?.len();
+                if size <= 40_000 || preview <= 4 {
+                    break (row, size);
+                }
+                preview = (preview / 2).max(4);
+            };
             if bytes.saturating_add(size) > 40_000 {
                 if rows.is_empty() {
                     anyhow::bail!(
@@ -2038,6 +2174,7 @@ impl TranscriptIndex {
                 break;
             }
             bytes += size;
+            selected_locators.push(messages[index].locator.as_str());
             rows.push(row);
         }
         if from_end {
@@ -2047,7 +2184,7 @@ impl TranscriptIndex {
         let consumed = offset.saturating_add(returned);
         serde_json::to_string(&serde_json::json!({
             "view": "indexed_transcript", "completeness": "indexed_projection_only",
-            "source_freshness": self.native_source_observations(rows.iter().filter_map(|row| row["locator"].as_str())), "total_matching_messages": total,
+            "source_freshness": self.native_source_observations(selected_locators.into_iter()), "total_matching_messages": total,
             "offset": offset, "from_end": from_end,
             "next_offset": (consumed < total).then_some(consumed),
             "page_limited_by_bytes": returned < end - start,
@@ -2075,7 +2212,13 @@ impl TranscriptIndex {
             .map(bbox_transcript_source_store::TranscriptSourceStore::for_read);
         let mut sources = std::collections::BTreeMap::new();
         let observations = native.iter().take(8).map(|locator| {
-            let mut row = serde_json::json!({"locator": locator, "status": "source_status_unavailable"});
+            let mut row = serde_json::json!({"status": "source_status_unavailable"});
+            if super::native_reader::compact_locator(locator) {
+                row["locator"] = Value::String((*locator).to_string());
+            } else {
+                use sha2::Digest;
+                row["locator_digest"] = Value::String(format!("{:x}", sha2::Sha256::digest(locator.as_bytes())));
+            }
             let parts = locator.trim_start_matches("native:").split('/').collect::<Vec<_>>();
             if parts.len() != 3 || bbox_transcript_source::validate_hash(parts[1]).is_err()
                 || bbox_transcript_source::validate_hash(parts[2]).is_err() {
@@ -2134,6 +2277,15 @@ impl TranscriptIndex {
                 "error.bad_input: provide exactly one of file_path (stored locator) or session_id"
             );
         }
+        let searcher = self.reader.searcher();
+        let anchor = locator
+            .filter(|value| value.starts_with(super::native_reader::PREFIX))
+            .map(|handle| self.resolve_native_reader(&searcher, handle))
+            .transpose()?;
+        let actual_locator = anchor
+            .as_ref()
+            .map(|doc| self.doc_text(doc, self.fields.file_path));
+        let locator = actual_locator.as_deref().or(locator);
         let selected = locator.or(session).unwrap_or_default();
         if selected.trim().is_empty() {
             anyhow::bail!("error.bad_input: transcript selector must not be blank");
@@ -2157,6 +2309,26 @@ impl TranscriptIndex {
                 IndexRecordOption::Basic,
             )),
         ));
+        if let Some(anchor) = &anchor {
+            // A compact handle selects one native source/session, even when
+            // multiple providers used the same legacy locator spelling.
+            for field in [
+                self.fields.session_id,
+                self.fields.source,
+                self.fields.account,
+            ] {
+                let value = self.doc_text(anchor, field);
+                if !value.is_empty() {
+                    clauses.push((
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, &value),
+                            IndexRecordOption::Basic,
+                        )),
+                    ));
+                }
+            }
+        }
         if let Some(role) = role {
             if role.parse::<bro_transcript::MessageRole>().is_err() {
                 anyhow::bail!("error.bad_input: unknown transcript role {role}");
@@ -2178,15 +2350,38 @@ impl TranscriptIndex {
                 )),
             ));
         }
-        let searcher = self.reader.searcher();
         // byte_offset is STORED-only. A ranked cap would silently lose later
         // source events, so collect the exact selected document set before sorting.
         let addresses = searcher.search(&BooleanQuery::new(clauses), &DocSetCollector)?;
         let mut messages = Vec::with_capacity(addresses.len());
         for address in addresses {
             let doc: TantivyDocument = searcher.doc(address)?;
+            if self
+                .doc_text(&doc, self.fields.file_path)
+                .starts_with("slack:")
+                || self.doc_text(&doc, self.fields.source) == "slack"
+                || self.doc_text(&doc, self.fields.account) == "slack"
+            {
+                continue;
+            }
+            if let Some(anchor) = &anchor {
+                if [
+                    self.fields.session_id,
+                    self.fields.source,
+                    self.fields.account,
+                ]
+                .iter()
+                .any(|field| self.doc_text(anchor, *field) != self.doc_text(&doc, *field))
+                    || self
+                        .native_reader_handle(&searcher, address, &doc)
+                        .is_none()
+                {
+                    continue;
+                }
+            }
             messages.push(IndexedTranscriptMessage {
                 locator: self.doc_text(&doc, self.fields.file_path),
+                reader_handle: self.native_reader_handle(&searcher, address, &doc),
                 session_id: self.doc_text(&doc, self.fields.session_id),
                 source: self.doc_text(&doc, self.fields.source),
                 entity_ref: self.doc_text(&doc, self.fields.entity_id),

@@ -21,6 +21,19 @@ struct CorpusSearchParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ContextToolParams {
+    #[serde(flatten)]
+    pub selection: ContextParams,
+    /// Exact stored native record page. Requires an indexed-transcript handle
+    /// from an exact_read hint; omit context_lines. Maximum 4096 bytes.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
+    /// Continue body.next_cursor with the same handle and event offset.
+    #[serde(default)]
+    pub body_cursor: Option<String>,
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
 }
@@ -243,9 +256,25 @@ impl BlackboxServer {
     )]
     pub(crate) async fn bbox_context(
         &self,
-        Parameters(p): Parameters<ContextParams>,
+        Parameters(p): Parameters<ContextToolParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_context", move || server.state.idx.read().context(&p)).await
+        Self::run_blocking("bbox_context", move || {
+            if p.body_limit.is_some() || p.body_cursor.is_some() {
+                anyhow::ensure!(
+                    p.selection.context_lines.is_none(),
+                    "exact record pages do not accept context_lines"
+                );
+                server.state.idx.read().native_reader_detail(
+                    &p.selection.file_path,
+                    p.selection.byte_offset,
+                    p.body_cursor.as_deref(),
+                    p.body_limit,
+                )
+            } else {
+                server.state.idx.read().context(&p.selection)
+            }
+        })
+        .await
     }
 }
