@@ -21,12 +21,14 @@ pub struct AgentSchemaEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct DescribeSchemaOptions {
     pub include_agents: bool,
+    pub compact: bool,
 }
 
 impl Default for DescribeSchemaOptions {
     fn default() -> Self {
         Self {
             include_agents: true,
+            compact: false,
         }
     }
 }
@@ -49,14 +51,20 @@ pub fn describe_schema_with_options(
         .map(|provider| {
             let schema = provider.schema();
             let key = schema.entity_type.as_str().to_string();
-            json!({
+            let mut row = json!({
                 "entity_type": key,
                 "virtual": schema.entity_type.is_virtual(),
                 "population_count": counts.get(schema.entity_type.as_str()).copied().unwrap_or_default(),
                 "key_fields": schema.properties,
                 "filterable_fields": schema.filterable_fields,
                 "edge_participation": schema.edge_families,
-            })
+            });
+            if options.compact {
+                for field in ["key_fields", "filterable_fields", "edge_participation"] {
+                    row.as_object_mut().unwrap().remove(field);
+                }
+            }
+            row
         })
         .collect::<Vec<_>>();
     let edge_families = edge_families();
@@ -65,6 +73,11 @@ pub fn describe_schema_with_options(
         "vertex_types": vertex_types,
         "edge_families": edge_families,
     });
+    if options.compact {
+        response["schema_hint"] = json!(
+            "mode=full expands entity properties and filters; include_agents=false omits the installed-agent catalog"
+        );
+    }
     if options.include_agents {
         if !agents.is_empty() {
             response["agents"] = json!(agents);
@@ -74,7 +87,7 @@ pub fn describe_schema_with_options(
         response["agents_hint"] =
             json!("Pass include_agents=true or mode=full for installed agents.");
     }
-    Ok(serde_json::to_string_pretty(&response)?)
+    Ok(serde_json::to_string(&response)?)
 }
 
 fn edge_families() -> Vec<serde_json::Value> {
@@ -173,6 +186,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_orientation_preserves_vocabulary_and_population_counts() {
+        let counts = BTreeMap::from([("knowledge".to_owned(), 42)]);
+        let full: serde_json::Value = serde_json::from_str(
+            &describe_schema_with_options(
+                &counts,
+                &[],
+                DescribeSchemaOptions {
+                    include_agents: false,
+                    compact: false,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let compact: serde_json::Value = serde_json::from_str(
+            &describe_schema_with_options(
+                &counts,
+                &[],
+                DescribeSchemaOptions {
+                    include_agents: false,
+                    compact: true,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(compact["edge_families"], full["edge_families"]);
+        for (small, large) in compact["vertex_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(full["vertex_types"].as_array().unwrap())
+        {
+            for field in ["entity_type", "virtual", "population_count"] {
+                assert_eq!(small[field], large[field]);
+            }
+            assert!(small.get("key_fields").is_none());
+        }
+        assert!(compact.to_string().len() < full.to_string().len());
+    }
+
+    #[test]
     fn schema_lists_all_d1_entity_types() {
         let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -266,6 +321,7 @@ mod tests {
                 &[],
                 DescribeSchemaOptions {
                     include_agents: false,
+                    compact: false,
                 },
             )
             .unwrap(),

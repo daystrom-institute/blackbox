@@ -921,6 +921,11 @@ pub(crate) struct DescribeSchemaParams {
     /// Convenience mode. `full` includes installed agents; `orientation` keeps
     /// the compact default. `agents` is a deprecated alias for `full`.
     pub mode: Option<String>,
+    /// Exact schema body pages, including any requested agent catalog. Changed
+    /// population or catalog evidence refuses continuation.
+    pub cursor: Option<String>,
+    /// Exact body bytes, clamped to 4..=4096. Oversized replies also start a body page.
+    pub body_limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1018,6 +1023,12 @@ pub(crate) struct ProjectGraphValidateParams {
     /// Error stamp from a previous page. A changed error set refuses the
     /// continuation; restart at error_offset 0.
     pub expected_error_stamp: Option<String>,
+    /// Variant summary page size (1..=100, default 20).
+    pub variant_limit: Option<usize>,
+    /// Variant continuation offset; nonzero requires expected_view_stamp.
+    pub variant_offset: Option<usize>,
+    /// Stamp from the previous variant page; changed evidence refuses continuation.
+    pub expected_view_stamp: Option<String>,
 }
 
 impl DescribeSchemaParams {
@@ -1327,14 +1338,31 @@ impl BlackboxServer {
                             bail!("error.graph_errors_changed: validation errors changed since the previous page; restart at error_offset=0 without expected_error_stamp");
                         }
                     }
-                    Ok(serde_json::to_string_pretty(&json!({
-                        "status": "ok",
-                        "detail": "summary",
-                        "graphs": graphs,
-                        "detail_hint": "Exact errors: bbox_project_graph_validate(project,graph_id,detail=\"errors\"); continue with cursor=body.next_cursor. Select one variant with source, checkout_id, and expected_content_hash when several are visible.",
-                    }))?)
+                    let scope = json!([p.project, p.graph_id, p.provisional, p.source,
+                        p.checkout_id, p.expected_content_hash, error_offset, error_limit]);
+                    let stamp = format!("{:x}", Sha256::digest(serde_json::to_vec(
+                        &json!([scope, graphs]))?));
+                    let offset = p.variant_offset.unwrap_or(0);
+                    if offset > 0 && p.expected_view_stamp.is_none() {
+                        bail!("error.graph_view_stamp_required: continue with expected_view_stamp from the previous response");
+                    }
+                    if p.expected_view_stamp.as_deref().is_some_and(|v| v != stamp) {
+                        bail!("error.graph_view_changed: validation variants changed; restart at variant_offset=0 without expected_view_stamp");
+                    }
+                    let rows = graphs.into_iter().map(serde_json::to_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let mut page = bbox_corpus_core::response_page::collection_page(
+                        rows, "graphs", p.variant_limit, Some(offset))?;
+                    page["status"] = json!("ok");
+                    page["detail"] = json!("summary");
+                    page["view_stamp"] = json!(stamp);
+                    page["detail_hint"] = json!("Continue variants with variant_offset=next_offset and expected_view_stamp=view_stamp. Exact errors: detail=errors with one variant selected by source, checkout_id and expected_content_hash.");
+                    Ok(page.to_string())
                 }
                 crate::project_graph_read::GraphValidateDetail::Errors => {
+                    if p.variant_limit.is_some() || p.variant_offset.is_some() || p.expected_view_stamp.is_some() {
+                        bail!("error.bad_input: variant paging applies only to detail=summary");
+                    }
                     if p.error_offset.is_some() {
                         bail!("error.bad_input: error_offset applies only to detail=summary");
                     }
@@ -1380,7 +1408,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents."
+        description = "Orient to entity types and edge families. mode=full expands fields and agents; include_agents=false omits agents. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages."
     )]
     pub(crate) fn bbox_describe_schema(
         &self,
@@ -1392,11 +1420,22 @@ impl BlackboxServer {
             let agents = include_agents
                 .then(|| self.build_agent_schema_entries())
                 .unwrap_or_default();
-            mcp_tools::describe_schema::describe_schema_with_options(
+            let rendered = mcp_tools::describe_schema::describe_schema_with_options(
                 &self.describe_schema_counts_from_view(&read_view),
                 &agents,
-                DescribeSchemaOptions { include_agents },
-            )
+                DescribeSchemaOptions {
+                    include_agents,
+                    compact: !include_agents && p.mode.as_deref() != Some("full"),
+                },
+            )?;
+            let scope = json!(["schema", include_agents, p.mode]).to_string();
+            let page = bbox_corpus_core::response_page::bounded_json_response(
+                &scope,
+                serde_json::from_str(&rendered)?,
+                p.cursor.as_deref(),
+                p.body_limit,
+            )?;
+            Ok(page.to_string())
         })
     }
 
@@ -1429,7 +1468,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_bundle_evidence",
-        description = "Bundle entity refs and cached path IDs with provenance and current evidence freshness. Default summary bodies are 600 characters; full and none are explicit. Exact property pages are available through bbox_inspect_entity. Stale paths are explicit."
+        description = "Bundle entity refs and cached paths with provenance and freshness. Properties default to summary; full/none are explicit. body_limit/cursor recovers exact bundle JSON, and oversized replies automatically start body pages."
     )]
     pub(crate) async fn bbox_bundle_evidence(
         &self,
@@ -1452,7 +1491,23 @@ impl BlackboxServer {
                 edge_index,
                 &mut server.state.path_cache.write(),
             )?;
-            knowledge_view.enrich_json_response(output)
+            let (_, enriched) = knowledge_view.enrich_json_response(output)?;
+            let scope = json!([
+                "bundle",
+                p.question,
+                p.entity_refs,
+                p.path_ids,
+                p.provisional,
+                p.property_mode
+            ])
+            .to_string();
+            let bounded = bbox_corpus_core::response_page::bounded_json_response(
+                &scope,
+                enriched,
+                p.cursor.as_deref(),
+                p.body_limit,
+            )?;
+            Ok((bounded.to_string(), bounded))
         })
         .await
     }
@@ -1567,14 +1622,18 @@ impl BlackboxServer {
             let apply = p.apply.unwrap_or(false);
             let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
             let edge_index_rebuilt = apply && p.rebuild.unwrap_or(false);
+            let mut receipt = json!({"status":"ok", "stats":stats,
+                "compaction_completed":true, "edge_index_rebuilt":false});
             if edge_index_rebuilt {
-                crate::server::rebuild_edge_index_from_shared(&server.state, false)?;
+                match crate::server::rebuild_edge_index_from_shared(&server.state, false) {
+                    Ok(()) => receipt["edge_index_rebuilt"] = json!(true),
+                    Err(_) => {
+                        receipt["status"] = json!("partial");
+                        receipt["error"] = json!("Compaction completed, but the in-memory edge index rebuild failed. Retry apply=true,rebuild=true to rebuild from the compacted sidecar.");
+                    }
+                }
             }
-            Ok(serde_json::to_string_pretty(&json!({
-                "status": "ok",
-                "stats": stats,
-                "edge_index_rebuilt": edge_index_rebuilt,
-            }))?)
+            Ok(receipt.to_string())
         })
         .await
     }
@@ -1929,12 +1988,100 @@ impl BlackboxServer {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn compaction_receipt_survives_later_rebuild_failure() {
+        let mut env = crate::util::TestEnvGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let edges_dir = crate::server::edge_sidecar_dir(&server.state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        let original = "{\"provenance\":\"derived\"}\nmalformed-but-preserved\n";
+        std::fs::write(edges_dir.join("synthetic.jsonl"), original).unwrap();
+        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
+        let result = server
+            .bbox_edge_compact(Parameters(EdgeCompactParams {
+                project_id: "synthetic".into(),
+                apply: Some(true),
+                rebuild: Some(true),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["edge_index_rebuilt"], false);
+        assert_eq!(value["stats"]["applied"], true);
+        assert_eq!(
+            std::fs::read_to_string(edges_dir.join("synthetic.jsonl")).unwrap(),
+            "malformed-but-preserved\n"
+        );
+        let backup = PathBuf::from(value["stats"]["backup_path"].as_str().unwrap());
+        assert!(backup.starts_with(&root));
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn validation_variant_pages_reconstruct_and_refuse_changed_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project = install_published_entries(&server, &root, |project| {
+            vec![graph_entry(synthetic_graph(
+                project,
+                "shared",
+                "vary",
+                "vary:Node",
+                "one",
+            ))]
+        });
+        for id in 0..25 {
+            install_overlay(
+                &server,
+                &project,
+                &format!("{id:032x}"),
+                synthetic_graph(&project, "shared", "vary", "vary:Node", "one"),
+            );
+        }
+        let args = json!({"project":project,"graph_id":"shared","provisional":"all"});
+        let first = server
+            .bbox_project_graph_validate(Parameters(serde_json::from_value(args.clone()).unwrap()))
+            .await;
+        let first: serde_json::Value = serde_json::from_str(&extract_text(&first)).unwrap();
+        assert_eq!(first["total"], 26);
+        assert_eq!(first["count"], 20);
+        let mut next = args.clone();
+        next["variant_offset"] = first["next_offset"].clone();
+        let unstamped = server
+            .bbox_project_graph_validate(Parameters(serde_json::from_value(next.clone()).unwrap()))
+            .await;
+        assert_eq!(unstamped.is_error, Some(true));
+        next["expected_view_stamp"] = first["view_stamp"].clone();
+        let second = server
+            .bbox_project_graph_validate(Parameters(serde_json::from_value(next.clone()).unwrap()))
+            .await;
+        let second: serde_json::Value = serde_json::from_str(&extract_text(&second)).unwrap();
+        assert_eq!(second["count"], 6);
+        assert!(second["next_offset"].is_null());
+        assert_eq!(first["view_stamp"], second["view_stamp"]);
+        install_overlay(
+            &server,
+            &project,
+            &format!("{:032x}", 26),
+            synthetic_graph(&project, "shared", "vary", "vary:Node", "two"),
+        );
+        let stale = server
+            .bbox_project_graph_validate(Parameters(serde_json::from_value(next).unwrap()))
+            .await;
+        assert!(extract_text(&stale).contains("error.graph_view_changed"));
+    }
+
     #[test]
     fn schema_mode_rejects_unknown_values_even_with_explicit_agent_flag() {
         for include_agents in [None, Some(true), Some(false)] {
             let params = DescribeSchemaParams {
                 mode: Some("ful".into()),
                 include_agents,
+                ..Default::default()
             };
             assert!(params.include_agents_resolved().is_err());
         }
@@ -1947,6 +2094,7 @@ mod tests {
             DescribeSchemaParams {
                 mode: Some("full".into()),
                 include_agents: None,
+                ..Default::default()
             }
             .include_agents_resolved()
             .unwrap()
@@ -3032,6 +3180,9 @@ mod tests {
                     error_offset: None,
                     error_limit: None,
                     expected_error_stamp: None,
+                    variant_limit: None,
+                    variant_offset: None,
+                    expected_view_stamp: None,
                 }))
                 .await;
             let text = extract_text(&result);
@@ -3993,6 +4144,9 @@ mod tests {
                         error_offset,
                         error_limit: None,
                         expected_error_stamp,
+                        variant_limit: None,
+                        variant_offset: None,
+                        expected_view_stamp: None,
                     }))
                     .await
             }
@@ -4266,6 +4420,8 @@ mod tests {
                 path_ids: Vec::new(),
                 provisional: Some("published".into()),
                 property_mode: Some("summary".into()),
+                cursor: None,
+                body_limit: None,
             }))
             .await;
         let text = extract_text(&bundled);
@@ -4358,6 +4514,9 @@ mod tests {
                 error_offset: None,
                 error_limit: None,
                 expected_error_stamp: None,
+                variant_limit: None,
+                variant_offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         assert!(extract_text(&validated).contains("\"valid\": true"));
@@ -4585,6 +4744,9 @@ mod tests {
                 error_offset: None,
                 error_limit: None,
                 expected_error_stamp: None,
+                variant_limit: None,
+                variant_offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         let own_text = extract_text(&own);
@@ -4609,6 +4771,9 @@ mod tests {
                 error_offset: None,
                 error_limit: None,
                 expected_error_stamp: None,
+                variant_limit: None,
+                variant_offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         assert!(extract_text(&published).contains("\"valid\": true"));
@@ -5394,6 +5559,7 @@ mod tests {
         let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams {
             include_agents: Some(true),
             mode: None,
+            ..Default::default()
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();

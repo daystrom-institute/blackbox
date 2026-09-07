@@ -90,7 +90,36 @@ fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> ser
     if let Some(replacement) = &meta.superseded_by {
         response["superseded_by"] = serde_json::json!(replacement);
     }
+    compact_artifact_fields(&mut response);
     response
+}
+
+fn artifact_metadata_view(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
+    serde_json::json!({
+        "kind": meta.kind, "name": meta.name, "version": meta.version,
+        "active": meta.active, "installed_at": meta.installed_at,
+        "content_sha256": meta.content_sha256, "project_id": meta.project_id,
+        "local": meta.local, "supersedes": meta.supersedes,
+        "supersedes_chain": meta.supersedes_chain, "superseded_by": meta.superseded_by,
+        "install_warnings": meta.install_warnings,
+    })
+}
+
+fn compact_artifact_fields(row: &mut serde_json::Value) {
+    let mut omitted = Vec::new();
+    for (key, value) in row.as_object_mut().expect("artifact object") {
+        let bytes = value.to_string().len();
+        if bytes > 1024 {
+            omitted.push(key.clone());
+            *value = serde_json::json!({"detail_bytes": bytes});
+        }
+    }
+    if !omitted.is_empty() {
+        row["omitted_fields"] = serde_json::json!(omitted);
+        row["exact_reader"] = serde_json::json!(
+            "bbox_artifact_list with the same filters and body_limit=4096 recovers the inventory; metadata=true with kind/name/version recovers installation metadata"
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -106,12 +135,29 @@ pub(crate) struct ArtifactCatalogListParams {
     /// Include installation time and supersession history. Storage paths are never returned.
     #[serde(default)]
     pub detail: bool,
+    /// Read one complete redacted installation record. Requires kind and name;
+    /// version selects a historical record, otherwise the current receipt.
+    #[serde(default)]
+    pub metadata: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Exact redacted inventory or metadata pages (4..=4096 bytes). Omit
+    /// limit/offset. Source URLs and daemon paths are never returned.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
+    /// Continue body.next_cursor with the same selectors; changed content refuses.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 fn artifact_list_page(
     mut rows: Vec<crate::artifacts::ArtifactListEntry>,
     p: &ArtifactCatalogListParams,
 ) -> anyhow::Result<serde_json::Value> {
+    let exact = p.cursor.is_some() || p.body_limit.is_some();
+    if exact && (p.limit.is_some() || p.offset.is_some()) {
+        anyhow::bail!("exact inventory uses cursor/body_limit; omit limit and offset");
+    }
     let retired = |kind| {
         matches!(
             kind,
@@ -132,25 +178,40 @@ fn artifact_list_page(
     let total = rows.len();
     let offset = p.offset.unwrap_or(0);
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
-    let artifacts: Vec<_> = rows.into_iter().skip(offset).take(limit).map(|entry| {
+    let artifacts: Vec<_> = rows.into_iter().skip(if exact {0} else {offset}).take(if exact {usize::MAX} else {limit}).map(|entry| {
         let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active && !retired(entry.kind)});
         if retired(entry.kind) { row["retired"] = serde_json::json!(true); }
         if let Some(description) = entry.description {
-            let preview: String = if p.detail { description.clone() } else { description.chars().take(200).collect() };
+            let preview: String = if exact || p.detail { description.clone() } else { description.chars().take(200).collect() };
             if preview.len() < description.len() { row["description_truncated"] = serde_json::json!(true); }
             row["description"] = serde_json::json!(preview);
         }
         if let Some(replacement) = entry.superseded_by { row["superseded_by"] = serde_json::json!(replacement); }
-        if p.detail {
+        if exact || p.detail {
             row["installed_at"] = serde_json::json!(entry.installed_at);
             row["supersedes_chain"] = serde_json::json!(entry.supersedes_chain);
         }
+        if !exact { compact_artifact_fields(&mut row); }
         row
     }).collect();
+    if exact {
+        let scope =
+            serde_json::json!([p.filters.kind, p.filters.name, p.filters.include_superseded])
+                .to_string();
+        let body = bbox_corpus_core::response_page::json_body_page(
+            &format!("artifact-inventory:{scope}"),
+            &serde_json::json!({"artifacts": artifacts}),
+            p.cursor.as_deref(),
+            p.body_limit,
+        )?;
+        return Ok(serde_json::json!({"body": body}));
+    }
     let next_offset = offset.saturating_add(artifacts.len());
     bbox_corpus_core::response_page::bound_page(
         serde_json::json!({"artifacts": artifacts, "total": total, "limit": limit, "offset": offset,
             "next_offset": (next_offset < total).then_some(next_offset),
+            "pagination": "live_offset: installs and supersession can move rows; restart at offset 0 after changes",
+            "exact_reader": "Same filters with body_limit=4096 and no limit/offset recover the complete redacted inventory",
         }),
         "artifacts",
     )
@@ -205,13 +266,49 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed artifact summaries (default 20, maximum 100); continue with next_offset. Retired kinds are omitted unless explicitly selected with kind. Historical receipts are marked retired and inactive. detail=true adds installation and supersession metadata."
+        description = "List installed artifact summaries with live next_offset pages. body_limit/cursor recovers the complete redacted inventory; metadata=true with kind/name and optional version reads an exact installation receipt. Retired kinds require an explicit kind filter."
     )]
     pub(crate) fn bbox_artifact_list(
         &self,
         Parameters(p): Parameters<ArtifactCatalogListParams>,
     ) -> CallToolResult {
         Self::run("bbox_artifact_list", || {
+            if p.metadata {
+                if p.limit.is_some()
+                    || p.offset.is_some()
+                    || p.detail
+                    || p.filters.include_superseded
+                {
+                    anyhow::bail!(
+                        "metadata reads accept kind/name/version and body_limit/cursor, not list/detail selectors"
+                    );
+                }
+                let kind = p
+                    .filters
+                    .kind
+                    .ok_or_else(|| anyhow::anyhow!("metadata requires kind"))?;
+                let name = p
+                    .filters
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("metadata requires name"))?;
+                let store = self.state.artifacts.read();
+                let meta = match p.version.as_deref() {
+                    Some(version) => store.metadata_for_version(kind, name, version)?,
+                    None => store.metadata_for(kind, name)?,
+                }
+                .ok_or_else(|| anyhow::anyhow!("artifact metadata not found"))?;
+                let body = bbox_corpus_core::response_page::json_body_page(
+                    &serde_json::json!(["artifact-metadata", kind, name, p.version]).to_string(),
+                    &artifact_metadata_view(&meta),
+                    p.cursor.as_deref(),
+                    p.body_limit,
+                )?;
+                return Ok(serde_json::json!({"body": body}).to_string());
+            }
+            if p.version.is_some() {
+                anyhow::bail!("version requires metadata=true");
+            }
             let rows = self.state.artifacts.read().list(&p.filters)?;
             Ok(serde_json::to_string(&artifact_list_page(rows, &p)?)?)
         })
@@ -236,8 +333,21 @@ impl BlackboxServer {
                     .artifacts
                     .write()
                     .supersede(p.kind, &p.name, &p.superseded_by)?;
-            deactivate_artifact(&server.state, kind, &name)?;
-            Ok(serde_json::to_string_pretty(&meta)?)
+            let mut response = installed_artifact_response(&meta);
+            response["catalog_updated"] = serde_json::json!(true);
+            match deactivate_artifact(&server.state, kind, &name) {
+                Ok(()) => {
+                    response["runtime_deactivated"] = serde_json::json!(true);
+                }
+                Err(_) => {
+                    response["status"] = serde_json::json!("partial");
+                    response["runtime_deactivated"] = serde_json::json!(false);
+                    response["error"] = serde_json::json!(
+                        "artifact catalog was updated but runtime deactivation failed"
+                    );
+                }
+            }
+            Ok(response.to_string())
         })
         .await
     }
@@ -285,6 +395,82 @@ mod tests {
     use crate::server::state::SharedState;
     use serde_json::{Value, json};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn artifact_supersede_and_metadata_withhold_source_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
+        let source = "https://synthetic-user:synthetic-password@example.test/private-artifact?token=synthetic-query";
+        let installed = server
+            .state
+            .artifacts
+            .write()
+            .install_value(
+                artifacts::ArtifactKind::Brofile,
+                source.into(),
+                &json!({"name":"safe-artifact","version":1,"provider":"glm"}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(installed.source, source);
+        assert!(
+            !installed_artifact_response(&installed)
+                .to_string()
+                .contains("synthetic-password")
+        );
+        let result = server
+            .bbox_artifact_supersede(Parameters(
+                serde_json::from_value(json!({
+                    "kind":"brofile","name":"safe-artifact","superseded_by":"replacement"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let encoded = serde_json::to_string(&result).unwrap();
+        for secret in [
+            "synthetic-user",
+            "synthetic-password",
+            "synthetic-query",
+            "private-artifact",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let mut args =
+            json!({"kind":"brofile","name":"safe-artifact","metadata":true,"body_limit":128});
+        let mut recovered = String::new();
+        loop {
+            let result = server
+                .bbox_artifact_list(Parameters(serde_json::from_value(args.clone()).unwrap()))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let encoded = serde_json::to_string(&result).unwrap();
+            assert!(encoded.len() < 65536);
+            for secret in [
+                source,
+                "synthetic-password",
+                "synthetic-query",
+                root.to_str().unwrap(),
+            ] {
+                assert!(!encoded.contains(secret));
+            }
+            let page: Value =
+                serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            match page["body"]["next_cursor"].as_str() {
+                Some(next) => args["cursor"] = json!(next),
+                None => break,
+            }
+        }
+        let metadata: Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(metadata["superseded_by"], "replacement");
+        assert_eq!(metadata["active"], false);
+        assert!(metadata.get("source").is_none());
+        assert!(metadata.get("project_path").is_none());
+    }
 
     #[tokio::test]
     async fn retired_artifact_kinds_cannot_activate_but_receipts_stay_readable() {
@@ -366,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_expanded_nested_row_refuses_without_losing_continuation() {
+    fn artifact_expanded_nested_row_has_exact_inventory_recovery() {
         let entry = artifacts::ArtifactListEntry {
             kind: artifacts::ArtifactKind::Agent,
             name: "large-history".into(),
@@ -380,11 +566,32 @@ mod tests {
             description: Some("界".repeat(1000)),
         };
         let p: ArtifactCatalogListParams = serde_json::from_value(json!({"detail": true})).unwrap();
+        let detail = artifact_list_page(vec![entry.clone()], &p).unwrap();
         assert!(
-            artifact_list_page(vec![entry.clone()], &p)
-                .unwrap_err()
-                .to_string()
-                .contains("collection_row_too_large")
+            detail["artifacts"][0]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("supersedes_chain"))
+        );
+        let mut p: ArtifactCatalogListParams =
+            serde_json::from_value(json!({"body_limit":4096})).unwrap();
+        let mut recovered = String::new();
+        loop {
+            let page = artifact_list_page(vec![entry.clone()], &p).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            p.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if p.cursor.is_none() {
+                break;
+            }
+        }
+        let recovered: Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(
+            recovered["artifacts"][0]["supersedes_chain"],
+            json!(entry.supersedes_chain)
+        );
+        assert_eq!(
+            recovered["artifacts"][0]["description"],
+            json!(entry.description)
         );
         let p: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
         let summary = artifact_list_page(vec![entry], &p).unwrap();

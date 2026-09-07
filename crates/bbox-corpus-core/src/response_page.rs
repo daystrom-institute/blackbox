@@ -135,9 +135,71 @@ pub fn json_body_page(
     }
 }
 
+/// Keep ordinary JSON replies intact when their complete mirrored MCP envelope
+/// fits. Explicit detail and oversized replies recover the same value through
+/// content-bound pages, including metadata that cannot safely be shortened.
+pub fn bounded_json_response(
+    scope: &str,
+    value: Value,
+    cursor: Option<&str>,
+    body_limit: Option<usize>,
+) -> Result<Value> {
+    let text = serde_json::to_string(&value)?;
+    let envelope = json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": &value,
+        "isError": false,
+    });
+    if cursor.is_none()
+        && body_limit.is_none()
+        && serde_json::to_vec(&envelope)?.len() <= PAGE_BUDGET_BYTES
+    {
+        return Ok(value);
+    }
+    let body = json_body_page(scope, &value, cursor, body_limit)?;
+    let mut page = json!({
+        "detail_limited": true,
+        "body": body,
+        "continuation": "Repeat the same selectors with cursor=body.next_cursor. Concatenate body.text as JSON; changed evidence or selectors refuse continuation.",
+    });
+    if let Some(status) = value.get("status").and_then(Value::as_str)
+        && status.len() <= 64
+    {
+        page["status"] = json!(status);
+    }
+    Ok(page)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_envelope_pages_recover_unicode_and_reject_changed_selection() {
+        let small = json!({"status":"ok","items":[1,2]});
+        assert_eq!(
+            bounded_json_response("small", small.clone(), None, None).unwrap(),
+            small
+        );
+        let value = json!({"status":"ok","nested":{"text":"界\n\"".repeat(8000)}});
+        let mut cursor = None;
+        let mut recovered = String::new();
+        loop {
+            let page =
+                bounded_json_response("selection", value.clone(), cursor.as_deref(), None).unwrap();
+            let envelope = json!({"content":[{"type":"text","text":page.to_string()}],"structuredContent":page});
+            assert!(serde_json::to_vec(&envelope).unwrap().len() <= PAGE_BUDGET_BYTES);
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            let Some(ref next) = cursor else { break };
+            assert!(bounded_json_response("other", value.clone(), Some(next), None).is_err());
+            assert!(
+                bounded_json_response("selection", json!({"changed":true}), Some(next), None)
+                    .is_err()
+            );
+        }
+        assert_eq!(serde_json::from_str::<Value>(&recovered).unwrap(), value);
+    }
 
     #[test]
     fn page_budget_counts_escaped_unicode_and_nested_detail_without_skipping() {

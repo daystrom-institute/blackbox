@@ -31,6 +31,13 @@ pub struct BundleEvidenceParams {
     /// bbox_inspect_entity(entity_ref=..., property=<key>) and its body cursor.
     #[serde(default)]
     pub property_mode: Option<String>,
+    /// Exact complete bundle pages. Oversized default replies also start this
+    /// reader. Repeat all selectors and property_mode; changed evidence refuses.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Exact body bytes, clamped to 4..=4096; use body.next_cursor to continue.
+    #[serde(default)]
+    pub body_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -444,6 +451,8 @@ mod tests {
             path_ids: Vec::new(),
             provisional: None,
             property_mode: Some("summray".into()),
+            cursor: None,
+            body_limit: None,
         };
         let value: serde_json::Value = serde_json::from_str(
             &bundle_evidence(
@@ -467,6 +476,8 @@ mod tests {
             path_ids: vec!["P999".into()],
             provisional: None,
             property_mode: None,
+            cursor: None,
+            body_limit: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -496,6 +507,8 @@ mod tests {
             path_ids: Vec::new(),
             provisional: None,
             property_mode: None,
+            cursor: None,
+            body_limit: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -538,6 +551,8 @@ mod tests {
             path_ids: Vec::new(),
             provisional: None,
             property_mode: None,
+            cursor: None,
+            body_limit: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -565,6 +580,8 @@ mod tests {
             path_ids: Vec::new(),
             provisional: None,
             property_mode: None,
+            cursor: None,
+            body_limit: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -664,6 +681,8 @@ mod tests {
             path_ids: Vec::new(),
             provisional: None,
             property_mode: Some("summary".into()),
+            cursor: None,
+            body_limit: None,
         };
 
         let rendered = bundle_evidence(
