@@ -44,4 +44,6 @@ measure complete mirrored envelopes, assert producers run exactly once, reject
 cross-session and changed selectors, exercise expiry and eviction, and verify
 both byte and count retention limits. The isolated HTTP probe additionally
 checks actual MCP session isolation and continuation through the served tool.
-Final gate and deployment evidence is recorded after integration.
+Later diagnostic/probe failures preserve completed observations and return
+`error.embedding_observation_partial` on every exact page. Final gate and
+deployment evidence is recorded after integration.

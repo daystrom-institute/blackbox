@@ -68,6 +68,7 @@ struct Snapshot {
     selection: String,
     body: String,
     captured_at: String,
+    status: Option<String>,
     created: Instant,
 }
 
@@ -174,6 +175,11 @@ pub(crate) fn read_status(
     let report = Snapshot {
         id: uuid::Uuid::new_v4().simple().to_string(),
         selection,
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|s| s.len() <= 64)
+            .map(str::to_owned),
         body,
         captured_at: chrono::Utc::now().to_rfc3339(),
         created: Instant::now(),
@@ -201,11 +207,14 @@ fn page(report: &Snapshot, offset: usize, limit: Option<usize>) -> Result<String
         while !report.body.is_char_boundary(end) {
             end -= 1;
         }
-        let value = json!({
+        let mut value = json!({
             "snapshot": {"id":report.id,"captured_at":report.captured_at,"ttl_seconds":TTL.as_secs(),"session_scoped":true,"immutable":true},
             "body": {"format":"json","text":&report.body[offset..end],"offset":offset,"total_bytes":report.body.len(),"next_cursor":(end < report.body.len()).then(|| format!("{}:{end}",report.id))},
             "continuation":"Concatenate body.text as JSON. Repeat the original selectors and body.next_cursor as cursor in this MCP session. Pages never repeat scans or probes. Retained up to ten minutes, four reports and 16 MiB per session; restart or eviction makes cursors unavailable.",
         });
+        if let Some(status) = &report.status {
+            value["status"] = json!(status);
+        }
         let text = serde_json::to_string(&value)?;
         let envelope = json!({"content":[{"type":"text","text":&text}],"structuredContent":value,"isError":false});
         if serde_json::to_vec(&envelope)?.len()
@@ -234,23 +243,32 @@ pub(crate) fn collect_status(state: &SharedState, p: &EmbedStatusParams) -> Resu
         });
         let timeout =
             Duration::from_millis(p.diagnostic_deadline_ms.unwrap_or(2_000).clamp(1, 30_000));
-        value["vector_diagnostics"] = match crate::vectors::try_diagnostics_bounded(
-            &routes, timeout,
-        ) {
-            Some(report) => serde_json::to_value(report?)?,
-            None => {
-                json!({"partitions":{},"unavailable":[{"route":"<vector-store>","reason":"store_warming_up"}]})
-            }
+        let report = match crate::vectors::try_diagnostics_bounded(&routes, timeout) {
+            Some(report) => report.and_then(|report| Ok(serde_json::to_value(report)?)),
+            None => Ok(
+                json!({"partitions":{},"unavailable":[{"route":"<vector-store>","reason":"store_warming_up"}]}),
+            ),
         };
+        append_observation(&mut value, "vector_diagnostics", report);
     }
     if let Some(route) = p.recall_probe_route.as_deref() {
         let sample_every = p.probe_sample_every.unwrap_or(50).max(1);
         let k = p.probe_k.unwrap_or(10).max(1);
-        let self_recall = crate::vectors::self_recall_probe(route, sample_every, k)?;
-        value["recall_probe"] =
-            json!({"route":route,"sample_every":sample_every,"k":k,"self_recall":self_recall});
+        let report = crate::vectors::self_recall_probe(route, sample_every, k).map(|self_recall| json!({"route":route,"sample_every":sample_every,"k":k,"self_recall":self_recall}));
+        append_observation(&mut value, "recall_probe", report);
     }
     Ok(value)
+}
+
+// Later diagnostics must not discard completed status/coverage observations.
+fn append_observation(value: &mut Value, key: &str, observation: Result<Value>) {
+    value[key] = match observation {
+        Ok(report) => report,
+        Err(error) => {
+            value["status"] = json!("error.embedding_observation_partial");
+            json!({"state":"failed","error":error.to_string()})
+        }
+    };
 }
 
 #[cfg(test)]
@@ -343,6 +361,37 @@ mod tests {
         }
         assert_eq!(cache.lock().reports.len(), MAX_REPORTS);
         assert!(read_status(&cache, &next, || panic!("eviction collected")).is_err());
+    }
+
+    #[test]
+    fn later_probe_failure_preserves_completed_observations_and_paged_error_signal() {
+        let cache = Mutex::new(StatusSnapshots::default());
+        let mut value = json!({"routes":{"synthetic":{"source_count":31}},"vector_diagnostics":{"components":2}});
+        append_observation(
+            &mut value,
+            "recall_probe",
+            Err(anyhow::anyhow!("synthetic busy route")),
+        );
+        assert_eq!(value["routes"]["synthetic"]["source_count"], 31);
+        assert_eq!(value["vector_diagnostics"]["components"], 2);
+        assert_eq!(value["recall_probe"]["state"], "failed");
+        let mut p = EmbedStatusParams {
+            body_limit: Some(32),
+            ..Default::default()
+        };
+        let mut page = parse(read_status(&cache, &p, || Ok(value.clone())).unwrap());
+        let mut text = String::new();
+        loop {
+            let result = crate::server::BlackboxServer::ok_json(&page);
+            assert_eq!(result.is_error, Some(true));
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            p.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if p.cursor.is_none() {
+                break;
+            }
+            page = parse(read_status(&cache, &p, || panic!("failed probe repeated")).unwrap());
+        }
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
     }
 
     #[test]
