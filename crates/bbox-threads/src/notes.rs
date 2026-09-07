@@ -166,7 +166,11 @@ impl NoteResolveParams {
         const MAX_BATCH_NOTES: usize = 100;
         const MAX_INPUT_BYTES: usize = 64 * 1024;
         anyhow::ensure!(
-            self.ids.len().saturating_add(self.notes.len()).saturating_add(usize::from(self.id.is_some())) <= MAX_BATCH_NOTES,
+            self.ids
+                .len()
+                .saturating_add(self.notes.len())
+                .saturating_add(usize::from(self.id.is_some()))
+                <= MAX_BATCH_NOTES,
             "note resolution accepts at most 100 supplied IDs across id, ids and notes; split the batch before retrying"
         );
         anyhow::ensure!(
@@ -1510,9 +1514,14 @@ mod tests {
     #[test]
     fn resolve_refuses_oversized_selection_and_notes_before_mutation() {
         let (_tmp, mut notes) = mk_store();
-        notes.create(&serde_json::from_value(serde_json::json!({
-            "kind":"done", "body":"remain unresolved"
-        })).unwrap()).unwrap();
+        notes
+            .create(
+                &serde_json::from_value(serde_json::json!({
+                    "kind":"done", "body":"remain unresolved"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let id = notes.store.notes[0].id.clone();
         let before = serde_json::to_value(&notes.store).unwrap();
         for value in [
