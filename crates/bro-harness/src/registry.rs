@@ -186,9 +186,21 @@ impl Registry {
     }
 
     /// Session-owned activation names, never persisted schemas or permissions.
+    /// Prior activations remain evidence when their tools become pinned/eager;
+    /// otherwise a later resume could forget the earlier schema promise.
     pub fn activation_state(&self) -> Value {
-        let mut names: Vec<_> = self.activated.lock().unwrap().iter().cloned().collect();
-        names.sort();
+        let mut names: std::collections::BTreeSet<_> =
+            self.activated.lock().unwrap().iter().cloned().collect();
+        names.extend(
+            self.resume_required
+                .iter()
+                .filter(|name| {
+                    self.tools
+                        .get(*name)
+                        .is_some_and(|entry| entry.tier != Tier::Deferred)
+                })
+                .cloned(),
+        );
         json!(names)
     }
 
@@ -705,6 +717,50 @@ mod tests {
         );
         resumed.restore_activations(&json!([null, 7, "unknown"]));
         assert_eq!(resumed.activation_state(), json!([]));
+    }
+
+    #[test]
+    fn prior_activation_survives_pinned_or_eager_resume_then_catalog_loss() {
+        for pinned in [true, false] {
+            let saved = json!(["file_read"]);
+            let pin = PinPolicy {
+                patterns: if pinned {
+                    vec!["file_read".into()]
+                } else {
+                    vec![]
+                },
+            };
+            let mut first_resume = Registry::with_options(
+                vec![mk("file_read", "current read")],
+                vec![],
+                &pin,
+                &ToolFilter::default(),
+                pinned,
+            );
+            // Only the saved activation survives; neither snapshot nor event
+            // history still contains the original search receipt.
+            first_resume.restore_resume_activations(Some(&saved), &json!([]));
+            first_resume.validate_resume_tool_schemas().unwrap();
+            assert!(first_resume.activated.lock().unwrap().is_empty());
+            assert_eq!(first_resume.activation_state(), saved);
+
+            let mut second_resume = Registry::new(
+                vec![mk("file_write", "unactivated tool")],
+                vec![],
+                &PinPolicy::default(),
+                &ToolFilter::default(),
+            );
+            second_resume
+                .restore_resume_activations(Some(&first_resume.activation_state()), &json!([]));
+            let error = second_resume.validate_resume_tool_schemas().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("error.resume_tool_schema_missing")
+            );
+            assert!(error.to_string().contains("file_read"));
+            assert_eq!(second_resume.activation_state(), json!([]));
+        }
     }
 
     #[test]
