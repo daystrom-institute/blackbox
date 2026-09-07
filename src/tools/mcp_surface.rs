@@ -444,7 +444,7 @@ impl BlackboxServer {
                         field,
                         value: packets::Value::String(value),
                     } if field == "surface" => (Some(value.as_str()), "exact_surface"),
-                    packets::Predicate::True => (Some("*"), "unconditional"),
+                    packets::Predicate::AlwaysTrue {} => (Some("*"), "unconditional"),
                     _ => (None, "requires_predicate_evaluation"),
                 };
                 serde_json::json!({
