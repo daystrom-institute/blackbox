@@ -153,7 +153,15 @@ async fn review_rejects_read_fields_before_checkout_owner_admission() {
             let params: ReviewParams = serde_json::from_value(value).unwrap();
             let result = server.bbox_review(Parameters(params)).await;
             assert_eq!(result.is_error, Some(true), "{result:?}");
-            assert_eq!(server.state.checkout_mutations.read().outstanding_writes().count(), 0);
+            assert_eq!(
+                server
+                    .state
+                    .checkout_mutations
+                    .read()
+                    .outstanding_writes()
+                    .count(),
+                0
+            );
         }
     }
 }

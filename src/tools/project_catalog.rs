@@ -716,10 +716,16 @@ fn publisher_status_lane_inventory(values: &[&str]) -> serde_json::Value {
 
 fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow::Result<()> {
     if p.detail.is_none() && (p.detail_cursor.is_some() || p.detail_limit.is_some()) {
-        anyhow::bail!("error.project_publisher_status_detail_cursor: detail_cursor and detail_limit require detail");
+        anyhow::bail!(
+            "error.project_publisher_status_detail_cursor: detail_cursor and detail_limit require detail"
+        );
     }
-    if p.detail_limit.is_some_and(|limit| !(4..=4096).contains(&limit)) {
-        anyhow::bail!("error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096");
+    if p.detail_limit
+        .is_some_and(|limit| !(4..=4096).contains(&limit))
+    {
+        anyhow::bail!(
+            "error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096"
+        );
     }
     Ok(())
 }
@@ -729,8 +735,12 @@ fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow:
 fn publisher_auto_advance_summary(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(text) => publisher_status_bounded_text(text),
-        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter()
-            .map(|(key, value)| (key.clone(), publisher_auto_advance_summary(value))).collect()),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), publisher_auto_advance_summary(value)))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -2196,18 +2206,29 @@ impl BlackboxServer {
         let census = match row.validated_scope.as_ref() {
             None => Ok(false),
             Some(scope) => (|| -> anyhow::Result<bool> {
-                let _lifecycle = self.state.checkout_access.lifecycle_mutation_guard()
+                let _lifecycle = self
+                    .state
+                    .checkout_access
+                    .lifecycle_mutation_guard()
                     .map_err(anyhow::Error::new)?;
-                self.state.checkout_registry.write()
+                self.state
+                    .checkout_registry
+                    .write()
                     .deregister_scope(&row.checkout_id, scope)
             })(),
         };
         let watcher = (|| -> anyhow::Result<bool> {
-            let mut guard = self.state.bbox_watcher.lock()
+            let mut guard = self
+                .state
+                .bbox_watcher
+                .lock()
                 .map_err(|_| anyhow::anyhow!("watcher lock unavailable"))?;
-            let Some(watcher) = guard.as_mut() else { return Ok(false); };
+            let Some(watcher) = guard.as_mut() else {
+                return Ok(false);
+            };
             let carrier = crate::watcher::ArtifactWatchCarrier::checkout(
-                row.project_id.as_str().to_string(), row.checkout_id.clone(),
+                row.project_id.as_str().to_string(),
+                row.checkout_id.clone(),
             )?;
             watcher.unwatch_carrier(&carrier)
         })();
@@ -2219,7 +2240,6 @@ impl BlackboxServer {
         }
         DetachCleanup::from_results(census, watcher)
     }
-
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2231,9 +2251,16 @@ struct DetachCleanup {
 impl DetachCleanup {
     fn from_results(census: anyhow::Result<bool>, watcher: anyhow::Result<bool>) -> Self {
         fn outcome(result: anyhow::Result<bool>) -> &'static str {
-            match result { Ok(true) => "removed", Ok(false) => "not_registered", Err(_) => "failed" }
+            match result {
+                Ok(true) => "removed",
+                Ok(false) => "not_registered",
+                Err(_) => "failed",
+            }
         }
-        Self { census: outcome(census), watcher: outcome(watcher) }
+        Self {
+            census: outcome(census),
+            watcher: outcome(watcher),
+        }
     }
 
     fn failed(&self) -> bool {
@@ -2958,9 +2985,19 @@ mod tests {
     #[test]
     fn publisher_detail_selectors_refuse_before_collection() {
         for params in [
-            ProjectPublisherStatusParams { detail_limit: Some(512), ..Default::default() },
-            ProjectPublisherStatusParams { detail_cursor: Some("old".into()), ..Default::default() },
-            ProjectPublisherStatusParams { detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_limit: Some(3), ..Default::default() },
+            ProjectPublisherStatusParams {
+                detail_limit: Some(512),
+                ..Default::default()
+            },
+            ProjectPublisherStatusParams {
+                detail_cursor: Some("old".into()),
+                ..Default::default()
+            },
+            ProjectPublisherStatusParams {
+                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail_limit: Some(3),
+                ..Default::default()
+            },
         ] {
             assert!(validate_publisher_status_detail(&params).is_err());
         }
@@ -2973,34 +3010,76 @@ mod tests {
         let server = fixture.server();
         let ledger = server.state.knowledge_sources.auto_advance_ledger();
         let detail = "escaped-\"\n诊断".repeat(5000);
-        ledger.record("p_status_policy", AutoAdvanceAttempt {
-            source_generation_id: "source-a".into(), producer_id: "producer-a".into(),
-            outcome: AutoAdvanceOutcome::Refused { code: "error.refused".into(), detail: detail.clone(), may_have_swapped: true },
-            at_unix_secs: 42,
-        });
-        let summary = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
-            project_id: "p_status_policy".into(), ..Default::default()
-        })).await;
+        ledger.record(
+            "p_status_policy",
+            AutoAdvanceAttempt {
+                source_generation_id: "source-a".into(),
+                producer_id: "producer-a".into(),
+                outcome: AutoAdvanceOutcome::Refused {
+                    code: "error.refused".into(),
+                    detail: detail.clone(),
+                    may_have_swapped: true,
+                },
+                at_unix_secs: 42,
+            },
+        );
+        let summary = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_policy".into(),
+                ..Default::default()
+            }))
+            .await;
         assert_ne!(summary.is_error, Some(true));
-        assert!(serde_json::to_vec(&summary).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        assert!(
+            serde_json::to_vec(&summary).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
         let value: serde_json::Value = serde_json::from_str(&error_text(&summary)).unwrap();
-        assert_eq!(value["auto_advance"]["last_attempt"]["may_have_swapped"], true);
-        assert_eq!(value["auto_advance"]["last_attempt"]["detail"]["truncated"], true);
-        let full = page_publisher_status_detail(&server, "p_status_policy", ProjectPublisherStatusDetail::AutoAdvance).await;
+        assert_eq!(
+            value["auto_advance"]["last_attempt"]["may_have_swapped"],
+            true
+        );
+        assert_eq!(
+            value["auto_advance"]["last_attempt"]["detail"]["truncated"],
+            true
+        );
+        let full = page_publisher_status_detail(
+            &server,
+            "p_status_policy",
+            ProjectPublisherStatusDetail::AutoAdvance,
+        )
+        .await;
         let recovered: serde_json::Value = serde_json::from_str(&full).unwrap();
         assert_eq!(recovered["last_attempt"]["detail"], detail);
-        let first = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
-            project_id: "p_status_policy".into(), detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_limit: Some(128), ..Default::default()
-        })).await;
+        let first = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_policy".into(),
+                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail_limit: Some(128),
+                ..Default::default()
+            }))
+            .await;
         let first: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
-        let cursor = first["detail"]["body"]["next_cursor"].as_str().unwrap().to_owned();
-        ledger.record("p_status_policy", AutoAdvanceAttempt {
-            source_generation_id: "source-b".into(), producer_id: "producer-a".into(),
-            outcome: AutoAdvanceOutcome::PolicyDisabled, at_unix_secs: 43,
-        });
-        let stale = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
-            project_id: "p_status_policy".into(), detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_cursor: Some(cursor), ..Default::default()
-        })).await;
+        let cursor = first["detail"]["body"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        ledger.record(
+            "p_status_policy",
+            AutoAdvanceAttempt {
+                source_generation_id: "source-b".into(),
+                producer_id: "producer-a".into(),
+                outcome: AutoAdvanceOutcome::PolicyDisabled,
+                at_unix_secs: 43,
+            },
+        );
+        let stale = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_policy".into(),
+                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail_cursor: Some(cursor),
+                ..Default::default()
+            }))
+            .await;
         assert_eq!(stale.is_error, Some(true));
     }
 
@@ -3015,16 +3094,23 @@ mod tests {
             let _guard = server.state.bbox_watcher.lock().unwrap();
             panic!("synthetic watcher poison");
         }));
-        let result = server.bbox_project_detach(Parameters(ProjectDetachParams {
-            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: epoch, audit_reason: "cleanup fixture".into(),
-        })).await;
+        let result = server
+            .bbox_project_detach(Parameters(ProjectDetachParams {
+                attachment_id: CatalogFixture::attachment().to_string(),
+                expected_catalog_epoch: epoch,
+                audit_reason: "cleanup fixture".into(),
+            }))
+            .await;
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
         assert_eq!(body["status"], "partial");
         assert_eq!(body["catalog_detached"], true);
         assert_eq!(body["cleanup"]["watcher"], "failed");
         let snapshot = store.snapshot().unwrap();
-        assert_eq!(snapshot.attachments().attachments[&CatalogFixture::attachment()].status, AttachmentStatus::Detached);
+        assert_eq!(
+            snapshot.attachments().attachments[&CatalogFixture::attachment()].status,
+            AttachmentStatus::Detached
+        );
         assert!(!DetachCleanup::from_results(Ok(false), Ok(false)).failed());
     }
 

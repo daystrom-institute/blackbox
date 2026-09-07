@@ -113,9 +113,13 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
     // later note must not leave earlier targets applied without a receipt.
     let mut prepared = Vec::with_capacity(grouped.len());
     for ((project_id, commit), edges) in grouped {
-        let Some(project) = project_map.get(&project_id) else { continue; };
-        anyhow::ensure!(project_id.len() <= 256 && commit.len() <= 128,
-            "error.provenance_export_invalid_target: oversized target identity; no checkout mutation was attempted");
+        let Some(project) = project_map.get(&project_id) else {
+            continue;
+        };
+        anyhow::ensure!(
+            project_id.len() <= 256 && commit.len() <= 128,
+            "error.provenance_export_invalid_target: oversized target identity; no checkout mutation was attempted"
+        );
         let note = note_from_edges(&commit, &edges, edge_index);
         let documents = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)
             .and_then(|parts| parts.iter().map(serialize_note).collect::<Result<Vec<_>>>())
@@ -123,7 +127,10 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
                 "error.provenance_export_prepare_failed: documents could not be prepared; no checkout mutation was attempted"
             ))?;
         prepared.push(PreparedExportTarget {
-            project_id, commit, root: project.project_root.clone(), documents,
+            project_id,
+            commit,
+            root: project.project_root.clone(),
+            documents,
         });
     }
     let mut configured_roots = std::collections::HashSet::new();
@@ -131,11 +138,17 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
         if configured_roots.insert(target.root.clone())
             && bbox_corpus_core::git::ensure_notes_merge_strategy_union(&target.root).is_err()
         {
-            tracing::warn!("error.checkout_io_failed: could not set provenance note merge strategy");
+            tracing::warn!(
+                "error.checkout_io_failed: could not set provenance note merge strategy"
+            );
         }
         bbox_provenance::append_note_documents_dedup(
-            &target.root, &notes_ref, &target.commit, &target.documents,
-        ).map(|outcome| outcome.written)
+            &target.root,
+            &notes_ref,
+            &target.commit,
+            &target.documents,
+        )
+        .map(|outcome| outcome.written)
     })
 }
 
@@ -502,16 +515,23 @@ mod tests {
 
     #[test]
     fn export_failure_preserves_completed_counts_and_current_uncertainty() {
-        let targets = (0..4).map(|index| PreparedExportTarget {
-            project_id: format!("project-{index}"), commit: format!("commit-{index}"),
-            root: PathBuf::from("unused-synthetic-root"), documents: vec!["synthetic-note".into()],
-        }).collect::<Vec<_>>();
+        let targets = (0..4)
+            .map(|index| PreparedExportTarget {
+                project_id: format!("project-{index}"),
+                commit: format!("commit-{index}"),
+                root: PathBuf::from("unused-synthetic-root"),
+                documents: vec!["synthetic-note".into()],
+            })
+            .collect::<Vec<_>>();
         let mut attempted = Vec::new();
         let reply = export_prepared_targets(&targets, "refs/notes/bbox", |target| {
             attempted.push(target.commit.clone());
-            if attempted.len() == 2 { anyhow::bail!("synthetic-secret-process-output"); }
+            if attempted.len() == 2 {
+                anyhow::bail!("synthetic-secret-process-output");
+            }
             Ok(3)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(attempted, ["commit-0", "commit-1"]);
         assert!(!reply.contains("synthetic-secret-process-output"));
         assert!(!reply.contains("unused-synthetic-root"));
@@ -523,8 +543,9 @@ mod tests {
         assert_eq!(value["failed_target"]["commit"], "commit-1");
         assert_eq!(value["failed_target"]["may_have_written"], true);
         let success: serde_json::Value = serde_json::from_str(
-            &export_prepared_targets(&targets, "refs/notes/bbox", |_| Ok(2)).unwrap()
-        ).unwrap();
+            &export_prepared_targets(&targets, "refs/notes/bbox", |_| Ok(2)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(success["status"], "ok");
         assert_eq!(success["notes_written"], 8);
         assert_eq!(success["completed_targets"], 4);

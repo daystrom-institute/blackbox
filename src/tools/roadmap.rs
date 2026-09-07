@@ -220,21 +220,42 @@ impl BlackboxServer {
 }
 
 fn validate_roadmap_projection(p: &RoadmapParams) -> anyhow::Result<()> {
-    let read = matches!(p.action.as_str(), "get" | "list" | "search" | "next" | "render" | "default_template");
+    let read = matches!(
+        p.action.as_str(),
+        "get" | "list" | "search" | "next" | "render" | "default_template"
+    );
     let detail = p.detail.as_deref().unwrap_or("summary");
-    anyhow::ensure!(matches!(detail, "summary" | "body"), "error.bad_input: detail must be summary or body");
-    anyhow::ensure!(read || (p.detail.is_none() && p.cursor.is_none() && p.body_limit.is_none() && p.offset.is_none()),
-        "error.bad_input: projection fields apply only to roadmap reads; no mutation was attempted");
-    anyhow::ensure!(detail == "body" || (p.cursor.is_none() && p.body_limit.is_none()),
-        "error.bad_input: cursor and body_limit require detail=body");
-    anyhow::ensure!(p.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
-        "error.bad_input: body_limit must be between 4 and 4096");
-    anyhow::ensure!(matches!(p.action.as_str(), "list" | "search" | "next") || p.offset.is_none(),
-        "error.bad_input: offset applies only to list/search/next");
-    anyhow::ensure!(matches!(p.action.as_str(), "list" | "search") || p.limit.is_none(),
-        "error.bad_input: limit applies only to list/search; next uses n");
-    anyhow::ensure!(detail != "body" || (p.limit.is_none() && p.offset.is_none()),
-        "error.bad_input: limit/offset page summary rows; omit them for exact body reads");
+    anyhow::ensure!(
+        matches!(detail, "summary" | "body"),
+        "error.bad_input: detail must be summary or body"
+    );
+    anyhow::ensure!(
+        read || (p.detail.is_none()
+            && p.cursor.is_none()
+            && p.body_limit.is_none()
+            && p.offset.is_none()),
+        "error.bad_input: projection fields apply only to roadmap reads; no mutation was attempted"
+    );
+    anyhow::ensure!(
+        detail == "body" || (p.cursor.is_none() && p.body_limit.is_none()),
+        "error.bad_input: cursor and body_limit require detail=body"
+    );
+    anyhow::ensure!(
+        p.body_limit.is_none_or(|limit| (4..=4096).contains(&limit)),
+        "error.bad_input: body_limit must be between 4 and 4096"
+    );
+    anyhow::ensure!(
+        matches!(p.action.as_str(), "list" | "search" | "next") || p.offset.is_none(),
+        "error.bad_input: offset applies only to list/search/next"
+    );
+    anyhow::ensure!(
+        matches!(p.action.as_str(), "list" | "search") || p.limit.is_none(),
+        "error.bad_input: limit applies only to list/search; next uses n"
+    );
+    anyhow::ensure!(
+        detail != "body" || (p.limit.is_none() && p.offset.is_none()),
+        "error.bad_input: limit/offset page summary rows; omit them for exact body reads"
+    );
     Ok(())
 }
 
@@ -242,12 +263,18 @@ fn roadmap_preview(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(text) if text.len() > 128 => {
             let mut end = 128;
-            while !text.is_char_boundary(end) { end -= 1; }
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
             serde_json::json!({"text": &text[..end], "total_bytes": text.len(), "truncated": true})
         }
         serde_json::Value::Array(rows) => serde_json::json!({"count": rows.len(), "omitted": true}),
-        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter()
-            .map(|(key, value)| (key.clone(), roadmap_preview(value))).collect()),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), roadmap_preview(value)))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -255,12 +282,18 @@ fn roadmap_preview(value: &serde_json::Value) -> serde_json::Value {
 fn project_roadmap_response(p: &RoadmapParams, output: &str) -> anyhow::Result<String> {
     // Mutation receipts retain their existing per-effect fields. Exact reads
     // recompute only read operations, never a mutation or link repair.
-    if !matches!(p.action.as_str(), "get" | "list" | "search" | "next" | "render" | "default_template") {
+    if !matches!(
+        p.action.as_str(),
+        "get" | "list" | "search" | "next" | "render" | "default_template"
+    ) {
         return Ok(output.to_owned());
     }
     let markdown = matches!(p.action.as_str(), "render" | "default_template");
-    let full = if markdown { serde_json::Value::String(output.into()) }
-        else { serde_json::from_str(output)? };
+    let full = if markdown {
+        serde_json::Value::String(output.into())
+    } else {
+        serde_json::from_str(output)?
+    };
     if p.detail.as_deref() == Some("body") {
         let mut selection = serde_json::to_value(p)?;
         for key in ["cursor", "body_limit", "detail", "limit", "offset"] {
@@ -268,26 +301,43 @@ fn project_roadmap_response(p: &RoadmapParams, output: &str) -> anyhow::Result<S
         }
         let body = super::body_page::json_body_page(
             &format!("roadmap:{}", serde_json::to_string(&selection)?),
-            &full, p.cursor.as_deref(), p.body_limit,
+            &full,
+            p.cursor.as_deref(),
+            p.body_limit,
         )?;
-        return Ok(serde_json::json!({"action": p.action, "detail": "body", "body": body}).to_string());
+        return Ok(
+            serde_json::json!({"action": p.action, "detail": "body", "body": body}).to_string(),
+        );
     }
     let hint = "Repeat this read with detail=body, omitting limit/offset, to recover exact JSON pages; mutations expand through action=get and the returned id.";
     if let Some(items) = full.get("items").and_then(serde_json::Value::as_array) {
-        let rows = items.iter().map(|item| {
-            let mut row = roadmap_preview(item);
-            row["detail"] = serde_json::json!({"action": "get", "id": item["id"], "detail": "body"});
-            row
-        }).collect();
-        let mut page = bbox_corpus_core::response_page::collection_page(rows, "items", if p.action == "next" { p.n } else { p.limit }, p.offset)?;
+        let rows = items
+            .iter()
+            .map(|item| {
+                let mut row = roadmap_preview(item);
+                row["detail"] =
+                    serde_json::json!({"action": "get", "id": item["id"], "detail": "body"});
+                row
+            })
+            .collect();
+        let mut page = bbox_corpus_core::response_page::collection_page(
+            rows,
+            "items",
+            if p.action == "next" { p.n } else { p.limit },
+            p.offset,
+        )?;
         page["count"] = serde_json::json!(page["items"].as_array().map_or(0, Vec::len));
         page["detail_hint"] = serde_json::json!(hint);
-        page["view"] = serde_json::json!("Live selection; concurrent updates can move rows. Restart at offset=0 after changes.");
+        page["view"] = serde_json::json!(
+            "Live selection; concurrent updates can move rows. Restart at offset=0 after changes."
+        );
         return Ok(page.to_string());
     }
     let mut result = if markdown {
         serde_json::json!({"format": "markdown", "preview": roadmap_preview(&full), "total_bytes": output.len()})
-    } else { roadmap_preview(&full) };
+    } else {
+        roadmap_preview(&full)
+    };
     result["detail_hint"] = serde_json::json!(hint);
     Ok(result.to_string())
 }
@@ -503,9 +553,18 @@ impl BlackboxServer {
         } else {
             rm.all_items().iter().collect()
         };
-        let items = candidates.into_iter()
-            .filter(|i| p.status.as_deref().is_none_or(|status| i.status.as_str() == status))
-            .filter(|i| p.category.as_deref().is_none_or(|category| i.category.as_str() == category))
+        let items = candidates
+            .into_iter()
+            .filter(|i| {
+                p.status
+                    .as_deref()
+                    .is_none_or(|status| i.status.as_str() == status)
+            })
+            .filter(|i| {
+                p.category
+                    .as_deref()
+                    .is_none_or(|category| i.category.as_str() == category)
+            })
             .filter(project_filter);
         let result: Vec<_> = items
             .into_iter()
@@ -1029,7 +1088,9 @@ mod projection_tests {
     use super::*;
     use serde_json::{Value, json};
 
-    fn params(value: Value) -> RoadmapParams { serde_json::from_value(value).unwrap() }
+    fn params(value: Value) -> RoadmapParams {
+        serde_json::from_value(value).unwrap()
+    }
 
     #[test]
     fn roadmap_projection_refuses_mutation_and_contradictory_fields() {
@@ -1046,11 +1107,16 @@ mod projection_tests {
 
     #[test]
     fn roadmap_summary_pages_every_row_and_recovers_huge_record() {
-        let rows = (0..35).map(|index| json!({"id":format!("roadmap-{index:08}"),
-            "title":"\"诊断\n".repeat(4000), "spawned_thread_ids":["thread-a","thread-b"]})).collect::<Vec<_>>();
+        let rows = (0..35)
+            .map(|index| {
+                json!({"id":format!("roadmap-{index:08}"),
+            "title":"\"诊断\n".repeat(4000), "spawned_thread_ids":["thread-a","thread-b"]})
+            })
+            .collect::<Vec<_>>();
         let source = json!({"items":rows,"count":35}).to_string();
         let mut p = params(json!({"action":"list","limit":100}));
-        let first: Value = serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
+        let first: Value =
+            serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
         assert_eq!(first["total"], 35);
         let mut count = first["items"].as_array().unwrap().len();
         let mut next = first["next_offset"].as_u64();
@@ -1058,21 +1124,31 @@ mod projection_tests {
             p.offset = Some(offset as usize);
             let page = project_roadmap_response(&p, &source).unwrap();
             let result = BlackboxServer::ok_text(&page);
-            assert!(serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
             let page: Value = serde_json::from_str(&page).unwrap();
             count += page["items"].as_array().unwrap().len();
             next = page["next_offset"].as_u64();
         }
         assert_eq!(count, 35);
         let source = rows[0].to_string();
-        let mut p = params(json!({"action":"get","id":"roadmap-00000000","detail":"body","body_limit":257}));
-        let first: Value = serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
+        let mut p = params(
+            json!({"action":"get","id":"roadmap-00000000","detail":"body","body_limit":257}),
+        );
+        let first: Value =
+            serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
         let cursor = first["body"]["next_cursor"].as_str().unwrap().to_owned();
         let mut recovered = first["body"]["text"].as_str().unwrap().to_owned();
         p.cursor = Some(cursor.clone());
         while p.cursor.is_some() {
             let page = project_roadmap_response(&p, &source).unwrap();
-            assert!(serde_json::to_vec(&BlackboxServer::ok_text(&page)).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+            assert!(
+                serde_json::to_vec(&BlackboxServer::ok_text(&page))
+                    .unwrap()
+                    .len()
+                    < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
             let page: Value = serde_json::from_str(&page).unwrap();
             recovered.push_str(page["body"]["text"].as_str().unwrap());
             p.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
@@ -1090,10 +1166,13 @@ mod projection_tests {
         let mut p = params(json!({"action":"render","detail":"body"}));
         let mut recovered = String::new();
         loop {
-            let page: Value = serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
+            let page: Value =
+                serde_json::from_str(&project_roadmap_response(&p, &source).unwrap()).unwrap();
             recovered.push_str(page["body"]["text"].as_str().unwrap());
             p.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
-            if p.cursor.is_none() { break; }
+            if p.cursor.is_none() {
+                break;
+            }
         }
         assert_eq!(serde_json::from_str::<String>(&recovered).unwrap(), source);
     }

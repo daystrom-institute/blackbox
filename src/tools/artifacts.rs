@@ -444,8 +444,7 @@ mod tests {
         let mut recovered = String::new();
         loop {
             let result = server
-                .bbox_artifact_list(Parameters(serde_json::from_value(args.clone()).unwrap()))
-                .await;
+                .bbox_artifact_list(Parameters(serde_json::from_value(args.clone()).unwrap()));
             assert_ne!(result.is_error, Some(true), "{result:?}");
             let encoded = serde_json::to_string(&result).unwrap();
             assert!(encoded.len() < 65536);

@@ -1441,7 +1441,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_find_paths",
-        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. max_fanout (default 16, range 1..=64) caps the edges enumerated out of any single vertex; a capped expansion is reported explicitly under truncated_expansions rather than silently returning a prefix. Graph selection precedes neighbor enumeration: a hop into a graph the caller may not read is dropped before the frontier, and nothing in the response implies an unreadable graph exists. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent. A target is required: a call with neither to nor to_type is refused with error.bad_input rather than answered as an empty result. Over project graphs under own or all visibility, to_type='project_graph_vertex' also matches provisional overlay vertices, so the logical type is enough; pass to_type='provisional_project_graph_vertex' only to target the overlay form exactly. Tenant-owned evidence bindings are traversable like any other edge and cross between graphs and out to project files, knowledge entries, and other entities. Their steps carry an `evidence.*` metadata family naming the binding, who asserted it, the observation or mapping it came from, and each endpoint's status (current, stale, missing, unauthorized, unresolved); the rendered path shows the aggregate freshness in brackets. A stale or missing endpoint is still walked and labeled, because a stale chain is still what was asserted; an unauthorized endpoint is never crossed."
+        description = "Find direction-preserving paths to an exact ref (to) or entity type (to_type); a target is required. Filter edge_types and use a small max_depth. Fanout omissions and evidence freshness are explicit. Pass returned path IDs to bbox_bundle_evidence."
     )]
     pub(crate) async fn bbox_find_paths(
         &self,
@@ -1996,8 +1996,22 @@ mod tests {
         let server = test_server(&tmp);
         let edges_dir = crate::server::edge_sidecar_dir(&server.state);
         std::fs::create_dir_all(&edges_dir).unwrap();
-        let original = "{\"provenance\":\"derived\"}\nmalformed-but-preserved\n";
-        std::fs::write(edges_dir.join("synthetic.jsonl"), original).unwrap();
+        let edge = edge_index::Edge {
+            source: entity_ref::EntityRef::Knowledge { id: "first".into() },
+            target: entity_ref::EntityRef::Knowledge {
+                id: "second".into(),
+            },
+            kind: "RELATED_TO".into(),
+            provenance: bbox_chunker::EdgeProvenance::Derived,
+            confidence: bbox_chunker::EdgeConfidence::Exact,
+            metadata: Default::default(),
+            project_id: None,
+        };
+        let original = format!(
+            "{}\nmalformed-but-preserved\n",
+            serde_json::to_string(&edge).unwrap()
+        );
+        std::fs::write(edges_dir.join("synthetic.jsonl"), &original).unwrap();
         env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let result = server
             .bbox_edge_compact(Parameters(EdgeCompactParams {
@@ -4519,7 +4533,7 @@ mod tests {
                 expected_view_stamp: None,
             }))
             .await;
-        assert!(extract_text(&validated).contains("\"valid\": true"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&extract_text(&validated)).unwrap()["graphs"][0]["valid"], true);
 
         let vertex_ref =
             format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
@@ -4750,7 +4764,7 @@ mod tests {
             }))
             .await;
         let own_text = extract_text(&own);
-        assert!(own_text.contains("\"valid\": false"), "{own_text}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["valid"], false);
         assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
         assert!(
             own_text.contains("\"source\": \"provisional\""),
@@ -4776,7 +4790,7 @@ mod tests {
                 expected_view_stamp: None,
             }))
             .await;
-        assert!(extract_text(&published).contains("\"valid\": true"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&extract_text(&published)).unwrap()["graphs"][0]["valid"], true);
     }
 
     #[tokio::test]

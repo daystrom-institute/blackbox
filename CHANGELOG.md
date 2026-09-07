@@ -19,6 +19,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- MCP discovery now keeps ordinary schema, knowledge, artifact, roadmap and
+  health reads compact, with exact JSON pages for oversized evidence and
+  metadata. Graph validation pages variants separately from error rows.
+- MCP configuration and project tools state their supported owner/locality
+  lanes. Wrong-action detail selectors refuse before writes or queue admission.
+
 - GLM and DeepSeek peak-hour advisories appear as `peak_usage` on provider
   discovery, allocator candidates, and dispatch/resume receipts. These use
   provider-local weekday schedules without changing automatic selection.
@@ -77,6 +83,15 @@ out explicitly under `Changed` or `Removed`.
   to start another task.
 
 ### Fixed
+
+- Invalid prune providers, empty task selections and unrepresentable wait
+  durations refuse before effects. Allocator updates preserve corrupt stores
+  and concurrent observations, and configuration reads expose unavailable state.
+- Broadcast, team, project cleanup, compaction and provenance export receipts
+  preserve completed effects after later failures. Report, note and prune
+  batches are bounded before effects.
+- Artifact supersession receipts and exact metadata withhold source URLs and
+  daemon paths. Doctor exact reads retain findings beyond the summary prefix.
 
 - Bro status, roster summaries and wait timeouts preview the latest assistant
   text instead of the opening of accumulated output. Preview state survives

@@ -114,16 +114,26 @@ fn migration_plan_page(
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
     // Identify the requested page before opening sidecar contents. A small
     // response should not re-plan every other project's migration.
-    let rows = targets.into_iter().skip(offset).take(limit).map(|project_id| {
-        plan(&project_id).unwrap_or_else(|error| serde_json::json!({
-            "project_id": project_id, "error": error.to_string(),
-        }))
-    }).collect::<Vec<_>>();
-    bbox_corpus_core::response_page::bound_page(serde_json::json!({
-        "mode": "dry_run", "offset": offset, "limit": limit,
-        "total": total, "count": rows.len(), "projects": rows,
-        "view": "Live project-order inventory; restart at offset=0 after lifecycle changes.",
-    }), "projects")
+    let rows = targets
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|project_id| {
+            plan(&project_id).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "project_id": project_id, "error": error.to_string(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    bbox_corpus_core::response_page::bound_page(
+        serde_json::json!({
+            "mode": "dry_run", "offset": offset, "limit": limit,
+            "total": total, "count": rows.len(), "projects": rows,
+            "view": "Live project-order inventory; restart at offset=0 after lifecycle changes.",
+        }),
+        "projects",
+    )
 }
 
 /// A03: one authoritative selector contract for dry-run and apply. The
@@ -344,12 +354,20 @@ mod tests {
     #[test]
     fn preview_only_plans_requested_page_targets() {
         let mut planned = Vec::new();
-        let page = migration_plan_page((0..50).map(|id| format!("p_{id:02}")).collect(),
-            &StorageMigrationParams { dry_run: true, project: None, limit: Some(2), offset: Some(30) },
+        let page = migration_plan_page(
+            (0..50).map(|id| format!("p_{id:02}")).collect(),
+            &StorageMigrationParams {
+                dry_run: true,
+                project: None,
+                limit: Some(2),
+                offset: Some(30),
+            },
             |id| {
                 planned.push(id.to_owned());
                 Ok(serde_json::json!({"project_id":id}))
-            }).unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(planned, ["p_30", "p_31"]);
         assert_eq!(page["total"], 50);
         assert_eq!(page["next_offset"], 32);

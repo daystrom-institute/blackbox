@@ -390,13 +390,11 @@ fn accepted_publication_section(
                 "bbox_doctor",
             ));
             findings.push(match status.accepted.state {
-                "current" if status.accepted.serves_published_content => {
-                    Finding::info(format!(
-                        "project {project} accepted publication is verified independently \
+                "current" if status.accepted.serves_published_content => Finding::info(format!(
+                    "project {project} accepted publication is verified independently \
                          of the catalog and is CURRENT; published knowledge and gaps keep \
                          serving while the catalog pair is unreadable"
-                    ))
-                }
+                )),
                 "prior" => Finding::action(
                     format!(
                         "project {project} accepted publication is verified independently \
@@ -2203,12 +2201,14 @@ mod catalog_health_tests {
         let fixture = CatalogFixture::new();
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
         let base = status(&fixture.server());
-        let mut statuses = (0..35).map(|index| {
-            let mut row = base.clone();
-            row.project_id = format!("p_health_{index:02}");
-            row.accepted.state = "missing";
-            row
-        }).collect::<Vec<_>>();
+        let mut statuses = (0..35)
+            .map(|index| {
+                let mut row = base.clone();
+                row.project_id = format!("p_health_{index:02}");
+                row.accepted.state = "missing";
+                row
+            })
+            .collect::<Vec<_>>();
         statuses[34].accepted.state = "corrupt";
         statuses[34].accepted.diagnostic = Some("late-诊断-\"\n".repeat(2000));
         let section = accepted_publication_section(&statuses);
@@ -2218,12 +2218,23 @@ mod catalog_health_tests {
         let mut recovered = String::new();
         let mut cursor = None;
         loop {
-            let page = bbox_corpus_core::response_page::json_body_page("doctor", &report, cursor.as_deref(), Some(257)).unwrap();
+            let page = bbox_corpus_core::response_page::json_body_page(
+                "doctor",
+                &report,
+                cursor.as_deref(),
+                Some(257),
+            )
+            .unwrap();
             recovered.push_str(page["text"].as_str().unwrap());
             cursor = page["next_cursor"].as_str().map(str::to_owned);
-            if cursor.is_none() { break; }
+            if cursor.is_none() {
+                break;
+            }
         }
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&recovered).unwrap(), report);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered).unwrap(),
+            report
+        );
         assert!(recovered.contains("p_health_34"));
     }
 
