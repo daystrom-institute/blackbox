@@ -730,17 +730,22 @@ fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow:
     Ok(())
 }
 
-// Policy outcome structure is fixed, but refusal prose and source identities
-// are producer data. Keep every outcome flag while bounding these strings.
+// Preserve ordinary identity/CAS strings byte-for-byte. Diagnostic prose has
+// a smaller preview budget; oversized identities are exact-reader markers,
+// never plausible but invalid prefixes callers could submit as selectors.
 fn publisher_auto_advance_summary(value: &serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => publisher_status_bounded_text(text),
-        serde_json::Value::Object(fields) => serde_json::Value::Object(
-            fields
-                .iter()
-                .map(|(key, value)| (key.clone(), publisher_auto_advance_summary(value)))
-                .collect(),
-        ),
+        serde_json::Value::String(text) if text.len() > 256 => json!({
+            "total_bytes": text.len(), "omitted": true, "detail": "auto_advance",
+        }),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter()
+            .map(|(key, value)| {
+                let summary = if matches!(key.as_str(), "detail" | "granted_reason" | "message" | "error") {
+                    value.as_str().map(publisher_status_bounded_text)
+                        .unwrap_or_else(|| publisher_auto_advance_summary(value))
+                } else { publisher_auto_advance_summary(value) };
+                (key.clone(), summary)
+            }).collect()),
         _ => value.clone(),
     }
 }
@@ -2981,6 +2986,24 @@ impl BlackboxServer {
 mod tests {
     use super::*;
     use crate::server::state::SharedState;
+
+    #[test]
+    fn auto_advance_summary_preserves_cas_ids_and_never_prefixes_oversized_selectors() {
+        let generation = format!("kps_{}", "a".repeat(64));
+        let value = json!({"source_generation_id":generation,
+            "expected_generation_id":format!("generation_{}", "b".repeat(64)),
+            "expected_pointer_sha256":"c".repeat(64),
+            "full_ref":format!("refs/heads/{}", "d".repeat(120)),
+            "producer_id":"界".repeat(1000), "detail":"diagnostic".repeat(100)});
+        let summary = publisher_auto_advance_summary(&value);
+        for key in ["source_generation_id", "expected_generation_id", "expected_pointer_sha256", "full_ref"] {
+            assert_eq!(summary[key], value[key]);
+        }
+        assert_eq!(summary["producer_id"]["omitted"], true);
+        assert!(summary["producer_id"].get("text").is_none());
+        assert_eq!(summary["producer_id"]["detail"], "auto_advance");
+        assert_eq!(summary["detail"]["truncated"], true);
+    }
 
     #[test]
     fn publisher_detail_selectors_refuse_before_collection() {
