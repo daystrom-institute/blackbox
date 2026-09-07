@@ -1361,7 +1361,24 @@ fn system_memory_catalog_response(p: &KnowledgeListParams) -> Option<String> {
         return None;
     }
     if matches_system_memory_catalog(p.category.as_deref()) {
-        return Some(format_system_memory_catalog(p.query.as_deref()));
+        let memories = system_memory::search(p.query.as_deref());
+        let offset = usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX);
+        let limit = p.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let total = memories.len();
+        let mut out = format!("System memories ({total}), offset {offset}:\n");
+        let mut count = 0;
+        for memory in memories.into_iter().skip(offset).take(limit) {
+            let line = system_memory::format_for_signpost(memory);
+            if count > 0 && out.len().saturating_add(line.len()) > 12 * 1024 {
+                break;
+            }
+            out.push_str(&line);
+            count += 1;
+        }
+        if offset.saturating_add(count) < total {
+            out.push_str(&format!("\nContinue bbox_knowledge(category=system_memory, offset={}, limit={limit}) with the same query; live catalog order can change after reload.\n", offset.saturating_add(count)));
+        }
+        return Some(out);
     }
     None
 }
@@ -1848,6 +1865,10 @@ fn validate_knowledge_detail_selection(
         selected <= 1,
         "choose only one detail mode: diagnostics_detail, entry_detail, or an exact sm-* query"
     );
+    anyhow::ensure!(
+        !(entry || exact_memory_requested) || p.offset.is_none(),
+        "offset applies only to discovery lists, not exact entry or memory reads"
+    );
     if p.entry_detail
         .as_deref()
         .is_some_and(|selector| selector.trim().is_empty())
@@ -2243,6 +2264,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_knowledge", move || {
+            anyhow::ensure!(serde_json::to_vec(&p)?.len() <= 16 * 1024, "knowledge query selectors exceed 16384 bytes; shorten the query or use an exact entry selector");
             let exact_memory = exact_system_memory_target(&p);
             validate_knowledge_detail_selection(&p, exact_memory.is_some())?;
             if let Some(out) = system_memory_catalog_response(&p) {
@@ -2277,6 +2299,7 @@ impl BlackboxServer {
             if p.entry_detail.is_some() {
                 let mut scope_params = p.clone();
                 scope_params.limit = Some(u64::MAX);
+                scope_params.offset = None;
                 let scoped = view.knowledge.list(&scope_params)?;
                 let visible_refs = returned_entry_ids(&scoped)
                     .iter()
@@ -2284,14 +2307,17 @@ impl BlackboxServer {
                     .collect::<Vec<_>>();
                 return exact_entry_detail_response(&view, &p, &visible_refs);
             }
+            p.limit = Some(p.limit.unwrap_or(12).clamp(1, 100));
+            loop {
             let mut combined = view.knowledge.list(&p)?;
             let returned_ids = returned_entry_ids(&combined);
+            let next_offset = combined.contains("\n\nContinue with offset=").then_some(p.offset.unwrap_or(0).saturating_add(returned_ids.len() as u64));
             // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
             // line belongs to the rows this caller actually got, and the
             // filter-resolution lines lead so an empty result explains
             // itself.
             let returned_legacy_rows = view.returned_rows_include_legacy_lane(&returned_ids);
-            view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
+            view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics.clone());
             if p.diagnostics_detail == Some(true) {
                 return exact_diagnostics_response(&view.diagnostics, &p);
             }
@@ -2299,22 +2325,6 @@ impl BlackboxServer {
             // top knowledge entry (not a packet/memory line).
             let top_entry_id = first_entry_id(&combined);
             let recall_ids = entry_ids(&combined);
-            if !recall_ids.is_empty() {
-                let recall_result = {
-                    let mut kb = server.state.kb.write();
-                    kb.record_recall(&recall_ids)
-                };
-                match recall_result {
-                    Ok(()) => {
-                        // Recall telemetry was always best-effort on this read path;
-                        // keep it write-behind rather than making queries wait for fsync.
-                        server.state.kb_persister.request();
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "knowledge recall telemetry update failed");
-                    }
-                }
-            }
 
             // Surface matching packets. Uses the same match semantics as
             // bbox_packet_list so the two tools agree on what "matches" means.
@@ -2340,7 +2350,7 @@ impl BlackboxServer {
                     .limit
                     .map(|limit| limit as usize)
                     .unwrap_or(DEFAULT_PACKET_SIDECAR_LIMIT)
-                    .min(25);
+                    .min(DEFAULT_PACKET_SIDECAR_LIMIT);
                 for pkt in matching_packets.iter().take(limit) {
                     let histogram: Vec<String> = pkt
                         .rules
@@ -2355,10 +2365,10 @@ impl BlackboxServer {
                     combined.push_str(&format!(
                         "[{}] Packet | domain: {} | scope: {} | {} rules [{}] | created {}\n",
                         pkt.id,
-                        pkt.domain,
-                        pkt.scope,
+                        compact_text_fragment(&pkt.domain, 200),
+                        compact_text_fragment(&pkt.scope, 64),
                         pkt.rules.len(),
-                        histogram.join(", "),
+                        compact_text_fragment(&histogram.join(", "), 256),
                         pkt.created_at,
                     ));
                 }
@@ -2391,7 +2401,7 @@ impl BlackboxServer {
                     .limit
                     .map(|limit| limit as usize)
                     .unwrap_or(DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT)
-                    .min(12);
+                    .min(DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT);
                 for m in memories.iter().take(limit) {
                     combined.push_str(&system_memory::format_for_signpost(m));
                     combined.push('\n');
@@ -2424,6 +2434,7 @@ impl BlackboxServer {
                 ));
             }
             let mut structured = view.structured_response(&returned_ids);
+            structured["page"] = json!({"offset":p.offset.unwrap_or(0),"count":returned_ids.len(),"next_offset":next_offset,"order":"live_ranked","continuation_note":"Keep filters unchanged; writes and recall updates can move rows."});
             structured["diagnostics"] = diagnostic_summary(&view.diagnostics, &p);
             bound_structured_knowledge_rows(&mut structured, &p);
             let diagnostic_text = diagnostic_summary_text(&structured["diagnostics"]);
@@ -2435,7 +2446,33 @@ impl BlackboxServer {
                 combined.push('\n');
             }
             combined = view.append_built_from_for_ids(combined, &returned_ids);
-            Ok((combined, structured))
+            let mut measured = CallToolResult::success(vec![rmcp::model::Content::text(combined.clone())]);
+            measured.structured_content = Some(structured.clone());
+            measured.is_error = Some(false);
+            if serde_json::to_vec(&measured)?.len() > Self::MCP_RESPONSE_CAP_BYTES {
+                let count = returned_ids.len();
+                anyhow::ensure!(count > 1, "knowledge summary metadata exceeds the response budget; use entry_detail or diagnostics_detail for exact bounded recovery");
+                p.limit = Some((count / 2).max(1) as u64);
+                continue;
+            }
+            if !recall_ids.is_empty() {
+                let recall_result = {
+                    let mut kb = server.state.kb.write();
+                    kb.record_recall(&recall_ids)
+                };
+                match recall_result {
+                    Ok(()) => {
+                        // Recall telemetry was always best-effort on this read path;
+                        // keep it write-behind rather than making queries wait for fsync.
+                        server.state.kb_persister.request();
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "knowledge recall telemetry update failed");
+                    }
+                }
+            }
+            return Ok((combined, structured));
+            }
         })
         .await
     }
@@ -3545,6 +3582,79 @@ mod tests {
             .await;
         assert_eq!(stale.is_error, Some(true), "{stale:?}");
         assert!(format!("{stale:?}").contains("stale detail cursor"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_knowledge_pages_bound_complete_envelopes_and_preserve_ranked_rows() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (base, _) = init_repo_with_worktree(&root);
+        let (server, record) = server_with_registered(&root, &base);
+        let large = "界\n\"metadata\"".repeat(2000);
+        for index in 0..80 {
+            let mut entry = stamped_entry(
+                &format!("entry{index:08}"),
+                "bounded recall fixture",
+                &record.project_id,
+            );
+            entry.title = format!("{large}{index:08}");
+            entry.providers = vec![large.clone(); 10];
+            entry.rationale = Some(large.clone());
+            server.state.kb.write().upsert_generated(entry).unwrap();
+        }
+        let mut offset = 0;
+        let mut seen = BTreeSet::new();
+        loop {
+            let result = server
+                .bbox_knowledge(Parameters(KnowledgeListParams {
+                    query: Some("bounded recall fixture".into()),
+                    mode: Some("substring".into()),
+                    limit: Some(100),
+                    offset: Some(offset),
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert!(
+                serde_json::to_vec(&result).unwrap().len()
+                    <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let value = result.structured_content.unwrap();
+            let rows = value["rows"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            for row in rows {
+                assert!(seen.insert(row["entity_ref"].as_str().unwrap().to_string()));
+            }
+            let Some(next) = value["page"]["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(seen.len(), 80);
+        let catalog = system_memory_catalog_response(&KnowledgeListParams {
+            category: Some("system_memory".into()),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            catalog
+                .lines()
+                .filter(|line| line.starts_with("[system]"))
+                .count(),
+            1
+        );
+        assert!(catalog.contains("offset=1"));
+        let invalid = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                entry_detail: Some("knowledge:entry00000000".into()),
+                offset: Some(1),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(invalid.is_error, Some(true));
     }
 
     #[tokio::test]

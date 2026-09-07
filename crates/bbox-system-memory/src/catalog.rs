@@ -287,15 +287,26 @@ const SIGNPOST_TAG_LIMIT: usize = 8;
 /// the body it wants — `bbox_knowledge(query="sm-<id>")` short-circuits to the
 /// full body via the exact-id path.
 pub fn format_for_signpost(memory: &SystemMemory) -> String {
+    let preview = |text: &str| {
+        let mut value: String = text.chars().take(160).collect();
+        if text.chars().count() > 160 {
+            value.push_str(" [truncated; exact memory read recovers this field]");
+        }
+        value
+    };
     let mut out = String::new();
-    out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
+    out.push_str(&format!(
+        "[system] {}: {}\n",
+        memory.id,
+        preview(&memory.title)
+    ));
     out.push_str(&format!("  ref: system_memory:{}\n", memory.id));
     if !memory.tags.is_empty() {
         let mut tags = memory
             .tags
             .iter()
             .take(SIGNPOST_TAG_LIMIT)
-            .cloned()
+            .map(|tag| preview(tag))
             .collect::<Vec<_>>();
         if memory.tags.len() > SIGNPOST_TAG_LIMIT {
             tags.push(format!("+{} more", memory.tags.len() - SIGNPOST_TAG_LIMIT));

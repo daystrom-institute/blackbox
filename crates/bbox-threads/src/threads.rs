@@ -10,6 +10,18 @@ use serde::{Deserialize, Serialize};
 use bbox_corpus_core::project_selector::project_scope_matches;
 use bbox_stores::store_persister::StoreSnapshot;
 
+fn thread_display(text: &str) -> String {
+    let mut end = text.len().min(200);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = text[..end].to_string();
+    if end < text.len() {
+        preview.push_str(" [truncated; read detail=metadata]");
+    }
+    preview
+}
+
 // ── embed-sink hook ────────────────────────────────────────────────
 //
 // The daemon registers `embed_queue::enqueue_thread` here at SharedState
@@ -654,7 +666,7 @@ impl Threads {
         enqueue_thread_embed(&thread);
 
         Ok(ThreadMutation {
-            message: format!("Thread created: {} — \"{}\"", id, topic),
+            message: format!("Thread created: {} - \"{}\"", id, thread_display(topic)),
             changed_thread: Some(thread),
             changed_edges,
         })
@@ -933,12 +945,15 @@ impl Threads {
         });
         thread.last_activity = now;
 
-        let topic = thread.topic.clone();
+        let topic = thread_display(&thread.topic);
         let thread_for_embed = thread.clone();
         enqueue_thread_embed(&thread_for_embed);
 
         Ok(ThreadMutation {
-            message: format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"),
+            message: format!(
+                "Thread {id} ({topic}): added {kind_str} edge to {}",
+                thread_display(target)
+            ),
             changed_thread: Some(thread_for_embed),
             changed_edges: true,
         })
@@ -1018,7 +1033,7 @@ impl Threads {
 
         thread.status = ThreadStatus::Active;
         thread.last_activity = now;
-        let topic = thread.topic.clone();
+        let topic = thread_display(&thread.topic);
         let thread_for_embed = thread.clone();
 
         enqueue_thread_embed(&thread_for_embed);
@@ -1060,7 +1075,7 @@ impl Threads {
         thread.status = ThreadStatus::Resolved;
         thread.last_activity = now.clone();
         thread.resolved_at = Some(now);
-        let topic = thread.topic.clone();
+        let topic = thread_display(&thread.topic);
         let thread_for_embed = thread.clone();
 
         // Workflow-origin threads are transient arc scaffolding: their
@@ -1131,7 +1146,7 @@ impl Threads {
         thread.promoted_to = Some(promoted_to.to_string());
         thread.last_activity = now.clone();
         thread.resolved_at = Some(now);
-        let topic = thread.topic.clone();
+        let topic = thread_display(&thread.topic);
         let thread_for_embed = thread.clone();
 
         let record_rider = match write_thread_record(&thread_for_embed) {
@@ -1147,7 +1162,10 @@ impl Threads {
         };
         enqueue_thread_embed(&thread_for_embed);
 
-        let mut message = format!("Thread {id} promoted to {promoted_to} — \"{topic}\"");
+        let mut message = format!(
+            "Thread {id} promoted to {}: \"{topic}\"",
+            thread_display(promoted_to)
+        );
         if let Some(rider) = record_rider {
             message.push_str(&rider);
         }
@@ -1175,13 +1193,16 @@ impl Threads {
 
         thread.name = Some(new_name.to_string());
         thread.last_activity = Self::now_iso();
-        let topic = thread.topic.clone();
+        let topic = thread_display(&thread.topic);
         let thread_for_embed = thread.clone();
 
         enqueue_thread_embed(&thread_for_embed);
 
         Ok(ThreadMutation {
-            message: format!("Thread {id} renamed to \"{new_name}\" (topic: {topic})"),
+            message: format!(
+                "Thread {id} renamed to \"{}\" (topic: {topic})",
+                thread_display(new_name)
+            ),
             changed_thread: Some(thread_for_embed),
             changed_edges: false,
         })
