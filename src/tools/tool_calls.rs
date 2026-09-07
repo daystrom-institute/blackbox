@@ -234,6 +234,7 @@ fn query_tool_calls(
             let context = json!({"file_path": locator, "byte_offset": offset});
             if serde_json::to_vec(&context)?.len() <= 4096
                 && !std::path::Path::new(&locator).is_absolute()
+                && !locator.starts_with("file:")
             {
                 row["context"] = context;
             } else if let Some(handle) = &reader {

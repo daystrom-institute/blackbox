@@ -252,7 +252,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_context",
-        description = "Read surrounding indexed events using a search hit's opaque locator and offset. Native replies disclose projection and freshness limits."
+        description = "Read surrounding indexed events by opaque locator and offset, or page an exact native stored record using its recovery handle. Native replies disclose projection and freshness limits."
     )]
     pub(crate) async fn bbox_context(
         &self,
