@@ -253,8 +253,21 @@ fn roadmap_preview(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn project_roadmap_response(p: &RoadmapParams, output: &str) -> anyhow::Result<String> {
-    // Mutation receipts retain their existing per-effect fields. Exact reads
-    // recompute only read operations, never a mutation or link repair.
+    // Keep committed IDs and per-effect fields exact; titles and messages
+    // can contain arbitrary stored prose after a successful durable write.
+    if matches!(p.action.as_str(), "create" | "update" | "promote") {
+        let mut receipt: serde_json::Value = serde_json::from_str(output)?;
+        for field in ["title", "message"] {
+            bbox_corpus_core::response_page::preview_field(&mut receipt, field, 256);
+        }
+        let id = receipt.get("id").or_else(|| receipt.get("existing_id"))
+            .cloned().or_else(|| p.id.as_ref().map(|id| serde_json::json!(id)));
+        if let Some(id) = id {
+            receipt["exact_reader"] = serde_json::json!({"action":"get", "id":id, "detail":"body"});
+        }
+        return Ok(receipt.to_string());
+    }
+    // Exact reads never rerun a mutation or link repair.
     if !matches!(p.action.as_str(), "get" | "list" | "search" | "next" | "render" | "default_template") {
         return Ok(output.to_owned());
     }
@@ -690,18 +703,14 @@ impl BlackboxServer {
             promoted_to: None,
             origin: None,
         };
-        let result = {
+        let thread_id = {
             let mut th = self.state.threads.write();
-            th.thread_mutation(&params, write_dir.as_deref())?.message
+            th.thread_mutation(&params, write_dir.as_deref())?
+                .changed_thread
+                .ok_or_else(|| anyhow::anyhow!("thread open did not return its created thread"))?
+                .id
         };
         self.state.persist_threads_durable().await?;
-
-        // Parse thread id from result string: "Thread created: <id> — \"<topic>\""
-        let thread_id = result
-            .strip_prefix("Thread created: ")
-            .and_then(|s| s.split(" — ").next())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("failed to parse thread id from: {}", result))?;
 
         // Record the SPOWNS edge
         {
@@ -1030,6 +1039,51 @@ mod projection_tests {
     use serde_json::{Value, json};
 
     fn params(value: Value) -> RoadmapParams { serde_json::from_value(value).unwrap() }
+
+    #[tokio::test]
+    async fn oversized_titles_keep_write_receipts_and_typed_promotion_ids_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(&root)));
+        let title = format!("Original {}", "界\n\"".repeat(20000));
+        let result = server.bbox_roadmap(Parameters(params(json!({
+            "action":"create", "title":title, "body":"fixture", "category":"feature", "scope":"global"
+        })))).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let receipt: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        let id = receipt["id"].as_str().unwrap().to_owned();
+        assert_eq!(receipt["title_truncated"], true);
+        assert_eq!(receipt["exact_reader"]["id"], id);
+        let title = format!("Updated {}", "界\n\"".repeat(20000));
+        let result = server.bbox_roadmap(Parameters(params(json!({
+            "action":"update", "id":id, "title":title
+        })))).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let result = server.bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id})))).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let promoted: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        let thread_id = promoted["thread_id"].as_str().unwrap();
+        assert!(server.state.threads.read().all().iter().any(|thread| thread.id == thread_id));
+        assert_eq!(server.state.roadmap.read().spawned_thread_ids(&id), vec![format!("thread:{thread_id}")]);
+        let result = server.bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id})))).await;
+        let repeated: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(repeated["already_promoted"], true);
+        assert_eq!(repeated["existing_thread_ids"], json!([format!("thread:{thread_id}")]));
+        let mut read = json!({"action":"get", "id":id, "detail":"body"});
+        let mut recovered = String::new();
+        loop {
+            let result = server.bbox_roadmap(Parameters(params(read.clone()))).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let page: Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            let Some(next) = page["body"]["next_cursor"].as_str() else { break; };
+            read["cursor"] = json!(next);
+        }
+        assert_eq!(serde_json::from_str::<Value>(&recovered).unwrap()["title"], title);
+    }
 
     #[test]
     fn roadmap_projection_refuses_mutation_and_contradictory_fields() {
