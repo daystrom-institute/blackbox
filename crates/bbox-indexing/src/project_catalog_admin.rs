@@ -177,7 +177,9 @@ pub fn attach_checkout(
 /// clears capability bits (strict validation forbids a detached row that
 /// claims active capability state), clears any default-attachment selection
 /// pointing at it, and leaves every logical store, entity ref, and
-/// generation untouched.
+/// generation untouched. A repeated detach at the caller's current epoch
+/// validates the pair in a new transaction without changing attachment fields,
+/// allowing the adapter to retry scoped auxiliary cleanup after partial success.
 pub fn detach_attachment(
     store: &ProjectCatalogStore,
     expected_epoch: u64,
@@ -194,10 +196,7 @@ pub fn detach_attachment(
             ));
         };
         if row.status == AttachmentStatus::Detached {
-            return Err(admin_error(
-                "error.project_catalog_admin_already_detached",
-                format!("attachment {attachment_id} is already detached"),
-            ));
+            return Ok(());
         }
         row.status = AttachmentStatus::Detached;
         row.detached_at = Some(detached_at.clone());
@@ -5435,15 +5434,19 @@ mod tests {
         assert!(!row.capabilities.any());
         assert!(state.attachments().default_attachments.is_empty());
 
-        // Detaching again refuses; stale epochs refuse.
-        let error = detach_attachment(
+        // Cleanup retries still require the current epoch, and preserve the
+        // original detach timestamp and all attachment evidence.
+        let before = serde_json::to_value(row).unwrap();
+        let epoch = current_epoch(&store);
+        let retry = detach_attachment(
             &store,
-            current_epoch(&store),
+            epoch,
             &receipt.attachment_id,
             "2026-07-24T00:00:02Z",
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), "error.project_catalog_admin_already_detached");
+        ).unwrap();
+        assert_eq!(retry.epoch, epoch + 1);
+        let state = store.snapshot().unwrap();
+        assert_eq!(serde_json::to_value(&state.attachments().attachments[&receipt.attachment_id]).unwrap(), before);
         let error = detach_attachment(&store, 1, &receipt.attachment_id, "t").unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_stale_epoch");
     }

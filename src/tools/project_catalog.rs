@@ -1404,7 +1404,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_detach",
-        description = "Detach one attachment: the row is marked detached with a timestamp, every logical store, entity ref, and generation is left untouched, and the catalog keeps its data. Census and watcher deregistration is scoped to the detached attachment's checkout and scope pair only, so a monorepo checkout carrying sibling attachments for other projects keeps their census rows and watcher coverage. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Detach one attachment: the row is marked detached with a timestamp, every logical store, entity ref, and generation is left untouched, and the catalog keeps its data. Census and watcher deregistration is scoped to the detached attachment's checkout and scope pair only, so a monorepo checkout carrying sibling attachments for other projects keeps their census rows and watcher coverage. Requires expected_catalog_epoch and a bounded audit_reason. After partial cleanup, repeat with the returned epoch to retry cleanup without reattaching; the validated retry advances the catalog epoch and preserves the original detach timestamp. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_detach(
         &self,
@@ -1446,6 +1446,7 @@ impl BlackboxServer {
             Ok(serde_json::to_string_pretty(&json!({
                 "status": if cleanup.failed() { "partial" } else { "ok" },
                 "catalog_detached": true,
+                "cleanup_retry": row.status == AttachmentStatus::Detached,
                 "attachment_id": attachment_id.as_str(),
                 "project_id": row.project_id.as_str(),
                 "checkout_id": row.checkout_id,
@@ -3052,6 +3053,27 @@ mod tests {
         assert_eq!(body["cleanup"]["watcher"], "failed");
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.attachments().attachments[&CatalogFixture::attachment()].status, AttachmentStatus::Detached);
+        let detached_at = snapshot.attachments().attachments[&CatalogFixture::attachment()].detached_at.clone();
+        server.state.bbox_watcher.clear_poison();
+        let stale = server.bbox_project_detach(Parameters(ProjectDetachParams {
+            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: epoch, audit_reason: "stale cleanup retry".into(),
+        })).await;
+        assert_eq!(stale.is_error, Some(true));
+        assert!(error_text(&stale).contains("error.project_catalog_stale_epoch"));
+        let retry = server.bbox_project_detach(Parameters(ProjectDetachParams {
+            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: snapshot.epoch(), audit_reason: "cleanup retry".into(),
+        })).await;
+        assert_ne!(retry.is_error, Some(true));
+        let retry: serde_json::Value = serde_json::from_str(&error_text(&retry)).unwrap();
+        assert_eq!(retry["status"], "ok");
+        assert_eq!(retry["cleanup_retry"], true);
+        assert_eq!(retry["catalog_detached"], true);
+        assert_eq!(retry["cleanup"]["watcher"], "not_registered");
+        let snapshot = store.snapshot().unwrap();
+        let row = &snapshot.attachments().attachments[&CatalogFixture::attachment()];
+        assert_eq!(row.status, AttachmentStatus::Detached);
+        assert_eq!(row.detached_at, detached_at);
+        assert!(!row.capabilities.any());
         assert!(!DetachCleanup::from_results(Ok(false), Ok(false)).failed());
     }
 
