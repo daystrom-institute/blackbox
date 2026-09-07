@@ -43,7 +43,7 @@ fn default_true() -> bool {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_migrate_legacy_edges",
-        description = "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Selectors (project_id, operator alias, registered path) resolve through one authority in both modes; unknown selectors fail both. Dry-run plans are paged."
+        description = "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Selectors (project_id, operator alias, registered path) resolve through one authority in both modes; unknown selectors fail both. Dry-run plans are paged; only selected page targets are planned after sidecar discovery."
     )]
     pub(crate) async fn bbox_storage_migrate_legacy_edges(
         &self,
@@ -77,24 +77,10 @@ pub(crate) fn run_storage_migration(
             ),
             None => resolve_dry_run_targets(&registered, &edges_dir),
         };
-        let mut results = Vec::new();
-        for project_id in targets {
-            match edge_index::plan_legacy_edge_extraction(&edges_dir, &project_id) {
-                Ok(plan) => {
-                    results.push(serde_json::to_value(&plan).unwrap_or_default());
-                }
-                Err(err) => {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("project_id".into(), serde_json::Value::String(project_id));
-                    obj.insert("error".into(), serde_json::Value::String(err.to_string()));
-                    results.push(serde_json::Value::Object(obj));
-                }
-            }
-        }
-        let mut page = bbox_corpus_core::response_page::collection_page(
-            results, "projects", p.limit, p.offset,
-        )?;
-        page["mode"] = serde_json::json!("dry_run");
+        let mut page = migration_plan_page(targets, p, |project_id| {
+            let plan = edge_index::plan_legacy_edge_extraction(&edges_dir, project_id)?;
+            Ok(serde_json::to_value(plan)?)
+        })?;
         if p.project.is_none() {
             page["unregistered_sidecars_skipped"] =
                 serde_json::json!(unregistered_sidecars_skipped);
@@ -116,6 +102,28 @@ pub(crate) fn run_storage_migration(
         "mode": "apply",
         "migration": manifest,
     }))?)
+}
+
+fn migration_plan_page(
+    targets: Vec<String>,
+    p: &StorageMigrationParams,
+    mut plan: impl FnMut(&str) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let total = targets.len();
+    let offset = p.offset.unwrap_or(0);
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    // Identify the requested page before opening sidecar contents. A small
+    // response should not re-plan every other project's migration.
+    let rows = targets.into_iter().skip(offset).take(limit).map(|project_id| {
+        plan(&project_id).unwrap_or_else(|error| serde_json::json!({
+            "project_id": project_id, "error": error.to_string(),
+        }))
+    }).collect::<Vec<_>>();
+    bbox_corpus_core::response_page::bound_page(serde_json::json!({
+        "mode": "dry_run", "offset": offset, "limit": limit,
+        "total": total, "count": rows.len(), "projects": rows,
+        "view": "Live project-order inventory; restart at offset=0 after lifecycle changes.",
+    }), "projects")
 }
 
 /// A03: one authoritative selector contract for dry-run and apply. The
@@ -331,6 +339,20 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["next_offset"], serde_json::Value::Null);
         assert_eq!(value["projects"][0]["project_id"], ids[2]);
+    }
+
+    #[test]
+    fn preview_only_plans_requested_page_targets() {
+        let mut planned = Vec::new();
+        let page = migration_plan_page((0..50).map(|id| format!("p_{id:02}")).collect(),
+            &StorageMigrationParams { dry_run: true, project: None, limit: Some(2), offset: Some(30) },
+            |id| {
+                planned.push(id.to_owned());
+                Ok(serde_json::json!({"project_id":id}))
+            }).unwrap();
+        assert_eq!(planned, ["p_30", "p_31"]);
+        assert_eq!(page["total"], 50);
+        assert_eq!(page["next_offset"], 32);
     }
 
     #[test]
