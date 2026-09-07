@@ -686,11 +686,13 @@ pub(crate) struct BrofileParams {
     /// rejects it. Unknown scopes are refused before any store access.
     #[serde(default)]
     pub(crate) scope: Option<String>,
-    /// Owner-host project directory for scope=project; ignored-when-absent is
-    /// not supported: global scope rejects a supplied project_dir.
+    /// Absolute owner-host project directory for scope=project in local bridge
+    /// mode. Catalog mode refuses project brofiles because no remote owner
+    /// transport exists. Global scope rejects a supplied project_dir.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
-    /// Exact get/get_account or list_accounts inventory: pass body.next_cursor unchanged. A
+    /// Exact get/get_account, list_accounts inventory, or provider-default reads:
+    /// pass body.next_cursor unchanged. A
     /// changed record or selector refuses continuation; restart without
     /// cursor.
     #[serde(default)]

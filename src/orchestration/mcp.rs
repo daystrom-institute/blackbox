@@ -684,7 +684,8 @@ pub struct McpToolParams {
     #[serde(default)]
     pub scope: Option<String>,
     /// Project selector for scope=project, resolved daemon-side to the
-    /// durable store key. Omit for global scope.
+    /// durable store key in local bridge mode. Catalog mode refuses project
+    /// configuration because no remote owner transport exists. Omit for global scope.
     #[serde(default)]
     pub project: Option<String>,
     /// Filter pattern for allow/disallow (e.g. `mcp__blackbox__bro_*`).
@@ -755,7 +756,7 @@ pub fn handle(p: &McpToolParams) -> Result<McpToolReply> {
 /// Closed scope vocabulary plus scope/project pairing, checked before any
 /// store access so typos cannot widen into global/effective lookup and a
 /// supplied project selector cannot be silently ignored.
-fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
+pub(crate) fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
     use McpAction::*;
     anyhow::ensure!(
         matches!(p.action, List) || (p.limit.is_none() && p.offset.is_none()),

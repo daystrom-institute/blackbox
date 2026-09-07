@@ -364,10 +364,20 @@ impl BlackboxServer {
 
     fn bro_brofile_sync(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
-        let exact = matches!(p.action.as_str(), "get" | "get_account" | "list_accounts");
+        if let Err(error) = validate_brofile_params(&p) {
+            return Self::err_text(&error.to_string());
+        }
+        let exact = matches!(
+            p.action.as_str(),
+            "get"
+                | "get_account"
+                | "list_accounts"
+                | "get_provider_default"
+                | "list_provider_defaults"
+        );
         if !exact && (p.cursor.is_some() || p.body_limit.is_some()) {
             return Self::err_text(
-                "cursor and body_limit require get, get_account, or list_accounts",
+                "cursor and body_limit require get, get_account, list_accounts, get_provider_default, or list_provider_defaults",
             );
         }
         if !matches!(p.action.as_str(), "list" | "list_accounts")
@@ -415,6 +425,29 @@ impl BlackboxServer {
             );
         }
 
+        if let Some(project) = project_dir {
+            if !Path::new(project).is_absolute() {
+                return Self::err_text("project_dir must be an absolute owner-host directory");
+            }
+            if !self.state.project_authority.is_bridge() {
+                return Self::err_text(
+                    "error.brofile_locality_required: project .bro/brofiles have no remote owner transport; use the checkout owner's file tools or scope=global with no project_dir. No project configuration was read or changed",
+                );
+            }
+        }
+        let account_config = if account_scoped
+            && !matches!(
+                p.action.as_str(),
+                "set_account" | "set_provider_default" | "clear_provider_default"
+            ) {
+            match brofile::read_config(store_dir) {
+                Ok(config) => Some(config),
+                Err(error) => return Self::err_text(&format!("error.config_unavailable: {error}")),
+            }
+        } else {
+            None
+        };
+
         match p.action.as_str() {
             "create" => {
                 let name = match &p.name {
@@ -455,21 +488,21 @@ impl BlackboxServer {
                 Self::ok_json(&json!({
                     "created": name,
                     "scope": scope,
-                    "summary": {
-                        "name": bf.name,
-                        "provider": bf.provider,
-                        "account": bf.account,
-                        "model": bf.model,
-                        "effort": bf.effort,
-                        "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
-                    },
+                    "summary": brofile::summary_row(&bf),
                     "detail_hint": format!(
-                        "bro_brofile(action=\"get\", name=\"{name}\", scope=\"{scope}\") returns the exact stored brofile as bounded body pages"
+                        "bro_brofile(action=\"get\", name=\"{name}\", scope=\"{scope}\") with the same project_dir returns the exact stored brofile as bounded body pages"
                     ),
                 }))
             }
             "list" => {
-                let list = brofile::list_brofiles(scope, store_dir, project_dir);
+                let list = match brofile::read_brofiles(scope, store_dir, project_dir) {
+                    Ok(list) => list,
+                    Err(error) => {
+                        return Self::err_text(&format!(
+                            "error.brofile_store_unavailable: {error}"
+                        ));
+                    }
+                };
                 let provider = match p
                     .provider
                     .as_deref()
@@ -479,21 +512,24 @@ impl BlackboxServer {
                     Ok(provider) => provider,
                     Err(_) => return Self::err_text("Unknown provider"),
                 };
-                Self::ok_json(&brofile::list_summary_page(
+                match brofile::list_summary_page(
                     list,
                     provider,
                     p.name.as_deref(),
                     p.offset.unwrap_or(0),
                     p.limit.unwrap_or(20),
-                ))
+                ) {
+                    Ok(page) => Self::ok_json(&page),
+                    Err(error) => Self::err_text(&format!("brofile inventory: {error}")),
+                }
             }
             "get" => {
                 let name = match &p.name {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                match brofile::get_brofile(name, scope, store_dir, project_dir) {
-                    Some(bf) => {
+                match brofile::read_brofile(name, scope, store_dir, project_dir) {
+                    Ok(Some(bf)) => {
                         let value = serde_json::to_value(&bf).unwrap_or_default();
                         let selection = brofile_selection(scope, store_dir, project_dir, name);
                         match super::body_page::json_body_page(
@@ -505,20 +541,18 @@ impl BlackboxServer {
                             Ok(body) => Self::ok_json(&json!({
                                 "name": name,
                                 "scope": scope,
-                                "summary": {
-                                    "name": bf.name,
-                                    "provider": bf.provider,
-                                    "account": bf.account,
-                                    "model": bf.model,
-                                    "effort": bf.effort,
-                                    "has_lens": bf.lens.as_ref().is_some_and(|lens| !lens.is_empty()),
-                                },
+                                "summary": brofile::summary_row(&bf),
                                 "body": body,
                             })),
                             Err(error) => Self::err_text(&format!("Error: {error:#}")),
                         }
                     }
-                    None => Self::err_text(&format!("Brofile not found in {scope} scope: {name}")),
+                    Ok(None) => {
+                        Self::err_text(&format!("Brofile not found in {scope} scope: {name}"))
+                    }
+                    Err(error) => {
+                        Self::err_text(&format!("error.brofile_store_unavailable: {error}"))
+                    }
                 }
             }
             "delete" => {
@@ -526,10 +560,10 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                if brofile::delete_brofile(name, scope, store_dir, project_dir) {
-                    Self::ok_json(&json!({"deleted": name}))
-                } else {
-                    Self::err_text(&format!("Brofile not found: {name}"))
+                match brofile::remove_brofile(name, scope, store_dir, project_dir) {
+                    Ok(true) => Self::ok_json(&json!({"deleted":name})),
+                    Ok(false) => Self::err_text(&format!("Brofile not found: {name}")),
+                    Err(error) => Self::err_text(&format!("Brofile removal failed: {error}")),
                 }
             }
             "set_account" => {
@@ -543,12 +577,10 @@ impl BlackboxServer {
                     brofile::account_summary_row(name, account)
                 }) {
                     Ok(summary) => Self::ok_json(&json!({
-                        "account": name,
+                        "account": super::agents::preview_text(name, 256),
                         "updated": true,
                         "summary": summary,
-                        "detail_hint": format!(
-                            "get_account(name=\"{name}\") pages the exact redacted key/policy projection"
-                        ),
+                        "detail_hint": "bro_brofile(action=list_accounts, body_limit=4096) recovers exact identities; get_account with the original name pages redacted policy",
                     })),
                     Err(error) => Self::err_text(&format!("Configuration was not saved: {error}")),
                 }
@@ -559,7 +591,7 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                match brofile::load_account(name, store_dir) {
+                match account_config.as_ref().unwrap().accounts.get(name) {
                     Some(account) => {
                         let value = account.response_view();
                         let selection = format!("account:{}:{name}", store_identity(store_dir));
@@ -570,7 +602,7 @@ impl BlackboxServer {
                             p.body_limit,
                         ) {
                             Ok(body) => Self::ok_json(&json!({
-                                "name": name,
+                                "name": super::agents::preview_text(name, 256),
                                 "body": body,
                             })),
                             Err(error) => Self::err_text(&format!("Error: {error:#}")),
@@ -581,7 +613,7 @@ impl BlackboxServer {
             }
 
             "list_accounts" => {
-                let config = brofile::load_config(store_dir);
+                let config = account_config.as_ref().unwrap();
                 if p.cursor.is_some() || p.body_limit.is_some() {
                     if p.limit.is_some() || p.offset.is_some() {
                         return Self::err_text(
@@ -646,7 +678,8 @@ impl BlackboxServer {
                     return Self::err_text(&format!("Configuration was not saved: {error}"));
                 }
                 Self::ok_json(
-                    &json!({"provider": provider.as_str(), "account": account, "updated": true}),
+                    &json!({"provider":provider.as_str(), "account":super::agents::preview_text(&account, 256),
+                    "updated":true, "detail_hint":"get_provider_default with the same provider pages the exact mapping"}),
                 )
             }
             "get_provider_default" => {
@@ -658,17 +691,52 @@ impl BlackboxServer {
                     Some(p) => p,
                     None => return Self::err_text("valid provider is required"),
                 };
-                let account = brofile::provider_default_account(provider, store_dir);
-                Self::ok_json(&json!({"provider": provider.as_str(), "account": account}))
+                let account = account_config
+                    .as_ref()
+                    .unwrap()
+                    .provider_defaults
+                    .get(&provider)
+                    .map(|entry| &entry.account);
+                let mapping = json!({"provider":provider.as_str(), "account":account});
+                if p.cursor.is_none()
+                    && p.body_limit.is_none()
+                    && serde_json::to_vec(&mapping).is_ok_and(|b| b.len() < 1024)
+                {
+                    return Self::ok_json(&mapping);
+                }
+                match super::body_page::json_body_page(
+                    &format!("provider-default:{}:{provider}", store_identity(store_dir)),
+                    &mapping,
+                    p.cursor.as_deref(),
+                    p.body_limit,
+                ) {
+                    Ok(body) => Self::ok_json(&json!({"provider":provider.as_str(),"body":body})),
+                    Err(error) => Self::err_text(&format!("provider default page: {error}")),
+                }
             }
             "list_provider_defaults" => {
-                let config = brofile::load_config(store_dir);
+                let config = account_config.unwrap();
                 let defaults: std::collections::HashMap<String, String> = config
                     .provider_defaults
                     .into_iter()
                     .map(|(provider, entry)| (provider.to_string(), entry.account))
                     .collect();
-                Self::ok_json(&serde_json::to_value(defaults).unwrap_or_default())
+                let value = json!(defaults);
+                if p.cursor.is_none()
+                    && p.body_limit.is_none()
+                    && serde_json::to_vec(&value).is_ok_and(|b| b.len() < 2048)
+                {
+                    return Self::ok_json(&value);
+                }
+                match super::body_page::json_body_page(
+                    &format!("provider-defaults:{}", store_identity(store_dir)),
+                    &value,
+                    p.cursor.as_deref(),
+                    p.body_limit,
+                ) {
+                    Ok(body) => Self::ok_json(&json!({"body":body})),
+                    Err(error) => Self::err_text(&format!("provider defaults page: {error}")),
+                }
             }
             "clear_provider_default" => {
                 let provider = match p
@@ -908,6 +976,75 @@ impl BlackboxServer {
     clippy::disallowed_methods,
     reason = "bro_brofile runs its store operations on spawn_blocking; tests use isolated fixture directories"
 )]
+fn validate_brofile_params(p: &BrofileParams) -> anyhow::Result<()> {
+    let action = p.action.as_str();
+    anyhow::ensure!(
+        matches!(
+            action,
+            "create"
+                | "list"
+                | "get"
+                | "delete"
+                | "get_account"
+                | "set_account"
+                | "list_accounts"
+                | "get_provider_default"
+                | "set_provider_default"
+                | "list_provider_defaults"
+                | "clear_provider_default"
+        ),
+        "Unknown brofile action"
+    );
+    if matches!(action, "create" | "get" | "delete") {
+        let name = p
+            .name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+        validate_team_object_name(name)?;
+    }
+    anyhow::ensure!(
+        action == "create"
+            || (p.lens.is_none()
+                && p.model.is_none()
+                && p.effort.is_none()
+                && p.tool_defaults.is_none()
+                && p.allow_tools.is_none()
+                && p.disallow_tools.is_none()
+                && p.surface.is_none()
+                && p.context.is_none()
+                && p.code_mode.is_none()
+                && p.service_tier.is_none()),
+        "persona configuration fields require action=create"
+    );
+    anyhow::ensure!(
+        action == "set_account" || p.env.is_none(),
+        "env requires action=set_account"
+    );
+    anyhow::ensure!(
+        matches!(action, "create" | "set_provider_default") || p.account.is_none(),
+        "account requires action=create or set_provider_default"
+    );
+    anyhow::ensure!(
+        matches!(
+            action,
+            "create"
+                | "list"
+                | "get_provider_default"
+                | "set_provider_default"
+                | "clear_provider_default"
+        ) || p.provider.is_none(),
+        "provider does not apply to this action"
+    );
+    anyhow::ensure!(
+        matches!(
+            action,
+            "create" | "list" | "get" | "delete" | "get_account" | "set_account"
+        ) || p.name.is_none(),
+        "name does not apply to this action"
+    );
+    Ok(())
+}
+
 fn store_identity(dir: &Path) -> String {
     std::fs::canonicalize(dir)
         .map(|path| path.to_string_lossy().into_owned())
@@ -1680,10 +1817,14 @@ mod tests {
             "set_provider_default",
             "clear_provider_default",
         ] {
-            let params: BrofileParams = serde_json::from_value(json!({
-                "action": action, "name": "synthetic", "provider": "brodex", "account": "synthetic",
-            }))
-            .unwrap();
+            let args = match action {
+                "set_account" => json!({"action":action,"name":"synthetic"}),
+                "set_provider_default" => {
+                    json!({"action":action,"provider":"brodex","account":"synthetic"})
+                }
+                _ => json!({"action":action,"provider":"brodex"}),
+            };
+            let params: BrofileParams = serde_json::from_value(args).unwrap();
             let result = server.bro_brofile_sync(Parameters(params));
             assert_eq!(
                 result.is_error,
@@ -1705,6 +1846,86 @@ mod tests {
             std::fs::read_to_string(path.join("retained")).unwrap(),
             "existing-data"
         );
+    }
+
+    #[test]
+    fn configuration_reads_report_corruption_without_empty_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let path = server.state.store_dir.join("config.json");
+        std::fs::write(&path, b"{synthetic corrupt account").unwrap();
+        for args in [
+            json!({"action":"list_accounts"}),
+            json!({"action":"get_account","name":"synthetic"}),
+            json!({"action":"get_provider_default","provider":"brodex"}),
+            json!({"action":"list_provider_defaults"}),
+        ] {
+            let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
+            assert_eq!(reply.is_error, Some(true));
+            assert!(extract_text(&reply).contains("config_unavailable"));
+        }
+        let dir = server.state.store_dir.join("brofiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("synthetic.json"), b"{bad brofile").unwrap();
+        for args in [
+            json!({"action":"list"}),
+            json!({"action":"get","name":"synthetic"}),
+        ] {
+            let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
+            assert_eq!(reply.is_error, Some(true));
+            assert!(extract_text(&reply).contains("brofile_store_unavailable"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"{synthetic corrupt account");
+    }
+
+    #[test]
+    fn catalog_brofile_project_calls_refuse_before_filesystem_access() {
+        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        let server = fixture.server();
+        for action in ["list", "get", "create", "delete"] {
+            let mut args = json!({"action":action,"scope":"project","project_dir":"/synthetic/owner-checkout"});
+            if action != "list" {
+                args["name"] = json!("synthetic");
+            }
+            if action == "create" {
+                args["provider"] = json!("brodex");
+            }
+            let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
+            assert_eq!(reply.is_error, Some(true));
+            assert!(extract_text(&reply).contains("brofile_locality_required"));
+        }
+    }
+
+    #[test]
+    fn large_provider_default_mutation_has_bounded_receipt_and_exact_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let account = "synthetic-界\"".repeat(4000);
+        let reply = server.bro_brofile_sync(Parameters(
+            serde_json::from_value(json!({
+                "action":"set_provider_default","provider":"brodex","account":account
+            }))
+            .unwrap(),
+        ));
+        assert_ne!(reply.is_error, Some(true));
+        assert!(serde_json::to_vec(&reply).unwrap().len() < 4096);
+        let mut cursor = None;
+        let mut recovered = String::new();
+        loop {
+            let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(json!({
+                "action":"get_provider_default","provider":"brodex","body_limit":4096,"cursor":cursor
+            })).unwrap()));
+            assert_ne!(reply.is_error, Some(true));
+            assert!(serde_json::to_vec(&reply).unwrap().len() < 16 * 1024);
+            let page: Value = serde_json::from_str(&extract_text(&reply)).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mapping: Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(mapping["account"], account);
     }
 
     #[test]
