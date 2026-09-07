@@ -1,192 +1,66 @@
-# Roadmap Tool
+# Historical roadmap records
 
-`bbox_roadmap` is an operator-directed prospective work tracker:
-designed-but-not-implemented features, refactors, explorations, tech debt,
-and risks. It sits in a distinct time band from the other stores - inbox is
-reactive, threads are active, knowledge is atemporal. The roadmap tracks the
-*future*.
+`bbox_roadmap` is a read-only compatibility surface. New roadmap writes,
+promotion, link changes, and link repair are retired. Stored items, transition
+history, and relationships remain intact. Retirement does not change an item's
+stored status or declare its work completed.
 
-Roadmap interactions are performed only at the express direction of the
-operator. Agents must not create, update, rank, promote, or render roadmap
-items as an agent-selected deferral path. If the operator requested
-implementation, do the implementation unless the operator explicitly redirects
-the work to roadmap tracking.
+## Read and export
 
-The [blackbox project roadmap](roadmap.md) is the generated output of
-this tool applied to this repo. This page explains the tool itself.
+- `get`, `list`, and `search` inspect retained items.
+- `next` ranks retained accepted items using the historical ranking function.
+  It is a read-only view, not an execution or commitment decision.
+- `render` and `default_template` return inline projections for the caller to
+  apply. The historical default template omits delivered and rejected items;
+  `list` without status filters is the complete inventory.
+- Summaries are bounded. `list`/`search` accept `limit` (default 20, max 100)
+  and `offset`; `next` uses `n`/`offset`. Follow `next_offset` against the live
+  view.
+- `detail="body"` returns exact JSON body pages. Repeat the same read and
+  selectors with `cursor=body.next_cursor`, concatenate `body.text`, and parse
+  JSON. Rendered markdown and template source are JSON strings. Changed
+  content or selection rejects a cursor. Omit row limits/offsets for body reads.
 
-## Item model
+Every MCP read labels its lifecycle `historical_read_only`. The stored record
+and the exact body retain their original fields and bytes. `roadmap_item:`
+entity refs and the eight `ROADMAP_*` edge types remain available through graph
+retrieval. Schema orientation identifies them as historical.
 
-Each roadmap item has:
+`create`, `update`, `delete`, `promote`, `link`, `unlink`, and `repair_links`
+return `error.roadmap_mutation_retired` before changing roadmap or thread state.
+Legacy requests get this specific refusal even though discovery advertises
+only the six historical read actions. There is no bypass flag.
 
-| Field | Values |
-|---|---|
-| `status` | `proposed` → `accepted` / `rejected`; `accepted` → `deferred`; `deferred` → `accepted`; `rejected` → `proposed` |
-| `category` | `feature`, `refactor`, `exploration`, `debt`, `risk`, `infrastructure` |
-| `priority` | `high`, `medium`, `low` |
-| `scope` | `global` or `project` (project-scoped requires `project` path) |
+## New work
 
-Items also carry a transition history (who moved it, when, and why).
+This repository already has `dsg:Campaign`, `dsg:Inquiry`, and `dsg:Concept`
+vertices in its committed design graph. Use the existing
+[design graph operations](design-graph.md): list/show before creating, stage
+changes through `scripts/design-graph`, and use `apply --dry-run`, `check`,
+and `lint` to validate. `frontier` and `blockers` are existing planning reads.
+The documented commitment gate still applies: agents may propose, while
+campaign status changes and other binding decisions require operator
+ratification. The script is a checkout-owned writer, not a remote MCP mutation
+endpoint, and does not mechanically enforce all human authority rules.
 
-## Edge kinds
+For active execution, read the historical item and explicitly open a
+`bbox_thread` with the necessary context. This does not migrate the record or
+create a new roadmap edge. Do not turn requested implementation into a new
+planning entry merely to defer it.
 
-Link items to related entities in the corpus:
+Other projects retain ownership of their own plans. This repository's design
+graph is not a migration destination for another project's private records.
+Choose any conversion in the owning project, preserving source identity,
+status history, scope, and links with an explicit mapping. No automatic
+roadmap-to-graph converter is shipped by this milestone.
 
-| Kind | Purpose |
-|---|---|
-| `designed_in` | Design doc that fully specifies the item |
-| `spawns` | Work thread opened when the item was promoted |
-| `deferred_from` | Thread or event that caused the deferral |
-| `depends_on` | Another roadmap item this one needs first |
-| `blocked_by` | Entity (task, thread, decision) blocking progress |
-| `supersedes` | Item this one replaces |
-| `subsumes` | Item absorbed into this one |
-| `related_to` | General cross-reference |
+## Preservation
 
-## Actions
+The configured roadmap JSON store and its project ownership adapters remain.
+Catalog migration, project relocation, and persistence can still preserve and
+re-scope historical data. Indexing and embedding continue to support retrieval.
+No startup deletion, status rewrite, or graph-edge purge is introduced.
 
-### `create`
-
-Add a roadmap item. Starts in `proposed` status.
-
-```
-bbox_roadmap(
-  action="create",
-  title="Disk-backed WaitStore",
-  body="Suspended arcs lose their wait registrations on daemon restart. Persist to disk.",
-  category="infrastructure",
-  priority="high",
-  scope="project",
-  project="/repo/x"
-)
-```
-
-Duplicate guard: returns `{duplicate: true, existing_id: ...}` if a
-title match already exists.
-
-### `get` / `list` / `search`
-
-```
-bbox_roadmap(action="get", id="rm-a1b2c3d4")
-bbox_roadmap(action="list", project="/repo/x", status="accepted")
-bbox_roadmap(action="search", query="wait store", category="infrastructure")
-```
-
-### `update`
-
-Change title, body, status, category, or priority. Status transitions
-are validated against the allowed graph.
-
-```
-bbox_roadmap(action="update", id="rm-a1b2c3d4", status="accepted", priority="high")
-```
-
-### `next`
-
-Rank accepted items by priority, staleness, and design-link health. Use this
-only when the operator asks for roadmap-based planning or asks what accepted
-roadmap item should be worked next.
-
-```
-bbox_roadmap(action="next", n=5, project="/repo/x")
-bbox_roadmap(action="next", n=10, include_blocked=true)
-```
-
-Items with a `designed_in` link rank higher (the design already exists;
-implementation is the remaining step). Items with `blocked_by` edges are
-filtered out unless `include_blocked=true`.
-
-### `promote`
-
-Spin an accepted roadmap item into an active work thread. Injects the
-item's body and design links as the thread's context. Use this only when the
-operator explicitly asks to promote a roadmap item or start work from one.
-
-```
-bbox_roadmap(action="promote", id="rm-a1b2c3d4", project_dir="/repo/x")
-bbox_roadmap(action="promote", id="rm-a1b2c3d4", brofile="executor", project_dir="/repo/x")
-```
-
-Returns the opened `thread_id` and a `spawns` edge linking the item to
-the thread.
-
-### `link` / `unlink`
-
-```
-bbox_roadmap(
-  action="link",
-  id="rm-a1b2c3d4",
-  link_type="designed_in",
-  link_target="knowledge:ab12cd34",
-  link_note="Phase 1 of design/corpus/commit-work-provenance.md"
-)
-bbox_roadmap(action="unlink", id="rm-a1b2c3d4", link_type="depends_on", link_target="rm-efgh5678")
-```
-
-### `repair_links`
-
-Validate all edges for an item (or the full store). Reports dangling
-references - `designed_in` pointing to a deleted knowledge entry,
-`spawns` pointing to a resolved thread, etc.
-
-```
-bbox_roadmap(action="repair_links", dry_run=true)          # full store
-bbox_roadmap(action="repair_links", id="rm-a1b2c3d4")      # single item
-```
-
-### `render`
-
-Emit the roadmap as markdown, grouped by status and sorted by priority.
-The tool returns markdown. The caller decides whether and where to apply it
-on its own checkout.
-
-```
-bbox_roadmap(action="render")
-bbox_roadmap(action="render", template="# Roadmap\n{{ project }}")
-```
-
-The generated file carries a `<!-- Generated by blackbox -->` header.
-Do not edit it by hand - changes are overwritten on the next render.
-
-### `delete`
-
-Remove an item and all its edges.
-
-```
-bbox_roadmap(action="delete", id="rm-a1b2c3d4")
-```
-
-## Typical flow
-
-The flow below is operator-directed. It is not a license for an agent to avoid
-requested implementation by filing or promoting roadmap work on its own.
-
-```
-# Propose an item
-bbox_roadmap(action="create", title="...", body="...", category="feature", ...)
-
-# Accept it and link its design doc
-bbox_roadmap(action="update", id="rm-...", status="accepted")
-bbox_roadmap(action="link", id="rm-...", link_type="designed_in", link_target="knowledge:...")
-
-# Decide what to work on
-bbox_roadmap(action="next", n=5)
-
-# Start a thread and code
-bbox_roadmap(action="promote", id="rm-...", project_dir="/repo/x")
-
-# Regenerate the published roadmap page
-bbox_roadmap(action="render")
-```
-
-## Storage
-
-Items persist to `~/.local/share/blackbox/roadmap.json` (path follows
-`BBOX_DATA_DIR` if set). The store is a flat JSON array - no external
-database.
-
-
-MCP render returns markdown. `write_path` and `template_path` are retired and
-refused before rendering; provide Tera source through `template` and let the
-caller apply returned content on its own checkout. MCP rendering never consults
-server-local project configuration for implicit file destinations or templates.
+The checked-in [roadmap snapshot](roadmap.md) is historical output, not the
+current planning source. The [retirement milestone](../design/surfaces/mcp/roadmap-retirement.md)
+records consumer evidence and the remaining per-owner migration decision.

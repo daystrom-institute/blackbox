@@ -99,7 +99,7 @@ impl ToolCategory {
                 "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
             Self::Roadmap => {
-                "Operator-directed prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Use `action=\"next\"` to rank accepted items, and `action=\"promote\"` to spin a roadmap item into a work thread."
+                "Historical roadmap records are read-only. Use bbox_roadmap to inspect or export retained items; never use the roadmap to defer requested implementation. New prospective concepts and inquiries belong in the owning project's planning graph; active execution belongs in bbox_thread."
             }
             Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
@@ -975,9 +975,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_roadmap",
         category: ToolCategory::Roadmap,
-        summary: "Use the roadmap only at the express direction of the operator; never use the roadmap to defer requested work. Reads return bounded summaries. list/search use limit/offset; next uses n/offset (max 100). detail=body and cursor recover exact JSON, including markdown as JSON strings. Paging controls are rejected for mutations.",
-        when_to_use: "Use only when the operator explicitly asks to manage future work, review what's designed but not yet built, decide what to work on next, or promote a specific roadmap item. Do not initiate roadmap actions as an agent-selected deferral path; if the operator requested implementation, do the implementation unless they explicitly redirect it to roadmap tracking. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from). `action=\"render\"` emits a Tera-templated markdown artifact; pass `template` (inline Tera source) to customise layout and which statuses are included - `delivered`/`rejected` are excluded from the default template. `action=\"default_template\"` returns the built-in Tera source as a starting point. Render returns markdown for caller-owned application; write_path/template_path are rejected and server-local configuration cannot choose implicit file destinations. Read summaries are bounded. list/search accept limit/offset; next uses n/offset. Follow next_offset against a live selection. detail=body returns exact JSON pages for get/list/search/next/render/default_template; markdown is encoded as a JSON string. Paging selectors are rejected for mutations. Create/update/promote bound display titles and preserve IDs plus exact get/body recovery. Invalid status transitions leave all fields unchanged; promotion uses the typed created-thread identity.",
-        example: Some(r#"bbox_roadmap(action="next", n=5)"#),
+        summary: "Read historical roadmap records. All mutation actions, including promotion and repair_links, are retired. Bounded reads and exact JSON recovery remain available; stored data and graph relations are preserved.",
+        when_to_use: "Use get/list/search to recover historical items. next only ranks retained accepted items; it does not create work. list/search accept limit/offset; next uses n/offset. render/default_template export inline projections for caller-owned application. detail=body plus cursor recovers exact JSON with unchanged selectors, including markdown as JSON strings. create/update/delete/promote/link/unlink/repair_links refuse before effects with error.roadmap_mutation_retired. For new prospective concepts/inquiries use the owning project's planning graph and its authorized writer; this repository documents scripts/design-graph in docs/design-graph.md. For active work, read the old item first and explicitly open bbox_thread; no automatic migration or new roadmap edge is implied. Historical roadmap_item refs and ROADMAP_* edges remain inspectable.",
+        example: Some(r#"bbox_roadmap(action="get", id="roadmap-a1b2c3d4", detail="body")"#),
     },
     // ── Operations ──────────────────────────────────────────────────
     ToolDoc {
@@ -1388,22 +1388,15 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_guidance_requires_operator_direction_and_forbids_deferral() {
+    fn roadmap_guidance_describes_historical_reads_and_actual_replacements() {
         let md = render_markdown();
-        let doc = TOOL_DOCS
-            .iter()
-            .find(|d| d.name == "bbox_roadmap")
-            .expect("bbox_roadmap doc exists");
-
-        assert!(md.contains("express direction of the operator"));
-        assert!(md.contains("never use the roadmap to defer"));
-        assert!(doc.summary.contains("express direction of the operator"));
-        assert!(doc.summary.contains("never use the roadmap to defer"));
-        assert!(
-            doc.when_to_use
-                .contains("Use only when the operator explicitly asks")
-        );
-        assert!(doc.when_to_use.contains("Do not initiate roadmap actions"));
+        let doc = TOOL_DOCS.iter().find(|d| d.name == "bbox_roadmap").unwrap();
+        assert!(md.contains("Historical roadmap records are read-only"));
+        assert!(doc.summary.contains("All mutation actions"));
+        assert!(doc.when_to_use.contains("error.roadmap_mutation_retired"));
+        assert!(doc.when_to_use.contains("scripts/design-graph"));
+        assert!(doc.when_to_use.contains("no automatic migration"));
+        assert!(doc.example.unwrap().contains("action=\"get\""));
     }
 
     #[test]

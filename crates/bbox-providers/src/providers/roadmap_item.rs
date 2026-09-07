@@ -26,6 +26,7 @@ impl InspectableEntityProvider for RoadmapItemProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("id".into(), id.clone());
+        properties.insert("lifecycle".into(), "historical_read_only".into());
         if let Some(stores) = ctx.stores() {
             let rm = stores.roadmap.read();
             if let Some(item) = rm.item(id) {
@@ -50,7 +51,15 @@ impl InspectableEntityProvider for RoadmapItemProvider {
     fn schema(&self) -> EntitySchemaView {
         schema(
             self.entity_type(),
-            &["id", "title", "status", "category", "priority", "scope"],
+            &[
+                "id",
+                "title",
+                "status",
+                "category",
+                "priority",
+                "scope",
+                "lifecycle",
+            ],
             &[
                 "ROADMAP_SPAWNS",
                 "ROADMAP_DEFERRED_FROM",

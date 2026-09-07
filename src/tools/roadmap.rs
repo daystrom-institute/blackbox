@@ -14,9 +14,25 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
+// The wire decoder still accepts legacy action strings so old callers get a
+// stable retirement refusal. Discovery advertises only historical readers.
+#[derive(schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum RoadmapReadAction {
+    Get,
+    List,
+    Search,
+    Next,
+    Render,
+    DefaultTemplate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RoadmapParams {
-    /// Roadmap operation: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render, or default_template.
+    /// Historical read: get, list, search, next, render, or default_template.
+    /// All mutation actions are retired and refuse before touching stored data.
+    #[schemars(with = "RoadmapReadAction")]
     pub(crate) action: String,
     /// Read projection: summary (default) or body (exact JSON pages).
     /// Body reads apply only to get/list/search/next/render/default_template.
@@ -171,7 +187,7 @@ pub(crate) struct RoadmapSearchParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_roadmap",
-        description = "Use the roadmap only at the express direction of the operator; never use the roadmap to defer requested work. Reads return bounded summaries. list/search use limit/offset; next uses n/offset (max 100). detail=body and cursor recover exact JSON, including markdown as JSON strings. Paging controls are rejected for mutations."
+        description = "Read historical roadmap records. Writes and promotion are retired. get/list/search/next/render/default_template remain read-only; next ranks retained accepted items. list/search use limit/offset; next uses n/offset. detail=body with cursor recovers exact JSON. Use the owning project's planning graph for new concepts/inquiries and bbox_thread for active work."
     )]
     pub(crate) async fn bbox_roadmap(
         &self,
@@ -197,11 +213,14 @@ impl BlackboxServer {
                 "repair_links" => self.roadmap_repair_links(serde_json::from_value(params)?).await,
                 "render" => self.roadmap_render(serde_json::from_value(params)?),
                 "default_template" => Ok(crate::roadmap::DEFAULT_ROADMAP_TEMPLATE.to_string()),
-                other => anyhow::bail!(
-                    "unknown action '{other}'. Valid: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render, default_template"
+                _ => anyhow::bail!(
+                    "unknown roadmap action; historical reads: get, list, search, next, render, default_template"
                 ),
             }?;
-            project_roadmap_response(&p, &output)
+            let output = project_roadmap_response(&p, &output)?;
+            let mut response: serde_json::Value = serde_json::from_str(&output)?;
+            response["lifecycle"] = serde_json::json!("historical_read_only");
+            Ok::<_, anyhow::Error>(response.to_string())
         })
         .await
         {
@@ -220,6 +239,14 @@ impl BlackboxServer {
 }
 
 fn validate_roadmap_projection(p: &RoadmapParams) -> anyhow::Result<()> {
+    if matches!(
+        p.action.as_str(),
+        "create" | "update" | "delete" | "promote" | "link" | "unlink" | "repair_links"
+    ) {
+        anyhow::bail!(
+            "error.roadmap_mutation_retired: roadmap records are historical and read-only. Use get/list/search/next/render/default_template to recover them; use the owning project's planning graph for new concepts/inquiries, or bbox_thread for active work. No roadmap or thread mutation was attempted."
+        );
+    }
     let read = matches!(
         p.action.as_str(),
         "get" | "list" | "search" | "next" | "render" | "default_template"
@@ -1105,67 +1132,97 @@ mod projection_tests {
     }
 
     #[tokio::test]
-    async fn oversized_titles_keep_write_receipts_and_typed_promotion_ids_recoverable() {
+    async fn retired_mutations_preserve_historical_data_and_exact_reads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let server = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(&root)));
-        let title = format!("Original {}", "界\n\"".repeat(20000));
-        let result = server.bbox_roadmap(Parameters(params(json!({
-            "action":"create", "title":title, "body":"fixture", "category":"feature", "scope":"global"
-        })))).await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let receipt: Value =
-            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-        let id = receipt["id"].as_str().unwrap().to_owned();
-        assert_eq!(receipt["title_truncated"], true);
-        assert_eq!(receipt["exact_reader"]["id"], id);
-        let title = format!("Updated {}", "界\n\"".repeat(20000));
-        let result = server
-            .bbox_roadmap(Parameters(params(json!({
-                "action":"update", "id":id, "title":title
-            }))))
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let result = server
-            .bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id}))))
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let promoted: Value =
-            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-        let thread_id = promoted["thread_id"].as_str().unwrap();
-        assert!(
-            server
-                .state
-                .threads
-                .read()
-                .all()
-                .iter()
-                .any(|thread| thread.id == thread_id)
-        );
-        assert_eq!(
-            server.state.roadmap.read().spawned_thread_ids(&id),
-            vec![format!("thread:{thread_id}")]
-        );
-        let result = server
-            .bbox_roadmap(Parameters(params(json!({"action":"promote", "id":id}))))
-            .await;
-        let repeated: Value =
-            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-        assert_eq!(repeated["already_promoted"], true);
-        assert_eq!(
-            repeated["existing_thread_ids"],
-            json!([format!("thread:{thread_id}")])
-        );
+        // Seed through the retained store API, not through retired MCP writes.
+        let title = format!("Historical {}", "界\n\"".repeat(20000));
+        let id = server
+            .state
+            .roadmap
+            .write()
+            .create(
+                title.clone(),
+                "Historical body".into(),
+                roadmap::RoadmapCategory::Feature,
+                roadmap::RoadmapPriority::High,
+                "global".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+            .clone();
+        server
+            .state
+            .roadmap
+            .write()
+            .add_edge(
+                format!("roadmap_item:{id}"),
+                "knowledge:synthetic-source".into(),
+                roadmap::RoadmapEdgeKind::DesignedIn,
+                Some("Retained evidence".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        server.state.persist_roadmap_durable().await.unwrap();
+        let before = server
+            .roadmap_get(RoadmapGetParams { id: id.clone() })
+            .unwrap();
+        let thread_count = server.state.threads.read().all().len();
+        for action in [
+            "create",
+            "update",
+            "delete",
+            "promote",
+            "link",
+            "unlink",
+            "repair_links",
+        ] {
+            let result = server
+                .bbox_roadmap(Parameters(params(json!({
+                    "action": action, "id":id, "title":"Must not change",
+                    "body":"Must not change", "category":"feature", "scope":"global",
+                    "link_type":"designed_in", "link_target":"knowledge:synthetic-source",
+                    "dry_run":false
+                }))))
+                .await;
+            assert_eq!(result.is_error, Some(true), "{action}: {result:?}");
+            assert!(
+                result.content[0]
+                    .as_text()
+                    .unwrap()
+                    .text
+                    .contains("error.roadmap_mutation_retired")
+            );
+            assert_eq!(
+                server
+                    .roadmap_get(RoadmapGetParams { id: id.clone() })
+                    .unwrap(),
+                before
+            );
+            assert_eq!(server.state.threads.read().all().len(), thread_count);
+        }
+        // The read-only gate cannot leak rejected edits into a later flush.
+        server.state.persist_roadmap_durable().await.unwrap();
+        let reopened =
+            roadmap::Roadmap::open(&server.state.store_dir.join("roadmap.json")).unwrap();
+        assert_eq!(reopened.item(&id).unwrap().title, title);
+        assert_eq!(reopened.all_edges().len(), 1);
         let mut read = json!({"action":"get", "id":id, "detail":"body"});
         let mut recovered = String::new();
         loop {
             let result = server.bbox_roadmap(Parameters(params(read.clone()))).await;
             assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
             let page: Value =
                 serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(page["lifecycle"], "historical_read_only");
             recovered.push_str(page["body"]["text"].as_str().unwrap());
             let Some(next) = page["body"]["next_cursor"].as_str() else {
                 break;
@@ -1173,8 +1230,38 @@ mod projection_tests {
             read["cursor"] = json!(next);
         }
         assert_eq!(
-            serde_json::from_str::<Value>(&recovered).unwrap()["title"],
-            title
+            serde_json::from_str::<Value>(&recovered).unwrap(),
+            serde_json::from_str::<Value>(&before).unwrap()
+        );
+        for action in ["list", "search", "next", "render", "default_template"] {
+            let result = server
+                .bbox_roadmap(Parameters(params(json!({"action":action}))))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{action}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn roadmap_schema_advertises_only_historical_read_actions() {
+        let schema = serde_json::to_value(schemars::schema_for!(RoadmapReadAction)).unwrap();
+        assert_eq!(
+            schema["enum"],
+            json!([
+                "get",
+                "list",
+                "search",
+                "next",
+                "render",
+                "default_template"
+            ])
+        );
+        // Legacy clients still deserialize so the adapter can return its
+        // explicit retirement code rather than a generic parser error.
+        assert!(
+            validate_roadmap_projection(&params(json!({"action":"create"})))
+                .unwrap_err()
+                .to_string()
+                .contains("error.roadmap_mutation_retired")
         );
     }
 

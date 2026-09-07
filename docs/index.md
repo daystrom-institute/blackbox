@@ -46,8 +46,8 @@ The main operator binaries are:
 | [Agent System](agent-system.md) | Simple agent contracts and dispatch |
 | [Badgey](badgey.md) | Retired integration and retained evidence |
 | [Consultant Runtime](consultant-runtime.md) | Retired consultant runtime |
-| [Project Roadmap](roadmap.md) | Generated roadmap for this repository |
-| [Roadmap Tool](roadmap-tool.md) | Operator-directed prospective work tracker |
+| [Historical Roadmap](roadmap.md) | Retained snapshot; current planning uses the design graph |
+| [Historical Roadmap Reader](roadmap-tool.md) | Read-only records, exact export, and replacement guidance |
 | [Ingress Paths](ingress-paths.md) | Bro control and collector transport boundaries |
 | [System Events](system-events.md) | Observation journal without reaction execution |
 | [Slack Bridge](slack-bridge.md) | Retired bridge and retained conversation evidence |
