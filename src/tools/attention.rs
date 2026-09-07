@@ -224,6 +224,29 @@ fn validate_pin_request(p: &PinParams) -> anyhow::Result<()> {
     {
         anyhow::bail!("full, cursor, body_limit, limit and offset require action=list");
     }
+    if p.action != "set" {
+        anyhow::ensure!(
+            p.content.is_none() && p.title.is_none() && p.expires_at.is_none(),
+            "content, title and expires_at require action=set"
+        );
+    }
+    if p.action == "delete" {
+        anyhow::ensure!(
+            p.id.as_deref().is_some_and(|id| !id.trim().is_empty()),
+            "id is required for action=delete"
+        );
+        anyhow::ensure!(
+            p.scope.is_none() && p.target.is_none(),
+            "scope and target filter reads or select a set operation; delete selects id"
+        );
+    }
+    if p.full == Some(true) || p.cursor.is_some() || p.body_limit.is_some() {
+        anyhow::ensure!(p.id.is_some(), "exact reads require id");
+        anyhow::ensure!(
+            p.limit.is_none() && p.offset.is_none(),
+            "limit and offset apply only to summary lists"
+        );
+    }
     if p.action == "set" {
         if p.scope.is_none() {
             anyhow::bail!("scope is required for action=set");

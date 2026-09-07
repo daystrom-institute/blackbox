@@ -38,7 +38,8 @@ pub(crate) struct ThreadToolParams {
     pub inner: ThreadParams,
     /// For action=get: summary (default), notes, sessions, edges (bounded
     /// history pages), note (exact note read; requires note_index), or
-    /// handoff (exact handoff-doc read). Invalid values are rejected.
+    /// handoff (exact handoff-doc read), or metadata (exact topic, identity,
+    /// sessions, edges and lifecycle JSON). Invalid values are rejected.
     #[serde(default)]
     pub detail: Option<String>,
     /// 1-based note index for detail=note, matching the detail=notes rows.
@@ -50,7 +51,7 @@ pub(crate) struct ThreadToolParams {
     /// Continue a detail page using its next_offset.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// Continue an exact (detail=note|handoff) body page using body.next_cursor.
+    /// Continue an exact (detail=note|handoff|metadata) body page using body.next_cursor.
     #[serde(default)]
     pub cursor: Option<String>,
     /// Maximum bytes per exact body page (default 4096, clamped).
@@ -80,13 +81,16 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_thread",
-        description = "Open / continue / resolve / promote / rename / link a work thread. action=get returns a bounded summary (counts + 200-char previews); detail=notes|sessions|edges pages history, detail=note|handoff reads exact bodies through content-bound cursors."
+        description = "Open / continue / resolve / promote / rename / link a work thread. action=get returns a bounded summary; detail=notes|sessions|edges pages history, detail=note|handoff|metadata reads exact bodies through content-bound cursors. Metadata recovers complete topic, session and edge fields."
     )]
     pub(crate) async fn bbox_thread(
         &self,
         Parameters(p): Parameters<ThreadToolParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        if let Err(error) = validate_thread_request(&p) {
+            return Self::err_text(&error.to_string());
+        }
         if p.inner.action == "get" {
             // Audit A04: the get lane is a pure read — no write lock, no
             // durable persist, no index enqueue. Bounded summary by default;
@@ -94,6 +98,19 @@ impl BlackboxServer {
             return Self::run("bbox_thread", || {
                 let detail = validate_thread_get_detail(&p)?;
                 match detail.as_deref() {
+                    Some("metadata") => {
+                        let threads = self.state.threads.read();
+                        let (thread_id, metadata) = threads.thread_metadata(&p.inner)?;
+                        let body = super::body_page::json_body_page(
+                            &format!("thread:{thread_id}:metadata"),
+                            &metadata,
+                            p.cursor.as_deref(),
+                            p.body_limit,
+                        )?;
+                        Ok(serde_json::to_string(
+                            &serde_json::json!({"thread_id":thread_id,"body":body}),
+                        )?)
+                    }
                     Some("note") => {
                         let index = p.note_index.ok_or_else(|| {
                             anyhow::anyhow!("detail=note requires note_index (1-based, from the detail=notes rows)")
@@ -503,6 +520,96 @@ mod tests {
     /// bodies through the content-bound cursor. Invalid detail values are
     /// rejected before any store read.
     #[tokio::test]
+    async fn thread_metadata_recovers_omitted_fields_and_reads_never_mutate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let large = "界\n\"metadata\"".repeat(4000);
+        let mut open = tp("open");
+        open.topic = Some(large.clone());
+        open.name = Some("metadata-fixture".into());
+        open.session_id = Some("session-fixture".into());
+        open.session_name = Some(large.clone());
+        server.state.threads.write().thread(&open).unwrap();
+        let id = server.state.threads.read().all()[0].id.clone();
+        let mut link = tp("link");
+        link.id = Some(id.clone());
+        link.target = Some("session-fixture".into());
+        link.target_type = Some("session".into());
+        link.edge = Some("relates_to".into());
+        link.note = Some(large.clone());
+        server.state.threads.write().thread(&link).unwrap();
+        let before = serde_json::to_value(server.state.threads.read().all()).unwrap();
+        let params = |detail: &str| ThreadToolParams {
+            detail: Some(detail.into()),
+            ..ThreadToolParams::from(ThreadParams {
+                id: Some(id.clone()),
+                ..tp("get")
+            })
+        };
+        for detail in ["summary", "sessions", "edges"] {
+            let result = server.bbox_thread(Parameters(params(detail))).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            assert!(!text_of(&result).contains(&large));
+        }
+        let mut request = params("metadata");
+        request.body_limit = Some(512);
+        let mut joined = String::new();
+        let mut first_cursor = None;
+        loop {
+            let result = server.bbox_thread(Parameters(request)).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let value = parse_json(&result);
+            joined.push_str(value["body"]["text"].as_str().unwrap());
+            let cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if first_cursor.is_none() {
+                first_cursor = cursor.clone();
+            }
+            if cursor.is_none() {
+                break;
+            }
+            request = params("metadata");
+            request.cursor = cursor;
+            request.body_limit = Some(512);
+        }
+        let value: serde_json::Value = serde_json::from_str(&joined).unwrap();
+        assert_eq!(value["topic"], large);
+        assert_eq!(value["sessions"][0]["name"], large);
+        assert_eq!(value["edges"][0]["note"], large);
+        assert!(value.get("record_dir").is_none());
+        for bad in [
+            serde_json::json!({"action":"continue","id":id,"note":"must not append","detail":"metadata"}),
+            serde_json::json!({"action":"get","id":id,"detail":"summary","cursor":first_cursor}),
+            serde_json::json!({"action":"open","topic":"must not open","note_index":1}),
+        ] {
+            let result = server
+                .bbox_thread(Parameters(serde_json::from_value(bad).unwrap()))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+        }
+        assert_eq!(
+            serde_json::to_value(server.state.threads.read().all()).unwrap(),
+            before
+        );
+        let mut rename = tp("rename");
+        rename.id = Some(id.clone());
+        rename.name = Some("changed".into());
+        server.state.threads.write().thread(&rename).unwrap();
+        let mut stale = params("metadata");
+        stale.cursor = first_cursor;
+        assert_eq!(
+            server.bbox_thread(Parameters(stale)).await.is_error,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn bbox_thread_get_defaults_bounded_and_exact_reads_use_body_cursor() {
         let tmp = tempfile::tempdir().unwrap();
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
@@ -670,13 +777,133 @@ fn validate_thread_get_detail(p: &ThreadToolParams) -> anyhow::Result<Option<Str
         return Ok(None);
     };
     match raw {
-        "summary" | "notes" | "sessions" | "edges" | "note" | "handoff" => {
+        "summary" => Ok(None),
+        "notes" | "sessions" | "edges" | "note" | "handoff" | "metadata" => {
             Ok(Some(raw.to_string()))
         }
         other => Err(anyhow::anyhow!(
-            "invalid detail: {other:?} (use summary, notes, sessions, edges, note, handoff)"
+            "invalid detail: {other:?} (use summary, notes, sessions, edges, note, handoff, metadata)"
         )),
     }
+}
+
+fn validate_thread_request(p: &ThreadToolParams) -> anyhow::Result<()> {
+    let action = p.inner.action.as_str();
+    let allowed: &[&str] = match action {
+        "get" => &["action", "id", "name"],
+        "open" => &[
+            "action",
+            "name",
+            "topic",
+            "project",
+            "session_id",
+            "provider",
+            "session_name",
+            "handoff_doc",
+            "note",
+            "kind",
+            "origin",
+        ],
+        "continue" => &[
+            "action",
+            "id",
+            "name",
+            "project",
+            "session_id",
+            "provider",
+            "session_name",
+            "handoff_doc",
+            "note",
+        ],
+        "link" => &[
+            "action",
+            "id",
+            "name",
+            "project",
+            "target",
+            "target_type",
+            "edge",
+            "note",
+        ],
+        "resolve" => &["action", "id", "name", "project", "note"],
+        "promote" => &["action", "id", "name", "project", "note", "promoted_to"],
+        "rename" => &["action", "id", "name", "project"],
+        _ => anyhow::bail!(
+            "unknown thread action; use get, open, continue, link, resolve, promote or rename"
+        ),
+    };
+    for (field, value) in serde_json::to_value(&p.inner)?.as_object().unwrap() {
+        anyhow::ensure!(
+            value.is_null() || allowed.contains(&field.as_str()),
+            "{field} does not apply to action={action}"
+        );
+    }
+    if action != "get" {
+        anyhow::ensure!(
+            p.detail.is_none()
+                && p.note_index.is_none()
+                && p.limit.is_none()
+                && p.offset.is_none()
+                && p.cursor.is_none()
+                && p.body_limit.is_none(),
+            "detail, note_index, limit, offset, cursor and body_limit require action=get"
+        );
+    } else {
+        let detail = validate_thread_get_detail(p)?;
+        let exact = matches!(detail.as_deref(), Some("note" | "handoff" | "metadata"));
+        anyhow::ensure!(
+            exact || (p.cursor.is_none() && p.body_limit.is_none()),
+            "cursor and body_limit require detail=note, handoff or metadata"
+        );
+        anyhow::ensure!(
+            !exact || (p.limit.is_none() && p.offset.is_none()),
+            "limit and offset apply only to history pages"
+        );
+        anyhow::ensure!(
+            detail.is_some() || (p.limit.is_none() && p.offset.is_none()),
+            "limit and offset require detail=notes, sessions or edges"
+        );
+        anyhow::ensure!(
+            detail.as_deref() == Some("note") || p.note_index.is_none(),
+            "note_index requires detail=note"
+        );
+        anyhow::ensure!(
+            detail.as_deref() != Some("note") || p.note_index.is_some_and(|index| index > 0),
+            "detail=note requires positive note_index"
+        );
+        anyhow::ensure!(
+            p.inner.id.is_none() || p.inner.name.is_none(),
+            "choose id or name for get, not both"
+        );
+    }
+    if p.inner.provider.is_some() || p.inner.session_name.is_some() {
+        anyhow::ensure!(
+            p.inner
+                .session_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty()),
+            "provider and session_name require session_id"
+        );
+    }
+    if action == "open" {
+        anyhow::ensure!(
+            p.inner
+                .topic
+                .as_deref()
+                .is_some_and(|topic| !topic.trim().is_empty()),
+            "topic is required for open"
+        );
+    } else {
+        anyhow::ensure!(
+            p.inner
+                .id
+                .as_deref()
+                .or(p.inner.name.as_deref())
+                .is_some_and(|id| !id.trim().is_empty()),
+            "id or name is required"
+        );
+    }
+    Ok(())
 }
 
 /// Audit A02: threads are host-owned state. Mutations key to the identity the

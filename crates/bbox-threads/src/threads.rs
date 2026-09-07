@@ -715,6 +715,18 @@ impl Threads {
         Ok((thread.id.clone(), doc.to_string()))
     }
 
+    /// Exact caller-facing metadata. Internal record storage paths stay private;
+    /// note bodies have their own stable per-note reader.
+    pub fn thread_metadata(&self, p: &ThreadParams) -> Result<(String, serde_json::Value)> {
+        let thread = self.find_thread(p)?;
+        let mut value = serde_json::to_value(thread)?;
+        let object = value.as_object_mut().expect("thread object");
+        object.remove("record_dir");
+        object.remove("notes");
+        object.insert("notes_count".into(), serde_json::json!(thread.notes.len()));
+        Ok((thread.id.clone(), value))
+    }
+
     /// Bounded thread get (audit A04): the default summary carries counts
     /// and 200-char previews only — never the full session/edge/note
     /// history, which was a 23KB+ unbounded dump. History lives behind
@@ -731,7 +743,7 @@ impl Threads {
         use bbox_corpus_core::response_page as page_lib;
         let thread = self.find_thread(p)?;
         let mut rows = match detail {
-            None => return Ok(self.thread_summary_value(thread)),
+            None | Some("summary") => return Ok(self.thread_summary_value(thread)),
             Some("notes") => thread
                 .notes
                 .iter()
@@ -757,7 +769,9 @@ impl Threads {
                     if let Some(name) = &session.name {
                         row["name"] = serde_json::json!(name);
                     }
-                    page_lib::preview_field(&mut row, "name", 200);
+                    for field in ["name", "session_id", "provider"] {
+                        page_lib::preview_field(&mut row, field, 200);
+                    }
                     row
                 })
                 .collect::<Vec<_>>(),
@@ -775,6 +789,7 @@ impl Threads {
                         row["note"] = serde_json::json!(note);
                     }
                     page_lib::preview_field(&mut row, "note", 200);
+                    page_lib::preview_field(&mut row, "target", 200);
                     row
                 })
                 .collect::<Vec<_>>(),
@@ -794,10 +809,17 @@ impl Threads {
         page["pagination"] = serde_json::json!(
             "append_only_offset: existing rows keep their index; new rows append; re-query from offset 0 after continuing a thread"
         );
-        page["detail_hint"] = serde_json::json!(format!(
-            "bbox_thread(action=get,id={},detail=note,note_index=<1-based>)",
-            thread.id
-        ));
+        page["detail_hint"] = serde_json::json!(if field == "notes" {
+            format!(
+                "bbox_thread(action=get,id={},detail=note,note_index=<1-based>)",
+                thread.id
+            )
+        } else {
+            format!(
+                "bbox_thread(action=get,id={},detail=metadata); follow body.next_cursor with cursor",
+                thread.id
+            )
+        });
         Ok(page)
     }
 
@@ -847,11 +869,13 @@ impl Threads {
         page_lib::preview_field(&mut row, "name", 200);
         page_lib::preview_field(&mut row, "latest_note", 200);
         page_lib::preview_field(&mut row, "handoff_doc", 200);
+        page_lib::preview_field(&mut row, "project_selector", 200);
+        page_lib::preview_field(&mut row, "promoted_to", 200);
         serde_json::json!({
             "thread": row,
             "pagination": "summary is bounded; history pages are append-only offsets",
             "detail_hint": format!(
-                "bbox_thread(action=get,id={},detail=notes|sessions|edges|note(note_index=N)|handoff)",
+                "bbox_thread(action=get,id={},detail=notes|sessions|edges|note(note_index=N)|handoff|metadata); metadata recovers topic, name, sessions and edges",
                 thread.id
             ),
         })
