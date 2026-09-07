@@ -687,8 +687,8 @@ impl TranscriptSearchMode {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextParams {
-    /// Exact stored transcript locator from bbox_search.file_path. This is an
-    /// opaque lookup key, never a path opened on the daemon.
+    /// Exact stored transcript locator or indexed-transcript recovery handle.
+    /// This is an opaque lookup key, never a path opened on the daemon.
     pub file_path: String,
     /// Exact stored event offset from search results (Slack uses message timestamp digits).
     pub byte_offset: u64,
