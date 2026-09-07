@@ -1,0 +1,23 @@
+{
+  "id": "gap-1c1dd8e8",
+  "title": "Reject resumed activation history when current tool schemas are unavailable",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/resume-tool-contract",
+  "wanted_capability": "Fail locally before any provider or compaction request when trusted activation evidence promises a client tool whose schema is absent from the current request. Preserve permissions and allow consistent/legacy-recovered sessions.",
+  "evidence": [
+    "thread-c130128f",
+    "design/bro-harness/glm-native-search-validation.md",
+    "captured exact-request controls: missing bro_report schema triggers spurious native searches on flagship and Flash; restored schema calls report directly"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "tooling/bro-harness/resume-missing-schema-preflight",
+  "notes": "Operator authorized preflight guard with acceptance zero provider requests for missing-schema controls. Check saved activations and successful paired tool_search receipts including explicit-empty snapshot, denied tool, and missing catalog; no restoration of disallowed tool. Implementation in progress.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "thread_id": "thread-c130128f",
+  "created_at": "2026-09-07T01:40:55Z",
+  "updated_at": "2026-09-07T01:55:36Z",
+  "resolved_at": "2026-09-07T01:55:36Z",
+  "resolution_note": "Implemented and pushed in 841b286b plus 9453ff81. Saved activations and paired successful tool_search receipts from event logs/native snapshots require current permitted wire schemas; otherwise admission emits durable error.resume_tool_schema_missing before model/compaction. Explicit [] cannot erase receipts, legacy absent fields recover permitted activations, and saved-only evidence survives pinned/eager transitions. Final lane full-profile harness tests: 523 passed, 3 skipped. Clippy passed with warnings; pinned formatter and native arm64 build passed. Nine offline process cases passed on built and installed binary; all four refusal cases made zero provider requests. Live Flash/flagship controls at 841b286b: 12 provider requests, zero native searches in arithmetic/report controls; both lost-activation resumes refused with zero provider requests. Stable-signed 9453ff81 installed on host Fleet with unchanged designated requirement and backup. Normal Fleet code-mode dispatch/resume passed; explicit top-level activation followed by policy denial failed immediately with durable num_turns 0. Code-mode-only use without flat activation is outside this guard's requirement set. Original provider consistency and mixed duplicate-call gaps remain open. See design/bro-harness/glm-native-search-validation.md."
+}

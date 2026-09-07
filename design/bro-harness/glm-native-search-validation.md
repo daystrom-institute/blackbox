@@ -26,11 +26,11 @@ intended client tool. This establishes a reproducible trigger and a successful
 control, not the provider's internal routing algorithm or a universal absence
 of spurious search.
 
-The existing deferred-activation persistence and legacy-receipt recovery repair
-prevents the demonstrated accidental loss on normal process resume. Current
-policy/catalog filtering remains required. Intentionally unavailable tools can
-still create a history/catalog mismatch; the provider must not be assumed to
-handle that condition safely merely because normal resumes pass.
+Deferred-activation persistence and legacy-receipt recovery prevent accidental
+loss on normal process resume. The resume preflight now also refuses locally
+when saved activations or successful activation receipts require a schema that
+is absent from the current permitted wire catalog. This covers intentionally
+unavailable tools without assuming the provider handles the mismatch safely.
 
 No query deny list, invented native result, or default search disablement was
 used. Native `web_search_20250305` remained in every captured request. No client
@@ -151,6 +151,58 @@ repository. The thread records the concrete paths and session IDs.
 
 ## Repair verification
 
+### Resume admission guard
+
+`gap-1c1dd8e8` tracks the pre-provider guard. Its requirement set combines saved
+activation names with successful paired `tool_search` receipts from both the
+durable event log and native transport snapshot. Explicit `tool_activations: []`
+still controls restoration, but cannot erase receipt evidence. Legacy snapshots
+without the field recover only tools allowed by the current catalog and policy.
+
+A missing required schema produces `error.resume_tool_schema_missing`, naming
+the tools and recording a terminal error before any model or compaction request.
+The operator can restore the intended permitted catalog and activation state,
+or start a fresh session using current policy. Merely making a previously flat
+tool callable through code mode does not fulfill its wire-schema requirement.
+Unactivated tools hidden for code mode create no requirement.
+Prior activation names remain saved when their currently available tool becomes
+pinned or eager, so a later resume cannot forget the requirement merely because
+its placement changed. GLM transport construction performs no provider HTTP.
+Other transports may initialize authentication before this guard; the common
+contract prevents model and compaction requests, not authentication refresh.
+
+`scripts/probe-tool-search-resume.py --binary <binary>` exercises real harness
+processes against a synthetic local provider. Independent snapshot/event-log
+copies cover normal and legacy success, current policy denial, explicit empty
+activations with and without the event log, and removal of an activated MCP
+tool from the current catalog. Refusal cases require zero provider requests.
+The live runner's `--expect-resume-refusal` option applies the same expectation
+to its own lost-activation control, labeling the result as local admission
+evidence rather than an observed provider response.
+
+Verification at `9453ff81` passed 523 harness tests (three skipped) using the
+lane's full nextest profile, package all-target clippy (with warnings), pinned
+formatting, and the native arm64 release build. All nine offline process cases
+passed on both the final build and installed executable. Each of the four
+refusal cases made zero provider requests.
+
+Live Flash and flagship controls at `841b286b` each made six provider requests
+for arithmetic, fresh reporting and a normal process resume, with zero native
+searches. Both deliberately cleared-activation resumes refused locally with
+zero provider requests. Native search remained enabled throughout.
+
+The final `9453ff81` standalone harness was stable-signed and atomically installed
+on the host Fleet worker, retaining its designated requirement and backing up
+the previous executable. A normal Fleet dispatch and resume succeeded using
+code-mode reporting. An explicit top-level `tool_search` then loaded the report
+schema; a subsequent policy-denied resume failed immediately with the guard
+error, durable `num_turns: 0`, and exit code 1. An earlier denial before flat
+activation reached code mode and returned a missing-function error, as expected
+for that distinct boundary; it is not counted as a guard-refusal control.
+These host installation checks required no service restart.
+
+### Earlier stream repairs
+
 At `11dc7105`, lane-side
 `cargo nextest run --workspace --profile full -E 'package(bro-harness)'`
 passed 520 tests with three skipped. The pinned formatter passed, and the
@@ -164,10 +216,10 @@ terminal error. It preserved six native starts and five native results, marked
 the sixth result missing with unknown execution status, and emitted no assistant
 message or client tool call. The observation is explicitly nonreplayable.
 
-Source repairs are committed and built; these checks are not a shared-runtime
-replacement or deployment receipt. The original native-search consistency gap
-remains open because catalog-unavailability behavior and duplicate client
-emission are still material limits.
+These earlier checks were source/build verification, not a shared-runtime
+deployment receipt. The original native-search consistency gap remains open:
+blocking the demonstrated missing-schema trigger does not establish universal
+search consistency, and duplicate client emission remains separately tracked.
 
 ## Quota policy reconciliation
 

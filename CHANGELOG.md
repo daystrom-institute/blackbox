@@ -23,6 +23,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness resumes refuse before model or compaction requests when saved activations
+  or successful activation receipts require a client schema that is no longer
+  available. The error identifies the missing tools; current permissions remain
+  authoritative, and older sessions can recover receipts from native snapshots.
 - Anthropic-compatible streams stop automatic retries after native tool starts
   or inline content, preventing a transient error from repeating provider-side
   execution. Empty precontent text/thinking starts remain retryable.
