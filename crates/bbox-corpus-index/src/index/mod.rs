@@ -2810,6 +2810,7 @@ pub mod git_history;
 pub mod helpers;
 pub mod history_generations;
 pub mod migration_inventory;
+mod native_reader;
 pub mod passes;
 pub mod project_files;
 pub mod schema_replacement;

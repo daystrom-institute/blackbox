@@ -226,15 +226,34 @@ fn query_tool_calls(
             bbox_corpus_core::response_page::preview_field(&mut row, key, 1024);
         }
         let locator = doc_text(&doc, fields.file_path);
+        let reader = idx.native_reader_handle(&searcher, addr, &doc);
         if !locator.is_empty()
             && let Some(tantivy::schema::OwnedValue::U64(offset)) =
                 doc.get_first(fields.byte_offset)
         {
             let context = json!({"file_path": locator, "byte_offset": offset});
-            if serde_json::to_vec(&context)?.len() <= 4096 {
+            if serde_json::to_vec(&context)?.len() <= 4096
+                && !std::path::Path::new(&locator).is_absolute()
+            {
                 row["context"] = context;
+            } else if let Some(handle) = &reader {
+                row["context"] = json!({"file_path":handle,"byte_offset":offset});
             } else {
                 row["context_unavailable"] = "stored locator exceeds the response budget".into();
+            }
+            if let Some(handle) = &reader {
+                row["exact_read"] = json!({"tool":"bbox_context","arguments":{
+                    "file_path":handle,"byte_offset":offset,"body_limit":4096
+                }});
+            }
+        }
+        for key in ["session_id", "task_id"] {
+            if row[format!("{key}_truncated")] == true {
+                row.as_object_mut().unwrap().remove(key);
+                row.as_object_mut()
+                    .unwrap()
+                    .remove(&format!("{key}_truncated"));
+                row[format!("{key}_omitted")] = true.into();
             }
         }
         let row_bytes = serde_json::to_vec(&row)?.len();
@@ -281,6 +300,85 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_history_giant_locator_exact_recovery_bounds_the_complete_mcp_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&root),
+        ));
+        let locator = format!("/private/synthetic-transcripts/{}", "界\"\\".repeat(3000));
+        let target = "界\"\\\n".repeat(10000);
+        {
+            let index = server.state.idx.read();
+            let fields = index.field_handles();
+            let mut writer = index
+                .index_handle()
+                .writer::<tantivy::TantivyDocument>(15_000_000)
+                .unwrap();
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(fields.doc_type, "tool_call");
+            doc.add_text(fields.tool_name, "synthetic-tool");
+            doc.add_text(fields.tool_target, &target);
+            doc.add_text(fields.tool_outcome, &target);
+            doc.add_text(fields.file_path, &locator);
+            doc.add_text(fields.session_id, "giant-locator-session");
+            doc.add_text(fields.source, "codex");
+            doc.add_u64(fields.byte_offset, 17);
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+            index.reader_reload_for_test();
+        }
+        let result = server
+            .bbox_tool_calls(Parameters(ToolCallsParams::default()))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let result = serde_json::to_value(&result).unwrap();
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let page: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let row = &page["rows"][0];
+        assert_eq!(row["target_truncated"], true);
+        assert!(row.get("context_unavailable").is_none());
+        let mut arguments = row["exact_read"]["arguments"].clone();
+        assert_eq!(arguments["file_path"], row["context"]["file_path"]);
+        assert!(
+            !result
+                .to_string()
+                .contains("/private/synthetic-transcripts/")
+        );
+        let mut recovered = String::new();
+        loop {
+            let params: crate::tools::transcripts::ContextToolParams =
+                serde_json::from_value(arguments.clone()).unwrap();
+            let result = server.bbox_context(Parameters(params)).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let result = serde_json::to_value(result).unwrap();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let page: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            let Some(cursor) = page["body"]["next_cursor"].as_str() else {
+                break;
+            };
+            arguments["body_cursor"] = json!(cursor);
+        }
+        let recovered: serde_json::Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(recovered["target"], target);
+        assert_eq!(recovered["outcome"], target);
+        assert_eq!(recovered["locator"], arguments["file_path"]);
+        arguments["context_lines"] = json!(0);
+        let refused = server
+            .bbox_context(Parameters(serde_json::from_value(arguments).unwrap()))
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(server.state.idx.read().searcher().num_docs(), 1);
+    }
 
     #[test]
     fn tool_history_continues_past_empty_filtered_pages_and_preserves_identity() {
