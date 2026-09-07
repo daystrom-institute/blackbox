@@ -15,9 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/glm-mixed-native-client-duplicates",
   "notes": "Captured duplicates already exist inside single HTTP200 raw SSE responses under distinct call IDs, before harness client dispatch. Normal tool-only turns do not duplicate. Native calls/results replay exactly. No arbitrary same-argument dedupe added because distinct legitimate calls may intentionally repeat. Search remains enabled. Provider causality beyond mixed native/client response association remains unknown.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-c130128f",
   "created_at": "2026-09-07T01:26:27Z",
-  "updated_at": "2026-09-07T01:26:27Z"
+  "updated_at": "2026-09-07T02:29:01Z",
+  "resolved_at": "2026-09-07T02:29:01Z",
+  "resolution_note": "Execution containment implemented in ddb93ce5 and tightened in 2e82ee7e; installed signed standalone harness on host Fleet. Explicit GLM identity and matching native-result boundary classify equal client name/parsed args with distinct IDs as ambiguous. Entire batch is rejected before any dispatch/final_result, every ID gets an explicit error, original native/assistant blocks stay intact. One correction opportunity; at most one client call per response for remainder of turn is mechanically enforced; recurrence/no budget fails. Ordinary repeated batches and intentional serial repeats remain valid. Final full-profile harness tests 525 passed/3 skipped; clippy and pinned formatter passed; native arm64 build passed. Offline original duplicate batch has zero executions, corrected call exactly one, recurrent refusal zero; snapshots retain native blocks and paired errors. Captured duplicate response followed by real Flash and flagship recovery passed on built and installed binaries, each two live requests, one report, no new native searches. This contains provider duplicate proposals without guessing dedup semantics; it does not claim upstream emission fixed. Separate native completion receipt uncertainty is gap-93b63892. Details in design/bro-harness/glm-native-search-validation.md."
 }

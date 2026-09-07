@@ -67,9 +67,94 @@ Two mixed Flash native-search responses also emitted duplicate client calls
 with distinct IDs: duplicate `tool_search` during the first lookup and duplicate
 `bro_report` during the resumed lookup. The latter reached the synthetic MCP
 server twice. These duplicates were already present in a single raw provider
-response, not manufactured by harness replay. They remain a separate provider
-behavior to track; deduplicating arbitrary same-argument client calls would
-change legitimate tool semantics.
+response, not manufactured by harness replay. Deduplicating arbitrary
+same-argument client calls would change legitimate tool semantics.
+
+## Duplicate client-call containment
+
+All three captured duplicate responses have the same ordering: a native search
+starts, a complete client call appears while its result is pending, the native
+result arrives, and the provider emits the same client name and parsed arguments
+under a different ID. Each capture has one message start and one terminal
+message stop. There is no cancellation or supersession marker establishing
+that either client proposal was withdrawn.
+
+The harness therefore treats this specific GLM batch as ambiguous. Before any
+client dispatch, it rejects the entire batch and returns an explicit error result
+for every client ID. The original assistant blocks and native search results
+remain intact. GLM gets one correction opportunity to issue the intended actions
+one per response using the existing search results. Intentional repeated actions
+can still execute after each preceding result. Once correction starts, the
+harness enforces at most one client call per response for that user turn,
+including responses without native blocks. A multi-call correction, recurring
+ambiguity or exhausted correction budget terminates with an error rather than
+requesting an unbounded sequence of corrections.
+
+The check is scoped to explicit GLM provider identity and requires a matching
+native result between the identical calls. Ordinary same-argument batches,
+separate turns, changed arguments and other providers retain their execution
+semantics. This is an execution safeguard, not a claim that the provider stops
+emitting duplicate proposals.
+
+Returning an error result for each unexecuted client call follows the
+[Messages tool-result contract](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use).
+An exact-request Flash experiment separately compared the captured report
+request with only `tool_choice.disable_parallel_tool_use: true` added. Two
+baseline and two modified requests each emitted one native search and one
+report, with no duplicates in either group. The baseline did not reproduce,
+so this experiment does not establish that GLM honors the option or that it
+prevents the defect. No provider-option change is justified by that result.
+
+The deterministic process probe
+`scripts/probe-glm-duplicate-containment.py --binary <binary>` failed against the
+previous binary: both original duplicate calls executed. With `ddb93ce5`, the
+original batch executes nothing, a corrected single call executes once, and a
+second ambiguous batch terminates with no executions. The probe verifies exact
+native observations and paired client errors in durable logs, snapshots and
+the correction request.
+
+The same probe can inject an explicit `--capture` and, with `--live` and an
+explicit settings file, forward only subsequent correction requests to GLM.
+The captured `flash-harness/016-response.sse` passed this check on both Flash and
+flagship: each made two live correction/continuation requests, issued no new
+native searches, executed one synthetic report and completed successfully.
+The historical duplicate response is injected evidence; the recovery responses
+are live provider observations. Only tool discovery and the synthetic report
+sink are callable in this probe.
+
+`gap-8b53a3d4` records a related persistence fix: one-shot execution now saves
+valid conversation state after terminal turn errors. A stopped correction can
+therefore resume with its completed search results and paired client errors.
+Invalid failed transport content remains rolled back and nonreplayable.
+
+Final source `2e82ee7e` passed 525 harness tests (three skipped) in the lane's
+full nextest profile, package all-target clippy (with warnings), pinned formatting
+and the native arm64 release build. The stable-signed standalone harness was
+installed on the host Fleet worker with unchanged designated requirement and a
+backup of the previous executable. Installed-binary offline recovery/refusal
+checks and captured-response live recovery on both models passed again.
+
+### Native completion evidence remains distinct
+
+The broader Flash check completed 13 requests with two requested native searches,
+both paired with results. Arithmetic, reporting and replay-only tasks performed
+no native search, and lost activation refused locally. The broader flagship
+check completed the same tasks across 15 requests, but its first requested lookup
+emitted ten distinct native search starts with only five matching results.
+All queries concerned the requested Python documentation. Four results contained
+search data and one contained a provider content-filter error.
+
+That request advertised `max_uses: 5`. Five result receipts may reflect the budget,
+but no receipt proves whether the remaining five proposals were skipped or
+executed. This is not evidence that ten searches executed or that the budget was
+ignored. Provider log ID: `20260907101919cfd615339c4c43ea`.
+
+`6f87a8a2` corrects the probe's earlier false-green result: native starts, matched
+completed results and unmatched IDs are separate measurements, and missing result
+receipts make the run **inconclusive**. Result receipts can themselves contain
+provider errors, so their count is not a successful-execution count.
+`gap-93b63892` tracks this remaining upstream completion uncertainty. No synthetic
+native result is inserted, and the raw observation remains available for review.
 
 ## Exact-request schema comparison
 

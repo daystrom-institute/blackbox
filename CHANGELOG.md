@@ -23,6 +23,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- GLM client batches that repeat an identical call across a native search
+  result are rejected before execution. Every proposed call receives an explicit
+  error, with one opportunity to reissue intended actions separately; recurring
+  ambiguity stops the turn. Ordinary repeated calls retain their semantics.
 - Harness resumes refuse before model or compaction requests when saved activations
   or successful activation receipts require a client schema that is no longer
   available. The error identifies the missing tools; current permissions remain
