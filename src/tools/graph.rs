@@ -1994,7 +1994,7 @@ mod tests {
         let mut env = crate::util::TestEnvGuard::new();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
         let edges_dir = crate::server::edge_sidecar_dir(&server.state);
         std::fs::create_dir_all(&edges_dir).unwrap();
         let edge = edge_index::Edge {
