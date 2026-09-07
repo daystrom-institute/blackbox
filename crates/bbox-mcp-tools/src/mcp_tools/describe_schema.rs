@@ -59,6 +59,9 @@ pub fn describe_schema_with_options(
                 "filterable_fields": schema.filterable_fields,
                 "edge_participation": schema.edge_families,
             });
+            if schema.entity_type == bbox_corpus_core::entity_ref::EntityType::RoadmapItem {
+                row["lifecycle"] = json!("historical_read_only");
+            }
             if options.compact {
                 for field in ["key_fields", "filterable_fields", "edge_participation"] {
                     row.as_object_mut().unwrap().remove(field);
@@ -144,6 +147,7 @@ fn edge_families() -> Vec<serde_json::Value> {
             ],
             "Use provenance edges to move from artifacts back to sessions, threads, notes, and brofiles.",
         ),
+        historical_roadmap_family(),
         family(
             "Git",
             &[
@@ -173,6 +177,25 @@ fn edge_families() -> Vec<serde_json::Value> {
     ]
 }
 
+fn historical_roadmap_family() -> serde_json::Value {
+    let mut row = family(
+        "Roadmap",
+        &[
+            "ROADMAP_SPAWNS",
+            "ROADMAP_DEFERRED_FROM",
+            "ROADMAP_DESIGNED_IN",
+            "ROADMAP_DEPENDS_ON",
+            "ROADMAP_BLOCKED_BY",
+            "ROADMAP_SUPERSEDES",
+            "ROADMAP_SUBSUMES",
+            "ROADMAP_RELATED_TO",
+        ],
+        "Historical roadmap relations remain traversable. Roadmap mutations are retired; inspect retained records and their source/thread links.",
+    );
+    row["lifecycle"] = json!("historical_read_only");
+    row
+}
+
 fn family(name: &str, types: &[&str], tip: &str) -> serde_json::Value {
     json!({
         "family": name,
@@ -184,6 +207,40 @@ fn family(name: &str, types: &[&str], tip: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_roadmap_schema_keeps_provider_edges_and_population() {
+        use providers::InspectableEntityProvider;
+        let expected = providers::roadmap_item::RoadmapItemProvider.schema();
+        for compact in [false, true] {
+            let output = describe_schema_with_options(
+                &BTreeMap::from([("roadmap_item".into(), 3)]),
+                &[],
+                DescribeSchemaOptions {
+                    include_agents: false,
+                    compact,
+                },
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let vertex = value["vertex_types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["entity_type"] == "roadmap_item")
+                .unwrap();
+            assert_eq!(vertex["population_count"], 3);
+            assert_eq!(vertex["lifecycle"], "historical_read_only");
+            let family = value["edge_families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["family"] == "Roadmap")
+                .unwrap();
+            assert_eq!(family["types"], json!(expected.edge_families));
+            assert_eq!(family["lifecycle"], "historical_read_only");
+        }
+    }
 
     #[test]
     fn compact_orientation_preserves_vocabulary_and_population_counts() {

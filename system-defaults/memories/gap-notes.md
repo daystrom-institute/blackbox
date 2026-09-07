@@ -150,7 +150,7 @@ rejected: application-specific TODO, not blackbox substrate
 superseded by roadmap item BB-RX-14
 ```
 
-When a gap escalates into real implementation work, open or link a `bbox_thread(kind="work_item")` or roadmap item. The gap stays as the original field report; the thread becomes the execution object.
+When a gap escalates into real implementation work, open or link a `bbox_thread(kind="work_item")`. The gap stays as the original field report; the thread becomes the execution object.
 
 ## Close-out
 

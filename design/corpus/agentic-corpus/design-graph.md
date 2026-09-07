@@ -143,7 +143,7 @@ miner can derive them mechanically).
 | `dsg:Design` | `doc/<path>.md` | one per design leaf; `lifecycle` and `topic` mined from frontmatter; `brief`; `verified_against` commit + `verified_at` | A |
 | `dsg:Hub` | `doc/<path>.md` | one per design-hub / topic home | A |
 | `dsg:Module` | `module/<crate-or-plane>` | the touch-surface anchor: major code boundaries, path-keyed, mechanically seedable | A |
-| `dsg:OpenQuestion` | `question/<slug>` | statement, depth, outcome + synthesis when concluded; the harvest source for roadmap promotion | A |
+| `dsg:OpenQuestion` | `question/<slug>` | statement, depth, outcome + synthesis when concluded; input to campaign inquiries and active threads | A |
 | `dsg:Decision` | `decision/<slug>@N` | rationale, alternatives, `status: proposed \| active \| superseded \| reversed`, `enacted_by` commit ref | B |
 | `dsg:Constraint` | `constraint/<slug>@N` | kind `invariant \| preference` (the senior-engineer test), scope, `check_rule` (mechanical check), licensing | B |
 | `dsg:Concept` | `concept/<slug>` | the durable idea behind one or more docs; lifecycle `proposed → active → superseded \| absorbed \| deferred \| dismissed`. Mint lazily: only when a second artifact shows up for the same idea | B |
@@ -304,8 +304,9 @@ The duplication boundary, stated once and held:
 - Substrate gaps -> `bbox_gap` stays (a design-graph Finding analog, if ever
   needed, files drift between docs and tree and cites evidence; it does not
   replace gap notes).
-- Prospective work and sequencing -> roadmap and threads stay;
-  `dsg:OpenQuestion` promotes into them via the existing promotion paths.
+- Prospective concepts and inquiries -> the campaign layer; active execution
+  -> threads. Roadmap records are retained as read-only history; see
+  [the retirement contract](../../surfaces/mcp/roadmap-retirement.md).
 - Normative clause-level content -> `specs/` stays; this graph links.
 
 ## What this design refuses

@@ -61,9 +61,11 @@ The graph holds STATE; the design docs hold STORY.
 | A mirror of one gap-log record (target of `SOURCED_FROM`) | `dsg:GapRef` | `gap/<gap-id>` |
 
 If it is about agent behavior or cross-project operating rules, it belongs in
-knowledge (`bbox_learn` / `bbox_decide`), not here. If it is prospective work,
-it belongs in roadmap/threads. If it is normative clause content, it belongs
-in `specs/`. The graph links to those stores by ref, never absorbs them.
+knowledge (`bbox_learn` / `bbox_decide`), not here. Prospective concepts and inquiries belong in the campaign layer described
+below; active execution belongs in threads. Roadmap records are now
+[historical read-only data](roadmap-tool.md), not a destination for new work.
+If it is normative clause content, it belongs in `specs/`. The graph links
+to other stores without automatically absorbing their historical records.
 The one traversable exception is the gap log: a `dsg:GapRef` mirrors a gap
 record so `dsg:SOURCED_FROM` stays vertex-to-vertex; the gap itself (status,
 resolution) stays in `.bbox/gaps/`. Group inquiries, concepts, and open
