@@ -47,3 +47,43 @@ checks actual MCP session isolation and continuation through the served tool.
 Later diagnostic/probe failures preserve completed observations and return
 `error.embedding_observation_partial` on every exact page. Final gate and
 deployment evidence is recorded after integration.
+
+## Native transcript recovery
+
+Native search, citation and tool-history hits can use compact indexed-record
+handles instead of oversized or path-shaped source locators. Handles bind
+index identity, segment, document and complete stored content. Exact
+`bbox_context` pages recover stored content and metadata, while normal context
+and message readers constrain native source, account and session. Deleted,
+replaced, foreign-index or wrong-source handles refuse. Reindex/segment merges
+can invalidate handles; repeat the original search. These readers never open a
+caller-supplied path or grant retained-conversation access through a native
+fallback. Source-host freshness and parser truncation remain explicit limits.
+
+## Broadcast authority and admission
+
+The [branch acceptance record](mcp-v01-dispatch-acceptance.json) names the
+regressions and evidence limits. Broadcast now preserves explicit tool defaults
+on fresh and resumed children, applies the ordinary-resume ownership guard,
+and writes history only for tracked admissions. A tracked setup/provider
+failure retains exact task recovery. A refused reservation reports a member
+error and preserves the original team and corrupt store bytes. Reservation
+refusal releases the task-store write lock before its readback.
+
+## Roadmap retirement
+
+[Roadmap retirement](roadmap-retirement.md) records actual consumers and
+replacement instructions. All seven MCP mutation actions refuse before
+side effects. Six historical read actions, exact JSON export, stored items and
+graph relations remain. The public project design graph already supports
+Campaign, Inquiry and Concept vertices with guarded CLI authoring. Historical
+records belonging to other projects are not automatically moved into it;
+per-owner archival or migration is the remaining data-disposition boundary.
+
+## Recall probes are reads
+
+Self-recall selects only an already-loaded vector partition and never opens
+or creates a partition. Missing names, busy inventory/partition locks, empty
+HNSW state and measured recall remain distinct outcomes. Tempdir regressions
+prove unknown, parent-relative and absolute routes leave storage and the
+loaded-partition inventory unchanged.

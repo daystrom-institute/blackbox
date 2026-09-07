@@ -207,8 +207,16 @@ try:
  assert {row['name'] for row in surface['visible_tools']}==names
  call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
+ # Retired roadmap calls preserve the complete historical inventory.
+ historical=call('bbox_roadmap',{'action':'list'})
+ assert historical['lifecycle']=='historical_read_only'
+ for action in ['create','update','delete','promote','link','unlink','repair_links']:
+  refusal=call('bbox_roadmap',{'action':action,'id':'roadmap-00000000','title':'must not change','body':'synthetic rejected mutation'},True)
+  assert 'error.roadmap_mutation_retired' in str(refusal)
+ assert call('bbox_roadmap',{'action':'list'})==historical
+ print('roadmap historical reads and seven mutation refusals PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
- for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0}]:
+ for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:
   call('bbox_embed_status',args,True)
  args={'debug':True,'body_limit':512}
  first=call('bbox_embed_status',args)
