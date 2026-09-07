@@ -34,6 +34,103 @@ pub(crate) struct ContextToolParams {
     pub body_cursor: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cite_bounds_the_complete_envelope_and_preserves_ordered_exact_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&root),
+        ));
+        let escaped = "\u{0001}".repeat(2000);
+        {
+            let index = server.state.idx.read();
+            let fields = index.field_handles();
+            let mut writer = index
+                .index_handle()
+                .writer::<tantivy::TantivyDocument>(15_000_000)
+                .unwrap();
+            for i in 0..20 {
+                let mut doc = tantivy::TantivyDocument::new();
+                doc.add_text(fields.doc_type, "transcript");
+                doc.add_text(fields.content, "citationenvelopefixture");
+                doc.add_text(fields.file_path, format!("native:synthetic/stream{i}"));
+                doc.add_text(fields.session_id, "\u{0001}".repeat(256));
+                doc.add_text(fields.account, &escaped);
+                doc.add_text(fields.project, &escaped);
+                doc.add_text(fields.timestamp, format!("{i:02}{escaped}"));
+                doc.add_text(fields.role, "user");
+                doc.add_u64(fields.byte_offset, i);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+            index.reader_reload_for_test();
+        }
+        let result = server
+            .bbox_cite(Parameters(
+                serde_json::from_value::<CiteParams>(json!({
+                    "claim":"citationenvelopefixture", "limit":20
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let result = serde_json::to_value(result).unwrap();
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let out = result["content"][0]["text"].as_str().unwrap();
+        let readers: Vec<serde_json::Value> = out
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("Exact read: "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            !readers.is_empty() && readers.len() < 20,
+            "fixture must exercise aggregate byte admission"
+        );
+        assert!(
+            out.contains(&format!(
+                "omitted {} of 20 ranked citations",
+                20 - readers.len()
+            )),
+            "{out}"
+        );
+        for (i, reader) in readers.iter().enumerate() {
+            assert_eq!(reader["arguments"]["byte_offset"], i);
+        }
+        let mut arguments = readers[0]["arguments"].clone();
+        let mut recovered = String::new();
+        loop {
+            let result = server
+                .bbox_context(Parameters(
+                    serde_json::from_value::<ContextToolParams>(arguments.clone()).unwrap(),
+                ))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let result = serde_json::to_value(result).unwrap();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
+            );
+            let page: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            recovered.push_str(page["body"]["text"].as_str().unwrap());
+            let Some(cursor) = page["body"]["next_cursor"].as_str() else {
+                break;
+            };
+            arguments["body_cursor"] = json!(cursor);
+        }
+        let recovered: serde_json::Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(recovered["account"], escaped);
+        assert_eq!(recovered["project"], escaped);
+        assert_eq!(recovered["content"], "citationenvelopefixture");
+        assert_eq!(server.state.idx.read().searcher().num_docs(), 20);
+    }
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
 }
