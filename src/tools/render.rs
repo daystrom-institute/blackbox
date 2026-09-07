@@ -128,8 +128,11 @@ fn rescope_render_project(p: &mut RenderParams, projects: &[crate::projects::Pro
 impl BlackboxServer {
     pub(crate) fn lint_session_knowledge(&self) -> anyhow::Result<String> {
         let view = self.session_knowledge_view(None, None)?;
-        let output = view.knowledge.lint()?;
-        Ok(view.append_diagnostics(output))
+        let mut output = view.knowledge.lint()?;
+        if !view.diagnostics.is_empty() {
+            output.push_str(&format!("\n{} source visibility notices; results may be incomplete. Inspect bbox_knowledge(diagnostics_detail=true) for bounded visibility detail.", view.diagnostics.len()));
+        }
+        Ok(output)
     }
 
     pub(crate) fn review_session_knowledge(&self, p: &ReviewParams) -> anyhow::Result<String> {

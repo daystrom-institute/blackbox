@@ -44,7 +44,7 @@ pub fn packet_summary(pkt: &Packet) -> serde_json::Value {
         *histogram.entry(rule.classification.clone()).or_insert(0) += 1;
     }
     let preview: Vec<&str> = pkt.rules.iter().take(3).map(|r| r.id.as_str()).collect();
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "id": pkt.id,
         "domain": pkt.domain,
         "scope": pkt.scope,
@@ -53,7 +53,22 @@ pub fn packet_summary(pkt: &Packet) -> serde_json::Value {
         "rule_ids_preview": preview,
         "created_at": pkt.created_at,
         "updated_at": pkt.updated_at,
-    })
+    });
+    for field in ["domain", "scope"] {
+        bbox_corpus_core::response_page::preview_field(&mut row, field, 200);
+    }
+    for field in ["classification_histogram", "rule_ids_preview"] {
+        if serde_json::to_vec(&row[field]).map_or(true, |bytes| bytes.len() > 1024) {
+            let count = match &row[field] {
+                serde_json::Value::Object(values) => values.len(),
+                serde_json::Value::Array(values) => values.len(),
+                _ => 0,
+            };
+            row[field] = serde_json::json!({"count":count,"omitted":true});
+            row["exact_read"] = serde_json::json!({"tool":"bbox_inspect_entity","entity_ref":format!("packet:{}",pkt.id),"property":"body"});
+        }
+    }
+    row
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

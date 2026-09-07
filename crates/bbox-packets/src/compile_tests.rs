@@ -153,6 +153,21 @@ fn packet_list_helpers_match_and_summarize() {
     assert_eq!(preview.len(), 3);
     assert_eq!(preview[0], "breaking_api_change");
 
+    let mut huge = pr_triage_new.clone();
+    huge.domain = "界\n\"domain\"".repeat(2000);
+    huge.rules = (0..1000)
+        .map(|index| mk_rule(&format!("rule{index}"), &format!("classification{index}")))
+        .collect();
+    let bounded = packet_summary(&huge);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() < 4096);
+    assert_eq!(bounded["classification_histogram"]["count"], 1000);
+    assert_eq!(bounded["classification_histogram"]["omitted"], true);
+    assert_eq!(
+        bounded["exact_read"]["entity_ref"],
+        format!("packet:{}", huge.id)
+    );
+    assert_eq!(huge.rules.len(), 1000);
+
     let (_dir, store) = tmp_packets();
     store.save_packet(&pr_triage_old).unwrap();
     store.save_packet(&pr_triage_new).unwrap();

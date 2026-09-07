@@ -133,9 +133,14 @@ pub struct KnowledgeListParams {
     /// query parser; substring uses literal whole-query matching.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Max rows to return.
+    /// Maximum recall rows (default 12, MCP maximum 100). A complete-response
+    /// byte budget can return fewer rows; continue using the returned offset.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Live ranked-row offset, or system-memory catalog offset. Keep filters
+    /// unchanged; writes and recall ranking can move rows between requests.
+    #[serde(default)]
+    pub offset: Option<u64>,
     /// Return the exact diagnostics for this same query scope as bounded
     /// body pages instead of the compact diagnostic summary.
     #[serde(default)]
@@ -3680,6 +3685,8 @@ impl Knowledge {
                 .then_with(|| a_entry.title.cmp(&b_entry.title))
         });
         let total_results = results.len();
+        let offset = usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX);
+        results.drain(..offset.min(total_results));
         results.truncate(limit);
 
         if results.is_empty() {
@@ -3692,7 +3699,7 @@ impl Knowledge {
                 let prov = if e.providers.is_empty() {
                     "all".to_string()
                 } else {
-                    e.providers.join(",")
+                    knowledge_excerpt(&e.providers.join(","), 256)
                 };
                 let approval_mark = match e.approval {
                     Approval::UserConfirmed => "",
@@ -3718,7 +3725,7 @@ impl Knowledge {
                     format!(
                         "\n  score={:.1} | matched_by={}",
                         query_match.score,
-                        query_match.evidence.summary()
+                        knowledge_excerpt(&query_match.evidence.summary(), 256)
                     )
                 } else {
                     String::new()
@@ -3730,7 +3737,7 @@ impl Knowledge {
                     e.category,
                     e.scope,
                     prov,
-                    e.title,
+                    knowledge_excerpt(&e.title, 256),
                     approval_mark,
                     render_mark,
                     decay_mark,
@@ -3748,11 +3755,14 @@ impl Knowledge {
                 " (showing {} of {}; pass limit={} or a sharper query to expand)",
                 results.len(),
                 total_results,
-                total_results.min(500)
+                total_results.min(100)
             ));
         }
         out.push_str(":\n\n");
         out.push_str(&lines.join("\n\n"));
+        if offset.saturating_add(results.len()) < total_results {
+            out.push_str(&format!("\n\nContinue with offset={}; keep filters unchanged. This is a live ranked view; writes and recall updates can move rows.", offset.saturating_add(results.len())));
+        }
         Ok(out)
     }
 
@@ -4323,7 +4333,7 @@ impl Knowledge {
 
         if unverified > 0 {
             issues.push(format!(
-                "{} unverified entries (use blackbox_review)",
+                "{} unverified entries (use bbox_review)",
                 unverified
             ));
         }
@@ -4384,7 +4394,17 @@ impl Knowledge {
         if issues.is_empty() {
             Ok("No issues found.".to_string())
         } else {
-            Ok(format!("{} issues:\n\n{}", issues.len(), issues.join("\n")))
+            let total = issues.len();
+            let lines = issues
+                .iter()
+                .take(20)
+                .map(|issue| knowledge_excerpt(issue, 512))
+                .collect::<Vec<_>>();
+            Ok(format!(
+                "{total} issues (showing {}): unverified={unverified}, expired={expired}, disabled={disabled}, past_review={needs_review}, never_recalled={never_recalled}\n\n{}\n\nThis is a bounded diagnostic preview. Use bbox_review for unverified entries; page bbox_knowledge(status=all, limit=20, offset=0) for the underlying records and entry_detail for exact metadata.",
+                lines.len(),
+                lines.join("\n")
+            ))
         }
     }
 
@@ -5555,6 +5575,26 @@ mod tests {
         assert!(out.contains("matched_by="));
         assert!(out.contains("title:glob"));
         assert!(out.contains("content:disallow"));
+    }
+
+    #[test]
+    fn lint_bounds_large_issue_sets_and_names_real_recovery_tools() {
+        let (_tmp, mut kb) = mk_kb();
+        let title = "界\n\"expired\"".repeat(2000);
+        for index in 0..100 {
+            let id = format!("{index:08x}");
+            push_entry(&mut kb, &id, &format!("{title}{index}"), "fixture");
+            let entry = kb.store.entries.last_mut().unwrap();
+            entry.expires_at = Some("2000-01-01T00:00:00Z".into());
+            entry.approval = Approval::AgentInferred;
+        }
+        let output = kb.lint().unwrap();
+        assert!(output.len() < 16 * 1024);
+        assert!(output.contains("expired=100"));
+        assert!(output.contains("bbox_review"));
+        assert!(output.contains("bbox_knowledge"));
+        assert!(!output.contains("blackbox_review"));
+        assert!(!output.contains(&title));
     }
 
     #[test]

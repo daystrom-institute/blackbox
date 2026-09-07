@@ -117,6 +117,7 @@ fn packet_list_page(
     bbox_corpus_core::response_page::bound_page(
         serde_json::json!({"count": packets.len(), "packets": packets, "total": total, "offset": offset, "limit": limit,
             "next_offset": (next_offset < total).then_some(next_offset), "order": "created_at_desc,id_asc",
+            "pagination": "live_offset: installs and removals can move rows; restart at offset 0 after changing packets",
             "detail_hint": "Rule previews: bbox_packet_list(packet_id=<id>,detail=true). Complete JSON: bbox_inspect_entity(entity_ref=packet:<id>,property=body); continue with property_cursor=body.next_cursor.",
         }),
         "packets",
