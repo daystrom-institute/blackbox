@@ -2638,6 +2638,9 @@ impl AcceptedRuntimeView {
 
 #[derive(Clone)]
 pub(crate) struct BlackboxServer {
+    /// Bounded immutable reports owned by this MCP session and shared by its clones.
+    pub(crate) embed_status_snapshots:
+        Arc<parking_lot::Mutex<crate::embed_runtime::status_snapshot::StatusSnapshots>>,
     pub(crate) state: Arc<SharedState>,
     pub(crate) tool_router: ToolRouter<Self>,
     /// Session-scoped MCP tool surface selector. Set once during

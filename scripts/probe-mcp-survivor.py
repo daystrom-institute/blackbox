@@ -207,6 +207,27 @@ try:
  assert {row['name'] for row in surface['visible_tools']}==names
  call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
+ # Immutable embedding report pages never invoke producer work again.
+ for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0}]:
+  call('bbox_embed_status',args,True)
+ args={'debug':True,'body_limit':512}
+ first=call('bbox_embed_status',args)
+ assert first['snapshot']['session_scoped'] and first['snapshot']['immutable']
+ cursor=first['body']['next_cursor']; assert cursor
+ call('bbox_embed_status',{**args,'debug':False,'cursor':cursor},True)
+ original_session=session
+ session=None
+ rpc('initialize',{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'mcp-snapshot-other','version':'1'}})
+ rpc('notifications/initialized',{},True)
+ call('bbox_embed_status',{**args,'cursor':cursor},True)
+ session=original_session
+ joined=first['body']['text']; snapshot_id=first['snapshot']['id']
+ while cursor:
+  page=call('bbox_embed_status',{**args,'cursor':cursor})
+  assert page['snapshot']['id']==snapshot_id and page['snapshot']['captured_at']==first['snapshot']['captured_at']
+  joined+=page['body']['text']; cursor=page['body']['next_cursor']
+ assert isinstance(json.loads(joined)['routes'],dict)
+ print('embedding session snapshot recovery and selector refusal PASS',flush=True)
  result={'revision':subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip(),'catalog_tools':len(names),'checks':rows,'max_result_bytes':max(r['result_bytes'] for r in rows),'thread_note_bytes':len(note.encode()),'passed':True}
  (root/'summary.json').write_text(json.dumps(result,indent=2)); print(json.dumps({k:v for k,v in result.items() if k!='checks'}),flush=True)
 finally:

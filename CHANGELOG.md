@@ -19,6 +19,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Embedding health reports now support immutable session snapshots. Exact
+  continuation reuses captured bytes instead of repeating scans or recall
+  probes; invalid diagnostic/probe selectors refuse before collection.
+
 - MCP discovery now keeps ordinary schema, knowledge, artifact, roadmap and
   health reads compact, with exact JSON pages for oversized evidence and
   metadata. Graph validation pages variants separately from error rows.

@@ -7,6 +7,8 @@
 //! contradiction detector (registered into the queue worker's hook at
 //! SharedState construction).
 
+pub(crate) mod status_snapshot;
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
