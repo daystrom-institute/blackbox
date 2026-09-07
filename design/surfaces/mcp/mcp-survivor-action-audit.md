@@ -11,10 +11,12 @@ brief: "Current per-action dispositions, evidence limits, and prioritized residu
 
 # Surviving MCP action audit
 
-Current owner: thread-c749d06c. Reconciled on 2026-09-06 against source
-004822640975f19f90dc4d50dd16d7fc9efc42e8 and fresh read-only production
-observations. The next implementation starts with destructive selector
-validation, followed by pre-effect validation and honest partial receipts.
+Current owner: thread-c749d06c. The audit below is the reconciliation baseline
+at source 004822640975f19f90dc4d50dd16d7fc9efc42e8, committed as fdd0180c.
+The subsequent [fix checkpoint](mcp-survivor-fix-checkpoint.md) is authoritative
+for implemented corrections, current verification and retained obligations.
+Remaining/future wording in the baseline matrix describes the queue that drove
+those fixes, not a claim that each original defect still exists.
 
 The source declarations and complete ops replay still agree on 109 named tools.
 Default replay exposes 96; this connected client exposes 101, with the five

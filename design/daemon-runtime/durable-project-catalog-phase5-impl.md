@@ -672,6 +672,16 @@ Allowed bridge-visible additions:
 - dormant code and types; catalog-inactive refusal from new tools; empty catalog runtime state not serialized into existing responses
 Any other bridge output change requires a new explicit decision.
 
+### MCP survivor caller-contract amendment
+
+The authorized survivor fixes extend the presentation amendment to the eight
+bridge rows listed in the [fix checkpoint](../surfaces/mcp/mcp-survivor-fix-checkpoint.md#bridge-presentation-amendment).
+This permits the documented bounded projections, exact-reader hints and
+completed-target accounting. The canonical capture is reviewed and refreshed
+for those rows only. Authority, visibility, selected data, tombstones, measured
+file bytes and written provenance remain governed by the existing contracts;
+the verifier retains complete responses and its exact normalization rules.
+
 ### 2026-09-05 MCP response amendment
 
 The operator-authorized MCP contract remediation deliberately changes the
