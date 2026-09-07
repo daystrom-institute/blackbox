@@ -696,6 +696,13 @@ impl Transport for AnthropicTransport {
         "anthropic"
     }
 
+    fn tool_batch_rejection(&self, out: &TurnOutput) -> Option<String> {
+        if self.provider.as_deref() != Some("glm") {
+            return None;
+        }
+        glm_native_batch_rejection(out.observation_content.as_deref()?)
+    }
+
     fn push_user_text(&mut self, text: &str) {
         self.messages.push(json!({
             "role": "user",
@@ -1236,6 +1243,63 @@ fn content_blocks(message: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
 }
 
+/// GLM can expose a client proposal while native search is pending, then
+/// issue it again under a new ID after the native result. No wire signal
+/// withdraws either proposal, so reject the batch rather than guess which
+/// invocation was intended. Identical calls without this boundary remain valid.
+fn glm_native_batch_rejection(content: &[Value]) -> Option<String> {
+    let mut pending = std::collections::HashMap::new();
+    let mut native_spans = Vec::new();
+    for (index, block) in content.iter().enumerate() {
+        if block["type"] == "server_tool_use"
+            && matches!(
+                block["name"].as_str(),
+                Some("web_search" | "web_search_prime")
+            )
+            && let Some(id) = block["id"].as_str().filter(|id| !id.is_empty())
+        {
+            pending.insert(id, index);
+        } else if block["type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("tool_result"))
+            && let Some(id) = block["tool_use_id"].as_str()
+            && let Some(start) = pending.remove(id)
+        {
+            native_spans.push((start, index, id));
+        }
+    }
+    let clients: Vec<_> = content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            if block["type"] != "tool_use" {
+                return None;
+            }
+            Some((
+                index,
+                block["id"].as_str().filter(|id| !id.is_empty())?,
+                block["name"].as_str()?,
+                block.get("input")?,
+            ))
+        })
+        .collect();
+    for (offset, &(first_index, first_id, name, args)) in clients.iter().enumerate() {
+        for &(last_index, last_id, last_name, last_args) in &clients[offset + 1..] {
+            if first_id == last_id || name != last_name || args != last_args {
+                continue;
+            }
+            if let Some((_, _, native_id)) = native_spans.iter().find(|&&(start, result, _)| {
+                start < first_index && first_index < result && result < last_index
+            }) {
+                return Some(format!(
+                    "error.glm_ambiguous_client_batch: client tool {name} was proposed with identical arguments under distinct IDs {first_id} and {last_id} across native search result {native_id}. None of the client tools in this batch were executed. Reissue the intended actions one per response using the existing search results; do not repeat the native searches for this correction. Intentional repeated actions may follow after each preceding tool result."
+                ));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1326,85 @@ mod tests {
             web_search: false,
             service_tier: None,
         }
+    }
+
+    #[test]
+    fn glm_batch_rejection_requires_distinct_client_ids_across_matching_native_result() {
+        let native = json!({"type":"server_tool_use","id":"search","name":"web_search_prime","input":{"search_query":"synthetic"}});
+        let result = json!({"type":"tool_result","tool_use_id":"search","content":"[]"});
+        let first =
+            json!({"type":"tool_use","id":"first","name":"count_action","input":{"a":1,"b":2}});
+        let second =
+            json!({"type":"tool_use","id":"second","name":"count_action","input":{"b":2,"a":1}});
+        let valid = vec![
+            native.clone(),
+            first.clone(),
+            result.clone(),
+            second.clone(),
+        ];
+        let out = |content| TurnOutput {
+            observation_content: Some(content),
+            text: String::new(),
+            thinking: String::new(),
+            tool_calls: vec![],
+            stop: StopReason::ToolCalls,
+            end_turn: None,
+            usage: Usage::default(),
+        };
+        let mut tx = transport();
+        for provider in [None, Some("deepseek"), Some("minimax"), Some("kimi")] {
+            tx.provider = provider.map(str::to_owned);
+            assert!(tx.tool_batch_rejection(&out(valid.clone())).is_none());
+        }
+        tx.provider = Some("glm".into());
+        assert!(
+            tx.tool_batch_rejection(&out(valid.clone()))
+                .unwrap()
+                .contains("error.glm_ambiguous_client_batch")
+        );
+        let mut changed_args = second.clone();
+        changed_args["input"]["a"] = json!(3);
+        let mut same_id = second.clone();
+        same_id["id"] = first["id"].clone();
+        let mut unrelated_result = result.clone();
+        unrelated_result["tool_use_id"] = json!("other-search");
+        let mut nonsearch = native.clone();
+        nonsearch["name"] = json!("other_native_tool");
+        for content in [
+            vec![first.clone(), second.clone()],
+            vec![
+                native.clone(),
+                result.clone(),
+                first.clone(),
+                second.clone(),
+            ],
+            vec![
+                first.clone(),
+                native.clone(),
+                result.clone(),
+                second.clone(),
+            ],
+            vec![native.clone(), first.clone(), second.clone()],
+            vec![
+                native.clone(),
+                first.clone(),
+                unrelated_result,
+                second.clone(),
+            ],
+            vec![native.clone(), first.clone(), result.clone(), changed_args],
+            vec![native.clone(), first.clone(), result.clone(), same_id],
+            vec![nonsearch, first.clone(), result.clone(), second.clone()],
+            vec![native.clone(), first.clone(), result.clone()],
+            vec![second.clone()],
+        ] {
+            assert!(tx.tool_batch_rejection(&out(content)).is_none());
+        }
+        let canonical =
+            json!({"type":"web_search_tool_result","tool_use_id":"search","content":[]});
+        assert!(
+            tx.tool_batch_rejection(&out(vec![native, first, canonical, second]))
+                .is_some()
+        );
     }
 
     fn opts_with_base(base: &str, system: SystemPrompt) -> TurnOpts {

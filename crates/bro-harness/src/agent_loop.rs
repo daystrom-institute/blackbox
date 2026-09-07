@@ -182,16 +182,28 @@ async fn run_with_emitter(
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    session
+    let turn_result = session
         .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
-        .await?;
-    let body = session.persist_body()?;
-    let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-        .await
-        .context("persist task panicked")?
-        .context("write session")?;
-    Ok(())
+        .await;
+    // Completed assistant/tool exchanges remain valid replay state even when
+    // the turn ends with a local refusal. Failed transport responses already
+    // remove incomplete assistant content before reaching this boundary.
+    let persist_result = async {
+        let body = session.persist_body()?;
+        let path = session.store_path().to_path_buf();
+        tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+            .await
+            .context("persist task panicked")?
+            .context("write session")
+    }
+    .await;
+    match (turn_result, persist_result) {
+        (Err(error), Err(persist_error)) => Err(error.context(format!(
+            "session persistence also failed: {persist_error:#}"
+        ))),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), persisted) => persisted,
+    }
 }
 
 /// Builds an `Emitter` for `session_id`, wiring in the sidecar event log and
@@ -1236,6 +1248,7 @@ impl Session {
         let mut last_step_text = String::new();
         // One-shot guard for the empty-output nudge below.
         let mut empty_output_nudged = false;
+        let mut tool_batch_correction_used = false;
         let mut turn_steps = 0u64;
         let mut last_model_stop: Option<StopReason> = None;
         let mut last_model_tool_call_count = 0usize;
@@ -1456,6 +1469,52 @@ impl Session {
                     Some(&out.stop),
                     Some(&out.usage),
                 );
+            }
+
+            // A rejected batch stays visible and replayable, but no client
+            // action (including final_result) runs. Supply a result for every
+            // ID before either requesting correction or terminating.
+            if let Some(reason) = self.tx.tool_batch_rejection(&out) {
+                last_tool_results = out
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id, "name": call.name, "is_error": true, "rejected": true,
+                        })
+                    })
+                    .collect();
+                let results: Vec<_> = out
+                    .tool_calls
+                    .iter()
+                    .map(|call| transport::ToolResult {
+                        id: call.id.clone(),
+                        content: reason.clone(),
+                        is_error: true,
+                    })
+                    .collect();
+                self.emitter.tool_results(&results);
+                self.pending_input_estimate = self
+                    .pending_input_estimate
+                    .saturating_add(est_tool_results(&results));
+                self.tx.push_tool_results(results);
+                self.hooks.tick();
+                if *cancel.borrow() {
+                    break 'turn "cancelled";
+                }
+                if tool_batch_correction_used {
+                    anyhow::bail!(
+                        "{reason} Automatic correction was already attempted for this user turn; stopping."
+                    );
+                }
+                if turn_steps >= self.max_turns {
+                    anyhow::bail!(
+                        "{reason} No correction turn remains within the configured turn limit; stopping."
+                    );
+                }
+                tool_batch_correction_used = true;
+                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
+                continue;
             }
 
             let has_tool_work = out.stop == StopReason::ToolCalls && !out.tool_calls.is_empty();
@@ -3146,6 +3205,302 @@ mod tests {
                         .contains("error.resume_tool_schema_missing"),
                     "{case}"
                 );
+            }
+        }
+    }
+
+    struct CountingAction(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl bro_tools::Tool for CountingAction {
+        fn name(&self) -> &str {
+            "count_action"
+        }
+        fn description(&self) -> &str {
+            "Count synthetic actions"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            bro_tools::ToolResult::Text("executed".into())
+        }
+    }
+
+    fn ambiguous_native_batch(suffix: &str) -> Vec<Value> {
+        vec![
+            json!({"type":"server_tool_use","id":format!("native-{suffix}"),"name":"web_search_prime","input":{"search_query":"synthetic"}}),
+            json!({"type":"tool_use","id":format!("early-{suffix}"),"name":"count_action","input":{"value":1}}),
+            json!({"type":"tool_result","tool_use_id":format!("native-{suffix}"),"content":"[]"}),
+            json!({"type":"tool_use","id":format!("late-{suffix}"),"name":"count_action","input":{"value":1}}),
+            json!({"type":"tool_use","id":format!("sibling-{suffix}"),"name":"count_action","input":{"value":2}}),
+            json!({"type":"tool_use","id":format!("final-{suffix}"),"name":"final_result","input":{"done":true}}),
+        ]
+    }
+
+    fn complete_block_sse(blocks: &[Value]) -> String {
+        let mut events = vec![
+            json!({"type":"message_start","message":{"id":"synthetic","role":"assistant","content":[]}}),
+        ];
+        for (index, block) in blocks.iter().enumerate() {
+            if block["type"] == "text" {
+                events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}));
+                events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":block["text"]}}));
+            } else {
+                events.push(
+                    json!({"type":"content_block_start","index":index,"content_block":block}),
+                );
+            }
+            events.push(json!({"type":"content_block_stop","index":index}));
+        }
+        let stop = if blocks.iter().any(|b| b["type"] == "tool_use") {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop}}));
+        events.push(json!({"type":"message_stop"}));
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn glm_ambiguous_batches_reject_all_calls_and_bound_correction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let corrected = vec![
+            json!({"type":"tool_use","id":"corrected","name":"count_action","input":{"value":1}}),
+        ];
+        let done = vec![json!({"type":"text","text":"done"})];
+        let ordinary = vec![
+            json!({"type":"tool_use","id":"repeat-a","name":"count_action","input":{"value":1}}),
+            json!({"type":"tool_use","id":"repeat-b","name":"count_action","input":{"value":1}}),
+        ];
+        for (label, responses, max_turns, user_turns, expected_counts, expected_error) in [
+            (
+                "corrected",
+                vec![ambiguous_native_batch("a"), corrected.clone(), done.clone()],
+                10,
+                1,
+                vec![0, 0, 1],
+                None,
+            ),
+            (
+                "recurrent",
+                vec![ambiguous_native_batch("a"), ambiguous_native_batch("b")],
+                10,
+                1,
+                vec![0, 0],
+                Some("Automatic correction was already attempted"),
+            ),
+            (
+                "no-budget",
+                vec![ambiguous_native_batch("a")],
+                1,
+                1,
+                vec![0],
+                Some("No correction turn remains"),
+            ),
+            (
+                "ordinary",
+                vec![ordinary, done.clone()],
+                10,
+                1,
+                vec![0, 2],
+                None,
+            ),
+            (
+                "separate-turns",
+                vec![corrected.clone(), done.clone(), corrected.clone(), done],
+                10,
+                2,
+                vec![0, 1, 1, 2],
+                None,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let count = Arc::new(AtomicUsize::new(0));
+            let (mut session, _) = mk_session_with_store(
+                vec![],
+                Some(SessionStore::for_test(root.join("session.json"))),
+            );
+            session.cx.root = root.clone();
+            session.max_turns = max_turns;
+            let schema = json!({"type":"object","properties":{"done":{"type":"boolean"}}});
+            // An ambiguous final_result sibling must not terminate the turn.
+            if label != "ordinary" && label != "separate-turns" {
+                session.output_schema = Some(schema.clone());
+            }
+            session.reg = Registry::new(
+                vec![
+                    Arc::new(CountingAction(count.clone())),
+                    Arc::new(FinalResultTool::new(schema)),
+                ],
+                vec![],
+                &PinPolicy::default(),
+                &mcp::ToolFilter::default(),
+            );
+            let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
+            session.event_log = log.clone();
+            session.emitter = Emitter::new(label.into()).with_event_log(log.clone());
+            session.base_opts.model = "glm-5.3".into();
+            session.base_opts.web_search = true;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_count = count.clone();
+            let expected_responses = responses.clone();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for blocks in responses {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let body = loop {
+                        let mut chunk = [0_u8; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let length = headers
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                                .unwrap();
+                            if request.len() >= header_end + 4 + length {
+                                break serde_json::from_slice::<Value>(
+                                    &request[header_end + 4..header_end + 4 + length],
+                                )
+                                .unwrap();
+                            }
+                        }
+                    };
+                    requests.push((body, server_count.load(Ordering::SeqCst)));
+                    let body = complete_block_sse(&blocks);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            session.tx = Box::new(
+                transport::with_session_env(
+                    BTreeMap::from([
+                        ("ANTHROPIC_BASE_URL".into(), format!("http://{addr}")),
+                        ("ANTHROPIC_AUTH_TOKEN".into(), "synthetic-token".into()),
+                        ("BRO_HARNESS_PROVIDER".into(), "glm".into()),
+                    ]),
+                    async { transport::anthropic::AnthropicTransport::from_env().unwrap() },
+                )
+                .await,
+            );
+            for _ in 0..user_turns {
+                let (_cancel_tx, cancel_rx) = watch::channel(false);
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    session.user_turn(
+                        "Perform the intended synthetic action.",
+                        cancel_rx,
+                        Arc::new(StdMutex::new(VecDeque::new())),
+                    ),
+                )
+                .await
+                .expect(label);
+                if let Some(message) = expected_error {
+                    let error = result.expect_err(label).to_string();
+                    assert!(
+                        error.contains("error.glm_ambiguous_client_batch"),
+                        "{error}"
+                    );
+                    assert!(error.contains(message), "{error}");
+                } else {
+                    result.unwrap();
+                }
+            }
+            let requests = server.await.unwrap();
+            assert_eq!(
+                requests.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+                expected_counts,
+                "{label}"
+            );
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                *expected_counts.last().unwrap(),
+                "{label}"
+            );
+            let snapshot = session.tx.snapshot();
+            let messages = snapshot.as_array().unwrap();
+            for blocks in expected_responses
+                .iter()
+                .filter(|blocks| blocks.iter().any(|b| b["type"] == "server_tool_use"))
+            {
+                let pos = messages
+                    .iter()
+                    .position(|message| {
+                        message["role"] == "assistant" && message["content"] == json!(blocks)
+                    })
+                    .expect("exact original native/client blocks retained");
+                let errors = messages[pos + 1]["content"].as_array().unwrap();
+                let clients: Vec<_> = blocks
+                    .iter()
+                    .filter(|block| block["type"] == "tool_use")
+                    .collect();
+                assert_eq!(errors.len(), clients.len());
+                for (error, client) in errors.iter().zip(clients) {
+                    assert_eq!(error["tool_use_id"], client["id"]);
+                    assert_eq!(error["is_error"], true);
+                    assert!(
+                        error["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("None of the client tools in this batch were executed")
+                    );
+                }
+                let replay_request = requests.iter().find(|(request, _)| {
+                    request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m == &messages[pos])
+                });
+                if blocks == &expected_responses[0] && label != "no-budget" {
+                    assert!(
+                        replay_request.is_some(),
+                        "correction must replay the original response"
+                    );
+                }
+                if let Some((request, _)) = replay_request {
+                    let replay = request["messages"].as_array().unwrap();
+                    assert!(replay.contains(&messages[pos + 1]));
+                }
+            }
+            let rows: Vec<Value> = std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let terminals: Vec<_> = rows
+                .iter()
+                .filter(|r| r["event"]["type"] == "result")
+                .collect();
+            assert_eq!(terminals.len(), user_turns);
+            assert_eq!(
+                terminals.last().unwrap()["event"]["is_error"]
+                    .as_bool()
+                    .unwrap_or(false),
+                expected_error.is_some()
+            );
+            for message in messages.iter().filter(|m| m["role"] == "assistant") {
+                assert!(rows.iter().any(|r| r["event"]["type"] == "assistant"
+                    && r["event"]["message"]["content"] == message["content"]));
             }
         }
     }

@@ -426,6 +426,13 @@ pub trait Transport: Send {
     /// Append tool results for the tool calls from the previous turn.
     fn push_tool_results(&mut self, results: Vec<ToolResult>);
 
+    /// Reject an ambiguous provider-produced client batch before execution.
+    /// The loop preserves the observed assistant and supplies explicit error
+    /// results for every client ID, allowing bounded model correction.
+    fn tool_batch_rejection(&self, _out: &TurnOutput) -> Option<String> {
+        None
+    }
+
     /// Run one assistant turn: encode the conversation + tools, call the
     /// provider, append the assistant's native output to the buffer, and
     /// return the normalized result. Streaming transports forward incremental
