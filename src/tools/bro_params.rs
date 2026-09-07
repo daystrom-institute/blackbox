@@ -622,6 +622,10 @@ pub(crate) struct AgentDispatchParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentSearchParams {
     pub(crate) query: String,
+    /// Include bounded ranking/vector diagnostics. Ordinary reads retain only
+    /// search mode, evidence identity and degradation flags.
+    #[serde(default)]
+    pub(crate) debug: bool,
     #[serde(default)]
     pub(crate) limit: Option<u64>,
     #[serde(default)]

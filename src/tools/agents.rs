@@ -70,6 +70,29 @@ fn compact_agent_plane(value: &serde_json::Value, exact_plane: &str) -> serde_js
     summary
 }
 
+/// Ranked discovery keeps small examples and counts; exact pattern text stays
+/// in the manifest reader. Never shorten the returned agent name/version.
+fn project_agent_search_patterns(row: &mut serde_json::Value, field: &str, values: &[String]) {
+    let mut shortened = values.len() > 2;
+    let preview: Vec<_> = values
+        .iter()
+        .take(2)
+        .map(|value| {
+            let mut end = value.len().min(192);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            shortened |= end != value.len();
+            value[..end].to_owned()
+        })
+        .collect();
+    row[field] = serde_json::json!(preview);
+    row[format!("{field}_count")] = serde_json::json!(values.len());
+    if shortened {
+        row[format!("{field}_truncated")] = serde_json::json!(true);
+    }
+}
+
 /// Compact manifest identity for summary responses. Exact (redacted) JSON
 /// stays reachable through body pages.
 pub(crate) fn manifest_summary(
@@ -697,7 +720,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_agent_search",
-        description = "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns."
+        description = "Search installed agents with ranked compact previews and exact manifest recovery hints. Returned count is top-k, not total matches. debug adds bounded ranking/vector diagnostics."
     )]
     pub(crate) fn bro_agent_search(
         &self,
@@ -709,7 +732,7 @@ impl BlackboxServer {
         if query.is_empty() {
             return Self::err_text("query is required");
         }
-        let limit = p.limit.unwrap_or(5).min(50) as usize;
+        let limit = p.limit.unwrap_or(5).clamp(1, 50) as usize;
         let cost_class = match p.cost_class.as_deref() {
             Some("cheap") => Some(AgentCostClass::Cheap),
             Some("normal") => Some(AgentCostClass::Normal),
@@ -756,26 +779,18 @@ impl BlackboxServer {
             Ok(r) => r,
             Err(e) => return Self::err_text(&format!("search failed: {e}")),
         };
-        let json_results: Vec<serde_json::Value> = results
-            .iter()
-            .map(|r| {
-                let mut obj = serde_json::json!({
-                    "name": r.name,
-                    "version": r.version,
-                    "score": (r.score * 1000.0).round() / 1000.0,
-                    "description": r.description,
-                    "when_to_use": r.when_to_use,
-                    "anti_patterns": r.anti_patterns,
-                    "cost_class": r.cost_class,
-                    "provenance_kind": r.provenance_kind,
-                    "sources": r.sources,
-                });
-                if !exclude_ap {
-                    obj["matched_anti_patterns"] = serde_json::json!(r.matched_anti_patterns);
-                }
-                obj
-            })
-            .collect();
+        let json_results: Vec<serde_json::Value> = results.iter().map(|r| {
+            let mut obj = serde_json::json!({"name":r.name,"version":r.version,
+                "score":(r.score * 1000.0).round() / 1000.0,
+                "description":r.description,"cost_class":r.cost_class,"provenance_kind":r.provenance_kind});
+            bbox_corpus_core::response_page::preview_field(&mut obj, "description", 256);
+            for (field, values) in [("when_to_use", &r.when_to_use), ("anti_patterns", &r.anti_patterns)] {
+                project_agent_search_patterns(&mut obj, field, values);
+            }
+            if !exclude_ap { project_agent_search_patterns(&mut obj, "matched_anti_patterns", &r.matched_anti_patterns); }
+            if p.debug { obj["sources"] = serde_json::json!(r.sources); }
+            obj
+        }).collect();
         let active_count = active_agents.len();
         let vector_available = vector_plan.search.is_some();
         let coverage_ratio = if active_count == 0 {
@@ -783,23 +798,32 @@ impl BlackboxServer {
         } else {
             embedded_agents as f64 / active_count as f64
         };
-        Self::ok_json(&serde_json::json!({
-            "results": json_results,
-            "search_mode": if vector_available { "hybrid" } else { "keyword" },
-            "total_matched": json_results.len(),
-            "active_agents": active_count,
-            "degraded": {
-                "embedding_pending": embedded_agents < active_count,
-                "vector_search_unavailable": !vector_available,
-                "vector_error": vector_plan.error,
-            },
-            "vector_status": {
-                "coverage_ratio": coverage_ratio,
-                "embedded_agents": embedded_agents,
-                "active_agents": active_count,
-                "route": vector_plan.route,
-            },
-        }))
+        let mut out = serde_json::json!({
+            "results":json_results,"returned":json_results.len(),"selection":"ranked_top_k", "limit":limit,
+            "active_agents":active_count,"search_mode":if vector_available { "hybrid" } else { "keyword" },
+            "degraded":{"embedding_pending":embedded_agents < active_count,"vector_search_unavailable":!vector_available},
+            "detail_hint":"bro_agent_get(name) pages the exact stored manifest including description, when_to_use and anti_patterns; bro_agent_describe(agent) inspects computed dispatch policy. Counts describe stored fields; previews are not exact bodies. Top-k is not an exhaustive match count."
+        });
+        if p.debug {
+            out["vector_status"] = serde_json::json!({"coverage_ratio":coverage_ratio,
+                "embedded_agents":embedded_agents,"active_agents":active_count,
+                "route":vector_plan.route.as_deref().map(|s| preview_text(s,256)),
+                "error":vector_plan.error.as_deref().map(|s| preview_text(s,256))});
+        }
+        let selected = results.len();
+        loop {
+            let returned = out["results"].as_array().unwrap().len();
+            out["returned"] = serde_json::json!(returned);
+            if returned < selected {
+                out["byte_limited"] = serde_json::json!(true);
+                out["omitted_from_top_k"] = serde_json::json!(selected - returned);
+            }
+            let response = Self::ok_json(&out);
+            if response.is_error != Some(true) || returned <= 1 {
+                return response;
+            }
+            out["results"].as_array_mut().unwrap().pop();
+        }
     }
 
     #[tool(
@@ -2064,6 +2088,7 @@ mod tests {
         .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: true,
             query: "review pull request security".into(),
             limit: None,
             cost_class: None,
@@ -2076,7 +2101,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["search_mode"], "keyword");
         assert!(body["results"].is_array());
-        assert!(body["total_matched"].as_u64().unwrap() > 0);
+        assert!(body["returned"].as_u64().unwrap() > 0);
         assert!(body["active_agents"].as_u64().unwrap() > 0);
         assert!(body["degraded"]["embedding_pending"].as_bool().unwrap());
         assert!(body["vector_status"]["coverage_ratio"].is_number());
@@ -2136,6 +2161,7 @@ mod tests {
             .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "orthogonal words".into(),
             limit: Some(5),
             cost_class: None,
@@ -2284,6 +2310,7 @@ mod tests {
         }
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "testing search".into(),
             limit: Some(2),
             cost_class: None,
@@ -2298,10 +2325,76 @@ mod tests {
     }
 
     #[test]
+    fn agent_search_bounds_fanout_and_recovers_large_manifest_without_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let description = format!("synthetic audit {}", "\u{1}".repeat(3000));
+        let pattern = format!("synthetic audit {}", "\u{1}".repeat(1000));
+        for n in 0..50 {
+            server.state.artifacts.read().install_value(artifacts::ArtifactKind::Agent,
+                format!("synthetic-{n}.json"), &serde_json::json!({"kind":"agent","name":format!("synthetic-{n:02}"),"version":1,
+                    "manifest":{"description":description,"when_to_use":[pattern,pattern,pattern],
+                        "anti_patterns":["unrelated","unrelated","unrelated"],"brofile_inline":{"provider":"brodex"}}}),
+                None,None,None).unwrap();
+        }
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "synthetic audit".into(),
+            debug: false,
+            limit: Some(50),
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: Some(false),
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES
+        );
+        let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert!(value.get("vector_status").is_none());
+        assert!(value.get("total_matched").is_none());
+        assert_eq!(
+            value["returned"].as_u64().unwrap() as usize,
+            value["results"].as_array().unwrap().len()
+        );
+        let first = &value["results"][0];
+        assert_eq!(first["when_to_use_count"], 3);
+        assert_eq!(first["when_to_use_truncated"], true);
+        assert_eq!(first["description_truncated"], true);
+        let name = first["name"].as_str().unwrap();
+        let mut cursor = None;
+        let mut recovered = String::new();
+        loop {
+            let response = server.bro_agent_get(Parameters(AgentGetParams {
+                name: name.into(),
+                cursor,
+                body_limit: Some(4096),
+            }));
+            assert_ne!(response.is_error, Some(true));
+            let page: serde_json::Value = serde_json::from_str(&extract_text(&response)).unwrap();
+            recovered.push_str(page["manifest_body"]["text"].as_str().unwrap());
+            cursor = page["manifest_body"]["next_cursor"]
+                .as_str()
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let manifest: serde_json::Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(manifest["description"], description);
+        assert_eq!(
+            manifest["when_to_use"],
+            serde_json::json!([pattern, pattern, pattern])
+        );
+    }
+
+    #[test]
     fn bro_agent_search_empty_query_is_error() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "  ".into(),
             limit: None,
             cost_class: None,
@@ -2341,6 +2434,7 @@ mod tests {
         .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "deploy untested code".into(),
             limit: None,
             cost_class: None,
@@ -2384,6 +2478,7 @@ mod tests {
         .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "deploy untested code".into(),
             limit: None,
             cost_class: None,
@@ -2469,6 +2564,7 @@ mod tests {
         .unwrap();
 
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "search test agent".into(),
             limit: None,
             cost_class: None,
@@ -2503,6 +2599,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            debug: false,
             query: "test".into(),
             limit: None,
             cost_class: Some("invalid".into()),
