@@ -34,6 +34,7 @@ MAX_BODY_BYTES = 16 * 1024 * 1024
 SAFE_RESPONSE_HEADERS = {"request-id", "x-request-id", "x-log-id", "content-type"}
 REPORT_NAME = "mcp__blackbox__bro_report"
 RESUME_ERROR = "error.resume_tool_schema_missing"
+AMBIGUOUS_BATCH_ERROR = "error.glm_ambiguous_client_batch"
 
 
 def arguments():
@@ -177,7 +178,8 @@ class Probe:
                     valid = (params.get("name") == "bro_report"
                              and isinstance(params.get("arguments", {}).get("message"), str))
                     with probe.lock:
-                        probe.mcp_calls.append({"case": probe.case, "params": params, "success": valid})
+                        probe.mcp_calls.append({"case": probe.case, "params": params, "success": valid,
+                                                "after_response_n": len(probe.requests)})
                         probe.save("mcp-calls.json", probe.mcp_calls)
                     result = {"content": [{"type": "text", "text": json.dumps({"ok": valid})}],
                               "isError": not valid}
@@ -468,6 +470,21 @@ def duplicate_calls(calls):
             for key, ids in groups.items() if len(ids) > 1]
 
 
+def rejected_batch(value, client_ids):
+    """Require exactly one durable guard error for every client ID in the batch."""
+    results = [block for block in nested_blocks(value) if block.get("type") == "tool_result"
+               and block.get("tool_use_id") in client_ids]
+    paired = {}
+    for ident in client_ids:
+        matches = [block for block in results if block.get("tool_use_id") == ident]
+        content = matches[0].get("content", "") if len(matches) == 1 else ""
+        if isinstance(content, list):
+            content = "".join(block.get("text", "") for block in content if isinstance(block, dict))
+        paired[ident] = (len(matches) == 1 and matches[0].get("is_error") is True
+                         and isinstance(content, str) and content.startswith(AMBIGUOUS_BATCH_ERROR))
+    return {"all_rejected": bool(client_ids) and all(paired.values()), "client_ids": paired}
+
+
 def summarize(root, requests, cases, mcp_calls, aborted):
     failures, unknown, wire = [], [], []
     if aborted:
@@ -497,7 +514,26 @@ def summarize(root, requests, cases, mcp_calls, aborted):
         if not row["native_search_enabled"]:
             failures.append(f"request {meta['n']}: native search was not enabled")
         if row["duplicate_client_emissions"]:
-            failures.append(f"request {meta['n']}: duplicate client calls emitted by provider")
+            sid = by_case[meta["case"]]["session_id"]
+            event_path = root / "bro" / "harness-sessions" / f"{sid}.events.jsonl"
+            events = [json.loads(line) for line in event_path.read_text().splitlines()] if event_path.exists() else []
+            ids = [call.get("id") for call in client]
+            pairing = rejected_batch(events, ids)
+            executions = [call for call in mcp_calls if call.get("after_response_n") == meta["n"]]
+            timeline_known = all("after_response_n" in call for call in mcp_calls)
+            following = [r for r in requests if r["n"] > meta["n"]
+                         and by_case[r["case"]]["session_id"] == sid]
+            correction_pairing = None
+            if following:
+                correction = json.loads((root / f"{following[0]['n']:03}-request.json").read_text())
+                correction_pairing = rejected_batch(correction.get("messages", []), ids)
+            contained = (pairing["all_rejected"] and not executions and timeline_known
+                         and (correction_pairing is None or correction_pairing["all_rejected"]))
+            row["duplicate_containment"] = {"contained": contained, "durable_errors": pairing,
+                "correction_request_errors": correction_pairing, "executions_before_correction": executions,
+                "execution_timeline_known": timeline_known}
+            if not contained:
+                failures.append(f"request {meta['n']}: duplicate client batch was not proven contained")
         if native:
             sid = by_case[meta["case"]]["session_id"]
             following = [r for r in requests if r["n"] > meta["n"]
