@@ -43,6 +43,7 @@ enum SearchRecovery {
         locator: Option<String>,
         byte_offset: Option<u64>,
         session_id: Option<String>,
+        has_permalink: bool,
     },
     Thread {
         thread_id: String,
@@ -90,6 +91,7 @@ impl SearchRecovery {
         raw_byte_offset: Option<u64>,
         message_ts: &str,
         source: &str,
+        has_permalink: bool,
     ) -> Self {
         let locator = non_blank(locator);
         let session_id = non_blank(session_id);
@@ -110,6 +112,7 @@ impl SearchRecovery {
                     locator,
                     byte_offset,
                     session_id,
+                    has_permalink,
                 };
             }
             if source == "slack" {
@@ -178,6 +181,7 @@ impl SearchRecovery {
                 locator,
                 byte_offset,
                 session_id,
+                has_permalink,
             } => {
                 if let (Some(locator), Some(byte_offset)) = (locator, byte_offset) {
                     out.push_str(&format!(
@@ -202,9 +206,11 @@ impl SearchRecovery {
                         json_string(locator)
                     ));
                 }
-                out.push_str(
-                    "  → Open a specific message in Slack: follow its Permalink line above\n",
-                );
+                if *has_permalink {
+                    out.push_str(
+                        "  → Open a specific message in Slack: follow its Permalink line above\n",
+                    );
+                }
             }
             Self::Thread { thread_id } => {
                 let thread_ref = json_string(&format!("thread:{thread_id}"));
@@ -1169,6 +1175,7 @@ impl TranscriptIndex {
             let source = self.doc_text(&doc, self.fields.source);
             let recovery_session = if serde_json::to_vec(&session_id)?.len() <= 1024
                 && (source == "slack"
+                    || file_path.starts_with("slack:")
                     || crate::transcripts::conversation::parse_session_bucket(&session_id)
                         .is_none())
             {
@@ -1186,6 +1193,10 @@ impl TranscriptIndex {
                     byte_offset,
                     &message_ts,
                     &source,
+                    {
+                        let permalink = self.doc_text(&doc, self.fields.permalink);
+                        !permalink.is_empty() && permalink.len() <= 1024
+                    },
                 ));
             }
 
@@ -1930,30 +1941,50 @@ impl TranscriptIndex {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows.truncate(limit);
 
-        let mut out = String::new();
-        out.push_str(&format!(
-            "{} citation(s) for: {}\n\n",
-            rows.len(),
-            display_fragment(claim, 256)
-        ));
+        let mut rendered = Vec::new();
+        let mut bytes = 0;
         for (ts, account, project, sid, r, locator, offset, excerpt, handle) in &rows {
-            out.push_str(&format!(
+            let mut row = format!(
                 "[{}] {}/{}: {}\n  session: {}\n  locator: {locator}\n  byte_offset: {offset}\n  > {}\n",
-                display_fragment(ts,128), display_fragment(account,128), display_fragment(r,128),
-                display_fragment(project,256), if sid.len() <= 256 { sid.as_str() } else { "[omitted; use exact reader]" },
-                display_fragment(excerpt,600),
-            ));
+                display_fragment(ts, 128),
+                display_fragment(account, 128),
+                display_fragment(r, 128),
+                display_fragment(project, 256),
+                if sid.len() <= 256 {
+                    sid.as_str()
+                } else {
+                    "[omitted; use exact reader]"
+                },
+                display_fragment(excerpt, 600),
+            );
             if let Some(handle) = handle {
-                out.push_str(&format!(
+                row.push_str(&format!(
                     "  Exact read: {}\n",
                     serde_json::json!({"tool":"bbox_context","arguments":{
                         "file_path":handle,"byte_offset":offset,"body_limit":4096
                     }})
                 ));
             }
-            out.push('\n');
+            let size = serde_json::to_vec(&row)?.len();
+            if bytes + size > 32_000 {
+                anyhow::ensure!(
+                    !rendered.is_empty(),
+                    "citation identity exceeds the response budget"
+                );
+                break;
+            }
+            bytes += size;
+            rendered.push(row);
         }
-
+        let mut out = format!(
+            "{} citation(s) for: {}\n\n{}",
+            rendered.len(),
+            display_fragment(claim, 256),
+            rendered.join("\n")
+        );
+        if rendered.len() < rows.len() {
+            out.push_str(&format!("\nResponse byte limit: omitted {} of {} ranked citations; narrow the claim or filters to inspect the remaining hits.\n", rows.len()-rendered.len(),rows.len()));
+        }
         Ok(out)
     }
 
@@ -4399,6 +4430,14 @@ mod search_recovery_hint_tests {
         slack.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
         slack.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
         slack.add_text(fields.conversation_message_ts, "1786390478.000100");
+        slack.add_text(
+            fields.permalink,
+            "https://synthetic.slack.com/archives/C0RECOVERY/p1786390478000100",
+        );
+        let mut without_permalink = document(&fields, "transcript", "", "noexternallinkfixture");
+        without_permalink.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
+        without_permalink.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
+        without_permalink.add_text(fields.conversation_message_ts, "1786390478.000100");
         let generic = document(
             &fields,
             "project_graph_vertex",
@@ -4407,6 +4446,7 @@ mod search_recovery_hint_tests {
         );
         let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
         writer.add_document(slack).unwrap();
+        writer.add_document(without_permalink).unwrap();
         writer.add_document(generic).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
@@ -4425,6 +4465,15 @@ mod search_recovery_hint_tests {
         assert!(
             slack_hits.contains("channel=\"C0RECOVERY\""),
             "{slack_hits}"
+        );
+        assert!(slack_hits.contains(
+            "Permalink: https://synthetic.slack.com/archives/C0RECOVERY/p1786390478000100"
+        ));
+        assert!(slack_hits.contains("follow its Permalink line above"));
+        let without_permalink = search(&index, "noexternallinkfixture", None);
+        assert!(
+            !without_permalink.contains("follow its Permalink line above"),
+            "{without_permalink}"
         );
 
         let generic_hits = search(&index, "generic-entity-recovery-fixture", None);

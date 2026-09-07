@@ -186,7 +186,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_cite",
         category: ToolCategory::Transcripts,
         summary: "Trace a claim back to the turn that established it.",
-        when_to_use: "Use when you need provenance for a rule, preference, or standing claim. Returns citations oldest-first so the origin surfaces first. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        when_to_use: "Use when you need provenance for a rule, preference, or standing claim. Returns citations oldest-first so the origin surfaces first. Native citations carry exact_read JSON for bounded bbox_context recovery of stored fields. An aggregate byte budget accounts for escaped metadata; any omitted ranked citations are counted explicitly, with narrower claim/filter recovery. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
         example: Some(r#"bbox_cite(claim="never kill processes by port")"#),
     },
     ToolDoc {
