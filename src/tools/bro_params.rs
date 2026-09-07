@@ -302,7 +302,9 @@ pub(crate) struct ReportParams {
     /// Optional blocker, handoff need, or requested input.
     #[serde(default)]
     pub(crate) needs: Option<String>,
-    /// Optional structured payload for workflow hooks or richer agent state.
+    /// Optional structured progress data. The complete admitted report is at
+    /// most 32 KiB; larger reports refuse without replacing the previous report.
+    /// Large accepted reports recover through bro_status(detail=report).
     #[serde(default)]
     pub(crate) data: Option<serde_json::Value>,
 }

@@ -1770,9 +1770,10 @@ impl BlackboxServer {
         // the length of a fan-out and hold a non-Send guard across an await.
         let team = {
             let _team_lock = orchestration::team::lock_teams();
-            match orchestration::team::load_team(&p.team, &self.state.store_dir) {
-                Some(t) => t,
-                None => {
+            match orchestration::team::load_team_checked(&p.team, &self.state.store_dir) {
+                Ok(Some(t)) => t,
+                Err(error) => return Self::err_text(&format!("Team unavailable: {error}")),
+                Ok(None) => {
                     return Self::err_text(&format!(
                         "Unknown team: {}",
                         orch::truncated_chars(&p.team, 64)
@@ -1990,7 +1991,10 @@ impl BlackboxServer {
                         extra.as_ref(),
                     ) {
                         Ok(df) => df,
-                        Err(e) => return Self::err_text(&e),
+                        Err(error) => {
+                            launched.push(json!({"bro":member.name,"error":error}));
+                            continue;
+                        }
                     };
                     args.extend(df.args);
                     let t = orch::spawn_task(
@@ -2043,7 +2047,10 @@ impl BlackboxServer {
                     extra.as_ref(),
                 ) {
                     Ok(df) => df,
-                    Err(e) => return Self::err_text(&e),
+                    Err(error) => {
+                        launched.push(json!({"bro":member.name,"error":error}));
+                        continue;
+                    }
                 };
                 args.extend(df.args);
                 let t = orch::spawn_task(
@@ -2076,15 +2083,22 @@ impl BlackboxServer {
             launched.push(json!({"bro": member.name, "taskId": tid, "sessionId": sid}));
         }
 
-        {
-            let _team_lock = orchestration::team::lock_teams();
-            orchestration::team::save_team(&updated_team, &store_dir);
-        }
+        let team_persistence = if launched.iter().any(|row| row.get("taskId").is_some()) {
+            match orchestration::team::persist_broadcast_history(&team, &updated_team, &store_dir) {
+                Ok(()) => json!({"status":"persisted"}),
+                Err(error) => {
+                    json!({"status":"unconfirmed","message":orch::truncated_chars(&error.to_string(), 256),
+                    "hint":"Inspect tasks by returned taskId and team history before retrying; admitted tasks were not rolled back"})
+                }
+            }
+        } else {
+            json!({"status":"unchanged"})
+        };
         // Every member keeps a receipt (identity + admission outcome); the
         // aggregate is byte-bounded by compacting later rows, never by
         // dropping members from the reply.
         let (tasks, receipts_truncated) = orch::bound_broadcast_receipts(launched);
-        let mut out = json!({"team": orch::truncated_chars(&p.team, 64), "tasks": tasks});
+        let mut out = json!({"team": orch::truncated_chars(&p.team, 64), "tasks": tasks, "team_persistence":team_persistence});
         if let Some(truncation) = receipts_truncated {
             out["receiptsTruncated"] = truncation;
         }
@@ -2210,6 +2224,28 @@ impl BlackboxServer {
             true
         };
 
+        let selected_ids: Vec<String> = self
+            .state
+            .task_store
+            .read()
+            .all_tasks()
+            .iter()
+            .filter_map(|task| {
+                let inner = task.inner.lock();
+                matches_filter(&inner).then(|| inner.id.clone())
+            })
+            .collect();
+        if selected_ids.len() > 256
+            || serde_json::to_vec(&selected_ids).map_or(true, |bytes| bytes.len() > 24 * 1024)
+        {
+            return Self::err_text(
+                "Prune selection exceeds the bounded receipt limit (256 tasks / 24 KiB IDs); use narrower filters or explicit task_ids batches. No tasks were pruned or retros admitted",
+            );
+        }
+        let selected_ids: std::collections::HashSet<_> = selected_ids.into_iter().collect();
+        let selected_filter =
+            |inner: &orch::TaskInner| selected_ids.contains(&inner.id) && matches_filter(inner);
+
         // Capture workload-retro targets BEFORE the drop: resume keys off
         // the on-disk session, but we read provider/session/cwd from the
         // in-memory task records that retain_drop is about to remove.
@@ -2225,7 +2261,7 @@ impl BlackboxServer {
                     .iter()
                     .filter_map(|t| {
                         let inner = t.inner.lock();
-                        if !matches_filter(&inner) {
+                        if !selected_filter(&inner) {
                             return None;
                         }
                         // Only sessions we can actually resume, with something
@@ -2263,7 +2299,7 @@ impl BlackboxServer {
                 .iter()
                 .filter_map(|t| {
                     let inner = t.inner.lock();
-                    matches_filter(&inner).then(|| inner.id.clone())
+                    selected_filter(&inner).then(|| inner.id.clone())
                 })
                 .collect()
         } else {
@@ -2273,7 +2309,7 @@ impl BlackboxServer {
                 // keep = NOT a prune match.
                 store.retain_drop(|t| {
                     let inner = t.inner.lock();
-                    !matches_filter(&inner)
+                    !selected_filter(&inner)
                 })
             };
             // Persist AFTER dropping the write guard, off the async worker —
@@ -2313,6 +2349,7 @@ impl BlackboxServer {
             "status": status_label,
             "pruned": dropped.len(),
             "taskIds": dropped,
+            "persistence": if dry_run { "not_requested" } else { "requested" },
         });
         if retro_enabled {
             out["retrosQueued"] = json!(retros_queued);
@@ -4033,6 +4070,33 @@ mod tests {
                     b"synthetic existing snapshot"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_oversized_sweep_refuses_before_task_or_retro_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        for n in 0..257 {
+            let id = format!("synthetic-{n}");
+            server
+                .state
+                .task_store
+                .write()
+                .insert(
+                    id.clone(),
+                    orch::test_task(&id, orch::TaskStatus::Failed, Provider::Brodex),
+                )
+                .unwrap();
+        }
+        for dry_run in [true, false] {
+            let mut p = prune_params(None, None);
+            p.dry_run = Some(dry_run);
+            p.retro = Some(true);
+            let result = server.bro_prune(Parameters(p)).await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(server.state.task_store.read().all_tasks().len(), 257);
+            assert!(call_result_text(&result).contains("No tasks were pruned"));
         }
     }
 
