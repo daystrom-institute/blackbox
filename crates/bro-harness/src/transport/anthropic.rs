@@ -164,8 +164,8 @@ impl AnthropicTransport {
         // (`adaptive`) rather than a fixed `budget_tokens`, which previously
         // starved output when budget >= max_tokens and produced empty,
         // spurious-stop turns. Effort is the categorical `output_config.effort`
-        // knob (gated by the `effort` beta in the request header). Only emitted
-        // when an effort is requested, preserving "no effort ⇒ no thinking".
+        // knob. Only emit overrides when requested; omitted effort leaves the
+        // endpoint default intact (DeepSeek enables high-effort thinking).
         if let Some(effort) = opts.effort.as_deref() {
             body["thinking"] = json!({"type": "adaptive"});
             body["output_config"] = json!({"effort": effort});
@@ -1423,6 +1423,48 @@ mod tests {
         let body = tx.build_body(&[], &options);
         assert_eq!(body["model"], "glm-5.3-flash");
         assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn deepseek_flash_preserves_effort_output_budget_and_multimodal_history() {
+        let mut tx = transport();
+        tx.provider = Some("deepseek".into());
+        let image = json!({"type":"image", "source":{
+            "type":"base64", "media_type":"image/png", "data":"aW1hZ2U="
+        }});
+        let thinking =
+            json!({"type":"thinking", "thinking":"Inspect the image.", "signature":"sig"});
+        tx.messages = vec![
+            json!({"role":"user", "content":[image.clone()]}),
+            json!({"role":"assistant", "content":[thinking.clone(),
+                {"type":"tool_use", "id":"inspect", "name":"view_image", "input":{}}
+            ]}),
+            json!({"role":"user", "content":[
+                {"type":"tool_result", "tool_use_id":"inspect", "content":[image.clone()]}
+            ]}),
+        ];
+        let mut options = opts(SystemPrompt::default());
+        options.model = "deepseek-flash".into();
+        // DeepSeek's documented 384K maximum is 393216 tokens.
+        // https://api-docs.deepseek.com/api/create-chat-completion/
+        options.max_tokens = 393_216;
+        for effort in [None, Some("low"), Some("high"), Some("max")] {
+            options.effort = effort.map(str::to_owned);
+            let body = tx.build_body(&[], &options);
+            assert_eq!(body["model"], "deepseek-flash");
+            assert_eq!(body["max_tokens"], 393_216);
+            if let Some(effort) = effort {
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                assert_eq!(body["output_config"]["effort"], effort);
+            } else {
+                assert!(body.get("thinking").is_none());
+                assert!(body.get("output_config").is_none());
+            }
+            assert_eq!(body["messages"][0]["content"][0]["source"], image["source"]);
+            assert_eq!(body["messages"][1]["content"][0], thinking);
+            assert_eq!(body["messages"][2]["content"][0]["content"][0], image);
+            assert!(body.get("temperature").is_none());
+        }
     }
 
     #[test]

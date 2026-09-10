@@ -478,30 +478,46 @@ static GLM_MODELS: &[ModelInfo] = &[
 ];
 
 static DEEPSEEK_MODELS: &[ModelInfo] = &[
+    // Canonical API name for V4.1 Flash; the versioned V4 Flash names are
+    // compatibility aliases. https://api-docs.deepseek.com/quick_start/pricing/
     ModelInfo {
-        id: "deepseek-v4-pro",
-        description: "DeepSeek 4.1 Pro / V4 Pro reasoning model via Claude Code",
+        id: "deepseek-flash",
+        description: "DeepSeek V4.1 Flash, vision and 1M context via bro-harness",
         default: true,
-        efforts: &[],
-        default_effort: None,
+        efforts: &["low", "high", "max"],
+        default_effort: Some("high"),
     },
     ModelInfo {
-        id: "deepseek-v4-flash",
-        description: "Fast DeepSeek V4 model via Claude Code",
+        id: "deepseek-v4-pro",
+        description: "DeepSeek V4 Pro via bro-harness (legacy model)",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
+        id: "deepseek-v4-flash",
+        description: "Legacy alias for DeepSeek V4.1 Flash via bro-harness",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "deepseek-v4-flash-vision-exp",
+        description: "Legacy vision alias for DeepSeek V4.1 Flash via bro-harness",
+        default: false,
+        efforts: &["low", "high", "max"],
+        default_effort: Some("high"),
+    },
+    ModelInfo {
         id: "deepseek-reasoner",
-        description: "DeepSeek reasoning model via Claude Code",
+        description: "Legacy DeepSeek reasoning model via bro-harness",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "deepseek-chat",
-        description: "DeepSeek chat model via Claude Code",
+        description: "Legacy DeepSeek chat model via bro-harness",
         default: false,
         efforts: &[],
         default_effort: None,
@@ -816,6 +832,35 @@ static VIBEBH_EFFORTS: &[EffortInfo] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_flash_catalog_uses_canonical_model_and_native_efforts() {
+        let provider = Provider::Deepseek;
+        let defaults: Vec<_> = provider.models().iter().filter(|m| m.default).collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].id, "deepseek-flash");
+        assert_eq!(
+            provider.model_efforts("deepseek-flash"),
+            ["low", "high", "max"]
+        );
+        assert_eq!(
+            provider.model_default_effort("deepseek-flash"),
+            Some("high")
+        );
+        assert_eq!(
+            provider
+                .model_effort_infos("deepseek-flash")
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            ["low", "high", "max"]
+        );
+        // Existing pins keep their accepted compatibility effort values.
+        for legacy in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+            assert!(provider.models().iter().any(|m| m.id == legacy));
+            assert!(provider.model_efforts(legacy).contains(&"medium"));
+        }
+    }
 
     #[test]
     fn prompt_cache_capability_tracks_transport_surfaces() {

@@ -214,6 +214,7 @@ fn default_entries() -> BTreeMap<String, Entry> {
         ("glm-4*", 200_000, None),
         ("glm-5.3", 1_000_000, None),
         ("glm-5.3-flash", 1_000_000, None),
+        ("deepseek-flash", 1_000_000, None),
         ("deepseek-v4*", 1_000_000, None),
         ("deepseek-*", 128_000, None),
         ("MiniMax-M*", 1_000_000, Some(0.45)),
@@ -304,6 +305,8 @@ mod tests {
         // 1M-class models must not inherit the stale small windows
         // (thread-9dfe1da5: premature compaction at ~10% of capacity).
         assert_eq!(p.resolve("deepseek-v4-pro").0, 1_000_000);
+        assert_eq!(p.resolve("deepseek-flash").0, 1_000_000);
+        assert_eq!(p.threshold("deepseek-flash"), Some(750_000));
         assert_eq!(p.resolve("MiniMax-M3").0, 1_000_000);
         // Kimi k3 is 1M-class (bare id and any future k3* variant);
         // kimi-k2* is 256K-class.
@@ -477,6 +480,8 @@ mod tests {
         for (model, expected) in [
             ("glm-4.6", 200_000),
             ("deepseek-chat", 128_000),
+            ("deepseek-flash", 1_000_000),
+            ("deepseek-v4-flash-vision-exp", 1_000_000),
             ("deepseek-v4-plus", 1_000_000),
             ("MiniMax-M2", 1_000_000),
             ("kimi-k2-turbo", 256_000),

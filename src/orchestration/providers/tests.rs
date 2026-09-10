@@ -32,6 +32,33 @@ fn provider_roundtrip_for_dispatchable_harness_providers() {
 }
 
 #[test]
+fn deepseek_flash_exec_resume_and_default_use_canonical_model() {
+    let provider = Provider::Deepseek;
+    for model in ["deepseek-flash", "deepseek/deepseek-flash"] {
+        let opts = ExecOpts {
+            model: Some(model.into()),
+            effort: Some("max".into()),
+            ..Default::default()
+        };
+        for args in [
+            provider.build_exec_args("hello", None, "sid", None, Some(&opts)),
+            provider.build_resume_args("sid", "continue", None, Some(&opts)),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--model", "deepseek-flash"])
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]));
+        }
+    }
+    let args = provider.build_exec_args("hello", None, "sid", None, None);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "deepseek-flash"])
+    );
+}
+
+#[test]
 fn harness_exec_and_resume_args_use_stream_json() {
     let glm_opts = ExecOpts {
         model: Some("zai-coding-plan/glm-5.1".into()),

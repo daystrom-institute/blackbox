@@ -23,6 +23,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- DeepSeek V4.1 Flash is selectable as `deepseek-flash` and is the default
+  DeepSeek model across built-in allocator tiers, with native low/high/max
+  efforts and a 1M harness context window. Legacy V4 Flash model names remain
+  selectable; the Anthropic transport preserves vision and thinking blocks.
 - GLM client batches that repeat an identical call across a native search
   result are rejected before execution. Every proposed call receives an explicit
   error, with one opportunity to reissue intended actions separately; recurring
