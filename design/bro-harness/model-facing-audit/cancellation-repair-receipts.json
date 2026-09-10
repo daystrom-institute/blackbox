@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "scope": "Deterministic cancellation ownership and shell lifecycle regressions; no real model requests.",
+  "codex_reference": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "baseline": {
+    "revision": "c384fb8a1cc022f7a8bc00f94ad0462373ca1a8e",
+    "platform": "macOS arm64 installed binaries",
+    "cases": [
+      {
+        "case": "flat-blocking",
+        "terminal_before_release": true,
+        "ack_before_release": true,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": false,
+        "contract_passed": false,
+        "process_exit": 0
+      },
+      {
+        "case": "nested-blocking",
+        "terminal_before_release": true,
+        "ack_before_release": true,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": false,
+        "contract_passed": false,
+        "process_exit": 0
+      },
+      {
+        "case": "yielded-cell-blocking",
+        "terminal_before_release": true,
+        "ack_before_release": true,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": false,
+        "contract_passed": false,
+        "process_exit": 0
+      },
+      {
+        "case": "shell-stdin-cancellation",
+        "terminal_before_release": true,
+        "ack_before_release": true,
+        "terminal_subtype": "interrupted",
+        "committed_file": false,
+        "escaped_child_write": true,
+        "actual_outcome_visible": false,
+        "contract_passed": false,
+        "process_exit": 0
+      },
+      {
+        "case": "passive-deadline",
+        "exit": 0,
+        "elapsed_seconds": 0.622,
+        "escaped_child_write": true,
+        "output": "Script completed\nOutput:\n{\"exit_code\":null,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":true}\n",
+        "contract_passed": false
+      },
+      {
+        "case": "stdin-deadline",
+        "exit": 0,
+        "elapsed_seconds": 2.033,
+        "escaped_child_write": false,
+        "output": "Script completed\nOutput:\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n",
+        "contract_passed": false
+      }
+    ]
+  },
+  "candidate": {
+    "branch": "fix/harness-cancellation",
+    "parent_revision": "c0c41ac0625dfaeab8a1ed5474dde95c6a42b004",
+    "revision_note": "Implementation in the commit containing this receipt.",
+    "platform": "Linux amd64 cluster lane",
+    "cases": [
+      {
+        "case": "flat-blocking",
+        "terminal_before_release": false,
+        "ack_before_release": false,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": true,
+        "contract_passed": true,
+        "process_exit": 0
+      },
+      {
+        "case": "nested-blocking",
+        "terminal_before_release": false,
+        "ack_before_release": false,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": true,
+        "contract_passed": true,
+        "process_exit": 0
+      },
+      {
+        "case": "yielded-cell-blocking",
+        "terminal_before_release": false,
+        "ack_before_release": false,
+        "terminal_subtype": "interrupted",
+        "committed_file": true,
+        "escaped_child_write": false,
+        "actual_outcome_visible": true,
+        "contract_passed": true,
+        "process_exit": 0
+      },
+      {
+        "case": "shell-stdin-cancellation",
+        "terminal_before_release": true,
+        "ack_before_release": true,
+        "terminal_subtype": "interrupted",
+        "committed_file": false,
+        "escaped_child_write": false,
+        "actual_outcome_visible": true,
+        "contract_passed": true,
+        "process_exit": 0
+      },
+      {
+        "case": "passive-deadline",
+        "exit": 0,
+        "elapsed_seconds": 0.632,
+        "escaped_child_write": false,
+        "output": "Script completed\nOutput:\n{\"cancelled\":false,\"exit_code\":null,\"group_cleanup_signal\":\"kill\",\"running\":false,\"session_id\":\"sh-1\",\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":true}\n",
+        "contract_passed": true
+      },
+      {
+        "case": "stdin-deadline",
+        "exit": 0,
+        "elapsed_seconds": 0.132,
+        "escaped_child_write": false,
+        "output": "Script completed\nOutput:\n{\"cancelled\":false,\"exit_code\":null,\"group_cleanup_signal\":\"kill\",\"input_error\":\"Broken pipe (os error 32)\",\"running\":false,\"stderr\":\"\",\"stdin_bytes_written\":65536,\"stdout\":\"\",\"timed_out\":true}\n",
+        "contract_passed": true
+      }
+    ]
+  },
+  "authority_regressions": [
+    {
+      "case": "flat-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "wrapped-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-diff-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-hook-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-lsp-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "diagnostic-lsp-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "denied-shell-build-gate",
+      "contract_passed": true
+    }
+  ],
+  "notes": [
+    "The exact same cancellation recorder was run against both binaries. All six baseline contracts fail; all six candidate contracts pass.",
+    "The terminal_before_release and ack_before_release fields refer to the held FIFO in edit cases. For shell-stdin-cancellation they only report completion within 150 ms; prompt completion after child cleanup is expected.",
+    "Elapsed times are fixture deadline observations, not a cross-platform performance comparison.",
+    "The blocking edit fixture verifies a committed change, its actual result, and absence of premature interruption acknowledgement. It does not claim transactional rollback or fix partial-patch accounting.",
+    "The candidate still passes all eight invocation authority contracts from the prior slice."
+  ],
+  "validation": {
+    "workspace_full_nextest": {
+      "passed": 6802,
+      "skipped": 19
+    },
+    "final_description_nextest": {
+      "passed": 45,
+      "skipped": 0
+    },
+    "workspace_clippy": "passed with existing warnings; new shell style warning fixed and bro-tools rechecked",
+    "concurrency_lint": "passed",
+    "pinned_rustfmt": "passed"
+  }
+}

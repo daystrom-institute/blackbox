@@ -843,6 +843,7 @@ mod tests {
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
         }
     }

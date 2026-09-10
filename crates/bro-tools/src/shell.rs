@@ -2,21 +2,15 @@
 //! `shell_poll` (drain / feed / await an existing session), and `shell_kill`
 //! (signal + reap a session).
 //!
-//! Model mirrors Codex's `exec_command` / `write_stdin`: a command that
-//! finishes within `yield_time_ms` returns its full result inline; one that
-//! doesn't returns a `session_id` + partial output, and `shell_poll` resumes
-//! draining it (and may feed more stdin). This is the cooperative middle path
-//! between block-forever and a full background task registry — no wake
-//! machinery, synchronous from the agent loop's view. See
-//! design/bro-harness/bro-harness-tool-surface.md.
+//! Commands return an inline terminal receipt or a retained session id after
+//! `yield_time_ms`. Independent supervisors enforce hard deadlines and own each
+//! child process group through termination, reaping, and bounded output draining.
+//! Polling, feeding stdin, and signalling use shared session handles, so a long
+//! poll cannot hide the process from another control call.
 //!
-//! Sessions are in-memory and live only within a single harness `run()` (across
-//! the LLM turns of one dispatch, NOT across exec → resume): a live OS child
-//! can't be serialized into the persisted `side` cell. Children are spawned
-//! `kill_on_drop` in their own process group, so abandoned sessions die — whole
-//! group, grandchildren included — when the `ToolCx` drops
-//! ([`ShellSession`]'s `Drop` signals the group; `kill_on_drop` reaps the
-//! direct child).
+//! Sessions last for one harness run. Dropped invocations request cancellation;
+//! normal yields leave supervision active. Interrupted turns explicitly call
+//! [`shutdown_shell_sessions`] to await final receipts for retained sessions.
 
 use crate::promise::{PromiseProgress, StreamKind};
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
@@ -32,13 +26,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 /// Per-stream in-memory buffer cap. Beyond this, output is counted-and-dropped
 /// rather than retained, so a runaway producer can't exhaust memory.
 const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
-/// Default returned-output budget (~40 KB at a 4-bytes/token heuristic).
+/// Default returned-output budget (~8 KB at a 4-bytes/token heuristic).
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_000;
 /// Default cooperative yield for a fresh command. Long commands should not make
 /// the whole agent turn look hung just because the model forgot to set
@@ -47,9 +42,8 @@ const DEFAULT_RUN_YIELD_MS: u64 = 1_000;
 /// Default cooperative yield when polling an already-yielded command. The poll
 /// default is longer because the model is explicitly checking an active child.
 const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
-/// Max concurrently-retained (still-running) sessions per dispatch. A blocking
-/// command never counts; only yielded sessions are retained. Prevents a loop
-/// from accumulating unbounded live children.
+/// Maximum retained sessions per dispatch, including commands whose final
+/// output has not yet been consumed.
 const MAX_LIVE_SESSIONS: usize = 32;
 /// Grace window for readers to flush final bytes after a child exits, before we
 /// abort them. Bounds the case where a grandchild inherited the pipe and holds
@@ -84,48 +78,85 @@ impl OutBuf {
     }
 }
 
-/// One live child plus the background readers draining its pipes.
+/// A retained handle never owns the child or blocks process control. The
+/// supervisor owns the process from spawn through reaping and reader completion.
 struct ShellSession {
-    child: Child,
-    /// `Some` while stdin is open for feeding; `None` once closed (EOF sent).
-    stdin: Option<ChildStdin>,
+    controls: mpsc::UnboundedSender<Control>,
+    state: watch::Receiver<Option<TerminalState>>,
+    stdin: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
     stdout: Arc<Mutex<OutBuf>>,
     stderr: Arc<Mutex<OutBuf>>,
-    readers: Vec<JoinHandle<()>>,
-    /// Absolute hard-kill deadline carried from the originating `shell_run`'s
-    /// `timeout_ms`, so polls honor the same ceiling.
-    kill_at: Option<Instant>,
-    /// The command line, retained so `shell_list` can identify orphanable
-    /// sessions whose id was lost.
     command: String,
-    /// When the session was spawned, for an elapsed readout in `shell_list`.
     started: Instant,
-    /// Shared progress for a yielded session — the readers heartbeat into this
-    /// so `shell_poll`/`shell_list` can expose running-progress metadata.
-    progress: Option<Arc<PromiseProgress>>,
-    /// Optional post-capture output filter. This never affects process exit
-    /// status; it only reduces returned stdout/stderr lines after capture.
-    output_filter: Option<ShellOutputFilter>,
+    hard_deadline: Option<Instant>,
+    progress: Arc<PromiseProgress>,
+    output_filter: Mutex<Option<ShellOutputFilter>>,
 }
 
-impl Drop for ShellSession {
-    /// `kill_on_drop` only covers the direct bash child; an abandoned live
-    /// session (the `ToolCx` drops mid-run) must take its whole process group
-    /// down too, or grandchildren keep running. `Child::id()` returns `None`
-    /// once the child has been reaped, so this never fires for a command that
-    /// already exited — survivors a *successful* command intentionally
-    /// backgrounded are left alone, same as before.
+#[derive(Clone, Default)]
+struct TerminalState {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    killed: bool,
+    signal_sent: Option<&'static str>,
+    escalated_to_sigkill: bool,
+    wait_error: Option<String>,
+    group_cleanup_sigkill: bool,
+}
+
+enum Control {
+    Signal(i32, &'static str),
+    Terminate {
+        signal: i32,
+        name: &'static str,
+        deadline: Instant,
+    },
+    Cancel,
+}
+
+/// Covers cancellation even in the interval between spawn and supervisor start.
+struct OwnedChild {
+    child: Child,
+    pgid: u32,
+    active: bool,
+}
+
+impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if let Some(pid) = self.child.id() {
-            signal_group(pid, libc::SIGKILL);
+        if self.active {
+            signal_group(self.pgid, libc::SIGKILL);
         }
     }
 }
 
-/// Session table hung off `ToolCx`. In-memory, single-`run()` lifetime.
+/// A dropped invocation requests cleanup; a normal yield disarms this guard.
+struct InvocationGuard {
+    controls: mpsc::UnboundedSender<Control>,
+    armed: bool,
+}
+
+impl InvocationGuard {
+    fn new(session: &ShellSession) -> Self {
+        Self {
+            controls: session.controls.clone(),
+            armed: true,
+        }
+    }
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.controls.send(Control::Cancel);
+        }
+    }
+}
+
+/// Entries include exited commands whose final output has not been consumed.
 #[derive(Default)]
 pub struct ShellSessions {
-    map: HashMap<String, ShellSession>,
+    map: HashMap<String, Arc<ShellSession>>,
     counter: u64,
 }
 
@@ -133,83 +164,379 @@ impl ShellSessions {
     pub fn len(&self) -> usize {
         self.map.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
-
     pub fn ids(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
     }
 
+    /// Request cleanup without blocking. Use shutdown_shell_sessions when a
+    /// caller must await reaping and retain the actual final receipts.
     pub fn shutdown_all(&mut self) -> usize {
         let count = self.map.len();
+        for session in self.map.values() {
+            let _ = session.controls.send(Control::Cancel);
+        }
         self.map.clear();
         count
     }
+}
 
-    /// Insert a retained session, or hand it back (boxed; the session is large)
-    /// if at the live cap so the caller can kill it and surface an error.
-    fn insert(&mut self, s: ShellSession) -> Result<String, Box<ShellSession>> {
-        if self.map.len() >= MAX_LIVE_SESSIONS {
-            return Err(Box::new(s));
-        }
-        self.counter += 1;
-        let id = format!("sh-{}", self.counter);
-        self.map.insert(id.clone(), s);
-        Ok(id)
+impl Drop for ShellSessions {
+    fn drop(&mut self) {
+        self.shutdown_all();
     }
 }
 
-enum Outcome {
-    Exited(Option<i32>),
-    Yielded,
-    TimedOut,
-}
-
-/// Running-progress metadata for a yielded session, drawn from the same
-/// [`PromiseProgress`] the pipe readers heartbeat into. Surfaces elapsed
-/// runtime, last-output recency, and stdout/stderr byte counts so an agent
-/// polling a silent-but-healthy long command (a quiet `cargo build`) sees it is
-/// still making progress.
-fn session_progress(session: &ShellSession) -> Option<Value> {
-    let progress = session.progress.as_ref()?;
+fn session_progress(session: &ShellSession) -> Value {
     let started_ms =
         crate::promise::now_ms().saturating_sub(session.started.elapsed().as_millis() as u64);
-    Some(progress.snapshot(started_ms))
+    session.progress.snapshot(started_ms)
 }
 
-/// Convert a model-requested wait window into a deadline. `0` means no yield
-/// deadline, so explicit long waits are honored all the way to exit or timeout.
-/// There is intentionally no low safety cap here: the model-facing contract lets
-/// agents request 60-180s waits to avoid extra polling turns, while `timeout_ms`
-/// remains the hard-kill safety boundary for runaway children.
-fn yield_deadline(now: Instant, requested_ms: Option<u64>, default_ms: u64) -> Option<Instant> {
-    let yield_ms = requested_ms.unwrap_or(default_ms);
-    (yield_ms > 0).then(|| now + Duration::from_millis(yield_ms))
+fn deadline(now: Instant, millis: u64) -> Result<Instant, String> {
+    now.checked_add(Duration::from_millis(millis))
+        .ok_or_else(|| "requested timeout/yield/grace is too large".to_owned())
 }
 
-/// Drive a child until it exits, the yield deadline elapses, or the hard-kill
-/// deadline elapses (in which case its whole process group is killed). Holds
-/// no lock.
-async fn drive(child: &mut Child, yield_at: Option<Instant>, kill_at: Option<Instant>) -> Outcome {
-    let far = Instant::now() + Duration::from_secs(31_536_000);
-    let y = yield_at.unwrap_or(far);
-    let k = kill_at.unwrap_or(far);
-    tokio::select! {
-        s = child.wait() => Outcome::Exited(s.ok().and_then(|st| st.code())),
-        _ = sleep_until(y), if yield_at.is_some() => Outcome::Yielded,
-        _ = sleep_until(k), if kill_at.is_some() => {
-            // Group-wide SIGKILL first: a single-pid kill leaves grandchildren
-            // (sccache/rustc under a timed-out cargo) alive holding e.g. the
-            // target-dir build lock. Then reap the direct child.
-            if let Some(pid) = child.id() {
-                signal_group(pid, libc::SIGKILL);
+fn yield_deadline(
+    now: Instant,
+    requested_ms: Option<u64>,
+    default_ms: u64,
+) -> Result<Option<Instant>, String> {
+    let millis = requested_ms.unwrap_or(default_ms);
+    if millis == 0 {
+        Ok(None)
+    } else {
+        deadline(now, millis).map(Some)
+    }
+}
+
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn supervise(
+    mut owned: OwnedChild,
+    mut controls: mpsc::UnboundedReceiver<Control>,
+    state: watch::Sender<Option<TerminalState>>,
+    readers: Vec<JoinHandle<()>>,
+    kill_at: Option<Instant>,
+) {
+    let mut terminal = TerminalState::default();
+    let mut grace_at = None;
+    loop {
+        tokio::select! {
+            status = owned.child.wait() => {
+                match status {
+                    Ok(status) => terminal.exit_code = status.code(),
+                    Err(error) => terminal.wait_error = Some(error.to_string()),
+                }
+                break;
             }
-            let _ = child.kill().await;
-            Outcome::TimedOut
+            control = controls.recv() => match control {
+                Some(Control::Signal(signal, name)) => {
+                    signal_group(owned.pgid, signal);
+                    terminal.signal_sent = Some(name);
+                }
+                Some(Control::Terminate { signal, name, deadline }) => {
+                    signal_group(owned.pgid, signal);
+                    terminal.killed = true;
+                    terminal.signal_sent = Some(name);
+                    grace_at = Some(grace_at.map_or(deadline, |current: Instant| current.min(deadline)));
+                }
+                Some(Control::Cancel) | None => {
+                    terminal.cancelled = true;
+                    signal_group(owned.pgid, libc::SIGKILL);
+                    match owned.child.wait().await {
+                        Ok(status) => terminal.exit_code = status.code(),
+                        Err(error) => terminal.wait_error = Some(error.to_string()),
+                    }
+                    break;
+                }
+            },
+            _ = until(kill_at) => {
+                terminal.timed_out = true;
+                signal_group(owned.pgid, libc::SIGKILL);
+                match owned.child.wait().await {
+                    Ok(status) => terminal.exit_code = status.code(),
+                    Err(error) => terminal.wait_error = Some(error.to_string()),
+                }
+                break;
+            }
+            _ = until(grace_at) => {
+                terminal.escalated_to_sigkill = terminal.signal_sent != Some("kill");
+                signal_group(owned.pgid, libc::SIGKILL);
+                match owned.child.wait().await {
+                    Ok(status) => terminal.exit_code = status.code(),
+                    Err(error) => terminal.wait_error = Some(error.to_string()),
+                }
+                break;
+            }
         }
     }
+    if terminal.wait_error.is_some() {
+        signal_group(owned.pgid, libc::SIGKILL);
+        let _ = owned.child.kill().await;
+    }
+    if terminal.killed || terminal.cancelled || terminal.timed_out {
+        // A shell may exit on TERM while its descendants ignore that signal.
+        signal_group(owned.pgid, libc::SIGKILL);
+        terminal.group_cleanup_sigkill = true;
+    }
+    // The direct child can exit while descendants still hold output pipes.
+    // Cancellation/deadlines remain effective throughout this final drain.
+    let drain = drain_readers(readers);
+    tokio::pin!(drain);
+    let mut drain_kill_at = if terminal.timed_out { None } else { kill_at };
+    let mut controls_open = true;
+    loop {
+        tokio::select! {
+            _ = &mut drain => break,
+            control = controls.recv(), if controls_open => {
+                match control {
+                    Some(Control::Cancel) | None => {
+                        terminal.cancelled = true;
+                        signal_group(owned.pgid, libc::SIGKILL);
+                        terminal.group_cleanup_sigkill = true;
+                        controls_open = false;
+                    }
+                    Some(Control::Signal(signal, name)) => {
+                        signal_group(owned.pgid, signal);
+                        terminal.signal_sent = Some(name);
+                    }
+                    Some(Control::Terminate { signal, name, .. }) => {
+                        signal_group(owned.pgid, signal);
+                        signal_group(owned.pgid, libc::SIGKILL);
+                        terminal.killed = true;
+                        terminal.signal_sent = Some(name);
+                        terminal.group_cleanup_sigkill = true;
+                    }
+                }
+            }
+            _ = until(drain_kill_at) => {
+                terminal.timed_out = true;
+                signal_group(owned.pgid, libc::SIGKILL);
+                terminal.group_cleanup_sigkill = true;
+                drain_kill_at = None;
+            }
+        }
+    }
+    // Linearize completion against concurrent control sends. Closing rejects
+    // future sends; recv drains every send accepted before closure, including
+    // a stop queued as the final reader became ready.
+    controls.close();
+    while let Some(control) = controls.recv().await {
+        match control {
+            Control::Cancel => {
+                terminal.cancelled = true;
+                signal_group(owned.pgid, libc::SIGKILL);
+                terminal.group_cleanup_sigkill = true;
+            }
+            Control::Signal(signal, name) => {
+                signal_group(owned.pgid, signal);
+                terminal.signal_sent = Some(name);
+            }
+            Control::Terminate { signal, name, .. } => {
+                signal_group(owned.pgid, signal);
+                signal_group(owned.pgid, libc::SIGKILL);
+                terminal.killed = true;
+                terminal.signal_sent = Some(name);
+                terminal.group_cleanup_sigkill = true;
+            }
+        }
+    }
+    owned.active = false;
+    state.send_replace(Some(terminal));
+}
+
+async fn terminal_state(session: &ShellSession) -> TerminalState {
+    let mut state = session.state.clone();
+    loop {
+        if let Some(terminal) = state.borrow().clone() {
+            return terminal;
+        }
+        if state.changed().await.is_err() {
+            return TerminalState {
+                wait_error: Some("shell supervisor stopped before publishing its outcome".into()),
+                ..Default::default()
+            };
+        }
+    }
+}
+
+async fn wait_session(session: &ShellSession, yield_at: Option<Instant>, cx: &ToolCx) -> bool {
+    let mut state = session.state.clone();
+    loop {
+        if state.borrow().is_some() {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = cx.cancellation.cancelled() => {
+                let _ = session.controls.send(Control::Cancel);
+                terminal_state(session).await;
+                return true;
+            }
+            changed = state.changed() => {
+                if changed.is_err() { return true; }
+            }
+            _ = until(yield_at) => return false,
+        }
+    }
+}
+
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_STDIN_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct InputOutcome {
+    written: usize,
+    error: Option<String>,
+}
+
+async fn feed_stdin(
+    session: &ShellSession,
+    data: Option<&str>,
+    close: bool,
+    yield_at: Option<Instant>,
+    cx: &ToolCx,
+) -> InputOutcome {
+    if data.is_none() && !close {
+        return InputOutcome::default();
+    }
+    let mut outcome = InputOutcome::default();
+    let mut state = session.state.clone();
+    let input_deadline = yield_at.map_or(Instant::now() + MAX_STDIN_WAIT, |at| {
+        at.min(Instant::now() + MAX_STDIN_WAIT)
+    });
+    let write = async {
+        let mut stdin = session.stdin.lock().await;
+        if let Some(data) = data.filter(|data| !data.is_empty()) {
+            let input = stdin.as_mut().ok_or_else(|| "stdin is closed".to_owned())?;
+            while outcome.written < data.len() {
+                let count = input
+                    .write(&data.as_bytes()[outcome.written..])
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    return Err("stdin accepted zero bytes".to_owned());
+                }
+                outcome.written += count;
+            }
+            input.flush().await.map_err(|error| error.to_string())?;
+        }
+        if close {
+            stdin.take();
+        }
+        Ok(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cx.cancellation.cancelled() => {
+            let _ = session.controls.send(Control::Cancel);
+            Err("stdin interrupted by invocation cancellation".to_owned())
+        }
+        result = write => result,
+        _ = until(Some(input_deadline)) => Err("stdin write exceeded its wait budget; some input may have been accepted".to_owned()),
+        _ = state.changed() => Err("process exited before input was fully accepted".to_owned()),
+    };
+    outcome.error = result.err();
+    outcome
+}
+
+fn get_session(cx: &ToolCx, id: &str) -> Result<Arc<ShellSession>, ToolResult> {
+    cx.shell_sessions
+        .lock()
+        .unwrap()
+        .map
+        .get(id)
+        .cloned()
+        .ok_or_else(|| {
+            ToolResult::Error(format!(
+                "no such shell session: {id} (it may have already been consumed)"
+            ))
+        })
+}
+
+fn session_result(
+    cx: &ToolCx,
+    id: &str,
+    session: &ShellSession,
+    max_tokens: usize,
+    input: InputOutcome,
+) -> ToolResult {
+    let terminal = session.state.borrow().clone().or_else(|| {
+        session.state.has_changed().is_err().then(|| TerminalState {
+            wait_error: Some("shell supervisor stopped before publishing its outcome".into()),
+            ..Default::default()
+        })
+    });
+    let output = snapshot(session, max_tokens);
+    let mut result = if let Some(terminal) = terminal {
+        cx.shell_sessions.lock().unwrap().map.remove(id);
+        let mut value = terminal_json(terminal.exit_code, output, terminal.timed_out);
+        value["cancelled"] = json!(terminal.cancelled);
+        if terminal.group_cleanup_sigkill {
+            value["group_cleanup_signal"] = json!("kill");
+        }
+        if terminal.killed {
+            value["killed"] = json!(true);
+            value["escalated_to_sigkill"] = json!(terminal.escalated_to_sigkill);
+        }
+        if let Some(signal) = terminal.signal_sent {
+            value["signal_sent"] = json!(signal);
+        }
+        if let Some(error) = terminal.wait_error {
+            value["process_error"] = json!(error);
+        }
+        value
+    } else {
+        let mut value = json!({
+            "exit_code": Value::Null, "stdout": output.stdout, "stderr": output.stderr,
+            "running": true, "timed_out": false,
+            "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
+            "progress": session_progress(session),
+        });
+        if let Some(filter) = output.output_filter {
+            value["output_filter"] = filter;
+        }
+        value
+    };
+    result["session_id"] = json!(id);
+    if let Some(error) = input.error {
+        result["input_error"] = json!(error);
+        result["stdin_bytes_written"] = json!(input.written);
+    }
+    ToolResult::Json(result)
+}
+
+/// Stop all sessions owned by this ToolCx, await reaping, and return final facts.
+/// The caller can persist these receipts when an interrupted turn had yielded
+/// commands whose originating invocation already returned.
+pub async fn shutdown_shell_sessions(cx: &ToolCx) -> Vec<Value> {
+    let sessions: Vec<_> = cx.shell_sessions.lock().unwrap().map.drain().collect();
+    for (_, session) in &sessions {
+        let _ = session.controls.send(Control::Cancel);
+    }
+    let mut receipts = Vec::with_capacity(sessions.len());
+    for (id, session) in sessions {
+        terminal_state(&session).await;
+        if let ToolResult::Json(receipt) = session_result(
+            cx,
+            &id,
+            &session,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            InputOutcome::default(),
+        ) {
+            receipts.push(receipt);
+        }
+    }
+    receipts
 }
 
 fn spawn_reader<R>(
@@ -398,7 +725,7 @@ fn snapshot(session: &ShellSession, max_tokens: usize) -> ShellOutputSnapshot {
         so_drop,
         se,
         se_drop,
-        session.output_filter.as_ref(),
+        session.output_filter.lock().unwrap().as_ref(),
         max_tokens,
     )
 }
@@ -440,23 +767,17 @@ fn render_snapshot(
 /// inherited the stdout/stderr pipe (`cmd &`), the direct child exits but the
 /// pipe stays open, so a reader awaiting EOF would block forever. We abort it
 /// instead of hanging the agent loop.
-async fn drain_final(session: &mut ShellSession, max_tokens: usize) -> ShellOutputSnapshot {
-    let readers = std::mem::take(&mut session.readers);
-    let aborts: Vec<_> = readers.iter().map(|h| h.abort_handle()).collect();
-    let join_all = async move {
-        for h in readers {
-            let _ = h.await;
-        }
-    };
-    if tokio::time::timeout(READER_DRAIN_GRACE, join_all)
-        .await
-        .is_err()
-    {
-        for a in aborts {
-            a.abort();
+async fn drain_readers(readers: Vec<JoinHandle<()>>) {
+    let drain_at = Instant::now() + READER_DRAIN_GRACE;
+    for mut handle in readers {
+        if tokio::time::timeout_at(drain_at, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
         }
     }
-    snapshot(session, max_tokens)
 }
 
 /// Map a signal name to (libc signal, canonical name). Unknown → SIGTERM.
@@ -480,13 +801,6 @@ fn signal_group(pid: u32, sig: i32) {
     }
 }
 
-/// Send `sig` to a session's process group (no-op if already reaped).
-fn signal_child(session: &ShellSession, sig: i32) {
-    if let Some(pid) = session.child.id() {
-        signal_group(pid, sig);
-    }
-}
-
 /// Build the terminal JSON for an exited/timed-out/killed session.
 fn terminal_json(exit_code: Option<i32>, output: ShellOutputSnapshot, timed_out: bool) -> Value {
     let mut out = json!({
@@ -500,15 +814,6 @@ fn terminal_json(exit_code: Option<i32>, output: ShellOutputSnapshot, timed_out:
         out["output_filter"] = report;
     }
     out
-}
-
-/// Build a terminal `shell_run` result.
-fn terminal_result(
-    exit_code: Option<i32>,
-    output: ShellOutputSnapshot,
-    timed_out: bool,
-) -> ToolResult {
-    ToolResult::Json(terminal_json(exit_code, output, timed_out))
 }
 
 fn shell_path_env() -> Option<OsString> {
@@ -581,7 +886,9 @@ struct ShellRunInput {
     /// Cap on returned stdout/stderr, in approximate tokens (~4 bytes each;
     /// default 2000). The TAIL is kept so trailing errors survive.
     max_output_tokens: Option<usize>,
-    /// Initial stdin written to the process. The stream stays open for
+    /// Initial stdin (at most 1 MiB). Writes wait at most 5 seconds or the
+    /// invocation yield budget; partial/error writes are reported as input_error.
+    /// The stream stays open for
     /// shell_poll to feed more, unless close_stdin is set.
     stdin: Option<String>,
     /// Close (EOF) the stdin stream after writing `stdin`. Required for
@@ -635,6 +942,31 @@ impl Tool for ShellRun {
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
             .min(3_000);
 
+        if args
+            .stdin
+            .as_ref()
+            .is_some_and(|input| input.len() > MAX_STDIN_BYTES)
+        {
+            return ToolResult::Error(format!(
+                "stdin exceeds {MAX_STDIN_BYTES} bytes; write large input to a file and redirect it"
+            ));
+        }
+        let now = Instant::now();
+        let yield_at = match yield_deadline(now, args.yield_time_ms, DEFAULT_RUN_YIELD_MS) {
+            Ok(at) => at,
+            Err(error) => return ToolResult::Error(error),
+        };
+        let kill_at = match args
+            .timeout_ms
+            .map(|millis| deadline(now, millis))
+            .transpose()
+        {
+            Ok(at) => at,
+            Err(error) => return ToolResult::Error(error),
+        };
+        if cx.cancellation.is_cancelled() {
+            return ToolResult::Error("shell invocation cancelled before spawn".into());
+        }
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-lc", &args.command])
             .current_dir(&cwd)
@@ -642,109 +974,94 @@ impl Tool for ShellRun {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            // Each command gets its own process group so kill/timeout paths
-            // can take down the whole tree with one negative-pid kill(2)
-            // (codex-rs does the equivalent via setsid/setpgid in pre_exec).
-            // kill_on_drop alone only reaps the direct bash child.
             .process_group(0);
         apply_child_env(&mut cmd, cx);
-        for (k, v) in &args.env {
-            cmd.env(k, v);
+        for (key, value) in &args.env {
+            cmd.env(key, value);
         }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return ToolResult::Error(format!("spawn failed: {e}")),
+
+        // Reserve admission and install ownership without an intervening await.
+        // A capacity refusal must not execute a command first.
+        let (id, session) = {
+            let mut sessions = cx.shell_sessions.lock().unwrap();
+            if sessions.map.len() >= MAX_LIVE_SESSIONS {
+                return ToolResult::Error(format!(
+                    "too many retained shell sessions ({MAX_LIVE_SESSIONS}); poll or stop an existing session first"
+                ));
+            }
+            let child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(error) => return ToolResult::Error(format!("spawn failed: {error}")),
+            };
+            let pgid = child.id().expect("freshly spawned child has a pid");
+            let mut owned = OwnedChild {
+                child,
+                pgid,
+                active: true,
+            };
+            let stdout = Arc::new(Mutex::new(OutBuf::default()));
+            let stderr = Arc::new(Mutex::new(OutBuf::default()));
+            let progress = Arc::new(PromiseProgress::new());
+            let mut readers = Vec::new();
+            if let Some(output) = owned.child.stdout.take() {
+                readers.push(spawn_reader(
+                    output,
+                    stdout.clone(),
+                    Some((StreamKind::Stdout, progress.clone())),
+                ));
+            }
+            if let Some(output) = owned.child.stderr.take() {
+                readers.push(spawn_reader(
+                    output,
+                    stderr.clone(),
+                    Some((StreamKind::Stderr, progress.clone())),
+                ));
+            }
+            let stdin = Arc::new(tokio::sync::Mutex::new(owned.child.stdin.take()));
+            let (controls, control_rx) = mpsc::unbounded_channel();
+            let (state_tx, state) = watch::channel(None);
+            let session = Arc::new(ShellSession {
+                controls,
+                state,
+                stdin,
+                stdout,
+                stderr,
+                command: args.command,
+                started: now,
+                hard_deadline: kill_at,
+                progress,
+                output_filter: Mutex::new(output_filter),
+            });
+            sessions.counter += 1;
+            let id = format!("sh-{}", sessions.counter);
+            sessions.map.insert(id.clone(), session.clone());
+            tokio::spawn(supervise(owned, control_rx, state_tx, readers, kill_at));
+            (id, session)
         };
-
-        let stdout = Arc::new(Mutex::new(OutBuf::default()));
-        let stderr = Arc::new(Mutex::new(OutBuf::default()));
-        let progress = Arc::new(PromiseProgress::new());
-        let mut readers = Vec::new();
-        if let Some(o) = child.stdout.take() {
-            readers.push(spawn_reader(
-                o,
-                stdout.clone(),
-                Some((StreamKind::Stdout, progress.clone())),
-            ));
+        let mut guard = InvocationGuard::new(&session);
+        let input = feed_stdin(
+            &session,
+            args.stdin.as_deref(),
+            args.close_stdin,
+            yield_at,
+            cx,
+        )
+        .await;
+        if cx.cancellation.is_cancelled()
+            || session.hard_deadline.is_some_and(|at| at <= Instant::now())
+        {
+            wait_session(&session, None, cx).await;
+        } else if input.error.is_none() {
+            wait_session(&session, yield_at, cx).await;
         }
-        if let Some(e) = child.stderr.take() {
-            readers.push(spawn_reader(
-                e,
-                stderr.clone(),
-                Some((StreamKind::Stderr, progress.clone())),
-            ));
+        let mut result = session_result(cx, &id, &session, max_tokens, input);
+        if let ToolResult::Json(value) = &mut result
+            && value["running"] == false
+        {
+            value.as_object_mut().unwrap().remove("session_id");
         }
-        let mut stdin = child.stdin.take();
-        if let Some(si) = stdin.as_mut() {
-            if let Some(data) = args.stdin.as_deref() {
-                let _ = si.write_all(data.as_bytes()).await;
-            }
-            let _ = si.flush().await;
-        }
-        // Drop the handle to send EOF when the command reads until end-of-input.
-        if args.close_stdin {
-            stdin = None;
-        }
-
-        let now = Instant::now();
-        let yield_at = yield_deadline(now, args.yield_time_ms, DEFAULT_RUN_YIELD_MS);
-        let kill_at = args.timeout_ms.map(|ms| now + Duration::from_millis(ms));
-
-        let mut session = ShellSession {
-            child,
-            stdin,
-            stdout,
-            stderr,
-            readers,
-            kill_at,
-            command: args.command.clone(),
-            started: now,
-            progress: Some(progress.clone()),
-            output_filter,
-        };
-
-        match drive(&mut session.child, yield_at, kill_at).await {
-            Outcome::Exited(code) => {
-                let output = drain_final(&mut session, max_tokens).await;
-                terminal_result(code, output, false)
-            }
-            Outcome::TimedOut => {
-                let output = drain_final(&mut session, max_tokens).await;
-                terminal_result(None, output, true)
-            }
-            Outcome::Yielded => {
-                let output = snapshot(&session, max_tokens);
-                let progress = session_progress(&session);
-                match cx.shell_sessions.lock().unwrap().insert(session) {
-                    Ok(id) => {
-                        let mut out = json!({
-                            "exit_code": Value::Null, "stdout": output.stdout, "stderr": output.stderr,
-                            "running": true, "timed_out": false, "session_id": id,
-                            "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
-                        });
-                        if let Some(report) = output.output_filter {
-                            out["output_filter"] = report;
-                        }
-                        if let Some(p) = progress {
-                            out["progress"] = p;
-                        }
-                        ToolResult::Json(out)
-                    }
-                    Err(mut overflow) => {
-                        // Group-wide kill so the overflow session's whole tree
-                        // dies, then reap the direct child.
-                        if let Some(pid) = overflow.child.id() {
-                            signal_group(pid, libc::SIGKILL);
-                        }
-                        let _ = overflow.child.start_kill();
-                        ToolResult::Error(format!(
-                            "too many live shell sessions ({MAX_LIVE_SESSIONS}); \
-                             poll or shell_kill an existing one before starting another"
-                        ))
-                    }
-                }
-            }
-        }
+        guard.armed = false;
+        result
     }
 }
 
@@ -756,7 +1073,8 @@ impl Tool for ShellRun {
 struct ShellPollInput {
     /// Session id from a prior shell_run that returned running=true.
     session_id: String,
-    /// Optional stdin to feed before draining.
+    /// Optional stdin (at most 1 MiB); waits at most 5 seconds or the yield
+    /// budget. Partial/error writes are reported as input_error.
     stdin: Option<String>,
     /// Close (EOF) the stdin stream after writing `stdin`.
     #[serde(default)]
@@ -770,7 +1088,7 @@ struct ShellPollInput {
     /// Cooperative yield in milliseconds before returning if still running.
     /// Defaults to 5000; set 0 to block until the command exits or times out.
     yield_time_ms: Option<u64>,
-    /// Output token budget for this drain (default 10000).
+    /// Output token budget for this drain (default 2000, maximum 3000).
     max_output_tokens: Option<usize>,
     /// Optional post-capture line filter for this drain. When omitted, the
     /// filter from the originating shell_run is reused, if any.
@@ -806,76 +1124,73 @@ impl Tool for ShellPoll {
             Err(e) => return ToolResult::Error(e),
         };
 
-        // Take the session out so we never hold the lock across an await.
-        let mut session = match cx
-            .shell_sessions
-            .lock()
-            .unwrap()
-            .map
-            .remove(&args.session_id)
+        if args
+            .stdin
+            .as_ref()
+            .is_some_and(|input| input.len() > MAX_STDIN_BYTES)
         {
-            Some(s) => s,
-            None => {
-                return ToolResult::Error(format!(
-                    "no such shell session: {} (it may have already exited)",
-                    args.session_id
-                ));
-            }
+            return ToolResult::Error(format!("stdin exceeds {MAX_STDIN_BYTES} bytes"));
+        }
+        if args
+            .signal
+            .as_deref()
+            .is_some_and(|name| !matches!(name, "int" | "term" | "kill"))
+        {
+            return ToolResult::Error("signal must be int, term, or kill".into());
+        }
+        let yield_at =
+            match yield_deadline(Instant::now(), args.yield_time_ms, DEFAULT_POLL_YIELD_MS) {
+                Ok(at) => at,
+                Err(error) => return ToolResult::Error(error),
+            };
+        let session = match get_session(cx, &args.session_id) {
+            Ok(session) => session,
+            Err(error) => return error,
         };
+        let mut guard = InvocationGuard::new(&session);
         if output_filter_was_provided {
-            session.output_filter = output_filter;
+            *session.output_filter.lock().unwrap() = output_filter;
         }
-
-        if let Some(data) = &args.stdin
-            && let Some(si) = session.stdin.as_mut()
-        {
-            let _ = si.write_all(data.as_bytes()).await;
-            let _ = si.flush().await;
-        }
-        if args.close_stdin {
-            session.stdin = None;
-        }
-        // Optional teardown signal: ask the process to stop, then fall through
-        // to draining. If it exits within the yield window the session closes;
-        // if it ignores the signal it survives for a follow-up poll/kill.
+        // Signals never queue behind a blocked stdin writer or an output wait.
         if let Some(name) = args.signal.as_deref() {
-            let (sig, _) = signal_for(Some(name));
-            signal_child(&session, sig);
-        }
-
-        let yield_at = yield_deadline(Instant::now(), args.yield_time_ms, DEFAULT_POLL_YIELD_MS);
-        match drive(&mut session.child, yield_at, session.kill_at).await {
-            Outcome::Exited(code) => {
-                let output = drain_final(&mut session, max_tokens).await;
-                ToolResult::Json(terminal_json(code, output, false))
-            }
-            Outcome::TimedOut => {
-                let output = drain_final(&mut session, max_tokens).await;
-                ToolResult::Json(terminal_json(None, output, true))
-            }
-            Outcome::Yielded => {
-                let output = snapshot(&session, max_tokens);
-                let progress = session_progress(&session);
-                // Re-insert directly (we already own the slot; can't overflow).
-                cx.shell_sessions
-                    .lock()
-                    .unwrap()
-                    .map
-                    .insert(args.session_id.clone(), session);
-                let mut out = json!({
-                    "exit_code": Value::Null, "stdout": output.stdout, "stderr": output.stderr,
-                    "running": true, "timed_out": false, "session_id": args.session_id,
-                    "next_step": format!("Call shell_poll again with session_id={} until running=false before interpreting this command as complete.", args.session_id),
-                });
-                if let Some(report) = output.output_filter {
-                    out["output_filter"] = report;
-                }
-                if let Some(p) = progress {
-                    out["progress"] = p;
-                }
-                ToolResult::Json(out)
+            let (signal, name) = signal_for(Some(name));
+            if session
+                .controls
+                .send(Control::Signal(signal, name))
+                .is_err()
+            {
+                terminal_state(&session).await;
+                let input = if args.stdin.is_some() || args.close_stdin {
+                    InputOutcome {
+                        written: 0,
+                        error: Some("process completed before input was accepted".into()),
+                    }
+                } else {
+                    InputOutcome::default()
+                };
+                let result = session_result(cx, &args.session_id, &session, max_tokens, input);
+                guard.armed = false;
+                return result;
             }
         }
+        let input = feed_stdin(
+            &session,
+            args.stdin.as_deref(),
+            args.close_stdin,
+            yield_at,
+            cx,
+        )
+        .await;
+        if cx.cancellation.is_cancelled()
+            || session.hard_deadline.is_some_and(|at| at <= Instant::now())
+        {
+            wait_session(&session, None, cx).await;
+        } else if input.error.is_none() {
+            wait_session(&session, yield_at, cx).await;
+        }
+        let result = session_result(cx, &args.session_id, &session, max_tokens, input);
+        guard.armed = false;
+        result
     }
 }
 
@@ -894,7 +1209,7 @@ struct ShellKillInput {
     /// Grace window in ms to wait for exit after the signal before
     /// force-killing (default 2000).
     grace_ms: Option<u64>,
-    /// Output token budget for the final drain (default 10000).
+    /// Output token budget for the final drain (default 2000, maximum 3000).
     max_output_tokens: Option<usize>,
     /// Optional post-capture line filter for the final drain. When omitted, the
     /// filter from the originating shell_run is reused, if any.
@@ -930,54 +1245,41 @@ impl Tool for ShellKill {
             Err(e) => return ToolResult::Error(e),
         };
 
-        let mut session = match cx
-            .shell_sessions
-            .lock()
-            .unwrap()
-            .map
-            .remove(&args.session_id)
+        if args
+            .signal
+            .as_deref()
+            .is_some_and(|name| !matches!(name, "int" | "term" | "kill"))
         {
-            Some(s) => s,
-            None => {
-                return ToolResult::Error(format!(
-                    "no such shell session: {} (it may have already exited)",
-                    args.session_id
-                ));
-            }
+            return ToolResult::Error("signal must be int, term, or kill".into());
+        }
+        let deadline = match deadline(Instant::now(), args.grace_ms.unwrap_or(2000)) {
+            Ok(at) => at,
+            Err(error) => return ToolResult::Error(error),
         };
+        let session = match get_session(cx, &args.session_id) {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let mut guard = InvocationGuard::new(&session);
         if output_filter_was_provided {
-            session.output_filter = output_filter;
+            *session.output_filter.lock().unwrap() = output_filter;
         }
-
-        let (sig, sig_name) = signal_for(args.signal.as_deref());
-        signal_child(&session, sig);
-
-        // Wait for graceful exit up to grace_ms; drive escalates to SIGKILL via
-        // its kill_at branch if the process ignores the first signal.
-        let grace = Duration::from_millis(args.grace_ms.unwrap_or(2000));
-        let kill_at = Some(Instant::now() + grace);
-        let outcome = drive(&mut session.child, None, kill_at).await;
-        let output = drain_final(&mut session, max_tokens).await;
-        // `escalated_to_sigkill` means the requested signal was ignored and we
-        // had to force-kill after grace — NOT merely "SIGKILL was requested".
-        let (exit_code, escalated) = match outcome {
-            Outcome::Exited(code) => (code, false),
-            Outcome::TimedOut => (None, true),
-            Outcome::Yielded => (None, false), // unreachable (no yield_at)
-        };
-        let mut out = json!({
-            "exit_code": exit_code,
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "running": false,
-            "killed": true,
-            "signal_sent": sig_name,
-            "escalated_to_sigkill": escalated,
+        let (signal, name) = signal_for(args.signal.as_deref());
+        let _ = session.controls.send(Control::Terminate {
+            signal,
+            name,
+            deadline,
         });
-        if let Some(report) = output.output_filter {
-            out["output_filter"] = report;
-        }
-        ToolResult::Json(out)
+        wait_session(&session, None, cx).await;
+        let result = session_result(
+            cx,
+            &args.session_id,
+            &session,
+            max_tokens,
+            InputOutcome::default(),
+        );
+        guard.armed = false;
+        result
     }
 }
 
@@ -996,7 +1298,7 @@ impl Tool for ShellList {
         "shell_list"
     }
     fn description(&self) -> &str {
-        "List the live (still-running) shell sessions for this dispatch: their session_id, the command, and how long they've been running. Use this to recover a session_id you lost, or to find orphaned long-running processes to shell_poll or shell_kill."
+        "List retained shell sessions with session_id, command, elapsed time, and running state. Completed sessions retain unread terminal output until shell_poll consumes it. Use session_id with shell_poll or shell_kill."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellListInput>()
@@ -1017,6 +1319,7 @@ impl Tool for ShellList {
                 json!({
                     "session_id": id,
                     "command": s.command,
+                    "running": s.state.borrow().is_none(),
                     "elapsed_secs": now.saturating_duration_since(s.started).as_secs(),
                 })
             })
@@ -1039,6 +1342,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
             child_env: Arc::new(Default::default()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -1050,6 +1354,278 @@ mod tests {
             ToolResult::Json(v) => v,
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    fn isolated_cx() -> (tempfile::TempDir, ToolCx) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut context = cx();
+        context.root = root.clone();
+        context.shell_env = Arc::new(std::collections::BTreeMap::from([
+            ("HOME".to_owned(), root.to_string_lossy().into_owned()),
+            (
+                "XDG_CONFIG_HOME".to_owned(),
+                root.join("config").to_string_lossy().into_owned(),
+            ),
+            (
+                "XDG_STATE_HOME".to_owned(),
+                root.join("state").to_string_lossy().into_owned(),
+            ),
+        ]));
+        (directory, context)
+    }
+
+    async fn assert_group_stopped(pgid: i32) {
+        for _ in 0..100 {
+            if !group_has_live_members(pgid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("process group {pgid} still has live members");
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_at_ready_terminal_drain_cleans_group_before_publication() {
+        let (_directory, c) = isolated_cx();
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .args(["-c", "sleep 30 >/dev/null 2>&1 &"])
+            .current_dir(&c.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        apply_child_env(&mut command, &c);
+        let child = command.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        let mut owned = OwnedChild {
+            child,
+            pgid,
+            active: true,
+        };
+        assert!(owned.child.wait().await.unwrap().success());
+        assert!(group_has_live_members(pgid as i32));
+        let (controls, receiver) = mpsc::unbounded_channel();
+        assert!(controls.send(Control::Cancel).is_ok());
+        let (sender, receipt) = watch::channel(None);
+        // Both child.wait and the empty reader drain are already ready when
+        // supervision starts. The accepted cancellation must still be applied.
+        supervise(owned, receiver, sender, Vec::new(), None).await;
+        let terminal = receipt.borrow().clone().unwrap();
+        assert_eq!(terminal.exit_code, Some(0));
+        assert!(terminal.cancelled);
+        assert!(terminal.group_cleanup_sigkill);
+        assert!(controls.send(Control::Cancel).is_err());
+        assert_group_stopped(pgid as i32).await;
+    }
+
+    #[tokio::test]
+    async fn hard_deadline_is_enforced_without_polling() {
+        let (_directory, c) = isolated_cx();
+        let result = as_json(
+            ShellRun
+                .call(
+                    json!({
+                        "command": "echo $$ > group; sleep 30 & wait",
+                        "yield_time_ms": 25, "timeout_ms": 250
+                    }),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(result["running"], true, "{result}");
+        // Never poll the session while the hard deadline expires.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let pgid: i32 = std::fs::read_to_string(c.root.join("group"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_group_stopped(pgid).await;
+        let receipt = as_json(
+            ShellPoll
+                .call(
+                    json!({"session_id": result["session_id"], "yield_time_ms": 0}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(receipt["running"], false, "{receipt}");
+        assert_eq!(receipt["timed_out"], true, "{receipt}");
+        assert_eq!(receipt["cancelled"], false, "{receipt}");
+    }
+
+    #[tokio::test]
+    async fn nonreading_stdin_is_bounded_and_reports_partial_write() {
+        let (_directory, c) = isolated_cx();
+        let result = as_json(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                ShellRun.call(
+                    json!({
+                        "command": "sleep 30", "stdin": "x".repeat(MAX_STDIN_BYTES),
+                        "yield_time_ms": 100, "timeout_ms": 1000
+                    }),
+                    &c,
+                ),
+            )
+            .await
+            .expect("stdin blocked beyond yield budget"),
+        );
+        assert_eq!(result["running"], true, "{result}");
+        assert!(result["input_error"].is_string(), "{result}");
+        assert!(result["stdin_bytes_written"].as_u64().unwrap() < MAX_STDIN_BYTES as u64);
+        let receipts = shutdown_shell_sessions(&c).await;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["cancelled"], true);
+        assert_eq!(receipts[0]["running"], false);
+    }
+
+    #[tokio::test]
+    async fn nonreading_stdin_hard_timeout_returns_terminal_receipt() {
+        let (_directory, c) = isolated_cx();
+        let receipt = as_json(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                ShellRun.call(
+                    json!({
+                        "command": "sleep 30", "stdin": "x".repeat(MAX_STDIN_BYTES),
+                        "yield_time_ms": 0, "timeout_ms": 100
+                    }),
+                    &c,
+                ),
+            )
+            .await
+            .expect("hard timeout did not interrupt stdin"),
+        );
+        assert_eq!(receipt["running"], false, "{receipt}");
+        assert_eq!(receipt["timed_out"], true, "{receipt}");
+        assert!(c.shell_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_stdin_cancellation_reaps_process_group_and_returns_receipt() {
+        let (_directory, c) = isolated_cx();
+        let run = ShellRun.call(
+            json!({
+                "command": "echo $$ > group; sleep 30 & wait",
+                "stdin": "x".repeat(MAX_STDIN_BYTES), "yield_time_ms": 0
+            }),
+            &c,
+        );
+        let cancel = async {
+            while !c.root.join("group").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            c.cancellation.cancel();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, cancel) })
+                .await
+                .expect("cancelled stdin did not drain");
+        let receipt = as_json(result);
+        assert_eq!(receipt["running"], false, "{receipt}");
+        assert_eq!(receipt["cancelled"], true, "{receipt}");
+        assert!(receipt["input_error"].is_string(), "{receipt}");
+        let pgid: i32 = std::fs::read_to_string(c.root.join("group"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_group_stopped(pgid).await;
+        assert!(c.shell_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_poll_remains_reachable_to_list_and_kill() {
+        let (_directory, c) = isolated_cx();
+        let initial = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 30", "yield_time_ms": 20}), &c)
+                .await,
+        );
+        let id = initial["session_id"].as_str().unwrap();
+        let poll = ShellPoll.call(json!({"session_id": id, "yield_time_ms": 0}), &c);
+        let kill = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let listed = as_json(ShellList.call(json!({}), &c).await);
+            assert_eq!(listed["sessions"][0]["session_id"], id, "{listed}");
+            ShellKill
+                .call(json!({"session_id": id, "signal": "kill"}), &c)
+                .await
+        };
+        let (polled, killed) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(poll, kill) })
+                .await
+                .expect("poll hid session from kill");
+        for receipt in [as_json(polled), as_json(killed)] {
+            assert_eq!(receipt["running"], false, "{receipt}");
+            assert_eq!(receipt["killed"], true, "{receipt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn term_cleanup_kills_descendant_that_ignores_term() {
+        let (_directory, c) = isolated_cx();
+        let initial = as_json(ShellRun.call(json!({
+            "command": "echo $$ > group; (trap '' TERM; echo ready > ready; sleep 30; echo survived > sentinel) & wait",
+            "yield_time_ms": 20
+        }), &c).await);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !c.root.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let killed = as_json(
+            ShellKill
+                .call(
+                    json!({"session_id": initial["session_id"], "signal": "term"}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(killed["running"], false, "{killed}");
+        assert_eq!(killed["group_cleanup_signal"], "kill", "{killed}");
+        let pgid: i32 = std::fs::read_to_string(c.root.join("group"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_group_stopped(pgid).await;
+        assert!(!c.root.join("sentinel").exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_reader_drain_stops_background_group() {
+        let (_directory, c) = isolated_cx();
+        let run = ShellRun.call(
+            json!({"command": "echo $$ > group; sleep 30 &", "yield_time_ms": 0}),
+            &c,
+        );
+        let cancel = async {
+            while !c.root.join("group").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.cancellation.cancel();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, cancel) })
+                .await
+                .unwrap();
+        let receipt = as_json(result);
+        assert_eq!(receipt["cancelled"], true, "{receipt}");
+        assert_eq!(receipt["running"], false, "{receipt}");
+        let pgid: i32 = std::fs::read_to_string(c.root.join("group"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_group_stopped(pgid).await;
     }
 
     #[tokio::test]

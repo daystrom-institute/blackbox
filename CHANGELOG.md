@@ -28,6 +28,14 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness cancellation stops queued calls and waits for admitted work to return
+  its actual outcome before acknowledging interruption. Nested code-mode calls
+  retain bounded completion receipts, including calls left pending by JavaScript.
+- Shell supervisors enforce deadlines without polling, bound stdin writes, keep
+  process controls available during waits, terminate owned process groups and
+  reap their child processes.
+  Interrupt, provider failure and session exit drain retained cells and commands.
+
 - Harness child environment policy survives spawned code-mode calls and applies
   to model-facing Git subprocesses, commit hooks and language servers. Explicit
   project environment overlays remain available after inherited transport credentials are scrubbed.

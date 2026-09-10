@@ -269,6 +269,20 @@ impl Emitter {
         }));
     }
 
+    /// Publish final observations from previously yielded work before the
+    /// interrupted terminal event, without duplicating resolved tool-call IDs.
+    pub fn cancellation_outcomes(&self, content: &str) {
+        self.write_line(json!({
+            "type": "user",
+            "subtype": "tool_cancellation_outcomes",
+            "session_id": self.session_id,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": content}],
+            },
+        }));
+    }
+
     /// Marks an auto-compaction boundary in the stream — the harness summarized
     /// and replaced the older conversation prefix. The daemon's claude parser
     /// ignores unknown `system` subtypes, so this is purely a marker for the

@@ -168,6 +168,9 @@ pub(crate) enum RuntimeEvent {
     Result {
         stored_value_writes: HashMap<String, JsonValue>,
         error_text: Option<String>,
+        /// Local addition (not vendored): host responses V8 has not consumed
+        /// when JavaScript finishes. Their outcomes need terminal receipts.
+        pending_tool_call_ids: Vec<String>,
     },
 }
 
@@ -301,7 +304,7 @@ fn run_runtime(
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
-        send_result(&event_tx, HashMap::new(), Some(error_text));
+        send_result(&event_tx, HashMap::new(), Some(error_text), Vec::new());
         return;
     }
 
@@ -320,7 +323,12 @@ fn run_runtime(
             stored_value_writes,
             error_text,
         } => {
-            send_result(&event_tx, stored_value_writes, error_text);
+            send_result(
+                &event_tx,
+                stored_value_writes,
+                error_text,
+                pending_tool_call_ids(scope),
+            );
             return;
         }
         CompletionState::Pending => {}
@@ -365,7 +373,12 @@ fn run_runtime(
                 stored_value_writes,
                 error_text,
             } => {
-                send_result(&event_tx, stored_value_writes, error_text);
+                send_result(
+                    &event_tx,
+                    stored_value_writes,
+                    error_text,
+                    pending_tool_call_ids(scope),
+                );
                 return;
             }
             CompletionState::Pending => {}
@@ -414,17 +427,33 @@ fn capture_scope_send_error(
         .map(|state| state.stored_value_writes.clone())
         .unwrap_or_default();
 
-    send_result(event_tx, stored_value_writes, error_text);
+    send_result(
+        event_tx,
+        stored_value_writes,
+        error_text,
+        pending_tool_call_ids(scope),
+    );
+}
+
+/// Local addition (not vendored): snapshot before releasing the isolate so
+/// controller scheduling cannot confuse completed calls with delivered calls.
+fn pending_tool_call_ids(scope: &mut v8::PinScope<'_, '_>) -> Vec<String> {
+    scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.pending_tool_calls.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn send_result(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     stored_value_writes: HashMap<String, JsonValue>,
     error_text: Option<String>,
+    pending_tool_call_ids: Vec<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
         error_text,
+        pending_tool_call_ids,
     });
 }
 

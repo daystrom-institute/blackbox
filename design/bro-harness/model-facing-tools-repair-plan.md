@@ -46,9 +46,9 @@ Implemented on `fix/harness-invocation-authority`:
   and both language-server canaries. The `--check` mode asserts these contracts.
 
 This addresses the environment and wrapper portions of `gap-74966891`.
-Cancellation and completion ownership remain open, so that gap stays open.
-The other audit gaps remain open. Process termination, output limits, provider
-validation, scoped instructions and resume are outside this first slice.
+Cancellation and completion ownership are handled in the second slice below.
+Output limits, provider validation, scoped instructions and resume are outside
+this first slice.
 
 MCP stdio launch remains a separate trusted-server credential boundary. These
 changes do not strip credentials explicitly configured for an MCP server.
@@ -72,6 +72,34 @@ profile (6,782 passed; 19 skipped), `cargo clippy --workspace` and concurrency
 lint passed. Clippy reports existing repository warnings. These are lane gates;
 this slice has not replaced the installed macOS binaries or restarted services.
 
-Next implementation slice: cancellation ownership and process lifecycle (order 2).
-The audit's remaining gaps are still open; this is the first completed repair
-slice, not completion of the broader audit backlog.
+## Second implementation slice
+
+Implemented on `fix/harness-cancellation`:
+
+- A shared invocation owner retains workspace admission until actual tool
+  completion. Dropping a waiter requests cancellation; it does not abandon an
+  admitted blocking mutation. Cancelled queued calls never start.
+- Code-mode stops JavaScript and new admission, then drains admitted host calls
+  and notifications. Bounded receipts preserve actual outcomes. A runtime
+  snapshot of unresolved call IDs identifies results JavaScript did not consume,
+  including fire-and-forget calls, without guessing from timestamps.
+- Shell supervision owns child reaping, process-group termination, passive hard
+  deadlines and bounded output-reader cleanup independently of model polling.
+  Stdin has a byte cap and bounded wait, and reports partial acceptance. Polling
+  keeps session handles registered; process controls use their supervisor's
+  synchronization instead of waiting behind the workspace mutation gate.
+- The loop acknowledges interruption after draining work, preserves committed
+  edit facts, and records terminal facts for previously yielded cells/commands.
+  Provider errors, idle interruption, stdin closure and one-shot session exit
+  use the same cleanup. Closed stdin is disabled while cleanup is pending.
+
+The [cancellation implementation and evidence](model-facing-audit/cancellation-repair.md)
+records boundaries, reference differences and reproducible probes. The ownership
+portion of `gap-74966891` is repaired alongside the first slice's authority work.
+The shell lifecycle portion of `gap-cf64b0da` is repaired; output paging, UTF-8
+chunk handling and filtering still need work, so that broader gap stays open.
+The phase-2 row is therefore only partially closed.
+
+Next: finish shell output integrity, then provider/result integrity (order 3).
+Other audit gaps remain open. No repair slice here has replaced the installed
+macOS binaries or restarted shared services.

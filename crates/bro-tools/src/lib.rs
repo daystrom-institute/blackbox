@@ -22,6 +22,7 @@ pub mod edits;
 pub mod file_read;
 pub mod fleet_worktree;
 pub mod git_commit;
+pub mod invocation;
 pub mod output;
 pub mod promise;
 pub mod safety;
@@ -36,6 +37,7 @@ pub mod workspace;
 
 pub use child_env::ChildEnvironment;
 pub use edits::{EditEvent, EditSink};
+pub use invocation::{InvocationHandle, InvocationReceipt, start_tool_invocation};
 pub use promise::{PromiseProgress, StreamKind};
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};

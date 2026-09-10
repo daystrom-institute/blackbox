@@ -69,10 +69,17 @@ pub(super) fn response_to_result(
         }
     };
     let mut texts = Vec::new();
+    let mut nested_outcomes = Vec::new();
     let mut image_unsupported = false;
     for item in items {
         match item {
-            FunctionCallOutputContentItem::InputText { text } => texts.push(text),
+            FunctionCallOutputContentItem::InputText { text } => {
+                if text.starts_with("[nested tool outcomes]\n") {
+                    nested_outcomes.push(text);
+                } else {
+                    texts.push(text);
+                }
+            }
             FunctionCallOutputContentItem::InputImage { .. } => image_unsupported = true,
         }
     }
@@ -92,6 +99,12 @@ pub(super) fn response_to_result(
     if !notifications.is_empty() {
         status.push_str("[notifications]\n");
         status.push_str(&bounded_text(&notifications.join("\n"), DIAGNOSTIC_BYTES));
+        status.push('\n');
+    }
+    // Cancellation receipts are lifecycle evidence. Even max_tokens=0 must
+    // retain their bounded actual outcomes rather than only a stopped label.
+    if !nested_outcomes.is_empty() {
+        status.push_str(&bounded_text(&nested_outcomes.join("\n"), DIAGNOSTIC_BYTES));
         status.push('\n');
     }
     status.push_str("Output:\n");
@@ -160,6 +173,31 @@ mod tests {
         assert!(text.contains("Script error:\nReferenceError: missing is not defined"));
         assert!(text.contains("[notifications]\nnested operation finished"));
         assert!(!text.contains("hidden payload"));
+    }
+
+    #[test]
+    fn terminated_cell_preserves_bounded_nested_receipts_with_zero_body_budget() {
+        let result = response_to_result(
+            RuntimeResponse::Terminated {
+                cell_id: CellId::new("123".into()),
+                content_items: vec![
+                    text_item("ordinary output hidden".into()),
+                    text_item(format!(
+                        "[nested tool outcomes]\n{{\"tool\":\"mutation\",\"output\":\"finished\"}}\n{}\n[3 additional nested outcomes omitted]",
+                        "界".repeat(4000)
+                    )),
+                ],
+            },
+            vec![],
+            Some(0),
+        );
+        let text = result_text(result);
+        assert!(text.starts_with("Script terminated\n"));
+        assert!(text.contains("mutation") && text.contains("finished"));
+        assert!(text.contains("3 additional nested outcomes omitted"));
+        assert!(text.contains("output truncated"));
+        assert!(!text.contains("ordinary output hidden"));
+        assert!(text.len() <= MAX_RESULT_BYTES);
     }
 
     #[test]

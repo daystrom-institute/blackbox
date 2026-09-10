@@ -64,6 +64,15 @@ impl HostTools {
 #[async_trait]
 impl ToolCapability for HostTools {
     async fn call_tool(&self, invocation: ToolInvocation) -> Result<ToolCallOutput, BroError> {
+        self.call_tool_with_cancellation(invocation, self.cx.cancellation.clone())
+            .await
+    }
+
+    async fn call_tool_with_cancellation(
+        &self,
+        invocation: ToolInvocation,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ToolCallOutput, BroError> {
         let tool = self.tools.get(&invocation.name).ok_or_else(|| {
             // Unknown OR filtered-out → fail closed (no in-box route around the
             // ToolFilter, §4.5).
@@ -75,20 +84,15 @@ impl ToolCapability for HostTools {
                 ),
             )
         })?;
-        // Cells may launch calls with Promise.all. Treat mutations as exclusive
-        // barriers and allow declared reads to overlap, just like flat dispatch.
-        // Acquire before applying defaults so the whole invocation is protected.
-        let (_read_guard, _write_guard) = if tool.annotations().read_only {
-            (Some(self.execution.read().await), None)
-        } else {
-            (None, Some(self.execution.write().await))
-        };
-        let (content, is_error, content_type) = match crate::registry::call_tool_with_arg_defaults(
-            tool.as_ref(),
-            &invocation.name,
+        let mut cx = self.cx.clone();
+        cx.cancellation = cancellation;
+        let (content, is_error, content_type) = match bro_tools::start_tool_invocation(
+            tool.clone(),
             invocation.input_json,
-            &self.cx,
+            cx,
+            Some(self.execution.clone()),
         )
+        .wait()
         .await
         {
             ToolResult::Text(t) => (t, false, "text/plain"),
@@ -122,6 +126,7 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
@@ -290,6 +295,9 @@ mod tests {
         for name in [
             bro_code_mode::PUBLIC_TOOL_NAME,
             bro_code_mode::WAIT_TOOL_NAME,
+            "shell_poll",
+            "shell_kill",
+            "shell_list",
         ] {
             flat_tools.push(Arc::new(GateProbe {
                 name,
@@ -309,6 +317,13 @@ mod tests {
             input_json: json!({"block": true}),
         }));
         assert!(futures_util::poll!(&mut nested).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned nested invocation starts");
         assert_eq!(started.load(Ordering::SeqCst), 1);
         let mut flat = Box::pin(registry.dispatch("mutation", json!({}), &cx));
         assert!(futures_util::poll!(&mut flat).is_pending());
@@ -320,6 +335,9 @@ mod tests {
         for name in [
             bro_code_mode::PUBLIC_TOOL_NAME,
             bro_code_mode::WAIT_TOOL_NAME,
+            "shell_poll",
+            "shell_kill",
+            "shell_list",
         ] {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -333,5 +351,49 @@ mod tests {
         assert!(!nested.await.unwrap().is_error);
         assert_eq!(flat.await.into_content(), ("mutation".into(), false));
         assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn flat_and_nested_queued_cancellation_never_enter_the_tool() {
+        use crate::registry::{PinPolicy, Registry};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = test_cx();
+        cx.root = dir.path().canonicalize().unwrap();
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let _held = gate.write().await;
+        let started = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(GateProbe {
+            name: "mutation",
+            started: started.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let host = HostTools::with_dispatch_gate(vec![tool.clone()], cx.clone(), gate.clone());
+        let mut registry = Registry::new(
+            vec![tool],
+            vec![],
+            &PinPolicy::from_env(),
+            &crate::mcp::ToolFilter::default(),
+        );
+        registry.set_dispatch_gate(gate.clone());
+        cx.cancellation.cancel();
+        let (flat, nested) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                registry.dispatch("mutation", json!({}), &cx),
+                host.call_tool_with_cancellation(
+                    ToolInvocation {
+                        name: "mutation".into(),
+                        input_json: json!({})
+                    },
+                    cx.cancellation.clone(),
+                ),
+            )
+        })
+        .await
+        .expect("cancelled calls do not wait for admission");
+        let nested = nested.unwrap();
+        assert_eq!(flat.into_content(), (nested.content, nested.is_error));
+        assert!(nested.is_error);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
     }
 }

@@ -12,6 +12,8 @@ const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may b
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 // Local addition (not vendored): document the harness output cap and its
 // text-only transport instead of promising upstream image forwarding.
+// Local addition (not vendored): describe admitted-call draining on completion
+// and cancellation, rather than promising silent disposal of tool work.
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
 - All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
@@ -22,7 +24,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call may still be in flight when the cell yields; call `wait` with the returned cell id to observe the eventual tool response and final result.
 - `max_output_tokens` sets the text output budget for direct `exec` results, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers. Large text keeps its beginning and end; print a smaller selection to inspect omitted content.
-- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded. Each `exec` cell is a FRESH scope: locals from earlier cells are gone — redeclare them, or pass values across cells via `store()`/`load()`.
+- Await every tool call you need. When JavaScript finishes, its callbacks stop; pending tool calls are cancelled and admitted work is drained before the terminal result. Already-started mutations may finish, with bounded outcome receipts. Each `exec` cell is a FRESH scope: locals from earlier cells are gone; redeclare them, or pass values across cells via `store()`/`load()`.
 
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
@@ -42,7 +44,7 @@ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` return
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
 - `max_tokens` limits new text output for this wait call, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers.
-- `terminate: true` stops the running cell; false or omitted waits for output.
+- `terminate: true` stops JavaScript, requests cancellation of nested work, and waits for admitted calls to return actual outcomes. Blocking work may delay the response; termination does not roll back completed changes. False or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
 - Queued `notify(...)` payloads from the cell are delivered in a `[notifications]` section of the result.
 - A nested tool call may still be in flight when `wait` yields; call `wait` again with the same `cell_id` until it returns the eventual tool response or final result.

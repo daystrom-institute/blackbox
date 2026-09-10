@@ -46,4 +46,15 @@ pub struct ToolCallOutput {
 #[async_trait]
 pub trait ToolCapability: Send + Sync {
     async fn call_tool(&self, invocation: ToolInvocation) -> CapabilityResult<ToolCallOutput>;
+
+    /// Cancellation-aware hosts stop admission before execution and drain any
+    /// admitted work. The fallback preserves completion for existing hosts;
+    /// dropping their future cannot safely cancel underlying side effects.
+    async fn call_tool_with_cancellation(
+        &self,
+        invocation: ToolInvocation,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> CapabilityResult<ToolCallOutput> {
+        self.call_tool(invocation).await
+    }
 }

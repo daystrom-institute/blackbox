@@ -378,7 +378,11 @@ async fn session_loop(
                     raw,
                 }) => {
                     // Control while idle: apply any mutation, ack success.
-                    session.apply_control(&subtype, &raw);
+                    if subtype == "interrupt" {
+                        session.drain_cancelled_work().await;
+                    } else {
+                        session.apply_control(&subtype, &raw);
+                    }
                     ctrl_emitter.control_response_success(req_id.as_deref());
                     continue;
                 }
@@ -401,6 +405,7 @@ async fn session_loop(
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut stdin_closed = false;
         let mut deferred: Vec<(String, Value)> = Vec::new();
+        let mut interrupt_responses = Vec::new();
         let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
         {
@@ -415,11 +420,11 @@ async fn session_loop(
                         }
                         break;
                     }
-                    maybe = input_rx.recv() => match maybe {
+                    maybe = input_rx.recv(), if !stdin_closed => match maybe {
                         Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
                             queue_redirect_from_control(&raw, &mid_turn_user_inputs);
                             let _ = cancel_tx.send(true);
-                            ctrl_emitter.control_response_success(req_id.as_deref());
+                            interrupt_responses.push(req_id);
                         }
                         Some(Input::User(p)) => {
                             if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
@@ -439,6 +444,9 @@ async fn session_loop(
                     }
                 }
             }
+        }
+        for req_id in interrupt_responses {
+            ctrl_emitter.control_response_success(req_id.as_deref());
         }
         // The turn (and its &mut self borrow) is done — apply deferred controls.
         for (subtype, raw) in deferred {
@@ -478,6 +486,7 @@ async fn session_loop(
             break;
         }
     }
+    session.drain_cancelled_work().await;
     Ok(())
 }
 
@@ -497,7 +506,11 @@ async fn session_loop_until_idle(
                     req_id,
                     raw,
                 }) => {
-                    session.apply_control(&subtype, &raw);
+                    if subtype == "interrupt" {
+                        session.drain_cancelled_work().await;
+                    } else {
+                        session.apply_control(&subtype, &raw);
+                    }
                     ctrl_emitter.control_response_success(req_id.as_deref());
                     continue;
                 }
@@ -526,6 +539,7 @@ async fn session_loop_until_idle(
             }
         }
     }
+    session.drain_cancelled_work().await;
     Ok(())
 }
 
@@ -546,7 +560,11 @@ async fn await_first_controlled_input(
                 req_id,
                 raw,
             }) => {
-                session.apply_control(&subtype, &raw);
+                if subtype == "interrupt" {
+                    session.drain_cancelled_work().await;
+                } else {
+                    session.apply_control(&subtype, &raw);
+                }
                 ctrl_emitter.control_response_success(req_id.as_deref());
             }
             None => break,
@@ -570,6 +588,8 @@ async fn run_prompt_with_controls(
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut deferred: Vec<(String, Value)> = Vec::new();
+    let mut interrupt_responses = Vec::new();
+    let mut stdin_closed = false;
     let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
         Arc::new(StdMutex::new(VecDeque::new()));
     let turn_result = {
@@ -579,11 +599,11 @@ async fn run_prompt_with_controls(
             tokio::select! {
                 biased;
                 res = &mut turn => break res,
-                maybe = input_rx.recv() => match maybe {
+                maybe = input_rx.recv(), if !stdin_closed => match maybe {
                     Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
                         queue_redirect_from_control(&raw, &mid_turn_user_inputs);
                         let _ = cancel_tx.send(true);
-                        ctrl_emitter.control_response_success(req_id.as_deref());
+                        interrupt_responses.push(req_id);
                     }
                     Some(Input::User(p)) => {
                         if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
@@ -596,11 +616,15 @@ async fn run_prompt_with_controls(
                     }
                     None => {
                         let _ = cancel_tx.send(true);
+                        stdin_closed = true;
                     }
                 }
             }
         }
     };
+    for req_id in interrupt_responses {
+        ctrl_emitter.control_response_success(req_id.as_deref());
+    }
     // user_turn emits the durable terminal error in every entry mode.
     if let Err(e) = turn_result {
         tracing::error!("turn failed: {e:#}");
@@ -624,6 +648,8 @@ struct Session {
     /// persisted in the session file and restored on resume so the surface
     /// shape stays consistent with any `exec` cells already in the transcript.
     code_mode: crate::code_mode::CodeMode,
+    code_mode_session: Option<crate::code_mode::CodeModeToolSession>,
+    retain_background_work: bool,
     cx: ToolCx,
     reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
@@ -861,6 +887,7 @@ impl Session {
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
             child_env: Arc::new(child_env),
+            cancellation: Default::default(),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
             shell_env: Arc::new(shell_env),
         };
@@ -958,6 +985,7 @@ impl Session {
         // `off` ⇒ no authorial code surface: skip exec/wait entirely. `optional`
         // and `only` register + pin them; `only` additionally hides the flat
         // builtins from the wire array (below), making exec/wait the surface.
+        let mut code_mode_session = None;
         if code_mode.enables_code_surface() {
             // Domain bindings (code-mode-cell-dsl.md §5): cell-only constructs
             // projected as namespace globals (`code.*`). They join the callable
@@ -977,12 +1005,14 @@ impl Session {
                     cx.clone(),
                     dispatch_gate.clone(),
                 ));
-            builtins.extend(crate::code_mode::code_mode_tools(
+            let cm_session = crate::code_mode::CodeModeToolSession::new(
                 &cm_callable,
                 cm_seam,
                 code_mode,
                 &crate::bindings::namespace_descriptions(),
-            ));
+            );
+            builtins.extend(cm_session.tools());
+            code_mode_session = Some(cm_session);
             pin.also_pin(bro_code_mode::PUBLIC_TOOL_NAME);
             pin.also_pin(bro_code_mode::WAIT_TOOL_NAME);
         }
@@ -1096,6 +1126,9 @@ impl Session {
             tx,
             reg,
             code_mode,
+            code_mode_session,
+            retain_background_work: cli.input_format.as_deref() == Some("stream-json")
+                && !cli.exit_when_idle,
             cx,
             reference_context_item,
             hooks,
@@ -1213,6 +1246,7 @@ impl Session {
             .user_turn_inner(prompt, cancel, mid_turn_user_inputs)
             .await;
         if let Err(error) = &result {
+            self.drain_cancelled_work().await;
             if let Some(observation) = error.downcast_ref::<transport::FailedTurnObservation>() {
                 self.emitter.failed_turn_observation(observation);
             }
@@ -1230,6 +1264,7 @@ impl Session {
         mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
     ) -> Result<()> {
         self.reg.validate_resume_tool_schemas()?;
+        self.cx.cancellation = tokio_util::sync::CancellationToken::new();
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
 
@@ -1672,7 +1707,14 @@ impl Session {
                                     raw[i] = Some(res.into_content());
                                 }
                             }
-                            _ = cancel.changed() => { interrupted = true; break; }
+                            _ = cancel.changed() => {
+                                interrupted = true;
+                                self.cx.cancellation.cancel();
+                                while let Some((i, res)) = pending.next().await {
+                                    raw[i] = Some(res.into_content());
+                                }
+                                break;
+                            }
                         }
                     }
                     if interrupted {
@@ -1681,16 +1723,26 @@ impl Session {
                 } else {
                     let tc = &out.tool_calls[next];
                     tracing::info!(tool = %tc.name, "dispatch");
-                    tokio::select! {
+                    let dispatch = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx);
+                    tokio::pin!(dispatch);
+                    let result = tokio::select! {
                         biased;
-                        res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
-                            raw[next] = Some(res.into_content());
+                        result = &mut dispatch => result,
+                        _ = cancel.changed() => {
+                            interrupted = true;
+                            self.cx.cancellation.cancel();
+                            dispatch.await
                         }
-                        _ = cancel.changed() => { interrupted = true; break; }
-                    }
+                    };
+                    raw[next] = Some(result.into_content());
                     next += 1;
+                    if interrupted {
+                        break;
+                    }
                 }
             }
+
+            interrupted |= *cancel.borrow();
 
             // Assemble results in tool-call order: bound oversized output, run
             // result hooks. Diagnostics are deferred to the single batch-boundary
@@ -1732,7 +1784,7 @@ impl Session {
             // dispatch round produced, attached to the last result so it rides
             // back with the batch. Replaces the per-tool window-0 drain (which
             // could not attribute edits under concurrent dispatch / V8 cells).
-            if let Some(last) = results.last_mut() {
+            if !interrupted && let Some(last) = results.last_mut() {
                 self.append_edit_diagnostics(&mut last.content).await;
             }
 
@@ -1809,6 +1861,9 @@ impl Session {
                 }
             }
             self.tx.note_interrupted();
+            self.drain_cancelled_work().await;
+        } else if !self.retain_background_work {
+            self.drain_cancelled_work().await;
         }
 
         let turn_end = self.turn_end_diagnostics(
@@ -1853,6 +1908,62 @@ impl Session {
         let log = self.event_log.clone();
         let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
         Ok(())
+    }
+
+    /// Stop admission to yielded work and retain completion facts before the
+    /// interrupted turn is acknowledged. Blocking mutations may delay this.
+    async fn drain_cancelled_work(&mut self) {
+        self.cx.cancellation.cancel();
+        let cells = if let Some(session) = &self.code_mode_session {
+            session
+                .cancel_all()
+                .await
+                .into_iter()
+                .map(|result| {
+                    let (content, is_error) = result.into_content();
+                    json!({"content": content, "is_error": is_error})
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let shells = bro_tools::shell::shutdown_shell_sessions(&self.cx).await;
+        let edits = self
+            .cx
+            .edits
+            .lock()
+            .map(|mut sink| sink.drain())
+            .unwrap_or_default();
+        let recorded_changes: Vec<_> = edits
+            .into_iter()
+            .map(|edit| {
+                json!({
+                    "path": edit.path,
+                    "pre_sha256": edit.pre_sha256,
+                    "post_sha256": edit.post_sha256,
+                })
+            })
+            .collect();
+        if cells.is_empty() && shells.is_empty() && recorded_changes.is_empty() {
+            return;
+        }
+        let content = format!(
+            "[Tool outcomes after cancellation]\n{}",
+            json!({
+                "cells": cells,
+                "shells": shells,
+                "recorded_file_changes": recorded_changes,
+            })
+        );
+        let content =
+            crate::bound::bound_tool_result("cancellation_outcomes", content, self.tool_result_cap);
+        // Earlier yielded exec/shell calls already have tool results. This is
+        // a context observation, not a second result for those request IDs.
+        self.emitter.cancellation_outcomes(&content);
+        self.pending_input_estimate = self
+            .pending_input_estimate
+            .saturating_add(est_tokens(&content));
+        self.tx.push_user_text(&content);
     }
 
     #[cfg(test)]
@@ -2636,6 +2747,7 @@ mod tests {
         NativeSearch(Vec<Value>),
         HighUsageFollowUp,
         ContextOverflow,
+        Failure,
         /// Return text immediately with a Responses-style follow-up signal.
         TextWithEndTurn(String, Option<bool>),
         /// Wait on the shared gate, then request a tool call.
@@ -2729,6 +2841,7 @@ mod tests {
                         ..Usage::default()
                     },
                 }),
+                MockTurn::Failure => anyhow::bail!("synthetic provider failure"),
                 MockTurn::Block => {
                     self.shared.model_gate.notified().await;
                     unreachable!("gate is never released in tests");
@@ -2883,10 +2996,12 @@ mod tests {
             json!({"type":"object"})
         }
 
-        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+        async fn call(&self, _input: Value, cx: &ToolCx) -> bro_tools::ToolResult {
             self.shared.tool_started.fetch_add(1, Ordering::SeqCst);
-            self.shared.tool_gate.notified().await;
-            bro_tools::ToolResult::Text("slow done".into())
+            tokio::select! {
+                _ = self.shared.tool_gate.notified() => bro_tools::ToolResult::Text("slow done".into()),
+                _ = cx.cancellation.cancelled() => bro_tools::ToolResult::Error(INTERRUPTED_TOOL_RESULT.into()),
+            }
         }
     }
 
@@ -2978,11 +3093,12 @@ mod tests {
             json!({"type": "object"})
         }
 
-        async fn call(&self, input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+        async fn call(&self, input: Value, cx: &ToolCx) -> bro_tools::ToolResult {
             if input["block"] == true {
                 self.finished_read.notified().await;
                 self.pending_read.notify_one();
-                return std::future::pending().await;
+                cx.cancellation.cancelled().await;
+                return bro_tools::ToolResult::Error(INTERRUPTED_TOOL_RESULT.into());
             }
             let value = if self.read_only {
                 self.value.load(Ordering::SeqCst)
@@ -3057,6 +3173,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             child_env: Arc::new(Default::default()),
+            cancellation: Default::default(),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -3069,6 +3186,8 @@ mod tests {
         let session = Session {
             tx: Box::new(mock),
             code_mode: crate::code_mode::CodeMode::Optional,
+            code_mode_session: None,
+            retain_background_work: true,
             output_schema: None,
             reg: Registry::new(
                 vec![
@@ -4057,6 +4176,217 @@ mod tests {
                 ("after-2", "2"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn idle_exit_interrupt_and_provider_failure_drain_retained_processes() {
+        for case in [
+            "idle_interrupt",
+            "idle_eof",
+            "until_idle",
+            "provider_failure",
+            "one_shot",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let scripts = if case == "provider_failure" {
+                vec![MockTurn::Failure]
+            } else {
+                vec![MockTurn::Text("done".into())]
+            };
+            let (mut session, _) = mk_session_with_store(
+                scripts,
+                Some(SessionStore::for_test(root.join("session.json"))),
+            );
+            session.cx.root = root;
+            let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let sink = events.clone();
+            let callback: crate::emit::EventCallback =
+                Arc::new(move |event| sink.lock().unwrap().push(event));
+            session.emitter = Emitter::with_callback("fixture".into(), callback.clone());
+            let ctrl = Emitter::with_callback("fixture".into(), callback);
+            let shell = bro_tools::ShellRun
+                .call(
+                    json!({"command":"sleep 30", "yield_time_ms":1}),
+                    &session.cx,
+                )
+                .await;
+            assert!(!shell.is_error(), "{case}: {shell:?}");
+            assert_eq!(session.cx.shell_sessions.lock().unwrap().len(), 1);
+            let run = async {
+                if case == "provider_failure" || case == "one_shot" {
+                    session.retain_background_work = case != "one_shot";
+                    let (_cancel_tx, cancel_rx) = watch::channel(false);
+                    let result = session
+                        .user_turn(
+                            "finish",
+                            cancel_rx,
+                            Arc::new(StdMutex::new(VecDeque::new())),
+                        )
+                        .await;
+                    assert_eq!(result.is_err(), case == "provider_failure");
+                } else {
+                    let (input_tx, input_rx) = mpsc::unbounded_channel();
+                    if case == "idle_interrupt" {
+                        input_tx
+                            .send(Input::Control {
+                                subtype: "interrupt".into(),
+                                req_id: Some("stop".into()),
+                                raw: json!({}),
+                            })
+                            .unwrap();
+                    }
+                    if case == "until_idle" {
+                        session_loop_until_idle(&mut session, input_rx, &ctrl, VecDeque::new())
+                            .await
+                            .unwrap();
+                    } else {
+                        drop(input_tx);
+                        session_loop(&mut session, input_rx, &ctrl, VecDeque::new())
+                            .await
+                            .unwrap();
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), run)
+                .await
+                .unwrap();
+            assert!(
+                session.cx.shell_sessions.lock().unwrap().is_empty(),
+                "{case}"
+            );
+            let events = events.lock().unwrap();
+            let observation = events
+                .iter()
+                .position(|event| event["subtype"] == "tool_cancellation_outcomes")
+                .unwrap();
+            assert!(
+                events[observation].to_string().contains("cancelled"),
+                "{case}"
+            );
+            if let Some(terminal) = events
+                .iter()
+                .position(|event| event["type"] == "result" || event["type"] == "control_response")
+            {
+                assert!(observation < terminal, "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_waits_for_blocking_mutation_and_reports_committed_result() {
+        struct BlockingMutation {
+            started: Arc<Notify>,
+            release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+        #[async_trait]
+        impl Tool for BlockingMutation {
+            fn name(&self) -> &str {
+                "blocking_mutation"
+            }
+            fn description(&self) -> &str {
+                "Synthetic committed mutation"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, cx: &ToolCx) -> bro_tools::ToolResult {
+                let release = self.release.lock().unwrap().take().unwrap();
+                let started = self.started.clone();
+                let cx = cx.clone();
+                bro_tools::tool::call_blocking(move || {
+                    started.notify_one();
+                    release.blocking_recv().unwrap();
+                    let path = cx.root.join("committed.txt");
+                    std::fs::write(&path, b"committed").unwrap();
+                    cx.edits
+                        .lock()
+                        .unwrap()
+                        .push(bro_tools::EditEvent::from_bytes(path, b"", b"committed"));
+                    bro_tools::ToolResult::Text("committed mutation".into())
+                })
+                .await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, shared) = mk_session_with_store(
+            vec![MockTurn::ToolCalls(vec![
+                dispatch_call("active", "blocking_mutation", json!({})),
+                dispatch_call("not-started", "blocking_mutation", json!({})),
+            ])],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        session.cx.root = root.clone();
+        let started = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        session.reg = Registry::new(
+            vec![Arc::new(BlockingMutation {
+                started: started.clone(),
+                release: Mutex::new(Some(release_rx)),
+            })],
+            vec![],
+            &PinPolicy::default(),
+            &mcp::ToolFilter::default(),
+        );
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        session.emitter = Emitter::with_callback(
+            "fixture".into(),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
+        );
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = completed.clone();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let run = async {
+            session
+                .user_turn(
+                    "Mutate fixture",
+                    cancel_rx,
+                    Arc::new(StdMutex::new(VecDeque::new())),
+                )
+                .await
+                .unwrap();
+            done.store(true, Ordering::SeqCst);
+        };
+        let interrupt = async {
+            started.notified().await;
+            cancel_tx.send(true).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let acknowledged_early = completed.load(Ordering::SeqCst);
+            let wrote_early = root.join("committed.txt").exists();
+            release_tx.send(()).unwrap();
+            assert!(
+                !acknowledged_early,
+                "interruption acknowledged before the mutation finished"
+            );
+            assert!(!wrote_early);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(run, interrupt);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("committed.txt")).unwrap(),
+            b"committed"
+        );
+        let batches = shared.pushed_tool_results.lock().unwrap();
+        assert_eq!(batches[0][0].content, "committed mutation");
+        assert!(!batches[0][0].is_error);
+        assert_eq!(batches[0][1].content, INTERRUPTED_TOOL_RESULT);
+        let events = events.lock().unwrap();
+        let observation = events
+            .iter()
+            .position(|event| event["subtype"] == "tool_cancellation_outcomes")
+            .unwrap();
+        let terminal = events
+            .iter()
+            .position(|event| event["type"] == "result")
+            .unwrap();
+        assert!(observation < terminal);
+        assert!(events[observation].to_string().contains("committed.txt"));
+        assert!(session.cx.edits.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -387,6 +387,14 @@ impl CodeModeService {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.inner.shutting_down.store(true, Ordering::Release);
+        self.cancel_all().await;
+        Ok(())
+    }
+
+    /// Local addition (not vendored): close current cells without closing the
+    /// session. Every reply follows callback completion and remains available
+    /// to the host for transcript delivery.
+    pub async fn cancel_all(&self) -> Vec<RuntimeResponse> {
         let handles = self
             .inner
             .cells
@@ -395,18 +403,22 @@ impl CodeModeService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut responses = Vec::new();
         for handle in handles {
             handle.cancellation_token.cancel();
-            let (response_tx, _response_rx) = oneshot::channel();
+            let (response_tx, response_rx) = oneshot::channel();
             let _ = handle
                 .control_tx
                 .send(CellControlCommand::Terminate { response_tx });
-            let _ = handle.runtime_tx.send(RuntimeCommand::Terminate);
+            responses.push(response_rx);
         }
-        while !self.inner.cells.lock().await.is_empty() {
-            tokio::task::yield_now().await;
+        let mut outcomes = Vec::new();
+        for response in responses {
+            if let Ok(response) = response.await {
+                outcomes.push(response);
+            }
         }
-        Ok(())
+        outcomes
     }
 }
 
@@ -549,6 +561,110 @@ fn send_yield_response(
     }
 }
 
+// Local addition (not vendored): retain bounded, actual nested outcomes when
+// JavaScript is terminated before it can print a tool's completed response.
+#[derive(Default)]
+struct NestedOutcomeLog {
+    records: Vec<(String, String)>,
+    bytes: usize,
+    omitted: usize,
+}
+
+// Local addition (not vendored).
+struct NestedOutcome {
+    id: String,
+    name: String,
+    result: Result<serde_json::Value, String>,
+}
+
+impl NestedOutcomeLog {
+    // Local addition (not vendored): omission counts are explicit; no output
+    // files or new recovery tools are created by cancellation.
+    fn record(&mut self, outcome: NestedOutcome) {
+        let id = outcome.id.clone();
+        let is_error = outcome.result.is_err();
+        let output = match outcome.result {
+            Ok(value) => value,
+            Err(error) => serde_json::Value::String(error),
+        };
+        let rendered = output.to_string();
+        let mut record = serde_json::json!({
+            "call_id": outcome.id,
+            "tool": outcome.name,
+            "is_error": is_error,
+        });
+        if rendered.len() > 1024 {
+            let mut end = 1024;
+            while !rendered.is_char_boundary(end) {
+                end -= 1;
+            }
+            record["output_preview"] = serde_json::json!(&rendered[..end]);
+            record["omitted_bytes"] = serde_json::json!(rendered.len() - end);
+        } else {
+            record["output"] = output;
+        }
+        let record = record.to_string();
+        if self.bytes + record.len() > 8 * 1024 {
+            self.omitted += 1;
+        } else {
+            self.bytes += record.len();
+            self.records.push((id, record));
+        }
+    }
+
+    // Local addition (not vendored).
+    fn append_to(&self, content: &mut Vec<FunctionCallOutputContentItem>) {
+        self.append_selected_to(content, None);
+    }
+
+    // Local addition (not vendored): normal terminal replies only need results
+    // the isolate had not consumed, as identified by its resolver map.
+    fn append_selected_to(
+        &self,
+        content: &mut Vec<FunctionCallOutputContentItem>,
+        ids: Option<&[String]>,
+    ) {
+        if ids.is_some_and(|ids| ids.is_empty()) {
+            return;
+        }
+        let records = self
+            .records
+            .iter()
+            .filter(|(id, _)| ids.is_none_or(|ids| ids.contains(id)))
+            .map(|(_, record)| record.as_str())
+            .collect::<Vec<_>>();
+        if records.is_empty() && self.omitted == 0 {
+            return;
+        }
+        let mut text = format!("[nested tool outcomes]\n{}", records.join("\n"));
+        if self.omitted > 0 {
+            text.push_str(&format!(
+                "\n[{} additional nested outcomes omitted]",
+                self.omitted
+            ));
+        }
+        content.push(FunctionCallOutputContentItem::InputText { text });
+    }
+}
+
+// Local addition (not vendored): an admitted host call owns its actual
+// completion. Never abort its task merely because V8 has stopped.
+async fn drain_tool_call_tasks(
+    tasks: &mut JoinSet<NestedOutcome>,
+    outcomes: &mut NestedOutcomeLog,
+) {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(outcome) => outcomes.record(outcome),
+            Err(error) => outcomes.record(NestedOutcome {
+                id: "unknown".into(),
+                name: "unknown".into(),
+                result: Err(format!("nested tool task failed: {error}")),
+            }),
+        }
+    }
+}
+
 async fn run_cell_control(
     inner: Arc<Inner>,
     context: CellControlContext,
@@ -581,6 +697,7 @@ async fn run_cell_control(
     let mut yield_window_ms: Option<u64> = initial_yield_time_ms;
     let mut tool_call_tasks = JoinSet::new();
     let mut notification_tasks = JoinSet::new();
+    let mut nested_outcomes = NestedOutcomeLog::default();
 
     loop {
         tokio::select! {
@@ -594,6 +711,11 @@ async fn run_cell_control(
                 let Some(event) = maybe_event else {
                     runtime_closed = true;
                     if termination_requested {
+                        // Local addition (not vendored): callback results must
+                        // be settled before any terminal reply is observable.
+                        drain_notification_tasks(&mut notification_tasks).await;
+                        drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
+                        nested_outcomes.append_to(&mut content_items);
                         if let Some(response_tx) = response_tx.take() {
                             let response = RuntimeResponse::Terminated {
                                 cell_id: cell_id.clone(),
@@ -604,6 +726,10 @@ async fn run_cell_control(
                         break;
                     }
                     if pending_result.is_none() {
+                        cancellation_token.cancel();
+                        drain_notification_tasks(&mut notification_tasks).await;
+                        drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
+                        nested_outcomes.append_to(&mut content_items);
                         let result = PendingResult {
                             content_items: std::mem::take(&mut content_items),
                             error_text: Some("exec runtime ended unexpectedly".to_string()),
@@ -656,20 +782,15 @@ async fn run_cell_control(
                         let cell_id = cell_id.clone();
                         let cancellation_token = cancellation_token.child_token();
                         notification_tasks.spawn(async move {
-                            tokio::select! {
-                                result = delegate.notify(
+                            // Local addition (not vendored): callbacks already
+                            // emitted by V8 are drained, never raced and dropped.
+                            if let Err(err) = delegate.notify(
                                     call_id,
                                     cell_id.clone(),
                                     text,
-                                    cancellation_token.clone(),
-                                ) => {
-                                    if let Err(err) = result {
-                                        warn!(
-                                            "failed to deliver code mode notification for cell {cell_id}: {err}"
-                                        );
-                                    }
-                                }
-                                _ = cancellation_token.cancelled() => {}
+                                    cancellation_token,
+                                ).await {
+                                warn!("failed to deliver code mode notification for cell {cell_id}: {err}");
                             }
                         });
                     }
@@ -679,6 +800,16 @@ async fn run_cell_control(
                         kind,
                         input,
                     } => {
+                        // Local addition (not vendored): queued runtime events
+                        // cannot start fresh host calls after cancellation.
+                        if termination_requested || cancellation_token.is_cancelled() {
+                            nested_outcomes.record(NestedOutcome {
+                                id,
+                                name: name.to_string(),
+                                result: Err("cancelled before tool admission".into()),
+                            });
+                            continue;
+                        }
                         if pending_mode == PendingRuntimeMode::PauseUntilResumed {
                             pending_tool_call_ids.push(id.clone());
                         }
@@ -693,23 +824,28 @@ async fn run_cell_control(
                         let runtime_tx = runtime_tx.clone();
                         let cancellation_token = cancellation_token.child_token();
                         tool_call_tasks.spawn(async move {
-                            let response = tokio::select! {
-                                response = delegate.invoke_tool(tool_call, cancellation_token.clone()) => response,
-                                _ = cancellation_token.cancelled() => return,
-                            };
-                            let command = match response {
-                                Ok(result) => RuntimeCommand::ToolResponse { id, result },
-                                Err(error_text) => RuntimeCommand::ToolError { id, error_text },
+                            // Local addition (not vendored): the host controls
+                            // admission and cancellation of admitted operations.
+                            let name = tool_call.tool_name.to_string();
+                            let response = delegate.invoke_tool(tool_call, cancellation_token).await;
+                            let command = match &response {
+                                Ok(result) => RuntimeCommand::ToolResponse { id: id.clone(), result: result.clone() },
+                                Err(error_text) => RuntimeCommand::ToolError { id: id.clone(), error_text: error_text.clone() },
                             };
                             let _ = runtime_tx.send(command);
+                            NestedOutcome { id, name, result: response }
                         });
                     }
                     RuntimeEvent::Result {
                         stored_value_writes,
                         error_text,
+                        pending_tool_call_ids,
                     } => {
                         yield_timer = None;
                         if termination_requested {
+                            drain_notification_tasks(&mut notification_tasks).await;
+                            drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
+                            nested_outcomes.append_to(&mut content_items);
                             if let Some(response_tx) = response_tx.take() {
                                 let response = RuntimeResponse::Terminated {
                                     cell_id: cell_id.clone(),
@@ -720,6 +856,11 @@ async fn run_cell_control(
                             break;
                         }
                         drain_notification_tasks(&mut notification_tasks).await;
+                        // Local addition (not vendored): even fire-and-forget
+                        // calls that began executing must finish before success.
+                        cancellation_token.cancel();
+                        drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
+                        nested_outcomes.append_selected_to(&mut content_items, Some(&pending_tool_call_ids));
                         inner
                             .stored_values
                             .lock()
@@ -748,10 +889,13 @@ async fn run_cell_control(
                 }
             }
             task_result = tool_call_tasks.join_next(), if !tool_call_tasks.is_empty() => {
-                if let Some(Err(err)) = task_result
-                    && !err.is_cancelled()
-                {
-                    warn!("code mode nested tool call task failed: {err}");
+                match task_result {
+                    Some(Ok(outcome)) => nested_outcomes.record(outcome),
+                    Some(Err(err)) => nested_outcomes.record(NestedOutcome {
+                        id: "unknown".into(), name: "unknown".into(),
+                        result: Err(format!("nested tool task failed: {err}")),
+                    }),
+                    None => {}
                 }
                 // The nested call is back: re-arm a fresh yield window from
                 // tool-return (only if a window is active — i.e. the cell has
@@ -809,6 +953,9 @@ async fn run_cell_control(
                         terminate_paused_runtime(&runtime_control_tx, pending_mode);
                         let _ = runtime_terminate_handle.terminate_execution();
                         if runtime_closed {
+                            drain_notification_tasks(&mut notification_tasks).await;
+                            drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
+                            nested_outcomes.append_to(&mut content_items);
                             if let Some(response_tx) = response_tx.take() {
                                 let response = RuntimeResponse::Terminated {
                                     cell_id: cell_id.clone(),
@@ -839,6 +986,7 @@ async fn run_cell_control(
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
     cancellation_token.cancel();
     drain_notification_tasks(&mut notification_tasks).await;
+    drain_tool_call_tasks(&mut tool_call_tasks, &mut nested_outcomes).await;
     terminate_paused_runtime(&runtime_control_tx, pending_mode);
     inner.cells.lock().await.remove(&cell_id);
     inner.delegate.cell_closed(&cell_id);
@@ -986,6 +1134,224 @@ mod tests {
             output_schema: None,
             namespace_binding: None,
         }
+    }
+
+    // Local addition (not vendored): explicit barriers prove completion order,
+    // without relying on a real subprocess or filesystem mutation.
+    struct CompletionDelegate {
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        tool_finished: std::sync::atomic::AtomicBool,
+        notification_finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl CompletionDelegate {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                tool_finished: std::sync::atomic::AtomicBool::new(false),
+                notification_finished: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl super::CodeModeSessionDelegate for CompletionDelegate {
+        fn invoke_tool<'a>(
+            &'a self,
+            _: crate::runtime::CodeModeNestedToolCall,
+            _: tokio_util::sync::CancellationToken,
+        ) -> super::ToolInvocationFuture<'a> {
+            Box::pin(async move {
+                self.started.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                self.tool_finished.store(true, Ordering::SeqCst);
+                Ok(serde_json::json!({"mutation": "finished"}))
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _: String,
+            _: CellId,
+            _: String,
+            _: tokio_util::sync::CancellationToken,
+        ) -> super::NotificationFuture<'a> {
+            Box::pin(async move {
+                self.started.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                self.notification_finished.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn cell_closed(&self, _: &CellId) {}
+    }
+
+    #[tokio::test]
+    async fn termination_drains_admitted_tool_and_notification_before_reply() {
+        let delegate = Arc::new(CompletionDelegate::new());
+        let service = CodeModeService::with_delegate(delegate.clone());
+        let started = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![slow_tool_definition()],
+                source: "notify('record this'); text(await tools.slow({}));".into(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), delegate.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let termination = service.terminate(started.cell_id.clone());
+        tokio::pin!(termination);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut termination)
+                .await
+                .is_err()
+        );
+        assert!(!delegate.tool_finished.load(Ordering::SeqCst));
+        delegate.release.add_permits(2);
+        let response = tokio::time::timeout(Duration::from_secs(2), termination)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delegate.tool_finished.load(Ordering::SeqCst));
+        assert!(delegate.notification_finished.load(Ordering::SeqCst));
+        let WaitOutcome::LiveCell(RuntimeResponse::Terminated { content_items, .. }) = response
+        else {
+            panic!("expected terminated cell, got {response:?}");
+        };
+        assert!(content_items.iter().any(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text }
+            if text.contains("nested tool outcomes") && text.contains("finished") && text.contains("slow"))));
+    }
+
+    #[tokio::test]
+    async fn normal_completion_drains_unawaited_nested_work() {
+        let delegate = Arc::new(CompletionDelegate::new());
+        let service = CodeModeService::with_delegate(delegate.clone());
+        let started = service.execute(ExecuteRequest {
+            enabled_tools: vec![slow_tool_definition()],
+            source: "tools.slow({}); await new Promise(resolve => setTimeout(resolve, 20)); text('done');".into(),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), delegate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let response = started.initial_response();
+        tokio::pin!(response);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), &mut response)
+                .await
+                .is_err()
+        );
+        delegate.release.add_permits(1);
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delegate.tool_finished.load(Ordering::SeqCst));
+        let RuntimeResponse::Result {
+            content_items,
+            error_text: None,
+            ..
+        } = response
+        else {
+            panic!("expected completion, got {response:?}");
+        };
+        assert!(content_items.iter().any(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text } if text == "done")));
+        assert!(content_items.iter().any(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text }
+            if text.contains("nested tool outcomes") && text.contains("finished"))));
+    }
+
+    #[tokio::test]
+    async fn normal_terminal_retains_completed_response_not_consumed_by_v8() {
+        let inner = Arc::new(Inner {
+            stored_values: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            delegate: Arc::new(SlowToolDelegate {
+                delay: Duration::ZERO,
+            }),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            next_cell_id: AtomicU64::new(1),
+        });
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        let (runtime_event_tx, _runtime_event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(""),
+            runtime_event_tx,
+            PendingRuntimeMode::Continue,
+        )
+        .unwrap();
+        // Observe the host response separately from V8. This establishes that
+        // it completed BEFORE the controller sees the runtime terminal event.
+        let (tool_response_tx, tool_response_rx) = std::sync::mpsc::channel();
+        let actor = tokio::spawn(run_cell_control(
+            inner,
+            CellControlContext {
+                cell_id: cell_id("delayed-result"),
+                runtime_tx: tool_response_tx,
+                runtime_control_tx,
+                pending_mode: PendingRuntimeMode::Continue,
+                runtime_terminate_handle,
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+            },
+            event_rx,
+            control_rx,
+            CellResponseSender::Runtime(response_tx),
+            None,
+        ));
+        event_tx
+            .send(RuntimeEvent::ToolCall {
+                id: "tool-1".into(),
+                name: ToolName::plain("slow"),
+                kind: CodeModeToolKind::Function,
+                input: None,
+            })
+            .unwrap();
+        let response = tokio::task::spawn_blocking(move || {
+            tool_response_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(matches!(response, RuntimeCommand::ToolResponse { .. }));
+        event_tx
+            .send(RuntimeEvent::Result {
+                stored_value_writes: HashMap::new(),
+                error_text: None,
+                pending_tool_call_ids: vec!["tool-1".into()],
+            })
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeResponse::Result {
+            content_items,
+            error_text: None,
+            ..
+        } = response
+        else {
+            panic!("expected normal completion");
+        };
+        assert!(content_items.iter().any(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text }
+            if text.contains("slow-result") && text.contains("tool-1"))));
+        actor.await.unwrap();
     }
 
     #[tokio::test]
@@ -1461,13 +1827,24 @@ await Promise.all([
 
         let termination = service.terminate(cell_id("1")).await.unwrap();
 
-        assert_eq!(
-            termination,
-            WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-                cell_id: cell_id("1"),
-                content_items: Vec::new(),
+        let WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: id,
+            content_items,
+        }) = termination
+        else {
+            panic!("expected terminated cell");
+        };
+        assert_eq!(id, cell_id("1"));
+        let outcomes = content_items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                _ => None,
             })
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(outcomes.matches("\"tool\":\"echo\"").count(), 2);
+        assert!(outcomes.contains("unavailable"));
     }
 
     #[tokio::test]
@@ -1544,13 +1921,24 @@ await Promise.all([
 
         let termination = service.terminate(cell_id("1")).await.unwrap();
 
-        assert_eq!(
-            termination,
-            WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-                cell_id: cell_id("1"),
-                content_items: Vec::new(),
+        let WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: id,
+            content_items,
+        }) = termination
+        else {
+            panic!("expected terminated cell");
+        };
+        assert_eq!(id, cell_id("1"));
+        let outcomes = content_items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                _ => None,
             })
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(outcomes.matches("\"tool\":\"echo\"").count(), 3);
+        assert!(outcomes.contains("unavailable"));
     }
 
     #[tokio::test]

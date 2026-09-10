@@ -367,23 +367,32 @@ impl Registry {
     }
 
     pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
+        self.start_dispatch(name, input, cx).wait().await
+    }
+
+    /// Retain completion ownership across interruption or dropped wait futures.
+    pub fn start_dispatch(
+        &self,
+        name: &str,
+        input: Value,
+        cx: &ToolCx,
+    ) -> bro_tools::InvocationHandle {
         let Some(entry) = self.tools.get(name) else {
-            return ToolResult::Error(format!("unknown tool: {name}"));
+            return bro_tools::InvocationHandle::completed(ToolResult::Error(format!(
+                "unknown tool: {name}"
+            )));
         };
         // Cell controls must remain callable while nested work owns the gate:
         // exec and wait may themselves await a nested call or cancel it.
-        if matches!(
+        let execution = if matches!(
             name,
             bro_code_mode::PUBLIC_TOOL_NAME | bro_code_mode::WAIT_TOOL_NAME
         ) {
-            return call_tool_with_arg_defaults(entry.tool.as_ref(), name, input, cx).await;
-        }
-        let (_read_guard, _write_guard) = if entry.tool.annotations().read_only {
-            (Some(self.execution.read().await), None)
+            None
         } else {
-            (None, Some(self.execution.write().await))
+            Some(self.execution.clone())
         };
-        call_tool_with_arg_defaults(entry.tool.as_ref(), name, input, cx).await
+        bro_tools::start_tool_invocation(entry.tool.clone(), input, cx.clone(), execution)
     }
 
     /// Whether `name` is safe to dispatch concurrently with other tools — i.e.
@@ -399,8 +408,6 @@ impl Registry {
             .unwrap_or(false)
     }
 }
-
-pub(crate) use bro_tools::call_tool_with_arg_defaults;
 
 fn short_desc(d: &str) -> String {
     let line = d.lines().next().unwrap_or("").trim();
@@ -578,6 +585,7 @@ mod tests {
             todos: Arc::new(std::sync::Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(defaults),

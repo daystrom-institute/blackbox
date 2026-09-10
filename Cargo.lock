@@ -1375,6 +1375,7 @@ dependencies = [
  "bro-core",
  "serde",
  "serde_json",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1558,6 +1559,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

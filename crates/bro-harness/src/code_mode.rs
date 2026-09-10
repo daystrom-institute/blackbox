@@ -133,24 +133,24 @@ impl CodeModeSessionDelegate for HarnessDelegate {
                 name: name.clone(),
                 input_json,
             };
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    Err(format!("{name}: cell cancelled before the tool returned"))
-                }
-                out = seam.call_tool(call) => match out {
-                    Ok(out) if out.is_error => Err(out.content),
-                    Ok(out) => {
-                        // Match the flat seam's contract: JSON results parse into
-                        // values; everything else is handed back as a string.
-                        if out.content_type == "application/json" {
-                            serde_json::from_str(&out.content)
-                                .map_err(|e| format!("{name}: tool returned invalid JSON: {e}"))
-                        } else {
-                            Ok(Value::String(out.content))
-                        }
+            // Admission is cancellation-aware at the host gate. Once admitted,
+            // await its real outcome, including blocking mutations and cleanup.
+            match seam
+                .call_tool_with_cancellation(call, cancellation_token)
+                .await
+            {
+                Ok(out) if out.is_error => Err(out.content),
+                Ok(out) => {
+                    // Match the flat seam's contract: JSON results parse into
+                    // values; everything else is handed back as a string.
+                    if out.content_type == "application/json" {
+                        serde_json::from_str(&out.content)
+                            .map_err(|e| format!("{name}: tool returned invalid JSON: {e}"))
+                    } else {
+                        Ok(Value::String(out.content))
                     }
-                    Err(e) => Err(format!("{}: {}", e.code, e.message)),
                 }
+                Err(e) => Err(format!("{}: {}", e.code, e.message)),
             }
         })
     }
@@ -216,6 +216,7 @@ impl CodeModeSurface {
 /// [`code_mode_tools`]. Standalone drivers such as `isolate --cell` also need a
 /// deliberate shutdown point so live cells and delegated child work are stopped
 /// before the process exits.
+#[derive(Clone)]
 pub struct CodeModeToolSession {
     tools: Vec<Arc<dyn Tool>>,
     surface: Arc<CodeModeSurface>,
@@ -271,6 +272,29 @@ impl CodeModeToolSession {
     pub async fn shutdown(&self) -> Result<(), String> {
         self.surface.service.shutdown().await
     }
+
+    /// Close yielded cells at an interrupted turn boundary without closing the
+    /// reusable session. Call after active exec/wait invocations have drained.
+    pub async fn cancel_all(&self) -> Vec<ToolResult> {
+        self.surface
+            .service
+            .cancel_all()
+            .await
+            .into_iter()
+            .map(|response| {
+                let cell_id = response_cell_id(&response).clone();
+                let notifications = self.surface.drain_notifications(&cell_id);
+                let result = response_to_result(response, notifications, None);
+                let (content, is_error) = result.into_content();
+                let content = format!("Code-mode cell {cell_id}:\n{content}");
+                if is_error {
+                    ToolResult::Error(content)
+                } else {
+                    ToolResult::Text(content)
+                }
+            })
+            .collect()
+    }
 }
 
 /// The cell a runtime response belongs to (every variant carries one).
@@ -318,7 +342,10 @@ impl Tool for ExecTool {
         })
     }
 
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        if cx.cancellation.is_cancelled() {
+            return ToolResult::Error("exec cancelled before cell admission".into());
+        }
         let Some(source) = input.get("source").and_then(Value::as_str) else {
             return ToolResult::Error("exec: `source` is required".into());
         };
@@ -338,7 +365,25 @@ impl Tool for ExecTool {
             Ok(s) => s,
             Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
         };
-        match started.initial_response().await {
+        // Startup itself is never dropped: once execute allocates a cell, its
+        // identifier is known and any raced cancellation can close it fully.
+        let cell_id = started.cell_id.clone();
+        let initial_response = started.initial_response();
+        tokio::pin!(initial_response);
+        let outcome = tokio::select! {
+            biased;
+            response = &mut initial_response => response,
+            _ = cx.cancellation.cancelled() => {
+                match self.surface.service.terminate(cell_id).await {
+                    Ok(WaitOutcome::LiveCell(response)) => Ok(response),
+                    // Completion can race cell lookup. Its original receiver
+                    // owns the real outcome even after the cell map is empty.
+                    Ok(WaitOutcome::MissingCell(missing)) => initial_response.await.or(Ok(missing)),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match outcome {
             Ok(response) => {
                 let notifications = self
                     .surface
@@ -390,7 +435,7 @@ impl Tool for WaitTool {
         })
     }
 
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let Some(cell_id) = input.get("cell_id").and_then(Value::as_str) else {
             return ToolResult::Error("wait: `cell_id` is required".into());
         };
@@ -417,20 +462,28 @@ impl Tool for WaitTool {
             .get("terminate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let outcome = if terminate {
+        let outcome = if terminate || cx.cancellation.is_cancelled() {
             self.surface.service.terminate(cell_id).await
         } else {
             let yield_time_ms = input
                 .get("yield_time_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(bro_code_mode::DEFAULT_WAIT_YIELD_TIME_MS);
-            self.surface
-                .service
-                .wait(WaitRequest {
-                    cell_id,
-                    yield_time_ms,
-                })
-                .await
+            let waiting = self.surface.service.wait(WaitRequest {
+                cell_id: cell_id.clone(),
+                yield_time_ms,
+            });
+            tokio::pin!(waiting);
+            tokio::select! {
+                biased;
+                response = &mut waiting => response,
+                _ = cx.cancellation.cancelled() => {
+                    match self.surface.service.terminate(cell_id.clone()).await {
+                        Ok(WaitOutcome::MissingCell(_)) => waiting.await,
+                        response => response,
+                    }
+                }
+            }
         };
         match outcome {
             Ok(WaitOutcome::LiveCell(response)) | Ok(WaitOutcome::MissingCell(response)) => {
@@ -495,6 +548,7 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
@@ -525,6 +579,135 @@ mod tests {
             .next()
             .expect("yielded cell id terminator missing")
             .to_string()
+    }
+
+    struct BlockingMutation {
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingMutation {
+        fn name(&self) -> &str {
+            "mutation"
+        }
+        fn description(&self) -> &str {
+            "Controlled mutation fixture"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, _: &ToolCx) -> ToolResult {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::Json(json!({"mutation":"finished"}))
+        }
+    }
+
+    fn cancellation_fixture() -> (CodeModeToolSession, Arc<BlockingMutation>) {
+        let mutation = Arc::new(BlockingMutation {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let callable: Vec<Arc<dyn Tool>> = vec![mutation.clone()];
+        let seam = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            test_cx(),
+        ));
+        (
+            CodeModeToolSession::new(&callable, seam, CodeMode::Only, &BTreeMap::new()),
+            mutation,
+        )
+    }
+
+    #[tokio::test]
+    async fn exec_cancellation_drains_mutation_and_keeps_receipt_at_zero_output_budget() {
+        let (session, mutation) = cancellation_fixture();
+        let exec = session.tools()[0].clone();
+        let cx = test_cx();
+        let cancellation = cx.cancellation.clone();
+        let call = tokio::spawn(async move {
+            exec.call(json!({"source":"// @exec: {\"yield_time_ms\": 60000, \"max_output_tokens\": 0}\nnotify('callback delivered'); text(await tools.mutation({}));"}), &cx).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        cancellation.cancel();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !call.is_finished(),
+            "cancelled exec must wait for actual mutation completion"
+        );
+        mutation.release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = result.into_content().0;
+        assert!(mutation.finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(text.contains("Script terminated"), "{text}");
+        assert!(
+            text.contains("nested tool outcomes") && text.contains("finished"),
+            "{text}"
+        );
+        assert!(text.contains("callback delivered"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn cancel_all_drains_yielded_cells_and_session_accepts_next_turn() {
+        let (session, mutation) = cancellation_fixture();
+        let exec = session.tools()[0].clone();
+        let result = exec.call(json!({"source":"// @exec: {\"yield_time_ms\": 20}\ntext(await tools.mutation({}));"}), &test_cx()).await;
+        assert!(
+            result
+                .into_content()
+                .0
+                .contains("Script running with cell ID")
+        );
+        tokio::time::timeout(Duration::from_secs(2), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let cancelled = session.cancel_all();
+        tokio::pin!(cancelled);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut cancelled)
+                .await
+                .is_err()
+        );
+        mutation.release.add_permits(1);
+        let results = tokio::time::timeout(Duration::from_secs(2), cancelled)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let text = results.into_iter().next().unwrap().into_content().0;
+        assert!(
+            text.contains("Code-mode cell") && text.contains("finished"),
+            "{text}"
+        );
+        let result = exec
+            .call(json!({"source":"text('next turn');"}), &test_cx())
+            .await;
+        assert!(result.into_content().0.contains("next turn"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_exec_never_allocates_a_cell() {
+        let (session, _) = cancellation_fixture();
+        let cx = test_cx();
+        cx.cancellation.cancel();
+        let result = session.tools()[0]
+            .call(json!({"source":"while (true) {}"}), &cx)
+            .await;
+        assert!(result.is_error());
+        assert!(session.cancel_all().await.is_empty());
     }
 
     #[test]
@@ -779,6 +962,7 @@ text(JSON.stringify(result));
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
@@ -1002,6 +1186,7 @@ text(JSON.stringify(result));
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
@@ -1051,6 +1236,7 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),

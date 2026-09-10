@@ -45,6 +45,9 @@ pub async fn call_tool_with_arg_defaults_and_fallbacks(
     cx: &ToolCx,
     fallbacks: &[(&str, Value)],
 ) -> ToolResult {
+    if cx.cancellation.is_cancelled() {
+        return ToolResult::Error("tool invocation cancelled before execution".into());
+    }
     let (mut input, rider) = match cx.tool_arg_defaults.apply(name, input) {
         Ok(applied) => applied,
         Err(conflict) => return conflict.into_tool_result(name),

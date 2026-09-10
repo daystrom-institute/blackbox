@@ -168,6 +168,7 @@ fn make_cx(root: PathBuf, tool_arg_defaults: ToolArgDefaults) -> ToolCx {
         todos: Arc::new(StdMutex::new(TodoList::default())),
         shell_sessions: Arc::new(StdMutex::new(ShellSessions::default())),
         edits: Arc::new(StdMutex::new(EditSink::default())),
+        cancellation: Default::default(),
         child_env: Arc::new(Default::default()),
         session_env: Arc::new(BTreeMap::new()),
         shell_env: Arc::new(BTreeMap::new()),

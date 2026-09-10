@@ -1590,6 +1590,7 @@ mod tests {
             session_env: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: std::sync::Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
             shell_env: std::sync::Arc::new(Default::default()),
+            cancellation: Default::default(),
             child_env: std::sync::Arc::new(Default::default()),
         }
     }
