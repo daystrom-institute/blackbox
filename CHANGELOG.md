@@ -8,6 +8,11 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Session browsing now enumerates retained transcript history without producer
+  filesystem access, with source/account filters and bounded recency pages.
+  Session-name filters report unavailable indexed metadata explicitly.
+
+
 ### Removed
 
 - Roadmap support in full: MCP tool, store, entity and edge types, indexing,

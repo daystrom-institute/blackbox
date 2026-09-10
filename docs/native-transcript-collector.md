@@ -66,6 +66,15 @@ Same-size rewrites and shrinks produce new generations. Files removed from the
 producer remain retained; omission from a filesystem walk is not a deletion
 instruction.
 
+Inventory every intended source-host root before treating a successful scan as
+complete host coverage. Configure alternate Claude-format roots explicitly with
+stable, distinct account labels; do not rename existing labels during coverage
+expansion because source/account/relative-path identity determines the stream.
+Copied history in different accounts remains separately attributed. Compare
+recent and historical retrieval samples per account after a completed background
+scan, and check published versus indexed generations. Aggregate scan success
+only covers configured roots.
+
 Source publication and index freshness are separate. A durable publish receipt
 confirms stored source bytes; the index writer subsequently projects them.
 Native `bbox_context`, `bbox_messages`, `bbox_session`, and `bbox_topics` read

@@ -110,11 +110,20 @@ name, lane, or author) shows the start of the message as its excerpt.
 
 ## Sessions And Messages
 
-Use `bbox_sessions_list` when recency matters more than text:
+Use `bbox_sessions_list` to browse retained sessions by latest indexed activity:
 
 ```text
 bbox_sessions_list(project="/repo/x", limit=20)
 ```
+
+Listings group by source, account, and session ID, including collected native
+history. `source` selects the provider format; `account` matches the exact
+source-owner label. Pages contain at most 100 rows and return `next_offset`;
+byte limits can shorten a page. Missing timestamps sort last, with stable
+identity ordering for ties. Separate pages can change as indexing advances.
+Session names are not retained in this projection, so `name` filters return
+`error.session_names_not_indexed` rather than reading host metadata. An empty
+page means no matching retained sessions, not that producer history is empty.
 
 Use `bbox_session` for retained message count, source identities, and indexed
 time range. Session IDs are exact; no producer file is opened.

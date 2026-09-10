@@ -25,9 +25,11 @@
   the caller resolved one. Never read project records off disk here to
   interpret a filter: the dependency direction forbids reaching the
   resolver engine, which is why resolution moved up.
-- `bbox_sessions_list` is METADATA-backed, not doc-backed: it matches
-  candidate session cwds against the stamped documents at query time. If
-  session metadata ever gets stamped at write time, that lane can go.
+- `bbox_sessions_list` enumerates retained transcript projections, grouped by
+  source/account/session identity. It never opens producer metadata or session
+  files. Its compact catalog follows the pinned index reader generation,
+  including deletes. Project filtering uses recorded cwd or base-project stamps;
+  latest indexed activity orders pages and does not establish source freshness.
 
 ## Filters generally
 

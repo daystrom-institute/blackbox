@@ -244,8 +244,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_sessions_list",
         category: ToolCategory::Transcripts,
-        summary: "Browse configured provider session metadata by recency. limit defaults to 30, maximum 100; use offset to continue. project filters by registered project identity or recorded path text. Empty means no matching metadata at this offset; corpus search may still find transcripts.",
-        when_to_use: "Use when you need to find a session by recency, project, or name without a concrete text query. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        summary: "Browse retained indexed sessions by latest indexed activity. Filter by source, exact account, or registered project identity/recorded path text. Pages default to 30 sessions, maximum 100, with next_offset and byte limits. Source freshness is not assessed. Session-name filters are unavailable because names are not indexed.",
+        when_to_use: "Use when you need to find a retained session by recency, project, source, or account without a concrete text query. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
         example: None,
     },
     ToolDoc {

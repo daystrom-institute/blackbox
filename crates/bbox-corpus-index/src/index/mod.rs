@@ -265,6 +265,7 @@ pub struct TranscriptIndex {
     /// (the whole struct is already behind RwLock in SharedState), and
     /// in an Arc so the IndexWriterActor can invalidate it post-commit.
     pub stats_cache: StatsCache,
+    session_catalog: Mutex<Option<session_catalog::SessionCatalog>>,
     active_code_selectors: std::sync::Arc<RwLock<BTreeMap<String, String>>>,
     /// Injected project authority. Every selector derivation reads a fresh
     /// snapshot from it, so this index never reads `projects.json` off disk.
@@ -582,6 +583,7 @@ impl TranscriptIndex {
             fields,
             config,
             stats_cache: std::sync::Arc::new(Mutex::new(None)),
+            session_catalog: Mutex::new(None),
             active_code_selectors: std::sync::Arc::new(RwLock::new(active_code_selectors)),
             records_provider,
             replacement,
@@ -2873,6 +2875,7 @@ pub mod passes;
 pub mod project_files;
 pub mod schema_replacement;
 pub mod search;
+mod session_catalog;
 pub mod tool_edges;
 
 pub use helpers::find_session_file;

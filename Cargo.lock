@@ -475,6 +475,7 @@ dependencies = [
  "bbox-transcript-source-store",
  "bro-core",
  "bro-transcript",
+ "chrono",
  "dirs",
  "hex",
  "ignore",

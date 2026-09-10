@@ -140,7 +140,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_sessions_list",
-        description = "Browse configured provider session metadata by recency. limit defaults to 30, maximum 100; use offset to continue. project filters by registered project identity or recorded path text. Empty means no matching metadata at this offset; corpus search may still find transcripts."
+        description = "Browse retained indexed sessions by latest indexed activity. Filter by source, exact account, or registered project identity/recorded path text. Pages default to 30 sessions, maximum 100, with next_offset and byte limits. Source freshness is not assessed. Session-name filters are unavailable because names are not indexed."
     )]
     pub(crate) async fn bbox_sessions_list(
         &self,
