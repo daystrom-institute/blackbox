@@ -1,0 +1,20 @@
+{
+  "id": "gap-74966891",
+  "title": "Flat and nested invocations do not share credential, deny, and cancellation boundaries",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "One explicit per-invocation execution context carrying environment policy, authorization, cancellation and mutation completion ownership",
+  "missing_primitive": "One explicit per-invocation execution context carrying environment policy, authorization, cancellation and mutation completion ownership",
+  "fallback_used": "Isolated synthetic probes and explicit raw tool use; no shared service changes during audit.",
+  "evidence": [
+    "design/bro-harness/model-facing-tools-comprehensive-audit.md"
+  ],
+  "impact": "critical",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/invocation-policy-parity",
+  "notes": "Synthetic full harness probe: flat shell_run omits AUDIT_CANARY; nested tools.shell_run exposes it under identical daemon-worker scrub settings. build.gate still executes when shell_* denied. See comprehensive audit.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T19:08:00Z",
+  "updated_at": "2026-09-10T19:08:00Z"
+}

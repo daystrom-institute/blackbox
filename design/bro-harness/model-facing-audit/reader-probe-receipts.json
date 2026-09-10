@@ -1,0 +1,15 @@
+{
+  "code_read_mid_character": {
+    "byte_length": 1,
+    "char_length": 1,
+    "span": {
+      "byte_end": 2,
+      "byte_start": 1,
+      "content_sha256": "77710aedc74ecfa33685e33a6c7df5cc83004da1bdcef7fb280f5c2b2e97e0a5",
+      "file": "unicode.txt"
+    },
+    "text": "\ufffd",
+    "truncated": false
+  },
+  "web_fetch_json": "{\"type\":\"List \",\"expression\":\"a c\"}"
+}

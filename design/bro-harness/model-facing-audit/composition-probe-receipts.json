@@ -1,0 +1,29 @@
+[
+  {
+    "case": "flat-scrub",
+    "exit": 0,
+    "requests": 2,
+    "tool_outputs": [
+      "{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_ABSENT\",\"timed_out\":false}"
+    ],
+    "shell_run_visible": true
+  },
+  {
+    "case": "nested-scrub",
+    "exit": 0,
+    "requests": 2,
+    "tool_outputs": [
+      "Script completed\nOutput:\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_PRESENT\",\"timed_out\":false}"
+    ],
+    "shell_run_visible": true
+  },
+  {
+    "case": "denied-shell-build-gate",
+    "exit": 0,
+    "requests": 2,
+    "tool_outputs": [
+      "Script completed\nOutput:\n{\"counts\":{\"errors\":1,\"warnings\":0},\"diagnostics\":[{\"message\":\"command exited without recognized diagnostics\",\"severity\":\"error\"}],\"duration_ms\":11,\"exit_code\":23,\"ok\":false,\"status_lines\":[],\"tool\":\"generic\",\"truncated\":false}"
+    ],
+    "shell_run_visible": false
+  }
+]

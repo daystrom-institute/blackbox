@@ -1,0 +1,180 @@
+[
+  {
+    "case": "oversized-file-search",
+    "actual": {
+      "exit": 0,
+      "output": "no matches",
+      "error": ""
+    },
+    "expected": "match or explicit incomplete-search disclosure"
+  },
+  {
+    "case": "explicit-pruned-directory",
+    "actual": {
+      "exit": 0,
+      "output": "build/logic.txt:1:KNOWN_NEEDLE",
+      "error": ""
+    },
+    "expected": "match or explicit excluded-directory disclosure"
+  },
+  {
+    "case": "zero-search-limit",
+    "actual": {
+      "exit": 0,
+      "output": "small.txt:1:MATCH\n[truncated at 0 matches]\n[refine: narrow path=\"small.txt\" and glob=\"*.rs\", use mode=\"files\" or mode=\"count\" to size the hit set first, lower max_results for a compact sample, or raise max_results up to 5000 for a deliberate exhaustive search; current result cap 0, byte cap 8000]",
+      "error": ""
+    },
+    "expected": "reject zero or return zero matches"
+  },
+  {
+    "case": "path-glob-search",
+    "actual": {
+      "exit": 0,
+      "output": "no matches",
+      "error": ""
+    },
+    "expected": "match or clear basename-only contract"
+  },
+  {
+    "case": "normal",
+    "code_mode": "off",
+    "exit": 0,
+    "tools": [
+      "tool_search",
+      "content_search",
+      "file_edit",
+      "file_read",
+      "file_write",
+      "glob",
+      "list_dir",
+      "report",
+      "shell_kill",
+      "shell_list",
+      "shell_poll",
+      "shell_run",
+      "todo_write",
+      "web_fetch"
+    ],
+    "tool_schema_bytes": 19565,
+    "system_bytes": 21935,
+    "terminal": [
+      {
+        "subtype": "success",
+        "result": "fixture done",
+        "num_turns": 1
+      }
+    ]
+  },
+  {
+    "case": "normal",
+    "code_mode": "optional",
+    "exit": 0,
+    "tools": [
+      "exec",
+      "tool_search",
+      "wait",
+      "content_search",
+      "file_edit",
+      "file_read",
+      "file_write",
+      "glob",
+      "list_dir",
+      "report",
+      "shell_kill",
+      "shell_list",
+      "shell_poll",
+      "shell_run",
+      "todo_write",
+      "web_fetch"
+    ],
+    "tool_schema_bytes": 94954,
+    "system_bytes": 22097,
+    "terminal": [
+      {
+        "subtype": "success",
+        "result": "fixture done",
+        "num_turns": 1
+      }
+    ]
+  },
+  {
+    "case": "normal",
+    "code_mode": "only",
+    "exit": 0,
+    "tools": [
+      "exec",
+      "tool_search",
+      "wait"
+    ],
+    "tool_schema_bytes": 92562,
+    "system_bytes": 22598,
+    "terminal": [
+      {
+        "subtype": "success",
+        "result": "fixture done",
+        "num_turns": 1
+      }
+    ]
+  },
+  {
+    "case": "truncated",
+    "code_mode": "off",
+    "exit": 0,
+    "tools": [
+      "tool_search",
+      "content_search",
+      "file_edit",
+      "file_read",
+      "file_write",
+      "glob",
+      "list_dir",
+      "report",
+      "shell_kill",
+      "shell_list",
+      "shell_poll",
+      "shell_run",
+      "todo_write",
+      "web_fetch"
+    ],
+    "tool_schema_bytes": 19565,
+    "system_bytes": 21935,
+    "terminal": [
+      {
+        "subtype": "success",
+        "result": "fixture done",
+        "num_turns": 1
+      }
+    ]
+  },
+  {
+    "case": "bad-final",
+    "code_mode": "off",
+    "exit": 0,
+    "tools": [
+      "final_result",
+      "tool_search",
+      "content_search",
+      "file_edit",
+      "file_read",
+      "file_write",
+      "glob",
+      "list_dir",
+      "report",
+      "shell_kill",
+      "shell_list",
+      "shell_poll",
+      "shell_run",
+      "todo_write",
+      "web_fetch"
+    ],
+    "tool_schema_bytes": 19913,
+    "system_bytes": 22259,
+    "terminal": [
+      {
+        "subtype": "success",
+        "result": "{\"answer\":false}",
+        "num_turns": 1
+      }
+    ]
+  }
+]

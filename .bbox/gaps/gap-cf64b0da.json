@@ -1,0 +1,20 @@
+{
+  "id": "gap-cf64b0da",
+  "title": "Shell timeout and tail contracts depend on polling and lose final output",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Process-owned absolute deadlines and bounded tail retention with truthful live-session status",
+  "missing_primitive": "Process-owned absolute deadlines and bounded tail retention with truthful live-session status",
+  "fallback_used": "Isolated synthetic probes and explicit raw tool use; no shared service changes during audit.",
+  "evidence": [
+    "design/bro-harness/model-facing-tools-comprehensive-audit.md"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/shell-lifetime-and-output",
+  "notes": "Installed synthetic probes: yielded child runs beyond timeout until polled, initial stdin delays deadline, output cap drops final stderr, streaming filter loses split-line match.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T19:08:00Z",
+  "updated_at": "2026-09-10T19:08:00Z"
+}

@@ -1,0 +1,5306 @@
+{
+  "blackbox_commit": "c384fb8a1cc022f7a8bc00f94ad0462373ca1a8e",
+  "capture": "installed isolate --list and --describe for every listed tool",
+  "scope": "21 bro-tools builtins and 83 cell bindings; conditional harness-only tools and dynamic MCP placement documented in overview",
+  "tools": [
+    {
+      "name": "analysis.cohesionClusters",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Path to a .java file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. The FIRST class declaration is analyzed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.describe",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "analysis"
+      ],
+      "parameters": [
+        "analysis",
+        "language"
+      ],
+      "schema": {
+        "properties": {
+          "analysis": {
+            "description": "Analysis name, e.g. \"cohesionClusters\" or \"implPartition\".",
+            "type": "string"
+          },
+          "language": {
+            "description": "Optional language filter: only analyses for this language are valid.",
+            "enum": [
+              "java",
+              "rust"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "analysis"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.fieldClassification",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "className",
+        "fields",
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional owner class name to restrict the field set.",
+            "type": "string"
+          },
+          "fields": {
+            "description": "Optional field names to classify. Omit to classify every field in the file/class.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "file": {
+            "description": "Workspace-relative .java source file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.fieldInitializerClosure",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file",
+        "fields"
+      ],
+      "parameters": [
+        "className",
+        "fields",
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional owner class name when the file has multiple classes.",
+            "type": "string"
+          },
+          "fields": {
+            "description": "Field names to compute initializer closure for (typically seam.move_fields).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "file": {
+            "description": "Workspace-relative .java source file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "fields"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.implPartition",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "file",
+        "implName",
+        "moduleName"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Path to a .rs file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          },
+          "implName": {
+            "description": "The impl type name, e.g. \"BlackboxServer\" or \"impl BlackboxServer\".",
+            "type": "string"
+          },
+          "moduleName": {
+            "description": "Alias for implName.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.methodRegions",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file",
+        "method"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "includeNestedStatementRegions",
+        "includeStatementRegions",
+        "method",
+        "ranges",
+        "statementContains",
+        "statementEndLine",
+        "statementLimit",
+        "statementStartLine"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional owner class name when the file has multiple classes.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Workspace-relative .java source file.",
+            "type": "string"
+          },
+          "includeNestedStatementRegions": {
+            "description": "Default false. When true, statement_regions inventories nested Java statement nodes instead of only method-body top-level statements; useful when a giant loop/block encloses the target marker.",
+            "type": "boolean"
+          },
+          "includeStatementRegions": {
+            "description": "Default true. Set false when only requested_ranges and statement_region_summary are needed.",
+            "type": "boolean"
+          },
+          "method": {
+            "description": "Method or constructor name to analyze.",
+            "type": "string"
+          },
+          "ranges": {
+            "description": "Optional candidate ranges to analyze. Each range is either {startLine,endLine} or {byteStart,byteEnd}.",
+            "items": {
+              "properties": {
+                "byteEnd": {
+                  "type": "integer"
+                },
+                "byteStart": {
+                  "type": "integer"
+                },
+                "endLine": {
+                  "type": "integer"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "startLine": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "statementContains": {
+            "description": "Optional substring filter over the statement source text, useful as a marker-first compact query.",
+            "type": "string"
+          },
+          "statementEndLine": {
+            "description": "Optional line filter: include statement regions whose line range overlaps this end line or earlier.",
+            "type": "integer"
+          },
+          "statementLimit": {
+            "description": "Optional cap on returned statement_regions after filtering.",
+            "type": "integer"
+          },
+          "statementStartLine": {
+            "description": "Optional line filter: include statement regions whose line range overlaps this start line or later.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "file",
+          "method"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.references",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "symbols"
+      ],
+      "parameters": [
+        "declaringClass",
+        "kinds",
+        "language",
+        "symbols"
+      ],
+      "schema": {
+        "properties": {
+          "declaringClass": {
+            "description": "Optional Java receiver filter for method invocations (ignored in Rust mode).",
+            "type": "string"
+          },
+          "kinds": {
+            "description": "Optional Java usage-kind filter (ignored in Rust mode).",
+            "items": {
+              "enum": [
+                "type_reference",
+                "method_invocation",
+                "field_access",
+                "method_reference",
+                "import"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "language": {
+            "description": "Language mode (default \"java\"). Rust mode counts syntactic references with usage kinds: call, type_ref, path_ref, macro_use.",
+            "enum": [
+              "java",
+              "rust"
+            ],
+            "type": "string"
+          },
+          "symbols": {
+            "description": "Simple symbol names to count, e.g. method, field, or type names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "analysis.topLevelDeps",
+      "family": "analysis",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "file",
+        "itemKinds",
+        "itemNames",
+        "projectDir"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Path to a .rs file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          },
+          "itemKinds": {
+            "description": "Optional filter: only items of these tree-sitter kinds (e.g. \"function_item\", \"struct_item\").",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "itemNames": {
+            "description": "Optional specific item names to analyze; omit for all top-level named items.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "projectDir": {
+            "description": "Optional project directory for external reference scanning. Defaults to the file's parent directory.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "source"
+      ],
+      "parameters": [
+        "source"
+      ],
+      "schema": {
+        "properties": {
+          "source": {
+            "description": "The full apply_patch envelope text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "build.gate",
+      "family": "build",
+      "placement": "cell",
+      "required": [
+        "command"
+      ],
+      "parameters": [
+        "anchor_spans",
+        "command",
+        "cwd",
+        "max_diagnostics",
+        "timeout_ms"
+      ],
+      "schema": {
+        "properties": {
+          "anchor_spans": {
+            "description": "When true, attach hash-anchored line spans for diagnostics whose files exist under the session root.",
+            "type": "boolean"
+          },
+          "command": {
+            "description": "Shell command line to execute through bash -lc.",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "Working directory relative to the session root. Defaults to root.",
+            "type": "string"
+          },
+          "max_diagnostics": {
+            "description": "Maximum diagnostics returned. Default 100.",
+            "type": "number"
+          },
+          "timeout_ms": {
+            "description": "Hard timeout in milliseconds. Default 600000.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.fields",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "className",
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional Java class name to restrict field results to one owner class.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Workspace-relative .java source file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.files",
+      "family": "code",
+      "placement": "cell",
+      "required": [],
+      "parameters": [
+        "dir",
+        "language"
+      ],
+      "schema": {
+        "properties": {
+          "dir": {
+            "description": "Subdirectory to enumerate. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. Default: the whole workspace.",
+            "type": "string"
+          },
+          "language": {
+            "description": "Restrict to one language name, as reported by code.items (e.g. \"rust\").",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.items",
+      "family": "code",
+      "placement": "cell",
+      "required": [],
+      "parameters": [
+        "file",
+        "files",
+        "top_level_only"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape).",
+            "type": "string"
+          },
+          "files": {
+            "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); code.files entries ({ file, language } objects) are accepted verbatim; the host fans out (use instead of a cell for-loop).",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "file": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "file"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "top_level_only": {
+            "description": "When true, drops items declared inside nested Java types. Alias: topLevelOnly.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.query",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "query"
+      ],
+      "parameters": [
+        "file",
+        "files",
+        "query",
+        "within"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape).",
+            "type": "string"
+          },
+          "files": {
+            "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); code.files entries ({ file, language } objects) are accepted verbatim; the host fans out and returns a flat captures array.",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "file": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "file"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "query": {
+            "description": "Tree-sitter query source, e.g. \"(function_item name: (identifier) @fn_name)\".",
+            "type": "string"
+          },
+          "within": {
+            "description": "Optional byte range; only matches intersecting it are returned (single-file only).",
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "byte_start",
+              "byte_end"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.read",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "span"
+      ],
+      "schema": {
+        "properties": {
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.readLines",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "file",
+        "startLine",
+        "endLine"
+      ],
+      "parameters": [
+        "endLine",
+        "file",
+        "startLine"
+      ],
+      "schema": {
+        "properties": {
+          "endLine": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "file": {
+            "description": "Workspace-relative file path.",
+            "type": "string"
+          },
+          "startLine": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "file",
+          "startLine",
+          "endLine"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.signature",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "span"
+      ],
+      "schema": {
+        "properties": {
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "code.spanUnion",
+      "family": "code",
+      "placement": "cell",
+      "required": [
+        "spans"
+      ],
+      "parameters": [
+        "spans"
+      ],
+      "schema": {
+        "properties": {
+          "spans": {
+            "items": {
+              "properties": {
+                "byte_end": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "byte_start": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "content_sha256": {
+                  "description": "sha256 of the full file content the span was cut from.",
+                  "type": "string"
+                },
+                "file": {
+                  "description": "File path. May be relative to the session worktree root or absolute.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file",
+                "byte_start",
+                "byte_end",
+                "content_sha256"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "spans"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "content_search",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "pattern"
+      ],
+      "parameters": [
+        "case_insensitive",
+        "context_lines",
+        "glob",
+        "max_results",
+        "mode",
+        "path",
+        "pattern"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "SearchMode": {
+            "oneOf": [
+              {
+                "description": "`relpath:line:text` for every matching line (default).",
+                "enum": [
+                  "content"
+                ],
+                "type": "string"
+              },
+              {
+                "description": "One line per file that contains at least one match.",
+                "enum": [
+                  "files"
+                ],
+                "type": "string"
+              },
+              {
+                "description": "`relpath:count` per matching file, plus a total.",
+                "enum": [
+                  "count"
+                ],
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "case_insensitive": {
+            "default": false,
+            "description": "Case-insensitive matching (like ripgrep `-i`). Default false.",
+            "type": "boolean"
+          },
+          "context_lines": {
+            "description": "In `content` mode, also emit this many context lines before and after each match (like ripgrep `-C`). Ignored in other modes. Default 0.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "glob": {
+            "description": "Optional glob to restrict files by name (e.g. \"*.rs\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_results": {
+            "description": "Max results to return (default 80). Counts matching lines in `content` mode, matching files in `files`/`count` mode.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/SearchMode"
+              }
+            ],
+            "description": "Output shape: `content` (relpath:line:text), `files` (matching paths), or `count` (per-file match counts). Defaults to `content`."
+          },
+          "path": {
+            "description": "Subdirectory to search, relative to root (default: whole worktree).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "Regular expression to search for.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "title": "ContentSearchInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.apply",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es"
+      ],
+      "parameters": [
+        "es",
+        "validations"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "validations": {
+            "description": "Post-write validations (default: [\"tree_sitter_no_errors\"]).",
+            "items": {
+              "enum": [
+                "tree_sitter_no_errors"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "es"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.begin",
+      "family": "edits",
+      "placement": "cell",
+      "required": [],
+      "parameters": [],
+      "schema": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.createFile",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "path",
+        "content"
+      ],
+      "parameters": [
+        "content",
+        "es",
+        "path"
+      ],
+      "schema": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path that must not yet exist. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.delete",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "span"
+      ],
+      "parameters": [
+        "es",
+        "span"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "es",
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.deleteFile",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "path",
+        "contentSha256"
+      ],
+      "parameters": [
+        "contentSha256",
+        "es",
+        "path"
+      ],
+      "schema": {
+        "properties": {
+          "contentSha256": {
+            "description": "sha256 of the file content observed when the delete was planned.",
+            "type": "string"
+          },
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Existing file to delete. Relative paths resolve against the session worktree root.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "path",
+          "contentSha256"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.insertAfter",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "span",
+        "text"
+      ],
+      "parameters": [
+        "es",
+        "span",
+        "text"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "text": {
+            "description": "Replacement / inserted text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "span",
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.insertBefore",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "span",
+        "text"
+      ],
+      "parameters": [
+        "es",
+        "span",
+        "text"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "text": {
+            "description": "Replacement / inserted text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "span",
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.merge",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "changes"
+      ],
+      "parameters": [
+        "changes",
+        "es"
+      ],
+      "schema": {
+        "properties": {
+          "changes": {
+            "items": {
+              "properties": {
+                "new_text": {
+                  "type": "string"
+                },
+                "span": {
+                  "properties": {
+                    "byte_end": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "byte_start": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "content_sha256": {
+                      "description": "sha256 of the full file content the span was cut from.",
+                      "type": "string"
+                    },
+                    "file": {
+                      "description": "File path. May be relative to the session worktree root or absolute.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "file",
+                    "byte_start",
+                    "byte_end",
+                    "content_sha256"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "span",
+                "new_text"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "changes"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.replace",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "span",
+        "text"
+      ],
+      "parameters": [
+        "es",
+        "span",
+        "text"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "text": {
+            "description": "Replacement / inserted text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "span",
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "edits.replaceText",
+      "family": "edits",
+      "placement": "cell",
+      "required": [
+        "es",
+        "file",
+        "find",
+        "replace"
+      ],
+      "parameters": [
+        "es",
+        "file",
+        "find",
+        "occurrence",
+        "replace"
+      ],
+      "schema": {
+        "properties": {
+          "es": {
+            "description": "EditSet id from edits.begin.",
+            "type": "string"
+          },
+          "file": {
+            "description": "File to search. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          },
+          "find": {
+            "description": "Text that must occur exactly once when occurrence is unique.",
+            "type": "string"
+          },
+          "occurrence": {
+            "description": "Currently only unique is supported; default unique.",
+            "enum": [
+              "unique"
+            ],
+            "type": "string"
+          },
+          "replace": {
+            "description": "Replacement text queued for the matched bytes. `text` is accepted as an alias (the key span-based edits.replace uses).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "es",
+          "file",
+          "find",
+          "replace"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_edit",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "file_path",
+        "new_string",
+        "old_string"
+      ],
+      "parameters": [
+        "file_path",
+        "new_string",
+        "old_string",
+        "replace_all"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "file_path": {
+            "description": "Path to the file. Relative paths resolve against the worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          },
+          "new_string": {
+            "description": "Replacement text.",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Exact text to find. Must be unique in the file unless `replace_all`.",
+            "type": "string"
+          },
+          "replace_all": {
+            "default": false,
+            "description": "Replace every occurrence instead of requiring a unique match.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path",
+          "new_string",
+          "old_string"
+        ],
+        "title": "FileEditInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_read",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "file_path"
+      ],
+      "parameters": [
+        "end_line",
+        "file_path",
+        "line_numbers",
+        "max_bytes",
+        "max_lines",
+        "start_byte",
+        "start_line"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "end_line": {
+            "description": "Last source line, inclusive. Omit to continue toward EOF.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "file_path": {
+            "description": "File path, relative to the worktree or absolute. Supports @file mentions.",
+            "type": "string"
+          },
+          "line_numbers": {
+            "default": false,
+            "description": "Prefix source lines with their original 1-based number. Default false.",
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "description": "Maximum source output bytes (default/max 8000, minimum 64).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_lines": {
+            "description": "Maximum source lines (default 200, capped at 2000). Must be positive.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_byte": {
+            "description": "Byte offset from a previous continuation. Use instead of start_line. May resume inside a long line; source line numbers remain unchanged.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_line": {
+            "description": "First source line, 1-based (default 1). Cannot combine with start_byte.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "title": "FileReadInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_write",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "content",
+        "file_path"
+      ],
+      "parameters": [
+        "content",
+        "file_path"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "content": {
+            "description": "Full new contents of the file.",
+            "type": "string"
+          },
+          "file_path": {
+            "description": "Path to write. Relative paths resolve against the worktree root; absolute paths are accepted as-is. Parent dirs are created.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "file_path"
+        ],
+        "title": "FileWriteInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "git_commit",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "message",
+        "paths"
+      ],
+      "parameters": [
+        "message",
+        "paths"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "Commit message.",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Literal files relative to the Git repository root, including deletions. Directories, globs, pathspec magic, symlinks and traversal are refused.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "message",
+          "paths"
+        ],
+        "title": "GitCommitInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "git_diff",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [
+        "include_untracked"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "include_untracked": {
+            "description": "Include untracked files as new-file patches.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "GitDiffInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "git_log",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [],
+      "schema": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "git_show",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [
+        "rev"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "rev": {
+            "description": "Commit-ish to show (default HEAD).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "GitShowInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "git_status",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [],
+      "schema": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "glob",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "pattern"
+      ],
+      "parameters": [
+        "max_results",
+        "path",
+        "pattern",
+        "sort"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "GlobSort": {
+            "oneOf": [
+              {
+                "description": "Most-recently-modified first, explicitly requested.",
+                "enum": [
+                  "mtime"
+                ],
+                "type": "string"
+              },
+              {
+                "description": "Lexicographic path order (default).",
+                "enum": [
+                  "name"
+                ],
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "max_results": {
+            "description": "Max paths to return after sorting (default 200, maximum 2000). A truncation marker is appended when more matched, so a capped result is never silent.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Base dir relative to root (default root).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "Glob pattern relative to the base dir (e.g. \"**/*.rs\", \"src/*.toml\").",
+            "type": "string"
+          },
+          "sort": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/GlobSort"
+              }
+            ],
+            "description": "Result ordering: `name` (lexicographic, default) or `mtime` (newest first)."
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "title": "GlobInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.addImport",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "imports"
+      ],
+      "parameters": [
+        "file",
+        "imports"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Workspace-relative Java file.",
+            "type": "string"
+          },
+          "imports": {
+            "description": "Fully-qualified type names or full import lines.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file",
+          "imports"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.changeSignature",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methodName",
+        "methodRef",
+        "targetParams"
+      ],
+      "parameters": [
+        "acknowledgeSyntaxOnlyCallSites",
+        "className",
+        "file",
+        "files",
+        "methodName",
+        "methodRef",
+        "previewOnly",
+        "targetParams"
+      ],
+      "schema": {
+        "properties": {
+          "acknowledgeSyntaxOnlyCallSites": {
+            "type": "boolean"
+          },
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "methodName": {
+            "type": "string"
+          },
+          "methodRef": {
+            "type": "string"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "targetParams": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file",
+          "methodName",
+          "methodRef",
+          "targetParams"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.changeSignaturePreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methodName",
+        "targetParams"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "files",
+        "methodName",
+        "targetParams"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "methodName": {
+            "type": "string"
+          },
+          "targetParams": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file",
+          "methodName",
+          "targetParams"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.describe",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "transform"
+      ],
+      "parameters": [
+        "transform"
+      ],
+      "schema": {
+        "properties": {
+          "transform": {
+            "description": "Transform name, e.g. \"extractClass\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transform"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.encapsulateField",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "fieldName",
+        "fieldRef"
+      ],
+      "parameters": [
+        "acknowledgeSyntaxOnlyReferences",
+        "className",
+        "fieldName",
+        "fieldRef",
+        "file",
+        "files",
+        "getterName",
+        "previewOnly",
+        "rewriteReferences",
+        "setterName"
+      ],
+      "schema": {
+        "properties": {
+          "acknowledgeSyntaxOnlyReferences": {
+            "type": "boolean"
+          },
+          "className": {
+            "type": "string"
+          },
+          "fieldName": {
+            "type": "string"
+          },
+          "fieldRef": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "getterName": {
+            "type": "string"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "rewriteReferences": {
+            "enum": [
+              "none",
+              "same_file",
+              "files"
+            ],
+            "type": "string"
+          },
+          "setterName": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "fieldName",
+          "fieldRef"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.encapsulateFieldPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "fieldName"
+      ],
+      "parameters": [
+        "className",
+        "fieldName",
+        "file",
+        "files",
+        "getterName",
+        "setterName"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "fieldName": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "getterName": {
+            "type": "string"
+          },
+          "setterName": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "fieldName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.extractClass",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "delegateField",
+        "methods"
+      ],
+      "parameters": [
+        "className",
+        "delegateField",
+        "file",
+        "methods",
+        "moveFields",
+        "previewOnly",
+        "target",
+        "wiring",
+        "wrappers"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Name for the new class (default: derived from target filename).",
+            "type": "string"
+          },
+          "delegateField": {
+            "description": "Field name for the delegate instance on the source class.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Path to a Java source file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          },
+          "methods": {
+            "description": "Method names to move to the new class.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "moveFields": {
+            "description": "Field names to move with the methods (mutable fields written by extracted code MUST be listed here).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "description": "Run the full planner but omit heavy change/create payloads. Use this for risky seams to inspect findings and dependency_projection before re-calling without previewOnly to apply.",
+            "type": "boolean"
+          },
+          "target": {
+            "description": "Path for the NEW class file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. Must not exist (bounces at apply).",
+            "type": "string"
+          },
+          "wiring": {
+            "description": "How the source obtains the delegate. AUTO-SELECTED from the source \u2014 leave unset: a DI source with an @Inject constructor gets constructor_injection (delegate becomes a ctor param + `private final` field, preserving the source's zero-field-injection idiom); a DI source using field @Inject gets external_injection (@Inject delegate field); a non-DI source gets own_construction. All DI modes keep the delegate container-managed + AOP-interceptable. Set only to force a choice.",
+            "enum": [
+              "own_construction",
+              "constructor_injection",
+              "external_injection",
+              "none"
+            ],
+            "type": "string"
+          },
+          "wrappers": {
+            "description": "Keep thin delegating wrappers for the moved methods on the source class, preserving its public API. Pass true whenever callers OUTSIDE this file use the moved methods.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "delegateField",
+          "methods"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.extractClassPreviewPlan",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methods"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "methods",
+        "moveFields"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional owner class name.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Workspace-relative .java source file.",
+            "type": "string"
+          },
+          "methods": {
+            "description": "Method names from the cohesion cluster (seam.item_names).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "moveFields": {
+            "description": "Field names from the cohesion cluster (seam.move_fields).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file",
+          "methods"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.extractColumnSpec",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methods",
+        "target"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "methods",
+        "spec_name",
+        "target"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "methods": {
+            "description": "Two method names to compare (e.g. getInputGasGrid, getOutputGasGrid).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "spec_name": {
+            "description": "Generated record name. Default: <className>ColumnSpec.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Path for the new ColumnSpec record file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "methods",
+          "target"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.extractInterface",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "typeName",
+        "memberRefs"
+      ],
+      "parameters": [
+        "annotationPolicy",
+        "className",
+        "commentPolicy",
+        "file",
+        "memberRefs",
+        "previewOnly",
+        "target",
+        "targetKind",
+        "targetPackage",
+        "typeName"
+      ],
+      "schema": {
+        "properties": {
+          "annotationPolicy": {
+            "enum": [
+              "safe",
+              "copy",
+              "omit"
+            ],
+            "type": "string"
+          },
+          "className": {
+            "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class.",
+            "type": "string"
+          },
+          "commentPolicy": {
+            "enum": [
+              "copy",
+              "move",
+              "omit"
+            ],
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "memberRefs": {
+            "description": "Refs returned by java.pullUpPreview, not graph IDs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetKind": {
+            "enum": [
+              "interface",
+              "abstract_class"
+            ],
+            "type": "string"
+          },
+          "targetPackage": {
+            "type": "string"
+          },
+          "typeName": {
+            "description": "Name of the NEW interface or abstract type to create. Not the source class (that is className).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "typeName",
+          "memberRefs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.extractMethodCodeBlock",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "oldText",
+        "methodName"
+      ],
+      "parameters": [
+        "arguments",
+        "className",
+        "file",
+        "methodName",
+        "newText",
+        "oldText",
+        "parameters",
+        "previewOnly",
+        "resultRecord",
+        "resultRecordName",
+        "resultRecordVar",
+        "returnType",
+        "returnVar",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "arguments": {
+            "description": "Optional argument override aligned with parameters.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "className": {
+            "description": "Optional enclosing class name when the file has multiple classes.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Workspace-relative Java source file.",
+            "type": "string"
+          },
+          "methodName": {
+            "description": "Name of the new helper method.",
+            "type": "string"
+          },
+          "newText": {
+            "description": "Optional explicit call-site replacement. Usually omit and let the planner synthesize it.",
+            "type": "string"
+          },
+          "oldText": {
+            "description": "Exact contiguous source text to extract. Must match exactly once.",
+            "type": "string"
+          },
+          "parameters": {
+            "description": "Optional operator override for helper parameters. Omit to infer captures.",
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "name"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "description": "Run the planner but omit edit payloads; returns would_change_files and findings.",
+            "type": "boolean"
+          },
+          "resultRecord": {
+            "description": "Opt in to generated nested-record result bundle when the selected block has multiple live-out locals. Default false: multi-live-out blocks still refuse.",
+            "type": "boolean"
+          },
+          "resultRecordName": {
+            "description": "Optional generated record type name when resultRecord is true. Default <MethodName>Result.",
+            "type": "string"
+          },
+          "resultRecordVar": {
+            "description": "Optional call-site local name for the helper result record. Default <methodName>Result.",
+            "type": "string"
+          },
+          "returnType": {
+            "description": "Optional return type override. Omit to infer void or one live-out variable.",
+            "type": "string"
+          },
+          "returnVar": {
+            "description": "Optional return variable name override.",
+            "type": "string"
+          },
+          "visibility": {
+            "description": "Helper visibility. Default private.",
+            "enum": [
+              "private",
+              "package-private",
+              "protected",
+              "public"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "oldText",
+          "methodName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.fieldInjectToConstructor",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "fieldRefs"
+      ],
+      "parameters": [
+        "fieldRefs",
+        "field_refs",
+        "file",
+        "previewOnly",
+        "preview_only"
+      ],
+      "schema": {
+        "properties": {
+          "fieldRefs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "field_refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "file": {
+            "type": "string"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "preview_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file",
+          "fieldRefs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.fieldInjectToConstructorPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "className",
+        "class_name",
+        "fields",
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "class_name": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "file": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.hygiene",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "files"
+      ],
+      "parameters": [
+        "files",
+        "imports",
+        "whitespace"
+      ],
+      "schema": {
+        "properties": {
+          "files": {
+            "description": "Touched/created workspace-relative Java files, or scoped entries with whitespace ranges.",
+            "items": {
+              "anyOf": [
+                {
+                  "description": "Workspace-relative Java file. Whole-file whitespace behavior.",
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "file": {
+                      "description": "Workspace-relative Java file.",
+                      "type": "string"
+                    },
+                    "ranges": {
+                      "description": "Whitespace-only ranges. Line ranges are 1-based inclusive; byte ranges are 0-based half-open.",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "properties": {
+                              "endLine": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "end_line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "startLine": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "start_line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "byteEnd": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byteStart": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byte_end": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byte_start": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "file"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "imports": {
+            "description": "Run import hygiene. Default true.",
+            "type": "boolean"
+          },
+          "whitespace": {
+            "description": "Run whitespace hygiene. Default true.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.inlineMethod",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methodName",
+        "methodRef"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "methodName",
+        "methodRef",
+        "previewOnly",
+        "projectWide"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "methodName": {
+            "type": "string"
+          },
+          "methodRef": {
+            "type": "string"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "projectWide": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file",
+          "methodName",
+          "methodRef"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.inlineMethodPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "methodName"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "methodName",
+        "projectWide"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "methodName": {
+            "type": "string"
+          },
+          "projectWide": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file",
+          "methodName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.migrateTypeUsages",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "oldType",
+        "newType",
+        "migrationRef"
+      ],
+      "parameters": [
+        "file",
+        "migrationRef",
+        "newType",
+        "oldType",
+        "previewOnly",
+        "usageRefs"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "migrationRef": {
+            "type": "string"
+          },
+          "newType": {
+            "type": "string"
+          },
+          "oldType": {
+            "type": "string"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "usageRefs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file",
+          "oldType",
+          "newType",
+          "migrationRef"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.migrateTypeUsagesPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "oldType",
+        "newType"
+      ],
+      "parameters": [
+        "file",
+        "newType",
+        "oldType"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "newType": {
+            "type": "string"
+          },
+          "oldType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "oldType",
+          "newType"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.moveClass",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "targetPackage"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "previewOnly",
+        "targetFile",
+        "targetPackage"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional class name. Defaults from file stem.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Workspace-relative Java file to move.",
+            "type": "string"
+          },
+          "previewOnly": {
+            "description": "Return summaries and findings but omit changes/creates/deletes.",
+            "type": "boolean"
+          },
+          "targetFile": {
+            "description": "Optional destination file. Defaults by replacing the old package path segment with targetPackage.",
+            "type": "string"
+          },
+          "targetPackage": {
+            "description": "Destination Java package.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "targetPackage"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.moveMember",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "memberNames",
+        "memberRefs"
+      ],
+      "parameters": [
+        "acknowledgeRemainingAccessors",
+        "acknowledgeRemainingSourceReferences",
+        "file",
+        "keepCopy",
+        "memberKind",
+        "memberNames",
+        "memberRefs",
+        "previewOnly",
+        "target",
+        "targetClassName",
+        "targetPrelude",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "acknowledgeRemainingAccessors": {
+            "type": "boolean"
+          },
+          "acknowledgeRemainingSourceReferences": {
+            "type": "boolean"
+          },
+          "file": {
+            "type": "string"
+          },
+          "keepCopy": {
+            "type": "boolean"
+          },
+          "memberKind": {
+            "enum": [
+              "field",
+              "constant",
+              "method"
+            ],
+            "type": "string"
+          },
+          "memberNames": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "memberRefs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetClassName": {
+            "type": "string"
+          },
+          "targetPrelude": {
+            "type": "string"
+          },
+          "visibility": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "memberNames",
+          "memberRefs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.moveMemberPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "memberNames"
+      ],
+      "parameters": [
+        "file",
+        "keepCopy",
+        "memberKind",
+        "memberNames",
+        "target",
+        "targetClassName",
+        "targetPrelude",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "keepCopy": {
+            "type": "boolean"
+          },
+          "memberKind": {
+            "enum": [
+              "field",
+              "constant",
+              "method"
+            ],
+            "type": "string"
+          },
+          "memberNames": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetClassName": {
+            "type": "string"
+          },
+          "targetPrelude": {
+            "type": "string"
+          },
+          "visibility": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "memberNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.movePackage",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "oldPackage",
+        "targetPackage"
+      ],
+      "parameters": [
+        "files",
+        "oldPackage",
+        "previewOnly",
+        "targetPackage"
+      ],
+      "schema": {
+        "properties": {
+          "files": {
+            "description": "Optional explicit workspace-relative files to move; each must declare oldPackage.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "oldPackage": {
+            "description": "Package to move.",
+            "type": "string"
+          },
+          "previewOnly": {
+            "description": "Return summaries and findings but omit changes/creates/deletes.",
+            "type": "boolean"
+          },
+          "targetPackage": {
+            "description": "Destination package.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "oldPackage",
+          "targetPackage"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.normalizeWhitespace",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "files"
+      ],
+      "parameters": [
+        "files"
+      ],
+      "schema": {
+        "properties": {
+          "files": {
+            "description": "Touched/created workspace-relative Java files.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.organizeImports",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "files"
+      ],
+      "parameters": [
+        "files"
+      ],
+      "schema": {
+        "properties": {
+          "files": {
+            "description": "Touched/created workspace-relative Java files, or scoped entries with whitespace ranges.",
+            "items": {
+              "anyOf": [
+                {
+                  "description": "Workspace-relative Java file. Whole-file whitespace behavior.",
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "file": {
+                      "description": "Workspace-relative Java file.",
+                      "type": "string"
+                    },
+                    "ranges": {
+                      "description": "Whitespace-only ranges. Line ranges are 1-based inclusive; byte ranges are 0-based half-open.",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "properties": {
+                              "endLine": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "end_line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "startLine": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "start_line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "byteEnd": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byteStart": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byte_end": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "byte_start": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "file"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.pullUpMembers",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "memberRefs"
+      ],
+      "parameters": [
+        "annotationPolicy",
+        "className",
+        "commentPolicy",
+        "file",
+        "memberRefs",
+        "previewOnly",
+        "target",
+        "targetKind",
+        "targetTypeName"
+      ],
+      "schema": {
+        "properties": {
+          "annotationPolicy": {
+            "enum": [
+              "safe",
+              "copy",
+              "omit"
+            ],
+            "type": "string"
+          },
+          "className": {
+            "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class.",
+            "type": "string"
+          },
+          "commentPolicy": {
+            "enum": [
+              "copy",
+              "move",
+              "omit"
+            ],
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "memberRefs": {
+            "description": "Refs returned by java.pullUpPreview, not graph IDs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetKind": {
+            "enum": [
+              "interface",
+              "abstract_class"
+            ],
+            "type": "string"
+          },
+          "targetTypeName": {
+            "description": "Name of the EXISTING interface or abstract class receiving the members; defaults from the target file. Not the source class (that is className).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "memberRefs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.pullUpPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "targetKind"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "targetKind": {
+            "description": "Default interface.",
+            "enum": [
+              "interface",
+              "abstract_class"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.pushDownMembers",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "memberRefs"
+      ],
+      "parameters": [
+        "acknowledgeRemainingSourceReferences",
+        "className",
+        "commentPolicy",
+        "file",
+        "memberRefs",
+        "previewOnly",
+        "target",
+        "targetTypeName"
+      ],
+      "schema": {
+        "properties": {
+          "acknowledgeRemainingSourceReferences": {
+            "type": "boolean"
+          },
+          "className": {
+            "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class.",
+            "type": "string"
+          },
+          "commentPolicy": {
+            "enum": [
+              "move",
+              "copy",
+              "omit"
+            ],
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "memberRefs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetTypeName": {
+            "description": "Name of the EXISTING subtype in the target file receiving the members; defaults from the target file. Not the source class (that is className).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "memberRefs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.pushDownMembersPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target"
+      ],
+      "parameters": [
+        "className",
+        "file",
+        "target",
+        "targetTypeName"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class.",
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "targetTypeName": {
+            "description": "Name of the EXISTING subtype in the target file receiving the members; defaults from the target file. Not the source class (that is className).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.removeUnusedConstructorParams",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "file"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Path to a Java file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.renameSymbol",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "oldName",
+        "newName"
+      ],
+      "parameters": [
+        "file",
+        "itemKinds",
+        "newName",
+        "oldName",
+        "previewOnly"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Optional declaration file used as a validation hint.",
+            "type": "string"
+          },
+          "itemKinds": {
+            "description": "Optional v1 kind filter, e.g. [\"class_declaration\"] or [\"method_declaration\"].",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "newName": {
+            "description": "New simple Java identifier.",
+            "type": "string"
+          },
+          "oldName": {
+            "description": "Old simple Java identifier.",
+            "type": "string"
+          },
+          "previewOnly": {
+            "description": "Run the planner but omit edit payloads; returns would_change_files.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "oldName",
+          "newName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.replaceConstructorWithFactory",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "constructorRef"
+      ],
+      "parameters": [
+        "acknowledgeSyntaxOnlyCallSites",
+        "className",
+        "constructorRef",
+        "factoryName",
+        "file",
+        "files",
+        "previewOnly"
+      ],
+      "schema": {
+        "properties": {
+          "acknowledgeSyntaxOnlyCallSites": {
+            "type": "boolean"
+          },
+          "className": {
+            "type": "string"
+          },
+          "constructorRef": {
+            "type": "string"
+          },
+          "factoryName": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previewOnly": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file",
+          "constructorRef"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.replaceConstructorWithFactoryPreview",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file"
+      ],
+      "parameters": [
+        "className",
+        "factoryName",
+        "file",
+        "files"
+      ],
+      "schema": {
+        "properties": {
+          "className": {
+            "type": "string"
+          },
+          "factoryName": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "java.synthesizeHelperWrappers",
+      "family": "java",
+      "placement": "cell",
+      "required": [
+        "file",
+        "target",
+        "delegateField",
+        "methods"
+      ],
+      "parameters": [
+        "delegateField",
+        "file",
+        "methods",
+        "target"
+      ],
+      "schema": {
+        "properties": {
+          "delegateField": {
+            "description": "Delegate field name on the source class.",
+            "type": "string"
+          },
+          "file": {
+            "description": "Source .java file (workspace-relative).",
+            "type": "string"
+          },
+          "methods": {
+            "description": "Moved method names, optionally signature-qualified (e.g. createEmptyCellHeader(HSSFRow,int)).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target": {
+            "description": "Delegate .java file (workspace-relative).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "target",
+          "delegateField",
+          "methods"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_dir",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [
+        "limit",
+        "offset",
+        "path"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "limit": {
+            "description": "Maximum entries (default 200, maximum 1000). Must be positive.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "offset": {
+            "description": "Offset into the current lexicographically sorted directory listing.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Directory to list. Relative paths resolve against the worktree root; absolute paths are accepted as-is. Defaults to root.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListDirInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.assist",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "kindPrefix",
+        "kind_prefix",
+        "limit",
+        "select",
+        "span",
+        "titleFilter",
+        "title_filter",
+        "waitReadyMs",
+        "wait_ready_ms"
+      ],
+      "schema": {
+        "properties": {
+          "kindPrefix": {
+            "description": "Alias for kind_prefix.",
+            "type": "string"
+          },
+          "kind_prefix": {
+            "description": "Optional CodeActionKind prefix to filter the menu (e.g. \"refactor.extract\").",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max actions to return in the list. Defaults to 64 (isolate-heap cap); truncation is reported.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "select": {
+            "description": "Zero-based index of the action to apply. When set, resolves the action and returns hash-anchored changes (list-then-apply).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "titleFilter": {
+            "description": "Alias for title_filter.",
+            "type": "string"
+          },
+          "title_filter": {
+            "description": "Optional case-insensitive substring match on action titles to narrow the menu.",
+            "type": "string"
+          },
+          "waitReadyMs": {
+            "description": "Alias for wait_ready_ms.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ready_ms": {
+            "description": "Milliseconds to wait for the language server to report ready. Defaults to 120000; 0 disables the readiness wait.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.definition",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "limit",
+        "span",
+        "waitReadyMs",
+        "wait_ready_ms"
+      ],
+      "schema": {
+        "properties": {
+          "limit": {
+            "description": "Max locations to return. Defaults to 4096; truncation is reported.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "waitReadyMs": {
+            "description": "Alias for wait_ready_ms.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ready_ms": {
+            "description": "Milliseconds to wait for the language server to report ready. Defaults to 120000; 0 disables the readiness wait.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.executeCommand",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "command"
+      ],
+      "parameters": [
+        "arguments",
+        "command",
+        "language"
+      ],
+      "schema": {
+        "properties": {
+          "arguments": {
+            "items": {},
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "language": {
+            "description": "Defaults to java.",
+            "enum": [
+              "java",
+              "rust"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.hover",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "span",
+        "waitReadyMs",
+        "wait_ready_ms"
+      ],
+      "schema": {
+        "properties": {
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "waitReadyMs": {
+            "description": "Alias for wait_ready_ms.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ready_ms": {
+            "description": "Milliseconds to wait for the language server to report ready before sending the request. Defaults to 120000; 0 disables the readiness wait.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.references",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "span"
+      ],
+      "parameters": [
+        "includeDeclaration",
+        "include_declaration",
+        "limit",
+        "span",
+        "waitReadyMs",
+        "wait_ready_ms"
+      ],
+      "schema": {
+        "properties": {
+          "includeDeclaration": {
+            "description": "Whether to include the declaration site in the result. Defaults to true (matches LSP context.includeDeclaration).",
+            "type": "boolean"
+          },
+          "include_declaration": {
+            "description": "snake_case alias for includeDeclaration.",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "Maximum number of locations to return. Defaults to 5000 (isolate-heap cap); truncation is reported when the cap binds.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "waitReadyMs": {
+            "description": "Alias for wait_ready_ms.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ready_ms": {
+            "description": "Milliseconds to wait for the language server to report ready before sending the request. Defaults to 120000; 0 disables the readiness wait.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "span"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.rename",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "span",
+        "newName"
+      ],
+      "parameters": [
+        "newName",
+        "span",
+        "waitReadyMs",
+        "wait_ready_ms"
+      ],
+      "schema": {
+        "properties": {
+          "newName": {
+            "description": "The new symbol name.",
+            "type": "string"
+          },
+          "span": {
+            "properties": {
+              "byte_end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "byte_start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_sha256": {
+                "description": "sha256 of the full file content the span was cut from.",
+                "type": "string"
+              },
+              "file": {
+                "description": "File path. May be relative to the session worktree root or absolute.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "byte_start",
+              "byte_end",
+              "content_sha256"
+            ],
+            "type": "object"
+          },
+          "waitReadyMs": {
+            "description": "Alias for wait_ready_ms.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ready_ms": {
+            "description": "Milliseconds to wait for the language server to report ready before sending the request. Defaults to 120000; 0 disables the readiness wait.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "span",
+          "newName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.status",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [],
+      "parameters": [
+        "file",
+        "language"
+      ],
+      "schema": {
+        "properties": {
+          "file": {
+            "description": "Workspace-relative file path used to infer the language backend.",
+            "type": "string"
+          },
+          "language": {
+            "description": "Language backend to inspect. Defaults to java when file is omitted.",
+            "enum": [
+              "java",
+              "rust"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "lsp.willRenameFiles",
+      "family": "lsp",
+      "placement": "cell",
+      "required": [
+        "renames"
+      ],
+      "parameters": [
+        "language",
+        "renames"
+      ],
+      "schema": {
+        "properties": {
+          "language": {
+            "description": "Defaults to java.",
+            "enum": [
+              "java",
+              "rust"
+            ],
+            "type": "string"
+          },
+          "renames": {
+            "items": {
+              "properties": {
+                "newFile": {
+                  "type": "string"
+                },
+                "oldFile": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "oldFile",
+                "newFile"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "renames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.describe",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "transform"
+      ],
+      "parameters": [
+        "transform"
+      ],
+      "schema": {
+        "properties": {
+          "transform": {
+            "description": "Transform name, e.g. \"fixRound\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transform"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.extractImplMethods",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "target",
+        "item_names"
+      ],
+      "parameters": [
+        "impl_name",
+        "item_names",
+        "source",
+        "target",
+        "target_prelude",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "impl_name": {
+            "description": "Optional impl block name disambiguator (the type name in `impl Foo`).",
+            "type": "string"
+          },
+          "item_names": {
+            "description": "Names of the impl methods to move (required, non-empty).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file path (relative to worktree root, or absolute).",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target file path.",
+            "type": "string"
+          },
+          "target_prelude": {
+            "description": "Optional target prelude (e.g. use statements) inserted after shebang/inner attrs/doc comments.",
+            "type": "string"
+          },
+          "visibility": {
+            "description": "Optional explicit visibility for every moved method.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "item_names"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.extractItems",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "target",
+        "itemNames"
+      ],
+      "parameters": [
+        "itemKinds",
+        "itemNames",
+        "mergeIntoExistingTarget",
+        "moduleName",
+        "previewOnly",
+        "section",
+        "source",
+        "target",
+        "targetPrelude",
+        "useDeclItems",
+        "useDeclVisibility",
+        "visibility",
+        "withLocalDeps"
+      ],
+      "schema": {
+        "properties": {
+          "itemKinds": {
+            "description": "Optional syntax item kinds to narrow ambiguous names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "itemNames": {
+            "description": "Top-level item names to move. Required unless section bounds select the region.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mergeIntoExistingTarget": {
+            "description": "Append to an existing non-empty target instead of refusing.",
+            "type": "boolean"
+          },
+          "moduleName": {
+            "description": "Module name for the parent `mod <name>;` declaration. Defaults to the target file stem (must match it).",
+            "type": "string"
+          },
+          "previewOnly": {
+            "description": "Return findings + metadata but zero changes/creates.",
+            "type": "boolean"
+          },
+          "section": {
+            "description": "Section addressing mode: select items by source-region bounds.",
+            "properties": {
+              "endLine": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "endMarker": {
+                "type": "string"
+              },
+              "startLine": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "startMarker": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "source": {
+            "description": "Source (parent) module file, workspace-relative.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target submodule file, workspace-relative. Required.",
+            "type": "string"
+          },
+          "targetPrelude": {
+            "description": "Prelude at the top of the new file. Defaults to `use super::*;`.",
+            "type": "string"
+          },
+          "useDeclItems": {
+            "description": "Explicit subset of itemNames to re-export. Defaults to auto-prune.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "useDeclVisibility": {
+            "description": "Visibility of the auto-emitted parent re-export.",
+            "enum": [
+              "private",
+              "pub",
+              "pub(crate)",
+              "pub(super)"
+            ],
+            "type": "string"
+          },
+          "visibility": {
+            "description": "Visibility floor for moved items AND struct fields. Defaults to `pub(super)`.",
+            "type": "string"
+          },
+          "withLocalDeps": {
+            "description": "Move the exclusive private dependency closure of the seed items.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.extractTrait",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "target",
+        "implName",
+        "traitName",
+        "itemNames"
+      ],
+      "parameters": [
+        "implName",
+        "itemNames",
+        "source",
+        "target",
+        "traitName"
+      ],
+      "schema": {
+        "properties": {
+          "implName": {
+            "description": "Inherent impl label, for example \"impl Store\".",
+            "type": "string"
+          },
+          "itemNames": {
+            "description": "Method names to extract from the selected impl.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file path (workspace-relative, no `..`).",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target trait file path (workspace-relative, no `..`). May be a new file.",
+            "type": "string"
+          },
+          "traitName": {
+            "description": "Name for the extracted trait.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "implName",
+          "traitName",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.fixRound",
+      "family": "rust",
+      "placement": "cell",
+      "required": [],
+      "parameters": [
+        "diagnostics",
+        "raw_json",
+        "restrict_to_files"
+      ],
+      "schema": {
+        "properties": {
+          "diagnostics": {
+            "description": "Diagnostics array from build.gate (the diagnostics[] field verbatim). Each entry may carry code, file, message, suggestions[].",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "raw_json": {
+            "description": "Optional raw cargo --message-format=json / rustc --error-format=json stdout; parsed and appended to diagnostics.",
+            "type": "string"
+          },
+          "restrict_to_files": {
+            "description": "Optional file path substrings; diagnostics whose file does not match any are skipped.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.inlineModToFile",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "moduleName"
+      ],
+      "parameters": [
+        "moduleName",
+        "previewOnly",
+        "source",
+        "target"
+      ],
+      "schema": {
+        "properties": {
+          "moduleName": {
+            "description": "The mod name to inline. Accepts modName alias.",
+            "type": "string"
+          },
+          "previewOnly": {
+            "description": "Return findings + metadata but zero changes/creates.",
+            "type": "boolean"
+          },
+          "source": {
+            "description": "Source file containing the inline `mod foo { ... }`, workspace-relative.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Optional explicit target path. Auto-derived from source when unset.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "moduleName"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.liftToFree",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "target",
+        "itemNames"
+      ],
+      "parameters": [
+        "itemNames",
+        "source",
+        "target"
+      ],
+      "schema": {
+        "properties": {
+          "itemNames": {
+            "description": "Inherent method names to lift.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file path (workspace-relative, no `..`).",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target free-function file path (workspace-relative, no `..`). May be a new file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.migrateErrorType",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "oldText",
+        "newText",
+        "itemNames"
+      ],
+      "parameters": [
+        "errorMapping",
+        "itemNames",
+        "newText",
+        "oldText",
+        "source"
+      ],
+      "schema": {
+        "properties": {
+          "errorMapping": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Old error variant to new error variant mapping for construction sites.",
+            "type": "object"
+          },
+          "itemNames": {
+            "description": "Named functions whose return signatures should change.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "newText": {
+            "description": "Replacement error type name.",
+            "type": "string"
+          },
+          "oldText": {
+            "description": "Existing error type name.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Source Rust file, workspace-relative and without `..`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "oldText",
+          "newText",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.migrateTypeUsages",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "moduleName",
+        "replacementKind",
+        "newText"
+      ],
+      "parameters": [
+        "moduleName",
+        "newText",
+        "replacementKind",
+        "source"
+      ],
+      "schema": {
+        "properties": {
+          "moduleName": {
+            "description": "Type name to migrate.",
+            "type": "string"
+          },
+          "newText": {
+            "description": "Replacement concrete type or trait text.",
+            "type": "string"
+          },
+          "replacementKind": {
+            "description": "Replacement form.",
+            "enum": [
+              "bareConcrete",
+              "boxDyn",
+              "arcDyn",
+              "rcDyn",
+              "implTrait",
+              "genericParamTBoundedTrait"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "description": "Source Rust file, workspace-relative and without `..`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "moduleName",
+          "replacementKind",
+          "newText"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.moduleWiring",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "action"
+      ],
+      "parameters": [
+        "action",
+        "moduleName",
+        "source",
+        "usePath",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "action": {
+            "enum": [
+              "add_mod",
+              "remove_mod",
+              "add_use",
+              "remove_use"
+            ],
+            "type": "string"
+          },
+          "moduleName": {
+            "description": "Module name for mod actions.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Source file to edit, workspace-relative.",
+            "type": "string"
+          },
+          "usePath": {
+            "description": "Use path for use actions (e.g. `std::collections::HashMap`, `child::{A, B}`).",
+            "type": "string"
+          },
+          "visibility": {
+            "description": "Optional visibility prefix (`pub`, `pub(crate)`, `pub(super)`, or empty/private).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "action"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.moveStructFields",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "target",
+        "structName",
+        "itemNames"
+      ],
+      "parameters": [
+        "itemNames",
+        "source",
+        "structName",
+        "target",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "itemNames": {
+            "description": "Field names to move (declaration order preserved).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file path (workspace-relative, no `..`).",
+            "type": "string"
+          },
+          "structName": {
+            "description": "Name of the source struct whose fields are being moved.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target file path (workspace-relative, no `..`). May equal source when the target struct is in the same file.",
+            "type": "string"
+          },
+          "visibility": {
+            "description": "Optional visibility override applied to moved fields in the target (e.g. \"pub\", \"pub(crate)\"). Defaults to preserving source visibility.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "structName",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.organizeImports",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source"
+      ],
+      "parameters": [
+        "allow_wildcards",
+        "mode",
+        "remove_unused_wildcards",
+        "source"
+      ],
+      "schema": {
+        "properties": {
+          "allow_wildcards": {
+            "description": "Optional allowlist of wildcard base paths to preserve verbatim.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "description": "\"minimize\" (default) runs the syntactic wildcard-minimizer; \"organize\" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2).",
+            "enum": [
+              "minimize",
+              "organize"
+            ],
+            "type": "string"
+          },
+          "remove_unused_wildcards": {
+            "description": "When true, wildcard imports with no directly-referenced names are deleted instead of left as leftovers.",
+            "type": "boolean"
+          },
+          "source": {
+            "description": "Source file path (workspace-relative, no `..`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.rewriteModuleCallers",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "project_dir",
+        "item_names"
+      ],
+      "parameters": [
+        "item_names",
+        "module_name",
+        "project_dir",
+        "skip_files",
+        "target_prelude"
+      ],
+      "schema": {
+        "properties": {
+          "item_names": {
+            "description": "Names of the moved items (required, non-empty).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "module_name": {
+            "description": "Source module's simple name. Defaults to the source file stem (lib/main/mod rejected without explicit override).",
+            "type": "string"
+          },
+          "project_dir": {
+            "description": "Project directory for the caller walk. Skips target/, build/, node_modules/, .git/.",
+            "type": "string"
+          },
+          "skip_files": {
+            "description": "File paths to skip during the walk (source/target of the extract/move).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target_prelude": {
+            "description": "Target module's simple name. Defaults to the target file stem.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_dir",
+          "item_names"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.setVisibility",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "visibility",
+        "itemNames"
+      ],
+      "parameters": [
+        "implName",
+        "itemNames",
+        "source",
+        "targetKind",
+        "visibility"
+      ],
+      "schema": {
+        "properties": {
+          "implName": {
+            "description": "Impl name disambiguator for method targets.",
+            "type": "string"
+          },
+          "itemNames": {
+            "description": "Item/struct/method names. Required.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file, workspace-relative.",
+            "type": "string"
+          },
+          "targetKind": {
+            "description": "What to rewrite. Defaults to `item`.",
+            "enum": [
+              "item",
+              "method",
+              "field"
+            ],
+            "type": "string"
+          },
+          "visibility": {
+            "description": "New visibility: `pub`, `pub(crate)`, `pub(super)`, or `private` (empty prefix).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "visibility",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rust.updateCallers",
+      "family": "rust",
+      "placement": "cell",
+      "required": [
+        "source",
+        "delegateField",
+        "itemNames"
+      ],
+      "parameters": [
+        "delegateField",
+        "delegateType",
+        "itemNames",
+        "source",
+        "structName",
+        "target"
+      ],
+      "schema": {
+        "properties": {
+          "delegateField": {
+            "description": "The delegate field name in the source struct (e.g. \"state\"), so self.field becomes self.state.field.",
+            "type": "string"
+          },
+          "delegateType": {
+            "description": "Optional delegate type name for field-type resolution in the target.",
+            "type": "string"
+          },
+          "itemNames": {
+            "description": "Names of the moved fields/methods whose accessors should be rewritten.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source file path (workspace-relative, no `..`).",
+            "type": "string"
+          },
+          "structName": {
+            "description": "Name of the source struct (for Copy-whitelist field-type resolution). Optional but recommended.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Optional target file path where the delegate type lives (for field-type resolution when the field moved out of the source struct).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "delegateField",
+          "itemNames"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "sandbox_grounding",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [
+        "enter_worktree",
+        "status_limit"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "enter_worktree": {
+            "default": null,
+            "description": "Deprecated: model-facing worktree creation is disabled. Worktrees are created mechanically by fleet dispatch or workflow ops before the harness session runs.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "status_limit": {
+            "default": null,
+            "description": "Number of dirty git status entries to include in each manifest. Default 12.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "SandboxGroundingInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "sandbox_status",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [
+        "root",
+        "status_limit"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "root": {
+            "default": null,
+            "description": "Optional root to inspect. Use the `cwd` returned by enter_worktree to inspect a managed worktree after entering it. Omit to inspect the harness launch root.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status_limit": {
+            "default": null,
+            "description": "Number of dirty git status entries to include. Default 12.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "SandboxStatusInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "shell_kill",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "session_id"
+      ],
+      "parameters": [
+        "grace_ms",
+        "max_output_tokens",
+        "output_filter",
+        "session_id",
+        "signal"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "ShellOutputFilterInput": {
+            "properties": {
+              "stderr": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stderr lines matching one of these regexes."
+              },
+              "stdout": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stdout lines matching one of these regexes."
+              }
+            },
+            "type": "object"
+          },
+          "ShellOutputFilterPatternsSchema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "grace_ms": {
+            "description": "Grace window in ms to wait for exit after the signal before force-killing (default 2000).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "description": "Output token budget for the final drain (default 10000).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ShellOutputFilterInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional post-capture line filter for the final drain. When omitted, the filter from the originating shell_run is reused, if any."
+          },
+          "session_id": {
+            "description": "Session id to terminate.",
+            "type": "string"
+          },
+          "signal": {
+            "description": "Signal to send first: \"term\" (SIGTERM, default, graceful), \"int\" (SIGINT), or \"kill\" (SIGKILL, immediate). If the process hasn't exited within grace_ms, it is force-killed (SIGKILL).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ShellKillInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "shell_list",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [],
+      "parameters": [],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "ShellListInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "shell_poll",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "session_id"
+      ],
+      "parameters": [
+        "close_stdin",
+        "max_output_tokens",
+        "output_filter",
+        "session_id",
+        "signal",
+        "stdin",
+        "yield_time_ms"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "ShellOutputFilterInput": {
+            "properties": {
+              "stderr": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stderr lines matching one of these regexes."
+              },
+              "stdout": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stdout lines matching one of these regexes."
+              }
+            },
+            "type": "object"
+          },
+          "ShellOutputFilterPatternsSchema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "close_stdin": {
+            "default": false,
+            "description": "Close (EOF) the stdin stream after writing `stdin`.",
+            "type": "boolean"
+          },
+          "max_output_tokens": {
+            "description": "Output token budget for this drain (default 10000).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ShellOutputFilterInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional post-capture line filter for this drain. When omitted, the filter from the originating shell_run is reused, if any."
+          },
+          "session_id": {
+            "description": "Session id from a prior shell_run that returned running=true.",
+            "type": "string"
+          },
+          "signal": {
+            "description": "Optional signal to send before draining: \"int\" (SIGINT, like Ctrl-C), \"term\" (SIGTERM), or \"kill\" (SIGKILL). Lets you ask a server/watcher to stop and then drain its shutdown output in the same call. Unlike shell_kill, the session stays alive if the process ignores the signal, so you can poll again or escalate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stdin": {
+            "description": "Optional stdin to feed before draining.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yield_time_ms": {
+            "description": "Cooperative yield in milliseconds before returning if still running. Defaults to 5000; set 0 to block until the command exits or times out.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ShellPollInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "shell_run",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "command"
+      ],
+      "parameters": [
+        "close_stdin",
+        "command",
+        "cwd",
+        "env",
+        "max_output_tokens",
+        "output_filter",
+        "stdin",
+        "timeout_ms",
+        "yield_time_ms"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "ShellOutputFilterInput": {
+            "properties": {
+              "stderr": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stderr lines matching one of these regexes."
+              },
+              "stdout": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/ShellOutputFilterPatternsSchema"
+                  }
+                ],
+                "default": [],
+                "description": "Keep only stdout lines matching one of these regexes."
+              }
+            },
+            "type": "object"
+          },
+          "ShellOutputFilterPatternsSchema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "close_stdin": {
+            "default": false,
+            "description": "Close (EOF) the stdin stream after writing `stdin`. Required for commands that read until EOF (e.g. `cat`, `sort`) to terminate.",
+            "type": "boolean"
+          },
+          "command": {
+            "description": "The shell command line to execute (run via `bash -lc`).",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "Working subdirectory relative to the worktree root.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Extra environment variables for the process, merged onto the inherited environment (these win on conflict). Cleaner than inlining `FOO=bar` in the command for things like `PORT`, `RUST_LOG`, etc.",
+            "type": "object"
+          },
+          "max_output_tokens": {
+            "description": "Cap on returned stdout/stderr, in approximate tokens (~4 bytes each; default 2000). The TAIL is kept so trailing errors survive.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ShellOutputFilterInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional post-capture line filter. Patterns are regexes; matching lines are kept and non-matching lines are dropped from the returned stream. The child process is not wrapped, so exit_code remains the real command exit status."
+          },
+          "stdin": {
+            "description": "Initial stdin written to the process. The stream stays open for shell_poll to feed more, unless close_stdin is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_ms": {
+            "description": "Hard-kill deadline in milliseconds. When set, the process is killed if it runs longer than this (honored across subsequent shell_poll calls).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "yield_time_ms": {
+            "description": "Cooperative yield in milliseconds. If the command has not finished by then, returns partial output plus a `session_id` (the process keeps running); resume with shell_poll. When omitted, defaults to a short cooperative yield so long commands do not stall the agent loop. Set to 0 only when you deliberately want to block until completion/timeout.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "ShellRunInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "smart_read",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "file_path"
+      ],
+      "parameters": [
+        "file_path",
+        "max_full_lines"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "file_path": {
+            "description": "Path to the file. Relative paths resolve against the worktree root; absolute paths are accepted as-is. `@relative/path` is accepted as a file mention; `@/absolute/instruction.md` is accepted for read-only instruction docs outside the worktree.",
+            "type": "string"
+          },
+          "max_full_lines": {
+            "description": "Maximum lines to return (default 200); continuation uses file_read.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "title": "SmartReadInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "todo_write",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "items"
+      ],
+      "parameters": [
+        "items"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "TodoItem": {
+            "properties": {
+              "status": {
+                "$ref": "#/definitions/TodoStatus"
+              },
+              "task": {
+                "description": "Short imperative description of the step. (`content` is also accepted as an alias for Claude Code TodoWrite parity.)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "task"
+            ],
+            "type": "object"
+          },
+          "TodoStatus": {
+            "enum": [
+              "pending",
+              "in_progress",
+              "completed"
+            ],
+            "type": "string"
+          }
+        },
+        "properties": {
+          "items": {
+            "description": "The full todo list. Replaces the previous list entirely \u2014 include every item each call, with its current status.",
+            "items": {
+              "$ref": "#/definitions/TodoItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "TodoWriteInput",
+        "type": "object"
+      }
+    },
+    {
+      "name": "web_fetch",
+      "family": "builtin",
+      "placement": "conditional flat and cell",
+      "required": [
+        "url"
+      ],
+      "parameters": [
+        "max_chars",
+        "url"
+      ],
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "max_chars": {
+            "description": "Max characters of extracted text to return (default 8000, clamped 500..=20000).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "URL to fetch (http/https).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "WebFetchInput",
+        "type": "object"
+      }
+    }
+  ]
+}

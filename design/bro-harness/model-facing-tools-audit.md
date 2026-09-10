@@ -12,6 +12,11 @@ brief: "Codex comparison and synthetic probes drive bounded exact reads, simpler
 
 # Model-facing tool audit
 
+This is the initial focused repair audit. The subsequent
+[comprehensive contract audit](model-facing-tools-comprehensive-audit.md) inventories
+the full local interface, compares the loop and transport lifecycle with Codex,
+and records synthetic probes and live task trials.
+
 The recursive dump reads are an affordance failure in the harness. The model
 follows the recovery instruction supplied by the tool result, and that recovery
 can reproduce the same oversized result indefinitely. Smaller original-source

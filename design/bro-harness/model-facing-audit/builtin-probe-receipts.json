@@ -1,0 +1,106 @@
+[
+  {
+    "name": "patch_partial",
+    "seconds": 0.007,
+    "exit": 1,
+    "stdout": "",
+    "stderr": "error: apply_patch failed: failed to read missing.txt: No such file or directory (os error 2)\n",
+    "first_exists": true
+  },
+  {
+    "name": "patch_move_collision",
+    "seconds": 0.006,
+    "exit": 0,
+    "stdout": "Applied patch (1 change):\nmoved source.txt -> destination.txt\n",
+    "stderr": "",
+    "destination_content": "changed\n",
+    "source_exists": false
+  },
+  {
+    "name": "empty_find_replace_all",
+    "seconds": 0.005,
+    "exit": 0,
+    "stdout": "{\n  \"ok\": true,\n  \"replacements\": 4\n}\n",
+    "stderr": "",
+    "content": "XaXbXcX"
+  },
+  {
+    "name": "passive_timeout",
+    "seconds": 0.542,
+    "exit": 0,
+    "stdout": "Script completed\nOutput:\n{\"exit_code\":null,\"next_step\":\"Call shell_poll with session_id=sh-1 until running=false before interpreting this command as complete.\",\"progress\":{\"elapsed_ms\":12,\"last_output_at_ms\":0,\"last_output_elapsed_ms\":0,\"stderr_bytes\":0,\"stdout_bytes\":0},\"running\":true,\"session_id\":\"sh-1\",\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\nsurvived\n{\"exit_code\":null,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":true}\n",
+    "stderr": ""
+  },
+  {
+    "name": "stdin_timeout_bypass",
+    "seconds": 2.025,
+    "exit": 0,
+    "stdout": "{\n  \"exit_code\": 0,\n  \"running\": false,\n  \"stderr\": \"\",\n  \"stdout\": \"\",\n  \"timed_out\": false\n}\n",
+    "stderr": ""
+  },
+  {
+    "name": "buffer_loses_actual_tail",
+    "seconds": 0.089,
+    "exit": 0,
+    "stdout": "{\n  \"exit_code\": 17,\n  \"running\": false,\n  \"stderr\": \"\",\n  \"stdout\": \"[... 8388448 earlier bytes truncated]\\n[... 611412 bytes dropped at buffer cap]\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n  \"timed_out\": false\n}\n",
+    "stderr": ""
+  },
+  {
+    "name": "line_filter_fragment_loss",
+    "seconds": 0.429,
+    "exit": 0,
+    "stdout": "Script completed\nOutput:\n{\"exit_code\":null,\"next_step\":\"Call shell_poll with session_id=sh-1 until running=false before interpreting this command as complete.\",\"output_filter\":{\"stdout\":{\"dropped_lines\":1,\"kept_lines\":0,\"mode\":\"matching_lines\",\"patterns\":[\"ERROR\"]}},\"progress\":{\"elapsed_ms\":101,\"last_output_at_ms\":1789066903578,\"last_output_elapsed_ms\":95,\"stderr_bytes\":0,\"stdout_bytes\":2},\"running\":true,\"session_id\":\"sh-1\",\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n{\"exit_code\":0,\"output_filter\":{\"stdout\":{\"dropped_lines\":1,\"kept_lines\":0,\"mode\":\"matching_lines\",\"patterns\":[\"ERROR\"]}},\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n",
+    "stderr": ""
+  },
+  {
+    "name": "list_completed_as_live",
+    "seconds": 0.245,
+    "exit": 0,
+    "stdout": "Script completed\nOutput:\n{\"exit_code\":null,\"next_step\":\"Call shell_poll with session_id=sh-1 until running=false before interpreting this command as complete.\",\"progress\":{\"elapsed_ms\":12,\"last_output_at_ms\":0,\"last_output_elapsed_ms\":0,\"stderr_bytes\":0,\"stdout_bytes\":0},\"running\":true,\"session_id\":\"sh-1\",\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n{\"count\":1,\"sessions\":[{\"command\":\"sleep 0.1\",\"elapsed_secs\":0,\"session_id\":\"sh-1\"}]}\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"\",\"timed_out\":false}\n",
+    "stderr": ""
+  },
+  {
+    "name": "mixed_crlf_patch",
+    "exit": 0,
+    "stdout": "Applied patch (1 change):\nupdated crlf.txt\n",
+    "stderr": "",
+    "bytes": "b'a\\r\\nB\\n'"
+  },
+  {
+    "name": "denylist_false_positive",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "error: refused: pkill is too broad; kill a specific known PID instead\n"
+  },
+  {
+    "name": "empty_patch_success",
+    "exit": 0,
+    "stdout": "Applied patch (0 changes):\n\n",
+    "stderr": ""
+  },
+  {
+    "name": "file_write_follows_symlink",
+    "exit": 0,
+    "stdout": "{\n  \"bytes\": 20,\n  \"ok\": true\n}\n",
+    "stderr": "",
+    "target": "changed through link"
+  },
+  {
+    "name": "patch_mutates_after_cell_timeout",
+    "seconds": 2.006,
+    "exit": 0,
+    "stdout": "Script completed\nOutput:\nApplied patch (2 changes):\nadded late.txt\ndeleted blocked.fifo\n",
+    "stderr": "",
+    "late_exists": true,
+    "fifo_exists": false
+  },
+  {
+    "name": "patch_mutates_after_explicit_cell_timeout",
+    "seconds": 2.009,
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Error: isolate: cell 1 exceeded --cell-timeout 1s after 1.0s\n",
+    "late_exists": true,
+    "fifo_exists": false
+  }
+]

@@ -1,0 +1,20 @@
+{
+  "id": "gap-eb974f4c",
+  "title": "MCP projection discards content and error structure while changing nested value shapes",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "One sanitized typed MCP result envelope preserving content, structured result and error state",
+  "missing_primitive": "One sanitized typed MCP result envelope preserving content, structured result and error state",
+  "fallback_used": "Isolated synthetic probes and explicit raw tool use; no shared service changes during audit.",
+  "evidence": [
+    "design/bro-harness/model-facing-tools-comprehensive-audit.md"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/mcp-result-fidelity",
+  "notes": "Source audit: structuredContent replaces all accompanying text, errors discard structured details, media/resources omitted. Preserve _meta internally rather than blindly surfacing to models.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T19:08:00Z",
+  "updated_at": "2026-09-10T19:08:00Z"
+}

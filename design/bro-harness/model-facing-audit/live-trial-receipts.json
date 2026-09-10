@@ -1,0 +1,327 @@
+{
+  "date": "2026-09-10",
+  "blackbox_commit": "c384fb8a1cc022f7a8bc00f94ad0462373ca1a8e",
+  "codex_source_reference": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "codex_live_binary": "codex-cli 0.154.0; not attested to source reference",
+  "interpretation": "One run per task/profile/cohort; exploratory observations, not statistical performance claims. Input token fields differ across native transport reporting. No monetary estimates.",
+  "tasks": {
+    "retrieval": "records.txt contains background newline repeated210000 times then AUDIT_RECORD=violet-731. Ask to find value, write answer.json with value key, verify against source. Independent JSON equality check.",
+    "edit": "src/calculator.py has average(values)=sum(values)/len(values). Ask to make empty input return0, preserve nonempty behavior and scoped first-line comment, add verify.py regression assertion, run verification. Independent behavior/comment/assertion checks plus transcript inspection for verification command."
+  },
+  "configuration": {
+    "bro": "Responses, empty MCP config, BRO_HOME per fixture, web search and heuristic nudges disabled, fresh Git root. Ambient uses ordinary global/project instructions. Controlled overrides system instructions with a small fixture-only instruction and requires AGENTS discovery.",
+    "codex": "exec --ignore-user-config --ephemeral --json, isolated CODEX_HOME with temporary auth reference removed after runs, workspace-write, never approvals, same fixture prompts. Native runtime prompt and sandbox differ from bro."
+  },
+  "runs": [
+    {
+      "cohort": "ambient",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "off",
+      "task": "edit",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 12,
+      "exit_code": 0,
+      "wall_seconds": 37.71,
+      "artifact_check_passed": true,
+      "requested_verification_performed": false,
+      "model_steps": 12,
+      "last_request_input_tokens": 24081,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 234752,
+        "input_tokens": 29216,
+        "output_tokens": 877
+      },
+      "tool_calls": [
+        "file_read",
+        "file_read",
+        "file_read",
+        "file_read",
+        "tool_search",
+        "tool_search",
+        "file_read",
+        "glob",
+        "file_read",
+        "file_read",
+        "file_read",
+        "apply_patch"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "ambient",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "off",
+      "task": "retrieval",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 12,
+      "exit_code": 0,
+      "wall_seconds": 12.25,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 4,
+      "last_request_input_tokens": 16562,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 47360,
+        "input_tokens": 17561,
+        "output_tokens": 383
+      },
+      "tool_calls": [
+        "shell_run",
+        "apply_patch",
+        "shell_run"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "ambient",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "optional",
+      "task": "edit",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 12,
+      "exit_code": 0,
+      "wall_seconds": 32.83,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 11,
+      "last_request_input_tokens": 34586,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 297728,
+        "input_tokens": 73870,
+        "output_tokens": 845
+      },
+      "tool_calls": [
+        "tool_search",
+        "list_dir",
+        "file_read",
+        "file_read",
+        "file_read",
+        "apply_patch",
+        "shell_run",
+        "tool_search",
+        "git_diff",
+        "git_status"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "ambient",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "optional",
+      "task": "retrieval",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 12,
+      "exit_code": 0,
+      "wall_seconds": 24.82,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 6,
+      "last_request_input_tokens": 34571,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 164608,
+        "input_tokens": 38014,
+        "output_tokens": 665
+      },
+      "tool_calls": [
+        "tool_search",
+        "tool_search",
+        "shell_run",
+        "apply_patch",
+        "shell_run"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "controlled",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "off",
+      "task": "edit",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 30,
+      "exit_code": 0,
+      "wall_seconds": 32.79,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 13,
+      "last_request_input_tokens": 9743,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 100352,
+        "input_tokens": 16821,
+        "output_tokens": 843
+      },
+      "tool_calls": [
+        "todo_write",
+        "glob",
+        "file_read",
+        "file_read",
+        "file_read",
+        "file_read",
+        "todo_write",
+        "apply_patch",
+        "todo_write",
+        "shell_run",
+        "shell_run",
+        "todo_write"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "controlled",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "off",
+      "task": "retrieval",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 30,
+      "exit_code": 0,
+      "wall_seconds": 25.87,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 10,
+      "last_request_input_tokens": 12048,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 83712,
+        "input_tokens": 22503,
+        "output_tokens": 674
+      },
+      "tool_calls": [
+        "glob",
+        "file_read",
+        "content_search",
+        "list_dir",
+        "file_read",
+        "shell_run",
+        "file_read",
+        "apply_patch",
+        "file_read"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "controlled",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "optional",
+      "task": "edit",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 30,
+      "exit_code": 0,
+      "wall_seconds": 34.85,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 11,
+      "last_request_input_tokens": 26880,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 281856,
+        "input_tokens": 7370,
+        "output_tokens": 853
+      },
+      "tool_calls": [
+        "list_dir",
+        "file_read",
+        "file_read",
+        "file_read",
+        "apply_patch",
+        "shell_run",
+        "shell_run",
+        "shell_run",
+        "file_read",
+        "file_read"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "controlled",
+      "runtime": "bro-harness c384fb8a",
+      "code_mode": "optional",
+      "task": "retrieval",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": 30,
+      "exit_code": 0,
+      "wall_seconds": 30.64,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": 10,
+      "last_request_input_tokens": 29291,
+      "usage_as_reported": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 244480,
+        "input_tokens": 34866,
+        "output_tokens": 615
+      },
+      "tool_calls": [
+        "glob",
+        "file_read",
+        "content_search",
+        "glob",
+        "file_read",
+        "shell_run",
+        "file_read",
+        "apply_patch",
+        "file_read"
+      ],
+      "terminal_type": "success"
+    },
+    {
+      "cohort": "reference",
+      "runtime": "codex-cli 0.154.0",
+      "code_mode": null,
+      "task": "edit",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": null,
+      "exit_code": 0,
+      "wall_seconds": 32.34,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": null,
+      "last_request_input_tokens": null,
+      "usage_as_reported": {
+        "input_tokens": 87628,
+        "cached_input_tokens": 79104,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1245,
+        "reasoning_output_tokens": 9
+      },
+      "tool_calls": null,
+      "terminal_type": "turn.completed"
+    },
+    {
+      "cohort": "reference",
+      "runtime": "codex-cli 0.154.0",
+      "code_mode": null,
+      "task": "retrieval",
+      "model": "gpt-5.5",
+      "effort": "low",
+      "max_model_steps": null,
+      "exit_code": 0,
+      "wall_seconds": 26.04,
+      "artifact_check_passed": true,
+      "requested_verification_performed": true,
+      "model_steps": null,
+      "last_request_input_tokens": null,
+      "usage_as_reported": {
+        "input_tokens": 70270,
+        "cached_input_tokens": 63360,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 624,
+        "reasoning_output_tokens": 17
+      },
+      "tool_calls": null,
+      "terminal_type": "turn.completed"
+    }
+  ]
+}
