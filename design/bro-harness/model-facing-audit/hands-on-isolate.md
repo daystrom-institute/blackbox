@@ -80,3 +80,21 @@ The rebuilt and installed executable passed the direct surface checks. Native
 release compilation, persistent signing and pinned formatting passed. Subsequent
 milestone receipts belong in the commit/deployment record; these findings do not
 support a model performance claim.
+
+
+## Deployment receipt
+
+Runtime changes are pushed on `beta/blackbox-v2` as
+`bbca22f71069e4cb026f2bbdb63bc9ac7dd2677b`. Full cluster verification
+`bbox-verify-lclzv` succeeded for that revision: nextest (full workspace profile),
+clippy and concurrency gates all passed. Native `bro-harness` and `isolate` were
+rebuilt, installed with persistent signing and exercised through the installed
+`isolate` path.
+
+Image workflow `build-bbox-image-v9lr7` succeeded using the same pinned revision
+from GitHub after two mirror connection failures before compilation. This was a
+per-invocation source URL override; no shared mirror service was changed.
+Convergence installed image digest
+`sha256:2d2234eaad465f3f4730c1be3c3be1906a6929679550e2dea666985e5cca9f74`.
+The deployment completed its rollout, had one ready replica, and returned HTTP
+200 from `/healthz`.
