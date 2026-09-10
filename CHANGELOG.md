@@ -28,6 +28,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Responses completion accepts metadata-only terminal events with empty output
+  after completed streamed items. Unfinished calls and contradictory nonempty
+  terminal snapshots still fail before dispatch.
+
 - Harness resume validates snapshots and event-log checkpoints, excludes concurrent
   writers, preserves queued controls and output schemas, and acknowledges controls
   only after durable persistence. Scoped instructions use exact versioned context

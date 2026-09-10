@@ -99,7 +99,7 @@
     "installed_probe_passes": 47,
     "image_workflow": "build-bbox-image-gztt7",
     "image_tag": "771c054a2533",
-    "digest": "sha256:4d12547f8fbdd80c81e6323a8f485630fac28a1fe30d94648f005f81dd33bce82",
+    "digest": "sha256:4d12547f8fbdd80c81e6323a8f485630fac28a1fe30d94648f005f81dd33bce8",
     "ready_replicas": 1,
     "health_http_status": 200
   },
@@ -182,6 +182,25 @@
         "bytes": 29387,
         "exec_description_bytes": 6289
       }
+    }
+  },
+  "native_executable_probes": {
+    "source_commit": "764479470cdd681891a7873749812f1710d7341b",
+    "passed": 60,
+    "failed": 0,
+    "codesign": "persistent identity, strict verification passed"
+  },
+  "live_initial_candidate_failure": {
+    "source_commit": "764479470cdd681891a7873749812f1710d7341b",
+    "cases": 4,
+    "failed_before_first_tool": 4,
+    "cause": "Responses output_item.done events contained complete items, but response.completed carried output:[]; the integrity parser incorrectly treated the empty terminal summary as contradicting streamed items.",
+    "comparison_disposition": "Retained as discovered regression; corrective implementation and new live trials required.",
+    "cluster_image": "build-bbox-image-ln9xs succeeded, rollout held after live failure.",
+    "repair_validation": {
+      "responses_tests_passed": 31,
+      "seconds": 0.017,
+      "native_live_rerun": "pending rebuilt binary"
     }
   }
 }

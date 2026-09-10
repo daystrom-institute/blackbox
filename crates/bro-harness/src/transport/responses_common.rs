@@ -549,7 +549,11 @@ fn parse_sse_validated(
     }
 
     anyhow::ensure!(terminal, "Responses stream closed before terminal response");
-    if let Some(output) = final_output {
+    // The ChatGPT Responses stream can finish with output:[] after publishing
+    // every item through output_item.done. That terminal is metadata-only, as
+    // in Codex's OutputItemDone + Completed event contract. It cannot close an
+    // unfinished item. A nonempty terminal snapshot still reconciles strictly.
+    if let Some(output) = final_output.filter(|output| !output.is_empty()) {
         for (index, added) in &open_items {
             let completed = usize::try_from(*index)
                 .ok()
@@ -1156,7 +1160,7 @@ mod tests {
             vec![done.clone(), done.clone(), completed.clone()],
             vec![
                 done.clone(),
-                json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call-1","name":"file_write","arguments":"{\"changed\":true}"}]}}),
             ],
             vec![
                 done.clone(),
@@ -1196,6 +1200,87 @@ mod tests {
             json!({}),
             "complete terminal snapshot is authoritative"
         );
+    }
+
+    #[test]
+    fn responses_completed_empty_output_preserves_streamed_items_and_native_history() {
+        // Sanitized shape from the observed ChatGPT backend stream:
+        // completed item events carry output; response.completed repeats only
+        // an empty output array, terminal metadata and usage. No live ciphertext
+        // or user prompt is needed to reproduce the wire contract.
+        for custom in [false, true] {
+            let reasoning = json!({"id":"rs_fixture","type":"reasoning","content":[],"summary":[],"encrypted_content":"fixture-opaque-state"});
+            let call = if custom {
+                json!({"id":"fc_fixture","type":"custom_tool_call","status":"completed","call_id":"call_fixture","name":"exec","input":"text('fixture');"})
+            } else {
+                json!({"id":"fc_fixture","type":"function_call","status":"completed","call_id":"call_fixture","name":"file_read","arguments":"{\"file_path\":\"fixture.txt\"}"})
+            };
+            let mut added = call.clone();
+            added["status"] = json!("in_progress");
+            let payload_field = if custom { "input" } else { "arguments" };
+            added[payload_field] = json!("");
+            let argument_event = if custom {
+                "response.custom_tool_call_input.done"
+            } else {
+                "response.function_call_arguments.done"
+            };
+            let mut s = state();
+            let output = s.parse_sse(&response_events(&[
+                json!({"type":"response.created","response":{"id":"resp_fixture","status":"in_progress","output":[]}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_fixture","type":"reasoning","summary":[]}}),
+                json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+                json!({"type":"response.output_item.added","output_index":1,"item":added}),
+                json!({"type":argument_event,"item_id":"fc_fixture","output_index":1,(payload_field):call[payload_field]}),
+                json!({"type":"response.output_item.done","output_index":1,"item":call}),
+                json!({"type":"response.completed","response":{"id":"resp_fixture","status":"completed","output":[],"usage":{"input_tokens":123,"output_tokens":17,"input_tokens_details":{"cached_tokens":23}}}}),
+            ])).unwrap();
+            assert_eq!(output.stop, StopReason::ToolCalls);
+            assert_eq!(output.tool_calls.len(), 1);
+            assert_eq!(output.tool_calls[0].id, "call_fixture");
+            assert_eq!(
+                output.tool_calls[0].args,
+                if custom {
+                    json!({"source":"text('fixture');"})
+                } else {
+                    json!({"file_path":"fixture.txt"})
+                }
+            );
+            assert_eq!(output.usage.input_tokens, 100);
+            assert_eq!(output.usage.cached_input_tokens, 23);
+            assert!(s.input.contains(&reasoning));
+            assert!(s.input.contains(&call));
+            assert_eq!(s.custom_tool_call_ids.contains("call_fixture"), custom);
+        }
+    }
+
+    #[test]
+    fn responses_empty_terminal_output_does_not_complete_missing_or_changed_items() {
+        let terminal =
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}});
+        let added = json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"file_read","arguments":""}});
+        let done = json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc_fixture","type":"function_call","status":"completed","call_id":"call_changed","name":"file_read","arguments":"{}"}});
+        for events in [
+            vec![added.clone(), terminal.clone()],
+            vec![added, done.clone(), terminal.clone()],
+            vec![done.clone(), done, terminal.clone()],
+            vec![
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_missing","arguments":"{}"}),
+                terminal,
+            ],
+        ] {
+            let mut s = state();
+            let before = s.input.clone();
+            let sse = response_events(&events);
+            let failure = s
+                .parse_sse(&sse)
+                .err()
+                .expect("invalid item stream must fail");
+            assert_eq!(s.input, before);
+            let evidence = failure
+                .downcast_ref::<super::super::FailedTurnObservation>()
+                .unwrap();
+            assert_eq!(evidence.tool_diagnostics[0]["evidence"]["sse"], sse);
+        }
     }
 
     #[test]

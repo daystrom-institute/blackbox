@@ -233,3 +233,21 @@ the same model, effort, and step budget. An initial ambiguous retrieval prompt i
 excluded from comparison; the corrected prompt names the JSON property explicitly.
 Independent artifact checks and observed verification commands are separate
 measurements. One trial per condition is exploratory, not statistical evidence.
+
+
+## Live-discovered Responses follow-up
+
+The first four live trials of revision `76447947` failed before tool dispatch.
+Their retained SSE evidence contained complete `response.output_item.done`
+events followed by `response.completed` with `status:completed` and `output:[]`.
+The provider integrity check from the prior milestone incorrectly treated that
+empty terminal summary as contradictory output. Pinned Codex consumes completed
+item events and uses completion for metadata and usage.
+
+The follow-up treats an empty terminal output like an omitted output snapshot,
+retaining completed streamed items only when no started item is unfinished.
+Nonempty snapshots still undergo strict reconciliation. Sanitized function-call,
+custom-call and reasoning fixtures exercise the observed shape; malformed,
+duplicate, changed and unfinished cases retain their refusal coverage. The
+failed live cohort remains in the receipt and is not presented as a successful
+comparison.
