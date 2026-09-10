@@ -13,8 +13,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/shell-lifetime-and-output",
   "notes": "Installed synthetic probes: yielded child runs beyond timeout until polled, initial stdin delays deadline, output cap drops final stderr, streaming filter loses split-line match.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T19:08:00Z",
-  "updated_at": "2026-09-10T19:08:00Z"
+  "updated_at": "2026-09-10T21:27:44Z",
+  "resolved_at": "2026-09-10T21:27:44Z",
+  "resolution_note": "Addressed by beta cancellation cdf5aaaf and shell output ce6284a6: process-owned deadlines, bounded stdin, retained complete output pages, newest-tail overflow accounting, incremental UTF-8 and complete-line filtering. Seven output probes, six cancellation probes and eight authority probes pass; full workspace 6817 tests pass. Evidence: design/bro-harness/model-facing-audit/shell-output-repair.md and shell-output-repair-receipts.json."
 }
