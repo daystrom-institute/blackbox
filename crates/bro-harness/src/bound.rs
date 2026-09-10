@@ -108,4 +108,36 @@ mod tests {
             "large".repeat(10_000)
         );
     }
+
+    #[test]
+    fn exact_budget_shell_page_preserves_escaped_bytes_and_continuation_metadata() {
+        let cap = 4096;
+        let mut page = json!({
+            "exit_code": 0,
+            "running": false,
+            "session_id": 42,
+            "stdout": "\n\"\\\t日".repeat(100),
+            "stderr": "\u{0000}\r\"problem",
+            "timed_out": false,
+            "output_pending": true,
+        });
+        let serialized_len = page.to_string().len();
+        assert!(serialized_len < cap);
+        let mut stdout = page["stdout"].as_str().unwrap().to_owned();
+        stdout.push_str(&"x".repeat(cap - serialized_len));
+        page["stdout"] = json!(stdout);
+        let serialized = page.to_string();
+        assert_eq!(serialized.len(), cap);
+
+        // The first producer bound and later final backstop both preserve a
+        // page that already accounts for JSON escaping and status metadata.
+        for tool in ["shell_run", "shell_poll", "tool_result"] {
+            let output = bound_tool_result(tool, serialized.clone(), cap);
+            assert_eq!(output, serialized);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+                page
+            );
+        }
+    }
 }

@@ -265,6 +265,7 @@ mod tests {
                 session_env: Arc::new(Default::default()),
                 shell_env: Arc::new(Default::default()),
                 cancellation: Default::default(),
+                output_budget: 16 * 1024,
                 child_env: Arc::new(Default::default()),
                 tool_arg_defaults: Arc::new(Default::default()),
             };

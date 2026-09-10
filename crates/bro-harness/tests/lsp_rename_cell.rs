@@ -82,6 +82,7 @@ async fn cell_renames_cross_file_via_lsp_authority() -> anyhow::Result<()> {
         shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
         edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         cancellation: Default::default(),
+        output_budget: 16 * 1024,
         child_env: Arc::new(Default::default()),
         session_env: Arc::new(BTreeMap::new()),
         tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),

@@ -20,7 +20,8 @@ use super::code_facts::Span;
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_MAX_DIAGNOSTICS: usize = 100;
 const STATUS_LINE_CAP: usize = 20;
-const SHELL_CAPTURE_TOKENS: usize = 2_100_000;
+const SHELL_CAPTURE_TOKENS: usize = 3_000;
+const CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct BuildGateInput {
@@ -124,7 +125,7 @@ impl Tool for BuildGate {
     }
 
     fn description(&self) -> &str {
-        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects cargo/rustc JSON (`--message-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Uses the same shell execution path as shell_run but never returns raw logs."
+        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects cargo/rustc JSON (`--message-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Collects retained shell output pages before parsing; diagnostics_complete=false discloses lost or unread output. Uses shell_run and shell_poll but never returns raw logs."
     }
 
     fn input_schema(&self) -> Value {
@@ -146,7 +147,7 @@ impl Tool for BuildGate {
     }
 
     fn required_tools(&self) -> &[&str] {
-        &["shell_run"]
+        &["shell_run", "shell_poll"]
     }
 
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
@@ -191,7 +192,6 @@ impl Tool for BuildGate {
             &[("timeout_ms", json!(DEFAULT_TIMEOUT_MS))],
         )
         .await;
-        let duration_ms = started.elapsed().as_millis() as u64;
 
         let shell_json = match shell_result {
             ToolResult::Json(value) => value,
@@ -200,26 +200,34 @@ impl Tool for BuildGate {
                 return ToolResult::Error(format!("build.gate: unexpected shell result: {t}"));
             }
         };
-        let cwd_arg = shell_json
-            .get("defaults_applied")
-            .and_then(|defaults| defaults.get("cwd"))
-            .and_then(Value::as_str)
-            .or(args.cwd.as_deref())
-            .unwrap_or(".");
+        let shell_json = collect_gate_output(shell_json, cx).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        // Resolve from invocation policy, not optional output telemetry: large
+        // riders may omit repeated default values to preserve page capacity.
+        let cwd_arg = if cwd_present {
+            args.cwd.as_deref()
+        } else {
+            cx.tool_arg_defaults.lookup("shell_run", "cwd")
+        }
+        .unwrap_or(".");
         let cwd_abs = match bro_tools::workspace::resolve_in_root(&cx.root, cwd_arg) {
             Ok(path) => path,
             Err(e) => return ToolResult::Error(format!("build.gate: {e}")),
         };
-        let shell_arg_context: serde_json::Map<String, Value> =
-            ["defaults_applied", "pin_enforced", "pin_conflict"]
-                .into_iter()
-                .filter_map(|key| {
-                    shell_json
-                        .get(key)
-                        .cloned()
-                        .map(|value| (key.to_owned(), value))
-                })
-                .collect();
+        let shell_arg_context: serde_json::Map<String, Value> = [
+            "defaults_applied",
+            "pin_enforced",
+            "pin_conflict",
+            "tool_arg_context",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            shell_json
+                .get(key)
+                .cloned()
+                .map(|value| (key.to_owned(), value))
+        })
+        .collect();
         // Parsing is pure, but span anchoring reads files; run the tail on
         // the blocking pool so no fs I/O lands on a tokio worker (I2).
         let root = cx.root.clone();
@@ -250,15 +258,24 @@ impl Tool for BuildGate {
             }
 
             let mut result = json!({
-                "ok": exit_code == 0 && !timed_out,
+                "ok": exit_code == 0 && !timed_out && shell_json["cancelled"] != true && shell_json["running"] != true,
                 "exit_code": exit_code,
                 "tool": parsed.tool,
                 "diagnostics": parsed.diagnostics,
                 "counts": parsed.counts,
-                "truncated": parsed.truncated,
+                "truncated": parsed.truncated || shell_json["diagnostics_complete"] != true,
+                "diagnostics_complete": !parsed.truncated && shell_json["diagnostics_complete"] == true,
+                "running": shell_json["running"] == true,
+                "timed_out": timed_out,
+                "cancelled": shell_json["cancelled"] == true,
                 "status_lines": parsed.status_lines,
                 "duration_ms": duration_ms
             });
+            for key in ["session_id", "output_pending", "output", "capture_error", "next_step", "metadata_omitted", "input_error_details_omitted", "process_error_details_omitted"] {
+                if let Some(value) = shell_json.get(key) {
+                    result[key] = value.clone();
+                }
+            }
             if !shell_arg_context.is_empty() {
                 result["shell_arg_context"] = Value::Object(shell_arg_context);
             }
@@ -266,6 +283,126 @@ impl Tool for BuildGate {
         })
         .await
     }
+}
+
+/// Collect retained pages only after process exit. Do not turn a yielded or
+/// incompletely observed gate into complete compiler diagnostics.
+async fn collect_gate_output(mut first: Value, cx: &ToolCx) -> Value {
+    let mut page = first.clone();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut complete = true;
+    let mut capture_error = None;
+    loop {
+        let so = page["stdout"].as_str().unwrap_or_default();
+        let se = page["stderr"].as_str().unwrap_or_default();
+        stdout.push_str(so);
+        stderr.push_str(se);
+        complete &= !shell_capture_lost(&page);
+        if page["running"] == true {
+            complete = false;
+            break;
+        }
+        if page["output_pending"] != true {
+            break;
+        }
+        if cx.cancellation.is_cancelled() {
+            capture_error = Some("output collection interrupted".to_owned());
+            break;
+        }
+        if stdout.len().saturating_add(stderr.len()) >= CAPTURE_BYTES {
+            capture_error = Some("output collection reached its 16 MiB limit".to_owned());
+            break;
+        }
+        let Some(id) = page["session_id"].as_str() else {
+            capture_error = Some("shell output is pending without a session id".to_owned());
+            break;
+        };
+        let next = bro_tools::call_tool_with_arg_defaults(
+            &bro_tools::ShellPoll,
+            "shell_poll",
+            json!({"session_id": id, "yield_time_ms": 1, "max_output_tokens": SHELL_CAPTURE_TOKENS}),
+            cx,
+        ).await;
+        match next {
+            ToolResult::Json(value) => {
+                let progress = value["stdout"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+                    || value["stderr"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty());
+                page = value;
+                if !progress && page["output_pending"] == true {
+                    capture_error = Some("shell output page made no progress".to_owned());
+                    break;
+                }
+            }
+            other => {
+                capture_error = Some(other.into_content().0);
+                break;
+            }
+        }
+    }
+    complete &=
+        capture_error.is_none() && page["running"] != true && page["output_pending"] != true;
+    for key in [
+        "session_id",
+        "output_pending",
+        "output",
+        "next_step",
+        "metadata_omitted",
+        "input_error_details_omitted",
+        "process_error_details_omitted",
+    ] {
+        if let Some(value) = page.get(key) {
+            first[key] = value.clone();
+        } else if let Some(object) = first.as_object_mut() {
+            object.remove(key);
+        }
+    }
+    if let Some(error) = capture_error {
+        first["capture_error"] = json!(error);
+    }
+    first["stdout"] = json!(stdout);
+    first["stderr"] = json!(stderr);
+    first["diagnostics_complete"] = json!(complete);
+    first
+}
+
+fn shell_capture_lost(page: &Value) -> bool {
+    // Counters are cumulative, so observing any page is sufficient. Pending
+    // bytes are recoverable and must not be mistaken for capture loss.
+    [
+        "metadata_omitted",
+        "input_error_details_omitted",
+        "process_error_details_omitted",
+    ]
+    .iter()
+    .any(|key| page[*key] == true)
+        || page
+            .get("output")
+            .and_then(Value::as_object)
+            .is_some_and(|streams| {
+                streams.values().any(|stream| {
+                    stream.as_object().is_some_and(|fields| {
+                        fields.iter().any(|(key, value)| {
+                            key != "pending_bytes"
+                                && (value.as_u64().is_some_and(|n| n > 0)
+                                    || value.as_bool() == Some(true)
+                                    || value.is_string())
+                        })
+                    })
+                })
+            })
+        || page
+            .get("output_filter")
+            .and_then(Value::as_object)
+            .is_some_and(|streams| {
+                streams
+                    .values()
+                    .any(|stream| stream["dropped_lines"].as_u64().unwrap_or(0) > 0)
+            })
 }
 
 fn combine_streams(stdout: &str, stderr: &str) -> String {
@@ -812,12 +949,12 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "build".to_string(),
-        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses cargo/rustc JSON (`--message-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
+        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses cargo/rustc JSON (`--message-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. It collects retained output pages before parsing; diagnostics_complete=false means capture or diagnostic results are incomplete, with session_id/output_pending when further raw pages remain. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
             .to_string(),
         declarations: r#"type BuildSpan = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type BuildSuggestion = { file: string; byte_start: number; byte_end: number; replacement: string; applicability: "MachineApplicable" | "MaybeIncorrect" | "HasPlaceholders"; span?: BuildSpan };
 type BuildDiagnostic = { file?: string; line?: number; column?: number; severity: "error" | "warning"; message: string; symbol?: string; code?: string; span?: BuildSpan; suggestions?: BuildSuggestion[] };
-type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "cargo" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number }; truncated: boolean; status_lines: string[]; duration_ms: number };
+type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "cargo" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number }; truncated: boolean; diagnostics_complete: boolean; running: boolean; timed_out: boolean; cancelled: boolean; output_pending?: boolean; session_id?: string; capture_error?: string; next_step?: string; output?: Record<string, Record<string, number | boolean | string>>; metadata_omitted?: boolean; input_error_details_omitted?: boolean; process_error_details_omitted?: boolean; status_lines: string[]; duration_ms: number };
 declare const build: {
   /** Run a bounded compile/test gate command and parse cargo/rustc JSON, javac, Gradle-wrapped javac, or generic nonzero output into structured diagnostics. cargo/rustc diagnostics carry compiler codes and machine-applicable suggestion spans. */
   gate(args: { command: string; cwd?: string; timeout_ms?: number; timeoutMs?: number; max_diagnostics?: number; maxDiagnostics?: number; anchor_spans?: boolean; anchorSpans?: boolean }): Promise<BuildGateResult>;
@@ -845,6 +982,7 @@ mod tests {
             shell_env: Arc::new(Default::default()),
             cancellation: Default::default(),
             child_env: Arc::new(Default::default()),
+            output_budget: 16 * 1024,
         }
     }
 
@@ -856,17 +994,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_reassembles_pages_before_parsing_diagnostics_and_retains_failed_continuations() {
+        for refuse_poll in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let mut cx = cx_in(&root);
+            cx.output_budget = 1024;
+            tokio::fs::write(root.join("gate.log"), format!(
+                "{}\nFixture.java:3: error: cannot find symbol\n  symbol: variable missing\n  location: class Fixture\n1 error\n",
+                "compiling fixture\n".repeat(1000)
+            )).await.unwrap();
+            if refuse_poll {
+                cx.tool_arg_defaults = Arc::new(
+                    bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([(
+                        "pin:shell_poll.max_output_tokens".into(),
+                        "0".into(),
+                    )]))
+                    .unwrap(),
+                );
+            }
+            let result = json_of(
+                BuildGate
+                    .call(json!({"command":"cat gate.log; exit 1"}), &cx)
+                    .await,
+            );
+            assert_eq!(result["exit_code"], 1);
+            assert_eq!(result["ok"], false);
+            if refuse_poll {
+                assert_eq!(result["diagnostics_complete"], false);
+                assert_eq!(result["output_pending"], true);
+                assert!(result["session_id"].is_string());
+                assert!(
+                    result["capture_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("pin conflict")
+                );
+                bro_tools::shell::shutdown_shell_sessions(&cx).await;
+            } else {
+                assert_eq!(result["diagnostics_complete"], true, "{result}");
+                assert_eq!(result["counts"]["errors"], 1);
+                assert_eq!(result["diagnostics"][0]["file"], "Fixture.java");
+                assert_eq!(result["diagnostics"][0]["line"], 3);
+                assert!(cx.shell_sessions.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn build_gate_is_unavailable_when_shell_is_denied_or_missing() {
         use bro_capabilities::{ToolCapability, ToolInvocation};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         for filter in [
             crate::mcp::ToolFilter::from_csv(Some("shell_run"), None),
+            crate::mcp::ToolFilter::from_csv(Some("shell_poll"), None),
             crate::mcp::ToolFilter::from_csv(Some("shell_*"), None),
             crate::mcp::ToolFilter::from_csv(None, Some("build.gate")),
         ] {
-            let tools: Vec<Arc<dyn Tool>> =
-                vec![Arc::new(BuildGate), Arc::new(bro_tools::ShellRun)];
+            let tools: Vec<Arc<dyn Tool>> = vec![
+                Arc::new(BuildGate),
+                Arc::new(bro_tools::ShellRun),
+                Arc::new(bro_tools::ShellPoll),
+            ];
             let admitted = tools
                 .into_iter()
                 .filter(|tool| filter.permits(tool.name()))
@@ -926,7 +1116,11 @@ mod tests {
             .unwrap(),
         );
         let host = crate::capabilities::HostTools::new(
-            vec![Arc::new(BuildGate), Arc::new(bro_tools::ShellRun)],
+            vec![
+                Arc::new(BuildGate),
+                Arc::new(bro_tools::ShellRun),
+                Arc::new(bro_tools::ShellPoll),
+            ],
             cx,
         );
         for input in [

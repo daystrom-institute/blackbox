@@ -18,6 +18,9 @@ pub struct FreeformGrammar {
 /// Execution context handed to every tool call.
 #[derive(Clone)]
 pub struct ToolCx {
+    /// Host budget in bytes for the complete serialized tool result. Zero is
+    /// an explicit host-unlimited policy; tools may retain their own page caps.
+    pub output_budget: usize,
     /// Explicit invocation cancellation, propagated through task boundaries.
     /// Active tools must finish cleanup before returning their actual outcome.
     pub cancellation: tokio_util::sync::CancellationToken,

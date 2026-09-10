@@ -1079,6 +1079,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             cancellation: Default::default(),
+            output_budget: 16 * 1024,
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(Default::default()),
             shell_env: Arc::new(Default::default()),

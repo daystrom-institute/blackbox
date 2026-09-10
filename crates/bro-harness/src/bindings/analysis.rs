@@ -1374,6 +1374,7 @@ mod tests {
             shell_sessions: Arc::new(StdMutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(StdMutex::new(bro_tools::EditSink::default())),
             cancellation: Default::default(),
+            output_budget: 16 * 1024,
             child_env: Arc::new(Default::default()),
             session_env: Arc::new(StdBTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),

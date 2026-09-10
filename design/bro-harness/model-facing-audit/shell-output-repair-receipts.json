@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "scope": "Synthetic shell output capture and model-facing page integrity. No real provider calls.",
+  "codex_reference": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "baseline": {
+    "revision": "c384fb8a1cc022f7a8bc00f94ad0462373ca1a8e",
+    "platform": "macOS arm64 installed binaries",
+    "cases": [
+      {
+        "case": "exited-pages",
+        "exit": 0,
+        "ok": false,
+        "pages": 1,
+        "stdout_bytes": 164,
+        "stderr_bytes": 164,
+        "firstEmpty": false,
+        "firstPending": false,
+        "contract_passed": false
+      },
+      {
+        "case": "zero-page",
+        "exit": 0,
+        "ok": false,
+        "pages": 1,
+        "stdout_bytes": 37,
+        "stderr_bytes": 37,
+        "firstEmpty": false,
+        "firstPending": false,
+        "contract_passed": false
+      },
+      {
+        "case": "split-utf8",
+        "exit": 0,
+        "ok": false,
+        "observed": "\ufffd\ufffd\ufffd",
+        "ready": true,
+        "contract_passed": false
+      },
+      {
+        "case": "split-filter-line",
+        "exit": 0,
+        "ok": false,
+        "observed": "",
+        "ready": true,
+        "contract_passed": false
+      },
+      {
+        "case": "overflow-tail",
+        "exit": 0,
+        "ok": false,
+        "found": false,
+        "loss": false,
+        "pages": 1,
+        "command_exit": 0,
+        "contract_passed": false
+      },
+      {
+        "case": "flat-escaped-1k",
+        "exit": 0,
+        "pages": 1,
+        "failures": [],
+        "stdout_exact": false,
+        "stderr_exact": false,
+        "contract_passed": false
+      },
+      {
+        "case": "flat-escaped-16k",
+        "exit": 0,
+        "pages": 1,
+        "failures": [],
+        "stdout_exact": false,
+        "stderr_exact": false,
+        "contract_passed": false
+      }
+    ]
+  },
+  "candidate": {
+    "branch": "beta/blackbox-v2",
+    "parent_revision": "cdf5aaafa7221fdbfd90b39e6022b723905e5bf5",
+    "revision_note": "Source in the commit containing this receipt.",
+    "platform": "Linux amd64 cluster lane",
+    "cases": [
+      {
+        "case": "exited-pages",
+        "exit": 0,
+        "ok": true,
+        "pages": 48,
+        "stdout_bytes": 24000,
+        "stderr_bytes": 21000,
+        "firstEmpty": false,
+        "firstPending": true,
+        "contract_passed": true
+      },
+      {
+        "case": "zero-page",
+        "exit": 0,
+        "ok": true,
+        "pages": 48,
+        "stdout_bytes": 24000,
+        "stderr_bytes": 21000,
+        "firstEmpty": true,
+        "firstPending": true,
+        "contract_passed": true
+      },
+      {
+        "case": "split-utf8",
+        "exit": 0,
+        "ok": true,
+        "observed": "\u20ac",
+        "ready": true,
+        "contract_passed": true
+      },
+      {
+        "case": "split-filter-line",
+        "exit": 0,
+        "ok": true,
+        "observed": "ERROR final\n",
+        "ready": true,
+        "contract_passed": true
+      },
+      {
+        "case": "overflow-tail",
+        "exit": 0,
+        "ok": true,
+        "found": true,
+        "loss": true,
+        "pages": 1,
+        "command_exit": 0,
+        "contract_passed": true
+      },
+      {
+        "case": "flat-escaped-1k",
+        "exit": 0,
+        "pages": 24,
+        "failures": [],
+        "stdout_exact": true,
+        "stderr_exact": true,
+        "contract_passed": true
+      },
+      {
+        "case": "flat-escaped-16k",
+        "exit": 0,
+        "pages": 3,
+        "failures": [],
+        "stdout_exact": true,
+        "stderr_exact": true,
+        "contract_passed": true
+      }
+    ]
+  },
+  "authority_regressions": [
+    {
+      "case": "flat-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "wrapped-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-diff-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-hook-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-lsp-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "diagnostic-lsp-scrub",
+      "contract_passed": true
+    },
+    {
+      "case": "denied-shell-build-gate",
+      "contract_passed": true
+    }
+  ],
+  "cancellation_regressions": [
+    {
+      "case": "flat-blocking",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-blocking",
+      "contract_passed": true
+    },
+    {
+      "case": "yielded-cell-blocking",
+      "contract_passed": true
+    },
+    {
+      "case": "shell-stdin-cancellation",
+      "contract_passed": true
+    },
+    {
+      "case": "passive-deadline",
+      "contract_passed": true
+    },
+    {
+      "case": "stdin-deadline",
+      "contract_passed": true
+    }
+  ],
+  "notes": [
+    "All seven baseline output contracts fail; all seven candidate contracts pass.",
+    "The overflow fixture asserts command exit0, final-error retention, and explicit capture loss.",
+    "Reconstruction compares exact complete strings when capture is below its buffer limit.",
+    "These are correctness regressions, not a platform-performance or model-efficacy comparison."
+  ],
+  "validation": {
+    "targeted_nextest": {
+      "passed": 704,
+      "skipped": 4
+    },
+    "workspace_full_nextest": {
+      "passed": 6817,
+      "skipped": 19
+    },
+    "workspace_clippy": "passed with existing repository warnings",
+    "concurrency_lint": "passed",
+    "pinned_rustfmt": "passed"
+  }
+}

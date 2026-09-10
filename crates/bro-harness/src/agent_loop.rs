@@ -878,6 +878,7 @@ impl Session {
         };
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
+        let tool_result_cap = crate::bound::cap_bytes();
         let cx = ToolCx {
             root: root.clone(),
             safety: Arc::new(SafetyPolicy::new()),
@@ -886,6 +887,7 @@ impl Session {
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
+            output_budget: tool_result_cap,
             child_env: Arc::new(child_env),
             cancellation: Default::default(),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
@@ -1101,7 +1103,6 @@ impl Session {
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
         let context_window = compaction.context_window(&base_opts.model);
-        let tool_result_cap = crate::bound::cap_bytes();
 
         // Timestamp the session boundary in the sidecar log. Daemon-launched
         // workers receive the dispatch provider through
@@ -1750,6 +1751,8 @@ impl Session {
             // under concurrent dispatch or V8 code-mode cells.
             let mut results: Vec<transport::ToolResult> = Vec::with_capacity(call_count);
             let mut scoped_riders = std::collections::HashMap::new();
+            let mut shell_result_ids = HashSet::new();
+            let mut shell_context = String::new();
             for (i, tc) in out.tool_calls.iter().enumerate() {
                 let Some((content, is_error)) = raw[i].take() else {
                     continue;
@@ -1762,8 +1765,22 @@ impl Session {
                     content,
                     is_error,
                 };
+                let shell_page = !result.is_error
+                    && matches!(tc.name.as_str(), "shell_run" | "shell_poll" | "shell_kill")
+                    && serde_json::from_str::<Value>(&result.content)
+                        .is_ok_and(|value| value["output_pending"].is_boolean());
+                if shell_page {
+                    shell_result_ids.insert(tc.id.clone());
+                }
                 for n in self.hooks.on_tool_result(tc, &result) {
                     match n.delivery {
+                        Delivery::Rider if shell_page => {
+                            shell_context.push_str(&format!(
+                                "\nContext for tool result {}:{}",
+                                tc.id,
+                                n.rider_block()
+                            ));
+                        }
                         Delivery::Rider => result.content.push_str(&n.rider_block()),
                         Delivery::SystemTail => self.tail_nudge = Some(n.message),
                     }
@@ -1785,7 +1802,11 @@ impl Session {
             // back with the batch. Replaces the per-tool window-0 drain (which
             // could not attribute edits under concurrent dispatch / V8 cells).
             if !interrupted && let Some(last) = results.last_mut() {
-                self.append_edit_diagnostics(&mut last.content).await;
+                if shell_result_ids.contains(&last.id) {
+                    self.append_edit_diagnostics(&mut shell_context).await;
+                } else {
+                    self.append_edit_diagnostics(&mut last.content).await;
+                }
             }
 
             // Ordinary hooks and diagnostics share the result budget. Scoped
@@ -1829,6 +1850,20 @@ impl Session {
                 .pending_input_estimate
                 .saturating_add(est_tool_results(&results));
             self.tx.push_tool_results(results);
+            if !shell_context.is_empty() {
+                // Shell pages already consumed exactly the bytes delivered in
+                // their JSON. Context must not displace that non-replayable data.
+                let content = crate::bound::bound_tool_result(
+                    "tool_context",
+                    shell_context,
+                    self.tool_result_cap,
+                );
+                self.emitter.tool_result_context(&content);
+                self.pending_input_estimate = self
+                    .pending_input_estimate
+                    .saturating_add(est_tokens(&content));
+                self.tx.push_user_text(&content);
+            }
             if interrupted {
                 break "interrupted_dispatch";
             }
@@ -2573,9 +2608,9 @@ fn compose_system(
         if reg.contains("shell_poll") {
             block.push_str(
                 "\nShell sessions: `shell_run` waits up to `yield_time_ms` for exit (default ~1s; \
-                 `0` waits until exit/timeout). If `shell_run` or `shell_poll` returns `running=true`, \
-                 the command is still active; call `shell_poll` with the returned `session_id` \
-                 until `running=false` (use its `yield_time_ms` to wake later), or `shell_kill` \
+                 `0` waits until exit/timeout). If `shell_run` or `shell_poll` returns `running=true` or `output_pending=true`, \
+                 call `shell_poll` with the returned `session_id` \
+                 until both `running=false` and `output_pending=false` (an exited command may still have unread pages), or `shell_kill` \
                  if you are abandoning it.\n",
             );
         }
@@ -3151,6 +3186,82 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shell_page_survives_large_result_hook_without_losing_consumed_bytes() {
+        struct LargeHook;
+        impl crate::hooks::Hook for LargeHook {
+            fn on_tool_result(
+                &self,
+                _: &transport::ToolCall,
+                _: &transport::ToolResult,
+            ) -> Vec<crate::hooks::Candidate> {
+                vec![crate::hooks::Candidate {
+                    rule_id: "shell-context-fixture".into(),
+                    message: "context fixture ".repeat(1000),
+                    delivery: Delivery::Rider,
+                    kind: crate::hooks::NudgeKind::Signpost,
+                    priority: 100,
+                }]
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::ToolCalls(vec![dispatch_call(
+                "shell-fixture",
+                "shell_run",
+                json!({"command":"printf '%0500d' 0", "yield_time_ms":0}),
+            )]),
+            MockTurn::Text("done".into()),
+        ]);
+        session.cx.root = root;
+        session.cx.output_budget = 1024;
+        session.tool_result_cap = 1024;
+        session.hooks =
+            crate::hooks::HookEngine::new(vec![Box::new(LargeHook)], Default::default());
+        session.reg = Registry::new(
+            vec![Arc::new(bro_tools::ShellRun)],
+            vec![],
+            &PinPolicy::from_env(),
+            &mcp::ToolFilter::default(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        session.emitter = Emitter::with_callback(
+            "fixture".into(),
+            Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            }),
+        );
+        let (_cancel_tx, cancel) = watch::channel(false);
+        session
+            .user_turn("run fixture", cancel, Arc::new(Mutex::new(VecDeque::new())))
+            .await
+            .unwrap();
+        let batches = shared.pushed_tool_results.lock().unwrap();
+        let page: Value =
+            serde_json::from_str(&batches[0][0].content).expect("hook cannot corrupt shell JSON");
+        assert_eq!(page["stdout"], "0".repeat(500));
+        assert!(batches[0][0].content.len() <= 1024);
+        drop(batches);
+        assert!(
+            shared
+                .pushed_users
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("context fixture"))
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event["subtype"] == "tool_result_context")
+        );
+        bro_tools::shell::shutdown_shell_sessions(&session.cx).await;
+    }
+
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
         mk_session_with_store(scripts, None)
     }
@@ -3172,6 +3283,7 @@ mod tests {
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            output_budget: 16 * 1024,
             child_env: Arc::new(Default::default()),
             cancellation: Default::default(),
             session_env: Arc::new(BTreeMap::new()),

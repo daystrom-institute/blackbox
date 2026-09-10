@@ -269,6 +269,16 @@ impl Emitter {
         }));
     }
 
+    /// Context appended after a shell page must not displace consumed output.
+    pub fn tool_result_context(&self, content: &str) {
+        self.write_line(json!({
+            "type": "user",
+            "subtype": "tool_result_context",
+            "session_id": self.session_id,
+            "message": {"role": "user", "content": [{"type": "text", "text": content}]},
+        }));
+    }
+
     /// Publish final observations from previously yielded work before the
     /// interrupted terminal event, without duplicating resolved tool-call IDs.
     pub fn cancellation_outcomes(&self, content: &str) {

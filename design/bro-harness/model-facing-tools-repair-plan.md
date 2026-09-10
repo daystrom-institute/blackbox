@@ -96,10 +96,11 @@ Implemented on `fix/harness-cancellation`:
 The [cancellation implementation and evidence](model-facing-audit/cancellation-repair.md)
 records boundaries, reference differences and reproducible probes. The ownership
 portion of `gap-74966891` is repaired alongside the first slice's authority work.
-The shell lifecycle portion of `gap-cf64b0da` is repaired; output paging, UTF-8
-chunk handling and filtering still need work, so that broader gap stays open.
-The phase-2 row is therefore only partially closed.
+The shell lifecycle portion of `gap-cf64b0da` is repaired. The follow-on
+[shell output repair](model-facing-audit/shell-output-repair.md) completes bounded
+paging, streaming UTF-8 and filtering, serialized budget accounting and wrapper
+collection. Both implementations are landed directly in beta.
 
-Next: finish shell output integrity, then provider/result integrity (order 3).
+Next: provider/result integrity (order 3).
 Other audit gaps remain open. No repair slice here has replaced the installed
 macOS binaries or restarted shared services.

@@ -28,6 +28,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Shell output pages preserve unread data after process exit, retain final output
+  on buffer overflow, and decode UTF-8 and filtered lines across read boundaries.
+  `output_pending` identifies further pages; loss and incomplete capture have
+  explicit metadata. Serialized page budgets include escaping and host riders.
+- `build.gate` collects retained output before parsing diagnostics and reports
+  incomplete capture with continuation instead of treating a preview as complete.
+
 - Harness cancellation stops queued calls and waits for admitted work to return
   its actual outcome before acknowledging interruption. Nested code-mode calls
   retain bounded completion receipts, including calls left pending by JavaScript.

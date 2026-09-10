@@ -106,5 +106,5 @@ All six cancellation probes and eight earlier authority probes passed.
   or schema validation. Those remain in the next result-integrity slice.
 - Shell output paging, split UTF-8 handling and filtering remain open. Replacing
   the process owner does not establish that every output byte is recoverable.
-- This branch is verified source. It has not replaced installed macOS binaries,
-  restarted shared services or been merged into beta.
+- This verified source was subsequently landed in beta. Installed macOS binaries
+  and shared services were not replaced by that source landing.

@@ -12,6 +12,9 @@
 //! normal yields leave supervision active. Interrupted turns explicitly call
 //! [`shutdown_shell_sessions`] to await final receipts for retained sessions.
 
+mod output;
+use output::OutBuf;
+
 use crate::promise::{PromiseProgress, StreamKind};
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
@@ -30,9 +33,6 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
-/// Per-stream in-memory buffer cap. Beyond this, output is counted-and-dropped
-/// rather than retained, so a runaway producer can't exhaust memory.
-const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
 /// Default returned-output budget (~8 KB at a 4-bytes/token heuristic).
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_000;
 /// Default cooperative yield for a fresh command. Long commands should not make
@@ -50,34 +50,6 @@ const MAX_LIVE_SESSIONS: usize = 32;
 /// it open past the direct child's exit (which would otherwise hang forever).
 const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// A drained-into output buffer with an overflow counter.
-#[derive(Default)]
-struct OutBuf {
-    bytes: Vec<u8>,
-    dropped: usize,
-}
-
-impl OutBuf {
-    fn push(&mut self, chunk: &[u8]) {
-        let room = MAX_BUF_BYTES.saturating_sub(self.bytes.len());
-        if chunk.len() <= room {
-            self.bytes.extend_from_slice(chunk);
-        } else {
-            self.bytes.extend_from_slice(&chunk[..room]);
-            self.dropped += chunk.len() - room;
-        }
-    }
-    /// Drain accumulated output as lossy UTF-8; returns (text, dropped) and
-    /// resets both.
-    fn take(&mut self) -> (String, usize) {
-        let s = String::from_utf8_lossy(&self.bytes).into_owned();
-        let dropped = self.dropped;
-        self.bytes.clear();
-        self.dropped = 0;
-        (s, dropped)
-    }
-}
-
 /// A retained handle never owns the child or blocks process control. The
 /// supervisor owns the process from spawn through reaping and reader completion.
 struct ShellSession {
@@ -91,6 +63,7 @@ struct ShellSession {
     hard_deadline: Option<Instant>,
     progress: Arc<PromiseProgress>,
     output_filter: Mutex<Option<ShellOutputFilter>>,
+    filter_change: Mutex<Option<Value>>,
 }
 
 #[derive(Clone, Default)]
@@ -470,49 +443,188 @@ fn session_result(
     max_tokens: usize,
     input: InputOutcome,
 ) -> ToolResult {
+    session_result_inner(cx, id, session, max_tokens, input, false)
+}
+
+fn session_result_inner(
+    cx: &ToolCx,
+    id: &str,
+    session: &ShellSession,
+    max_tokens: usize,
+    input: InputOutcome,
+    cleanup: bool,
+) -> ToolResult {
     let terminal = session.state.borrow().clone().or_else(|| {
         session.state.has_changed().is_err().then(|| TerminalState {
             wait_error: Some("shell supervisor stopped before publishing its outcome".into()),
             ..Default::default()
         })
     });
-    let output = snapshot(session, max_tokens);
-    let mut result = if let Some(terminal) = terminal {
-        cx.shell_sessions.lock().unwrap().map.remove(id);
-        let mut value = terminal_json(terminal.exit_code, output, terminal.timed_out);
-        value["cancelled"] = json!(terminal.cancelled);
+    let running = terminal.is_none();
+    let mut result =
+        json!({"session_id": id, "running": running, "exit_code": Value::Null, "timed_out": false});
+    if let Some(terminal) = terminal {
+        result["exit_code"] = json!(terminal.exit_code);
+        result["timed_out"] = json!(terminal.timed_out);
+        result["cancelled"] = json!(terminal.cancelled);
         if terminal.group_cleanup_sigkill {
-            value["group_cleanup_signal"] = json!("kill");
+            result["group_cleanup_signal"] = json!("kill");
         }
         if terminal.killed {
-            value["killed"] = json!(true);
-            value["escalated_to_sigkill"] = json!(terminal.escalated_to_sigkill);
+            result["killed"] = json!(true);
+            result["escalated_to_sigkill"] = json!(terminal.escalated_to_sigkill);
         }
         if let Some(signal) = terminal.signal_sent {
-            value["signal_sent"] = json!(signal);
+            result["signal_sent"] = json!(signal);
         }
         if let Some(error) = terminal.wait_error {
-            value["process_error"] = json!(error);
+            result["process_error"] = json!(error.chars().take(160).collect::<String>());
         }
-        value
-    } else {
-        let mut value = json!({
-            "exit_code": Value::Null, "stdout": output.stdout, "stderr": output.stderr,
-            "running": true, "timed_out": false,
-            "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
-            "progress": session_progress(session),
-        });
-        if let Some(filter) = output.output_filter {
-            value["output_filter"] = filter;
-        }
-        value
-    };
-    result["session_id"] = json!(id);
+    } else if cx.output_budget == 0 || cx.output_budget >= 4096 {
+        result["progress"] = session_progress(session);
+    }
     if let Some(error) = input.error {
         result["input_error"] = json!(error);
         result["stdin_bytes_written"] = json!(input.written);
     }
+    let result = output_receipt(session, max_tokens, cx.output_budget, result, cleanup);
+    if !running && result["output_pending"] == false {
+        cx.shell_sessions.lock().unwrap().map.remove(id);
+    }
     ToolResult::Json(result)
+}
+
+/// Prepare without discarding selected text, fit the complete serialized
+/// receipt, then commit exactly the returned strings. Output queue locks cover
+/// the preview/commit pair so concurrent polls cannot consume the same bytes.
+fn output_receipt(
+    session: &ShellSession,
+    max_tokens: usize,
+    host_budget: usize,
+    mut result: Value,
+    cleanup: bool,
+) -> Value {
+    let cap = if host_budget == 0 {
+        8192
+    } else {
+        host_budget.min(8192)
+    };
+    let requested = max_tokens.saturating_mul(4);
+    let filter = session.output_filter.lock().unwrap();
+    let mut stdout = session.stdout.lock().unwrap();
+    let mut stderr = session.stderr.lock().unwrap();
+    let stdout_patterns = filter.as_ref().map_or(&[][..], |f| f.stdout.as_slice());
+    let stderr_patterns = filter.as_ref().map_or(&[][..], |f| f.stderr.as_slice());
+    stdout.prepare(requested.min(cap), stdout_patterns);
+    stderr.prepare(requested.min(cap), stderr_patterns);
+    if filter.is_some() {
+        let mut report = json!({});
+        if !stdout_patterns.is_empty() {
+            report["stdout"] = stdout.filter_report();
+        }
+        if !stderr_patterns.is_empty() {
+            report["stderr"] = stderr.filter_report();
+        }
+        result["output_filter"] = report;
+    }
+    if let Some(notice) = session.filter_change.lock().unwrap().as_ref() {
+        result["filter_change"] = notice.clone();
+    }
+    let mut per_stream_budget = requested.min(cap / 2);
+    let mut compact = false;
+    loop {
+        let so = stdout.preview(per_stream_budget);
+        let se = stderr.preview(per_stream_budget);
+        let pending = stdout.pending_bytes() > so.len() || stderr.pending_bytes() > se.len();
+        result["stdout"] = json!(so);
+        result["stderr"] = json!(se);
+        result["output_pending"] = json!(pending && !cleanup);
+        result["output"] =
+            json!({"stdout": stdout.metadata(so.len()), "stderr": stderr.metadata(se.len())});
+        if compact {
+            for name in ["stdout", "stderr"] {
+                result["output"][name]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reader_error");
+            }
+        }
+        if cleanup {
+            for name in ["stdout", "stderr"] {
+                let count = result["output"][name]["pending_bytes"].as_u64().unwrap();
+                if count > 0 {
+                    result["output"][name]["discarded_bytes"] = json!(count);
+                }
+                result["output"][name]["pending_bytes"] = json!(0);
+            }
+        }
+        if !cleanup && !compact && (pending || result["running"] == true) {
+            result["next_step"] = json!(
+                "Call shell_poll with session_id until running=false and output_pending=false."
+            );
+        } else {
+            result.as_object_mut().unwrap().remove("next_step");
+        }
+        result
+            .as_object_mut()
+            .unwrap()
+            .remove("minimum_output_bytes");
+        if !cleanup && pending && so.is_empty() && se.is_empty() && per_stream_budget < 6 {
+            result["minimum_output_bytes"] = json!(6);
+        }
+        let size = serde_json::to_vec(&result).expect("JSON receipt").len();
+        let blocked_by_envelope = requested > 0
+            && stdout.selected_bytes() + stderr.selected_bytes() > 0
+            && so.is_empty()
+            && se.is_empty()
+            && per_stream_budget < requested.min(6);
+        if size <= cap && !blocked_by_envelope {
+            stdout.commit(so.len());
+            stderr.commit(se.len());
+            if cleanup {
+                stdout.discard();
+                stderr.discard();
+            }
+            return result;
+        }
+        if !compact && (per_stream_budget == 0 || blocked_by_envelope) {
+            compact = true;
+            result["metadata_omitted"] = json!(true);
+            for key in ["progress", "output_filter", "filter_change", "next_step"] {
+                result.as_object_mut().unwrap().remove(key);
+            }
+            for key in ["input_error", "process_error"] {
+                if result.as_object_mut().unwrap().remove(key).is_some() {
+                    result[format!("{key}_details_omitted")] = json!(true);
+                }
+            }
+            per_stream_budget = requested.min(cap / 2);
+            continue;
+        }
+        if per_stream_budget == 0 {
+            // No selected text was consumed. The caller must increase its host
+            // envelope budget before receiving this metadata and output.
+            let mut fallback = json!({
+                "session_id": result["session_id"], "running": result["running"],
+                "exit_code": result["exit_code"], "timed_out": result["timed_out"],
+                "cancelled": result["cancelled"],
+                "output_pending": !cleanup && stdout.pending_bytes() + stderr.pending_bytes() > 0,
+                "metadata_omitted": true,
+                "minimum_required_bytes": size,
+                "error": "shell metadata exceeds the host output budget"
+            });
+            if cleanup {
+                fallback["output"] = json!({
+                    "stdout": {"pending_bytes": 0, "discarded_bytes": stdout.discard()},
+                    "stderr": {"pending_bytes": 0, "discarded_bytes": stderr.discard()}
+                });
+                fallback["capture_metadata_omitted"] = json!(true);
+            }
+            return fallback;
+        }
+        per_stream_budget =
+            per_stream_budget.saturating_sub(size.saturating_sub(cap).div_ceil(2).max(1));
+    }
 }
 
 /// Stop all sessions owned by this ToolCx, await reaping, and return final facts.
@@ -526,17 +638,38 @@ pub async fn shutdown_shell_sessions(cx: &ToolCx) -> Vec<Value> {
     let mut receipts = Vec::with_capacity(sessions.len());
     for (id, session) in sessions {
         terminal_state(&session).await;
-        if let ToolResult::Json(receipt) = session_result(
+        if let ToolResult::Json(receipt) = session_result_inner(
             cx,
             &id,
             &session,
             DEFAULT_MAX_OUTPUT_TOKENS,
             InputOutcome::default(),
+            true,
         ) {
             receipts.push(receipt);
         }
     }
     receipts
+}
+
+struct ReaderCompletion {
+    buffer: Arc<Mutex<OutBuf>>,
+    finished: bool,
+}
+impl ReaderCompletion {
+    fn finish(&mut self, error: Option<String>) {
+        self.buffer.lock().unwrap().finish(error);
+        self.finished = true;
+    }
+}
+impl Drop for ReaderCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.buffer.lock().unwrap().finish(Some(
+                "output reader stopped before EOF; unread pipe bytes are unknown".into(),
+            ));
+        }
+    }
 }
 
 fn spawn_reader<R>(
@@ -547,11 +680,22 @@ fn spawn_reader<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let mut completion = ReaderCompletion {
+        buffer: buf.clone(),
+        finished: false,
+    };
     tokio::spawn(async move {
         let mut chunk = [0u8; 8192];
         loop {
             match r.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    completion.finish(None);
+                    break;
+                }
+                Err(error) => {
+                    completion.finish(Some(error.to_string()));
+                    break;
+                }
                 Ok(n) => {
                     buf.lock().unwrap().push(&chunk[..n]);
                     if let Some((kind, ref p)) = progress {
@@ -561,19 +705,6 @@ where
             }
         }
     })
-}
-
-/// Keep the last `budget` bytes (errors trail in shell output), adjusted to a
-/// char boundary. Returns (tail, bytes_dropped_from_head).
-fn cap_tail(s: &str, budget: usize) -> (String, usize) {
-    if s.len() <= budget {
-        return (s.to_string(), 0);
-    }
-    let mut start = s.len() - budget;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    (s[start..].to_string(), start)
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -615,21 +746,18 @@ where
 
 #[derive(Clone)]
 struct ShellOutputFilter {
-    stdout_patterns: Vec<String>,
-    stderr_patterns: Vec<String>,
     stdout: Vec<Regex>,
     stderr: Vec<Regex>,
 }
 
-struct FilteredStream {
-    text: String,
-    report: Option<Value>,
-}
-
-struct ShellOutputSnapshot {
-    stdout: String,
-    stderr: String,
-    output_filter: Option<Value>,
+fn update_output_filter(session: &ShellSession, filter: Option<ShellOutputFilter>) {
+    let mut current = session.output_filter.lock().unwrap();
+    let cached = session.stdout.lock().unwrap().selected_bytes()
+        + session.stderr.lock().unwrap().selected_bytes();
+    *session.filter_change.lock().unwrap() = Some(json!({
+        "scope": "unselected_lines", "cached_bytes_at_change": cached,
+    }));
+    *current = filter;
 }
 
 fn compile_output_filter(
@@ -643,12 +771,7 @@ fn compile_output_filter(
     }
     let stdout = compile_filter_patterns("stdout", &input.stdout)?;
     let stderr = compile_filter_patterns("stderr", &input.stderr)?;
-    Ok(Some(ShellOutputFilter {
-        stdout_patterns: input.stdout,
-        stderr_patterns: input.stderr,
-        stdout,
-        stderr,
-    }))
+    Ok(Some(ShellOutputFilter { stdout, stderr }))
 }
 
 fn compile_filter_patterns(stream: &str, patterns: &[String]) -> Result<Vec<Regex>, String> {
@@ -672,92 +795,6 @@ fn compile_filter_patterns(stream: &str, patterns: &[String]) -> Result<Vec<Rege
                 .map_err(|e| format!("output_filter.{stream}: invalid regex `{pattern}`: {e}"))
         })
         .collect()
-}
-
-fn filter_stream(raw: String, patterns: &[Regex], pattern_text: &[String]) -> FilteredStream {
-    if patterns.is_empty() {
-        return FilteredStream {
-            text: raw,
-            report: None,
-        };
-    }
-    let mut kept = String::new();
-    let mut kept_lines = 0usize;
-    let mut dropped_lines = 0usize;
-    for line in raw.split_inclusive('\n') {
-        if patterns.iter().any(|pattern| pattern.is_match(line)) {
-            kept.push_str(line);
-            kept_lines += 1;
-        } else {
-            dropped_lines += 1;
-        }
-    }
-    FilteredStream {
-        text: kept,
-        report: Some(json!({
-            "mode": "matching_lines",
-            "patterns": pattern_text,
-            "kept_lines": kept_lines,
-            "dropped_lines": dropped_lines,
-        })),
-    }
-}
-
-fn render(raw: String, dropped: usize, max_tokens: usize) -> String {
-    let budget = max_tokens.saturating_mul(4).max(1);
-    let (body, head_trunc) = cap_tail(&raw, budget);
-    let mut prefix = String::new();
-    if head_trunc > 0 {
-        prefix.push_str(&format!("[... {head_trunc} earlier bytes truncated]\n"));
-    }
-    if dropped > 0 {
-        prefix.push_str(&format!("[... {dropped} bytes dropped at buffer cap]\n"));
-    }
-    format!("{prefix}{body}")
-}
-
-/// Snapshot both buffers (draining them) and render with the token budget.
-fn snapshot(session: &ShellSession, max_tokens: usize) -> ShellOutputSnapshot {
-    let (so, so_drop) = session.stdout.lock().unwrap().take();
-    let (se, se_drop) = session.stderr.lock().unwrap().take();
-    render_snapshot(
-        so,
-        so_drop,
-        se,
-        se_drop,
-        session.output_filter.lock().unwrap().as_ref(),
-        max_tokens,
-    )
-}
-
-fn render_snapshot(
-    stdout: String,
-    stdout_dropped: usize,
-    stderr: String,
-    stderr_dropped: usize,
-    filter: Option<&ShellOutputFilter>,
-    max_tokens: usize,
-) -> ShellOutputSnapshot {
-    let (stdout, stderr, output_filter) = if let Some(filter) = filter {
-        let stdout = filter_stream(stdout, &filter.stdout, &filter.stdout_patterns);
-        let stderr = filter_stream(stderr, &filter.stderr, &filter.stderr_patterns);
-        let mut report = serde_json::Map::new();
-        if let Some(stdout_report) = stdout.report {
-            report.insert("stdout".to_string(), stdout_report);
-        }
-        if let Some(stderr_report) = stderr.report {
-            report.insert("stderr".to_string(), stderr_report);
-        }
-        let report = (!report.is_empty()).then_some(Value::Object(report));
-        (stdout.text, stderr.text, report)
-    } else {
-        (stdout, stderr, None)
-    };
-    ShellOutputSnapshot {
-        stdout: render(stdout, stdout_dropped, max_tokens),
-        stderr: render(stderr, stderr_dropped, max_tokens),
-        output_filter,
-    }
 }
 
 /// After a child has exited (or been killed) give its readers a bounded grace
@@ -799,21 +836,6 @@ fn signal_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
     }
-}
-
-/// Build the terminal JSON for an exited/timed-out/killed session.
-fn terminal_json(exit_code: Option<i32>, output: ShellOutputSnapshot, timed_out: bool) -> Value {
-    let mut out = json!({
-        "exit_code": exit_code,
-        "stdout": output.stdout,
-        "stderr": output.stderr,
-        "running": false,
-        "timed_out": timed_out,
-    });
-    if let Some(report) = output.output_filter {
-        out["output_filter"] = report;
-    }
-    out
 }
 
 fn shell_path_env() -> Option<OsString> {
@@ -915,7 +937,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; tail kept). output_filter keeps matching stdout/stderr lines after capture without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue shell_poll until running=false and output_pending=false; completed commands retain unread output. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; prefix pages retain remaining output; zero is metadata-only). output_filter keeps complete matching stdout/stderr lines after capture (lines over 256 KiB are excluded and counted) without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -1031,6 +1053,7 @@ impl Tool for ShellRun {
                 hard_deadline: kill_at,
                 progress,
                 output_filter: Mutex::new(output_filter),
+                filter_change: Mutex::new(None),
             });
             sessions.counter += 1;
             let id = format!("sh-{}", sessions.counter);
@@ -1057,6 +1080,7 @@ impl Tool for ShellRun {
         let mut result = session_result(cx, &id, &session, max_tokens, input);
         if let ToolResult::Json(value) = &mut result
             && value["running"] == false
+            && value["output_pending"] == false
         {
             value.as_object_mut().unwrap().remove("session_id");
         }
@@ -1091,7 +1115,8 @@ struct ShellPollInput {
     /// Output token budget for this drain (default 2000, maximum 3000).
     max_output_tokens: Option<usize>,
     /// Optional post-capture line filter for this drain. When omitted, the
-    /// filter from the originating shell_run is reused, if any.
+    /// filter from the originating shell_run is reused, if any. Changes affect
+    /// unselected lines; a previously selected line keeps its page remainder.
     output_filter: Option<ShellOutputFilterInput>,
 }
 
@@ -1103,7 +1128,7 @@ impl Tool for ShellPoll {
         "shell_poll"
     }
     fn description(&self) -> &str {
-        "Resume a running shell session from shell_run: optionally feed stdin, close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false closes the session. output_filter can override the originating post-capture line filter for this and later polls. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
+        "Resume a running shell session from shell_run: optionally feed stdin, close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false means the process exited; keep polling while output_pending=true to receive remaining output. Output pages consume only returned text; overflow retains the newest 8 MiB per stream and reports dropped_bytes. output_filter changes apply to unselected lines; cached page remainders keep their prior selection. Output byte counters describe buffer bytes, not source offsets. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellPollInput>()
@@ -1149,7 +1174,7 @@ impl Tool for ShellPoll {
         };
         let mut guard = InvocationGuard::new(&session);
         if output_filter_was_provided {
-            *session.output_filter.lock().unwrap() = output_filter;
+            update_output_filter(&session, output_filter);
         }
         // Signals never queue behind a blocked stdin writer or an output wait.
         if let Some(name) = args.signal.as_deref() {
@@ -1212,7 +1237,8 @@ struct ShellKillInput {
     /// Output token budget for the final drain (default 2000, maximum 3000).
     max_output_tokens: Option<usize>,
     /// Optional post-capture line filter for the final drain. When omitted, the
-    /// filter from the originating shell_run is reused, if any.
+    /// filter from the originating shell_run is reused, if any. Changes affect
+    /// unselected lines; a previously selected line keeps its page remainder.
     output_filter: Option<ShellOutputFilterInput>,
 }
 
@@ -1224,7 +1250,7 @@ impl Tool for ShellKill {
         "shell_kill"
     }
     fn description(&self) -> &str {
-        "Terminate a running shell session. Sends signal (term|int|kill, default term), waits up to grace_ms for graceful exit, then force-kills. Drains and returns final {exit_code, stdout, stderr, running:false, killed}. output_filter can override the originating post-capture line filter for the final drain. Use this to stop a dev server or watch process you started with shell_run + yield_time_ms."
+        "Terminate a running shell session. Sends signal (term|int|kill, default term), waits up to grace_ms for graceful exit, then force-kills. Returns terminal process facts plus a bounded output page; poll while output_pending=true to finish reading. output_filter can override the originating post-capture line filter for the final drain. Use this to stop a dev server or watch process you started with shell_run + yield_time_ms."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellKillInput>()
@@ -1262,7 +1288,7 @@ impl Tool for ShellKill {
         };
         let mut guard = InvocationGuard::new(&session);
         if output_filter_was_provided {
-            *session.output_filter.lock().unwrap() = output_filter;
+            update_output_filter(&session, output_filter);
         }
         let (signal, name) = signal_for(args.signal.as_deref());
         let _ = session.controls.send(Control::Terminate {
@@ -1298,7 +1324,7 @@ impl Tool for ShellList {
         "shell_list"
     }
     fn description(&self) -> &str {
-        "List retained shell sessions with session_id, command, elapsed time, and running state. Completed sessions retain unread terminal output until shell_poll consumes it. Use session_id with shell_poll or shell_kill."
+        "List retained shell sessions with session_id, command, elapsed time, and running state. Completed sessions retain unread terminal output until shell_poll returns output_pending=false. Use session_id with shell_poll or shell_kill."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellListInput>()
@@ -1320,6 +1346,7 @@ impl Tool for ShellList {
                     "session_id": id,
                     "command": s.command,
                     "running": s.state.borrow().is_none(),
+                    "output_pending": s.stdout.lock().unwrap().pending_bytes() > 0 || s.stderr.lock().unwrap().pending_bytes() > 0,
                     "elapsed_secs": now.saturating_duration_since(s.started).as_secs(),
                 })
             })
@@ -1343,6 +1370,7 @@ mod tests {
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
             child_env: Arc::new(Default::default()),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            output_budget: 16 * 1024,
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -2072,20 +2100,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_output_tokens_caps_tail() {
-        let v = as_json(
+    async fn output_pages_preserve_complete_stream_under_escaped_host_budget() {
+        let (_dir, mut c) = isolated_cx();
+        c.output_budget = 768;
+        let expected = "\"\\\n😀".repeat(500);
+        std::fs::write(c.root.join("output"), &expected).unwrap();
+        let mut receipt = as_json(
             ShellRun
                 .call(
-                    json!({"command": "for i in $(seq 1 1000); do echo line$i; done",
-                           "max_output_tokens": 5}),
-                    &cx(),
+                    json!({"command": "cat output; cat output >&2", "yield_time_ms": 0}),
+                    &c,
                 )
                 .await,
         );
-        let out = v["stdout"].as_str().unwrap();
-        assert!(out.contains("earlier bytes truncated"), "marker: {out}");
-        assert!(out.contains("line1000"), "tail kept: {out}");
-        assert!(!out.contains("line1\n"), "head dropped: {out}");
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        for _ in 0..200 {
+            assert!(
+                serde_json::to_vec(&receipt).unwrap().len() <= c.output_budget,
+                "{receipt}"
+            );
+            assert_eq!(receipt["running"], false);
+            stdout.push_str(receipt["stdout"].as_str().unwrap());
+            stderr.push_str(receipt["stderr"].as_str().unwrap());
+            if receipt["output_pending"] == false {
+                break;
+            }
+            receipt = as_json(
+                ShellPoll
+                    .call(
+                        json!({"session_id": receipt["session_id"], "yield_time_ms": 0}),
+                        &c,
+                    )
+                    .await,
+            );
+        }
+        assert_eq!(stdout, expected);
+        assert_eq!(stderr, expected);
+        assert!(c.shell_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_output_budget_keeps_terminal_output_for_later_poll() {
+        let (_dir, c) = isolated_cx();
+        let first = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "printf abc", "yield_time_ms": 0, "max_output_tokens": 0}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(first["running"], false);
+        assert_eq!(first["stdout"], "");
+        assert_eq!(first["output_pending"], true);
+        assert_eq!(first["output"]["stdout"]["pending_bytes"], 3);
+        let last = as_json(
+            ShellPoll
+                .call(
+                    json!({"session_id": first["session_id"], "max_output_tokens": 2}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(last["stdout"], "abc");
+        assert_eq!(last["output_pending"], false);
+    }
+
+    #[tokio::test]
+    async fn filter_change_reports_cached_page_remainder_as_prior_selection() {
+        let (_dir, mut c) = isolated_cx();
+        c.output_budget = 768;
+        let text = format!("{}\nkeep next\n", "noise ".repeat(200));
+        std::fs::write(c.root.join("output"), text).unwrap();
+        let first = as_json(
+            ShellRun
+                .call(json!({"command": "cat output", "yield_time_ms": 0}), &c)
+                .await,
+        );
+        let second = as_json(ShellPoll.call(json!({"session_id": first["session_id"], "output_filter": {"stdout": "^keep"}}), &c).await);
+        assert_eq!(second["filter_change"]["scope"], "unselected_lines");
+        assert!(
+            second["filter_change"]["cached_bytes_at_change"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(second["stdout"].as_str().unwrap().contains("noise"));
+        shutdown_shell_sessions(&c).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_unreturned_output_as_discarded_within_budget() {
+        let (_dir, mut c) = isolated_cx();
+        c.output_budget = 768;
+        std::fs::write(c.root.join("output"), "x".repeat(10000)).unwrap();
+        let first = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "cat output", "yield_time_ms": 0, "max_output_tokens": 0}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(first["output_pending"], true);
+        let receipts = shutdown_shell_sessions(&c).await;
+        assert_eq!(receipts.len(), 1);
+        let last = &receipts[0];
+        assert!(
+            serde_json::to_vec(last).unwrap().len() <= c.output_budget,
+            "{last}"
+        );
+        assert_eq!(last["output_pending"], false);
+        let returned = last["stdout"].as_str().unwrap().len();
+        let discarded = last["output"]["stdout"]["discarded_bytes"]
+            .as_u64()
+            .unwrap() as usize;
+        assert_eq!(returned + discarded, 10000);
+        assert!(c.shell_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_metadata_makes_progress_and_releases_empty_terminal_session() {
+        for has_output in [false, true] {
+            let (_dir, mut c) = isolated_cx();
+            c.output_budget = 768;
+            let first = as_json(ShellRun.call(json!({"command": "printf retained", "yield_time_ms": 0, "max_output_tokens": 0}), &c).await);
+            let id = first["session_id"].as_str().unwrap();
+            let session = get_session(&c, id).unwrap();
+            for buffer in [&session.stdout, &session.stderr] {
+                let mut buffer = buffer.lock().unwrap();
+                buffer.push(&[0xff]);
+                buffer.finish(Some("\u{1}".repeat(96)));
+                buffer.prepare(32, &[]);
+                if !has_output {
+                    buffer.discard();
+                }
+            }
+            let receipt = as_json(ShellPoll.call(json!({"session_id": id}), &c).await);
+            assert!(
+                serde_json::to_vec(&receipt).unwrap().len() <= 768,
+                "{receipt}"
+            );
+            assert_eq!(receipt["metadata_omitted"], true, "{receipt}");
+            assert_eq!(receipt["output"]["stdout"]["capture_incomplete"], true);
+            assert_eq!(receipt["output"]["stderr"]["capture_incomplete"], true);
+            assert_eq!(receipt["output_pending"], false, "{receipt}");
+            assert_eq!(receipt["stdout"], if has_output { "retained�" } else { "" });
+            assert_eq!(receipt["stderr"], if has_output { "�" } else { "" });
+            assert_eq!(receipt["output"]["stdout"]["invalid_utf8_bytes"], 1);
+            assert_eq!(receipt["output"]["stderr"]["invalid_utf8_bytes"], 1);
+            assert!(c.shell_sessions.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_failure_is_reported_and_incomplete_utf8_is_finalized() {
+        struct Broken(bool);
+        impl tokio::io::AsyncRead for Broken {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if !self.0 {
+                    self.0 = true;
+                    buf.put_slice(&[0xe2]);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::Poll::Ready(Err(std::io::Error::other("synthetic reader failure")))
+            }
+        }
+        let buffer = Arc::new(Mutex::new(OutBuf::default()));
+        spawn_reader(Broken(false), buffer.clone(), None)
+            .await
+            .unwrap();
+        let mut buffer = buffer.lock().unwrap();
+        buffer.prepare(8, &[]);
+        assert_eq!(buffer.preview(8), "�");
+        assert_eq!(buffer.metadata(0)["capture_incomplete"], true);
+        assert_eq!(buffer.metadata(0)["invalid_utf8_bytes"], 1);
     }
 
     #[tokio::test]
