@@ -284,7 +284,9 @@ async fn drive_cell_to_completion(
 ) -> Result<ToolResult> {
     let started = Instant::now();
     let mut accumulated = String::new();
+    let mut yielded_error = false;
     while let Some((cell_id, yielded_body)) = yielded_cell(&result) {
+        yielded_error |= result.is_error();
         append_cell_output(&mut accumulated, yielded_body);
         let elapsed = started.elapsed();
         if elapsed >= cell_timeout {
@@ -306,15 +308,41 @@ async fn drive_cell_to_completion(
             .call(json!({ "cell_id": cell_id, "yield_time_ms": wait_ms }), cx)
             .await;
     }
-    Ok(prepend_cell_output(result, accumulated))
+    let result = prepend_cell_output(result, accumulated);
+    Ok(match result {
+        ToolResult::Text(mut text) if yielded_error => {
+            if text.starts_with("Script completed\n") {
+                text.replace_range(.."Script completed".len(), "Script failed");
+            }
+            ToolResult::Error(text)
+        }
+        other => other,
+    })
 }
 
 fn yielded_cell(result: &ToolResult) -> Option<(String, &str)> {
-    let ToolResult::Text(text) = result else {
-        return None;
+    let text = match result {
+        ToolResult::Text(text) | ToolResult::Error(text) => text,
+        _ => return None,
     };
-    const MARKER: &str = "\n\nScript running with cell ID ";
+    const PREFIX: &str = "Script running with cell ID ";
     const SUFFIX: &str = ". Call `wait` with this cell_id for more output.";
+    if let Some(after_prefix) = text.strip_prefix(PREFIX) {
+        let (header, body) = after_prefix.split_once('\n')?;
+        let cell_id = header.strip_suffix(SUFFIX)?;
+        return Some((
+            cell_id.to_string(),
+            body.strip_prefix("Output:\n").unwrap_or(body),
+        ));
+    }
+    if matches!(
+        text.lines().next(),
+        Some("Script completed" | "Script failed" | "Script terminated")
+    ) {
+        return None;
+    }
+    // Accept the previous footer shape when driving an older tool adapter.
+    const MARKER: &str = "\n\nScript running with cell ID ";
     let marker_start = text.rfind(MARKER)?;
     let after_marker = &text[marker_start + MARKER.len()..];
     let suffix_start = after_marker.find(SUFFIX)?;
@@ -343,11 +371,26 @@ fn prepend_cell_output(result: ToolResult, accumulated: String) -> ToolResult {
     }
     match result {
         ToolResult::Text(text) if text.is_empty() => ToolResult::Text(accumulated),
-        ToolResult::Text(text) => ToolResult::Text(format!("{accumulated}\n{text}")),
+        ToolResult::Text(text) => ToolResult::Text(combine_cell_output(&accumulated, &text)),
         ToolResult::Error(error) if error.is_empty() => ToolResult::Error(accumulated),
-        ToolResult::Error(error) => ToolResult::Error(format!("{accumulated}\n{error}")),
+        ToolResult::Error(error) => ToolResult::Error(combine_cell_output(&accumulated, &error)),
         other => other,
     }
+}
+
+fn combine_cell_output(accumulated: &str, final_text: &str) -> String {
+    if let Some((status, body)) = final_text.split_once('\n')
+        && matches!(
+            status,
+            "Script completed" | "Script failed" | "Script terminated"
+        )
+    {
+        let body = body.strip_prefix("Output:\n").unwrap_or(body);
+        let mut output = format!("{status}\nOutput:\n{accumulated}");
+        append_cell_output(&mut output, body);
+        return output;
+    }
+    format!("{accumulated}\n{final_text}")
 }
 
 async fn shutdown_session_owned_children(cx: &ToolCx, surface: &IsolateSurface) {
@@ -565,9 +608,74 @@ text("after");"#
 
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ToolResult::Text(t) => assert_eq!(t, "before\nafter"),
+            ToolResult::Text(t) => assert_eq!(t, "Script completed\nOutput:\nbefore\nafter"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn yielded_cell_parses_new_headers_and_legacy_footers() {
+        for result in [
+            ToolResult::Text("Script running with cell ID 7. Call `wait` with this cell_id for more output.\nOutput:\nbefore".into()),
+            ToolResult::Text("before\n\nScript running with cell ID 7. Call `wait` with this cell_id for more output.".into()),
+            ToolResult::Error("Script running with cell ID 7. Call `wait` with this cell_id for more output.\nOutput:\nbefore".into()),
+        ] {
+            assert_eq!(yielded_cell(&result), Some(("7".into(), "before")));
+        }
+        let completed = ToolResult::Text(
+            "Script completed\nOutput:\n\nScript running with cell ID 7. Call `wait` with this cell_id for more output.".into(),
+        );
+        assert!(yielded_cell(&completed).is_none());
+    }
+
+    #[tokio::test]
+    async fn cell_mode_continues_after_yielded_image_error_and_retains_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cx = make_cx(root, ToolArgDefaults::default());
+        let results = execute_cell_sources(
+            vec![
+                "text('before'); image('data:image/png;base64,AA=='); await yield_control(); text('after');".into(),
+                "text('must not execute');".into(),
+            ],
+            &cx,
+            &[],
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "a failed output must stop subsequent cells"
+        );
+        let ToolResult::Error(text) = &results[0] else {
+            panic!("expected retained image error, got {:?}", results[0]);
+        };
+        assert!(text.contains("image() output is unsupported"), "{text}");
+        assert!(text.starts_with("Script failed\n"), "{text}");
+        assert!(
+            text.find("before").unwrap() < text.find("after").unwrap(),
+            "{text}"
+        );
+        assert!(!text.contains("Script running"), "{text}");
+        assert!(!text.contains("must not execute"), "{text}");
+    }
+
+    #[test]
+    fn accumulated_cell_output_keeps_terminal_diagnostics() {
+        let result = prepend_cell_output(
+            ToolResult::Error(
+                "Script failed\nScript error:\nmissing is not defined\nOutput:\nlast output".into(),
+            ),
+            "first output".into(),
+        );
+        let ToolResult::Error(text) = result else {
+            panic!("expected retained terminal error, got {result:?}");
+        };
+        assert!(text.starts_with("Script failed\nOutput:\nfirst output\n"));
+        assert!(text.contains("Script error:\nmissing is not defined"));
+        assert!(text.ends_with("last output"));
     }
 
     /// `build_surface` wiring proof: an MCP server's tools merge into the

@@ -1,0 +1,25 @@
+{
+  "id": "gap-49db33e3",
+  "title": "Harness output spill recovery recursively spills and hides source continuation",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Bound file/search/outline results at the producer and preserve source identity, continuation, errors, and async handles through model-facing rendering. Recovery of oversized output must make progress without creating another dump.",
+  "missing_primitive": "Source-aware bounded reader and metadata-preserving output envelope",
+  "fallback_used": "Read original source paths in small ranges; use code-mode to select fields before text().",
+  "evidence": [
+    "crates/bro-harness/src/bound.rs:47",
+    "crates/bro-tools/src/workspace.rs:468",
+    "crates/bro-tools/src/workspace.rs:1072",
+    "crates/bro-harness/src/code_mode.rs:339"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/recursive-output-spill",
+  "notes": "Synthetic fixture: 210954-byte numbered file_read became 2248-byte preview; subsequent numbered recovery payloads grew to 219851 and 228749 bytes and all spilled. Original continuation hint was absent from inline output. Related addressed gap-0c902d6d caps search at 24000 bytes, still above the 16384-byte harness cap. See design/bro-harness/model-facing-tools-audit.md.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T18:23:20Z",
+  "updated_at": "2026-09-10T18:44:56Z",
+  "resolved_at": "2026-09-10T18:44:56Z",
+  "resolution_note": "Addressed on fix/harness-tool-contracts: bounded exact source pages and UTF-8 byte continuation, no generic dump recursion, bounded source/search/shell/listing/web output with explicit omission metadata. Source end-of-line bytes survive paging. Focused suite and full workspace nextest (6770 passed), clippy, concurrency lint, formatting, and rebuilt isolate probes pass."
+}

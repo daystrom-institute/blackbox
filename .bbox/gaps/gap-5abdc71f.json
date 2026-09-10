@@ -1,0 +1,24 @@
+{
+  "id": "gap-5abdc71f",
+  "title": "git_commit accepts broad pathspecs and commits unrelated staged files",
+  "gap_kind": "tooling",
+  "domain": "git_commit",
+  "wanted_capability": "A commit tool whose explicit paths restrict both staging and committed content, rejecting broad pathspecs and validating every expanded file for sensitivity.",
+  "missing_primitive": "Validated exact path selection and index isolation",
+  "fallback_used": "Inspected the implementation and reproduced only in an isolated temporary repository.",
+  "evidence": [
+    "crates/bro-tools/src/workspace.rs:915",
+    "crates/bro-tools/src/workspace.rs:934",
+    "crates/bro-tools/src/workspace.rs:947"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/git_commit/explicit-path-isolation",
+  "notes": "Synthetic isolate probe with peer.txt already staged and paths=[mine.txt] committed both files. A second call with paths=[.] also succeeded. No real repository was committed by these probes. See design/bro-harness/model-facing-tools-audit.md.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T18:23:20Z",
+  "updated_at": "2026-09-10T18:44:56Z",
+  "resolved_at": "2026-09-10T18:44:56Z",
+  "resolution_note": "Addressed on fix/harness-tool-contracts: literal-file preflight refuses directories/globs/magic/symlinks/sensitive paths and foreign staged work; selected-path commit excludes late peer staging and handles deletions. Five isolated Git behavioral tests pass; full workspace nextest passes."
+}

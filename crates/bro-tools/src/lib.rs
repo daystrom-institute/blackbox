@@ -18,7 +18,10 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod edits;
+pub mod file_read;
 pub mod fleet_worktree;
+pub mod git_commit;
+pub mod output;
 pub mod promise;
 pub mod safety;
 pub mod shell;

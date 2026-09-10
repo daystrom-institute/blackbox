@@ -10,6 +10,8 @@ use crate::PUBLIC_TOOL_NAME;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 To find one, filter `ALL_TOOLS` by `name` and `description`."#;
+// Local addition (not vendored): document the harness output cap and its
+// text-only transport instead of promising upstream image forwarding.
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
 - All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
@@ -19,13 +21,13 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call may still be in flight when the cell yields; call `wait` with the returned cell id to observe the eventual tool response and final result.
-- `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
+- `max_output_tokens` sets the text output budget for direct `exec` results, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers. Large text keeps its beginning and end; print a smaller selection to inspect omitted content.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded. Each `exec` cell is a FRESH scope: locals from earlier cells are gone — redeclare them, or pass values across cells via `store()`/`load()`.
 
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
 - `text(value: string | number | boolean | undefined | null)`: Appends a text item. Non-string values are stringified with `JSON.stringify(...)` when possible.
-- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` can be an HTTPS URL or a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument.
+- `image(...)`: Unsupported by the harness text-only tool-result transport. Emitting an image reports an output error; no image is delivered to the model.
 - `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session. Functions store too — `store("helpers.parseDiag", (line) => {...})` persists the function's SOURCE, so it must be self-contained (captured outer variables do not survive; a revived function referencing them throws ReferenceError at call time).
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing. A stored function comes back as a callable: `const parse = load("helpers.parseDiag"); parse(line)`.
 - `notify(value: string | number | boolean | undefined | null)`: queues a notification for this cell; it is delivered in a `[notifications]` section of the next `exec`/`wait` result for the cell. Values are stringified like `text(...)`.
@@ -35,10 +37,11 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
 
 - Side-channel notes (e.g. a `done` note for an orchestrator): when the host exposes a note tool it is a nested tool like any other — `await tools.mcp__blackbox__bbox_note({ kind: "done", body: "..." })`. If it is not listed above, filter `ALL_TOOLS` by `name` for `bbox_note` to confirm the exact identifier; do not search the web or the filesystem for it."#;
+// Local addition (not vendored): wait uses the same bounded host envelope as exec.
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
-- `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
+- `max_tokens` limits new text output for this wait call, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
 - Queued `notify(...)` payloads from the cell are delivered in a `[notifications]` section of the result.
@@ -995,6 +998,19 @@ mod tests {
 bar"
         ));
         assert!(!description.contains("do not attempt to use any other tools directly"));
+    }
+
+    #[test]
+    // Local addition (not vendored): this host cannot deliver image blocks.
+    fn exec_and_wait_describe_the_harness_output_contract() {
+        let description = build_exec_tool_description(&[], &BTreeMap::new(), false, false);
+        assert!(description.contains("four bytes per token"));
+        assert!(description.contains("12 KiB"));
+        assert!(description.contains("no image is delivered"));
+        assert!(!description.contains("Appends an image item"));
+        let wait = super::build_wait_tool_description();
+        assert!(wait.contains("`max_tokens`"));
+        assert!(wait.contains("12 KiB"));
     }
 
     #[test]

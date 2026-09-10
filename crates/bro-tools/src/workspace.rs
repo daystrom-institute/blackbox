@@ -12,7 +12,6 @@ use crate::tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, sc
 use async_trait::async_trait;
 use globset::{Glob as GlobPattern, GlobBuilder};
 use ignore::WalkBuilder;
-use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -315,7 +314,7 @@ pub fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
 /// absolute path so oversized tool-result riders can point at a lossless
 /// recovery path. This is intentionally not used by write/edit/shell tools
 /// (those go through [`resolve_in_root`]).
-fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let Some(stripped) = raw.strip_prefix('@') else {
         let path = Path::new(raw);
         if path.is_absolute() {
@@ -463,114 +462,7 @@ fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
 // file_read
 // ---------------------------------------------------------------------------
 
-/// Default cap on lines returned by a single `file_read` when no explicit
-/// `max_lines` is given. Keeps an unbounded read from flooding context.
-const FILE_READ_DEFAULT_MAX_LINES: usize = 2000;
-
-#[derive(Deserialize, JsonSchema)]
-struct FileReadInput {
-    /// Path to the file. Relative paths resolve against the worktree root;
-    /// absolute paths are accepted as-is. `@relative/path` is accepted as a
-    /// file mention; `@/absolute/instruction.md` is accepted for read-only
-    /// instruction docs outside the worktree.
-    file_path: String,
-    /// 1-based start line (inclusive). Omit to read from the beginning.
-    start_line: Option<usize>,
-    /// 1-based end line (inclusive). Omit to read to EOF.
-    end_line: Option<usize>,
-    /// Cap on the number of lines returned (default 2000). The read stops once
-    /// this many in-range lines have been collected; a truncation marker is
-    /// appended so the caller knows there is more.
-    max_lines: Option<usize>,
-    /// When true, prefix each returned line with its 1-based file line number
-    /// (`<n>\t<text>`, cat -n style), so line ranges in follow-up edits are
-    /// unambiguous. Default false.
-    #[serde(default)]
-    line_numbers: bool,
-}
-
-pub struct FileRead;
-
-#[async_trait]
-impl Tool for FileRead {
-    fn name(&self) -> &str {
-        "file_read"
-    }
-    fn description(&self) -> &str {
-        "Read a UTF-8 text file in the worktree. Supports explicit @file mentions: @relative/path resolves inside the worktree, and @/absolute/instruction.md can read instruction docs outside it. Absolute harness dump paths from oversized tool-result riders are also readable. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<FileReadInput>()
-    }
-    fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations {
-            read_only: true,
-            ..Default::default()
-        }
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        use tokio::io::AsyncBufReadExt;
-
-        let args: FileReadInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
-        };
-        let path = match resolve_read_path(&cx.root, &args.file_path) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
-        };
-
-        // 1-based inclusive [start, end]; line numbers are 1-based here.
-        let start = args.start_line.unwrap_or(1).max(1);
-        let end = args.end_line.unwrap_or(usize::MAX);
-        if start > end {
-            return ToolResult::Error(format!("start_line {start} is after end_line {end}"));
-        }
-        let max_lines = args.max_lines.unwrap_or(FILE_READ_DEFAULT_MAX_LINES);
-
-        let mut reader = tokio::io::BufReader::new(file).lines();
-        let mut collected: Vec<String> = Vec::new();
-        let mut lineno = 0usize;
-        let mut more_after_cap = false;
-        loop {
-            let line = match reader.next_line().await {
-                Ok(Some(l)) => l,
-                Ok(None) => break,
-                Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
-            };
-            lineno += 1;
-            if lineno < start {
-                continue;
-            }
-            if lineno > end {
-                break;
-            }
-            if collected.len() == max_lines {
-                // There is at least one more in-range line we are not returning.
-                more_after_cap = true;
-                break;
-            }
-            if args.line_numbers {
-                collected.push(format!("{lineno}\t{line}"));
-            } else {
-                collected.push(line);
-            }
-        }
-
-        let mut out = collected.join("\n");
-        if more_after_cap {
-            let next = start + max_lines;
-            out.push_str(&format!(
-                "\n[truncated at max_lines={max_lines}; continue with start_line={next}]"
-            ));
-        }
-        ToolResult::Text(out)
-    }
-}
+pub use crate::file_read::FileRead;
 
 // ---------------------------------------------------------------------------
 // file_write
@@ -582,8 +474,7 @@ struct FileWriteInput {
     /// absolute paths are accepted as-is. Parent dirs are created.
     file_path: String,
     /// Full new contents of the file.
-    #[serde(default)]
-    content: Option<String>,
+    content: String,
 }
 
 pub struct FileWrite;
@@ -610,10 +501,7 @@ impl Tool for FileWrite {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let content = match args.content {
-            Some(c) => c,
-            None => return ToolResult::Error("file_write needs content".into()),
-        };
+        let content = args.content;
         let path = match resolve_in_root(&cx.root, &args.file_path) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
@@ -662,6 +550,10 @@ struct ListDirInput {
     /// Directory to list. Relative paths resolve against the worktree root;
     /// absolute paths are accepted as-is. Defaults to root.
     path: Option<String>,
+    /// Maximum entries (default 200, maximum 1000). Must be positive.
+    limit: Option<usize>,
+    /// Offset into the current lexicographically sorted directory listing.
+    offset: Option<usize>,
 }
 
 pub struct ListDir;
@@ -672,7 +564,7 @@ impl Tool for ListDir {
         "list_dir"
     }
     fn description(&self) -> &str {
-        "List the immediate entries of a directory in the worktree."
+        "List immediate directory entries in name order, with bounded pages (default 200). Follow next_offset with the same path. This is a live listing; concurrent file changes can move entries between pages."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ListDirInput>()
@@ -684,8 +576,10 @@ impl Tool for ListDir {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: ListDirInput =
-            serde_json::from_value(input).unwrap_or(ListDirInput { path: None });
+        let args: ListDirInput = match serde_json::from_value(input) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::Error(format!("bad input: {error}")),
+        };
         let dir = match resolve_in_root(&cx.root, args.path.as_deref().unwrap_or(".")) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
@@ -695,14 +589,44 @@ impl Tool for ListDir {
             Err(e) => return ToolResult::Error(format!("read_dir {}: {e}", dir.display())),
         };
         let mut entries = Vec::new();
-        while let Ok(Some(ent)) = rd.next_entry().await {
+        let limit = args.limit.unwrap_or(200).min(1000);
+        if limit == 0 {
+            return ToolResult::Error("limit must be positive".into());
+        }
+        loop {
+            let ent = match rd.next_entry().await {
+                Ok(Some(ent)) => ent,
+                Ok(None) => break,
+                Err(error) => return ToolResult::Error(format!("read_dir: {error}")),
+            };
+            if entries.len() == 20_000 {
+                return ToolResult::Error(
+                    "directory exceeds 20000 entries; use glob with a narrower pattern".into(),
+                );
+            }
             let is_dir = ent.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             entries.push(json!({
                 "name": ent.file_name().to_string_lossy(),
                 "is_dir": is_dir,
             }));
         }
-        ToolResult::Json(json!({ "entries": entries }))
+        entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        let total = entries.len();
+        let offset = args.offset.unwrap_or(0);
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        for entry in entries.into_iter().skip(offset).take(limit) {
+            let size = entry.to_string().len() + 1;
+            if bytes + size > crate::output::DEFAULT_OUTPUT_BYTES {
+                break;
+            }
+            bytes += size;
+            page.push(entry);
+        }
+        let next = offset.saturating_add(page.len());
+        ToolResult::Json(
+            json!({ "entries": page, "total":total, "next_offset":(next < total).then_some(next) }),
+        )
     }
 }
 
@@ -885,67 +809,16 @@ impl Tool for GitShow {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GitShowInput =
-            serde_json::from_value(input).unwrap_or(GitShowInput { rev: None });
-        let rev = args.rev.unwrap_or_else(|| "HEAD".into());
-        git(cx, &["show", &rev]).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// git_commit (guarded)
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize, JsonSchema)]
-struct GitCommitInput {
-    /// Commit message.
-    message: String,
-    /// Explicit pathspecs to stage (relative to root). Required — we never
-    /// `git add .`, matching the operator's data-safety rule.
-    paths: Vec<String>,
-}
-
-pub struct GitCommit;
-
-#[async_trait]
-impl Tool for GitCommit {
-    fn name(&self) -> &str {
-        "git_commit"
-    }
-    fn description(&self) -> &str {
-        "Stage the named paths and commit. Refuses to stage sensitive files (.env, *.pem, id_rsa, credentials, ...). Never stages with `.`; paths must be explicit."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<GitCommitInput>()
-    }
-    fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations {
-            destructive: true,
-            ..Default::default()
-        }
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GitCommitInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        let args: GitShowInput = match serde_json::from_value(input) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::Error(format!("bad input: {error}")),
         };
-        if args.paths.is_empty() {
-            return ToolResult::Error("paths must be explicit; refusing to `git add .`".into());
-        }
-        for p in &args.paths {
-            if cx.safety.is_sensitive_path(Path::new(p)) {
-                return ToolResult::Error(format!("refused: {p} looks like a secret/credential"));
-            }
-        }
-        let mut add_args = vec!["add", "--"];
-        add_args.extend(args.paths.iter().map(String::as_str));
-        let staged = git(cx, &add_args).await;
-        if staged.is_error() {
-            return staged;
-        }
-        git(cx, &["commit", "-m", &args.message]).await
+        let rev = args.rev.unwrap_or_else(|| "HEAD".into());
+        git(cx, &["show", "--end-of-options", &rev]).await
     }
 }
+
+pub use crate::git_commit::GitCommit;
 
 // ---------------------------------------------------------------------------
 // file_edit
@@ -1069,7 +942,7 @@ pub struct ContentSearch;
 
 const CONTENT_SEARCH_DEFAULT_MAX_RESULTS: usize = 80;
 const CONTENT_SEARCH_HARD_MAX_RESULTS: usize = 5000;
-const CONTENT_SEARCH_OUTPUT_BYTE_CAP: usize = 24_000;
+const CONTENT_SEARCH_OUTPUT_BYTE_CAP: usize = 8_000;
 
 fn push_search_line(hits: &mut Vec<String>, output_bytes: &mut usize, line: String) -> bool {
     let next = *output_bytes + line.len() + usize::from(!hits.is_empty());
@@ -1267,10 +1140,10 @@ impl Tool for ContentSearch {
 #[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum GlobSort {
-    /// Most-recently-modified first (default) — matches "recently edited" use.
-    #[default]
+    /// Most-recently-modified first, explicitly requested.
     Mtime,
-    /// Lexicographic path order.
+    /// Lexicographic path order (default).
+    #[default]
     Name,
 }
 
@@ -1280,10 +1153,10 @@ struct GlobInput {
     pattern: String,
     /// Base dir relative to root (default root).
     path: Option<String>,
-    /// Result ordering: `mtime` (most recent first, default) or `name`.
+    /// Result ordering: `name` (lexicographic, default) or `mtime` (newest first).
     #[serde(default)]
     sort: GlobSort,
-    /// Max paths to return after sorting (default 1000). A truncation marker is
+    /// Max paths to return after sorting (default 200, maximum 2000). A truncation marker is
     /// appended when more matched, so a capped result is never silent.
     max_results: Option<usize>,
 }
@@ -1318,7 +1191,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &str {
-        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths as ONE newline-delimited STRING (not an array — in code-mode cells use `result.split(\"\\n\")`), capped at max_results (default 1000) with a truncation marker. NOTE: results are sorted by modification time (newest first) by DEFAULT; pass sort=\"name\" for lexicographic order."
+        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths as ONE newline-delimited STRING (not an array; in code-mode cells use `result.split(\"\\n\")`), capped by max_results (default 200, maximum 2000) and 8000 output bytes with an explicit omission marker. Sorted lexicographically by default; sort=\"mtime\" explicitly requests newest first."
     }
     fn input_schema(&self) -> Value {
         schema_for::<GlobInput>()
@@ -1389,7 +1262,7 @@ impl Tool for Glob {
             }
             // Cap AFTER sorting, so the returned slice is the true top-N by the
             // chosen order (not an arbitrary walk-order prefix).
-            let cap = args.max_results.unwrap_or(1000);
+            let cap = args.max_results.unwrap_or(200).clamp(1, 2000);
             let total = out.len();
             let mut lines: Vec<String> = out.into_iter().take(cap).map(|(rel, _)| rel).collect();
             if total > lines.len() {
@@ -1398,7 +1271,10 @@ impl Tool for Glob {
                     lines.len()
                 ));
             }
-            ToolResult::Text(lines.join("\n"))
+            ToolResult::Text(crate::output::truncate_text(
+                &lines.join("\n"),
+                crate::output::DEFAULT_OUTPUT_BYTES,
+            ))
         })
         .await
     }
@@ -1415,8 +1291,7 @@ struct SmartReadInput {
     /// file mention; `@/absolute/instruction.md` is accepted for read-only
     /// instruction docs outside the worktree.
     file_path: String,
-    /// Line count above which the file is outlined instead of returned whole
-    /// (default 400).
+    /// Maximum lines to return (default 200); continuation uses file_read.
     max_full_lines: Option<usize>,
 }
 
@@ -1428,7 +1303,7 @@ impl Tool for SmartRead {
         "smart_read"
     }
     fn description(&self) -> &str {
-        "Read a file; small files are returned whole, large files are summarized as a definition outline (with line numbers) plus a head sample, so you can then file_read specific ranges. Supports @file mention syntax and absolute harness dump paths with the same read-only external carveouts as file_read."
+        "Compatibility alias for bounded file_read. Returns exact source text, never a heuristic summary. Prefer file_read with explicit ranges and its continuation parameters."
     }
     fn input_schema(&self) -> Value {
         schema_for::<SmartReadInput>()
@@ -1444,55 +1319,13 @@ impl Tool for SmartRead {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let path = match resolve_read_path(&cx.root, &args.file_path) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        let body = match tokio::fs::read_to_string(&path).await {
-            Ok(b) => b,
-            Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
-        };
-        let lines: Vec<&str> = body.lines().collect();
-        let threshold = args.max_full_lines.unwrap_or(400);
-        if lines.len() <= threshold {
-            return ToolResult::Text(body);
-        }
-        // Outline: lines that look like definitions/headers.
-        let def = definition_regex();
-        let mut outline: Vec<String> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if def.is_match(line) {
-                outline.push(format!("{}: {}", i + 1, line.trim_end()));
-            }
-        }
-        let head: String = lines
-            .iter()
-            .take(40)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        let summary = format!(
-            "[smart_read: {} lines — outlined (use file_read with start_line/end_line for detail)]\n\n\
-             === head (lines 1-40) ===\n{head}\n\n\
-             === outline ({} definitions) ===\n{}",
-            lines.len(),
-            outline.len(),
-            if outline.is_empty() {
-                "(no recognizable definitions)".to_string()
-            } else {
-                outline.join("\n")
-            }
-        );
-        ToolResult::Text(summary)
+        FileRead
+            .call(
+                json!({"file_path":args.file_path,"max_lines":args.max_full_lines.unwrap_or(200)}),
+                cx,
+            )
+            .await
     }
-}
-
-fn definition_regex() -> Regex {
-    static SRC: &str = r"^\s*(pub\s+)?(async\s+)?(fn|struct|enum|trait|impl|mod|const|static|type|class|def|function|interface|export|public|private|protected|func|package)\b|^\s*#\[|^#{1,6}\s";
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(SRC).expect("valid definition regex"))
-        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,7 +1671,7 @@ mod tests {
             )
             .await;
         match r {
-            ToolResult::Text(t) => assert_eq!(t, "line3\nline4\nline5"),
+            ToolResult::Text(t) => assert_eq!(t, "line3\nline4\nline5\n"),
             other => panic!("expected text, got {other:?}"),
         }
 
@@ -1863,7 +1696,7 @@ mod tests {
             )
             .await;
         match r {
-            ToolResult::Text(t) => assert_eq!(t, "3\tline3\n4\tline4"),
+            ToolResult::Text(t) => assert_eq!(t, "3\tline3\n4\tline4\n"),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -1882,7 +1715,7 @@ mod tests {
             .call(json!({"file_path": format!("@{}", doc.display())}), &cx)
             .await;
         match r {
-            ToolResult::Text(t) => assert_eq!(t, "global blackbox instructions"),
+            ToolResult::Text(t) => assert_eq!(t, "global blackbox instructions\n"),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -1904,7 +1737,7 @@ mod tests {
             .call(json!({"file_path": dump.display().to_string()}), &cx)
             .await;
         match r {
-            ToolResult::Text(t) => assert_eq!(t, "full spilled payload"),
+            ToolResult::Text(t) => assert_eq!(t, "full spilled payload\n"),
             other => panic!("expected text, got {other:?}"),
         }
 
@@ -2057,8 +1890,10 @@ mod tests {
             .unwrap();
         let cx = cx_at(dir.path());
 
-        // default mtime → newest (zzz) first
-        let r = Glob.call(json!({"pattern":"*.rs"}), &cx).await;
+        // Explicit mtime puts newest (zzz) first
+        let r = Glob
+            .call(json!({"pattern":"*.rs","sort":"mtime"}), &cx)
+            .await;
         match r {
             ToolResult::Text(t) => {
                 let lines: Vec<&str> = t.lines().collect();

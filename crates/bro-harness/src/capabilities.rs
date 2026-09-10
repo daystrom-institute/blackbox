@@ -25,6 +25,7 @@ use bro_tools::{Tool, ToolCx, ToolResult};
 pub struct HostTools {
     tools: HashMap<String, Arc<dyn Tool>>,
     cx: ToolCx,
+    execution: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl HostTools {
@@ -34,11 +35,29 @@ impl HostTools {
     /// (`exec`, `wait`, `report`, …) are intentionally NOT
     /// included — they are model-facing controls, not nested cell tools.
     pub fn new(filtered_builtins: Vec<Arc<dyn Tool>>, cx: ToolCx) -> Self {
+        Self::with_dispatch_gate(
+            filtered_builtins,
+            cx,
+            Arc::new(tokio::sync::RwLock::new(())),
+        )
+    }
+
+    /// Share admission with flat tools so work from a yielded cell cannot race
+    /// a subsequent direct invocation.
+    pub fn with_dispatch_gate(
+        filtered_builtins: Vec<Arc<dyn Tool>>,
+        cx: ToolCx,
+        execution: Arc<tokio::sync::RwLock<()>>,
+    ) -> Self {
         let tools = filtered_builtins
             .into_iter()
             .map(|t| (t.name().to_string(), t))
             .collect();
-        Self { tools, cx }
+        Self {
+            tools,
+            cx,
+            execution,
+        }
     }
 }
 
@@ -56,6 +75,14 @@ impl ToolCapability for HostTools {
                 ),
             )
         })?;
+        // Cells may launch calls with Promise.all. Treat mutations as exclusive
+        // barriers and allow declared reads to overlap, just like flat dispatch.
+        // Acquire before applying defaults so the whole invocation is protected.
+        let (_read_guard, _write_guard) = if tool.annotations().read_only {
+            (Some(self.execution.read().await), None)
+        } else {
+            (None, Some(self.execution.write().await))
+        };
         let (content, is_error, content_type) = match crate::registry::call_tool_with_arg_defaults(
             tool.as_ref(),
             &invocation.name,
@@ -133,5 +160,177 @@ mod tests {
             .await;
         let err = denied.expect_err("denied tool must fail closed");
         assert_eq!(err.code, "tool_unavailable");
+    }
+
+    struct ConcurrencyProbe {
+        read_only: bool,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        rendezvous: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    #[async_trait]
+    impl Tool for ConcurrencyProbe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "Test nested dispatch concurrency"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn annotations(&self) -> bro_tools::ToolAnnotations {
+            bro_tools::ToolAnnotations {
+                read_only: self.read_only,
+                destructive: false,
+            }
+        }
+        async fn call(&self, _: serde_json::Value, _: &ToolCx) -> ToolResult {
+            use std::sync::atomic::Ordering;
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            if let Some(rendezvous) = &self.rendezvous {
+                rendezvous.wait().await;
+            } else {
+                // Without a host barrier the sibling enters during this yield.
+                tokio::task::yield_now().await;
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::Text("finished".into())
+        }
+    }
+
+    async fn nested_concurrency_peak(read_only: bool) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = test_cx();
+        cx.root = dir.path().canonicalize().unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let host = HostTools::new(
+            vec![Arc::new(ConcurrencyProbe {
+                read_only,
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+                rendezvous: read_only.then(|| Arc::new(tokio::sync::Barrier::new(2))),
+            })],
+            cx,
+        );
+        let invoke = || {
+            host.call_tool(ToolInvocation {
+                name: "probe".into(),
+                input_json: json!({}),
+            })
+        };
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(invoke(), invoke())
+        })
+        .await
+        .expect("nested dispatch should finish without deadlock");
+        assert_eq!(first.unwrap().content, "finished");
+        assert_eq!(second.unwrap().content, "finished");
+        peak.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn nested_mutations_are_exclusive() {
+        assert_eq!(nested_concurrency_peak(false).await, 1);
+    }
+
+    #[tokio::test]
+    async fn nested_reads_can_overlap() {
+        assert_eq!(nested_concurrency_peak(true).await, 2);
+    }
+
+    struct GateProbe {
+        name: &'static str,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for GateProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Test shared dispatch admission"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn call(&self, input: serde_json::Value, _: &ToolCx) -> ToolResult {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if input["block"] == true {
+                self.release.notified().await;
+            }
+            ToolResult::Text(self.name.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_nested_mutation_blocks_flat_mutation_but_not_cell_controls() {
+        use crate::registry::{PinPolicy, Registry};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = test_cx();
+        cx.root = dir.path().canonicalize().unwrap();
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mutation: Arc<dyn Tool> = Arc::new(GateProbe {
+            name: "mutation",
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let host = HostTools::with_dispatch_gate(vec![mutation.clone()], cx.clone(), gate.clone());
+        let mut flat_tools = vec![mutation];
+        for name in [
+            bro_code_mode::PUBLIC_TOOL_NAME,
+            bro_code_mode::WAIT_TOOL_NAME,
+        ] {
+            flat_tools.push(Arc::new(GateProbe {
+                name,
+                started: Arc::new(AtomicUsize::new(0)),
+                release: release.clone(),
+            }));
+        }
+        let mut registry = Registry::new(
+            flat_tools,
+            vec![],
+            &PinPolicy::from_env(),
+            &crate::mcp::ToolFilter::default(),
+        );
+        registry.set_dispatch_gate(gate);
+        let mut nested = Box::pin(host.call_tool(ToolInvocation {
+            name: "mutation".into(),
+            input_json: json!({"block": true}),
+        }));
+        assert!(futures_util::poll!(&mut nested).is_pending());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        let mut flat = Box::pin(registry.dispatch("mutation", json!({}), &cx));
+        assert!(futures_util::poll!(&mut flat).is_pending());
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "flat mutation must await the nested mutation"
+        );
+        for name in [
+            bro_code_mode::PUBLIC_TOOL_NAME,
+            bro_code_mode::WAIT_TOOL_NAME,
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                registry.dispatch(name, json!({}), &cx),
+            )
+            .await
+            .expect("cell controls must bypass the shared gate");
+            assert_eq!(result.into_content(), (name.into(), false));
+        }
+        release.notify_one();
+        assert!(!nested.await.unwrap().is_error);
+        assert_eq!(flat.await.into_content(), ("mutation".into(), false));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
     }
 }

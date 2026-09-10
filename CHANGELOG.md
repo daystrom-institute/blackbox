@@ -28,6 +28,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness file reads return bounded exact source pages with line/byte continuations.
+  Oversized tool output uses explicit omissions instead of recursive dump files;
+  shell metadata and code-mode continuation handles remain visible.
+- Code-mode exec/wait enforce their output budgets and report unsupported image
+  output explicitly. File writes require content; directory reads page results;
+  searches, shell output, globs and web excerpts have compact output limits.
+- `smart_read` is a deferred compatibility alias for exact bounded reads. Git and
+  grounding convenience tools are deferred, globs default to name order, and
+  heuristic toolbox-preference nudges are off unless explicitly enabled.
+- Flat tool batches preserve read/write order and completed results on interruption.
+  Flat and nested calls share mutation exclusion; automatic/overflow compaction
+  restores startup instructions before the next model request.
+- `git_commit` validates literal files, refuses unrelated staged work, and commits
+  only the selected paths, including explicit deletions.
+
 - DeepSeek V4.1 Flash is selectable as `deepseek-flash` and is the default
   DeepSeek model across built-in allocator tiers, with native low/high/max
   efforts and a 1M harness context window. Legacy V4 Flash model names remain

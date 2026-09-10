@@ -3,7 +3,7 @@
 //! Projects the harness tool surface into the vendored [`bro_code_mode`] runtime
 //! as a typed `tools.*` namespace, and exposes exactly two model-facing tools:
 //! `exec` (run a JS/TS cell that composes `tools.*` calls, emits content via
-//! `text()`/`image()`, and persists across cells via `store()`/`load()`) and
+//! `text()`, and persists across cells via `store()`/`load()`) and
 //! `wait` (resume or terminate a still-running cell by `cell_id`).
 //!
 //! A cell's nested `tools.X(...)` call dispatches back through the SAME filtered
@@ -18,15 +18,17 @@ use async_trait::async_trait;
 use bro_capabilities::{ToolCapability, ToolInvocation};
 use bro_code_mode::{
     CellId, CodeModeNestedToolCall, CodeModeService, CodeModeSessionDelegate, CodeModeToolKind,
-    ExecuteRequest, FunctionCallOutputContentItem, NamespaceBinding, NotificationFuture,
-    PUBLIC_TOOL_NAME, RuntimeResponse, ToolDefinition, ToolInvocationFuture, ToolName,
-    ToolNamespaceDescription, WAIT_TOOL_NAME, WaitOutcome, WaitRequest,
-    build_exec_tool_description, build_wait_tool_description, is_code_mode_nested_tool,
-    parse_exec_source,
+    ExecuteRequest, NamespaceBinding, NotificationFuture, PUBLIC_TOOL_NAME, RuntimeResponse,
+    ToolDefinition, ToolInvocationFuture, ToolName, ToolNamespaceDescription, WAIT_TOOL_NAME,
+    WaitOutcome, WaitRequest, build_exec_tool_description, build_wait_tool_description,
+    is_code_mode_nested_tool, parse_exec_source,
 };
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+
+mod output;
+use output::response_to_result;
 
 /// Tri-state code-mode selector — the harness mirror of Codex's `ToolMode`
 /// (`Direct`/`CodeMode`/`CodeModeOnly`).
@@ -271,83 +273,12 @@ impl CodeModeToolSession {
     }
 }
 
-/// Join the model-facing content items of a runtime response into tool-result
-/// text. Images are noted but not yet forwarded (our `ToolResult` is single
-/// text/json; image-block passthrough is a follow-on transport change).
-fn join_content(items: &[FunctionCallOutputContentItem]) -> String {
-    let mut out = String::new();
-    for item in items {
-        match item {
-            FunctionCallOutputContentItem::InputText { text } => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(text);
-            }
-            FunctionCallOutputContentItem::InputImage { .. } => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str("[image omitted — not yet forwarded by the harness]");
-            }
-        }
-    }
-    out
-}
-
-/// Render queued `notify(...)` payloads as a clearly-delimited section
-/// appended to the cell output body. Empty when nothing was queued.
-fn render_notifications(notifications: &[String]) -> String {
-    if notifications.is_empty() {
-        return String::new();
-    }
-    format!("\n\n[notifications]\n{}", notifications.join("\n"))
-}
-
 /// The cell a runtime response belongs to (every variant carries one).
 fn response_cell_id(response: &RuntimeResponse) -> &CellId {
     match response {
         RuntimeResponse::Result { cell_id, .. }
         | RuntimeResponse::Yielded { cell_id, .. }
         | RuntimeResponse::Terminated { cell_id, .. } => cell_id,
-    }
-}
-
-/// Map a runtime response into a harness tool result. A still-running cell
-/// surfaces its `cell_id` so the model can `wait`. `notifications` are the
-/// drained `notify(...)` payloads for the cell, delivered as a delimited
-/// section alongside the cell output.
-fn response_to_result(response: RuntimeResponse, notifications: Vec<String>) -> ToolResult {
-    let notifications = render_notifications(&notifications);
-    match response {
-        RuntimeResponse::Result {
-            content_items,
-            error_text,
-            ..
-        } => {
-            let body = format!("{}{notifications}", join_content(&content_items));
-            match error_text {
-                Some(err) if body.is_empty() => ToolResult::Error(err),
-                Some(err) => ToolResult::Error(format!("{body}\n{err}")),
-                None => ToolResult::Text(body),
-            }
-        }
-        RuntimeResponse::Yielded {
-            cell_id,
-            content_items,
-        } => {
-            let body = format!("{}{notifications}", join_content(&content_items));
-            ToolResult::Text(format!(
-                "{body}\n\nScript running with cell ID {cell_id}. Call `wait` with this cell_id for more output.",
-            ))
-        }
-        RuntimeResponse::Terminated {
-            cell_id,
-            content_items,
-        } => {
-            let body = format!("{}{notifications}", join_content(&content_items));
-            ToolResult::Text(format!("{body}\n\n[cell {cell_id} terminated]"))
-        }
     }
 }
 
@@ -395,6 +326,7 @@ impl Tool for ExecTool {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(format!("exec: {e}")),
         };
+        let max_output_tokens = parsed.max_output_tokens;
         let request = ExecuteRequest {
             tool_call_id: "exec".to_string(),
             enabled_tools: self.surface.catalog.clone(),
@@ -411,7 +343,7 @@ impl Tool for ExecTool {
                 let notifications = self
                     .surface
                     .drain_notifications(response_cell_id(&response));
-                response_to_result(response, notifications)
+                response_to_result(response, notifications, max_output_tokens)
             }
             Err(e) => ToolResult::Error(format!("exec failed: {e}")),
         }
@@ -443,6 +375,12 @@ impl Tool for WaitTool {
                     "description": "How long to wait for more output before yielding again (default 10000).",
                     "minimum": 0
                 },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Output token budget for this wait call, estimated at four bytes per token. Defaults to 10000; the complete response is capped at 12 KiB with space reserved for status and diagnostics.",
+                    "minimum": 0,
+                    "maximum": 9007199254740991_u64
+                },
                 "terminate": {
                     "type": "boolean",
                     "description": "Stop the running cell instead of waiting for output."
@@ -455,6 +393,24 @@ impl Tool for WaitTool {
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
         let Some(cell_id) = input.get("cell_id").and_then(Value::as_str) else {
             return ToolResult::Error("wait: `cell_id` is required".into());
+        };
+        if cell_id.len() > 128 {
+            return ToolResult::Error("wait: `cell_id` exceeds 128 bytes".into());
+        }
+        let max_tokens = match input.get("max_tokens") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value
+                .as_u64()
+                .filter(|tokens| *tokens <= 9_007_199_254_740_991)
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                Some(tokens) => Some(tokens),
+                None => {
+                    return ToolResult::Error(
+                        "wait: `max_tokens` must be a non-negative safe integer".into(),
+                    );
+                }
+            },
         };
         let cell_id = CellId::new(cell_id.to_string());
         let terminate = input
@@ -481,7 +437,7 @@ impl Tool for WaitTool {
                 let notifications = self
                     .surface
                     .drain_notifications(response_cell_id(&response));
-                response_to_result(response, notifications)
+                response_to_result(response, notifications, max_tokens)
             }
             Err(e) => ToolResult::Error(format!("wait failed: {e}")),
         }
@@ -581,6 +537,107 @@ mod tests {
         assert!(!CodeMode::Off.enables_code_surface());
         assert!(CodeMode::Only.defers_builtins());
         assert!(!CodeMode::Optional.defers_builtins());
+    }
+
+    #[tokio::test]
+    async fn exec_and_wait_enforce_separate_output_budgets() {
+        let (exec, wait) = code_mode_pair(vec![]);
+        let source = r#"// @exec: {"max_output_tokens": 1}
+text('AB' + 'x'.repeat(20000) + 'YZ');
+await yield_control();
+text('CD' + 'z'.repeat(20000) + 'UV');
+"#;
+        let initial = exec.call(json!({ "source": source }), &test_cx()).await;
+        let cell_id = match initial {
+            ToolResult::Text(text) => {
+                assert!(text.starts_with("Script running with cell ID"));
+                assert!(text.contains("Output:\nAB\n[output truncated;"));
+                assert!(text.ends_with("\nYZ"));
+                yielded_cell_id(&text)
+            }
+            other => panic!("expected yielded text, got {other:?}"),
+        };
+        assert_eq!(
+            wait.input_schema()["properties"]["max_tokens"]["type"],
+            "integer"
+        );
+        let result = wait
+            .call(
+                json!({ "cell_id": cell_id, "max_tokens": 2, "yield_time_ms": 5000 }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Text(text) => {
+                assert!(text.starts_with("Script completed\n"), "{text}");
+                assert!(text.contains("Output:\nCDzz\n[output truncated;"), "{text}");
+                assert!(text.ends_with("\nzzUV"), "{text}");
+                assert!(
+                    !text.contains("AB"),
+                    "wait must not replay prior output: {text}"
+                );
+            }
+            other => panic!("expected completed text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_wait_budget_does_not_consume_or_terminate_the_cell() {
+        let (exec, wait) = code_mode_pair(vec![]);
+        let result = exec
+            .call(
+                json!({ "source": "await yield_control(); text('still available');" }),
+                &test_cx(),
+            )
+            .await;
+        let ToolResult::Text(text) = result else {
+            panic!("expected yielded result, got {result:?}");
+        };
+        let cell_id = yielded_cell_id(&text);
+        for budget in [
+            json!(-1),
+            json!(1.5),
+            json!("2"),
+            json!(9_007_199_254_740_992_u64),
+        ] {
+            let result = wait
+                .call(
+                    json!({ "cell_id": cell_id, "max_tokens": budget, "terminate": true }),
+                    &test_cx(),
+                )
+                .await;
+            assert!(
+                matches!(result, ToolResult::Error(ref text) if text.contains("non-negative safe integer"))
+            );
+        }
+        let result = wait
+            .call(
+                json!({ "cell_id": cell_id, "yield_time_ms": 5000 }),
+                &test_cx(),
+            )
+            .await;
+        assert!(matches!(result, ToolResult::Text(ref text) if text.contains("still available")));
+    }
+
+    #[tokio::test]
+    async fn emitted_image_reports_unsupported_transport() {
+        let exec = exec_with(vec![]);
+        assert!(exec.description().contains("no image is delivered"));
+        let result = exec
+            .call(
+                json!({ "source": "image('data:image/png;base64,AA=='); text('other output');" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Error(text) => {
+                assert!(text.starts_with("Script failed\n"));
+                assert!(text.contains("image() output is unsupported"));
+                assert!(text.contains("other output"));
+                assert!(!text.contains("AA=="));
+            }
+            other => panic!("expected unsupported-image error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -870,7 +927,7 @@ text(JSON.stringify(result));
             .await;
         match result {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t.split_once("Output:\n").unwrap().1.lines().collect();
                 assert_eq!(lines[0], "function", "got: {t}");
                 assert_eq!(lines[1], "undefined", "got: {t}");
                 assert_eq!(lines[2], "undefined", "got: {t}");

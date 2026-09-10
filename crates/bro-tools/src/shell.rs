@@ -39,7 +39,7 @@ use tokio::time::{Instant, sleep_until};
 /// rather than retained, so a runaway producer can't exhaust memory.
 const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
 /// Default returned-output budget (~40 KB at a 4-bytes/token heuristic).
-const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_000;
 /// Default cooperative yield for a fresh command. Long commands should not make
 /// the whole agent turn look hung just because the model forgot to set
 /// `yield_time_ms`.
@@ -606,7 +606,7 @@ struct ShellRunInput {
     /// 0 only when you deliberately want to block until completion/timeout.
     yield_time_ms: Option<u64>,
     /// Cap on returned stdout/stderr, in approximate tokens (~4 bytes each;
-    /// default 10000). The TAIL is kept so trailing errors survive.
+    /// default 2000). The TAIL is kept so trailing errors survive.
     max_output_tokens: Option<usize>,
     /// Initial stdin written to the process. The stream stays open for
     /// shell_poll to feed more, unless close_stdin is set.
@@ -635,7 +635,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). output_filter keeps matching stdout/stderr lines after capture without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; tail kept). output_filter keeps matching stdout/stderr lines after capture without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -657,7 +657,10 @@ impl Tool for ShellRun {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Error(e.to_string()),
             };
-        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let max_tokens = args
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+            .min(3_000);
 
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-lc", &args.command])
@@ -819,7 +822,10 @@ impl Tool for ShellPoll {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let max_tokens = args
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+            .min(3_000);
         let output_filter_arg = args.output_filter;
         let output_filter_was_provided = output_filter_arg.is_some();
         let output_filter = match compile_output_filter(output_filter_arg) {
@@ -940,7 +946,10 @@ impl Tool for ShellKill {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let max_tokens = args
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+            .min(3_000);
         let output_filter_arg = args.output_filter;
         let output_filter_was_provided = output_filter_arg.is_some();
         let output_filter = match compile_output_filter(output_filter_arg) {

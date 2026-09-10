@@ -1,0 +1,25 @@
+{
+  "id": "gap-3b0f218b",
+  "title": "Code-mode output budgets and image helper are advertised without host enforcement",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Honor exec max_output_tokens and wait max_tokens in the harness host adapter, preserve cell lifecycle/error metadata outside content truncation, and forward advertised image content or make the unsupported capability explicit.",
+  "missing_primitive": "Complete code-mode host result adapter",
+  "fallback_used": "Explicitly select and shorten text inside cells; do not rely on the advertised output budget.",
+  "evidence": [
+    "crates/bro-harness/src/code_mode.rs:277",
+    "crates/bro-harness/src/code_mode.rs:403",
+    "crates/bro-harness/src/code_mode.rs:437",
+    "crates/bro-code-mode/src/description.rs:22"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/code-mode-output-contract",
+  "notes": "Installed isolate probe with max_output_tokens=1 returned all 20000 emitted characters (20001 bytes with CLI newline). Source passes the field into ExecuteRequest but never consumes it. Wait description advertises max_tokens, absent from schema and handler. Upstream Codex 242c5ce01cd3388f7d23a87b68615b2042a04bfc implements truncation in core/src/tools/code_mode/mod.rs before adding lifecycle fields. See design/bro-harness/model-facing-tools-audit.md.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T18:23:40Z",
+  "updated_at": "2026-09-10T18:44:56Z",
+  "resolved_at": "2026-09-10T18:44:56Z",
+  "resolution_note": "Addressed on fix/harness-tool-contracts: host enforces exec/wait budgets under 12KiB, preserves lifecycle handles/error/notifications, explicit unsupported image error and honest description, isolate auto-wait adapts to status prefixes and retains yielded errors. Regression suite and rebuilt isolate validate behavior."
+}

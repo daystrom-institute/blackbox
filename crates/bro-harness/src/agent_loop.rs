@@ -662,9 +662,8 @@ struct Session {
     /// it. `None` for a model the table does not recognize; consumers then
     /// report occupancy with no utilization rather than guessing.
     context_window: Option<u64>,
-    /// Tool-result spill threshold in bytes (0 ⇒ disabled) and the dump dir.
+    /// Ordinary tool-result output limit in bytes (0 disables the limit).
     tool_result_cap: usize,
-    dump_dir: std::path::PathBuf,
     store: SessionStore,
     /// Sidecar append-only timestamped event log (`event_log.rs`). The
     /// emitters tee every protocol event into it; the loop additionally logs
@@ -946,6 +945,7 @@ impl Session {
             .map(|v| crate::code_mode::CodeMode::parse_or_default(&v))
             .unwrap_or_default();
 
+        let dispatch_gate = Arc::new(tokio::sync::RwLock::new(()));
         let mut cm_callable: Vec<Arc<dyn Tool>> = builtins
             .iter()
             .filter(|t| tool_filter.permits(t.name()))
@@ -967,9 +967,12 @@ impl Session {
                     .into_iter()
                     .filter(|t| tool_filter.permits(t.name())),
             );
-            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
-                crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
-            );
+            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> =
+                Arc::new(crate::capabilities::HostTools::with_dispatch_gate(
+                    cm_callable.clone(),
+                    cx.clone(),
+                    dispatch_gate.clone(),
+                ));
             builtins.extend(crate::code_mode::code_mode_tools(
                 &cm_callable,
                 cm_seam,
@@ -1006,6 +1009,7 @@ impl Session {
             &tool_filter,
             code_mode.defers_builtins(),
         );
+        reg.set_dispatch_gate(dispatch_gate);
         if restored_snapshot {
             // Receipts are independent evidence, even when an explicit saved
             // activation list is empty. Neither source can erase the other.
@@ -1064,7 +1068,6 @@ impl Session {
         let compact_threshold = compaction.threshold(&base_opts.model);
         let context_window = compaction.context_window(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
-        let dump_dir = crate::bound::dump_dir();
 
         // Timestamp the session boundary in the sidecar log. Daemon-launched
         // workers receive the dispatch provider through
@@ -1102,7 +1105,6 @@ impl Session {
             compact_threshold,
             context_window,
             tool_result_cap,
-            dump_dir,
             strategy,
             dispatch,
             store,
@@ -1307,6 +1309,9 @@ impl Session {
                         // longer applies.
                         self.pending_input_estimate = 0;
                         self.reference_context_item = None;
+                        // Mid-turn compaction must restore authoritative context
+                        // before the model continues without another user turn.
+                        self.emit_initial_context_if_needed();
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
@@ -1393,7 +1398,9 @@ impl Session {
                                     self.last_prompt_tokens,
                                     summary.len(),
                                 );
+                                self.pending_input_estimate = 0;
                                 self.reference_context_item = None;
+                                self.emit_initial_context_if_needed();
                             }
                             // Nothing compactible, or compaction itself failed:
                             // a retry would just re-overflow — surface the
@@ -1624,64 +1631,60 @@ impl Session {
                 }
             }
 
-            // Dispatch tool calls. Read-only tools (per their annotation) run
-            // CONCURRENTLY; mutating tools run serially after them. Serializing
-            // mutators preserves the edit-sink + interrupt invariants and mirrors
-            // codex's RwLock gate — read = shared/parallel, write = exclusive
-            // (`codex-rs/core/src/tools/parallel.rs`). On interrupt, every
-            // not-yet-resolved call is padded with an interrupted marker so the
-            // assistant(tool_use) message keeps a matching tool_result.
+            // Preserve the model's call order across mutations. Only adjacent
+            // reads may overlap; a write is a barrier for reads on either side.
+            // Collect each completed read immediately so cancellation of a
+            // sibling cannot erase an already completed result.
             let call_count = out.tool_calls.len();
             let mut raw: Vec<Option<(String, bool)>> = (0..call_count).map(|_| None).collect();
             last_tool_results.clear();
             let mut interrupted = false;
-
-            // Phase 1 — concurrent dispatch of read-only tools. They record no
-            // edits and touch no `&mut self` state, so overlapping them is safe
-            // and cuts latency on batches of reads (file_read/glob/search/…).
-            {
-                let read_idx: Vec<usize> = (0..call_count)
-                    .filter(|&i| self.reg.read_only(&out.tool_calls[i].name))
-                    .collect();
-                if !read_idx.is_empty() {
-                    tracing::info!(
-                        parallel = read_idx.len(),
-                        "dispatch (read-only, concurrent)"
-                    );
+            let mut next = 0;
+            while next < call_count {
+                if *cancel.borrow() {
+                    interrupted = true;
+                    break;
+                }
+                if self.reg.read_only(&out.tool_calls[next].name) {
+                    use futures_util::StreamExt as _;
+                    let start = next;
+                    while next < call_count && self.reg.read_only(&out.tool_calls[next].name) {
+                        next += 1;
+                    }
                     let reg = &self.reg;
                     let cx = &self.cx;
                     let calls = &out.tool_calls;
-                    let futs = read_idx.into_iter().map(|i| {
-                        let tc = &calls[i];
-                        async move { (i, reg.dispatch(&tc.name, tc.args.clone(), cx).await) }
-                    });
-                    tokio::select! {
-                        biased;
-                        _ = cancel.changed() => { interrupted = true; }
-                        done = futures_util::future::join_all(futs) => {
-                            for (i, res) in done {
-                                raw[i] = Some(res.into_content());
+                    let mut pending: futures_util::stream::FuturesUnordered<_> = (start..next)
+                        .map(|i| async move {
+                            let tc = &calls[i];
+                            (i, reg.dispatch(&tc.name, tc.args.clone(), cx).await)
+                        })
+                        .collect();
+                    while !pending.is_empty() {
+                        tokio::select! {
+                            biased;
+                            done = pending.next() => {
+                                if let Some((i, res)) = done {
+                                    raw[i] = Some(res.into_content());
+                                }
                             }
+                            _ = cancel.changed() => { interrupted = true; break; }
                         }
                     }
-                }
-            }
-
-            // Phase 2 — serial dispatch of every still-unresolved (mutating)
-            // call, interruptible between calls.
-            if !interrupted {
-                for (i, tc) in out.tool_calls.iter().enumerate() {
-                    if raw[i].is_some() {
-                        continue;
+                    if interrupted {
+                        break;
                     }
+                } else {
+                    let tc = &out.tool_calls[next];
                     tracing::info!(tool = %tc.name, "dispatch");
                     tokio::select! {
                         biased;
-                        _ = cancel.changed() => { interrupted = true; break; }
                         res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
-                            raw[i] = Some(res.into_content());
+                            raw[next] = Some(res.into_content());
                         }
+                        _ = cancel.changed() => { interrupted = true; break; }
                     }
+                    next += 1;
                 }
             }
 
@@ -1690,19 +1693,14 @@ impl Session {
             // pass below — the per-edit window-0 drain could not attribute edits
             // under concurrent dispatch or V8 code-mode cells.
             let mut results: Vec<transport::ToolResult> = Vec::with_capacity(call_count);
+            let mut scoped_riders = std::collections::HashMap::new();
             for (i, tc) in out.tool_calls.iter().enumerate() {
                 let Some((content, is_error)) = raw[i].take() else {
                     continue;
                 };
-                // Spill an oversized result to disk and inline a head + rider,
-                // uniformly across builtin and MCP tools (§2.3).
-                let content = crate::bound::bound_tool_result(
-                    &tc.name,
-                    content,
-                    self.tool_result_cap,
-                    &self.dump_dir,
-                    &tc.id,
-                );
+                // Bound producer output before appending contextual riders.
+                let content =
+                    crate::bound::bound_tool_result(&tc.name, content, self.tool_result_cap);
                 let mut result = transport::ToolResult {
                     id: tc.id.clone(),
                     content,
@@ -1721,9 +1719,8 @@ impl Session {
                         &tc.args,
                     )
                 {
-                    result.content.push_str(&rider);
+                    scoped_riders.insert(tc.id.clone(), rider);
                 }
-                last_tool_results.push(tool_result_trace(tc, &result));
                 results.push(result);
             }
 
@@ -1733,6 +1730,23 @@ impl Session {
             // could not attribute edits under concurrent dispatch / V8 cells).
             if let Some(last) = results.last_mut() {
                 self.append_edit_diagnostics(&mut last.content).await;
+            }
+
+            // Ordinary hooks and diagnostics share the result budget. Scoped
+            // instruction documents must survive intact, so append them after
+            // bounding. Trace the final payload that actually reaches the model.
+            for result in &mut results {
+                result.content = crate::bound::bound_tool_result(
+                    "tool_result",
+                    std::mem::take(&mut result.content),
+                    self.tool_result_cap,
+                );
+                if let Some(rider) = scoped_riders.remove(&result.id) {
+                    result.content.push_str(&rider);
+                }
+                if let Some(tc) = out.tool_calls.iter().find(|tc| tc.id == result.id) {
+                    last_tool_results.push(tool_result_trace(tc, result));
+                }
             }
 
             if interrupted {
@@ -2616,6 +2630,8 @@ mod tests {
         /// Return text immediately (Done, no tool calls).
         Text(String),
         NativeSearch(Vec<Value>),
+        HighUsageFollowUp,
+        ContextOverflow,
         /// Return text immediately with a Responses-style follow-up signal.
         TextWithEndTurn(String, Option<bool>),
         /// Wait on the shared gate, then request a tool call.
@@ -2623,6 +2639,8 @@ mod tests {
         /// Request two read-only `concurrent_probe` calls in one batch (to prove
         /// they dispatch concurrently).
         TwoReadProbes,
+        /// Request a caller-supplied batch for dispatch contract tests.
+        ToolCalls(Vec<transport::ToolCall>),
         /// Request the synthetic structured-output terminal tool.
         FinalResult,
         /// Request a test-only file_read call under a child directory.
@@ -2692,6 +2710,21 @@ mod tests {
                 .pop_front()
                 .unwrap_or(MockTurn::Text("ok".into()));
             match script {
+                MockTurn::ContextOverflow => {
+                    Err(transport::ContextWindowExceeded("test overflow".into()).into())
+                }
+                MockTurn::HighUsageFollowUp => Ok(transport::TurnOutput {
+                    observation_content: None,
+                    text: "continuing".into(),
+                    thinking: String::new(),
+                    tool_calls: vec![],
+                    stop: StopReason::Done,
+                    end_turn: Some(false),
+                    usage: Usage {
+                        input_tokens: 10_000,
+                        ..Usage::default()
+                    },
+                }),
                 MockTurn::Block => {
                     self.shared.model_gate.notified().await;
                     unreachable!("gate is never released in tests");
@@ -2736,6 +2769,15 @@ mod tests {
                         usage: Usage::default(),
                     })
                 }
+                MockTurn::ToolCalls(tool_calls) => Ok(transport::TurnOutput {
+                    observation_content: None,
+                    text: String::new(),
+                    thinking: String::new(),
+                    tool_calls,
+                    stop: StopReason::ToolCalls,
+                    end_turn: None,
+                    usage: Usage::default(),
+                }),
                 MockTurn::FinalResult => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
@@ -2907,6 +2949,88 @@ mod tests {
         }
     }
 
+    struct DispatchProbe {
+        read_only: bool,
+        value: Arc<AtomicUsize>,
+        finished_read: Arc<Notify>,
+        pending_read: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl bro_tools::Tool for DispatchProbe {
+        fn name(&self) -> &str {
+            if self.read_only {
+                "dispatch_read"
+            } else {
+                "dispatch_write"
+            }
+        }
+
+        fn description(&self) -> &str {
+            "Test dispatch ordering and interrupted read delivery"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn call(&self, input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            if input["block"] == true {
+                self.finished_read.notified().await;
+                self.pending_read.notify_one();
+                return std::future::pending().await;
+            }
+            let value = if self.read_only {
+                self.value.load(Ordering::SeqCst)
+            } else {
+                self.value.fetch_add(1, Ordering::SeqCst) + 1
+            };
+            if self.read_only {
+                self.finished_read.notify_one();
+            }
+            bro_tools::ToolResult::Text(value.to_string())
+        }
+
+        fn annotations(&self) -> bro_tools::ToolAnnotations {
+            bro_tools::ToolAnnotations {
+                read_only: self.read_only,
+                destructive: false,
+            }
+        }
+    }
+
+    fn install_dispatch_probes(session: &mut Session) -> Arc<Notify> {
+        let value = Arc::new(AtomicUsize::new(0));
+        let finished_read = Arc::new(Notify::new());
+        let pending_read = Arc::new(Notify::new());
+        let tools: Vec<Arc<dyn bro_tools::Tool>> = [true, false]
+            .into_iter()
+            .map(|read_only| {
+                Arc::new(DispatchProbe {
+                    read_only,
+                    value: value.clone(),
+                    finished_read: finished_read.clone(),
+                    pending_read: pending_read.clone(),
+                }) as Arc<dyn bro_tools::Tool>
+            })
+            .collect();
+        session.reg = Registry::new(
+            tools,
+            vec![],
+            &PinPolicy::from_env(),
+            &mcp::ToolFilter::default(),
+        );
+        pending_read
+    }
+
+    fn dispatch_call(id: &str, name: &str, args: Value) -> transport::ToolCall {
+        transport::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args,
+        }
+    }
+
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
         mk_session_with_store(scripts, None)
     }
@@ -2979,7 +3103,6 @@ mod tests {
             compact_threshold: None,
             context_window: None,
             tool_result_cap: 0,
-            dump_dir: std::env::temp_dir(),
             store: store.unwrap_or_else(|| SessionStore::open(Some(&id), None).unwrap()),
             event_log: Arc::new(EventLog::disabled()),
             seq_counter: Arc::new(AtomicU64::new(0)),
@@ -3894,6 +4017,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reads_observe_writes_in_model_call_order() {
+        let calls = vec![
+            dispatch_call("before", "dispatch_read", json!({})),
+            dispatch_call("write-1", "dispatch_write", json!({})),
+            dispatch_call("after-1", "dispatch_read", json!({})),
+            dispatch_call("after-1-again", "dispatch_read", json!({})),
+            dispatch_call("write-2", "dispatch_write", json!({})),
+            dispatch_call("after-2", "dispatch_read", json!({})),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, shared) = mk_session_with_store(
+            vec![MockTurn::ToolCalls(calls)],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        session.cx.root = root;
+        install_dispatch_probes(&mut session);
+        run_user_turn(&mut session, "read around each mutation").await;
+        let batches = shared.pushed_tool_results.lock().unwrap();
+        let observed: Vec<_> = batches[0]
+            .iter()
+            .map(|r| (r.id.as_str(), r.content.as_str()))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("before", "0"),
+                ("write-1", "1"),
+                ("after-1", "1"),
+                ("after-1-again", "1"),
+                ("write-2", "2"),
+                ("after-2", "2"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_read_batch_retains_completed_results_and_skips_later_writes() {
+        let calls = vec![
+            dispatch_call("completed", "dispatch_read", json!({})),
+            dispatch_call("pending", "dispatch_read", json!({"block": true})),
+            dispatch_call("unstarted", "dispatch_write", json!({})),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, shared) = mk_session_with_store(
+            vec![MockTurn::ToolCalls(calls)],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        session.cx.root = root;
+        let pending_read = install_dispatch_probes(&mut session);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let turn = session.user_turn(
+            "read then write",
+            cancel_rx,
+            Arc::new(StdMutex::new(VecDeque::new())),
+        );
+        let interrupt = async {
+            pending_read.notified().await;
+            cancel_tx.send(true).unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(turn, interrupt);
+            result.unwrap();
+        })
+        .await
+        .expect("read batch should be interruptible");
+        let batches = shared.pushed_tool_results.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        let results = &batches[0];
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "completed");
+        assert_eq!(results[0].content, "0");
+        assert!(!results[0].is_error);
+        for id in ["pending", "unstarted"] {
+            let result = results.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(result.content, INTERRUPTED_TOOL_RESULT);
+            assert!(result.is_error);
+        }
+    }
+
     #[test]
     fn first_user_push_emits_environment_context_and_baseline() {
         let (mut session, shared) = mk_session(vec![]);
@@ -3969,6 +4174,49 @@ mod tests {
 
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().cwd, session.cx.root.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn automatic_and_overflow_compaction_restore_instructions_before_continuing() {
+        for overflow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let first = if overflow {
+                MockTurn::ContextOverflow
+            } else {
+                MockTurn::HighUsageFollowUp
+            };
+            let (mut session, shared) = mk_session_with_store(
+                vec![first, MockTurn::Text("done".into())],
+                Some(SessionStore::for_test(root.join("session.json"))),
+            );
+            session.cx.root = root.clone();
+            session.compact_threshold = Some(5_000);
+            session.user_instructions = Some(crate::context::UserInstructions {
+                directory: root.display().to_string(),
+                text: "EXACT_COMPACTION_INSTRUCTIONS".into(),
+                loaded_paths: Vec::new(),
+            });
+            run_user_turn(&mut session, "continue through compaction").await;
+            assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.started.load(Ordering::SeqCst), 2);
+            let users = shared.pushed_users.lock().unwrap();
+            assert_eq!(
+                users
+                    .iter()
+                    .filter(|text| text.contains("EXACT_COMPACTION_INSTRUCTIONS"))
+                    .count(),
+                2,
+                "initial context must be restored without waiting for another user turn"
+            );
+            assert!(
+                users
+                    .last()
+                    .unwrap()
+                    .contains("EXACT_COMPACTION_INSTRUCTIONS")
+            );
+            assert!(session.reference_context_item.is_some());
+        }
     }
 
     #[tokio::test]

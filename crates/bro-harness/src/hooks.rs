@@ -194,12 +194,12 @@ impl HookEngine {
     }
 
     /// The default rule set shipped with the harness (§2: one trivial rule).
-    /// Gated by `BRO_HARNESS_NUDGES` (default on; `0`/`false` disables) so the
+    /// Gated by `BRO_HARNESS_NUDGES` (default off; `1`/`true` opts in) so the
     /// whole subsystem can be switched off without code changes. Uses
     /// transport session env first, then process env, so daemon-dispatched
     /// sessions can override it without mutating global env.
     pub fn from_env(ledger: NudgeLedger) -> Self {
-        let enabled = session_flag_enabled("BRO_HARNESS_NUDGES", true);
+        let enabled = session_flag_enabled("BRO_HARNESS_NUDGES", false);
         let gap_note_directive_enabled = session_flag_enabled(GAP_NOTE_DIRECTIVE_ENV, true);
         let hooks: Vec<Box<dyn Hook>> = if enabled {
             vec![
@@ -813,10 +813,10 @@ mod tests {
     #[tokio::test]
     async fn from_env_reads_session_env_for_gap_note_directive() {
         crate::transport::with_session_env(
-            std::collections::BTreeMap::from([(
-                GAP_NOTE_DIRECTIVE_ENV.to_string(),
-                "0".to_string(),
-            )]),
+            std::collections::BTreeMap::from([
+                ("BRO_HARNESS_NUDGES".to_string(), "1".to_string()),
+                (GAP_NOTE_DIRECTIVE_ENV.to_string(), "0".to_string()),
+            ]),
             async {
                 let mut eng = HookEngine::from_env(NudgeLedger::default());
                 let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());

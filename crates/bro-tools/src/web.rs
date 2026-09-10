@@ -34,7 +34,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &str {
-        "Fetch a web page and return its text content (HTML stripped, truncated to max_chars). Client-side; no external dependency."
+        "Fetch a web page and return its text content (HTML stripped, bounded by max_chars and 8000 bytes, with omission markers). Client-side; no external dependency."
     }
     fn input_schema(&self) -> Value {
         schema_for::<WebFetchInput>()
@@ -72,7 +72,11 @@ impl Tool for WebFetch {
             Err(e) => return ToolResult::Error(format!("fetch {}: {e}", args.url)),
         };
         let text = strip_html(&body);
-        let out: String = text.chars().take(max_chars).collect();
+        let excerpt: String = text.chars().take(max_chars).collect();
+        let mut out = crate::output::truncate_text(&excerpt, crate::output::DEFAULT_OUTPUT_BYTES);
+        if excerpt.len() < text.len() {
+            out.push_str("\n[page text truncated at max_chars; raise max_chars or request a narrower source]");
+        }
         ToolResult::Text(out)
     }
 }

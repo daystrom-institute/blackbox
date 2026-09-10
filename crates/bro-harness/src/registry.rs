@@ -77,6 +77,7 @@ struct Entry {
 }
 
 pub struct Registry {
+    execution: Arc<tokio::sync::RwLock<()>>,
     tools: HashMap<String, Entry>,
     activated: Arc<Mutex<HashSet<String>>>,
     /// Prior flat activation promises remain evidence even if restoration is
@@ -132,6 +133,20 @@ impl Registry {
             }
             let tier = if pin.matches(t.name()) {
                 Tier::Pinned
+            } else if matches!(
+                t.name(),
+                "smart_read"
+                    | "git_status"
+                    | "git_log"
+                    | "git_diff"
+                    | "git_show"
+                    | "git_commit"
+                    | "sandbox_status"
+                    | "sandbox_grounding"
+            ) {
+                // Compatibility and convenience tools remain callable, but basic
+                // file/search/shell operations own the default authoring surface.
+                Tier::Deferred
             } else {
                 default_builtin_tier
             };
@@ -182,6 +197,7 @@ impl Registry {
             tools,
             activated,
             resume_required: Default::default(),
+            execution: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -339,11 +355,29 @@ impl Registry {
         schemas
     }
 
+    /// Set the session admission gate shared with nested code-mode calls.
+    pub fn set_dispatch_gate(&mut self, execution: Arc<tokio::sync::RwLock<()>>) {
+        self.execution = execution;
+    }
+
     pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
-        match self.tools.get(name) {
-            Some(e) => call_tool_with_arg_defaults(e.tool.as_ref(), name, input, cx).await,
-            None => ToolResult::Error(format!("unknown tool: {name}")),
+        let Some(entry) = self.tools.get(name) else {
+            return ToolResult::Error(format!("unknown tool: {name}"));
+        };
+        // Cell controls must remain callable while nested work owns the gate:
+        // exec and wait may themselves await a nested call or cancel it.
+        if matches!(
+            name,
+            bro_code_mode::PUBLIC_TOOL_NAME | bro_code_mode::WAIT_TOOL_NAME
+        ) {
+            return call_tool_with_arg_defaults(entry.tool.as_ref(), name, input, cx).await;
         }
+        let (_read_guard, _write_guard) = if entry.tool.annotations().read_only {
+            (Some(self.execution.read().await), None)
+        } else {
+            (None, Some(self.execution.write().await))
+        };
+        call_tool_with_arg_defaults(entry.tool.as_ref(), name, input, cx).await
     }
 
     /// Whether `name` is safe to dispatch concurrently with other tools — i.e.

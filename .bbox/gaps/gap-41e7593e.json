@@ -1,0 +1,22 @@
+{
+  "id": "gap-41e7593e",
+  "title": "Scoped instructions need a shared pre-edit and compaction lifecycle for flat and nested tools",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Deliver applicable scoped AGENTS documents before first mutation, consistently for flat tools and code-mode calls, and restore dynamically delivered instructions after mid-turn compaction without relying on the summary.",
+  "missing_primitive": "Shared instruction-delivery lifecycle at the tool dispatch seam",
+  "fallback_used": "Read scoped AGENTS documents explicitly before editing. Current patch restores startup context after compaction but does not claim to restore dynamic riders.",
+  "evidence": [
+    "crates/bro-harness/src/project_doc.rs:329",
+    "crates/bro-harness/src/capabilities.rs:51",
+    "crates/bro-harness/src/agent_loop.rs:1705"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/scoped-instructions-shared-lifecycle",
+  "notes": "Broader model-facing tools audit compared Codex core/src/tools/code_mode/mod.rs shared ToolCallRuntime and compaction context reinjection. Existing first-touch flat rider arrives after operation and nested calls do not deliver it. A fix must preserve full instruction bodies and durable delivery receipts, not hide docs in truncated ordinary tool output. See design/bro-harness/model-facing-tools-audit.md.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T18:40:17Z",
+  "updated_at": "2026-09-10T18:40:17Z"
+}
