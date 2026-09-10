@@ -1,0 +1,24 @@
+{
+  "id": "gap-90fd9224",
+  "title": "Session browsing omits collected native transcripts because it reads daemon-local metadata",
+  "gap_kind": "mcp_surface",
+  "domain": "transcript-retrieval",
+  "wanted_capability": "Browse retained native Claude Code and Codex sessions by recency with project/account filters and bounded pagination, without requiring producer filesystem roots on the corpus daemon.",
+  "missing_primitive": "A corpus-owned session summary enumeration consumed by bbox_sessions_list. The current implementation only reads local Claude usage-data/session-meta and Codex session files.",
+  "fallback_used": "Use bbox_search to discover native locators and exact session ids, then bbox_session for indexed metadata and source freshness.",
+  "evidence": [
+    "crates/bbox-corpus-index/src/index/search.rs:2512",
+    "src/tools/sessions.rs:142",
+    "crates/bbox-corpus-index/src/transcripts/native.rs",
+    "2026-09-10 live bbox_sessions_list(limit=3) returned No sessions found while bbox_search returned native user messages timestamped the same day.",
+    "2026-09-10 live bbox_session reported completed producer scan at 17:45:47 UTC: 756 discovered, zero failed/deferred, sampled indexed generations matched published generations."
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/transcript-retrieval/native-sessions-list-missing",
+  "notes": "Distinct from addressed gap-e40feb8f (native ingestion) and addressed gap-72fd5932 (project-filter matching). The tool description acknowledges metadata-only coverage but ordinary recency browsing remains unavailable for collected sessions. Preserve source/account identity, generation deduplication, and indexed-projection limitations.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T17:47:36Z",
+  "updated_at": "2026-09-10T17:47:36Z"
+}
