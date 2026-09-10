@@ -909,8 +909,10 @@ struct ShellRunInput {
     /// cooperative yield so long commands do not stall the agent loop. Set to
     /// 0 only when you deliberately want to block until completion/timeout.
     yield_time_ms: Option<u64>,
-    /// Cap on returned stdout/stderr, in approximate tokens (~4 bytes each;
-    /// default 2000). The TAIL is kept so trailing errors survive.
+    /// Budget for this stdout/stderr page, in approximate tokens (~4 bytes each;
+    /// default 2000, maximum 3000). Retained output is read in stream order.
+    /// When output_pending=true, keep calling shell_poll with session_id even
+    /// after running=false. Output loss is reported separately.
     max_output_tokens: Option<usize>,
     /// Initial stdin (at most 1 MiB). Writes wait at most 5 seconds or the
     /// invocation yield budget; partial/error writes are reported as input_error.
@@ -1101,7 +1103,8 @@ impl Tool for ShellRun {
 
 #[derive(Deserialize, JsonSchema)]
 struct ShellPollInput {
-    /// Session id from a prior shell_run that returned running=true.
+    /// Session id from shell_run or shell_poll. Continue while running=true
+    /// or output_pending=true, including output retained after process exit.
     session_id: String,
     /// Optional stdin (at most 1 MiB); waits at most 5 seconds or the yield
     /// budget. Partial/error writes are reported as input_error.

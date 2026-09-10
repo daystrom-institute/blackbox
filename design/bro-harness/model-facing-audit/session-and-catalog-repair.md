@@ -275,9 +275,11 @@ had a successful verification command in the event record.
 | only | edit | 6 | 10 | 29.63 | 23.54 |
 | only | retrieval | 6 | 10 | 21.91 | 24.05 |
 
-There is no consistent step-count improvement. The catalog reduction and fixed
-correctness boundaries are established; this small sample does not establish
-broad model efficacy. `only` is the existing compatibility mode that defers
+These runs are smoke-test observations only. The old model, low reasoning
+effort, trivial workloads and single samples were not an appropriate design
+for assessing agent efficiency. Any efficiency conclusion drawn from their
+step counts is withdrawn; that question remains unanswered. Catalog byte sizes
+and independent correctness checks remain separate measurements. `only` is the existing compatibility mode that defers
 builtins but permits direct activation through `tool_search`. Both repaired
 `only` trials used direct tools, so the table compares starting configurations,
 not forced JavaScript execution. Fixture runtime files can enter Git observations,

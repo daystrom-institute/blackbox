@@ -1,5 +1,7 @@
 // Vendored from openai/codex codex-rs/code-mode (Apache-2.0); see crate NOTICE.
 mod description;
+// Local addition (not vendored): renderer refreshed from code-mode-protocol.
+mod json_schema_types;
 mod response;
 mod runtime;
 mod service;

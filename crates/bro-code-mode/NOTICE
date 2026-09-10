@@ -13,6 +13,9 @@ A copy of the license terms is available at:
 
 Portions Copyright OpenAI.
 
+The schema renderer and its tests are vendored from codex-rs/code-mode-protocol
+at commit a186f5484dc8b89f103859a7c9bd632881fba54b.
+
 Local modifications by the Blackbox project:
 
   - `ToolName` is vendored from codex-rs/protocol into `src/tool_name.rs` and

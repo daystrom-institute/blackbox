@@ -114,10 +114,15 @@ text(`${r.locations.length}:${r.unanchored.length}:${files.has("src/lib.rs")}:${
 "#;
     let result = exec.call(json!({ "source": source }), &cx).await;
     match result {
-        ToolResult::Text(t) => assert!(
-            t.starts_with("2:0:true:false") || t.starts_with("3:0:true:false"),
-            "expected at least 2 locations with src/lib.rs and not truncated, got: {t}"
-        ),
+        ToolResult::Text(t) => {
+            let output = t
+                .strip_prefix("Script completed\nOutput:\n")
+                .expect("cell must complete successfully before consuming references");
+            assert!(
+                matches!(output.trim(), "2:0:true:false" | "3:0:true:false"),
+                "expected at least 2 locations with src/lib.rs and not truncated, got: {t}"
+            );
+        }
         other => panic!("expected text, got {other:?}"),
     }
     Ok(())

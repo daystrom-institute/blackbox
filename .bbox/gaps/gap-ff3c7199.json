@@ -1,0 +1,22 @@
+{
+  "id": "gap-ff3c7199",
+  "title": "Direct isolate calls bypass harness argument policy and invocation admission",
+  "gap_kind": "tooling",
+  "domain": "isolate",
+  "wanted_capability": "Direct isolate TOOL --args and isolate --cell should exercise the same invocation path as the harness, including typed defaults, pins, validation, cancellation, and admission.",
+  "fallback_used": "Used --cell and compared direct calls while inspecting results myself.",
+  "evidence": [
+    "crates/bro-harness/src/bin/isolate.rs: main direct invocation",
+    "crates/bro-harness/src/capabilities.rs: HostTools shared invocation"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/isolate/direct-invocation-policy-parity",
+  "notes": "Reproduced with default:file_read.max_lines=3. Direct call returned the ordinary 200-line page and accepted an invalid string default; cell mode returned three lines and rejected the string. Repair routes direct calls through start_tool_invocation.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T23:40:26Z",
+  "updated_at": "2026-09-10T23:43:35Z",
+  "resolved_at": "2026-09-10T23:43:35Z",
+  "resolution_note": "Direct isolate calls now use start_tool_invocation, matching flat harness and cell admission. Rebuilt executable verified numeric defaults and invalid-policy refusal in both modes; reproducible checks are in scripts/audit-isolate-surface.py."
+}

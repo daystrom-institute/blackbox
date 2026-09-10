@@ -890,14 +890,29 @@ impl Tool for ContentSearch {
                         }
                     }
                     SearchMode::Content => {
+                        let mut next_context_line = 0usize;
+                        let mut emitted_context = false;
                         for (i, line) in lines.iter().enumerate() {
                             if re.is_match(line) {
                                 if ctx > 0 {
                                     let lo = i.saturating_sub(ctx);
                                     let hi = (i + ctx).min(lines.len().saturating_sub(1));
-                                    for (j, ctx_line) in lines[lo..=hi].iter().enumerate() {
-                                        let n = lo + j + 1;
-                                        let sep = if lo + j == i { ':' } else { '-' };
+                                    // Merge overlapping/adjacent windows. Match markers describe
+                                    // the source line, even when first emitted as nearby context.
+                                    if emitted_context && lo > next_context_line {
+                                        if !push_search_line(
+                                            &mut hits,
+                                            &mut output_bytes,
+                                            "--".into(),
+                                        ) {
+                                            truncated = true;
+                                            break 'walk;
+                                        }
+                                    }
+                                    for j in lo.max(next_context_line)..=hi {
+                                        let ctx_line = lines[j];
+                                        let n = j + 1;
+                                        let sep = if re.is_match(ctx_line) { ':' } else { '-' };
                                         if !push_search_line(
                                             &mut hits,
                                             &mut output_bytes,
@@ -907,11 +922,8 @@ impl Tool for ContentSearch {
                                             break 'walk;
                                         }
                                     }
-                                    if !push_search_line(&mut hits, &mut output_bytes, "--".into())
-                                    {
-                                        truncated = true;
-                                        break 'walk;
-                                    }
+                                    next_context_line = hi + 1;
+                                    emitted_context = true;
                                 } else {
                                     if !push_search_line(
                                         &mut hits,
@@ -1802,6 +1814,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_search_merges_context_windows_without_duplicate_source_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "one\nhit a\nhit b\nfour\nfive\nsix\nseven\nhit c\nnine\n",
+        )
+        .unwrap();
+        let ToolResult::Text(result) = ContentSearch
+            .call(json!({"pattern":"hit", "context_lines":1}), &cx_at(&root))
+            .await
+        else {
+            panic!("expected text")
+        };
+        let source: Vec<_> = result
+            .lines()
+            .filter(|line| !line.starts_with("[observation "))
+            .collect();
+        assert_eq!(
+            source,
+            vec![
+                "a.rs:1-one",
+                "a.rs:2:hit a",
+                "a.rs:3:hit b",
+                "a.rs:4-four",
+                "--",
+                "a.rs:7-seven",
+                "a.rs:8:hit c",
+                "a.rs:9-nine"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn content_search_modes_and_context() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2415,7 +2461,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // APFS rejects this fixture with EILSEQ before Git runs; exercise raw Unix
+    // filename bytes on filesystems that admit them (including the Linux gate).
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[tokio::test]
     async fn git_diff_uses_original_non_utf8_untracked_filename_bytes() {
         use std::os::unix::ffi::OsStringExt;

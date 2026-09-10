@@ -7,8 +7,7 @@ use bro_tools::ToolResult;
 pub(super) const MAX_RESULT_BYTES: usize = 12 * 1024;
 const DIAGNOSTIC_BYTES: usize = 2 * 1024;
 const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
-const TRUNCATION_MARKER: &str =
-    "\n[output truncated; narrow the source read or print a smaller selection]\n";
+const TRUNCATION_MARKER: &str = "\n[output truncated; the cell output budget omitted content here. Re-run affected reads separately with smaller ranges. Tool continuation hints below do not recover this omission.]\n";
 const IMAGE_ERROR: &str = "image() output is unsupported by the harness text-only tool-result transport; no image was delivered.";
 
 /// Keep both ends on UTF-8 boundaries. The marker is metadata, separate from

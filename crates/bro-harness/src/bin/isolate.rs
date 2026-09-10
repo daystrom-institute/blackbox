@@ -117,8 +117,8 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", default_value_t = 900)]
     cell_timeout: u64,
 
-    /// Host tool-arg default table as a JSON string map
-    /// ({"default:<tool>.<param>": "value", ...}), the same grammar as
+    /// Host tool-arg defaults as a JSON value map (preserves numbers, booleans,
+    /// arrays and objects; e.g. {"default:file_read.max_lines": 40}), as in
     /// BRO_HARNESS_TOOL_DEFAULTS (which is the fallback when the flag is
     /// absent). Operator-authority grants (RX-V1) reach bindings through
     /// this channel, never as cell-authored arguments.
@@ -535,7 +535,11 @@ async fn main() -> Result<()> {
     }
 
     let cx = make_cx(root, tool_defaults);
-    let result = tool.call(input, &cx).await;
+    // Direct probes must use the same defaults, validation, cancellation and
+    // admission path as flat harness calls and code-mode HostTools.
+    let result = bro_tools::start_tool_invocation(tool.clone(), input, cx.clone(), None)
+        .wait()
+        .await;
     shutdown_session_owned_children(&cx, &surface).await;
     if !emit_tool_result(result, cli.field.as_deref())? {
         std::process::exit(1);
