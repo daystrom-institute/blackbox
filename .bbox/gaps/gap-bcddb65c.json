@@ -1,0 +1,22 @@
+{
+  "id": "gap-bcddb65c",
+  "title": "Default image builds cannot reach Forgejo from the build namespace",
+  "gap_kind": "tooling",
+  "domain": "build/forge-ingress",
+  "wanted_capability": "The standard image-build workflow can fetch its pinned public repository ref from the configured Forgejo mirror.",
+  "missing_primitive": "Compatible Forgejo ingress policy for the bbox-build namespace, or an explicitly supported public-origin build fallback.",
+  "fallback_used": "Submitted the same build workflow with its existing git-url parameter pointing to the public GitHub origin, preserving the exact SHA check. No shared network policy changed.",
+  "evidence": [
+    "build-bbox-image-8sb4t: build-in-clone git fetch failed with exit 128 before compilation against the default mirror address.",
+    "build-bbox-image-k4b2k: the same ref failed before compilation against the Forgejo cluster service address.",
+    "Read-only inspection of forge/estate-ingress-walls shows permitted namespaces do not include bbox-build. Forgejo pod and service endpoints are healthy; host-side ls-remote succeeds."
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/build/forge-ingress-omits-bbox-build",
+  "notes": "Observed while preparing the native session browsing image on 2026-09-10. Any shared network policy repair requires operator approval; this task only uses the per-run public-origin parameter.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-10T18:05:18Z",
+  "updated_at": "2026-09-10T18:05:18Z"
+}

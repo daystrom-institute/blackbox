@@ -17,8 +17,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/transcript-retrieval/native-sessions-list-missing",
   "notes": "Distinct from addressed gap-e40feb8f (native ingestion) and addressed gap-72fd5932 (project-filter matching). The tool description acknowledges metadata-only coverage but ordinary recency browsing remains unavailable for collected sessions. Preserve source/account identity, generation deduplication, and indexed-projection limitations.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T17:47:36Z",
-  "updated_at": "2026-09-10T17:47:36Z"
+  "updated_at": "2026-09-10T18:14:39Z",
+  "resolved_at": "2026-09-10T18:14:39Z",
+  "resolution_note": "Implemented in 09c4f31f: retained-index session catalog, source/account/project/exclusion filters, stable timestamp ordering, generation-aware cache, bounded pagination, explicit unavailable name metadata. Full workspace verification passed all 6743 tests (19 suite skips), with the unrelated three-second publication-lock test scheduled alone after load-sensitive timeouts; formatting, Clippy and concurrency lint passed. Image 09c4f31f860c built successfully (build-bbox-image-mzrpx). Preview changes only blackboxd Deployment image; production rollout awaits named shared-service approval. Separately, expanded host collection to all eleven intended roots: 1785 streams, 1029 newly covered streams, completed background scans with zero failures/deferred, and historical/recent indexed samples plus exact account searches verified for every added account."
 }
