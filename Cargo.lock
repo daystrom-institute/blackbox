@@ -1551,6 +1551,7 @@ dependencies = [
  "fs2",
  "globset",
  "ignore",
+ "jsonschema",
  "libc",
  "regex",
  "reqwest 0.12.28",

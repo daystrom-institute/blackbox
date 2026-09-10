@@ -75,6 +75,9 @@ async fn cell_renames_cross_file_via_lsp_authority() -> anyhow::Result<()> {
     )?;
 
     let cx = ToolCx {
+        tool_observations: Default::default(),
+        instruction_generation: 0,
+        instruction_policy: None,
         root: root.clone(),
         safety: Arc::new(bro_tools::SafetyPolicy::new()),
         http: reqwest::Client::new(),

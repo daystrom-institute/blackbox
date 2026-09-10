@@ -47,6 +47,18 @@ pub struct ToolCallOutput {
 pub trait ToolCapability: Send + Sync {
     async fn call_tool(&self, invocation: ToolInvocation) -> CapabilityResult<ToolCallOutput>;
 
+    /// Preserve the immutable host context associated with a submitted cell.
+    /// Hosts without contextual policy retain their cancellation-aware behavior.
+    async fn call_tool_with_context(
+        &self,
+        invocation: ToolInvocation,
+        cancellation: tokio_util::sync::CancellationToken,
+        _context_id: Option<u64>,
+    ) -> CapabilityResult<ToolCallOutput> {
+        self.call_tool_with_cancellation(invocation, cancellation)
+            .await
+    }
+
     /// Cancellation-aware hosts stop admission before execution and drain any
     /// admitted work. The fallback preserves completion for existing hosts;
     /// dropping their future cannot safely cancel underlying side effects.

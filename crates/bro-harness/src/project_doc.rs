@@ -18,7 +18,6 @@
 //!   * empty string `""`  ⇒ explicit suppress (no overlay).
 //!   * absent (`None`)    ⇒ not overridden ⇒ this Codex-style overlay.
 
-use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -200,6 +199,9 @@ fn read_doc_tree(
     loaded_paths: &mut HashSet<PathBuf>,
     loaded: &mut Vec<String>,
     depth: usize,
+    scope: &Path,
+    origin: &Path,
+    documents: &mut Vec<InstructionDocument>,
 ) -> Vec<String> {
     if depth > MAX_INCLUDE_DEPTH {
         tracing::warn!(
@@ -219,13 +221,27 @@ fn read_doc_tree(
         return Vec::new();
     };
     loaded.push(canonical.display().to_string());
+    documents.push(InstructionDocument::new(
+        canonical.clone(),
+        scope.to_path_buf(),
+        origin.to_path_buf(),
+        body.clone(),
+    ));
 
     let mut sections = vec![body.clone()];
     for mention in extract_at_mentions(&body) {
         let Some(include) = resolve_include(&canonical, &mention) else {
             continue;
         };
-        sections.extend(read_doc_tree(&include, loaded_paths, loaded, depth + 1));
+        sections.extend(read_doc_tree(
+            &include,
+            loaded_paths,
+            loaded,
+            depth + 1,
+            scope,
+            origin,
+            documents,
+        ));
     }
     sections
 }
@@ -234,6 +250,7 @@ fn read_doc_tree(
 pub(crate) struct ProjectDocOverlay {
     pub(crate) text: String,
     pub(crate) loaded_paths: Vec<PathBuf>,
+    pub(crate) documents: Vec<InstructionDocument>,
 }
 
 /// Assemble the Codex-equivalent overlay from the process cwd + `$CODEX_HOME`.
@@ -258,6 +275,7 @@ fn assemble(
     project_doc_warn_bytes: usize,
 ) -> Option<ProjectDocOverlay> {
     let mut sections: Vec<String> = Vec::new();
+    let mut documents = Vec::new();
     let mut loaded: Vec<String> = Vec::new();
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
 
@@ -265,7 +283,15 @@ fn assemble(
     if let Some(home) = codex_home {
         for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
             let p = home.join(name);
-            sections.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
+            sections.extend(read_doc_tree(
+                &p,
+                &mut loaded_paths,
+                &mut loaded,
+                0,
+                cwd,
+                &p,
+                &mut documents,
+            ));
         }
     }
 
@@ -273,7 +299,15 @@ fn assemble(
     // instructions here; a large overlay is the operator's context decision.
     let mut project: Vec<String> = Vec::new();
     for p in project_agents_paths(cwd, project_doc_files) {
-        project.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
+        project.extend(read_doc_tree(
+            &p,
+            &mut loaded_paths,
+            &mut loaded,
+            0,
+            p.parent().unwrap_or(cwd),
+            &p,
+            &mut documents,
+        ));
     }
     if !project.is_empty() {
         let joined = project.join("\n\n");
@@ -304,213 +338,529 @@ fn assemble(
     Some(ProjectDocOverlay {
         text: sections.join("\n\n"),
         loaded_paths: loaded.into_iter().map(PathBuf::from).collect(),
+        documents,
     })
 }
 
+/// Exact host-discovered instruction version, with its top-level discovery
+/// origin. Includes inherit scope; removals are explicit authoritative updates.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InstructionDocument {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) scope: PathBuf,
+    pub(crate) origin: PathBuf,
+    pub(crate) body: String,
+    pub(crate) revoked: bool,
+}
+
+impl InstructionDocument {
+    fn new(path: PathBuf, scope: PathBuf, origin: PathBuf, body: String) -> Self {
+        Self {
+            path,
+            scope,
+            origin,
+            sha256: bbox_refactor::sha256_hex(body.as_bytes()),
+            body,
+            revoked: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstructionBatch {
+    pub(crate) generation: u64,
+    pub(crate) text: String,
+    pub(crate) documents: Vec<InstructionDocument>,
+    occurrences: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ActiveInstruction {
+    document: InstructionDocument,
+    origins: std::collections::BTreeSet<PathBuf>,
+    occurrence: u64,
+    delivered_generation: Option<u64>,
+}
+
 #[derive(Debug, Default)]
+struct InstructionLedger {
+    explicit_origins: std::collections::BTreeSet<(PathBuf, PathBuf)>,
+    active: Vec<ActiveInstruction>,
+    observed_paths: std::collections::BTreeSet<PathBuf>,
+    next_occurrence: u64,
+}
+
+impl InstructionLedger {
+    fn observe(&mut self, document: InstructionDocument) {
+        if let Some(active) = self.active.iter_mut().find(|active| {
+            active.document.path == document.path && active.document.scope == document.scope
+        }) {
+            active.origins.insert(document.origin.clone());
+            if active.document.sha256 != document.sha256
+                || active.document.body != document.body
+                || active.document.revoked != document.revoked
+            {
+                self.next_occurrence += 1;
+                active.occurrence = self.next_occurrence;
+                active.document = document;
+                active.delivered_generation = None;
+            }
+        } else {
+            self.next_occurrence += 1;
+            self.active.push(ActiveInstruction {
+                origins: std::collections::BTreeSet::from([document.origin.clone()]),
+                document,
+                occurrence: self.next_occurrence,
+                delivered_generation: None,
+            });
+        }
+    }
+
+    fn reconcile(&mut self, documents: Vec<InstructionDocument>, complete: bool) {
+        if complete {
+            let removed: Vec<_> = self
+                .active
+                .iter()
+                .filter(|active| {
+                    !active.document.revoked
+                        && !documents.iter().any(|document| {
+                            document.path == active.document.path
+                                && document.scope == active.document.scope
+                        })
+                })
+                .map(|active| InstructionDocument {
+                    body: String::new(),
+                    sha256: bbox_refactor::sha256_hex(b""),
+                    revoked: true,
+                    ..active.document.clone()
+                })
+                .collect();
+            for document in removed {
+                self.observe(document);
+            }
+        }
+        for document in documents {
+            self.observe(document);
+        }
+    }
+}
+
+/// Session-owned version ledger. Shell and remote tools are explicit escape
+/// hatches; this policy only admits tool-owned structured filesystem scopes.
+#[derive(Debug, Clone)]
 pub(crate) struct ScopedProjectDocs {
-    delivered: HashSet<PathBuf>,
+    root: PathBuf,
+    names: Vec<String>,
+    ledger: std::sync::Arc<std::sync::Mutex<InstructionLedger>>,
+}
+
+impl Default for ScopedProjectDocs {
+    fn default() -> Self {
+        Self::with_names(PathBuf::from("/"), None, vec![AGENTS_FILE.into()])
+    }
 }
 
 impl ScopedProjectDocs {
-    /// Build the live dedupe cache from startup docs plus any rider-delivered
-    /// docs already present in the session event log. The event log is the
-    /// durable source of truth for what the model saw; this set is only a
-    /// runtime cache to avoid repeated scans.
-    pub(crate) fn from_startup_and_event_log(
-        startup_paths: impl IntoIterator<Item = PathBuf>,
-        event_log_path: &Path,
-    ) -> Self {
-        let mut delivered: HashSet<PathBuf> = startup_paths.into_iter().collect();
-        delivered.extend(delivered_paths_from_event_log(event_log_path));
-        Self { delivered }
+    pub(crate) fn new(root: PathBuf, startup: Option<&ProjectDocOverlay>) -> Self {
+        Self::with_names(root, startup, project_doc_files())
     }
 
-    pub(crate) fn rider_for_tool_call(
-        &mut self,
-        root: &Path,
-        tool_name: &str,
-        args: &Value,
-    ) -> Option<String> {
-        let touched = touched_paths(root, tool_name, args);
-        if touched.is_empty() {
+    fn with_names(root: PathBuf, startup: Option<&ProjectDocOverlay>, names: Vec<String>) -> Self {
+        let mut ledger = InstructionLedger::default();
+        ledger.observed_paths.insert(root.clone());
+        if let Some(startup) = startup {
+            for document in &startup.documents {
+                ledger.observe(document.clone());
+            }
+        }
+        Self {
+            root,
+            names,
+            ledger: std::sync::Arc::new(std::sync::Mutex::new(ledger)),
+        }
+    }
+
+    /// Register global candidates even when discovery could not read them.
+    /// An explicit system override skips this startup enrollment.
+    pub(crate) fn enroll_global_candidates(&self) {
+        if let Some(home) = codex_home() {
+            self.enroll_global_candidates_at(&home);
+        }
+    }
+
+    fn enroll_global_candidates_at(&self, home: &Path) {
+        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
+            ledger
+                .explicit_origins
+                .insert((home.join(name), self.root.clone()));
+        }
+    }
+
+    /// Taking a batch grants nothing. Append its exact text to authoritative
+    /// transport input before acknowledging this exact batch.
+    pub(crate) fn pending_batch(&self, generation: u64) -> Option<InstructionBatch> {
+        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let pending: Vec<_> = ledger
+            .active
+            .iter()
+            .filter(|active| active.delivered_generation.is_none())
+            .collect();
+        if pending.is_empty() {
             return None;
         }
+        let documents: Vec<_> = pending
+            .iter()
+            .map(|active| active.document.clone())
+            .collect();
+        Some(InstructionBatch {
+            generation,
+            text: render_instruction_documents(&documents),
+            documents,
+            occurrences: pending.iter().map(|active| active.occurrence).collect(),
+        })
+    }
 
-        let doc_names = project_doc_files();
-        let mut loaded_paths = self.delivered.clone();
-        let mut newly_loaded = Vec::new();
-        let mut sections = Vec::new();
-        for touched_path in touched {
-            let display_touched = display_path(root, &touched_path);
-            for doc in scoped_agents_paths(root, &touched_path, &doc_names) {
-                let Some(canonical) = canonical_file(&doc) else {
-                    continue;
-                };
-                if self.delivered.contains(&canonical) || loaded_paths.contains(&canonical) {
-                    continue;
-                }
-                let before = sections.len();
-                sections.extend(read_doc_tree(
-                    &canonical,
-                    &mut loaded_paths,
-                    &mut newly_loaded,
-                    0,
-                ));
-                if sections.len() > before {
-                    tracing::info!(
-                        touched = %display_touched,
-                        doc = %canonical.display(),
-                        "attaching scoped AGENTS.md rider"
-                    );
+    pub(crate) fn acknowledge(&self, batch: &InstructionBatch) {
+        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        for (document, occurrence) in batch.documents.iter().zip(&batch.occurrences) {
+            if let Some(active) = ledger.active.iter_mut().find(|active| {
+                active.document.path == document.path && active.document.scope == document.scope
+            }) && active.occurrence == *occurrence
+                && active.document == *document
+            {
+                active.delivered_generation = Some(
+                    active
+                        .delivered_generation
+                        .map_or(batch.generation, |previous| previous.min(batch.generation)),
+                );
+            }
+        }
+    }
+
+    /// Compaction replaces instruction-bearing history. An acknowledgment
+    /// already in flight cannot revive a version from the previous history.
+    pub(crate) fn invalidate_delivery(&self) {
+        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        for index in 0..ledger.active.len() {
+            ledger.next_occurrence += 1;
+            ledger.active[index].occurrence = ledger.next_occurrence;
+            ledger.active[index].delivered_generation = None;
+        }
+    }
+
+    pub(crate) fn active_documents(&self) -> Vec<InstructionDocument> {
+        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        ledger
+            .active
+            .iter()
+            .flat_map(|active| {
+                active
+                    .origins
+                    .iter()
+                    .map(|origin| InstructionDocument {
+                        origin: origin.clone(),
+                        ..active.document.clone()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// An explicit system prompt suppresses automatic startup discovery. Later
+    /// structured file accesses still opt their actual paths into scoped checks.
+    pub(crate) fn suppress_startup_discovery(&self) {
+        self.ledger
+            .lock()
+            .expect("instruction ledger poisoned")
+            .observed_paths
+            .remove(&self.root);
+    }
+
+    pub(crate) fn observed_paths(&self) -> Vec<PathBuf> {
+        self.ledger
+            .lock()
+            .expect("instruction ledger poisoned")
+            .observed_paths
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn restore_observed_paths(&self, paths: Vec<PathBuf>) {
+        self.ledger
+            .lock()
+            .expect("instruction ledger poisoned")
+            .observed_paths
+            .extend(paths);
+    }
+
+    /// Restore graph origins/scopes only, never proof of delivery. Refresh
+    /// rereads current bytes before the host prepares its first resumed request.
+    pub(crate) async fn restore_documents(
+        &self,
+        documents: Vec<InstructionDocument>,
+    ) -> Result<(), String> {
+        {
+            let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+            for document in documents {
+                ledger.observe(document);
+            }
+        }
+        self.invalidate_delivery();
+        self.refresh().await
+    }
+
+    /// Rebuild complete include graphs and rewalk visited ancestry before each
+    /// provider boundary. Removed edges revoke old instructions; new AGENTS in
+    /// already visited scopes are discovered without another tool invocation.
+    pub(crate) async fn refresh(&self) -> Result<(), String> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = this.ledger.lock().expect("instruction ledger poisoned");
+            this.refresh_blocking(&mut ledger)
+        })
+        .await
+        .map_err(|error| format!("instruction refresh task failed: {error}"))?
+    }
+
+    // All filesystem discovery runs on the owning blocking executor, with the
+    // session mutex serializing observation and exact version acknowledgment.
+    #[allow(clippy::disallowed_methods)]
+    fn refresh_blocking(&self, ledger: &mut InstructionLedger) -> Result<(), String> {
+        let root = canonical_existing_ancestor(&self.root)?;
+        let mut origins = ledger.explicit_origins.clone();
+        for path in &ledger.observed_paths {
+            let canonical = canonical_existing_ancestor(path)?;
+            for touched in [path, &canonical] {
+                for directory in instruction_ancestry(&root, touched) {
+                    for name in &self.names {
+                        origins.insert((directory.join(name), directory.clone()));
+                    }
                 }
             }
         }
-
-        if sections.is_empty() {
-            return None;
-        }
-
-        let mut canonical_new = Vec::new();
-        for path in newly_loaded.into_iter().map(PathBuf::from) {
-            if self.delivered.insert(path.clone()) {
-                canonical_new.push(path);
+        for active in &ledger.active {
+            for origin in &active.origins {
+                origins.insert((origin.clone(), active.document.scope.clone()));
             }
         }
-        if canonical_new.is_empty() {
-            return None;
+        let mut documents = Vec::new();
+        let mut errors = Vec::new();
+        let mut origins: Vec<_> = origins.into_iter().collect();
+        origins.sort_by(|left, right| {
+            left.1
+                .components()
+                .count()
+                .cmp(&right.1.components().count())
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (origin, scope) in origins {
+            match std::fs::symlink_metadata(&origin) {
+                Ok(_) => {
+                    if let Err(error) = read_instruction_tree(
+                        &origin,
+                        &scope,
+                        &origin,
+                        &mut HashSet::new(),
+                        &mut documents,
+                        0,
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!("{}: {error}", origin.display())),
+            }
         }
+        ledger.reconcile(documents, errors.is_empty());
+        errors.into_iter().next().map_or(Ok(()), Err)
+    }
 
-        Some(render_scoped_rider(root, &canonical_new, &sections))
+    fn check_blocking(
+        &self,
+        request: bro_tools::InstructionPaths,
+        generation: u64,
+    ) -> Result<(), bro_tools::ToolResult> {
+        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let root = canonical_existing_ancestor(&self.root).map_err(instruction_read_error)?;
+        let mut touched = Vec::new();
+        for path in request.paths {
+            let lexical = normalize_lexical(&if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            });
+            let canonical =
+                canonical_existing_ancestor(&lexical).map_err(instruction_read_error)?;
+            touched.push(lexical);
+            touched.push(canonical);
+        }
+        ledger.observed_paths.extend(touched.iter().cloned());
+        self.refresh_blocking(&mut ledger)
+            .map_err(instruction_read_error)?;
+        if request.access == bro_tools::InstructionAccess::Read {
+            return Ok(());
+        }
+        let blocked: Vec<_> = ledger
+            .active
+            .iter()
+            .filter(|active| {
+                touched
+                    .iter()
+                    .any(|path| path.starts_with(&active.document.scope))
+                    && active
+                        .delivered_generation
+                        .is_none_or(|delivered| delivered > generation)
+            })
+            .map(|active| active.document.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if blocked.is_empty() {
+            return Ok(());
+        }
+        Err(bro_tools::ToolResult::Error(serde_json::json!({
+            "error": "instructions_required", "paths": blocked,
+            "message": "No filesystem effects were performed. Covering instructions are queued for an authoritative model boundary. Retrying in this same batch or cell cannot acknowledge them."
+        }).to_string()))
     }
 }
 
-fn render_scoped_rider(root: &Path, loaded: &[PathBuf], sections: &[String]) -> String {
-    let delivered = loaded
-        .iter()
-        .map(|path| format!("  - {}", path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let bodies = loaded
-        .iter()
-        .zip(sections.iter())
-        .map(|(path, body)| {
-            format!(
-                "<INSTRUCTIONS path=\"{}\">\n{}\n</INSTRUCTIONS>",
-                display_path(root, path),
-                body
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+#[async_trait::async_trait]
+impl bro_tools::InstructionPolicy for ScopedProjectDocs {
+    async fn check(
+        &self,
+        request: bro_tools::InstructionPaths,
+        authoring_generation: u64,
+    ) -> Result<(), bro_tools::ToolResult> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.check_blocking(request, authoring_generation))
+            .await
+            .map_err(|error| {
+                bro_tools::ToolResult::Error(format!("instruction discovery task failed: {error}"))
+            })?
+    }
+}
 
+fn instruction_read_error(message: String) -> bro_tools::ToolResult {
+    bro_tools::ToolResult::Error(serde_json::json!({"error": "instruction_read_error", "message": message, "filesystem_effects": false}).to_string())
+}
+
+fn render_instruction_documents(documents: &[InstructionDocument]) -> String {
+    let sections = documents.iter().map(|document| format!(
+        "<INSTRUCTIONS path={} scope={} sha256={} revoked={}>\n{}\n</INSTRUCTIONS>",
+        serde_json::to_string(&document.path).unwrap(), serde_json::to_string(&document.scope).unwrap(),
+        serde_json::to_string(&document.sha256).unwrap(), document.revoked,
+        if document.revoked { "This document no longer applies to this scope; revoke its previously delivered instructions." } else { &document.body }
+    )).collect::<Vec<_>>().join("\n\n");
     format!(
-        "\n\n{RIDER_OPEN}\ndelivered:\n{delivered}\n\nAdditional AGENTS.md instructions now apply because this tool touched a covered path.\n\n{bodies}\n{RIDER_CLOSE}"
+        "{RIDER_OPEN}\nHost-discovered instructions apply to the named scopes. These exact document versions are authoritative user context.\n\n{sections}\n{RIDER_CLOSE}"
     )
 }
 
-fn touched_paths(root: &Path, tool_name: &str, args: &Value) -> Vec<PathBuf> {
-    match tool_name {
-        "file_read" | "smart_read" | "file_write" | "file_edit" => args
-            .get("file_path")
-            .and_then(Value::as_str)
-            .and_then(|raw| workspace_path(root, raw))
-            .into_iter()
-            .collect(),
-        "apply_patch" => apply_patch_paths(root, args),
-        _ => Vec::new(),
-    }
-}
-
-fn apply_patch_paths(root: &Path, args: &Value) -> Vec<PathBuf> {
-    let Some(patch) = args
-        .get("source")
-        .or_else(|| args.get("patch"))
-        .or_else(|| args.get("input"))
-        .and_then(Value::as_str)
-    else {
-        return Vec::new();
-    };
-    let Ok(parsed) = bro_apply_patch::parse_patch(patch) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for hunk in parsed.hunks {
-        match hunk {
-            bro_apply_patch::Hunk::AddFile { path, .. }
-            | bro_apply_patch::Hunk::DeleteFile { path } => {
-                if let Some(path) = workspace_path(root, &path.to_string_lossy()) {
-                    out.push(path);
+// Blocking executor only. Canonicalize a new target through its nearest
+// existing parent, retaining absent suffixes without dropping symlink ancestry.
+#[allow(clippy::disallowed_methods)]
+fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
+    let mut cursor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                let mut canonical = std::fs::canonicalize(cursor)
+                    .map_err(|error| format!("{}: {error}", cursor.display()))?;
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
                 }
+                return Ok(canonical);
             }
-            bro_apply_patch::Hunk::UpdateFile {
-                path, move_path, ..
-            } => {
-                if let Some(path) = workspace_path(root, &path.to_string_lossy()) {
-                    out.push(path);
-                }
-                if let Some(move_path) = move_path
-                    && let Some(path) = workspace_path(root, &move_path.to_string_lossy())
-                {
-                    out.push(path);
-                }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    cursor
+                        .file_name()
+                        .ok_or_else(|| {
+                            format!("cannot resolve instruction scope {}", path.display())
+                        })?
+                        .to_os_string(),
+                );
+                cursor = cursor.parent().ok_or_else(|| {
+                    format!("cannot resolve instruction scope {}", path.display())
+                })?;
             }
+            Err(error) => return Err(format!("{}: {error}", cursor.display())),
         }
     }
-    out
 }
 
-fn workspace_path(root: &Path, raw: &str) -> Option<PathBuf> {
-    let raw = raw.strip_prefix('@').unwrap_or(raw);
-    if raw.trim().is_empty() {
-        return None;
-    }
-    let path = Path::new(raw);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
+fn instruction_ancestry(root: &Path, touched: &Path) -> Vec<PathBuf> {
+    let directory = if touched.is_dir() {
+        touched
     } else {
-        root.join(path)
+        touched.parent().unwrap_or(touched)
     };
-    let normalized = normalize_lexical(&joined);
-    normalized.starts_with(root).then_some(normalized)
-}
-
-fn scoped_agents_paths(root: &Path, touched_path: &Path, names: &[String]) -> Vec<PathBuf> {
-    let dir = if touched_path.is_dir() {
-        touched_path.to_path_buf()
-    } else {
-        touched_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.to_path_buf())
-    };
-    let mut dirs = Vec::new();
-    let mut cursor = Some(dir.as_path());
-    while let Some(cur) = cursor {
-        dirs.push(cur.to_path_buf());
-        if cur == root {
+    let in_workspace = touched.starts_with(root);
+    let boundary = root
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .unwrap_or(root);
+    let mut ancestors = Vec::new();
+    for ancestor in directory.ancestors() {
+        ancestors.push(ancestor.to_path_buf());
+        if (in_workspace && ancestor == boundary)
+            || (!in_workspace && ancestor.join(".git").exists())
+        {
             break;
         }
-        cursor = cur.parent();
     }
-    dirs.reverse();
-
-    let mut paths = Vec::new();
-    for dir in dirs {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                paths.push(candidate);
-            }
-        }
-    }
-    paths
+    ancestors.reverse();
+    ancestors
 }
 
-fn display_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+// Blocking executor only. Missing optional AGENTS candidates are filtered by
+// the caller; a selected document or allowed explicit include must be readable.
+#[allow(clippy::disallowed_methods)]
+fn read_instruction_tree(
+    path: &Path,
+    scope: &Path,
+    origin: &Path,
+    visited: &mut HashSet<PathBuf>,
+    documents: &mut Vec<InstructionDocument>,
+    depth: usize,
+) -> Result<(), String> {
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(format!(
+            "{}: instruction include depth exceeds {MAX_INCLUDE_DEPTH}",
+            path.display()
+        ));
+    }
+    let body = std::fs::read_to_string(&canonical)
+        .map_err(|error| format!("{}: {error}", canonical.display()))?;
+    documents.push(InstructionDocument::new(
+        canonical.clone(),
+        scope.to_path_buf(),
+        origin.to_path_buf(),
+        body.clone(),
+    ));
+    for mention in extract_at_mentions(&body) {
+        let raw = mention.strip_prefix('@').unwrap_or(&mention);
+        let candidate = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            canonical.parent().unwrap().join(raw)
+        };
+        if is_allowed_instruction_doc(&candidate) {
+            read_instruction_tree(&candidate, scope, origin, visited, documents, depth + 1)?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_lexical(p: &Path) -> PathBuf {
@@ -523,65 +873,6 @@ fn normalize_lexical(p: &Path) -> PathBuf {
             Component::CurDir => {}
             other => out.push(other.as_os_str()),
         }
-    }
-    out
-}
-
-// one-time session resume scan, before the loop serves turns.
-#[allow(clippy::disallowed_methods)]
-fn delivered_paths_from_event_log(path: &Path) -> Vec<PathBuf> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|line| {
-            line.pointer("/event/message/content")
-                .and_then(Value::as_array)
-                .cloned()
-        })
-        .flat_map(|blocks| {
-            blocks
-                .into_iter()
-                .filter_map(|block| {
-                    block
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>()
-        })
-        .flat_map(|content| delivered_paths_from_rider_text(&content))
-        .collect()
-}
-
-fn delivered_paths_from_rider_text(text: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(RIDER_OPEN) {
-        rest = &rest[start + RIDER_OPEN.len()..];
-        let Some(end) = rest.find(RIDER_CLOSE) else {
-            break;
-        };
-        let block = &rest[..end];
-        let mut in_delivered_list = false;
-        for line in block.lines() {
-            let trimmed = line.trim();
-            if trimmed == "delivered:" {
-                in_delivered_list = true;
-                continue;
-            }
-            if in_delivered_list && trimmed.is_empty() {
-                break;
-            }
-            if !in_delivered_list {
-                continue;
-            }
-            if let Some(path) = trimmed.strip_prefix("- ") {
-                out.push(PathBuf::from(path.trim()));
-            }
-        }
-        rest = &rest[end + RIDER_CLOSE.len()..];
     }
     out
 }
@@ -765,107 +1056,491 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    #[test]
-    fn scoped_rider_loads_child_doc_once_after_first_touch() {
-        let root = scratch().canonicalize().unwrap();
-        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
-        write(&root.join(AGENTS_FILE), "ROOT-DOC");
-        let child = root.join("crates").join("thing");
-        write(&child.join(AGENTS_FILE), "CHILD-DOC");
-        write(&child.join("src").join("lib.rs"), "fn main() {}\n");
-        let startup = assemble(&root, None, &default_docs(), DEFAULT_PROJECT_DOC_WARN_BYTES)
-            .expect("startup docs");
-        let mut scoped =
-            ScopedProjectDocs::from_startup_and_event_log(startup.loaded_paths, &root.join("none"));
+    fn guarded_context(
+        root: &Path,
+        ledger: std::sync::Arc<ScopedProjectDocs>,
+        generation: u64,
+    ) -> bro_tools::ToolCx {
+        bro_tools::ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: generation,
+            instruction_policy: Some(ledger),
+            root: root.to_path_buf(),
+            cancellation: Default::default(),
+            output_budget: 16 * 1024,
+            safety: std::sync::Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Default::default(),
+            shell_sessions: Default::default(),
+            edits: Default::default(),
+            session_env: Default::default(),
+            child_env: Default::default(),
+            shell_env: Default::default(),
+            tool_arg_defaults: Default::default(),
+        }
+    }
 
-        let rider = scoped
-            .rider_for_tool_call(
-                &root,
-                "file_read",
-                &serde_json::json!({"file_path": "crates/thing/src/lib.rs"}),
-            )
-            .expect("child doc rider");
-        assert!(rider.contains(RIDER_OPEN), "{rider}");
-        assert!(rider.contains("CHILD-DOC"), "{rider}");
-        assert!(!rider.contains("ROOT-DOC"), "{rider}");
+    fn request(path: PathBuf, access: bro_tools::InstructionAccess) -> bro_tools::InstructionPaths {
+        bro_tools::InstructionPaths {
+            paths: vec![path],
+            access,
+        }
+    }
 
-        let again = scoped.rider_for_tool_call(
-            &root,
-            "smart_read",
-            &serde_json::json!({"file_path": "crates/thing/src/other.rs"}),
+    fn scoped(root: &Path) -> std::sync::Arc<ScopedProjectDocs> {
+        std::sync::Arc::new(ScopedProjectDocs::with_names(
+            root.to_path_buf(),
+            None,
+            default_docs(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn read_then_mutation_waits_for_delivery_and_old_cell_never_borrows_it() {
+        use bro_tools::{InstructionPolicy, Tool};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("child/AGENTS.md"), "CHILD-DOC exact body\n");
+        write(&root.join("child/file.txt"), "before\n");
+        let ledger = scoped(&root);
+        let cx = guarded_context(&root, ledger.clone(), 1);
+        let read = bro_tools::file_read::FileRead;
+        let result = bro_tools::call_tool_with_arg_defaults(
+            &read,
+            read.name(),
+            serde_json::json!({"file_path":"child/file.txt"}),
+            &cx,
+        )
+        .await;
+        assert!(!result.is_error());
+        let batch = ledger.pending_batch(2).unwrap();
+        assert!(batch.text.contains("CHILD-DOC exact body\n"));
+        let edit = bro_tools::workspace::FileEdit;
+        let args = serde_json::json!({"file_path":"child/file.txt", "old_string":"before", "new_string":"after"});
+        for _ in 0..2 {
+            let result =
+                bro_tools::call_tool_with_arg_defaults(&edit, edit.name(), args.clone(), &cx).await;
+            assert!(
+                matches!(result, bro_tools::ToolResult::Error(error) if error.contains("instructions_required"))
+            );
+            assert_eq!(fs::read(root.join("child/file.txt")).unwrap(), b"before\n");
+        }
+        ledger.acknowledge(&batch);
+        assert!(
+            ledger
+                .check(
+                    request(
+                        root.join("child/file.txt"),
+                        bro_tools::InstructionAccess::Mutate
+                    ),
+                    1
+                )
+                .await
+                .is_err()
         );
-        assert_eq!(again, None);
-        fs::remove_dir_all(&root).ok();
+        let mut next = cx.clone();
+        next.instruction_generation = 2;
+        let result = bro_tools::call_tool_with_arg_defaults(&edit, edit.name(), args, &next).await;
+        assert!(!result.is_error(), "{result:?}");
+        assert_eq!(fs::read(root.join("child/file.txt")).unwrap(), b"after\n");
     }
 
-    #[test]
-    fn scoped_rider_ignores_shell_run() {
-        let root = scratch().canonicalize().unwrap();
-        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
-        let child = root.join("crates").join("thing");
-        write(&child.join(AGENTS_FILE), "CHILD-DOC");
-        let mut scoped = ScopedProjectDocs::default();
-
-        let rider = scoped.rider_for_tool_call(
-            &root,
-            "shell_run",
-            &serde_json::json!({"cmd": "cat crates/thing/src/lib.rs"}),
-        );
-        assert_eq!(rider, None);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn scoped_rider_extracts_apply_patch_paths() {
-        let root = scratch().canonicalize().unwrap();
-        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
-        let child = root.join("crates").join("thing");
-        write(&child.join(AGENTS_FILE), "CHILD-DOC");
-        let mut scoped = ScopedProjectDocs::default();
-        let patch = "*** Begin Patch\n*** Add File: crates/thing/src/lib.rs\n+fn main() {}\n*** End Patch\n";
-
-        let rider = scoped
-            .rider_for_tool_call(&root, "apply_patch", &serde_json::json!({"source": patch}))
-            .expect("apply_patch should load child doc");
-        assert!(rider.contains("CHILD-DOC"), "{rider}");
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn scoped_rider_reconstructs_delivered_paths_from_event_log() {
-        let root = scratch().canonicalize().unwrap();
-        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
-        let child = root.join("crates").join("thing");
-        let agents = child.join(AGENTS_FILE);
-        write(&agents, "CHILD-DOC");
-        let rider =
-            render_scoped_rider(&root, std::slice::from_ref(&agents), &["CHILD-DOC".into()]);
-        let log_path = root.join("session.events.jsonl");
+    #[tokio::test]
+    async fn first_create_and_failed_read_queue_docs_without_effects() {
+        use bro_tools::Tool;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
         write(
-            &log_path,
-            &serde_json::json!({
-                "ts": "2026-01-01T00:00:00Z",
-                "event": {
-                    "type": "user",
-                    "message": {
-                        "content": [{
-                            "type": "tool_result",
-                            "content": rider,
-                        }]
-                    }
-                }
-            })
-            .to_string(),
+            &root.join("child/AGENTS.md"),
+            "Create only after reading me.",
         );
+        let ledger = scoped(&root);
+        let cx = guarded_context(&root, ledger.clone(), 1);
+        let read = bro_tools::file_read::FileRead;
+        let result = bro_tools::call_tool_with_arg_defaults(
+            &read,
+            read.name(),
+            serde_json::json!({"file_path":"child/missing/file.txt"}),
+            &cx,
+        )
+        .await;
+        assert!(result.is_error());
+        assert!(ledger.pending_batch(2).is_some());
+        let write = bro_tools::workspace::FileWrite;
+        let result = bro_tools::call_tool_with_arg_defaults(
+            &write,
+            write.name(),
+            serde_json::json!({"file_path":"child/missing/file.txt", "content":"new"}),
+            &cx,
+        )
+        .await;
+        assert!(
+            matches!(result, bro_tools::ToolResult::Error(error) if error.contains("instructions_required"))
+        );
+        assert!(!root.join("child/missing").exists());
+    }
 
-        let mut scoped =
-            ScopedProjectDocs::from_startup_and_event_log(Vec::<PathBuf>::new(), &log_path);
-        let rider = scoped.rider_for_tool_call(
-            &root,
-            "file_read",
-            &serde_json::json!({"file_path": "crates/thing/src/lib.rs"}),
+    #[tokio::test]
+    async fn host_default_path_is_guarded_before_write() {
+        use bro_tools::Tool;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("child/AGENTS.md"), "Nested scope.");
+        let ledger = scoped(&root);
+        let mut cx = guarded_context(&root, ledger.clone(), 1);
+        cx.tool_arg_defaults = std::sync::Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
+                "default:file_write.file_path".into(),
+                "child/new.txt".into(),
+            )]))
+            .unwrap(),
         );
-        assert_eq!(rider, None);
-        fs::remove_dir_all(&root).ok();
+        let tool = bro_tools::workspace::FileWrite;
+        let result = bro_tools::call_tool_with_arg_defaults(
+            &tool,
+            tool.name(),
+            serde_json::json!({"content":"new"}),
+            &cx,
+        )
+        .await;
+        assert!(
+            matches!(result, bro_tools::ToolResult::Error(error) if error.contains("instructions_required"))
+        );
+        assert!(!root.join("child/new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn patch_move_checks_destination_before_any_hunk_effects() {
+        use bro_tools::Tool;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("source.txt"), "old\n");
+        write(
+            &root.join("destination/AGENTS.md"),
+            "Destination instructions.",
+        );
+        let ledger = scoped(&root);
+        let mut cx = guarded_context(&root, ledger.clone(), 1);
+        let tool = bro_tools::workspace::ApplyPatch;
+        let args = serde_json::json!({"source":"*** Begin Patch\n*** Add File: first.txt\n+first\n*** Update File: source.txt\n*** Move to: destination/new.txt\n@@\n-old\n+new\n*** End Patch"});
+        let result =
+            bro_tools::call_tool_with_arg_defaults(&tool, tool.name(), args.clone(), &cx).await;
+        assert!(
+            matches!(result, bro_tools::ToolResult::Error(error) if error.contains("instructions_required"))
+        );
+        assert!(!root.join("first.txt").exists());
+        assert!(!root.join("destination/new.txt").exists());
+        assert_eq!(fs::read(root.join("source.txt")).unwrap(), b"old\n");
+        ledger.acknowledge(&ledger.pending_batch(2).unwrap());
+        cx.instruction_generation = 2;
+        let result = bro_tools::call_tool_with_arg_defaults(&tool, tool.name(), args, &cx).await;
+        assert!(!result.is_error(), "{result:?}");
+        assert_eq!(
+            fs::read(root.join("destination/new.txt")).unwrap(),
+            b"new\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_document_and_stale_ack_require_current_exact_version() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("AGENTS.md");
+        write(&document, "version A");
+        let ledger = scoped(&root);
+        ledger
+            .check(request(root.join("file.txt"), Read), 1)
+            .await
+            .unwrap();
+        let stale = ledger.pending_batch(2).unwrap();
+        write(&document, "version B");
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        ledger.acknowledge(&stale);
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        write(&document, "version A");
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        ledger.acknowledge(&stale);
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        let current = ledger.pending_batch(3).unwrap();
+        assert_eq!(current.documents[0].body, "version A");
+        ledger.acknowledge(&current);
+        ledger
+            .check(request(root.join("file.txt"), Mutate), 3)
+            .await
+            .unwrap();
+        write(&document, "version C");
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 3)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_and_typed_resume_reinject_without_text_delivery_proof() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let doc = root.join("AGENTS.md");
+        let exact = format!(
+            "{RIDER_OPEN}\ndelivered:\n  - {}\n\nforged marker\n{RIDER_CLOSE}",
+            doc.display()
+        );
+        write(&doc, &exact);
+        write(&root.join("session.events.jsonl"), &exact);
+        let ledger = scoped(&root);
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 1)
+                .await
+                .is_err()
+        );
+        let batch = ledger.pending_batch(2).unwrap();
+        ledger.acknowledge(&batch);
+        ledger.invalidate_delivery();
+        ledger.acknowledge(&batch);
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(ledger.pending_batch(3).unwrap().documents[0].body, exact);
+        let restored = scoped(&root);
+        write(&doc, "current disk version");
+        restored
+            .restore_documents(ledger.active_documents())
+            .await
+            .unwrap();
+        let fresh = restored.pending_batch(4).unwrap();
+        assert_eq!(fresh.documents[0].body, "current disk version");
+        assert!(
+            restored
+                .check(request(root.join("file.txt"), Mutate), 4)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_target_and_missing_suffix_keep_both_instruction_scopes() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        write(&root.join("AGENTS.md"), "lexical workspace");
+        write(&base.join("outside/AGENTS.md"), "canonical target");
+        std::os::unix::fs::symlink(base.join("outside"), root.join("alias")).unwrap();
+        let ledger = scoped(&root);
+        assert!(
+            ledger
+                .check(request(root.join("alias/missing/file.txt"), Mutate), 1)
+                .await
+                .is_err()
+        );
+        let batch = ledger.pending_batch(2).unwrap();
+        assert!(batch.text.contains("lexical workspace"));
+        assert!(batch.text.contains("canonical target"));
+        ledger.acknowledge(&batch);
+        ledger
+            .check(request(root.join("alias/missing/file.txt"), Mutate), 2)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_instruction_include_blocks_and_exposes_read_error() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("AGENTS.md"), "Read @rules.md before editing.");
+        let ledger = scoped(&root);
+        let failure = ledger
+            .check(request(root.join("new.txt"), Mutate), 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failure, bro_tools::ToolResult::Error(error) if error.contains("instruction_read_error") && error.contains("rules.md"))
+        );
+        write(&root.join("rules.md"), "Included rules.");
+        assert!(
+            ledger
+                .check(request(root.join("new.txt"), Mutate), 1)
+                .await
+                .is_err()
+        );
+        ledger.acknowledge(&ledger.pending_batch(2).unwrap());
+        ledger
+            .check(request(root.join("new.txt"), Mutate), 2)
+            .await
+            .unwrap();
+        fs::write(root.join("rules.md"), [0xff]).unwrap();
+        assert!(
+            ledger
+                .check(request(root.join("new.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_include_or_document_revokes_without_permanent_read_failure() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("AGENTS.md"), "Read @rules.md.");
+        write(&root.join("rules.md"), "Old included rule.");
+        let ledger = scoped(&root);
+        ledger
+            .check(request(root.join("file.txt"), Read), 1)
+            .await
+            .unwrap();
+        ledger.acknowledge(&ledger.pending_batch(2).unwrap());
+        write(&root.join("AGENTS.md"), "Include was removed.");
+        ledger.refresh().await.unwrap();
+        let batch = ledger.pending_batch(3).unwrap();
+        assert!(
+            batch
+                .documents
+                .iter()
+                .any(|doc| doc.path == root.join("rules.md") && doc.revoked)
+        );
+        assert!(!batch.text.contains("Old included rule."));
+        ledger
+            .check(request(root.join("file.txt"), Read), 2)
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .check(request(root.join("file.txt"), Mutate), 2)
+                .await
+                .is_err()
+        );
+        ledger.acknowledge(&batch);
+        ledger
+            .check(request(root.join("file.txt"), Mutate), 3)
+            .await
+            .unwrap();
+        fs::remove_file(root.join("AGENTS.md")).unwrap();
+        ledger.refresh().await.unwrap();
+        let batch = ledger.pending_batch(4).unwrap();
+        assert!(
+            batch
+                .documents
+                .iter()
+                .any(|doc| doc.path == root.join("AGENTS.md") && doc.revoked)
+        );
+        ledger.acknowledge(&batch);
+        ledger
+            .check(request(root.join("file.txt"), Mutate), 4)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn boundary_refresh_finds_new_documents_in_prior_empty_scopes() {
+        use bro_tools::{InstructionAccess::*, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let ledger = scoped(&root);
+        ledger
+            .check(request(root.join("child/future/file.txt"), Read), 1)
+            .await
+            .unwrap();
+        assert!(ledger.pending_batch(2).is_none());
+        let restored = scoped(&root);
+        restored.restore_observed_paths(ledger.observed_paths());
+        write(&root.join("child/AGENTS.md"), "New scope.");
+        restored.refresh().await.unwrap();
+        assert_eq!(
+            restored.pending_batch(2).unwrap().documents[0].body,
+            "New scope."
+        );
+        assert!(
+            restored
+                .check(request(root.join("child/future/file.txt"), Mutate), 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_mutations_cannot_deliver_each_others_instructions() {
+        use bro_tools::Tool;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join("child/AGENTS.md"), "Parallel scope.");
+        let ledger = scoped(&root);
+        let cx = guarded_context(&root, ledger.clone(), 1);
+        let tool = bro_tools::workspace::FileWrite;
+        let (first, second) = tokio::join!(
+            bro_tools::call_tool_with_arg_defaults(
+                &tool,
+                tool.name(),
+                serde_json::json!({"file_path":"child/a.txt", "content":"a"}),
+                &cx
+            ),
+            bro_tools::call_tool_with_arg_defaults(
+                &tool,
+                tool.name(),
+                serde_json::json!({"file_path":"child/b.txt", "content":"b"}),
+                &cx
+            ),
+        );
+        assert!(first.is_error());
+        assert!(second.is_error());
+        assert!(!root.join("child/a.txt").exists());
+        assert!(!root.join("child/b.txt").exists());
+        assert_eq!(ledger.pending_batch(2).unwrap().documents.len(), 1);
+    }
+    #[tokio::test]
+    async fn global_candidates_are_strict_even_when_initial_discovery_skipped_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("global");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join(AGENTS_FILE), [0xff, 0xfe]).unwrap();
+        let ledger = ScopedProjectDocs::with_names(root.clone(), None, vec![AGENTS_FILE.into()]);
+        ledger.enroll_global_candidates_at(&home);
+        assert!(ledger.refresh().await.is_err());
+        std::fs::write(home.join(AGENTS_FILE), "STRICT_GLOBAL").unwrap();
+        ledger.refresh().await.unwrap();
+        assert!(
+            ledger
+                .pending_batch(1)
+                .unwrap()
+                .text
+                .contains("STRICT_GLOBAL")
+        );
+        let other = root.join("later-global");
+        std::fs::create_dir(&other).unwrap();
+        ledger.enroll_global_candidates_at(&other);
+        ledger.refresh().await.unwrap();
+        std::fs::write(other.join(AGENTS_OVERRIDE_FILE), "NEW_GLOBAL").unwrap();
+        ledger.refresh().await.unwrap();
+        assert!(ledger.pending_batch(2).unwrap().text.contains("NEW_GLOBAL"));
     }
 }

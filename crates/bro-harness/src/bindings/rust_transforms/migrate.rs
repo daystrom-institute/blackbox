@@ -48,8 +48,14 @@ pub struct RustMigrateTypeUsages(pub Arc<ProvenanceLedger>);
 
 fn operator_grant(cx: &ToolCx, tool: &str) -> Option<bool> {
     cx.tool_arg_defaults
-        .lookup(tool, OPT_OUT_PARAM)
-        .map(|value| value.eq_ignore_ascii_case("true"))
+        .lookup_grant(tool, OPT_OUT_PARAM)
+        .and_then(|value| {
+            value.as_bool().or_else(|| {
+                value
+                    .as_str()
+                    .map(|value| value.eq_ignore_ascii_case("true"))
+            })
+        })
 }
 
 fn public_api_hint(tool: &str) -> String {
@@ -137,6 +143,9 @@ fn project_plan(
 
 #[async_trait]
 impl Tool for RustMigrateErrorType {
+    fn authority_grants(&self) -> &[&str] {
+        &[OPT_OUT_PARAM]
+    }
     fn name(&self) -> &str {
         "rust.migrateErrorType"
     }
@@ -256,6 +265,9 @@ impl RustMigrateErrorType {
 
 #[async_trait]
 impl Tool for RustMigrateTypeUsages {
+    fn authority_grants(&self) -> &[&str] {
+        &[OPT_OUT_PARAM]
+    }
     fn name(&self) -> &str {
         "rust.migrateTypeUsages"
     }
@@ -373,6 +385,9 @@ mod tests {
 
     fn cx_in(root: &std::path::Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

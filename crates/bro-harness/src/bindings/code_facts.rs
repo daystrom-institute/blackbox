@@ -73,6 +73,39 @@ pub(super) fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+const MAX_EXACT_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FACT_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_ITEMS_PER_FILE: usize = 2_000;
+const MAX_ITEMS_FILE_BYTES: usize = 512 * 1024;
+const MAX_ITEMS_PAGE_FILES: usize = 128;
+
+#[allow(clippy::disallowed_methods)]
+fn read_exact_source(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    anyhow::ensure!(
+        std::fs::metadata(path)?.is_file(),
+        "not_regular_file: exact source reads require a regular file"
+    );
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take((MAX_EXACT_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_EXACT_SOURCE_BYTES,
+        "source_too_large: exact source reads permit at most {MAX_EXACT_SOURCE_BYTES} file bytes; use bounded file_read for browsing"
+    );
+    Ok(bytes)
+}
+
+fn exact_result(tool: &str, payload: Value) -> ToolResult {
+    if payload.to_string().len() > MAX_FACT_RESULT_BYTES {
+        return err(format!(
+            "{tool}: exact_result_too_large: serialized result exceeds {MAX_FACT_RESULT_BYTES} bytes; request a narrower span or line range. No partial text returned."
+        ));
+    }
+    ToolResult::Json(payload)
+}
+
 /// One-of `file` / `files` target selection, shared by the multi-file fact
 /// bindings (gap-3ec052ea: per-crate fan-out is the host's job, not a cell
 /// for-loop).
@@ -138,46 +171,65 @@ struct CodeItemsParams {
     targets: FactTargets,
     #[serde(default, rename = "top_level_only", alias = "topLevelOnly")]
     top_level_only: bool,
+    #[serde(default)]
+    offset: usize,
 }
 
-fn items_payload(file: &str, found: &facts::FileItemsFacts, top_level_only: bool) -> Value {
-    let items: Vec<Value> = found
+fn items_payload(
+    file: &str,
+    found: &facts::FileItemsFacts,
+    top_level_only: bool,
+) -> Result<Value, String> {
+    let mut items = Vec::new();
+    let mut bytes = 0;
+    for fact in found
         .items
         .iter()
         .filter(|fact| !top_level_only || !fact.nested)
-        .map(|fact| {
-            let item = &fact.item;
-            json!({
-                "name": item.name,
-                "kind": item.kind,
-                "visibility": fact.visibility,
-                "declaring_type": fact.declaring_type,
-                "nested": fact.nested,
-                "span": Span {
-                    file: file.to_string(),
-                    byte_start: item.byte_start,
-                    byte_end: item.byte_end,
-                    content_sha256: found.content_sha256.clone(),
-                },
-                "trivia_span": Span {
-                    file: file.to_string(),
-                    byte_start: item.leading_trivia_start,
-                    byte_end: item.trailing_trivia_end,
-                    content_sha256: found.content_sha256.clone(),
-                },
-                "line_start": item.line_start,
-                "line_end": item.line_end,
-                "attributes": item.attributes,
-            })
-        })
-        .collect();
-    json!({
+    {
+        if items.len() >= MAX_ITEMS_PER_FILE {
+            return Err(format!(
+                "inventory_too_large: more than {MAX_ITEMS_PER_FILE} items in one file; use a focused code.query instead"
+            ));
+        }
+        let item = &fact.item;
+        let value = json!({
+            "name": item.name,
+            "kind": item.kind,
+            "visibility": fact.visibility,
+            "declaring_type": fact.declaring_type,
+            "nested": fact.nested,
+            "span": Span {
+                file: file.to_string(),
+                byte_start: item.byte_start,
+                byte_end: item.byte_end,
+                content_sha256: found.content_sha256.clone(),
+            },
+            "trivia_span": Span {
+                file: file.to_string(),
+                byte_start: item.leading_trivia_start,
+                byte_end: item.trailing_trivia_end,
+                content_sha256: found.content_sha256.clone(),
+            },
+            "line_start": item.line_start,
+            "line_end": item.line_end,
+            "attributes": item.attributes,
+        });
+        bytes += value.to_string().len();
+        if bytes > MAX_ITEMS_FILE_BYTES {
+            return Err(format!(
+                "inventory_too_large: item data exceeds {MAX_ITEMS_FILE_BYTES} bytes in one file; use a focused code.query instead"
+            ));
+        }
+        items.push(value);
+    }
+    Ok(json!({
         "file": file,
         "language": found.language,
         "content_sha256": found.content_sha256,
         "source_len": found.source_len,
         "items": items,
-    })
+    }))
 }
 
 #[async_trait]
@@ -186,7 +238,7 @@ impl Tool for CodeItems {
         "code.items"
     }
     fn description(&self) -> &str {
-        "Inventory syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Java field declarations are NOT items; use code.fields for field facts. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
+        "Inventory syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans. Java field declarations are not items; use code.fields. Pass file for one inventory or files for a batch with per-file errors. Batch pages contain at most 128 files and 1 MiB serialized JSON; continue with next_offset and the same files array. Per-file inventories exceeding 2000 items or 512 KiB of item data return inventory_too_large; use a focused code.query."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -194,7 +246,8 @@ impl Tool for CodeItems {
             "properties": {
                 "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
                 "files": { "type": "array", "items": { "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "file": { "type": "string" } }, "required": ["file"] }] }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); code.files entries ({ file, language } objects) are accepted verbatim; the host fans out (use instead of a cell for-loop)." },
-                "top_level_only": { "type": "boolean", "description": "When true, drops items declared inside nested Java types. Alias: topLevelOnly." }
+                "top_level_only": { "type": "boolean", "description": "When true, drops items declared inside nested Java types. Alias: topLevelOnly." },
+                "offset": { "type":"integer", "minimum":0, "default":0, "description":"Batch file offset; reuse next_offset with the same files array. Only zero is valid for single-file calls." }
             }
         })
     }
@@ -213,10 +266,14 @@ impl Tool for CodeItems {
             Err(e) => return err(format!("code.items: {e}")),
         };
         let top_level_only = params.top_level_only;
+        let offset = params.offset;
         let (targets, multi) = match params.targets.resolve("code.items") {
             Ok(t) => t,
             Err(e) => return e,
         };
+        if !multi && offset != 0 {
+            return err("code.items: offset is only available for a files batch");
+        }
         let mut resolved = Vec::with_capacity(targets.len());
         for file in targets {
             match resolve(&cx.root, &file) {
@@ -228,18 +285,39 @@ impl Tool for CodeItems {
             if !multi {
                 let (file, path) = &resolved[0];
                 return match facts::file_items(path) {
-                    Ok(found) => ToolResult::Json(items_payload(file, &found, top_level_only)),
+                    Ok(found) => match items_payload(file, &found, top_level_only) {
+                        Ok(payload) => ToolResult::Json(payload),
+                        Err(error) => err(format!("code.items: {error}")),
+                    },
                     Err(e) => err(format!("code.items: {e:#}")),
                 };
             }
-            let files: Vec<Value> = resolved
-                .iter()
-                .map(|(file, path)| match facts::file_items(path) {
-                    Ok(found) => items_payload(file, &found, top_level_only),
-                    Err(e) => json!({ "file": file, "error": format!("{e:#}") }),
-                })
-                .collect();
-            ToolResult::Json(json!({ "files": files }))
+            let total = resolved.len();
+            let mut files = Vec::new();
+            let mut bytes = 0;
+            for (file, path) in resolved.iter().skip(offset).take(MAX_ITEMS_PAGE_FILES) {
+                let payload = facts::file_items(path)
+                    .map_err(|error| format!("{error:#}"))
+                    .and_then(|found| items_payload(file, &found, top_level_only))
+                    .unwrap_or_else(|error| json!({"file":file,"error":error}));
+                let size = payload.to_string().len();
+                // Reserve the fixed-size envelope and punctuation before
+                // admitting a complete per-file result into the aggregate.
+                if bytes + size + files.len() + 512 > MAX_FACT_RESULT_BYTES {
+                    if files.is_empty() {
+                        return err("code.items: one file result exceeds the aggregate budget; shorten its path or request a focused query");
+                    }
+                    break;
+                }
+                bytes += size;
+                files.push(payload);
+            }
+            let next = offset.saturating_add(files.len());
+            let truncated = next < total;
+            ToolResult::Json(json!({ "files":files, "files_total":total,
+                "files_scanned":files.len(), "offset":offset,
+                "next_offset":truncated.then_some(next), "truncated":truncated,
+                "aggregate_capped":truncated }))
         })
         .await
     }
@@ -606,7 +684,7 @@ impl Tool for CodeRead {
         "code.read"
     }
     fn description(&self) -> &str {
-        "Read the exact source text of a hash-anchored Span (pure). Errors with `stale_span` if the file content no longer matches the Span's content_sha256."
+        "Read exact UTF-8 text of a hash-anchored Span. Rejects stale hashes, invalid UTF-8 or split code points, source files over 16 MiB, and serialized results over 1 MiB. Request a narrower span when the result is too large; no partial or replacement text is returned."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -645,7 +723,7 @@ impl Tool for CodeRead {
         };
         let span = params.span;
         bro_tools::tool::call_blocking(move || {
-            let bytes = match read_file_bytes(&path) {
+            let bytes = match read_exact_source(&path) {
                 Ok(b) => b,
                 Err(e) => return err(format!("code.read: {}: {e}", span.file)),
             };
@@ -665,10 +743,21 @@ impl Tool for CodeRead {
                     bytes.len()
                 ));
             }
-            let text = String::from_utf8_lossy(&bytes[span.byte_start..span.byte_end]).to_string();
+            if span.byte_end - span.byte_start > MAX_FACT_RESULT_BYTES {
+                return err("code.read: exact_result_too_large: request a narrower span; no partial text returned");
+            }
+            if [span.byte_start, span.byte_end].iter().any(|index| {
+                bytes.get(*index).is_some_and(|byte| byte & 0xc0 == 0x80)
+            }) {
+                return err("code.read: invalid_utf8_span: span boundary splits a UTF-8 code point; no replacement text returned");
+            }
+            let text = match std::str::from_utf8(&bytes[span.byte_start..span.byte_end]) {
+                Ok(text) => text,
+                Err(error) => return err(format!("code.read: invalid_utf8_span: span contains invalid UTF-8 or splits a code point: {error}; no replacement text returned")),
+            };
             let byte_length = span.byte_end.saturating_sub(span.byte_start);
             let char_length = text.chars().count();
-            ToolResult::Json(json!({
+            exact_result("code.read", json!({
                 "text": text,
                 "span": span,
                 "byte_length": byte_length,
@@ -697,13 +786,13 @@ impl Tool for CodeReadLines {
         "code.readLines"
     }
     fn description(&self) -> &str {
-        "Read exact source text for a 1-based inclusive line range and return a hash-anchored Span (pure)."
+        "Read exact UTF-8 source text for a 1-based inclusive line range and return a hash-anchored Span. Rejects invalid UTF-8 files, source files over 16 MiB, and serialized results over 1 MiB. Request fewer lines when the result is too large; no partial or replacement text is returned."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative file path." },
+                "file": { "type": "string", "description": "Relative paths resolve against the session root; absolute paths are accepted as-is." },
                 "startLine": { "type": "integer", "minimum": 1 },
                 "endLine": { "type": "integer", "minimum": 1 }
             },
@@ -735,13 +824,16 @@ impl Tool for CodeReadLines {
             Err(e) => return err(format!("code.readLines: {e}")),
         };
         bro_tools::tool::call_blocking(move || {
-            let bytes = match read_file_bytes(&path) {
+            let bytes = match read_exact_source(&path) {
                 Ok(b) => b,
                 Err(e) => return err(format!("code.readLines: {}: {e}", params.file)),
             };
-            let source = String::from_utf8_lossy(&bytes);
+            let source = match std::str::from_utf8(&bytes) {
+                Ok(source) => source,
+                Err(error) => return err(format!("code.readLines: invalid_utf8_source: cannot derive exact byte spans from invalid UTF-8: {error}; no replacement text returned")),
+            };
             let Some((byte_start, byte_end)) =
-                line_range_to_bytes(&source, params.start_line, params.end_line)
+                line_range_to_bytes(source, params.start_line, params.end_line)
             else {
                 let line_count = source.lines().count().max(1);
                 return err(format!(
@@ -750,14 +842,17 @@ impl Tool for CodeReadLines {
                 ));
             };
             let content_sha256 = bbox_refactor::sha256_hex(&bytes);
-            let text = source[byte_start..byte_end].to_string();
+            if byte_end - byte_start > MAX_FACT_RESULT_BYTES {
+                return err("code.readLines: exact_result_too_large: request fewer lines; no partial text returned");
+            }
+            let text = &source[byte_start..byte_end];
             let span = Span {
                 file: params.file,
                 byte_start,
                 byte_end,
                 content_sha256,
             };
-            ToolResult::Json(json!({
+            exact_result("code.readLines", json!({
                 "text": text,
                 "span": span,
                 "startLine": params.start_line,
@@ -1074,6 +1169,9 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1139,6 +1237,178 @@ class Probe {
             ToolResult::Json(v) => v,
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exact_read_rejects_invalid_utf8_and_split_code_points() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_in(&root);
+        for (bytes, start, end) in [
+            ("é\n".as_bytes(), 0, 1),
+            ("é\n".as_bytes(), 1, 2),
+            ("é\n".as_bytes(), 1, 1),
+            (b"a\xff\nb\n".as_slice(), 0, 5),
+        ] {
+            std::fs::write(root.join("text.rs"), bytes).unwrap();
+            let result = CodeRead
+                .call(
+                    json!({"span":{
+                        "file":"text.rs", "byte_start":start, "byte_end":end,
+                        "content_sha256":bbox_refactor::sha256_hex(bytes)
+                    }}),
+                    &cx,
+                )
+                .await;
+            assert!(
+                matches!(result, ToolResult::Error(ref error) if error.contains("invalid_utf8_span")),
+                "{result:?}"
+            );
+        }
+        let result = CodeReadLines
+            .call(json!({"file":"text.rs", "startLine":2, "endLine":2}), &cx)
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref error) if error.contains("invalid_utf8_source")),
+            "{result:?}"
+        );
+        let bytes = "é\r\n中\n".as_bytes();
+        std::fs::write(root.join("text.rs"), bytes).unwrap();
+        let lines = json_of(
+            CodeReadLines
+                .call(json!({"file":"text.rs","startLine":2,"endLine":2}), &cx)
+                .await,
+        );
+        assert_eq!(lines["text"], "中\n");
+        assert_eq!(lines["span"]["byte_start"], 4);
+        assert_eq!(lines["span"]["byte_end"], bytes.len());
+        let span = json_of(CodeRead.call(json!({"span":lines["span"]}), &cx).await);
+        assert_eq!(span["text"], lines["text"]);
+        assert_eq!(span["byte_length"], 4);
+    }
+
+    #[tokio::test]
+    async fn exact_reads_bound_serialized_escaping_and_source_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_in(&root);
+        let bytes = vec![0; MAX_FACT_RESULT_BYTES / 5];
+        std::fs::write(root.join("escaped.rs"), &bytes).unwrap();
+        for result in [
+            CodeRead.call(json!({"span":{"file":"escaped.rs","byte_start":0,"byte_end":bytes.len(),"content_sha256":bbox_refactor::sha256_hex(&bytes)}}), &cx).await,
+            CodeReadLines.call(json!({"file":"escaped.rs","startLine":1,"endLine":1}), &cx).await,
+        ] {
+            assert!(matches!(result, ToolResult::Error(ref error) if error.contains("exact_result_too_large")), "{result:?}");
+        }
+        std::fs::File::create(root.join("large.rs"))
+            .unwrap()
+            .set_len((MAX_EXACT_SOURCE_BYTES + 1) as u64)
+            .unwrap();
+        let result = CodeReadLines
+            .call(json!({"file":"large.rs","startLine":1,"endLine":1}), &cx)
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref error) if error.contains("source_too_large")),
+            "{result:?}"
+        );
+        assert!(
+            read_exact_source(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("not_regular_file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_source_refuses_fifo_before_opening_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let pipe = root.join("source.rs");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            read_exact_source(&pipe)
+                .unwrap_err()
+                .to_string()
+                .contains("not_regular_file")
+        );
+    }
+
+    #[tokio::test]
+    async fn items_pages_by_file_count_and_serialized_aggregate_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_in(&root);
+        for (prefix, count, items) in [("small", 140, 1), ("dense", 8, 400)] {
+            let source = (0..items)
+                .map(|i| format!("pub fn item_{i}() {{}}\n"))
+                .collect::<String>();
+            let paths: Vec<_> = (0..count).map(|i| format!("{prefix}_{i}.rs")).collect();
+            for path in &paths {
+                std::fs::write(root.join(path), &source).unwrap();
+            }
+            let mut offset = 0;
+            let mut delivered = Vec::new();
+            loop {
+                let page = json_of(
+                    CodeItems
+                        .call(json!({"files":paths,"offset":offset}), &cx)
+                        .await,
+                );
+                assert!(page.to_string().len() <= MAX_FACT_RESULT_BYTES);
+                let files = page["files"].as_array().unwrap();
+                assert!(!files.is_empty());
+                assert!(files.len() <= MAX_ITEMS_PAGE_FILES);
+                assert!(files.iter().all(|file| file.get("error").is_none()));
+                if offset == 0 {
+                    assert_eq!(page["aggregate_capped"], true);
+                }
+                delivered.extend(
+                    files
+                        .iter()
+                        .map(|file| file["file"].as_str().unwrap().to_owned()),
+                );
+                match page["next_offset"].as_u64() {
+                    Some(next) => {
+                        assert!(next as usize > offset);
+                        offset = next as usize;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(delivered, paths);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_item_inventory_is_an_explicit_error_without_partial_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = (0..3_000)
+            .map(|i| format!("pub fn item_{i}() {{}}\n"))
+            .collect::<String>();
+        std::fs::write(root.join("dense.rs"), source).unwrap();
+        let cx = cx_in(&root);
+        let single = CodeItems.call(json!({"file":"dense.rs"}), &cx).await;
+        assert!(
+            matches!(single, ToolResult::Error(ref error) if error.contains("inventory_too_large")),
+            "{single:?}"
+        );
+        let batch = json_of(CodeItems.call(json!({"files":["dense.rs"]}), &cx).await);
+        assert!(
+            batch["files"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("inventory_too_large")
+        );
+        assert!(batch["files"][0].get("items").is_none());
+        assert_eq!(batch["truncated"], false);
     }
 
     #[tokio::test]

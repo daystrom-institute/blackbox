@@ -136,7 +136,7 @@ impl CodeModeSessionDelegate for HarnessDelegate {
             // Admission is cancellation-aware at the host gate. Once admitted,
             // await its real outcome, including blocking mutations and cleanup.
             match seam
-                .call_tool_with_cancellation(call, cancellation_token)
+                .call_tool_with_context(call, cancellation_token, invocation.context_id)
                 .await
             {
                 Ok(out) if out.is_error => Err(out.content),
@@ -229,21 +229,43 @@ impl CodeModeToolSession {
         mode: CodeMode,
         namespaces: &BTreeMap<String, ToolNamespaceDescription>,
     ) -> Self {
-        let catalog: Vec<ToolDefinition> = callable
+        let mut seen: std::collections::HashMap<String, Arc<dyn Tool>> =
+            std::collections::HashMap::new();
+        let mut catalog: Vec<ToolDefinition> = callable
             .iter()
             .filter(|t| is_code_mode_nested_tool(t.name()))
+            .filter(|tool| {
+                if seen
+                    .get(tool.name())
+                    .is_some_and(|previous| Arc::ptr_eq(previous, tool))
+                {
+                    return false;
+                }
+                seen.entry(tool.name().to_owned())
+                    .or_insert_with(|| (*tool).clone());
+                true
+            })
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 tool_name: ToolName::plain(t.name()),
                 description: t.description().to_string(),
-                kind: CodeModeToolKind::Function,
+                kind: if t.freeform_grammar().is_some() {
+                    CodeModeToolKind::Freeform
+                } else {
+                    CodeModeToolKind::Function
+                },
                 input_schema: Some(t.input_schema()),
-                output_schema: None,
+                output_schema: t.output_schema(),
                 namespace_binding: t
                     .namespace_binding()
                     .map(|(namespace, method)| NamespaceBinding { namespace, method }),
             })
             .collect();
+
+        // One tool admitted through multiple visibility lanes is one callable.
+        // Distinct implementations remain for runtime admission to reject,
+        // even if they happen to advertise identical metadata.
+        catalog.sort_by(|left, right| left.name.cmp(&right.name));
 
         let description = build_exec_tool_description(
             &catalog,
@@ -271,6 +293,11 @@ impl CodeModeToolSession {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.surface.service.shutdown().await
+    }
+
+    /// Includes completed cells whose terminal output has not been consumed.
+    pub async fn has_outstanding_work(&self) -> bool {
+        self.surface.service.has_outstanding_work().await
     }
 
     /// Close yielded cells at an interrupted turn boundary without closing the
@@ -355,6 +382,7 @@ impl Tool for ExecTool {
         };
         let max_output_tokens = parsed.max_output_tokens;
         let request = ExecuteRequest {
+            context_id: Some(cx.instruction_generation),
             tool_call_id: "exec".to_string(),
             enabled_tools: self.surface.catalog.clone(),
             source: parsed.code,
@@ -542,6 +570,9 @@ mod tests {
 
     fn test_cx() -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -957,6 +988,9 @@ text(JSON.stringify(result));
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("probe.txt"), "hello-codemode-123").unwrap();
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1119,6 +1153,141 @@ text(JSON.stringify(result));
     }
 
     #[tokio::test]
+    async fn full_binding_catalog_has_discoverable_schemas_without_default_manuals() {
+        let binding_session = crate::bindings::BindingToolSession::new();
+        let callable = binding_session.tools();
+        let count = callable.len();
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            test_cx(),
+        ));
+        let tools = code_mode_tools(
+            &callable,
+            seam,
+            CodeMode::Optional,
+            &crate::bindings::namespace_descriptions(),
+        );
+        assert!(
+            tools[0].description().len() < 8_000,
+            "default exec description grew to {} bytes",
+            tools[0].description().len()
+        );
+        let result = tools[0].call(json!({"source": r#"
+            for (const entry of ALL_TOOLS) {
+                if (!entry.input_schema || !entry.declaration) throw Error("missing schema: " + entry.canonical_name);
+                if (!entry.namespace || typeof globalThis[entry.namespace][entry.method] !== "function") throw Error("missing method: " + entry.canonical_name);
+            }
+            const assist = ALL_TOOLS.find(t => t.canonical_name === "lsp.assist");
+            if (!assist || !assist.declaration.includes("assist(args:")) throw Error("missing assist declaration");
+            text({count: ALL_TOOLS.length, assist: assist.callable});
+        "#}), &test_cx()).await;
+        let ToolResult::Text(text) = result else {
+            panic!("binding discovery failed: {result:?}");
+        };
+        assert!(text.contains(&format!("\"count\":{count}")), "{text}");
+        assert!(text.contains("\"assist\":\"lsp.assist\""), "{text}");
+        binding_session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn discovery_metadata_drives_flat_and_namespace_calls_in_both_modes() {
+        for mode in [CodeMode::Optional, CodeMode::Only] {
+            let callable: Vec<Arc<dyn Tool>> = vec![Arc::new(Echo), Arc::new(NamespacedEcho)];
+            let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+                callable.clone(),
+                test_cx(),
+            ));
+            let mut tools = code_mode_tools(&callable, seam, mode, &BTreeMap::new());
+            let result = tools.remove(0).call(json!({"source": r#"
+                for (const canonical of ["echo", "ns.echo"]) {
+                    const entry = ALL_TOOLS.find(t => t.canonical_name === canonical);
+                    if (!entry || entry.input_schema.type !== "object" || entry.kind !== "function") throw Error("missing schema");
+                    if (!entry.declaration.includes("echo(args:")) throw Error("missing generated declaration");
+                    const owner = entry.namespace === null ? tools : globalThis[entry.namespace];
+                    if (typeof owner[entry.method] !== "function") throw Error("uncallable discovery result");
+                    text({canonical: entry.canonical_name, callable: entry.callable, value: await owner[entry.method]({probe: canonical})});
+                }
+            "#}), &test_cx()).await;
+            let ToolResult::Text(text) = result else {
+                panic!("discovery execution failed: {result:?}");
+            };
+            assert!(text.contains("\"callable\":\"tools.echo\""), "{text}");
+            assert!(text.contains("\"callable\":\"ns.echo\""), "{text}");
+            assert!(text.contains("\"probe\":\"ns.echo\""), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_visibility_of_same_tool_does_not_duplicate_discovery() {
+        let echo: Arc<dyn Tool> = Arc::new(Echo);
+        let exec = exec_with(vec![echo.clone(), echo]);
+        let result = exec.call(json!({"source":"text(ALL_TOOLS.filter(t => t.canonical_name === 'echo').length); text(await tools.echo({ok:true}));"}), &test_cx()).await;
+        let ToolResult::Text(text) = result else {
+            panic!("duplicate visibility failed: {result:?}");
+        };
+        assert!(text.contains("Output:\n1\n"), "{text}");
+        assert!(text.contains("\"ok\":true"), "{text}");
+    }
+
+    struct CatalogProbe {
+        name: &'static str,
+        binding: Option<(&'static str, &'static str)>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CatalogProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Collision fixture"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn namespace_binding(&self) -> Option<(String, String)> {
+            self.binding
+                .map(|(namespace, method)| (namespace.into(), method.into()))
+        }
+        async fn call(&self, _: Value, _: &ToolCx) -> ToolResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::Json(json!({"called":true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_collisions_fail_before_any_nested_call() {
+        for definitions in [
+            vec![("foo-bar", None), ("foo_bar", None)],
+            vec![("same", None), ("same", None)],
+            vec![
+                ("one", Some(("ns", "foo-bar"))),
+                ("two", Some(("ns", "foo_bar"))),
+            ],
+            vec![("one", Some(("JSON", "call")))],
+            vec![("one", Some(("ns-x", "a"))), ("two", Some(("ns_x", "b")))],
+            vec![("__proto__", None)],
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tools = definitions
+                .into_iter()
+                .map(|(name, binding)| {
+                    Arc::new(CatalogProbe {
+                        name,
+                        binding,
+                        calls: calls.clone(),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let exec = exec_with(tools);
+            let result = exec.call(json!({"source":"for (const entry of ALL_TOOLS) { const owner = entry.namespace === null ? tools : globalThis[entry.namespace]; await owner[entry.method]({}); }"}), &test_cx()).await;
+            assert!(result.is_error(), "ambiguous catalog executed: {result:?}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn namespace_binding_projects_as_namespace_global() {
         let exec = exec_with(vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>]);
         let result = exec
@@ -1182,6 +1351,9 @@ text(JSON.stringify(result));
         )
         .unwrap();
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1233,6 +1405,9 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
         )
         .unwrap();
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1277,8 +1452,7 @@ text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);
 
     #[tokio::test]
     async fn exec_description_documents_namespace_globals_in_optional_mode() {
-        // D3 regression guard (refactor-v2-pressure-test.md §1): namespace
-        // declarations render even when code_mode != only.
+        // Only admitted methods appear in the default namespace index.
         let callable = vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>];
         let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
             callable.clone(),
@@ -1295,16 +1469,17 @@ text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);
         )]);
         let exec = code_mode_tools(&callable, seam, CodeMode::Optional, &namespaces).remove(0);
         let description = exec.description();
-        assert!(description.contains("## `ns` namespace"), "{description}");
-        assert!(description.contains("Namespace guidance."), "{description}");
+        assert!(description.contains("`ns`: echo"), "{description}");
         assert!(
-            description.contains("declare const ns: { echo(args: {}): Promise<unknown>; };"),
+            !description.contains("Namespace guidance."),
             "{description}"
         );
+        assert!(!description.contains("declare const ns:"), "{description}");
         assert!(
-            description.contains("installed as globals beside `tools`"),
+            description.contains("installed beside `tools`"),
             "{description}"
         );
+        assert!(description.contains("input_schema"), "{description}");
     }
 
     #[tokio::test]
@@ -1325,6 +1500,54 @@ text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);
         assert!(
             matches!(result, ToolResult::Error(_)),
             "denied in-cell tool must fail closed, got {result:?}"
+        );
+    }
+    struct AuthoringGeneration;
+    #[async_trait]
+    impl Tool for AuthoringGeneration {
+        fn name(&self) -> &str {
+            "authoring_generation"
+        }
+        fn description(&self) -> &str {
+            "Observe immutable authoring context"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, cx: &ToolCx) -> ToolResult {
+            ToolResult::Json(json!(cx.instruction_generation))
+        }
+    }
+
+    #[tokio::test]
+    async fn yielded_cell_retains_authoring_generation_across_newer_exec_and_wait() {
+        let callable = vec![Arc::new(AuthoringGeneration) as Arc<dyn Tool>];
+        let (exec, wait) = code_mode_pair(callable);
+        let mut old = test_cx();
+        old.instruction_generation = 7;
+        let yielded = exec.call(json!({"source":"// @exec: {\"yield_time_ms\": 1}\nawait new Promise(resolve => setTimeout(resolve, 80)); text(await tools.authoring_generation({}));"}), &old).await;
+        let ToolResult::Text(yielded) = yielded else {
+            panic!("expected yielded cell")
+        };
+        let cell_id = yielded_cell_id(&yielded);
+        let mut newer = old.clone();
+        newer.instruction_generation = 8;
+        let fresh = exec
+            .call(
+                json!({"source":"text(await tools.authoring_generation({}));"}),
+                &newer,
+            )
+            .await;
+        assert!(
+            matches!(fresh, ToolResult::Text(ref text) if text.lines().last() == Some("8")),
+            "{fresh:?}"
+        );
+        let result = wait
+            .call(json!({"cell_id":cell_id,"yield_time_ms":1000}), &newer)
+            .await;
+        assert!(
+            matches!(result, ToolResult::Text(ref text) if text.lines().last() == Some("7")),
+            "{result:?}"
         );
     }
 }

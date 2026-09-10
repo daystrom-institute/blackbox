@@ -2573,10 +2573,14 @@ impl AmbientContext {
 /// one invocation.
 pub fn merge_tool_arg_defaults(
     ambient: Option<BTreeMap<String, String>>,
-    brofile: Option<&BTreeMap<String, String>>,
-    per_dispatch: Option<&BTreeMap<String, String>>,
-) -> Option<BTreeMap<String, String>> {
-    let mut merged = ambient.unwrap_or_default();
+    brofile: Option<&BTreeMap<String, serde_json::Value>>,
+    per_dispatch: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    let mut merged: BTreeMap<String, serde_json::Value> = ambient
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, serde_json::Value::String(value)))
+        .collect();
     for defaults in [brofile, per_dispatch].into_iter().flatten() {
         merged.extend(
             defaults
@@ -3291,7 +3295,7 @@ pub async fn spawn_task_with_tool_placement(
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -3355,7 +3359,7 @@ async fn spawn_reserved_dispatch(
     task_id: String,
     params: SpawnTaskParams,
     tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
 ) -> Arc<Task> {
     let SpawnTaskParams {
         provider,
@@ -3493,7 +3497,7 @@ async fn spawn_harness_child_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -3742,7 +3746,7 @@ fn prepare_harness_child_launch(
     env_overrides: Option<HashMap<String, String>>,
     shell_env: Option<BTreeMap<String, String>>,
     tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     store_dir: &std::path::Path,
     self_mcp_url: Option<&str>,
     workspace_binding_authority: Option<&dyn WorkspaceBindingAuthority>,
@@ -6671,7 +6675,7 @@ mod tests {
             )])),
             Some(BTreeMap::from([(
                 "default:file_read.offset".to_string(),
-                "10".to_string(),
+                serde_json::json!("10"),
             )])),
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=default"),
@@ -9074,12 +9078,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_default_dispatch_merge_preserves_json_types() {
+        let ambient = BTreeMap::from([("default:fixture.label".into(), "false".into())]);
+        let brofile = BTreeMap::from([("default:fixture.limit".into(), serde_json::json!(10))]);
+        let dispatch = BTreeMap::from([
+            ("default:fixture.limit".into(), serde_json::json!(20)),
+            ("default:fixture.enabled".into(), serde_json::json!(true)),
+        ]);
+        let merged =
+            merge_tool_arg_defaults(Some(ambient), Some(&brofile), Some(&dispatch)).unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
+        assert_eq!(wire["default:fixture.label"], "false");
+        assert_eq!(wire["default:fixture.limit"], 20);
+        assert_eq!(wire["default:fixture.enabled"], true);
+    }
+
+    #[test]
     fn tool_arg_defaults_merge_ambient_only() {
         let ambient =
             BTreeMap::from([("default:mcp.bbox_note.session_id".into(), "sess-1".into())]);
         assert_eq!(
             merge_tool_arg_defaults(Some(ambient.clone()), None, None),
-            Some(ambient)
+            Some(
+                ambient
+                    .into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::String(value)))
+                    .collect()
+            )
         );
     }
 
@@ -9106,19 +9132,19 @@ mod tests {
         assert_eq!(
             merged
                 .get("default:rust.moveStructFields.acknowledge_repr")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("true")
         );
         assert_eq!(
             merged
                 .get("default:mcp.bbox_note.session_id")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("sess-1")
         );
         assert_eq!(
             merged
                 .get("default:rust.migrateErrorType.acknowledge_public_api_change")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("true")
         );
     }
@@ -9137,13 +9163,13 @@ mod tests {
         assert_eq!(
             merged
                 .get("default:rust.moveStructFields.acknowledge_repr")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("true")
         );
         assert_eq!(
             merged
                 .get("default:rust.migrateTypeUsages.acknowledge_public_api_change")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("true")
         );
     }
@@ -9167,7 +9193,7 @@ mod tests {
         assert_eq!(
             merged
                 .get("default:rust.moveStructFields.acknowledge_repr")
-                .map(String::as_str),
+                .and_then(serde_json::Value::as_str),
             Some("dispatch")
         );
     }

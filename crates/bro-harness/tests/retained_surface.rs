@@ -38,6 +38,7 @@ impl McpSurface for CorpusSurface {
                 name: name.into(),
                 description: name.into(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             })
             .collect())
     }
@@ -57,6 +58,9 @@ fn corpus_evidence() -> Value {
 
 fn fixture_context(root: &Path) -> ToolCx {
     ToolCx {
+        tool_observations: Default::default(),
+        instruction_generation: 0,
+        instruction_policy: None,
         root: root.into(),
         safety: Arc::new(bro_tools::SafetyPolicy::new()),
         http: reqwest::Client::new(),
@@ -86,9 +90,12 @@ async fn load_surfaces(
             })
             .collect(),
         tool_placement: ToolPlacementMap::new(),
+        server_policies: Default::default(),
     };
-    let mcp =
-        load_mcp_tools_from_config_with_capability_aliases(&config, filter, Some("blackbox")).await;
+    let mcp = load_mcp_tools_from_config_with_capability_aliases(&config, filter, Some("blackbox"))
+        .await
+        .unwrap()
+        .tools;
     let (in_box, out_box) = split_mcp_tools_by_placement(&mcp, &config.tool_placement);
     let builtins = bro_tools::builtin_tools();
     let mut callable = builtins
@@ -99,7 +106,7 @@ async fn load_surfaces(
     callable.extend(in_box);
     callable.extend(out_box.iter().cloned());
     (
-        Registry::new(builtins, out_box, &PinPolicy::from_env(), filter),
+        Registry::new(builtins, out_box, &PinPolicy::from_env(), filter).unwrap(),
         HostTools::new(callable, cx.clone()),
     )
 }

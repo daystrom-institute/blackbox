@@ -102,8 +102,14 @@ paging, streaming UTF-8 and filtering, serialized budget accounting and wrapper
 collection. Both implementations are landed directly in beta.
 
 Order 3 is implemented in the [provider/result integrity milestone](model-facing-audit/result-integrity-repair.md), including search/edit observation integrity.
-Next: instructions, context and resume (order 4), then catalog/default simplification (order 5).
-Other audit gaps remain open.
+Orders 4 and 5 are implemented in the working candidate described by
+[session and catalog repair](model-facing-audit/session-and-catalog-repair.md).
+That document maps the original finding IDs to repaired contracts and deliberate
+limits, and records operator migration for typed defaults and MCP server policy.
+It includes scoped instruction generations, strict durable resume/control state,
+retained-work recovery markers, compact discovery, bounded activation, collision
+admission, finite Git subprocesses, and remote MCP uncertainty/quarantine.
+Candidate verification and deployment receipts remain separate milestones.
 
 ## Deployment milestone
 

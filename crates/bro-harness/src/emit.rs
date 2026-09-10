@@ -165,6 +165,22 @@ impl Emitter {
         }));
     }
 
+    /// A control was rejected or could not be made durable. Never acknowledge
+    /// unsupported controls or failed persistence as successful application.
+    pub fn control_response_error(&self, request_id: Option<&str>, error: &str) {
+        self.write_line(json!({
+            "type": "control_response",
+            "response": {"subtype": "error", "request_id": request_id, "error": error},
+        }));
+    }
+
+    /// Startup status exposes no configured endpoint, command, or credential.
+    pub fn mcp_readiness(&self, servers: &[crate::mcp::McpServerReadiness]) {
+        if !servers.is_empty() {
+            self.write_line(json!({"type":"system", "subtype":"mcp_readiness", "session_id":self.session_id, "servers":servers}));
+        }
+    }
+
     /// One incremental streaming event — the inner Anthropic `event` wrapped as
     /// a Claude `stream_event` line. The daemon's parser folds
     /// `content_block_delta` text into the live assistant message and reads
@@ -266,6 +282,31 @@ impl Emitter {
                 "content": blocks,
                 "session_id": self.session_id,
             },
+        }));
+    }
+
+    pub(crate) fn tool_policy_observations(
+        &self,
+        observations: &bro_tools::ToolObservationBatch,
+        content: &str,
+    ) {
+        self.write_line(json!({
+            "type":"user", "subtype":"tool_policy_observations", "session_id":self.session_id,
+            "observations":observations,
+            "message":{"role":"user","content":[{"type":"text","text":content}]},
+        }));
+    }
+
+    pub(crate) fn instruction_context(
+        &self,
+        generation: u64,
+        content: &str,
+        documents: &[crate::project_doc::InstructionDocument],
+    ) {
+        self.write_line(json!({
+            "type":"user", "subtype":"instruction_context", "session_id":self.session_id,
+            "generation":generation, "documents":documents,
+            "message":{"role":"user","content":[{"type":"text","text":content}]},
         }));
     }
 

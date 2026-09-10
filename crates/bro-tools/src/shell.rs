@@ -13,6 +13,9 @@
 //! [`shutdown_shell_sessions`] to await final receipts for retained sessions.
 
 mod output;
+mod process;
+pub(crate) use process::{CommandCapture, run_supervised_command};
+
 use output::OutBuf;
 
 use crate::promise::{PromiseProgress, StreamKind};
@@ -199,6 +202,7 @@ async fn supervise(
     state: watch::Sender<Option<TerminalState>>,
     readers: Vec<JoinHandle<()>>,
     kill_at: Option<Instant>,
+    cleanup_on_exit: bool,
 ) {
     let mut terminal = TerminalState::default();
     let mut grace_at = None;
@@ -256,7 +260,7 @@ async fn supervise(
         signal_group(owned.pgid, libc::SIGKILL);
         let _ = owned.child.kill().await;
     }
-    if terminal.killed || terminal.cancelled || terminal.timed_out {
+    if cleanup_on_exit || terminal.killed || terminal.cancelled || terminal.timed_out {
         // A shell may exit on TERM while its descendants ignore that signal.
         signal_group(owned.pgid, libc::SIGKILL);
         terminal.group_cleanup_sigkill = true;
@@ -1058,7 +1062,9 @@ impl Tool for ShellRun {
             sessions.counter += 1;
             let id = format!("sh-{}", sessions.counter);
             sessions.map.insert(id.clone(), session.clone());
-            tokio::spawn(supervise(owned, control_rx, state_tx, readers, kill_at));
+            tokio::spawn(supervise(
+                owned, control_rx, state_tx, readers, kill_at, false,
+            ));
             (id, session)
         };
         let mut guard = InvocationGuard::new(&session);
@@ -1362,6 +1368,9 @@ mod tests {
 
     fn cx() -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1440,7 +1449,7 @@ mod tests {
         let (sender, receipt) = watch::channel(None);
         // Both child.wait and the empty reader drain are already ready when
         // supervision starts. The accepted cancellation must still be applied.
-        supervise(owned, receiver, sender, Vec::new(), None).await;
+        supervise(owned, receiver, sender, Vec::new(), None, false).await;
         let terminal = receipt.borrow().clone().unwrap();
         assert_eq!(terminal.exit_code, Some(0));
         assert!(terminal.cancelled);
@@ -2553,5 +2562,84 @@ mod tests {
         assert!(r.is_error());
         let r = ShellKill.call(json!({"session_id": "sh-999"}), &cx()).await;
         assert!(r.is_error());
+    }
+    #[tokio::test]
+    async fn internal_command_preserves_raw_bytes_and_bounds_both_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut cx = cx();
+        cx.root = root.clone();
+        let mut command = tokio::process::Command::new("bash");
+        command.env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &root).current_dir(&root)
+            .args(["-c", "printf '\\377\\000A'; for i in {1..100}; do printf x; printf y >&2; done; printf FINAL >&2"]);
+        let result = run_supervised_command(command, &cx, Duration::from_secs(2), 16, 16)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(&result.stdout[..3], &[255, 0, b'A']);
+        assert_eq!(result.stdout.len(), 16);
+        assert_eq!(result.stdout_dropped, 87);
+        assert_eq!(result.stderr.len(), 16);
+        assert!(result.stderr.ends_with(b"FINAL"));
+        assert_eq!(result.stderr_dropped, 89);
+        assert!(!result.complete());
+    }
+
+    #[tokio::test]
+    async fn internal_command_timeout_and_cancel_reap_owned_group() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let mut cx = cx();
+            cx.root = root.clone();
+            let mut command = tokio::process::Command::new("bash");
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &root)
+                .current_dir(&root)
+                .args(["-c", "(sleep 0.4; printf leaked > sentinel) & wait"]);
+            let cancellation = cx.cancellation.clone();
+            let cancel_task = tokio::spawn(async move {
+                if cancel {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancellation.cancel();
+                }
+            });
+            let timeout = if cancel {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(50)
+            };
+            let result = run_supervised_command(command, &cx, timeout, 100, 100)
+                .await
+                .unwrap();
+            cancel_task.await.unwrap();
+            assert_eq!(result.cancelled, cancel);
+            assert_eq!(result.timed_out, !cancel);
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            assert!(!root.join("sentinel").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_finite_command_cleans_background_children_after_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut cx = cx();
+        cx.root = root.clone();
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &root)
+            .current_dir(&root)
+            .args(["-c", "(sleep 0.3; printf leaked > sentinel) & exit 0"]);
+        let result = run_supervised_command(command, &cx, Duration::from_secs(2), 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!root.join("sentinel").exists());
     }
 }

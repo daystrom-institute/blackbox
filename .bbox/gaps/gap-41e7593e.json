@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/scoped-instructions-shared-lifecycle",
   "notes": "Broader model-facing tools audit compared Codex core/src/tools/code_mode/mod.rs shared ToolCallRuntime and compaction context reinjection. Existing first-touch flat rider arrives after operation and nested calls do not deliver it. A fix must preserve full instruction bodies and durable delivery receipts, not hide docs in truncated ordinary tool output. See design/bro-harness/model-facing-tools-audit.md.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T18:40:17Z",
-  "updated_at": "2026-09-10T18:40:17Z"
+  "updated_at": "2026-09-10T22:56:08Z",
+  "resolved_at": "2026-09-10T22:56:08Z",
+  "resolution_note": "Replaced result-text inference with a typed scoped-instruction graph and exact request-generation delivery. Flat/nested mutations require delivered instructions; retained cells cannot borrow newer authority; compaction/resume refresh current context, includes and removals. Actual flat, nested read/write and caught-retry probes pass, plus scoped graph/generation regressions. Shell/remote path manifests and external filesystem races remain explicit limits. See session-and-catalog-repair.md."
 }

@@ -28,6 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub const TOOL_SEARCH: &str = "tool_search";
+const MAX_ACTIVE_TOOLS: usize = 32;
+const MAX_ACTIVE_DEFINITION_BYTES: usize = 64 * 1024;
+const DEFAULT_SEARCH_LIMIT: usize = 8;
+const MAX_SEARCH_LIMIT: usize = 16;
+const MAX_SEARCH_RESULT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
@@ -74,6 +79,7 @@ impl PinPolicy {
 struct Entry {
     tool: Arc<dyn Tool>,
     tier: Tier,
+    definition_bytes: usize,
 }
 
 pub struct Registry {
@@ -103,7 +109,7 @@ impl Registry {
         mcp: Vec<Arc<dyn Tool>>,
         pin: &PinPolicy,
         filter: &ToolFilter,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::with_options(builtins, mcp, pin, filter, false)
     }
 
@@ -120,7 +126,7 @@ impl Registry {
         pin: &PinPolicy,
         filter: &ToolFilter,
         defer_builtins: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let default_builtin_tier = if defer_builtins {
             Tier::Deferred
         } else {
@@ -150,7 +156,7 @@ impl Registry {
             } else {
                 default_builtin_tier
             };
-            tools.insert(t.name().to_string(), Entry { tool: t, tier });
+            insert_admitted(&mut tools, t, tier)?;
         }
         for t in mcp {
             let tier = if pin.matches(t.name()) {
@@ -158,8 +164,7 @@ impl Registry {
             } else {
                 Tier::Deferred
             };
-            // Last writer wins; an MCP tool may intentionally shadow a built-in.
-            tools.insert(t.name().to_string(), Entry { tool: t, tier });
+            insert_admitted(&mut tools, t, tier)?;
         }
 
         let admitted = bro_tools::prune_tool_dependencies(
@@ -183,6 +188,7 @@ impl Registry {
                         name: e.tool.name().to_string(),
                         description: e.tool.description().to_string(),
                         schema: e.tool.input_schema(),
+                        definition_bytes: e.definition_bytes,
                     })
                     .collect(),
             );
@@ -193,18 +199,19 @@ impl Registry {
             tools.insert(
                 TOOL_SEARCH.to_string(),
                 Entry {
+                    definition_bytes: tool_definition_bytes(search.as_ref()),
                     tool: search,
                     tier: Tier::Pinned,
                 },
             );
         }
 
-        Self {
+        Ok(Self {
             tools,
             activated,
             resume_required: Default::default(),
             execution: Arc::new(tokio::sync::RwLock::new(())),
-        }
+        })
     }
 
     /// Session-owned activation names, never persisted schemas or permissions.
@@ -265,6 +272,17 @@ impl Registry {
     /// code-mode that were never flat-activated create no such requirement.
     pub fn validate_resume_tool_schemas(&self) -> anyhow::Result<()> {
         let activated = self.activated.lock().unwrap();
+        let bytes = activated
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .map(|entry| entry.definition_bytes)
+            .sum::<usize>();
+        if activated.len() > MAX_ACTIVE_TOOLS || bytes > MAX_ACTIVE_DEFINITION_BYTES {
+            anyhow::bail!(
+                "error.resume_tool_activation_limit: restored visibility exceeds the session catalog budget ({} tools, {bytes} definition bytes). Historical schemas cannot be silently removed; start a fresh session with focused discovery.",
+                activated.len()
+            );
+        }
         let missing: Vec<_> =
             self.resume_required
                 .iter()
@@ -409,6 +427,45 @@ impl Registry {
     }
 }
 
+fn tool_definition_bytes(tool: &dyn Tool) -> usize {
+    let grammar = tool
+        .freeform_grammar()
+        .map(|grammar| json!({"syntax":grammar.syntax,"definition":grammar.definition}));
+    json!({"name":tool.name(),"description":tool.description(),"input_schema":tool.input_schema(),"grammar":grammar}).to_string().len()
+}
+
+fn insert_admitted(
+    tools: &mut HashMap<String, Entry>,
+    tool: Arc<dyn Tool>,
+    tier: Tier,
+) -> anyhow::Result<()> {
+    let name = tool.name();
+    anyhow::ensure!(
+        !name.trim().is_empty() && name != TOOL_SEARCH,
+        "invalid or reserved tool name: {name}"
+    );
+    if let Some(existing) = tools.get_mut(name) {
+        anyhow::ensure!(
+            Arc::ptr_eq(&existing.tool, &tool),
+            "duplicate canonical tool name: {name}"
+        );
+        if tier == Tier::Pinned || (existing.tier == Tier::Deferred && tier == Tier::Eager) {
+            existing.tier = tier;
+        }
+        return Ok(());
+    }
+    let definition_bytes = tool_definition_bytes(tool.as_ref());
+    tools.insert(
+        name.to_owned(),
+        Entry {
+            tool,
+            tier,
+            definition_bytes,
+        },
+    );
+    Ok(())
+}
+
 fn short_desc(d: &str) -> String {
     let line = d.lines().next().unwrap_or("").trim();
     if line.len() > 100 {
@@ -434,18 +491,73 @@ struct DeferredEntry {
     name: String,
     description: String,
     schema: Value,
+    definition_bytes: usize,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolSearchInput {
     query: String,
     #[serde(default)]
     include_schemas: bool,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "activate_by_default")]
+    activate: bool,
+}
+
+fn default_search_limit() -> usize {
+    DEFAULT_SEARCH_LIMIT
+}
+fn activate_by_default() -> bool {
+    true
 }
 
 struct ToolSearchTool {
     catalog: Arc<Vec<DeferredEntry>>,
     activated: Arc<Mutex<HashSet<String>>>,
+}
+
+fn search_score(entry: &DeferredEntry, query: &str, terms: &[&str]) -> usize {
+    let name = entry.name.to_lowercase();
+    let description = entry.description.to_lowercase();
+    let words: HashSet<_> = name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let exact = usize::from(name == query) * 100_000;
+    exact
+        + terms
+            .iter()
+            .map(|term| {
+                if words.contains(term) {
+                    1_000
+                } else if name.starts_with(term) {
+                    500
+                } else if name.contains(term) {
+                    100
+                } else {
+                    usize::from(description.contains(term))
+                }
+            })
+            .sum::<usize>()
+}
+
+fn compact_search_description(description: &str) -> String {
+    let line = description.lines().next().unwrap_or("").trim();
+    let end = line
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= 240)
+        .last()
+        .unwrap_or(0);
+    if line.len() <= 240 {
+        line.to_owned()
+    } else {
+        format!("{}...", &line[..end])
+    }
 }
 
 #[async_trait]
@@ -454,96 +566,391 @@ impl Tool for ToolSearchTool {
         TOOL_SEARCH
     }
     fn description(&self) -> &str {
-        "Search for and load additional tools not in the always-available set. Pass a keyword query (e.g. \"slice edit\") or `select:name1,name2` for exact names. Returns compact match metadata by default and makes matches callable on subsequent turns; set include_schemas=true only when you need schema details in the tool result itself."
+        "Search the admitted deferred catalog and optionally activate matches. Use keywords or select:name1,name2; limit defaults to 8 (maximum 16), offset pages through stable ranked matches. Results use compact descriptions; include_schemas opts into schemas that fit this result's byte budget. activate=false inspects without adding wire schemas. Activated definitions remain available for this session: at most 32 deferred tools and 64 KiB of definitions. There is no in-session deactivation or automatic eviction of promised schemas; at capacity inspect without activation or start a fresh session."
     }
     fn input_schema(&self) -> Value {
         json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Keyword query, or `select:nameA,nameB` to load exact tool names."
-                },
-                "include_schemas": {
-                    "type": "boolean",
-                    "description": "When true, include full input schemas in this result. Default false; loaded tools are callable with schemas on the next turn either way."
-                }
-            },
-            "required": ["query"]
+            "type":"object", "properties": {
+                "query":{"type":"string","description":"Keywords, or select:nameA,nameB. Exact selection permits at most 64 names; query is at most 4096 bytes."},
+                "include_schemas":{"type":"boolean","description":"Include input schemas when they fit the result budget; omitted schemas are explicitly marked."},
+                "limit":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_LIMIT,"default":DEFAULT_SEARCH_LIMIT},
+                "offset":{"type":"integer","minimum":0,"default":0},
+                "activate":{"type":"boolean","default":true,"description":"False inspects matches without making new tools visible in the wire catalog."}
+            }, "required":["query"], "additionalProperties":false
         })
     }
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let args: ToolSearchInput = match serde_json::from_value(input) {
             Ok(args) => args,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+            Err(error) => return ToolResult::Error(format!("bad tool_search input: {error}")),
         };
-        let query = args.query.trim().to_string();
-        if query.is_empty() {
-            return ToolResult::Error("query is required".into());
+        let query = args.query.trim();
+        if query.is_empty() || query.len() > 4096 || !(1..=MAX_SEARCH_LIMIT).contains(&args.limit) {
+            return ToolResult::Error("tool_search requires a nonempty query of at most 4096 bytes and limit from 1 to 16".into());
         }
-
-        let matches: Vec<&DeferredEntry> = if let Some(sel) = query.strip_prefix("select:") {
-            let names: HashSet<&str> = sel.split(',').map(|s| s.trim()).collect();
-            self.catalog
-                .iter()
-                .filter(|e| names.contains(e.name.as_str()))
+        let matches: Vec<&DeferredEntry> = if let Some(selection) = query.strip_prefix("select:") {
+            let names: Vec<_> = selection
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.is_empty() || names.len() > 64 {
+                return ToolResult::Error(
+                    "select requires 1 to 64 exact tool names; use limit and offset to page".into(),
+                );
+            }
+            let mut seen = HashSet::new();
+            names
+                .into_iter()
+                .filter(|name| seen.insert(*name))
+                .filter_map(|name| self.catalog.iter().find(|entry| entry.name == name))
                 .collect()
         } else {
-            let terms: Vec<String> = query
-                .to_lowercase()
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            let mut scored: Vec<(usize, &DeferredEntry)> = self
+            let query = query.to_lowercase();
+            let terms: Vec<_> = query.split_whitespace().collect();
+            if terms.len() > 16 {
+                return ToolResult::Error("tool_search permits at most 16 keyword terms".into());
+            }
+            let mut scored: Vec<_> = self
                 .catalog
                 .iter()
-                .filter_map(|e| {
-                    let hay = format!("{} {}", e.name, e.description).to_lowercase();
-                    let score = terms.iter().filter(|t| hay.contains(t.as_str())).count();
-                    (score > 0).then_some((score, e))
+                .filter_map(|entry| {
+                    let score = search_score(entry, &query, &terms);
+                    (score > 0).then_some((score, entry))
                 })
                 .collect();
-            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
-            scored.into_iter().take(8).map(|(_, e)| e).collect()
+            scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.name.cmp(&right.1.name)));
+            scored.into_iter().map(|(_, entry)| entry).collect()
         };
-
-        if matches.is_empty() {
-            return ToolResult::Text(format!("no tools matched '{query}'"));
-        }
-
+        let total_matches = matches.len();
+        let mut page: Vec<_> = matches
+            .into_iter()
+            .skip(args.offset)
+            .take(args.limit)
+            .collect();
         let mut activated = self.activated.lock().unwrap();
-        let mut loaded = Vec::new();
-        for e in &matches {
-            activated.insert(e.name.clone());
-            let mut item = json!({
-                "name": e.name,
-                "description": e.description,
-            });
-            if args.include_schemas {
-                item["input_schema"] = e.schema.clone();
+        let budget = if cx.output_budget == 0 {
+            MAX_SEARCH_RESULT_BYTES
+        } else {
+            cx.output_budget.min(MAX_SEARCH_RESULT_BYTES)
+        };
+        let mut entries: Vec<Value> = page.iter().map(|entry| {
+            let description = compact_search_description(&entry.description);
+            let mut value = json!({"name":entry.name,"description":description,"active":activated.contains(&entry.name) || args.activate});
+            if description != entry.description { value["description_truncated"] = json!(true); }
+            if args.include_schemas { value["input_schema"] = entry.schema.clone(); }
+            value
+        }).collect();
+        let make_result = |page: &[&DeferredEntry], entries: &[Value]| {
+            let next_offset = args.offset.saturating_add(page.len());
+            json!({
+                "loaded":if args.activate { page.iter().map(|entry| entry.name.clone()).collect::<Vec<_>>() } else { Vec::new() },
+                "tools":entries, "total_matches":total_matches, "offset":args.offset,
+                "next_offset":if next_offset < total_matches { Some(next_offset) } else { None },
+                "remaining":{"count":self.catalog.iter().filter(|entry| !activated.contains(&entry.name) && !(args.activate && page.iter().any(|selected| selected.name == entry.name))).count()},
+                "activation":{"requested":args.activate,"max_tools":MAX_ACTIVE_TOOLS,"max_definition_bytes":MAX_ACTIVE_DEFINITION_BYTES,"retention":"session; no deactivation"},
+                "note":if args.activate { "Loaded schemas are callable on subsequent turns. Continue this query with next_offset to reach other matches." } else { "Inspection only. Unactivated matches are not added to the wire catalog." }
+            })
+        };
+        // Omit optional schemas before reducing the page. No tool is activated
+        // until the complete honest receipt fits the producer byte budget.
+        if make_result(&page, &entries).to_string().len() > budget {
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("input_schema")
+                    .is_some()
+                {
+                    entry["schema_omitted"] = json!(true);
+                    entry["input_schema_bytes"] = json!(page[index].schema.to_string().len());
+                }
             }
-            loaded.push(item);
         }
-        let remaining_count = self
-            .catalog
-            .iter()
-            .filter(|e| !activated.contains(e.name.as_str()))
-            .count();
-        ToolResult::Json(json!({
-            "loaded": matches.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
-            "tools": loaded,
-            "remaining": {
-                "count": remaining_count,
-                "hint": "Use tool_search with sharper keywords or select:name1,name2 for additional tools. Pass include_schemas=true only when the compact metadata is insufficient."
-            },
-            "note": "These tools are now callable on subsequent turns; their schemas will be present in the tool list.",
-        }))
+        while make_result(&page, &entries).to_string().len() > budget && !page.is_empty() {
+            page.pop();
+            entries.pop();
+        }
+        if page.is_empty() && total_matches > args.offset
+            || make_result(&page, &entries).to_string().len() > budget
+        {
+            return ToolResult::Error(
+                "tool_search result budget is too small for one match; nothing activated".into(),
+            );
+        }
+        let result = make_result(&page, &entries);
+        if args.activate {
+            let mut projected = activated.clone();
+            projected.extend(page.iter().map(|entry| entry.name.clone()));
+            let bytes = self
+                .catalog
+                .iter()
+                .filter(|entry| projected.contains(&entry.name))
+                .map(|entry| entry.definition_bytes)
+                .sum::<usize>();
+            if projected.len() > MAX_ACTIVE_TOOLS || bytes > MAX_ACTIVE_DEFINITION_BYTES {
+                return ToolResult::Error(format!(
+                    "error.tool_activation_limit: this page would retain {} tools and {bytes} definition bytes; limit is {MAX_ACTIVE_TOOLS} tools and {MAX_ACTIVE_DEFINITION_BYTES} bytes. Nothing activated. Use activate=false to inspect, or start a fresh session with focused discovery. Existing schemas cannot be deactivated in this conversation.",
+                    projected.len()
+                ));
+            }
+            *activated = projected;
+        }
+        ToolResult::Json(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_catalog(count: usize) -> Vec<Arc<dyn Tool>> {
+        (0..count)
+            .map(|index| mk(format!("fixture_{index:02}"), "Fixture search utility"))
+            .collect()
+    }
+
+    async fn search(registry: &Registry, input: Value) -> Value {
+        match registry
+            .dispatch(TOOL_SEARCH, input, &test_cx(Default::default()))
+            .await
+        {
+            ToolResult::Json(value) => value,
+            other => panic!("expected discovery JSON: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_distinct_canonical_duplicates_and_reserved_names() {
+        assert!(
+            Registry::new(
+                vec![mk("duplicate", "one")],
+                vec![mk("duplicate", "two")],
+                &PinPolicy::default(),
+                &ToolFilter::default()
+            )
+            .is_err()
+        );
+        assert!(
+            Registry::new(
+                vec![mk(TOOL_SEARCH, "external")],
+                vec![],
+                &PinPolicy::default(),
+                &ToolFilter::default()
+            )
+            .is_err()
+        );
+        let shared = mk("shared", "same implementation");
+        let registry = Registry::new(
+            vec![shared.clone()],
+            vec![shared],
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .wire_specs()
+                .iter()
+                .filter(|spec| spec.name == "shared")
+                .count(),
+            1
+        );
+        assert!(
+            registry.manifest().is_empty(),
+            "duplicate deferred placement cannot hide an eager tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn broad_discovery_pages_stably_beyond_eight_without_activation() {
+        let registry = Registry::new(
+            vec![],
+            fixture_catalog(21),
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let result = search(
+                &registry,
+                json!({"query":"fixture","offset":offset,"activate":false}),
+            )
+            .await;
+            assert_eq!(result["total_matches"], 21);
+            assert_eq!(result["loaded"], json!([]));
+            names.extend(
+                result["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_owned()),
+            );
+            let Some(next) = result["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(
+            names,
+            (0..21)
+                .map(|index| format!("fixture_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(registry.activation_state(), json!([]));
+        assert_eq!(registry.wire_specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_ranks_names_and_bounds_exact_selection() {
+        let registry = Registry::new(
+            vec![],
+            vec![
+                mk("aaa", "fixture keyword"),
+                mk("fixture", "exact name"),
+                mk("fixture_tail", "name token"),
+            ],
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        let result = search(&registry, json!({"query":"fixture","activate":false})).await;
+        assert_eq!(result["tools"][0]["name"], "fixture");
+        assert_eq!(result["tools"][1]["name"], "fixture_tail");
+        let result = search(
+            &registry,
+            json!({"query":"select:aaa,fixture_tail,fixture","limit":1,"offset":1}),
+        )
+        .await;
+        assert_eq!(result["loaded"], json!(["fixture_tail"]));
+        assert_eq!(result["next_offset"], 2);
+        for input in [
+            json!({"query":"fixture","limit":17}),
+            json!({"query":"fixture","limit":0}),
+            json!({"query":format!("select:{}", vec!["aaa";65].join(","))}),
+        ] {
+            assert!(
+                registry
+                    .dispatch(TOOL_SEARCH, input, &test_cx(Default::default()))
+                    .await
+                    .is_error()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_cap_is_atomic_and_never_evicts_history() {
+        let registry = Registry::new(
+            vec![],
+            fixture_catalog(40),
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        for offset in [0, 8, 16, 24] {
+            search(&registry, json!({"query":"fixture","offset":offset})).await;
+        }
+        let before = registry.activation_state();
+        assert_eq!(before.as_array().unwrap().len(), MAX_ACTIVE_TOOLS);
+        let result = registry
+            .dispatch(
+                TOOL_SEARCH,
+                json!({"query":"fixture","offset":32}),
+                &test_cx(Default::default()),
+            )
+            .await;
+        assert!(result.is_error());
+        assert!(
+            result
+                .into_content()
+                .0
+                .contains("error.tool_activation_limit")
+        );
+        assert_eq!(registry.activation_state(), before);
+        let inspected = search(
+            &registry,
+            json!({"query":"fixture","offset":32,"activate":false}),
+        )
+        .await;
+        assert_eq!(inspected["tools"][0]["name"], "fixture_32");
+        assert_eq!(inspected["tools"][0]["active"], false);
+        assert_eq!(registry.activation_state(), before);
+        registry.restore_activations(&json!(
+            (0..33)
+                .map(|index| format!("fixture_{index:02}"))
+                .collect::<Vec<_>>()
+        ));
+        assert!(registry.validate_resume_tool_schemas().is_err());
+        assert_eq!(
+            registry.activation_state().as_array().unwrap().len(),
+            33,
+            "validation must refuse, not erase history"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_byte_cap_and_result_budget_are_independent() {
+        let huge = mk("oversized", "x".repeat(MAX_ACTIVE_DEFINITION_BYTES));
+        let registry = Registry::new(
+            vec![],
+            vec![huge],
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        let refused = registry
+            .dispatch(
+                TOOL_SEARCH,
+                json!({"query":"select:oversized"}),
+                &test_cx(Default::default()),
+            )
+            .await;
+        assert!(refused.is_error());
+        assert_eq!(registry.activation_state(), json!([]));
+        let inspected = search(
+            &registry,
+            json!({"query":"select:oversized","activate":false}),
+        )
+        .await;
+        assert!(inspected["tools"][0]["description"].as_str().unwrap().len() <= 243);
+        assert_eq!(inspected["tools"][0]["description_truncated"], true);
+
+        let schema = json!({"type":"object","properties":{"large":{"enum":["x".repeat(12_000)]}}});
+        let registry = Registry::new(
+            vec![],
+            vec![mk_schema("large_schema", "large schema fixture", schema)],
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        let mut cx = test_cx(Default::default());
+        cx.output_budget = 1024;
+        let result = registry
+            .dispatch(
+                TOOL_SEARCH,
+                json!({"query":"select:large_schema","include_schemas":true}),
+                &cx,
+            )
+            .await;
+        let ToolResult::Json(result) = result else {
+            panic!("expected bounded receipt: {result:?}");
+        };
+        assert!(result.to_string().len() <= 1024);
+        assert_eq!(result["tools"][0]["schema_omitted"], true);
+        assert!(result["tools"][0].get("input_schema").is_none());
+        assert_eq!(registry.activation_state(), json!(["large_schema"]));
+        assert!(registry.wire_specs().iter().any(|spec| {
+            spec.name == "large_schema"
+                && spec.schema["properties"]["large"]["enum"][0]
+                    .as_str()
+                    .unwrap()
+                    .len()
+                    == 12_000
+        }));
+    }
 
     #[test]
     fn pin_policy_prefix_and_exact() {
@@ -557,28 +964,39 @@ mod tests {
         assert!(!p.matches("exact_tool_x"));
     }
 
-    fn mk(name: &'static str, desc: &'static str) -> Arc<dyn Tool> {
-        struct T(&'static str, &'static str);
+    fn mk(name: impl Into<String>, desc: impl Into<String>) -> Arc<dyn Tool> {
+        mk_schema(
+            name,
+            desc,
+            json!({"type": "object", "properties": {"session_id":{"type":"string"}}}),
+        )
+    }
+
+    fn mk_schema(name: impl Into<String>, desc: impl Into<String>, schema: Value) -> Arc<dyn Tool> {
+        struct T(String, String, Value);
         #[async_trait]
         impl Tool for T {
             fn name(&self) -> &str {
-                self.0
+                &self.0
             }
             fn description(&self) -> &str {
-                self.1
+                &self.1
             }
             fn input_schema(&self) -> Value {
-                json!({"type": "object", "properties": {}})
+                self.2.clone()
             }
             async fn call(&self, _i: Value, _c: &ToolCx) -> ToolResult {
                 ToolResult::Text("ok".into())
             }
         }
-        Arc::new(T(name, desc))
+        Arc::new(T(name.into(), desc.into(), schema))
     }
 
     fn test_cx(defaults: bro_tools::ToolArgDefaults) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -629,23 +1047,25 @@ mod tests {
             vec![Arc::new(Echo) as Arc<dyn Tool>],
             &PinPolicy { patterns: vec![] },
             &ToolFilter::default(),
-        );
+        )
+        .unwrap();
+        let cx = test_cx(defaults);
         let result = reg
-            .dispatch(
-                "mcp__blackbox__bbox_note",
-                json!({"kind": "done"}),
-                &test_cx(defaults),
-            )
+            .dispatch("mcp__blackbox__bbox_note", json!({"kind": "done"}), &cx)
             .await;
         let ToolResult::Json(v) = result else {
             panic!("expected json result");
         };
         assert_eq!(v["input"]["session_id"], "host-session");
-        assert_eq!(v["defaults_applied"]["session_id"], "host-session");
+        assert!(v.get("defaults_applied").is_none());
+        assert_eq!(
+            cx.tool_observations.drain().observations[0].context["defaults_applied"]["session_id"],
+            "host-session"
+        );
     }
 
     #[tokio::test]
-    async fn dispatch_returns_pin_conflict_error_with_rider() {
+    async fn dispatch_returns_pin_conflict_error_with_separate_observation() {
         let defaults = bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
             "pin:mcp.bbox_note.session_id".to_string(),
             "host-session".to_string(),
@@ -656,7 +1076,8 @@ mod tests {
             vec![mk("mcp__blackbox__bbox_note", "note")],
             &PinPolicy { patterns: vec![] },
             &ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let result = reg
             .dispatch(
                 "mcp__blackbox__bbox_note",
@@ -668,7 +1089,6 @@ mod tests {
             panic!("expected pin conflict error");
         };
         assert!(text.contains("pin conflict"));
-        assert!(text.contains("pin_conflict"));
         assert!(text.contains("host-session"));
         assert!(text.contains("model-session"));
     }
@@ -683,7 +1103,7 @@ mod tests {
             mk("bbox_hybrid_search", "hybrid corpus search"),
             mk("bbox_stats", "corpus stats"),
         ];
-        let reg = Registry::new(builtins, mcp, &pin, &ToolFilter::default());
+        let reg = Registry::new(builtins, mcp, &pin, &ToolFilter::default()).unwrap();
 
         // Pinned = hybrid search tool + tool_search; Eager = file_read; both in wire.
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
@@ -715,7 +1135,8 @@ mod tests {
             vec![],
             &PinPolicy::default(),
             &ToolFilter::from_csv(Some("shell_run"), None),
-        );
+        )
+        .unwrap();
         assert!(!registry.contains("build.gate"));
         assert!(
             !registry
@@ -749,7 +1170,8 @@ mod tests {
             &pin,
             &ToolFilter::default(),
             true,
-        );
+        )
+        .unwrap();
         reg.dispatch(
             TOOL_SEARCH,
             json!({"query":"select:file_read,file_write,mcp__fixture__removed"}),
@@ -771,7 +1193,8 @@ mod tests {
             &pin,
             &filter,
             true,
-        );
+        )
+        .unwrap();
         resumed.restore_activations(&saved);
         assert_eq!(resumed.activation_state(), json!(["file_read"]));
         let wire = resumed.wire_specs();
@@ -810,7 +1233,8 @@ mod tests {
                 &pin,
                 &ToolFilter::default(),
                 pinned,
-            );
+            )
+            .unwrap();
             // Only the saved activation survives; neither snapshot nor event
             // history still contains the original search receipt.
             first_resume.restore_resume_activations(Some(&saved), &json!([]));
@@ -823,7 +1247,8 @@ mod tests {
                 vec![],
                 &PinPolicy::default(),
                 &ToolFilter::default(),
-            );
+            )
+            .unwrap();
             second_resume
                 .restore_resume_activations(Some(&first_resume.activation_state()), &json!([]));
             let error = second_resume.validate_resume_tool_schemas().unwrap_err();
@@ -853,7 +1278,8 @@ mod tests {
             &pin,
             &ToolFilter::default(),
             false,
-        );
+        )
+        .unwrap();
         let wire: Vec<String> = optional.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"exec".to_string()));
         assert!(
@@ -862,7 +1288,8 @@ mod tests {
         );
 
         // only (defer_builtins=true): exec pinned/visible, file_read deferred.
-        let only = Registry::with_options(builtins, vec![], &pin, &ToolFilter::default(), true);
+        let only =
+            Registry::with_options(builtins, vec![], &pin, &ToolFilter::default(), true).unwrap();
         let wire: Vec<String> = only.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"exec".to_string()), "only wire: {wire:?}");
         assert!(
@@ -895,7 +1322,7 @@ mod tests {
         ];
         // Deny the shell + the git write family by glob; keep git read.
         let filter = ToolFilter::from_csv(Some("shell_*,git_local_*"), None);
-        let reg = Registry::new(builtins, vec![], &pin, &filter);
+        let reg = Registry::new(builtins, vec![], &pin, &filter).unwrap();
         let known = all_known(&reg);
 
         assert!(known.contains(&"file_read".to_string()), "kept: {known:?}");
@@ -923,7 +1350,7 @@ mod tests {
         ];
         // Explore-style: only read tools admitted.
         let filter = ToolFilter::from_csv(None, Some("file_read"));
-        let reg = Registry::new(builtins, vec![], &pin, &filter);
+        let reg = Registry::new(builtins, vec![], &pin, &filter).unwrap();
         let known = all_known(&reg);
 
         assert!(known.contains(&"file_read".to_string()), "{known:?}");
@@ -943,7 +1370,8 @@ mod tests {
             vec![],
             &pin,
             &ToolFilter::from_csv(None, Some("file_read")),
-        );
+        )
+        .unwrap();
         assert!(
             all_known(&kept).contains(&TOOL_SEARCH.to_string()),
             "tool_search must survive an allow-list it isn't named in"
@@ -955,7 +1383,8 @@ mod tests {
             vec![],
             &pin,
             &ToolFilter::from_csv(Some("tool_search"), None),
-        );
+        )
+        .unwrap();
         assert!(
             !all_known(&gone).contains(&TOOL_SEARCH.to_string()),
             "explicit deny must remove tool_search"
@@ -969,7 +1398,8 @@ mod tests {
             vec![mk("bbox_stats", "corpus stats")],
             &PinPolicy { patterns: vec![] },
             &ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let cx = test_cx(bro_tools::ToolArgDefaults::default());
 
         let compact = reg
@@ -989,7 +1419,8 @@ mod tests {
             vec![mk("bbox_stats", "corpus stats")],
             &PinPolicy { patterns: vec![] },
             &ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let verbose = reg
             .dispatch(
                 "tool_search",
@@ -1032,7 +1463,7 @@ mod tests {
         let in_names: Vec<_> = in_box.iter().map(|tool| tool.name()).collect();
         assert_eq!(in_names, vec!["mcp__srv__in_only", "mcp__srv__both"]);
 
-        let reg = Registry::new(vec![], out_box, &PinPolicy { patterns: vec![] }, &filter);
+        let reg = Registry::new(vec![], out_box, &PinPolicy { patterns: vec![] }, &filter).unwrap();
         assert!(!reg.contains("mcp__srv__in_only"));
         assert!(reg.contains("mcp__srv__out_only"));
         assert!(reg.contains("mcp__srv__both"));

@@ -13,8 +13,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/capability-truthful-context",
   "notes": "All104 builtins/bindings inventoried. Actual no-MCP Chat tool array grows19565 to94954 bytes with optional code-mode. Base prompts name absent update_plan/multi_tool_use.parallel and unavailable editor variants.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T19:08:00Z",
-  "updated_at": "2026-09-10T19:08:00Z"
+  "updated_at": "2026-09-10T22:56:08Z",
+  "resolved_at": "2026-09-10T22:56:08Z",
+  "resolution_note": "Default guidance now derives from admitted capabilities; exec uses a compact method index and ALL_TOOLS carries real schemas/coordinates. Discovery is paged/ranked/budgeted, collisions fail, and MCP metadata/startup/deadlines are explicit. Optional-mode wire catalog fell from 95620 to 29387 bytes; exec description from72909 to6289 bytes. Typed policy and local MCP envelope consumers preserve ordinary results. Full/focused gates and 60 executable probes pass; live efficacy comparison is separate and pending. See session-and-catalog-repair.md."
 }

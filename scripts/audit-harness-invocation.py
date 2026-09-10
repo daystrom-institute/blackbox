@@ -2,7 +2,7 @@
 """Diagnostic recorder: successful execution is not a claim of passing contracts."""
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import argparse, json, os, shlex, subprocess, tempfile, threading
+import argparse, json, os, shlex, shutil, subprocess, tempfile, threading
 
 parser = argparse.ArgumentParser(description="Synthetic full-harness credential-scrub and wrapper-admission observations; no real credentials or model requests.")
 parser.add_argument('--harness', default='bro-harness')
@@ -72,6 +72,17 @@ try:
                 diff_helper.write_text('#!/bin/sh\n'+command+'\n')
                 diff_helper.chmod(0o755)
                 env['GIT_EXTERNAL_DIFF'] = str(diff_helper)
+                # Observe the actual Git child environment even when the
+                # producer correctly disables external diff commands.
+                git_bin = root/(label+'-bin')
+                git_bin.mkdir()
+                git_observation = root/(label+'-child-observation.txt')
+                real_git = shutil.which('git')
+                assert real_git
+                launcher = git_bin/'git'
+                launcher.write_text('#!/bin/sh\n'+command+' >> '+shlex.quote(str(git_observation))+'\nprintf "\\n" >> '+shlex.quote(str(git_observation))+'\nexec '+shlex.quote(real_git)+' "$@"\n')
+                launcher.chmod(0o755)
+                env['PATH'] = str(git_bin)+os.pathsep+env['PATH']
         if label in ('nested-lsp-scrub', 'diagnostic-lsp-scrub'):
             cwd = root/(label+'-repo')
             cwd.mkdir()
@@ -88,7 +99,11 @@ try:
         if label == 'nested-git-hook-scrub':
             observed = cwd/'hook-observation.txt'
             row['hook_observation'] = observed.read_text() if observed.exists() else None
-        if label in ('flat-scrub', 'nested-scrub', 'nested-git-diff-scrub'):
+        if label == 'nested-git-diff-scrub':
+            observed = root/(label+'-child-observation.txt')
+            row['git_child_observations'] = observed.read_text().splitlines() if observed.exists() else []
+            row['contract_passed'] = bool(row['git_child_observations']) and all(value == 'CANARY_ABSENT' for value in row['git_child_observations'])
+        elif label in ('flat-scrub', 'nested-scrub'):
             rendered = json.dumps(outputs)
             row['contract_passed'] = bool(outputs) and 'CANARY_ABSENT' in rendered and 'CANARY_PRESENT' not in rendered
         elif label == 'wrapped-scrub':

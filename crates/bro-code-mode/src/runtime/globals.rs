@@ -63,13 +63,16 @@ fn build_tools_object<'s>(
         let name = v8::String::new(scope, &tool.global_name)
             .ok_or_else(|| "failed to allocate tool name".to_string())?;
         let function = tool_function(scope, tool_index)?;
-        tools.set(scope, name.into(), function.into());
+        // Local addition (not vendored): installation failure is not admission.
+        if tools.set(scope, name.into(), function.into()) != Some(true) {
+            return Err(format!("failed to install tool {}", tool.canonical_name));
+        }
     }
     Ok(tools)
 }
 
 /// Globals the runtime owns; a namespace global may not shadow them.
-const RESERVED_GLOBALS: [&str; 11] = [
+const RESERVED_GLOBALS: [&str; 15] = [
     "tools",
     "ALL_TOOLS",
     "text",
@@ -81,6 +84,10 @@ const RESERVED_GLOBALS: [&str; 11] = [
     "exit",
     "setTimeout",
     "clearTimeout",
+    "console",
+    "Atomics",
+    "SharedArrayBuffer",
+    "WebAssembly",
 ];
 
 /// Local addition (not vendored): install nested namespace objects for tools
@@ -119,18 +126,33 @@ fn install_namespace_globals<'s>(
                 "namespace global `{namespace}` would shadow a runtime global"
             ));
         }
+        // Local addition (not vendored): do not shadow V8 builtins such as
+        // Promise, JSON, or globalThis with a host-projected namespace.
+        let namespace_key = v8::String::new(scope, &namespace)
+            .ok_or_else(|| "failed to allocate namespace name".to_string())?;
+        if global.has_own_property(scope, namespace_key.into()) == Some(true) {
+            return Err(format!(
+                "namespace global `{namespace}` would shadow an existing global"
+            ));
+        }
         let object = v8::Object::new(scope);
         for (method, tool_index) in methods {
             let key = v8::String::new(scope, &method)
                 .ok_or_else(|| "failed to allocate namespace method name".to_string())?;
             let function = tool_function(scope, tool_index)?;
-            object.set(scope, key.into(), function.into());
+            if object.set(scope, key.into(), function.into()) != Some(true) {
+                return Err(format!(
+                    "failed to install namespace method {namespace}.{method}"
+                ));
+            }
         }
         set_global(scope, global, &namespace, object.into())?;
     }
     Ok(())
 }
 
+/// Local addition (not vendored): schema-bearing discovery covers the exact
+/// installed coordinates, including namespace methods absent from `tools`.
 fn build_all_tools_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
@@ -138,31 +160,29 @@ fn build_all_tools_value<'s>(
         .get_slot::<RuntimeState>()
         .map(|state| state.enabled_tools.clone())
         .unwrap_or_default();
-    let array = v8::Array::new(scope, enabled_tools.len() as i32);
-    let name_key = v8::String::new(scope, "name")
-        .ok_or_else(|| "failed to allocate ALL_TOOLS name key".to_string())?;
-    let description_key = v8::String::new(scope, "description")
-        .ok_or_else(|| "failed to allocate ALL_TOOLS description key".to_string())?;
-
-    for (index, tool) in enabled_tools.iter().enumerate() {
-        let item = v8::Object::new(scope);
-        let name = v8::String::new(scope, &tool.global_name)
-            .ok_or_else(|| "failed to allocate ALL_TOOLS name".to_string())?;
-        let description = v8::String::new(scope, &tool.description)
-            .ok_or_else(|| "failed to allocate ALL_TOOLS description".to_string())?;
-
-        if item.set(scope, name_key.into(), name.into()) != Some(true) {
-            return Err("failed to set ALL_TOOLS name".to_string());
-        }
-        if item.set(scope, description_key.into(), description.into()) != Some(true) {
-            return Err("failed to set ALL_TOOLS description".to_string());
-        }
-        if array.set_index(scope, index as u32, item.into()) != Some(true) {
-            return Err("failed to append ALL_TOOLS metadata".to_string());
-        }
-    }
-
-    Ok(array.into())
+    let entries = enabled_tools
+        .iter()
+        .map(|tool| {
+            let namespace = tool.namespace_binding.as_ref().map(|binding| {
+                crate::description::normalize_code_mode_identifier(&binding.namespace)
+            });
+            let method = tool
+                .namespace_binding
+                .as_ref()
+                .map(|binding| crate::description::normalize_code_mode_identifier(&binding.method))
+                .unwrap_or_else(|| tool.global_name.clone());
+            let callable = format!("{}.{}", namespace.as_deref().unwrap_or("tools"), method);
+            serde_json::json!({
+                "name": tool.global_name, "canonical_name": tool.canonical_name,
+                "description": tool.description, "namespace": namespace,
+                "method": method, "callable": callable, "kind": tool.kind,
+                "input_schema": tool.input_schema, "output_schema": tool.output_schema,
+                "declaration": tool.declaration,
+            })
+        })
+        .collect::<Vec<_>>();
+    super::value::json_to_v8(scope, &serde_json::Value::Array(entries))
+        .ok_or_else(|| "failed to allocate ALL_TOOLS discovery metadata".to_string())
 }
 
 fn helper_function<'s, F>(

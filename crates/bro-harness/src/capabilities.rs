@@ -73,6 +73,20 @@ impl ToolCapability for HostTools {
         invocation: ToolInvocation,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ToolCallOutput, BroError> {
+        self.call_tool_with_context(
+            invocation,
+            cancellation,
+            Some(self.cx.instruction_generation),
+        )
+        .await
+    }
+
+    async fn call_tool_with_context(
+        &self,
+        invocation: ToolInvocation,
+        cancellation: tokio_util::sync::CancellationToken,
+        context_id: Option<u64>,
+    ) -> Result<ToolCallOutput, BroError> {
         let tool = self.tools.get(&invocation.name).ok_or_else(|| {
             // Unknown OR filtered-out → fail closed (no in-box route around the
             // ToolFilter, §4.5).
@@ -86,6 +100,7 @@ impl ToolCapability for HostTools {
         })?;
         let mut cx = self.cx.clone();
         cx.cancellation = cancellation;
+        cx.instruction_generation = context_id.unwrap_or(0);
         let (content, is_error, content_type) = match bro_tools::start_tool_invocation(
             tool.clone(),
             invocation.input_json,
@@ -114,12 +129,15 @@ impl ToolCapability for HostTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn test_cx() -> ToolCx {
         use std::sync::Mutex;
         // A minimal context is sufficient for host-tool projection tests.
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -133,6 +151,57 @@ mod tests {
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn nested_primitive_result_survives_typed_defaults_without_wrapping() {
+        struct Primitive;
+        #[async_trait]
+        impl Tool for Primitive {
+            fn name(&self) -> &str {
+                "primitive"
+            }
+            fn description(&self) -> &str {
+                "Primitive fixture"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"properties":{"enabled":{"type":"boolean"}}})
+            }
+            async fn call(&self, input: Value, _: &ToolCx) -> ToolResult {
+                assert_eq!(input["enabled"], true);
+                ToolResult::Json(json!("host-edit-set-id"))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut cx = test_cx();
+        cx.root = root;
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_values(std::collections::BTreeMap::from([(
+                "default:primitive.enabled".into(),
+                json!(true),
+            )]))
+            .unwrap(),
+        );
+        let observations = cx.tool_observations.clone();
+        let host = HostTools::new(vec![Arc::new(Primitive)], cx);
+        let result = host
+            .call_tool(ToolInvocation {
+                name: "primitive".into(),
+                input_json: json!({}),
+            })
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content_type, "application/json");
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content).unwrap(),
+            json!("host-edit-set-id")
+        );
+        assert_eq!(
+            observations.drain().observations[0].context["defaults_applied"]["enabled"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -311,7 +380,8 @@ mod tests {
             vec![],
             &PinPolicy::from_env(),
             &crate::mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         registry.set_dispatch_gate(gate);
         let mut nested = Box::pin(host.call_tool(ToolInvocation {
             name: "mutation".into(),
@@ -375,7 +445,8 @@ mod tests {
             vec![],
             &PinPolicy::from_env(),
             &crate::mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         registry.set_dispatch_gate(gate.clone());
         cx.cancellation.cancel();
         let (flat, nested) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -396,5 +467,28 @@ mod tests {
         assert_eq!(flat.into_content(), (nested.content, nested.is_error));
         assert!(nested.is_error);
         assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn operator_report_does_not_wait_for_workspace_mutation() {
+        let execution = Arc::new(tokio::sync::RwLock::new(()));
+        let _held_mutation = execution.clone().write_owned().await;
+        let host = HostTools::with_dispatch_gate(
+            vec![Arc::new(crate::report::ReportTool::new(
+                crate::emit::Emitter::new("report-test".into()),
+            ))],
+            test_cx(),
+            execution,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            host.call_tool(ToolInvocation {
+                name: "report".into(),
+                input_json: json!({"message":"verification still running"}),
+            }),
+        )
+        .await
+        .expect("operator status must not queue behind filesystem work")
+        .unwrap();
+        assert!(!result.is_error);
     }
 }

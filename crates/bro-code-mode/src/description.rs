@@ -8,19 +8,17 @@ use std::collections::BTreeMap;
 use crate::PUBLIC_TOOL_NAME;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
-const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
-To find one, filter `ALL_TOOLS` by `name` and `description`."#;
 // Local addition (not vendored): document the harness output cap and its
 // text-only transport instead of promising upstream image forwarding.
 // Local addition (not vendored): describe admitted-call draining on completion
 // and cancellation, rather than promising silent disposal of tool work.
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
-- Nested tool methods take either a string or an object as their input argument.
+- Nested tools are installed on `tools` or on their namespace global. `ALL_TOOLS` lists exactly the admitted nested catalog and each callable coordinate. No other host tools or services are implied.
+- Inspect the selected entry's `kind` and `input_schema` before calling: function tools take an object; freeform tools take a string.
 - Nested tools return either an object or a string, based on the description.
-- Runs raw JavaScript -- no Node, no file system, no network access, no console. No Node stdlib globals exist: no `Buffer`, no `TextEncoder`/`TextDecoder`, no `process`, no `require`. Do not name local variables `text`, `image`, `store`, `load`, `notify`, or `exit` — they shadow the global helpers and cause `TypeError: x is not a function`.
-- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
+- Runs raw JavaScript -- no Node, no file system, no network access, no console. No Node stdlib globals exist: no `Buffer`, no `TextEncoder`/`TextDecoder`, no `process`, no `require`. Do not name local variables `text`, `image`, `store`, `load`, `notify`, or `exit` ; they shadow the global helpers and cause `TypeError: x is not a function`.
+- The code is JavaScript source, without markdown fences. If this tool is exposed as a freeform tool, send the source directly. If its input schema is an object, send `{ "source": "...JavaScript..." }`.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call may still be in flight when the cell yields; call `wait` with the returned cell id to observe the eventual tool response and final result.
 - `max_output_tokens` sets the text output budget for direct `exec` results, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers. Large text keeps its beginning and end; print a smaller selection to inspect omitted content.
@@ -30,15 +28,14 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
 - `text(value: string | number | boolean | undefined | null)`: Appends a text item. Non-string values are stringified with `JSON.stringify(...)` when possible.
 - `image(...)`: Unsupported by the harness text-only tool-result transport. Emitting an image reports an output error; no image is delivered to the model.
-- `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session. Functions store too — `store("helpers.parseDiag", (line) => {...})` persists the function's SOURCE, so it must be self-contained (captured outer variables do not survive; a revived function referencing them throws ReferenceError at call time).
+- `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the current process. Resume starts with an empty store and no live cell handles. Functions store too: `store("helpers.parseDiag", (line) => {...})` persists the function's SOURCE, so it must be self-contained (captured outer variables do not survive; a revived function referencing them throws ReferenceError at call time).
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing. A stored function comes back as a callable: `const parse = load("helpers.parseDiag"); parse(line)`.
 - `notify(value: string | number | boolean | undefined | null)`: queues a notification for this cell; it is delivered in a `[notifications]` section of the next `exec`/`wait` result for the cell. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
-- `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
+- `ALL_TOOLS`: entries contain `name` (normalized flat identifier), `canonical_name`, `description`, `namespace` (null for flat tools), `method`, `callable`, `kind`, `input_schema`, `output_schema`, and a schema-derived `declaration`. Filter by canonical name or description; print only matching names first, then the selected entry to inspect its schema. Use `tools[entry.name](args)` when `namespace` is null, otherwise `globalThis[entry.namespace][entry.method](args)`. The same metadata is available in optional and only modes; no flat discovery call is required inside a cell.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
-
-- Side-channel notes (e.g. a `done` note for an orchestrator): when the host exposes a note tool it is a nested tool like any other — `await tools.mcp__blackbox__bbox_note({ kind: "done", body: "..." })`. If it is not listed above, filter `ALL_TOOLS` by `name` for `bbox_note` to confirm the exact identifier; do not search the web or the filesystem for it."#;
+"#;
 // Local addition (not vendored): wait uses the same bounded host envelope as exec.
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
@@ -168,11 +165,9 @@ pub struct ToolNamespaceDescription {
     pub name: String,
     pub description: String,
     /// Local addition (not vendored): hand-authored TypeScript declaration
-    /// block for the namespace's value types and binding signatures. When
-    /// non-empty it replaces the schema-rendered declarations for the
-    /// namespace's bindings in the exec description (curated cross-binding
-    /// value types like `Span` need authored docs, not generated leaf
-    /// shapes). Empty for plain MCP-prefix grouping entries.
+    /// block for the namespace's value types and binding signatures. Retained as host-owned reference documentation; runtime discovery uses
+    /// the admitted per-method schemas and the default prompt renders only an
+    /// index. Empty for plain MCP-prefix grouping entries.
     pub declarations: String,
 }
 
@@ -280,86 +275,20 @@ pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
     tool_name != crate::PUBLIC_TOOL_NAME && tool_name != crate::WAIT_TOOL_NAME
 }
 
+/// Local addition (not vendored): keep the default prompt bounded. Complete
+/// schemas and per-method declarations live in runtime discovery, not a repeated
+/// manual whose handwritten methods can disagree with the admitted catalog.
 pub fn build_exec_tool_description(
     enabled_tools: &[ToolDefinition],
-    namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
-    code_mode_only: bool,
-    deferred_tools_available: bool,
+    _namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
+    _code_mode_only: bool,
+    _deferred_tools_available: bool,
 ) -> String {
-    let mut sections = Vec::new();
-    sections.push(EXEC_DESCRIPTION_TEMPLATE.to_string());
-    if deferred_tools_available {
-        sections.push(DEFERRED_NESTED_TOOLS_GUIDANCE.to_string());
+    let mut sections = vec![EXEC_DESCRIPTION_TEMPLATE.to_string()];
+    sections.push(format!("{} nested tools are admitted. Discover their exact inputs through ALL_TOOLS. Tools exposed only outside the cell, including session completion controls, are not implied to be nested.", enabled_tools.len()));
+    if let Some(reference) = render_namespace_global_reference(enabled_tools) {
+        sections.push(reference);
     }
-    // Namespace globals are documented regardless of code-mode-only: their
-    // declarations are hand-authored and compact (unlike the schema-rendered
-    // flat catalog below), and a cell cannot discover `code.*`-style globals
-    // from `ALL_TOOLS` alone.
-    if let Some(namespace_reference) =
-        render_namespace_global_reference(enabled_tools, namespace_descriptions)
-    {
-        sections.push(namespace_reference);
-    }
-    if !code_mode_only {
-        return sections.join("\n\n");
-    }
-
-    if !enabled_tools.is_empty() {
-        let mut current_namespace: Option<&str> = None;
-        let mut nested_tool_sections = Vec::with_capacity(enabled_tools.len());
-        let has_mcp_tools = enabled_tools
-            .iter()
-            .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
-
-        for tool in enabled_tools {
-            // Namespace-bound bindings are documented in their namespace
-            // section above, and are not properties of `tools`.
-            if tool.namespace_binding.is_some() {
-                continue;
-            }
-            let name = tool.name.as_str();
-            let nested_description = render_code_mode_sample_for_definition(tool);
-            let namespace_description = tool
-                .tool_name
-                .namespace
-                .as_ref()
-                .and_then(|namespace| namespace_descriptions.get(namespace));
-            let next_namespace = namespace_description
-                .map(|namespace_description| namespace_description.name.as_str());
-            if next_namespace != current_namespace {
-                if let Some(namespace_description) = namespace_description {
-                    let namespace_description_text = namespace_description.description.trim();
-                    if !namespace_description_text.is_empty() {
-                        nested_tool_sections.push(format!(
-                            "## {}\n{namespace_description_text}",
-                            namespace_description.name
-                        ));
-                    }
-                }
-                current_namespace = next_namespace;
-            }
-
-            let global_name = normalize_code_mode_identifier(name);
-            let nested_description = nested_description.trim();
-            if nested_description.is_empty() {
-                nested_tool_sections.push(render_tool_heading(&global_name, name));
-            } else {
-                nested_tool_sections.push(format!(
-                    "{}\n{nested_description}",
-                    render_tool_heading(&global_name, name)
-                ));
-            }
-        }
-
-        if has_mcp_tools {
-            sections.push(format!(
-                "Shared MCP Types:\n```ts\n{MCP_TYPESCRIPT_PREAMBLE}\n```"
-            ));
-        }
-        let nested_tool_reference = nested_tool_sections.join("\n\n");
-        sections.push(nested_tool_reference);
-    }
-
     sections.join("\n\n")
 }
 
@@ -402,6 +331,10 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
     EnabledToolMetadata {
         tool_name: definition.tool_name.clone(),
         global_name: normalize_code_mode_identifier(&definition.name),
+        canonical_name: definition.name.clone(),
+        input_schema: definition.input_schema.clone(),
+        output_schema: definition.output_schema.clone(),
+        declaration: discovery_declaration(definition),
         description: definition.description.clone(),
         kind: definition.kind,
         namespace_binding: definition.namespace_binding.clone(),
@@ -412,11 +345,87 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,
     pub global_name: String,
+    /// Local addition (not vendored): exact host name and schema-bearing
+    /// discovery, including namespace methods absent from the flat tools map.
+    pub canonical_name: String,
+    pub input_schema: Option<JsonValue>,
+    pub output_schema: Option<JsonValue>,
+    pub declaration: String,
     pub description: String,
     pub kind: CodeModeToolKind,
     /// Local addition (not vendored): nested-namespace projection — see
     /// [`ToolDefinition::namespace_binding`].
     pub namespace_binding: Option<NamespaceBinding>,
+}
+
+/// Local addition (not vendored): derive the selected method's declaration
+/// from its admitted schema, never from a full handwritten namespace manual.
+fn discovery_declaration(definition: &ToolDefinition) -> String {
+    let (input_name, input_type, output_type) = rendered_signature_types(definition);
+    let (namespace, method) = match &definition.namespace_binding {
+        Some(binding) => (
+            normalize_code_mode_identifier(&binding.namespace),
+            normalize_code_mode_identifier(&binding.method),
+        ),
+        None => (
+            "tools".to_string(),
+            normalize_code_mode_identifier(&definition.name),
+        ),
+    };
+    let declaration = format!(
+        "declare const {namespace}: {{ {method}({input_name}: {input_type}): Promise<{output_type}>; }};"
+    );
+    if mcp_structured_content_schema(definition.output_schema.as_ref()).is_some() {
+        format!("{MCP_TYPESCRIPT_PREAMBLE}\n{declaration}")
+    } else {
+        declaration
+    }
+}
+
+/// Local addition (not vendored): check names before installing any callable.
+/// The host may deduplicate identical entries, but conflicting canonical names
+/// or normalized JavaScript coordinates must never select a last writer.
+pub fn validate_tool_catalog(definitions: &[ToolDefinition]) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    let mut coordinates = std::collections::HashSet::new();
+    let mut namespaces = BTreeMap::new();
+    for definition in definitions {
+        if definition.name.trim().is_empty() || !names.insert(&definition.name) {
+            return Err(format!(
+                "duplicate or empty canonical tool name: {}",
+                definition.name
+            ));
+        }
+        let (namespace, method) = match &definition.namespace_binding {
+            Some(binding) => {
+                let namespace = normalize_code_mode_identifier(&binding.namespace);
+                if binding.namespace.trim().is_empty()
+                    || binding.method.trim().is_empty()
+                    || namespace == "__proto__"
+                {
+                    return Err("namespace bindings require nonempty, safe names".to_string());
+                }
+                if let Some(previous) = namespaces.insert(namespace.clone(), &binding.namespace)
+                    && previous != &binding.namespace
+                {
+                    return Err(format!(
+                        "namespace names collide after normalization: {namespace}"
+                    ));
+                }
+                (namespace, normalize_code_mode_identifier(&binding.method))
+            }
+            None => (
+                "tools".to_string(),
+                normalize_code_mode_identifier(&definition.name),
+            ),
+        };
+        if method == "__proto__" || !coordinates.insert((namespace.clone(), method.clone())) {
+            return Err(format!(
+                "tool JavaScript coordinate is unsafe or duplicated: {namespace}.{method}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn render_code_mode_sample(
@@ -476,74 +485,31 @@ fn rendered_signature_types(definition: &ToolDefinition) -> (&'static str, Strin
     (input_name, input_type, output_type)
 }
 
-/// Local addition (not vendored): document namespace globals — domain
-/// bindings projected as `<namespace>.<method>(...)` beside `tools`. Each
-/// namespace renders one section: its hand-authored declaration block when
-/// the host supplied one ([`ToolNamespaceDescription::declarations`]), or
-/// schema-rendered member signatures as the fallback.
-fn render_namespace_global_reference(
-    enabled_tools: &[ToolDefinition],
-    namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
-) -> Option<String> {
-    let mut grouped: BTreeMap<&str, Vec<&ToolDefinition>> = BTreeMap::new();
+/// Local addition (not vendored): an index reflects only admitted bindings.
+/// Namespace-wide authored prose/declarations stay out of the default prompt.
+fn render_namespace_global_reference(enabled_tools: &[ToolDefinition]) -> Option<String> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for tool in enabled_tools {
         if let Some(binding) = &tool.namespace_binding {
             grouped
-                .entry(binding.namespace.as_str())
+                .entry(normalize_code_mode_identifier(&binding.namespace))
                 .or_default()
-                .push(tool);
+                .push(normalize_code_mode_identifier(&binding.method));
         }
     }
     if grouped.is_empty() {
         return None;
     }
-
-    let bound = grouped
-        .keys()
-        .map(|namespace| format!("`{}`", normalize_code_mode_identifier(namespace)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut sections = vec![format!(
-        "Namespace globals — bound in this session: {bound}. Domain bindings are installed as globals beside `tools` — call them as `await <namespace>.<method>(...)` (for example `await code.items({{ file: \"src/lib.rs\" }})`), never via `tools.*`. They dispatch like nested tools and honor the same tool filter."
-    )];
-    for (namespace, tools) in grouped {
-        let namespace_ident = normalize_code_mode_identifier(namespace);
-        let mut section = format!("## `{namespace_ident}` namespace");
-        let described = namespace_descriptions.get(namespace);
-        if let Some(description) = described.map(|d| d.description.trim())
-            && !description.is_empty()
-        {
-            section.push('\n');
-            section.push_str(description);
-        }
-        let declarations = described
-            .map(|d| d.declarations.trim())
-            .filter(|d| !d.is_empty());
-        match declarations {
-            Some(declarations) => {
-                section.push_str(&format!("\n```ts\n{declarations}\n```"));
-            }
-            None => {
-                let members = tools
-                    .iter()
-                    .filter_map(|tool| {
-                        let binding = tool.namespace_binding.as_ref()?;
-                        let (input_name, input_type, output_type) = rendered_signature_types(tool);
-                        Some(format!(
-                            "{}({input_name}: {input_type}): Promise<{output_type}>;",
-                            normalize_code_mode_identifier(&binding.method)
-                        ))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                section.push_str(&format!(
-                    "\n```ts\ndeclare const {namespace_ident}: {{ {members} }};\n```"
-                ));
-            }
-        }
-        sections.push(section);
+    let mut lines = vec![
+        "Namespace globals installed beside `tools` (use ALL_TOOLS for each method's schema):"
+            .to_string(),
+    ];
+    for (namespace, mut methods) in grouped {
+        methods.sort();
+        methods.dedup();
+        lines.push(format!("- `{namespace}`: {}", methods.join(", ")));
     }
-    Some(sections.join("\n\n"))
+    Some(lines.join("\n"))
 }
 
 fn render_code_mode_tool_declaration(
@@ -554,14 +520,6 @@ fn render_code_mode_tool_declaration(
 ) -> String {
     let tool_name = normalize_code_mode_identifier(tool_name);
     format!("{tool_name}({input_name}: {input_type}): Promise<{output_type}>;")
-}
-
-fn render_tool_heading(global_name: &str, raw_name: &str) -> String {
-    if global_name == raw_name {
-        format!("### `{global_name}`")
-    } else {
-        format!("### `{global_name}` (`{raw_name}`)")
-    }
 }
 
 pub fn render_json_schema_to_typescript(schema: &JsonValue) -> String {
@@ -845,6 +803,74 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
 
+    // Local addition (not vendored): selected discovery must describe the
+    // admitted method even when a namespace manual advertises other methods.
+    #[test]
+    fn namespace_discovery_uses_actual_schema_and_default_index_is_filtered() {
+        let definition = ToolDefinition {
+            name: "code.onlyMethod".into(),
+            tool_name: ToolName::plain("code.onlyMethod"),
+            description: "One admitted method".into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(
+                json!({"type":"object","properties":{"limit":{"type":"integer"}},"required":["limit"],"additionalProperties":false}),
+            ),
+            output_schema: None,
+            namespace_binding: Some(super::NamespaceBinding {
+                namespace: "code".into(),
+                method: "onlyMethod".into(),
+            }),
+        };
+        let manuals = BTreeMap::from([(
+            "code".into(),
+            ToolNamespaceDescription {
+                name: "code".into(),
+                description: "A long irrelevant manual".repeat(8_000),
+                declarations: "declare const code: { deniedMethod(): Promise<void>; };".into(),
+            },
+        )]);
+        for only in [true, false] {
+            let description = build_exec_tool_description(
+                std::slice::from_ref(&definition),
+                &manuals,
+                only,
+                false,
+            );
+            assert!(description.contains("`code`: onlyMethod"));
+            assert!(!description.contains("deniedMethod"));
+            assert!(!description.contains("irrelevant manual"));
+            assert!(description.len() < 6_000);
+        }
+        let metadata = super::enabled_tool_metadata(&definition);
+        assert_eq!(metadata.canonical_name, "code.onlyMethod");
+        assert_eq!(metadata.input_schema, definition.input_schema);
+        assert!(metadata.declaration.contains("onlyMethod(args:"));
+        assert!(metadata.declaration.contains("limit: number"));
+        assert!(!metadata.declaration.contains("deniedMethod"));
+    }
+
+    #[test]
+    fn selected_mcp_discovery_keeps_shared_types_out_of_default_prompt() {
+        let definition = ToolDefinition {
+            name: "mcp__sample__read".into(),
+            tool_name: ToolName::plain("mcp__sample__read"),
+            description: "Read fixture".into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(json!({"type":"object"})),
+            output_schema: Some(mcp_call_tool_result_schema(
+                json!({"type":"object","properties":{"count":{"type":"integer"}}}),
+            )),
+            namespace_binding: None,
+        };
+        let metadata = super::enabled_tool_metadata(&definition);
+        assert!(metadata.declaration.contains("type CallToolResult"));
+        assert!(metadata.declaration.contains("mcp__sample__read(args:"));
+        assert!(
+            !build_exec_tool_description(&[definition], &BTreeMap::new(), true, false)
+                .contains("type CallToolResult")
+        );
+    }
+
     fn mcp_call_tool_result_schema(structured_content_schema: JsonValue) -> JsonValue {
         json!({
             "type": "object",
@@ -980,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_only_description_includes_nested_tools() {
+    fn code_mode_only_description_exposes_discovery_instead_of_full_manual() {
         let description = build_exec_tool_description(
             &[ToolDefinition {
                 name: "foo".to_string(),
@@ -995,10 +1021,9 @@ mod tests {
             /*code_mode_only*/ true,
             /*deferred_tools_available*/ false,
         );
-        assert!(description.contains(
-            "### `foo`
-bar"
-        ));
+        assert!(description.contains("1 nested tools are admitted"));
+        assert!(!description.contains("### `foo`"));
+        assert!(description.contains("input_schema"));
         assert!(!description.contains("do not attempt to use any other tools directly"));
     }
 
@@ -1028,16 +1053,16 @@ bar"
     }
 
     #[test]
-    fn exec_description_documents_note_emission_and_notify_delivery() {
+    fn exec_description_avoids_absent_services_and_documents_notify_delivery() {
         let description = build_exec_tool_description(
             &[],
             &BTreeMap::new(),
             /*code_mode_only*/ false,
             /*deferred_tools_available*/ false,
         );
-        // Exec-note idiom: bbox_note is reachable as a nested tool.
-        assert!(description.contains("tools.mcp__blackbox__bbox_note"));
-        assert!(description.contains("filter `ALL_TOOLS` by `name` for `bbox_note`"));
+        // Local addition (not vendored): no absent host service is suggested.
+        assert!(!description.contains("bbox_note"));
+        assert!(!description.contains("exec_command"));
         // Long-running cells: raise yield_time_ms via the pragma.
         assert!(description.contains(r#"// @exec: {"yield_time_ms": 60000}"#));
         // notify() is buffered into the next exec/wait result, not injected.
@@ -1049,7 +1074,7 @@ bar"
     }
 
     #[test]
-    fn code_mode_only_description_groups_namespace_instructions_once() {
+    fn code_mode_only_description_defers_namespace_instructions() {
         let namespace_descriptions = BTreeMap::from([(
             "mcp__sample__".to_string(),
             ToolNamespaceDescription {
@@ -1099,14 +1124,10 @@ bar"
             /*code_mode_only*/ true,
             /*deferred_tools_available*/ false,
         );
-        assert_eq!(description.matches("## mcp__sample").count(), 1);
-        assert!(description.contains("## mcp__sample\nShared namespace guidance."));
-        assert!(description.contains(
-            "declare const tools: { mcp__sample__alpha(args: {}): Promise<CallToolResult<{}>>; };"
-        ));
-        assert!(description.contains(
-            "declare const tools: { mcp__sample__beta(args: {}): Promise<CallToolResult<{}>>; };"
-        ));
+        assert!(description.contains("2 nested tools are admitted"));
+        assert!(!description.contains("Shared namespace guidance."));
+        assert!(!description.contains("declare const tools:"));
+        assert!(description.len() < 6_000);
     }
 
     #[test]
@@ -1143,11 +1164,11 @@ bar"
         );
 
         assert!(!description.contains("## mcp__sample"));
-        assert!(description.contains("### `mcp__sample__alpha`"));
+        assert!(description.contains("1 nested tools are admitted"));
     }
 
     #[test]
-    fn code_mode_only_description_renders_shared_mcp_types_once() {
+    fn code_mode_only_description_defers_shared_mcp_types() {
         let first_tool = augment_tool_definition(ToolDefinition {
             name: "mcp__sample__alpha".to_string(),
             tool_name: ToolName::namespaced("mcp__sample__", "alpha"),
@@ -1249,13 +1270,14 @@ bar"
             description
                 .matches("type CallToolResult<TStructured = { [key: string]: unknown }>")
                 .count(),
-            1
+            0
         );
-        assert_eq!(description.matches("Shared MCP Types:").count(), 1);
+        assert_eq!(description.matches("Shared MCP Types:").count(), 0);
+        assert!(description.contains("input_schema"));
     }
 
     #[test]
-    fn exec_description_mentions_deferred_nested_tools_when_available() {
+    fn exec_description_exposes_uniform_discovery_in_every_mode() {
         let description = build_exec_tool_description(
             &[],
             &BTreeMap::new(),
@@ -1263,8 +1285,8 @@ bar"
             /*deferred_tools_available*/ true,
         );
 
-        assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-        assert!(!description.contains("do not print the full `ALL_TOOLS` array"));
+        assert!(description.contains("exactly the admitted nested catalog"));
+        assert!(description.contains("no flat discovery call is required inside a cell"));
+        assert!(description.contains("print only matching names first"));
     }
 }

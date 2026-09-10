@@ -146,6 +146,9 @@ mod tests {
 
     fn cx() -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),

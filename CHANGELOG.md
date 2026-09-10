@@ -28,6 +28,27 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness resume validates snapshots and event-log checkpoints, excludes concurrent
+  writers, preserves queued controls and output schemas, and acknowledges controls
+  only after durable persistence. Scoped instructions use exact versioned context
+  delivery before structured mutations, including nested code cells.
+- Default harness and exec guidance describes admitted capabilities with compact
+  discovery, real schemas and invocation names. Tool activation is paged and
+  bounded; catalog collisions and malformed MCP configuration fail explicitly.
+- Tool defaults and pins retain JSON types throughout dispatch. Host authority
+  grants stay separate, and policy observations, hooks and diagnostics no longer
+  rewrite returned source content or JSON values. Numeric and boolean defaults
+  require JSON numbers and booleans; legacy numeric-looking strings stay strings.
+- MCP servers have explicit startup and remote call deadlines. Unknown remote
+  completion quarantines the connection and prevents silent retry or resume;
+  local render and blame adapters consume preserved MCP envelopes.
+- Git helpers share supervised process cleanup and bounded capture, including
+  commit hooks. Interrupted mutations disclose uncertain repository state.
+- Exact code readers reject invalid UTF-8 and oversized results; batch item
+  discovery is paged and bounded. Arbitrary LSP commands use exclusive admission
+  and are advertised as potentially destructive.
+
+
 - Shell output pages preserve unread data after process exit, retain final output
   on buffer overflow, and decode UTF-8 and filtered lines across read boundaries.
   `output_pending` identifies further pages; loss and incomplete capture have

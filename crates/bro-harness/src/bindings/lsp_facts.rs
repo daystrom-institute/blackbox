@@ -798,7 +798,7 @@ impl Tool for LspExecuteCommand {
         "lsp.executeCommand"
     }
     fn description(&self) -> &str {
-        "Execute a language-server workspace command through workspace/executeCommand. Defaults to Java/JDTLS. This is the generic harness seam for server-specific refactor commands that are not modeled as standard LSP requests."
+        "Execute a language-server workspace command through workspace/executeCommand. Defaults to Java/JDTLS. Specialized control capability: arbitrary server commands may have side effects and run under exclusive workspace admission. The client refuses workspace/applyEdit, but cannot promise that server commands are read-only. Prefer typed LSP queries and edit producers where available."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -813,8 +813,8 @@ impl Tool for LspExecuteCommand {
     }
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations {
-            read_only: true,
-            destructive: false,
+            read_only: false,
+            destructive: true,
         }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
@@ -2030,6 +2030,9 @@ mod tests {
 
     fn cx_in(dir: &std::path::Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

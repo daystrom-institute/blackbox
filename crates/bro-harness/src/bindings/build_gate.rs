@@ -214,20 +214,6 @@ impl Tool for BuildGate {
             Ok(path) => path,
             Err(e) => return ToolResult::Error(format!("build.gate: {e}")),
         };
-        let shell_arg_context: serde_json::Map<String, Value> = [
-            "defaults_applied",
-            "pin_enforced",
-            "pin_conflict",
-            "tool_arg_context",
-        ]
-        .into_iter()
-        .filter_map(|key| {
-            shell_json
-                .get(key)
-                .cloned()
-                .map(|value| (key.to_owned(), value))
-        })
-        .collect();
         // Parsing is pure, but span anchoring reads files; run the tail on
         // the blocking pool so no fs I/O lands on a tokio worker (I2).
         let root = cx.root.clone();
@@ -275,9 +261,6 @@ impl Tool for BuildGate {
                 if let Some(value) = shell_json.get(key) {
                     result[key] = value.clone();
                 }
-            }
-            if !shell_arg_context.is_empty() {
-                result["shell_arg_context"] = Value::Object(shell_arg_context);
             }
             ToolResult::Json(result)
         })
@@ -971,6 +954,9 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1006,9 +992,9 @@ mod tests {
             )).await.unwrap();
             if refuse_poll {
                 cx.tool_arg_defaults = Arc::new(
-                    bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([(
+                    bro_tools::ToolArgDefaults::parse_values(BTreeMap::from([(
                         "pin:shell_poll.max_output_tokens".into(),
-                        "0".into(),
+                        json!(0),
                     )]))
                     .unwrap(),
                 );
@@ -1115,6 +1101,7 @@ mod tests {
             ]))
             .unwrap(),
         );
+        let observations = cx.tool_observations.clone();
         let host = crate::capabilities::HostTools::new(
             vec![
                 Arc::new(BuildGate),
@@ -1155,9 +1142,13 @@ mod tests {
         assert!(!accepted.is_error, "{}", accepted.content);
         let value: Value = serde_json::from_str(&accepted.content).unwrap();
         assert_eq!(value["ok"], true);
-        assert_eq!(
-            value["shell_arg_context"]["pin_enforced"]["command"],
-            command
+        assert!(value.get("shell_arg_context").is_none());
+        assert!(
+            observations
+                .drain()
+                .observations
+                .iter()
+                .any(|observation| observation.context["pin_enforced"]["command"] == command)
         );
         assert_eq!(
             tokio::fs::read_to_string(permitted.join("approved.txt"))
@@ -1197,9 +1188,14 @@ mod tests {
                 .await,
         );
         assert_eq!(result["ok"], true);
-        assert_eq!(
-            result["shell_arg_context"]["defaults_applied"]["cwd"],
-            work.to_string_lossy().as_ref()
+        assert!(result.get("shell_arg_context").is_none());
+        assert!(
+            cx.tool_observations
+                .drain()
+                .observations
+                .iter()
+                .any(|observation| observation.context["defaults_applied"]["cwd"]
+                    == work.to_string_lossy().as_ref())
         );
         assert!(!root.join("marker.txt").exists());
         assert_eq!(
@@ -1244,9 +1240,9 @@ mod tests {
             root.to_string_lossy().into_owned(),
         )]));
         cx.tool_arg_defaults = Arc::new(
-            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([
-                ("pin:shell_run.cwd".into(), "other".into()),
-                ("pin:shell_run.timeout_ms".into(), "1".into()),
+            bro_tools::ToolArgDefaults::parse_values(BTreeMap::from([
+                ("pin:shell_run.cwd".into(), json!("other")),
+                ("pin:shell_run.timeout_ms".into(), json!(1)),
             ]))
             .unwrap(),
         );
@@ -1283,15 +1279,14 @@ mod tests {
             ]))
             .unwrap(),
         );
-        // The current host table stores strings; shell rejects a string timeout.
-        // Preserve that direct-shell failure instead of replacing the host value
-        // with the wrapper's numeric fallback or widening typing in this repair.
+        // Legacy host strings remain strings and are rejected by schema
+        // admission before spawning a shell; they are never guessed as numbers.
         let result = BuildGate
             .call(json!({"command":"printf forbidden > forbidden.txt"}), &cx)
             .await;
         assert!(result.is_error());
         let error = result.into_content().0;
-        assert!(error.contains("invalid type"), "{error}");
+        assert!(error.contains("declared parameter schema"), "{error}");
         assert!(!error.contains("pin conflict"), "{error}");
         assert!(!root.join("forbidden.txt").exists());
     }

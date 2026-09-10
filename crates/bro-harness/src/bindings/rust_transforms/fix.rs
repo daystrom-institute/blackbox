@@ -671,6 +671,9 @@ mod tests {
         let raw = r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0502"},"message":"borrow error","spans":[],"children":[]}}"#;
         let input = json!({ "raw_json": raw });
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::path::Path::new("/tmp").to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

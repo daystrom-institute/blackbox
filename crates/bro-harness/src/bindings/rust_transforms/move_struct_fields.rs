@@ -59,6 +59,9 @@ const OPT_OUT_PARAM: &str = "acknowledge_repr";
 
 #[async_trait]
 impl Tool for RustMoveStructFields {
+    fn authority_grants(&self) -> &[&str] {
+        &[OPT_OUT_PARAM]
+    }
     fn name(&self) -> &str {
         "rust.moveStructFields"
     }
@@ -103,8 +106,14 @@ impl Tool for RustMoveStructFields {
         // error, not confirm theater.
         let acknowledge_repr_grant = cx
             .tool_arg_defaults
-            .lookup("rust.moveStructFields", OPT_OUT_PARAM)
-            .map(|v| v.eq_ignore_ascii_case("true"));
+            .lookup_grant("rust.moveStructFields", OPT_OUT_PARAM)
+            .and_then(|value| {
+                value.as_bool().or_else(|| {
+                    value
+                        .as_str()
+                        .map(|value| value.eq_ignore_ascii_case("true"))
+                })
+            });
         let root = cx.root.clone();
         let ledger = Arc::clone(&self.0);
         bro_tools::tool::call_blocking(move || {
@@ -270,6 +279,9 @@ mod tests {
 
     fn cx_in(dir: &std::path::Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -293,6 +305,9 @@ mod tests {
         );
         let defaults = bro_tools::ToolArgDefaults::parse_map(map).unwrap();
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

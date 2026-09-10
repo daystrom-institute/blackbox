@@ -176,7 +176,7 @@ pub async fn run_with_event_callback_and_input_mcp(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
     mcp_config: Option<mcp::McpConfig>,
-    additional_context: Option<BTreeMap<String, String>>,
+    additional_context: Option<BTreeMap<String, Value>>,
     shell_env: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
     run_controlled_session(
@@ -199,34 +199,44 @@ async fn run_with_emitter(
         return run_session(cli, callback, mcp_config, None).await;
     }
 
-    // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
     let mut session = Session::build(&cli, callback, mcp_config, None, None).await?;
     session.emitter.system_init();
-    // A cancel channel that never fires — one-shot turns are not interruptible.
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let turn_result = session
-        .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
-        .await;
-    // Completed assistant/tool exchanges remain valid replay state even when
-    // the turn ends with a local refusal. Failed transport responses already
-    // remove incomplete assistant content before reaching this boundary.
-    let persist_result = async {
-        let body = session.persist_body()?;
-        let path = session.store_path().to_path_buf();
-        tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-            .await
-            .context("persist task panicked")?
-            .context("write session")
+    let mut pending = std::mem::take(&mut session.pending_user_inputs);
+    pending.push_back(prompt);
+    // A resumed redirect precedes the newly supplied prompt. Every completed
+    // turn checkpoints the remaining queue before proceeding to the next input.
+    while let Some(prompt) = pending.pop_front() {
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let turn_result = if prompt.trim() == "/compact" {
+            session.drain_cancelled_work().await;
+            let result = session.compact_manual().await;
+            if let Err(error) = &result {
+                session
+                    .emitter
+                    .result_error(&format!("manual /compact failed: {error:#}"), session.turns);
+            }
+            result
+        } else {
+            session
+                .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+                .await
+        };
+        session.pending_user_inputs = pending.clone();
+        // Keep completed exchanges and unconsumed queued inputs even when the
+        // current turn failed, while retaining one-shot error exit semantics.
+        let persist_result = session.persist().await;
+        match (turn_result, persist_result) {
+            (Err(error), Err(persist_error)) => {
+                return Err(error.context(format!(
+                    "session persistence also failed: {persist_error:#}"
+                )));
+            }
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(()), persisted) => persisted?,
+        }
     }
-    .await;
-    match (turn_result, persist_result) {
-        (Err(error), Err(persist_error)) => Err(error.context(format!(
-            "session persistence also failed: {persist_error:#}"
-        ))),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), persisted) => persisted,
-    }
+    Ok(())
 }
 
 /// Builds an `Emitter` for `session_id`, wiring in the sidecar event log and
@@ -258,7 +268,7 @@ async fn run_session(
     cli: Cli,
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
-    additional_context: Option<BTreeMap<String, String>>,
+    additional_context: Option<BTreeMap<String, Value>>,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
     let exit_when_idle = cli.exit_when_idle;
@@ -289,7 +299,7 @@ async fn run_session(
     );
 
     // Steers that arrived mid-turn wait here for the next turn boundary.
-    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut pending = std::mem::take(&mut session.pending_user_inputs);
     // An initial `-p` prompt (if any) is the first user turn.
     if let Some(p) = cli.prompt.clone() {
         pending.push_back(p);
@@ -297,17 +307,11 @@ async fn run_session(
 
     if exit_when_idle {
         await_first_controlled_input(&mut session, &mut input_rx, &ctrl_emitter, &mut pending)
-            .await;
+            .await?;
         session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
     } else {
         session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
     }
-    let body = session.persist_body()?;
-    let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-        .await
-        .context("persist task panicked")?
-        .context("write session")?;
     Ok(())
 }
 
@@ -316,7 +320,7 @@ async fn run_controlled_session(
     input_rx: SessionInputReceiver,
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
-    additional_context: Option<BTreeMap<String, String>>,
+    additional_context: Option<BTreeMap<String, Value>>,
     shell_env: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
     let mut session = Session::build(
@@ -336,19 +340,13 @@ async fn run_controlled_session(
         session.seq_counter(),
     );
 
-    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut pending = std::mem::take(&mut session.pending_user_inputs);
     if let Some(p) = cli.prompt.clone() {
         pending.push_back(p);
     }
     let input_rx = map_session_input(input_rx);
 
     session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
-    let body = session.persist_body()?;
-    let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-        .await
-        .context("persist task panicked")?
-        .context("write session")?;
     Ok(())
 }
 
@@ -379,21 +377,113 @@ fn to_input(input: SessionInput) -> Input {
     }
 }
 
-fn queue_redirect_from_control(raw: &Value, inputs: &Arc<StdMutex<VecDeque<String>>>) {
-    let prompt = raw["prompt"]
-        .as_str()
-        .or_else(|| raw["request"]["prompt"].as_str())
-        .map(str::to_string);
-    if let Some(prompt) = prompt
-        && let Ok(mut inputs) = inputs.lock()
-    {
-        inputs.push_back(prompt);
+#[derive(Debug)]
+enum SessionControl {
+    Interrupt { redirect: Option<String> },
+    SetModel(String),
+}
+
+fn restore_pending_user_inputs(side: &Value) -> Result<VecDeque<String>> {
+    let Some(value) = side.get("pending_user_inputs") else {
+        return Ok(VecDeque::new());
+    };
+    value
+        .as_array()
+        .context("persisted pending_user_inputs must be an array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("persisted pending input must be a string")
+        })
+        .collect()
+}
+
+fn parse_control(subtype: &str, raw: &Value) -> Result<SessionControl> {
+    anyhow::ensure!(raw.is_object(), "control payload must be an object");
+    let field = |name: &str| {
+        raw.get(name)
+            .or_else(|| raw.get("request").and_then(|request| request.get(name)))
+    };
+    match subtype {
+        "interrupt" => {
+            let redirect = field("prompt")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(str::to_owned)
+                        .context("interrupt prompt must be a nonempty string")
+                })
+                .transpose()?;
+            Ok(SessionControl::Interrupt { redirect })
+        }
+        "set_model" => {
+            let model = field("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.trim().is_empty())
+                .context("set_model requires a nonempty model string")?;
+            Ok(SessionControl::SetModel(model.to_owned()))
+        }
+        _ => anyhow::bail!("unsupported control: {subtype}"),
     }
 }
 
-/// The core bidirectional loop, factored out of `run_session` so it can be
-/// driven by an injected input channel in tests (independent of real stdin /
-/// HTTP). Persistence is the caller's responsibility.
+struct PendingControl {
+    command: SessionControl,
+    request_id: Option<String>,
+}
+
+fn receive_control(
+    subtype: &str,
+    raw: &Value,
+    request_id: Option<String>,
+    emitter: &Emitter,
+) -> Option<PendingControl> {
+    match parse_control(subtype, raw) {
+        Ok(command) => Some(PendingControl {
+            command,
+            request_id,
+        }),
+        Err(error) => {
+            emitter.control_response_error(request_id.as_deref(), &error.to_string());
+            None
+        }
+    }
+}
+
+async fn apply_pending_control(
+    session: &mut Session,
+    control: PendingControl,
+    emitter: &Emitter,
+    pending: &mut VecDeque<String>,
+) -> Result<()> {
+    match control.command {
+        SessionControl::Interrupt { redirect } => {
+            session.drain_cancelled_work().await;
+            if let Some(prompt) = redirect {
+                pending.push_front(prompt);
+            }
+        }
+        SessionControl::SetModel(model) => session.apply_control(&model),
+    }
+    session.pending_user_inputs = pending.clone();
+    match session.persist().await {
+        Ok(()) => emitter.control_response_success(control.request_id.as_deref()),
+        Err(error) => {
+            emitter.control_response_error(
+                control.request_id.as_deref(),
+                &format!("control applied but persistence failed: {error:#}"),
+            );
+            session.drain_cancelled_work().await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Both entry modes use the same turn/control boundary and durable persistence.
 async fn session_loop(
     session: &mut Session,
     mut input_rx: mpsc::UnboundedReceiver<Input>,
@@ -402,125 +492,27 @@ async fn session_loop(
 ) -> Result<()> {
     loop {
         let prompt = match pending.pop_front() {
-            Some(p) => p,
+            Some(prompt) => prompt,
             None => match input_rx.recv().await {
-                Some(Input::User(p)) => p,
+                Some(Input::User(prompt)) => prompt,
                 Some(Input::Control {
                     subtype,
                     req_id,
                     raw,
                 }) => {
-                    // Control while idle: apply any mutation, ack success.
-                    if subtype == "interrupt" {
-                        session.drain_cancelled_work().await;
-                    } else {
-                        session.apply_control(&subtype, &raw);
+                    if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
+                        apply_pending_control(session, control, ctrl_emitter, &mut pending).await?;
                     }
-                    ctrl_emitter.control_response_success(req_id.as_deref());
                     continue;
                 }
-                None => break, // stdin closed and nothing pending
+                None => break,
             },
         };
-
-        // `/compact` is an in-stream slash command, not a model turn.
-        if prompt.trim() == "/compact" {
-            if let Err(e) = session.compact_manual().await {
-                tracing::warn!("manual /compact failed: {e:#}");
-            }
-            continue;
-        }
-
-        // Run the turn while concurrently watching stdin for an interrupt
-        // (cancels the turn) or a steer. User steers received during a
-        // tool-calling turn are injected at the next model-call boundary inside
-        // that same turn, after any outstanding tool results are pushed.
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let mut stdin_closed = false;
-        let mut deferred: Vec<(String, Value)> = Vec::new();
-        let mut interrupt_responses = Vec::new();
-        let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
-            Arc::new(StdMutex::new(VecDeque::new()));
-        {
-            let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
-            tokio::pin!(turn);
-            loop {
-                tokio::select! {
-                    biased;
-                    res = &mut turn => {
-                        if let Err(e) = res {
-                            tracing::error!("turn failed: {e:#}");
-                        }
-                        break;
-                    }
-                    maybe = input_rx.recv(), if !stdin_closed => match maybe {
-                        Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
-                            queue_redirect_from_control(&raw, &mid_turn_user_inputs);
-                            let _ = cancel_tx.send(true);
-                            interrupt_responses.push(req_id);
-                        }
-                        Some(Input::User(p)) => {
-                            if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-                                inputs.push_back(p);
-                            }
-                        }
-                        Some(Input::Control { subtype, req_id, raw }) => {
-                            // Non-interrupt controls (set_model, …) ack now and
-                            // apply at the turn boundary, when self is free.
-                            ctrl_emitter.control_response_success(req_id.as_deref());
-                            deferred.push((subtype, raw));
-                        }
-                        None => {
-                            let _ = cancel_tx.send(true);
-                            stdin_closed = true;
-                        }
-                    }
-                }
-            }
-        }
-        for req_id in interrupt_responses {
-            ctrl_emitter.control_response_success(req_id.as_deref());
-        }
-        // The turn (and its &mut self borrow) is done — apply deferred controls.
-        for (subtype, raw) in deferred {
-            session.apply_control(&subtype, &raw);
-        }
-        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-            while let Some(p) = inputs.pop_back() {
-                pending.push_front(p);
-            }
-        }
-        // Persist after every turn, not just at clean session exit. A bidi
-        // session is routinely killed (SIGTERM on fleet stop / cockpit close)
-        // before the end-of-`run_session` persist runs; without this, every
-        // completed turn is lost and a `--resume` finds no session file and
-        // starts cold. Per-turn persistence bounds the loss to at most the
-        // single in-flight turn.
-        match session.persist_body() {
-            Ok(body) => {
-                let path = session.store_path().to_path_buf();
-                // Move the write off the async runtime.
-                let write_res =
-                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-                        .await;
-                if let Err(e) = match write_res {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.context("write session")),
-                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
-                } {
-                    tracing::warn!("failed to persist session after turn: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to serialize session after turn: {e:#}");
-            }
-        }
-        if stdin_closed && pending.is_empty() {
-            break;
-        }
+        run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
+            .await?;
     }
     session.drain_cancelled_work().await;
-    Ok(())
+    session.persist().await
 }
 
 async fn session_loop_until_idle(
@@ -531,60 +523,36 @@ async fn session_loop_until_idle(
 ) -> Result<()> {
     loop {
         let prompt = match pending.pop_front() {
-            Some(p) => p,
+            Some(prompt) => prompt,
             None => match input_rx.try_recv() {
-                Ok(Input::User(p)) => p,
+                Ok(Input::User(prompt)) => prompt,
                 Ok(Input::Control {
                     subtype,
                     req_id,
                     raw,
                 }) => {
-                    if subtype == "interrupt" {
-                        session.drain_cancelled_work().await;
-                    } else {
-                        session.apply_control(&subtype, &raw);
+                    if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
+                        apply_pending_control(session, control, ctrl_emitter, &mut pending).await?;
                     }
-                    ctrl_emitter.control_response_success(req_id.as_deref());
                     continue;
                 }
                 Err(_) => break,
             },
         };
-
         run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
             .await?;
-        match session.persist_body() {
-            Ok(body) => {
-                let path = session.store_path().to_path_buf();
-                let write_res =
-                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-                        .await;
-                if let Err(e) = match write_res {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.context("write session")),
-                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
-                } {
-                    tracing::warn!("failed to persist session after controlled turn: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to serialize session after controlled turn: {e:#}");
-            }
-        }
     }
     session.drain_cancelled_work().await;
-    Ok(())
+    session.persist().await
 }
 
-/// Child mode sends the initial prompt over stdin instead of argv. Wait for
-/// that first message before switching to non-blocking idle draining, otherwise
-/// process startup can outrun the stdin reader and exit without a turn.
+/// Child startup waits for the first message before switching to idle draining.
 async fn await_first_controlled_input(
     session: &mut Session,
     input_rx: &mut mpsc::UnboundedReceiver<Input>,
     ctrl_emitter: &Emitter,
     pending: &mut VecDeque<String>,
-) {
+) -> Result<()> {
     while pending.is_empty() {
         match input_rx.recv().await {
             Some(Input::User(prompt)) => pending.push_back(prompt),
@@ -593,16 +561,14 @@ async fn await_first_controlled_input(
                 req_id,
                 raw,
             }) => {
-                if subtype == "interrupt" {
-                    session.drain_cancelled_work().await;
-                } else {
-                    session.apply_control(&subtype, &raw);
+                if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
+                    apply_pending_control(session, control, ctrl_emitter, pending).await?;
                 }
-                ctrl_emitter.control_response_success(req_id.as_deref());
             }
             None => break,
         }
     }
+    Ok(())
 }
 
 async fn run_prompt_with_controls(
@@ -612,62 +578,99 @@ async fn run_prompt_with_controls(
     pending: &mut VecDeque<String>,
     prompt: String,
 ) -> Result<()> {
-    if prompt.trim() == "/compact" {
-        if let Err(e) = session.compact_manual().await {
-            tracing::warn!("manual /compact failed: {e:#}");
-        }
-        return Ok(());
+    let compact = prompt.trim() == "/compact";
+    if compact {
+        // Replacement history must follow the actual outcomes of active work.
+        session.drain_cancelled_work().await;
     }
-
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let mut deferred: Vec<(String, Value)> = Vec::new();
-    let mut interrupt_responses = Vec::new();
+    let mut deferred = Vec::new();
     let mut stdin_closed = false;
-    let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
-        Arc::new(StdMutex::new(VecDeque::new()));
+    let mid_turn_user_inputs = Arc::new(StdMutex::new(VecDeque::new()));
     let turn_result = {
-        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
-        tokio::pin!(turn);
+        let operation = async {
+            if compact {
+                session.compact_manual().await
+            } else {
+                session
+                    .user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone())
+                    .await
+            }
+        };
+        tokio::pin!(operation);
         loop {
             tokio::select! {
                 biased;
-                res = &mut turn => break res,
+                result = &mut operation => break result,
                 maybe = input_rx.recv(), if !stdin_closed => match maybe {
-                    Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
-                        queue_redirect_from_control(&raw, &mid_turn_user_inputs);
-                        let _ = cancel_tx.send(true);
-                        interrupt_responses.push(req_id);
-                    }
-                    Some(Input::User(p)) => {
-                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-                            inputs.push_back(p);
+                    Some(Input::Control { subtype, req_id, raw }) => {
+                        if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
+                            if matches!(&control.command, SessionControl::Interrupt { .. }) {
+                                let _ = cancel_tx.send(true);
+                            }
+                            deferred.push(control);
                         }
                     }
-                    Some(Input::Control { subtype, req_id, raw }) => {
-                        ctrl_emitter.control_response_success(req_id.as_deref());
-                        deferred.push((subtype, raw));
+                    Some(Input::User(prompt)) if compact || prompt.trim() == "/compact" => pending.push_back(prompt),
+                    Some(Input::User(prompt)) => {
+                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() { inputs.push_back(prompt); }
                     }
                     None => {
-                        let _ = cancel_tx.send(true);
+                        // EOF ends input admission; already accepted turns finish.
+                        // Explicit interrupt requests own cancellation.
                         stdin_closed = true;
                     }
                 }
             }
         }
     };
-    for req_id in interrupt_responses {
-        ctrl_emitter.control_response_success(req_id.as_deref());
-    }
-    // user_turn emits the durable terminal error in every entry mode.
-    if let Err(e) = turn_result {
-        tracing::error!("turn failed: {e:#}");
-    }
-    for (subtype, raw) in deferred {
-        session.apply_control(&subtype, &raw);
+    if let Err(error) = turn_result {
+        if compact {
+            session
+                .emitter
+                .result_error(&format!("manual /compact failed: {error:#}"), session.turns);
+        } else {
+            tracing::error!("turn failed: {error:#}");
+        }
     }
     if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-        while let Some(p) = inputs.pop_back() {
-            pending.push_front(p);
+        while let Some(prompt) = inputs.pop_back() {
+            pending.push_front(prompt);
+        }
+    }
+    // Preserve queued redirects and commands as well as completed operations.
+    session.pending_user_inputs = pending.clone();
+    // Preserve the completed operation before acknowledging any later controls.
+    if let Err(error) = session.persist().await {
+        for control in deferred {
+            let status = if matches!(&control.command, SessionControl::Interrupt { .. }) {
+                "interrupt completed but its redirect was not queued"
+            } else {
+                "control was not applied"
+            };
+            ctrl_emitter.control_response_error(
+                control.request_id.as_deref(),
+                &format!("{status}: session persistence failed: {error:#}"),
+            );
+        }
+        session.drain_cancelled_work().await;
+        return Err(error);
+    }
+    let mut deferred = deferred.into_iter();
+    while let Some(control) = deferred.next() {
+        if let Err(error) = apply_pending_control(session, control, ctrl_emitter, pending).await {
+            for remaining in deferred {
+                let status = if matches!(&remaining.command, SessionControl::Interrupt { .. }) {
+                    "interrupt completed but its redirect was not queued"
+                } else {
+                    "control was not applied"
+                };
+                ctrl_emitter.control_response_error(
+                    remaining.request_id.as_deref(),
+                    &format!("{status}: preceding control persistence failed: {error:#}"),
+                );
+            }
+            return Err(error);
         }
     }
     Ok(())
@@ -682,11 +685,13 @@ struct Session {
     /// shape stays consistent with any `exec` cells already in the transcript.
     code_mode: crate::code_mode::CodeMode,
     code_mode_session: Option<crate::code_mode::CodeModeToolSession>,
+    remote_outcome_sources: Vec<Arc<dyn Tool>>,
     retain_background_work: bool,
     cx: ToolCx,
     reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
-    scoped_project_docs: crate::project_doc::ScopedProjectDocs,
+    scoped_project_docs: Arc<crate::project_doc::ScopedProjectDocs>,
+    resume_runtime_reset: bool,
     emitter: Emitter,
     base_opts: TurnOpts,
     /// Explicit caller-supplied system text. Discovered AGENTS/UserInstructions
@@ -724,6 +729,7 @@ struct Session {
     /// a resumed session continues the sequence rather than restarting at 0.
     seq_counter: Arc<AtomicU64>,
     prior_side: Value,
+    pending_user_inputs: VecDeque<String>,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
@@ -776,7 +782,7 @@ impl Session {
         cli: &Cli,
         callback: Option<EventCallback>,
         injected_mcp: Option<mcp::McpConfig>,
-        additional_context: Option<BTreeMap<String, String>>,
+        additional_context: Option<BTreeMap<String, Value>>,
         shell_env: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
@@ -804,11 +810,19 @@ impl Session {
             None => std::env::current_dir().context("cwd")?,
         };
 
-        let (explicit_system, user_instructions) = match cli.system_prompt.as_deref() {
-            Some("") => (None, None),
-            Some(s) => (Some(s.to_string()), None),
-            None => (None, crate::context::UserInstructions::from_project(&root)),
-        };
+        let startup_docs = cli
+            .system_prompt
+            .is_none()
+            .then(|| crate::project_doc::discover(&root))
+            .flatten();
+        let explicit_system = cli
+            .system_prompt
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        // Filesystem instructions have one typed delivery ledger. Static user
+        // fragments remain available to callers without duplicating discovered docs.
+        let user_instructions = None;
 
         let kind = TransportKind::from_env();
         let mut tx = transport::build_transport(kind).await?;
@@ -830,13 +844,15 @@ impl Session {
         let restored_last_event_seq = store.restored.as_ref().map_or(0, |r| r.last_event_seq);
         let log_tail_seq = EventLog::max_seq_in_log(event_log.path());
         let seq_counter = Arc::new(AtomicU64::new(restored_last_event_seq.max(log_tail_seq)));
-        let scoped_project_docs = crate::project_doc::ScopedProjectDocs::from_startup_and_event_log(
-            user_instructions
-                .as_ref()
-                .map(|instructions| instructions.loaded_paths.clone())
-                .unwrap_or_default(),
-            event_log.path(),
-        );
+        let scoped_project_docs = Arc::new(crate::project_doc::ScopedProjectDocs::new(
+            root.clone(),
+            startup_docs.as_ref(),
+        ));
+        if cli.system_prompt.is_some() {
+            scoped_project_docs.suppress_startup_discovery();
+        } else {
+            scoped_project_docs.enroll_global_candidates();
+        }
         // Hand the transport the stable session id, so it can populate the
         // codex-style `session-id` header + `prompt_cache_key` (vs a random
         // per-request id).
@@ -851,6 +867,20 @@ impl Session {
             .as_ref()
             .map(|r| r.side.clone())
             .unwrap_or(Value::Null);
+        if let Some(paths) = prior_side.get("instruction_observed_paths") {
+            scoped_project_docs.restore_observed_paths(
+                serde_json::from_value(paths.clone())
+                    .context("invalid persisted instruction scopes")?,
+            );
+        }
+        if let Some(documents) = prior_side.get("instruction_documents") {
+            let documents = serde_json::from_value(documents.clone())
+                .context("invalid persisted instruction documents")?;
+            scoped_project_docs
+                .restore_documents(documents)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
         let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
             prior_side.get("todos").unwrap_or(&Value::Null),
         )));
@@ -871,6 +901,7 @@ impl Session {
             crate::context::dispatch::resolve_dispatch_context_arg(cli.dispatch_context.as_deref())
                 .map_err(anyhow::Error::msg)
                 .context("--dispatch-context")?;
+        let pending_user_inputs = restore_pending_user_inputs(&prior_side)?;
         let dispatch = crate::context::dispatch::DispatchState::from_arg(dispatch_arg, &prior_side);
         let strategy = crate::context::dispatch::CompositionStrategy::for_transport(kind);
         if let Some(r) = &store.restored {
@@ -923,6 +954,9 @@ impl Session {
             output_budget: tool_result_cap,
             child_env: Arc::new(child_env),
             cancellation: Default::default(),
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: Some(scoped_project_docs.clone()),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
             shell_env: Arc::new(shell_env),
         };
@@ -955,14 +989,14 @@ impl Session {
             Some(event_log.clone()),
             seq_counter.clone(),
         ))));
-        let (mcp_tools, tool_placement) = match injected_mcp {
+        let (mcp_loaded, tool_placement) = match injected_mcp {
             Some(config) => {
                 let tools = mcp::load_mcp_tools_from_config_with_capability_aliases(
                     &config,
                     &tool_filter,
                     cli.capability_mcp_server.as_deref(),
                 )
-                .await;
+                .await?;
                 (tools, config.tool_placement)
             }
             None => {
@@ -971,13 +1005,21 @@ impl Session {
                     &tool_filter,
                     cli.capability_mcp_server.as_deref(),
                 )
-                .await;
-                let placement = mcp::parse_tool_placement(cli.mcp_config.as_deref());
+                .await?;
+                let placement = mcp::parse_tool_placement(cli.mcp_config.as_deref())?;
                 (tools, placement)
             }
         };
+        make_emitter(
+            store.id.clone(),
+            callback.clone(),
+            Some(event_log.clone()),
+            seq_counter.clone(),
+        )
+        .mcp_readiness(&mcp_loaded.readiness);
+        let remote_outcome_sources = mcp_loaded.tools.clone();
         let mcp_tools = crate::locality::install_project_mutation_routes(
-            mcp_tools,
+            mcp_loaded.tools,
             &cx,
             cli.capability_mcp_server.as_deref(),
         )
@@ -1067,7 +1109,13 @@ impl Session {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()
-            .context("invalid output schema JSON")?;
+            .context("invalid output schema JSON")?
+            .or_else(|| {
+                prior_side
+                    .get("output_schema")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+            });
         if let Some(ref schema) = output_schema {
             compile_output_schema(schema)?;
             builtins.push(Arc::new(FinalResultTool::new(schema.clone())));
@@ -1080,7 +1128,7 @@ impl Session {
             &pin,
             &tool_filter,
             code_mode.defers_builtins(),
-        );
+        )?;
         reg.set_dispatch_gate(dispatch_gate);
         if restored_snapshot {
             // Receipts are independent evidence, even when an explicit saved
@@ -1111,7 +1159,9 @@ impl Session {
         validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 
         let base_opts = TurnOpts {
-            base_instructions: Some(transport::base_instructions_for(&model)),
+            base_instructions: Some(transport::base_instructions_for_capabilities(
+                &reg.wire_specs(),
+            )),
             model,
             max_tokens,
             system: SystemPrompt::default(),
@@ -1164,12 +1214,14 @@ impl Session {
             reg,
             code_mode,
             code_mode_session,
+            remote_outcome_sources,
             retain_background_work: cli.input_format.as_deref() == Some("stream-json")
                 && !cli.exit_when_idle,
             cx,
             reference_context_item,
             hooks,
             scoped_project_docs,
+            resume_runtime_reset: restored_snapshot,
             emitter,
             base_opts,
             explicit_system,
@@ -1185,6 +1237,7 @@ impl Session {
             event_log,
             seq_counter,
             prior_side,
+            pending_user_inputs,
             todos,
             lsp_baselines,
             lsp_pool: bro_lsp::SessionPool::new(lsp_config),
@@ -1216,23 +1269,12 @@ impl Session {
         self.seq_counter.clone()
     }
 
-    /// Apply a mid-session control mutation. `interrupt` is handled by the
-    /// caller (cancellation); everything else that mutates state lands here.
-    fn apply_control(&mut self, subtype: &str, raw: &Value) {
-        if subtype == "set_model"
-            && let Some(m) = raw["model"]
-                .as_str()
-                .or_else(|| raw["request"]["model"].as_str())
-        {
-            self.base_opts.model = m.to_string();
-            self.compact_threshold = self.compaction.threshold(m);
-            // The window is a property of the model, so a mid-session model
-            // swap moves the telemetry denominator too.
-            self.context_window = self.compaction.context_window(m);
-            tracing::info!(model = m, "set_model");
-        }
-        // set_max_thinking_tokens / others are accepted (acked) but not yet
-        // wired to a runtime knob; they no-op rather than error.
+    /// Apply a validated model control at a quiescent turn boundary.
+    fn apply_control(&mut self, model: &str) {
+        self.base_opts.model = model.to_owned();
+        self.compact_threshold = self.compaction.threshold(model);
+        self.context_window = self.compaction.context_window(model);
+        tracing::info!(model, "set_model");
     }
 
     /// Manual `/compact`: summarize-and-replace the prefix and emit a manual
@@ -1259,6 +1301,7 @@ impl Session {
                 self.emitter
                     .compact_boundary("manual", self.last_prompt_tokens, summary.len());
                 self.reference_context_item = None;
+                self.scoped_project_docs.invalidate_delivery();
             }
             None => tracing::info!("manual /compact: nothing compactible yet"),
         }
@@ -1333,6 +1376,9 @@ impl Session {
         let mut last_tool_results: Vec<Value> = Vec::new();
 
         let break_reason = 'turn: loop {
+            if !self.uncertain_remote_outcomes().is_empty() {
+                break "remote_outcome_unknown";
+            }
             if turn_steps >= self.max_turns {
                 tracing::warn!(max_turns = self.max_turns, "hit max turns; stopping");
                 break "max_turns";
@@ -1385,6 +1431,7 @@ impl Session {
                         // longer applies.
                         self.pending_input_estimate = 0;
                         self.reference_context_item = None;
+                        self.scoped_project_docs.invalidate_delivery();
                         // Mid-turn compaction must restore authoritative context
                         // before the model continues without another user turn.
                         self.emit_initial_context_if_needed();
@@ -1397,6 +1444,8 @@ impl Session {
                 self.prepare_context_for_user_turn();
                 self.push_user_text_raw(prompt);
             }
+            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
+                .await?;
             let mut sys = compose_system(
                 &self.system_sections(),
                 &self.reg,
@@ -1435,6 +1484,7 @@ impl Session {
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
             let out = 'attempt: loop {
+                self.deliver_instruction_context().await?;
                 self.tx.normalize_for_prompt();
                 let r = tokio::select! {
                     biased;
@@ -1476,6 +1526,7 @@ impl Session {
                                 );
                                 self.pending_input_estimate = 0;
                                 self.reference_context_item = None;
+                                self.scoped_project_docs.invalidate_delivery();
                                 self.emit_initial_context_if_needed();
                             }
                             // Nothing compactible, or compaction itself failed:
@@ -1631,7 +1682,8 @@ impl Session {
                     );
                 }
                 tool_batch_correction_reason = Some(reason);
-                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
+                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
+                    .await?;
                 continue;
             }
 
@@ -1774,9 +1826,7 @@ impl Session {
             // pass below — the per-edit window-0 drain could not attribute edits
             // under concurrent dispatch or V8 code-mode cells.
             let mut results: Vec<transport::ToolResult> = Vec::with_capacity(call_count);
-            let mut scoped_riders = std::collections::HashMap::new();
-            let mut shell_result_ids = HashSet::new();
-            let mut shell_context = String::new();
+            let mut tool_context = String::new();
             for (i, tc) in out.tool_calls.iter().enumerate() {
                 let Some((content, is_error)) = raw[i].take() else {
                     continue;
@@ -1784,39 +1834,22 @@ impl Session {
                 // Bound producer output before appending contextual riders.
                 let content =
                     crate::bound::bound_tool_result(&tc.name, content, self.tool_result_cap);
-                let mut result = transport::ToolResult {
+                let result = transport::ToolResult {
                     id: tc.id.clone(),
                     content,
                     is_error,
                 };
-                let shell_page = !result.is_error
-                    && matches!(tc.name.as_str(), "shell_run" | "shell_poll" | "shell_kill")
-                    && serde_json::from_str::<Value>(&result.content)
-                        .is_ok_and(|value| value["output_pending"].is_boolean());
-                if shell_page {
-                    shell_result_ids.insert(tc.id.clone());
-                }
                 for n in self.hooks.on_tool_result(tc, &result) {
                     match n.delivery {
-                        Delivery::Rider if shell_page => {
-                            shell_context.push_str(&format!(
+                        Delivery::Rider => {
+                            tool_context.push_str(&format!(
                                 "\nContext for tool result {}:{}",
                                 tc.id,
                                 n.rider_block()
                             ));
                         }
-                        Delivery::Rider => result.content.push_str(&n.rider_block()),
                         Delivery::SystemTail => self.tail_nudge = Some(n.message),
                     }
-                }
-                if !result.is_error
-                    && let Some(rider) = self.scoped_project_docs.rider_for_tool_call(
-                        &self.cx.root,
-                        &tc.name,
-                        &tc.args,
-                    )
-                {
-                    scoped_riders.insert(tc.id.clone(), rider);
                 }
                 results.push(result);
             }
@@ -1825,12 +1858,8 @@ impl Session {
             // dispatch round produced, attached to the last result so it rides
             // back with the batch. Replaces the per-tool window-0 drain (which
             // could not attribute edits under concurrent dispatch / V8 cells).
-            if !interrupted && let Some(last) = results.last_mut() {
-                if shell_result_ids.contains(&last.id) {
-                    self.append_edit_diagnostics(&mut shell_context).await;
-                } else {
-                    self.append_edit_diagnostics(&mut last.content).await;
-                }
+            if !interrupted && !results.is_empty() {
+                self.append_edit_diagnostics(&mut tool_context).await;
             }
 
             // Ordinary hooks and diagnostics share the result budget. Scoped
@@ -1842,9 +1871,6 @@ impl Session {
                     std::mem::take(&mut result.content),
                     self.tool_result_cap,
                 );
-                if let Some(rider) = scoped_riders.remove(&result.id) {
-                    result.content.push_str(&rider);
-                }
                 if let Some(tc) = out.tool_calls.iter().find(|tc| tc.id == result.id) {
                     last_tool_results.push(tool_result_trace(tc, result));
                 }
@@ -1874,12 +1900,12 @@ impl Session {
                 .pending_input_estimate
                 .saturating_add(est_tool_results(&results));
             self.tx.push_tool_results(results);
-            if !shell_context.is_empty() {
+            if !tool_context.is_empty() {
                 // Shell pages already consumed exactly the bytes delivered in
                 // their JSON. Context must not displace that non-replayable data.
                 let content = crate::bound::bound_tool_result(
                     "tool_context",
-                    shell_context,
+                    tool_context,
                     self.tool_result_cap,
                 );
                 self.emitter.tool_result_context(&content);
@@ -1891,9 +1917,17 @@ impl Session {
             if interrupted {
                 break "interrupted_dispatch";
             }
-            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
+            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
+                .await?;
             self.hooks.tick();
         };
+
+        // Even an early cancellation or a zero-step budget must preserve the
+        // accepted, logged input in the snapshot before checkpointing its event.
+        if let Some(prompt) = pending_prompt.take() {
+            self.prepare_context_for_user_turn();
+            self.push_user_text_raw(prompt);
+        }
 
         // An interrupted turn (cancelled model call, or cancelled tool dispatch)
         // leaves the buffer ending on a user-role message with no assistant
@@ -1925,6 +1959,12 @@ impl Session {
             self.drain_cancelled_work().await;
         }
 
+        self.deliver_tool_observations();
+        let break_reason = if self.uncertain_remote_outcomes().is_empty() {
+            break_reason
+        } else {
+            "remote_outcome_unknown"
+        };
         let turn_end = self.turn_end_diagnostics(
             break_reason,
             last_model_stop.as_ref(),
@@ -1953,7 +1993,11 @@ impl Session {
         } else {
             let incomplete = matches!(
                 break_reason,
-                "max_turns" | "output_limit" | "provider_stop" | "tool_calls_empty"
+                "max_turns"
+                    | "output_limit"
+                    | "provider_stop"
+                    | "tool_calls_empty"
+                    | "remote_outcome_unknown"
             ) || (break_reason == "model_stop"
                 && last_step_text.trim().is_empty())
                 || (self.output_schema.is_some() && break_reason != "structured_result");
@@ -2014,6 +2058,7 @@ impl Session {
                 })
             })
             .collect();
+        self.deliver_tool_observations();
         if cells.is_empty() && shells.is_empty() && recorded_changes.is_empty() {
             return;
         }
@@ -2108,6 +2153,11 @@ impl Session {
         if self.strategy.context_rides_user_lane() {
             // Turn-1 contextual user message ordering (codex order):
             // UserInstructions (AGENTS.md) → scope → pins → environment LAST.
+            if self.dispatch.scope_render().is_none() && self.dispatch.emitted_scope.is_some()
+                || self.dispatch.pins_render().is_none() && self.dispatch.emitted_pins.is_some()
+            {
+                self.emit_dispatch_context_changes_if_needed();
+            }
             let mut sections = Vec::new();
             if let Some(instructions) = &self.user_instructions {
                 sections.push(crate::context::ContextualUserFragment::render(instructions));
@@ -2135,32 +2185,30 @@ impl Session {
         self.reference_context_item = Some(env.to_turn_context_item());
     }
 
-    /// Re-emit scope/pins fragments when the current dispatch context differs
-    /// from the last-emitted baselines (resume with a changed scope, pin
-    /// update). No current scope ⇒ nothing emitted and the baseline survives
-    /// for future comparison (design §4/§7).
+    /// Replacements and removals both update authoritative context.
     fn emit_dispatch_context_changes_if_needed(&mut self) {
-        let mut sections: Vec<String> = Vec::new();
-        if let Some(scope) = self.dispatch.scope_render()
-            && self.dispatch.emitted_scope.as_deref() != Some(scope.as_str())
-        {
-            self.dispatch.emitted_scope = Some(scope.clone());
-            sections.push(scope);
+        let mut sections = Vec::new();
+        let scope = self.dispatch.scope_render();
+        if scope != self.dispatch.emitted_scope {
+            sections.push(scope.clone().unwrap_or_else(|| {
+                "<bbox_scope>Prior dispatch scope has been cleared.</bbox_scope>".into()
+            }));
+            self.dispatch.emitted_scope = scope;
         }
-        if let Some(pins) = self.dispatch.pins_render()
-            && self.dispatch.emitted_pins.as_deref() != Some(pins.as_str())
-        {
-            self.dispatch.emitted_pins = Some(pins.clone());
-            sections.push(pins);
+        let pins = self.dispatch.pins_render();
+        if pins != self.dispatch.emitted_pins {
+            sections.push(pins.clone().unwrap_or_else(|| {
+                "<bbox_pins>Prior dispatch pins have been cleared.</bbox_pins>".into()
+            }));
+            self.dispatch.emitted_pins = pins;
         }
         if let Some(message) = crate::context::build_contextual_user_message(sections) {
-            let added_tokens = message
-                .text_blocks
-                .iter()
-                .map(|section| est_tokens(section))
-                .fold(0u64, u64::saturating_add);
+            let text = message.text_blocks.join("\n\n");
+            self.pending_input_estimate = self
+                .pending_input_estimate
+                .saturating_add(est_tokens(&text));
+            self.emitter.tool_result_context(&text);
             self.tx.push_user_text_blocks(message.text_blocks);
-            self.pending_input_estimate = self.pending_input_estimate.saturating_add(added_tokens);
         }
     }
 
@@ -2190,29 +2238,82 @@ impl Session {
         self.reference_context_item = Some(env.to_turn_context_item());
     }
 
-    fn drain_mid_turn_user_inputs(&mut self, inputs: &Arc<StdMutex<VecDeque<String>>>) {
-        let Ok(mut inputs) = inputs.lock() else {
-            return;
-        };
-        while let Some(prompt) = inputs.pop_front() {
-            if prompt.trim() == "/compact" {
-                tracing::info!("deferring /compact received during active turn");
-                continue;
-            }
-            // Log the steer like the turn-start user log above: the event log
-            // is THE transcript (the fleet zoom renders it and reconciles
-            // queued-steer echoes against it), so an operator turn injected
-            // mid-turn must appear in it at the position the model saw it.
+    async fn drain_mid_turn_user_inputs(
+        &mut self,
+        inputs: &Arc<StdMutex<VecDeque<String>>>,
+    ) -> Result<()> {
+        // Take one input at a time. Unconsumed inputs survive an error and no
+        // std mutex is held across a compaction request.
+        loop {
+            let prompt = inputs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("input queue poisoned"))?
+                .pop_front();
+            let Some(prompt) = prompt else {
+                return Ok(());
+            };
             self.event_log.append_event(&json!({
-                "type": "user",
-                "session_id": self.session_id(),
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}],
-                },
+                "type": "user", "session_id": self.session_id(),
+                "message": {"role": "user", "content": [{"type":"text", "text":prompt}]},
             }));
-            self.push_user_text_raw(&prompt);
+            if prompt.trim() == "/compact" {
+                self.compact_manual().await?;
+            } else {
+                self.push_user_text_raw(&prompt);
+            }
         }
+    }
+
+    fn deliver_tool_observations(&mut self) {
+        let batch = self.cx.tool_observations.drain();
+        if batch.observations.is_empty() && batch.dropped_observations == 0 {
+            return;
+        }
+        let content = format!(
+            "[Host tool argument policy observations]\n{}",
+            serde_json::to_string(&batch).expect("tool observations serialize")
+        );
+        self.emitter.tool_policy_observations(&batch, &content);
+        self.pending_input_estimate = self
+            .pending_input_estimate
+            .saturating_add(est_tokens(&content));
+        self.tx.push_user_text(&content);
+    }
+
+    async fn deliver_instruction_context(&mut self) -> Result<()> {
+        self.deliver_tool_observations();
+        if std::mem::take(&mut self.resume_runtime_reset) {
+            let reset = "[Session runtime reset] This is a resumed process. Previous JavaScript cells, store/load values, and shell sessions are unavailable. Durable files and recorded conversation remain; inspect files before retrying prior effects. Current host instructions and environment follow.";
+            self.tx.push_user_text(reset);
+            self.emitter.tool_result_context(reset);
+            self.pending_input_estimate = self
+                .pending_input_estimate
+                .saturating_add(est_tokens(reset));
+        }
+        self.scoped_project_docs
+            .refresh()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        self.cx.instruction_generation = self
+            .cx
+            .instruction_generation
+            .checked_add(1)
+            .context("instruction generation exhausted")?;
+        if let Some(batch) = self
+            .scoped_project_docs
+            .pending_batch(self.cx.instruction_generation)
+        {
+            // Publish exactly the bytes entering provider history. A caught JS
+            // exception or a parsed source-file string cannot acknowledge them.
+            self.tx.push_user_text(&batch.text);
+            self.emitter
+                .instruction_context(batch.generation, &batch.text, &batch.documents);
+            self.pending_input_estimate = self
+                .pending_input_estimate
+                .saturating_add(est_tokens(&batch.text));
+            self.scoped_project_docs.acknowledge(&batch);
+        }
+        Ok(())
     }
 
     fn turn_end_diagnostics(
@@ -2317,27 +2418,78 @@ impl Session {
         }
     }
 
-    /// Serialize session state to a JSON string without performing I/O.
-    /// Callers should write the returned body to `store_path()` via
-    /// `tokio::task::spawn_blocking` to keep the write off the runtime.
-    fn persist_body(&self) -> Result<String> {
-        serde_json::to_string(&json!({
-            "transport": self.tx.name(),
-            "model": &self.base_opts.model,
-            "code_mode": self.code_mode.as_str(),
-            "service_tier": self.base_opts.service_tier.as_deref(),
-            "snapshot": self.tx.snapshot(),
-            "side": self.side_state(),
-            // Persist the counter across process runs of this session (see
-            // build()'s reconciliation) so a resume continues the seq
-            // sequence instead of restarting at 0.
-            "last_event_seq": self.seq_counter.load(Ordering::SeqCst),
-        }))
-        .context("serialize session")
+    /// Capture native/side state at a quiescent boundary, then flush the log,
+    /// checkpoint its exact byte length, and write through the shared serializer.
+    /// All filesystem work happens in this single awaited blocking task.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "filesystem calls execute inside spawn_blocking"
+    )]
+    async fn persist(&mut self) -> Result<()> {
+        // Retained cells may finish while this checkpoint is written. A cell
+        // with unconsumed terminal output remains in the service catalog, and
+        // any cell observed here conservatively marks this entire checkpoint.
+        // No new flat execution is admitted while this Session is borrowed.
+        let cells_outstanding = if let Some(session) = &self.code_mode_session {
+            session.has_outstanding_work().await
+        } else {
+            false
+        };
+        let shells_outstanding = !self
+            .cx
+            .shell_sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shell session map poisoned during checkpoint"))?
+            .is_empty();
+        let transport = self.tx.name().to_owned();
+        let model = self.base_opts.model.clone();
+        let code_mode = self.code_mode.as_str().to_owned();
+        let service_tier = self.base_opts.service_tier.clone();
+        let snapshot = self.tx.snapshot();
+        let mut side = self.side_state();
+        side["runtime_work_outstanding"] = json!(cells_outstanding || shells_outstanding);
+        let last_event_seq = self.seq_counter.load(Ordering::SeqCst);
+        let path = self.store.store_path().clone();
+        let writer_lease = self.store.writer_lease();
+        let log = self.event_log.clone();
+        tokio::task::spawn_blocking(move || {
+            let _writer_lease = writer_lease;
+            log.flush_blocking_checked()?;
+            let event_log_offset = if log.path() == path.with_extension("events.jsonl") {
+                match std::fs::metadata(log.path()) {
+                    Ok(metadata) => Some(metadata.len()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+                    Err(error) => return Err(error).context("read flushed event-log checkpoint"),
+                }
+            } else {
+                // Disabled/custom logs are test seams, not the canonical resume log.
+                None
+            };
+            let body = SessionStore::serialize(
+                &crate::session::SaveState {
+                    transport: &transport,
+                    model: &model,
+                    code_mode: &code_mode,
+                    service_tier: service_tier.as_deref(),
+                    snapshot,
+                    side,
+                    last_event_seq,
+                },
+                event_log_offset,
+            )?;
+            crate::session::write_atomic(&path, &body).context("write session")
+        })
+        .await
+        .context("persist task panicked")?
     }
 
-    fn store_path(&self) -> &std::path::PathBuf {
-        self.store.store_path()
+    fn uncertain_remote_outcomes(&self) -> Vec<String> {
+        self.remote_outcome_sources
+            .iter()
+            .filter_map(|tool| tool.uncertain_outcome())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn side_state(&self) -> Value {
@@ -2347,6 +2499,7 @@ impl Session {
             Value::Object(m) => Value::Object(m),
             _ => json!({}),
         };
+        side["pending_user_inputs"] = json!(self.pending_user_inputs);
         side["todos"] = self
             .todos
             .lock()
@@ -2360,6 +2513,14 @@ impl Session {
             .as_ref()
             .map(crate::context::TurnContextItem::to_side)
             .unwrap_or(Value::Null);
+        side["instruction_observed_paths"] =
+            serde_json::to_value(self.scoped_project_docs.observed_paths())
+                .expect("instruction paths serialize");
+        side["instruction_documents"] =
+            serde_json::to_value(self.scoped_project_docs.active_documents())
+                .expect("instruction documents serialize");
+        side["remote_outcomes_unknown"] = json!(self.uncertain_remote_outcomes());
+        side["output_schema"] = self.output_schema.clone().unwrap_or(Value::Null);
         side["dispatch_context"] = self.dispatch.context_to_side();
         side["dispatch_emitted"] = self.dispatch.emitted_to_side();
         side
@@ -2367,35 +2528,34 @@ impl Session {
 }
 
 fn reference_context_item_for_restore(
-    restored_snapshot: bool,
-    restored_reference_context: Option<crate::context::TurnContextItem>,
-    cx: &ToolCx,
+    _restored_snapshot: bool,
+    _restored_reference_context: Option<crate::context::TurnContextItem>,
+    _cx: &ToolCx,
 ) -> Option<crate::context::TurnContextItem> {
-    if !restored_snapshot {
-        return None;
-    }
-    restored_reference_context.or_else(|| {
-        Some(crate::context::EnvironmentContext::from_tool_cx(cx).to_turn_context_item())
-    })
+    // A new process re-establishes current host context, including explicit
+    // null and legacy baselines. Process-local work is never restored here.
+    None
 }
 
 fn load_tool_arg_defaults(
-    explicit: Option<BTreeMap<String, String>>,
+    explicit: Option<BTreeMap<String, Value>>,
     cli_json: Option<&str>,
 ) -> Result<bro_tools::ToolArgDefaults> {
     let raw = match explicit {
         Some(map) => map,
         None => match cli_json {
-            Some(raw) => parse_tool_arg_defaults_json(raw)
-                .context("parse --additional-context as JSON string map")?,
+            Some(raw) => serde_json::from_str::<BTreeMap<String, Value>>(raw)
+                .context("parse --additional-context as JSON value map")?,
             None => match std::env::var("BRO_HARNESS_TOOL_DEFAULTS") {
-                Ok(raw) if !raw.trim().is_empty() => parse_tool_arg_defaults_json(&raw)
-                    .context("parse BRO_HARNESS_TOOL_DEFAULTS as JSON string map")?,
+                Ok(raw) if !raw.trim().is_empty() => {
+                    serde_json::from_str::<BTreeMap<String, Value>>(&raw)
+                        .context("parse BRO_HARNESS_TOOL_DEFAULTS as JSON value map")?
+                }
                 _ => BTreeMap::new(),
             },
         },
     };
-    bro_tools::ToolArgDefaults::parse_map(raw)
+    bro_tools::ToolArgDefaults::parse_values(raw)
         .map_err(anyhow::Error::msg)
         .context("parse tool arg default table")
 }
@@ -2843,6 +3003,9 @@ mod tests {
         started: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
         compact_calls: Arc<AtomicUsize>,
+        compact_block: Arc<std::sync::atomic::AtomicBool>,
+        compact_gate: Arc<Notify>,
+        compact_fail: Arc<std::sync::atomic::AtomicBool>,
         model_gate: Arc<Notify>,
         tool_started: Arc<AtomicUsize>,
         tool_gate: Arc<Notify>,
@@ -3054,6 +3217,13 @@ mod tests {
             _opts: &TurnOpts,
         ) -> Result<Option<String>> {
             self.shared.compact_calls.fetch_add(1, Ordering::SeqCst);
+            if self.shared.compact_block.load(Ordering::SeqCst) {
+                self.shared.compact_gate.notified().await;
+            }
+            anyhow::ensure!(
+                !self.shared.compact_fail.load(Ordering::SeqCst),
+                "synthetic compaction failure"
+            );
             Ok(Some("summary".into()))
         }
     }
@@ -3219,7 +3389,8 @@ mod tests {
             vec![],
             &PinPolicy::from_env(),
             &mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         pending_read
     }
 
@@ -3269,7 +3440,8 @@ mod tests {
             vec![],
             &PinPolicy::from_env(),
             &mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         session.emitter = Emitter::with_callback(
@@ -3307,6 +3479,207 @@ mod tests {
         bro_tools::shell::shutdown_shell_sessions(&session.cx).await;
     }
 
+    #[tokio::test]
+    async fn yielded_cell_cannot_borrow_instruction_delivery_from_new_model_boundary() {
+        use bro_tools::ToolResult;
+        use std::time::Duration;
+
+        struct Pause {
+            started: tokio::sync::Semaphore,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl Tool for Pause {
+            fn name(&self) -> &str {
+                "pause"
+            }
+            fn description(&self) -> &str {
+                "Controlled test boundary"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, _: &ToolCx) -> ToolResult {
+                self.started.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                ToolResult::Json(json!({}))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("child")).unwrap();
+        std::fs::write(root.join("child/AGENTS.md"), "EXACT CHILD INSTRUCTIONS\n").unwrap();
+        std::fs::write(root.join("child/value.txt"), "before").unwrap();
+        let (mut session, shared) = mk_session(vec![]);
+        session.cx.root = root.clone();
+        session.scoped_project_docs = Arc::new(crate::project_doc::ScopedProjectDocs::new(
+            root.clone(),
+            None,
+        ));
+        session.cx.instruction_policy = Some(session.scoped_project_docs.clone());
+        session.deliver_instruction_context().await.unwrap();
+        let old_generation = session.cx.instruction_generation;
+        let pause = Arc::new(Pause {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let callable: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(bro_tools::file_read::FileRead),
+            Arc::new(bro_tools::workspace::FileWrite),
+            pause.clone(),
+        ];
+        let runtime = crate::code_mode::CodeModeToolSession::new(
+            &callable,
+            Arc::new(crate::capabilities::HostTools::new(
+                callable.clone(),
+                session.cx.clone(),
+            )),
+            crate::code_mode::CodeMode::Only,
+            &BTreeMap::new(),
+        );
+        let tools = runtime.tools();
+        let yielded = tools[0].call(
+            json!({"source":"// @exec: {\"yield_time_ms\": 1}\nawait tools.file_read({file_path:'child/value.txt'}); await tools.pause({}); try { await tools.file_write({file_path:'child/value.txt',content:'stale write'}); } catch (error) { text(String(error)); }"}),
+            &session.cx,
+        ).await.into_content().0;
+        let cell_id = yielded
+            .split("Script running with cell ID ")
+            .nth(1)
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), pause.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        session.deliver_instruction_context().await.unwrap();
+        assert!(session.cx.instruction_generation > old_generation);
+        assert!(
+            shared
+                .pushed_users
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("EXACT CHILD INSTRUCTIONS\n"))
+        );
+        pause.release.add_permits(1);
+        let result = tools[1]
+            .call(json!({"cell_id":cell_id,"yield_time_ms":1000}), &session.cx)
+            .await
+            .into_content()
+            .0;
+        assert!(result.contains("instructions_required"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("child/value.txt")).unwrap(),
+            "before"
+        );
+        let result = tools[0].call(
+            json!({"source":"text(await tools.file_write({file_path:'child/value.txt',content:'fresh write'}));"}),
+            &session.cx,
+        ).await;
+        assert!(!result.is_error(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("child/value.txt")).unwrap(),
+            "fresh write"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_marks_retained_cells_and_unread_shell_output_until_drained() {
+        use bro_tools::ToolResult;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (mut session, _) = mk_session_with_store(
+            vec![],
+            Some(SessionStore::for_test(root.join("checkpoint.json"))),
+        );
+        session.cx.root = root;
+        let read_marker = |session: &Session| {
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(session.store.store_path()).unwrap())
+                    .unwrap();
+            saved["side"]["runtime_work_outstanding"].as_bool().unwrap()
+        };
+        let code_mode = crate::code_mode::CodeModeToolSession::new(
+            &[],
+            Arc::new(crate::capabilities::HostTools::new(
+                vec![],
+                session.cx.clone(),
+            )),
+            crate::code_mode::CodeMode::Only,
+            &BTreeMap::new(),
+        );
+        let result = code_mode.tools()[0].call(
+            json!({"source":"// @exec: {\"yield_time_ms\": 1}\nawait new Promise(resolve => setTimeout(resolve, 30000));"}),
+            &session.cx,
+        ).await;
+        assert!(
+            result
+                .into_content()
+                .0
+                .contains("Script running with cell ID")
+        );
+        session.code_mode_session = Some(code_mode);
+        session.persist().await.unwrap();
+        assert!(read_marker(&session));
+        session.drain_cancelled_work().await;
+        session.persist().await.unwrap();
+        assert!(!read_marker(&session));
+
+        session.cx.cancellation = Default::default();
+        let code_tools = session.code_mode_session.as_ref().unwrap().tools();
+        for source in [
+            "text('normal receipt');",
+            "yield_control(); text('normal receipt');",
+        ] {
+            let result = code_tools[0]
+                .call(json!({"source":source}), &session.cx)
+                .await;
+            assert!(!result.is_error(), "{result:?}");
+            let content = result.into_content().0;
+            if let Some(rest) = content.split("Script running with cell ID ").nth(1) {
+                let cell_id = rest.split('.').next().unwrap();
+                session.persist().await.unwrap();
+                assert!(read_marker(&session));
+                let terminal = code_tools[1]
+                    .call(json!({"cell_id":cell_id,"yield_time_ms":1000}), &session.cx)
+                    .await;
+                assert!(!terminal.is_error(), "{terminal:?}");
+                assert!(terminal.into_content().0.contains("normal receipt"));
+            } else {
+                assert!(content.contains("normal receipt"), "{content}");
+            }
+            // No scheduling grace period: normal exec and wait replies both
+            // promise that terminal cleanup is complete before this capture.
+            session.persist().await.unwrap();
+            assert!(!read_marker(&session));
+        }
+
+        let result = bro_tools::ShellRun.call(
+            json!({"command":"printf 'retained shell receipt'", "yield_time_ms":1000, "max_output_tokens":0}),
+            &session.cx,
+        ).await;
+        let ToolResult::Json(result) = result else {
+            panic!("expected shell receipt: {result:?}");
+        };
+        assert_eq!(result["running"], false);
+        assert_eq!(result["output_pending"], true);
+        session.persist().await.unwrap();
+        assert!(read_marker(&session));
+        let result = bro_tools::ShellPoll
+            .call(json!({"session_id":result["session_id"]}), &session.cx)
+            .await;
+        assert!(!result.is_error(), "{result:?}");
+        assert!(session.cx.shell_sessions.lock().unwrap().is_empty());
+        session.persist().await.unwrap();
+        assert!(!read_marker(&session));
+    }
+
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
         mk_session_with_store(scripts, None)
     }
@@ -3322,6 +3695,9 @@ mod tests {
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: std::env::temp_dir(),
             safety: Arc::new(SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -3335,15 +3711,11 @@ mod tests {
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
         };
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let id = format!("bh-test-{}-{}", std::process::id(), nanos);
         let session = Session {
             tx: Box::new(mock),
             code_mode: crate::code_mode::CodeMode::Optional,
             code_mode_session: None,
+            remote_outcome_sources: Vec::new(),
             retain_background_work: true,
             output_schema: None,
             reg: Registry::new(
@@ -3360,11 +3732,13 @@ mod tests {
                 vec![],
                 &PinPolicy::from_env(),
                 &mcp::ToolFilter::default(),
-            ),
+            )
+            .unwrap(),
             cx,
             reference_context_item: None,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
-            scoped_project_docs: crate::project_doc::ScopedProjectDocs::default(),
+            scoped_project_docs: Arc::new(crate::project_doc::ScopedProjectDocs::default()),
+            resume_runtime_reset: false,
             strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
             dispatch: crate::context::dispatch::DispatchState::default(),
             emitter: Emitter::new("test".into()),
@@ -3384,10 +3758,11 @@ mod tests {
             compact_threshold: None,
             context_window: None,
             tool_result_cap: 0,
-            store: store.unwrap_or_else(|| SessionStore::open(Some(&id), None).unwrap()),
+            store: store.unwrap_or_else(SessionStore::temporary_for_test),
             event_log: Arc::new(EventLog::disabled()),
             seq_counter: Arc::new(AtomicU64::new(0)),
             prior_side: Value::Null,
+            pending_user_inputs: VecDeque::new(),
             todos,
             lsp_baselines: LspBaselines::default(),
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
@@ -3524,33 +3899,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_under_child_dir_attaches_scoped_project_doc_rider() {
-        let root = std::env::temp_dir().join(format!(
-            "bh-agents-rider-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let child = root.join("crates").join("thing");
+    async fn scoped_read_preserves_source_and_delivers_instructions_at_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let child = root.join("crates/thing");
         std::fs::create_dir_all(child.join("src")).unwrap();
         std::fs::write(child.join("AGENTS.md"), "CHILD-DOC").unwrap();
-        std::fs::write(child.join("src").join("lib.rs"), "FILE-BODY").unwrap();
-
-        let (mut session, shared) = mk_session(vec![MockTurn::FileReadUnderChild]);
-        session.cx.root = root.canonicalize().unwrap();
-
+        std::fs::write(child.join("src/lib.rs"), "FILE-BODY").unwrap();
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::FileReadUnderChild,
+            MockTurn::Text("done".into()),
+        ]);
+        session.cx.root = root.clone();
+        session.scoped_project_docs =
+            Arc::new(crate::project_doc::ScopedProjectDocs::new(root, None));
+        session.cx.instruction_policy = Some(session.scoped_project_docs.clone());
+        session.reg = Registry::new(
+            bro_tools::builtin_tools(),
+            vec![],
+            &PinPolicy::default(),
+            &crate::mcp::ToolFilter::default(),
+        )
+        .unwrap();
         run_user_turn(&mut session, "read it").await;
-
         let pushed = shared.pushed_tool_results.lock().unwrap();
         assert_eq!(pushed.len(), 1);
-        assert_eq!(pushed[0].len(), 1);
-        assert_eq!(pushed[0][0].content.matches("CHILD-DOC").count(), 1);
-        assert!(pushed[0][0].content.contains("<harness-project-docs>"));
         assert!(pushed[0][0].content.contains("FILE-BODY"));
-
-        std::fs::remove_dir_all(&root).ok();
+        assert!(!pushed[0][0].content.contains("CHILD-DOC"));
+        let users = shared.pushed_users.lock().unwrap();
+        assert_eq!(
+            users
+                .iter()
+                .filter(|text| text.contains("CHILD-DOC"))
+                .count(),
+            1
+        );
+        assert!(session.scoped_project_docs.pending_batch(99).is_none());
     }
 
     #[tokio::test]
@@ -3653,7 +4037,8 @@ mod tests {
             };
             let filter = mcp::ToolFilter::from_csv(denied.then_some("file_read"), None);
             session.reg =
-                Registry::with_options(builtins, vec![], &PinPolicy::default(), &filter, true);
+                Registry::with_options(builtins, vec![], &PinPolicy::default(), &filter, true)
+                    .unwrap();
             session
                 .reg
                 .restore_resume_activations(saved.as_ref(), &receipts);
@@ -3889,7 +4274,8 @@ mod tests {
                 vec![],
                 &PinPolicy::default(),
                 &mcp::ToolFilter::default(),
-            );
+            )
+            .unwrap();
             let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
             session.event_log = log.clone();
             session.emitter = Emitter::new(label.into()).with_event_log(log.clone());
@@ -4592,7 +4978,8 @@ mod tests {
             vec![],
             &PinPolicy::default(),
             &mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let events = Arc::new(Mutex::new(Vec::<Value>::new()));
         let sink = events.clone();
         session.emitter = Emitter::with_callback(
@@ -4698,6 +5085,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn early_cancel_and_zero_step_budget_preserve_accepted_user_input() {
+        for cancelled in [false, true] {
+            let (mut session, shared) = mk_session(vec![]);
+            if !cancelled {
+                session.max_turns = 0;
+            }
+            let (_cancel_tx, cancel_rx) = watch::channel(cancelled);
+            session
+                .user_turn(
+                    "PRESERVE_ACCEPTED_INPUT",
+                    cancel_rx,
+                    Arc::new(StdMutex::new(VecDeque::new())),
+                )
+                .await
+                .unwrap();
+            assert_eq!(shared.started.load(Ordering::SeqCst), 0);
+            assert!(
+                shared
+                    .pushed_users
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|text| text == "PRESERVE_ACCEPTED_INPUT")
+            );
+        }
+    }
+
     #[test]
     fn first_user_push_emits_environment_context_and_baseline() {
         let (mut session, shared) = mk_session(vec![]);
@@ -4735,7 +5150,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_reference_context_suppresses_emit_and_preserves_persisted_baseline() {
+    fn restored_reference_context_reestablishes_current_environment() {
         let (mut session, shared) = mk_session(vec![]);
         let persisted = crate::context::TurnContextItem {
             cwd: "/persisted/baseline".into(),
@@ -4749,8 +5164,10 @@ mod tests {
         session.push_user_text("resume turn");
 
         let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
-        assert_eq!(session.reference_context_item, Some(persisted));
+        assert_eq!(pushed.len(), 2);
+        assert!(pushed[0].contains("<environment_context>"));
+        assert_eq!(pushed[1], "resume turn");
+        assert_ne!(session.reference_context_item, Some(persisted));
     }
 
     #[test]
@@ -4766,13 +5183,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_resumed_session_without_reference_context_gets_marker_baseline() {
+    fn legacy_resumed_session_reestablishes_current_context() {
         let (session, _shared) = mk_session(vec![]);
 
         let restored = reference_context_item_for_restore(true, None, &session.cx);
 
-        assert!(restored.is_some());
-        assert_eq!(restored.unwrap().cwd, session.cx.root.to_string_lossy());
+        assert!(restored.is_none());
     }
 
     #[tokio::test]
@@ -5178,23 +5594,24 @@ mod tests {
     }
 
     #[test]
-    fn codex_shaped_no_scope_emits_nothing_and_keeps_baseline() {
-        // Restored session (scope never restored): no scope ⇒ no fragment,
-        // and the persisted baseline survives for future delta comparison.
+    fn removed_dispatch_scope_is_explicitly_cleared_once() {
         let (mut session, shared) = mk_session(vec![]);
         session.dispatch = test_dispatch_state(None);
-        session.dispatch.emitted_scope = Some("<bbox_scope>\ntask: old\n</bbox_scope>".into());
+        session.dispatch.emitted_scope = Some("<bbox_scope>task: old</bbox_scope>".into());
         session.push_user_text("follow-up");
-        let pushed = shared.pushed_users.lock().unwrap();
-        // Initial context = pins + environment only (no scope, no AGENTS).
-        assert_eq!(pushed.len(), 2);
-        assert!(!pushed[0].contains("<bbox_scope>"));
-        assert!(pushed[0].contains("<bbox_pins>"));
+        assert!(session.dispatch.emitted_scope.is_none());
+        let users = shared.pushed_users.lock().unwrap();
         assert_eq!(
-            session.dispatch.emitted_scope.as_deref(),
-            Some("<bbox_scope>\ntask: old\n</bbox_scope>"),
-            "baseline must survive a scope-less run"
+            users
+                .iter()
+                .filter(|text| text.contains("Prior dispatch scope has been cleared"))
+                .count(),
+            1
         );
+        drop(users);
+        let count = shared.pushed_users.lock().unwrap().len();
+        session.prepare_context_for_user_turn();
+        assert_eq!(shared.pushed_users.lock().unwrap().len(), count);
     }
 
     #[test]
@@ -5305,7 +5722,8 @@ mod tests {
             await_first_controlled_input(&mut session, &mut rx, &ctrl, &mut pending),
         )
         .await
-        .expect("worker must wait for the daemon's first stdin message");
+        .expect("worker must wait for the daemon's first stdin message")
+        .unwrap();
         writer.await.unwrap();
         assert_eq!(pending.front().map(String::as_str), Some("delayed prompt"));
 
@@ -5372,13 +5790,18 @@ mod tests {
         let (mut session, shared) = mk_session(vec![MockTurn::Block]);
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Input::User("go".into())).unwrap();
-        tx.send(Input::Control {
-            subtype: "interrupt".into(),
-            req_id: Some("r1".into()),
-            raw: json!({}),
-        })
-        .unwrap();
-        drop(tx);
+        let started = shared.started.clone();
+        let sender = tokio::spawn(async move {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tx.send(Input::Control {
+                subtype: "interrupt".into(),
+                req_id: Some("r1".into()),
+                raw: json!({}),
+            })
+            .unwrap();
+        });
         let ctrl = Emitter::new("ctrl".into());
         // Without cancellation the Block turn hangs forever; the timeout proves
         // the interrupt unwound it and the loop drained to EOF.
@@ -5389,6 +5812,7 @@ mod tests {
         .await
         .expect("session_loop must not hang on an interrupted turn")
         .unwrap();
+        sender.await.unwrap();
         assert_eq!(shared.started.load(Ordering::SeqCst), 1, "turn started");
         assert_eq!(
             shared.completed.load(Ordering::SeqCst),
@@ -5722,6 +6146,471 @@ mod tests {
         let mut content = "{\"ok\":true}".to_string();
         session.append_edit_diagnostics(&mut content).await;
         assert_eq!(content, "{\"ok\":true}", "no edits -> no rider appended");
+    }
+    fn control_recorder(session: &mut Session) -> (Emitter, Arc<Mutex<Vec<Value>>>, Arc<Notify>) {
+        let path = session.store.store_path().clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let rejected = Arc::new(Notify::new());
+        let rejected_callback = rejected.clone();
+        let log = Arc::new(EventLog::at_path(path.with_extension("events.jsonl")));
+        session.event_log = log.clone();
+        session.emitter = make_emitter(
+            "controls".into(),
+            Some(Arc::new(|_| {})),
+            Some(log.clone()),
+            session.seq_counter(),
+        );
+        let emitter = make_emitter(
+            "controls".into(),
+            Some(Arc::new(move |event| {
+                let snapshot = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                let is_error = event["response"]["subtype"] == "error";
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(json!({"event":event,"snapshot_at_ack":snapshot}));
+                if is_error {
+                    rejected_callback.notify_one();
+                }
+            })),
+            Some(log),
+            session.seq_counter(),
+        );
+        (emitter, events, rejected)
+    }
+
+    #[tokio::test]
+    async fn idle_controls_validate_then_persist_before_acknowledging() {
+        let (mut session, _) = mk_session(vec![]);
+        let (ctrl, events, _) = control_recorder(&mut session);
+        let mut pending = VecDeque::from(["older input".to_string()]);
+        for (subtype, raw, id) in [
+            (
+                "set_max_thinking_tokens",
+                json!({"value":12}),
+                "unsupported",
+            ),
+            ("set_model", json!({"model":false}), "wrong-type"),
+            ("set_model", json!({"model":" "}), "empty"),
+            ("interrupt", json!({"prompt":42}), "bad-redirect"),
+        ] {
+            assert!(receive_control(subtype, &raw, Some(id.into()), &ctrl).is_none());
+        }
+        assert_eq!(session.base_opts.model, "m");
+        let set_model = receive_control(
+            "set_model",
+            &json!({"request":{"model":"new-model"}}),
+            Some("model".into()),
+            &ctrl,
+        )
+        .unwrap();
+        apply_pending_control(&mut session, set_model, &ctrl, &mut pending)
+            .await
+            .unwrap();
+        let interrupt = receive_control(
+            "interrupt",
+            &json!({"prompt":"redirect first"}),
+            Some("redirect".into()),
+            &ctrl,
+        )
+        .unwrap();
+        apply_pending_control(&mut session, interrupt, &ctrl, &mut pending)
+            .await
+            .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 6);
+        assert!(
+            events[..4]
+                .iter()
+                .all(|event| event["event"]["response"]["subtype"] == "error")
+        );
+        assert_eq!(events[4]["snapshot_at_ack"]["model"], "new-model");
+        assert_eq!(
+            events[5]["snapshot_at_ack"]["side"]["pending_user_inputs"],
+            json!(["redirect first", "older input"])
+        );
+        let restored = restore_pending_user_inputs(&events[5]["snapshot_at_ack"]["side"]).unwrap();
+        assert_eq!(restored, pending);
+        assert!(
+            events[5]["snapshot_at_ack"]["event_log_offset"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn active_controls_defer_ack_and_durably_prioritize_redirects() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Block]);
+        let (ctrl, events, rejected) = control_recorder(&mut session);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(async move {
+            let mut pending = VecDeque::new();
+            run_prompt_with_controls(&mut session, &mut rx, &ctrl, &mut pending, "initial".into())
+                .await
+                .unwrap();
+            (session, pending)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while shared.started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tx.send(Input::Control {
+            subtype: "set_model".into(),
+            req_id: Some("model".into()),
+            raw: json!({"model":"after-turn"}),
+        })
+        .unwrap();
+        tx.send(Input::Control {
+            subtype: "unknown".into(),
+            req_id: Some("barrier".into()),
+            raw: json!({}),
+        })
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rejected.notified())
+            .await
+            .unwrap();
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|row| row["event"]["response"]["subtype"] == "error")
+        );
+        tx.send(Input::User("older steer".into())).unwrap();
+        tx.send(Input::User("/compact".into())).unwrap();
+        tx.send(Input::Control {
+            subtype: "interrupt".into(),
+            req_id: Some("stop".into()),
+            raw: json!({"prompt":"redirect"}),
+        })
+        .unwrap();
+        let (session, pending) = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending,
+            VecDeque::from([
+                "redirect".to_owned(),
+                "older steer".to_owned(),
+                "/compact".to_owned()
+            ])
+        );
+        assert_eq!(session.base_opts.model, "after-turn");
+        assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !shared
+                .pushed_users
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text == "/compact")
+        );
+        let events = events.lock().unwrap();
+        let model = events
+            .iter()
+            .find(|row| row["event"]["response"]["request_id"] == "model")
+            .unwrap();
+        assert_eq!(model["snapshot_at_ack"]["model"], "after-turn");
+        let stop = events
+            .iter()
+            .find(|row| row["event"]["response"]["request_id"] == "stop")
+            .unwrap();
+        assert_eq!(
+            stop["snapshot_at_ack"]["side"]["pending_user_inputs"],
+            json!(["redirect", "older steer", "/compact"])
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_compaction_waits_for_mutation_and_keeps_queued_input() {
+        let (mut session, shared) = mk_session(vec![]);
+        shared.compact_block.store(true, Ordering::SeqCst);
+        let (ctrl, events, rejected) = control_recorder(&mut session);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(async move {
+            let mut pending = VecDeque::new();
+            run_prompt_with_controls(
+                &mut session,
+                &mut rx,
+                &ctrl,
+                &mut pending,
+                "/compact".into(),
+            )
+            .await
+            .unwrap();
+            (session, pending)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while shared.compact_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tx.send(Input::User("queued after compact".into())).unwrap();
+        tx.send(Input::Control {
+            subtype: "interrupt".into(),
+            req_id: Some("stop".into()),
+            raw: json!({}),
+        })
+        .unwrap();
+        tx.send(Input::Control {
+            subtype: "unknown".into(),
+            req_id: Some("barrier".into()),
+            raw: json!({}),
+        })
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rejected.notified())
+            .await
+            .unwrap();
+        assert!(
+            !run.is_finished(),
+            "interrupt cannot drop an active native compaction mutation"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|row| row["event"]["response"]["subtype"] != "success")
+        );
+        shared.compact_gate.notify_one();
+        let (_, pending) = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending, VecDeque::from(["queued after compact".to_owned()]));
+        assert_eq!(shared.started.load(Ordering::SeqCst), 0);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|row| row["event"]["response"]["request_id"] == "stop"
+                    && row["snapshot_at_ack"]["side"]["pending_user_inputs"]
+                        == json!(["queued after compact"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_emits_control_error_without_success_ack() {
+        let (mut session, _) = mk_session(vec![]);
+        let (ctrl, events, _) = control_recorder(&mut session);
+        std::fs::create_dir(session.store.store_path()).unwrap();
+        let control = receive_control(
+            "set_model",
+            &json!({"model":"changed"}),
+            Some("persist-failure".into()),
+            &ctrl,
+        )
+        .unwrap();
+        assert!(
+            apply_pending_control(&mut session, control, &ctrl, &mut VecDeque::new())
+                .await
+                .is_err()
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"]["response"]["subtype"], "error");
+        assert!(
+            events[0]["event"]["response"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("persistence failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_failure_is_visible_and_snapshot_is_preserved() {
+        let (mut session, shared) = mk_session(vec![]);
+        shared.compact_fail.store(true, Ordering::SeqCst);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        session.emitter = Emitter::with_callback(
+            "compact-failure".into(),
+            Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            }),
+        );
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let ctrl = Emitter::with_callback("control".into(), Arc::new(|_| {}));
+        run_prompt_with_controls(
+            &mut session,
+            &mut rx,
+            &ctrl,
+            &mut VecDeque::new(),
+            "/compact".into(),
+        )
+        .await
+        .unwrap();
+        assert!(events.lock().unwrap().iter().any(|event| {
+            event["type"] == "result"
+                && event["is_error"] == true
+                && event["result"]
+                    .as_str()
+                    .unwrap()
+                    .contains("synthetic compaction failure")
+        }));
+        assert!(session.store.store_path().exists());
+        assert_eq!(shared.started.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queued_resume_inputs_reject_malformed_side_state() {
+        assert!(restore_pending_user_inputs(&json!({"pending_user_inputs":"lost queue"})).is_err());
+        assert!(restore_pending_user_inputs(&json!({"pending_user_inputs":[false]})).is_err());
+        assert!(restore_pending_user_inputs(&json!({})).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_event_log_never_gets_a_successful_control_ack() {
+        let (mut session, _) = mk_session(vec![]);
+        let (ctrl, events, _) = control_recorder(&mut session);
+        std::fs::create_dir(session.event_log.path()).unwrap();
+        let control = receive_control(
+            "set_model",
+            &json!({"model":"changed"}),
+            Some("log-failure".into()),
+            &ctrl,
+        )
+        .unwrap();
+        assert!(
+            apply_pending_control(&mut session, control, &ctrl, &mut VecDeque::new())
+                .await
+                .is_err()
+        );
+        assert!(!session.store.store_path().exists());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"]["response"]["subtype"], "error");
+    }
+    #[tokio::test]
+    async fn unresolved_remote_source_stops_provider_loop_even_when_wrapper_hides_error() {
+        const MARKER: &str = "MCP server fixture: deadline_exceeded; remote completion unknown";
+        struct RemoteSource(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl Tool for RemoteSource {
+            fn name(&self) -> &str {
+                "mcp__fixture__mutate"
+            }
+            fn description(&self) -> &str {
+                "Synthetic remote outcome source"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, _: &ToolCx) -> bro_tools::ToolResult {
+                self.0.store(true, Ordering::SeqCst);
+                bro_tools::ToolResult::Error(json!({"content":[{"type":"text","text":"Do not retry; remote completion unknown"}],"structuredContent":{"code":"mcp_remote_outcome_unknown"},"isError":true}).to_string())
+            }
+            fn uncertain_outcome(&self) -> Option<String> {
+                self.0.load(Ordering::SeqCst).then(|| MARKER.to_owned())
+            }
+        }
+        struct Wrapper {
+            source: Arc<dyn Tool>,
+            catches_error: bool,
+        }
+        #[async_trait]
+        impl Tool for Wrapper {
+            fn name(&self) -> &str {
+                self.source.name()
+            }
+            fn description(&self) -> &str {
+                "Wrapper without an uncertainty accessor"
+            }
+            fn input_schema(&self) -> Value {
+                self.source.input_schema()
+            }
+            async fn call(&self, input: Value, cx: &ToolCx) -> bro_tools::ToolResult {
+                let result = self.source.call(input, cx).await;
+                if self.catches_error {
+                    bro_tools::ToolResult::Json(json!({"error_was_caught":true}))
+                } else {
+                    result
+                }
+            }
+        }
+        for catches_error in [false, true] {
+            let source: Arc<dyn Tool> = Arc::new(RemoteSource(Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )));
+            let wrapper: Arc<dyn Tool> = Arc::new(Wrapper {
+                source: source.clone(),
+                catches_error,
+            });
+            let (mut session, shared) = mk_session(vec![
+                MockTurn::ToolCalls(vec![dispatch_call("remote-call", source.name(), json!({}))]),
+                MockTurn::Text("must not call the provider again".into()),
+            ]);
+            // The original connection sources survive wrapper replacement and
+            // multiple aliases, so no wrapper forwarding is needed for safety.
+            session.remote_outcome_sources = vec![source.clone(), source];
+            session.reg = Registry::new(
+                vec![wrapper.clone()],
+                vec![],
+                &PinPolicy::default(),
+                &mcp::ToolFilter::default(),
+            )
+            .unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = events.clone();
+            session.emitter = Emitter::with_callback(
+                "unknown-remote".into(),
+                Arc::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                }),
+            );
+            run_user_turn(&mut session, "call the remote fixture").await;
+            assert_eq!(
+                shared.started.load(Ordering::SeqCst),
+                1,
+                "no provider continuation after uncertainty"
+            );
+            assert!(
+                wrapper.uncertain_outcome().is_none(),
+                "fixture intentionally does not forward metadata"
+            );
+            assert_eq!(session.uncertain_remote_outcomes(), vec![MARKER.to_owned()]);
+            let terminal = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| event["type"] == "result")
+                .unwrap()
+                .clone();
+            assert_eq!(terminal["subtype"], "incomplete");
+            assert_eq!(terminal["is_error"], true);
+            assert_eq!(terminal["stop_reason"], "remote_outcome_unknown");
+            assert!(
+                !events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["type"] == "result" && event["subtype"] == "success")
+            );
+            assert_eq!(
+                shared.pushed_tool_results.lock().unwrap().len(),
+                1,
+                "actual tool receipt still reaches history"
+            );
+            session.persist().await.unwrap();
+            let persisted: Value =
+                serde_json::from_str(&std::fs::read_to_string(session.store.store_path()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                persisted["side"]["remote_outcomes_unknown"],
+                json!([MARKER])
+            );
+        }
     }
 }
 

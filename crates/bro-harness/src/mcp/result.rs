@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 pub(super) const RESULT_GUIDANCE: &str = "Returns {content, structuredContent?, isError}; on failure this envelope is in the error message.";
 
-pub(super) fn from_native_result(result: ToolResult) -> ToolResult {
+pub(crate) fn from_native_result(result: ToolResult) -> ToolResult {
     let mut envelope = CallToolResult::default();
     match result {
         ToolResult::Json(value) => envelope.structured_content = Some(value),
@@ -267,6 +267,12 @@ mod tests {
                             "_meta":{"private":"wire-private-canary"},
                         })
                     }
+                    "tools/list" => json!({"tools":[{
+                        "name":"evidence", "title":"Fixture evidence", "description":"Read fixture evidence",
+                        "inputSchema":{"type":"object"},
+                        "outputSchema":{"type":"object","properties":{"cursor":{"type":"string"},"code":{"type":"string"}}},
+                        "annotations":{"readOnlyHint":true,"idempotentHint":true,"openWorldHint":false}
+                    }]}),
                     method => panic!("unexpected fixture method {method}"),
                 };
                 let response = json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -278,15 +284,30 @@ mod tests {
         });
         let running = ().serve(client).await.unwrap();
         let stop = running.cancellation_token();
+        let connection = Arc::new(ServerConn::new(running, "fixture".into(), 300_000));
+        let spec = crate::mcp::remote_tool_spec(connection.list_tools().await.unwrap().remove(0));
         let tool: Arc<dyn Tool> = Arc::new(McpTool {
-            backend: McpBackend::Remote(Arc::new(ServerConn { running })),
+            backend: McpBackend::Remote(connection),
             call_name: "evidence".into(),
             name: "mcp__fixture__evidence".into(),
             description: "Return fixture evidence".into(),
             schema: json!({"type":"object"}),
+            output_schema: crate::mcp::admission::result_schema(&spec),
+            annotations: crate::mcp::admission::project_annotations(spec.annotations.as_ref()),
         });
+        assert!(tool.annotations().read_only);
+        let schema = tool.output_schema().unwrap();
+        assert_eq!(
+            schema["properties"]["structuredContent"]["properties"]["cursor"]["type"],
+            "string"
+        );
+        assert_eq!(schema["x-mcp"]["title"], "Fixture evidence");
+        assert_eq!(schema["x-mcp"]["annotations"]["openWorldHint"], false);
         let dir = tempfile::tempdir().unwrap();
         let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.path().canonicalize().unwrap(),
             output_budget: 16 * 1024,
             cancellation: Default::default(),
@@ -305,7 +326,8 @@ mod tests {
             vec![tool.clone()],
             &crate::registry::PinPolicy::default(),
             &crate::mcp::ToolFilter::default(),
-        );
+        )
+        .unwrap();
         let host = Arc::new(crate::capabilities::HostTools::new(
             vec![tool.clone()],
             cx.clone(),

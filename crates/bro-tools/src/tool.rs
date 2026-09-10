@@ -15,9 +15,42 @@ pub struct FreeformGrammar {
     pub definition: String,
 }
 
+/// Explicit instruction scope supplied by a tool that knows its file semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionAccess {
+    Read,
+    Mutate,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionPaths {
+    pub access: InstructionAccess,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Session-owned instruction admission. Receiving a tool result never grants
+/// delivery; only the host's authoritative model boundary can acknowledge it.
+#[async_trait]
+pub trait InstructionPolicy: Send + Sync {
+    async fn check(
+        &self,
+        request: InstructionPaths,
+        authoring_generation: u64,
+    ) -> Result<(), ToolResult>;
+}
+
 /// Execution context handed to every tool call.
 #[derive(Clone)]
 pub struct ToolCx {
+    /// Bounded host-only invocation observations. Tool result values are never
+    /// rewritten to carry argument policy or authority telemetry.
+    pub tool_observations: Arc<crate::tool_observations::ToolObservationSink>,
+    /// Immutable generation of the model request that authored this call.
+    /// Retained cells keep their original generation across subsequent turns.
+    pub instruction_generation: u64,
+    /// Optional scoped instruction barrier. Shell remains an explicit escape
+    /// hatch; only tools declaring exact affected paths participate.
+    pub instruction_policy: Option<Arc<dyn InstructionPolicy>>,
     /// Host budget in bytes for the complete serialized tool result. Zero is
     /// an explicit host-unlimited policy; tools may retain their own page caps.
     pub output_budget: usize,
@@ -127,8 +160,30 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the input object. Derive from a typed input with
     /// [`schema_for`].
     fn input_schema(&self) -> Value;
+    /// Optional producer-declared result schema; host metadata lives outside it.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+    /// A sanitized unresolved remote outcome that must survive session resume.
+    fn uncertain_outcome(&self) -> Option<String> {
+        None
+    }
     fn freeform_grammar(&self) -> Option<FreeformGrammar> {
         None
+    }
+    /// Host-only grant parameters read explicitly by this implementation.
+    /// They are never injected into ordinary model-authored arguments.
+    fn authority_grants(&self) -> &[&str] {
+        &[]
+    }
+    /// Resolve exact file scopes from this tool's own typed inputs, after host
+    /// argument defaults and pins. No generic schema/path inference is used.
+    fn instruction_paths(
+        &self,
+        _input: &Value,
+        _cx: &ToolCx,
+    ) -> Result<Option<InstructionPaths>, ToolResult> {
+        Ok(None)
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult;
     fn annotations(&self) -> ToolAnnotations {

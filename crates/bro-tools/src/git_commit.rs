@@ -28,7 +28,7 @@ impl Tool for GitCommit {
     }
 
     fn description(&self) -> &str {
-        "Commit the current worktree contents of explicit, literal repository-relative files (including new files and deletions). Refuses directories, globs, pathspec magic, symlinks and sensitive paths. Refuses if other files are already staged; leave other agents' staging alone and use an isolated worktree. Commits only the named files, including all their unstaged changes."
+        "Commit the current worktree contents of explicit, literal repository-relative files (including new files and deletions). Refuses directories, globs, pathspec magic, symlinks and sensitive paths. Refuses if other files are already staged; leave other agents' staging alone and use an isolated worktree. Commits only the named files, including all their unstaged changes. At most 256 files and 120 seconds total; interrupted or incomplete receipts disclose potentially changed index/commit state."
     }
 
     fn input_schema(&self) -> Value {
@@ -54,29 +54,47 @@ impl Tool for GitCommit {
     }
 }
 
-async fn git(cx: &ToolCx, root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .arg("--literal-pathspecs")
-        .args(args)
-        .current_dir(root);
-    cx.child_env.apply(command.as_std_mut());
-    command.envs(cx.shell_env.iter());
-    // Fixture subprocesses must not read the operator's Git configuration.
-    #[cfg(test)]
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    let output = command.output().await.context("start git")?;
-    if !output.status.success() {
+const COMMIT_TIME: std::time::Duration = std::time::Duration::from_secs(120);
+const GIT_CAPTURE_BYTES: usize = 1024 * 1024;
+
+async fn git_at(
+    cx: &ToolCx,
+    root: &Path,
+    args: &[std::ffi::OsString],
+    until: tokio::time::Instant,
+) -> anyhow::Result<Vec<u8>> {
+    let output =
+        crate::workspace::workspace_git::capture_git(cx, root, args, until, GIT_CAPTURE_BYTES)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    if output.exit_code != Some(0) || !output.complete() {
+        let cleanup_note = if output.cancelled || output.timed_out {
+            " Forced termination may leave Git lock files; inspect the repository before retrying."
+        } else {
+            ""
+        };
         bail!(
-            "git {} failed: {}{}",
-            args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "Git command did not return a complete success receipt; any attempted index or commit mutation may have completed or partially changed state. No rollback was attempted.{cleanup_note} {}\n{}{}",
+            output.facts(),
+            crate::output::truncate_text(&String::from_utf8_lossy(&output.stdout), 2000),
+            crate::output::truncate_text(&String::from_utf8_lossy(&output.stderr), 2000)
         );
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+async fn git(cx: &ToolCx, root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    git_at(
+        cx,
+        root,
+        &args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>(),
+        tokio::time::Instant::now() + COMMIT_TIME,
+    )
+    .await
 }
 
 fn validate_literal(path: &str, safety: &crate::SafetyPolicy) -> anyhow::Result<()> {
@@ -123,6 +141,15 @@ fn path_modes(output: &[u8]) -> anyhow::Result<BTreeMap<&[u8], &[u8]>> {
 }
 
 async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
+    let until = tokio::time::Instant::now() + COMMIT_TIME;
+    let git = |root: &Path, args: &[&str]| {
+        let root = root.to_path_buf();
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        async move { git_at(cx, &root, &args, until).await }
+    };
+    if args.paths.len() > 256 {
+        bail!("paths is limited to 256 explicit files per commit");
+    }
     if args.paths.is_empty() {
         bail!("paths must name explicit files; refusing an empty selection");
     }
@@ -133,19 +160,18 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
         validate_literal(path, &cx.safety)?;
     }
     let effective_root = crate::workspace::effective_root(&cx.root);
-    let root_output = git(cx, &effective_root, &["rev-parse", "--show-toplevel"]).await?;
+    let root_output = git(&effective_root, &["rev-parse", "--show-toplevel"]).await?;
     let root_text = std::str::from_utf8(&root_output).context("repository path is not UTF-8")?;
     let root = PathBuf::from(root_text.strip_suffix('\n').unwrap_or(root_text));
     let paths: BTreeSet<&str> = args.paths.iter().map(String::as_str).collect();
 
-    if !git(cx, &root, &["ls-files", "--unmerged", "-z"])
+    if !git(&root, &["ls-files", "--unmerged", "-z"])
         .await?
         .is_empty()
     {
         bail!("refused: resolve the repository's unmerged index entries before committing");
     }
     let staged = git(
-        cx,
         &root,
         &["diff", "--cached", "--name-only", "--no-renames", "-z"],
     )
@@ -165,16 +191,28 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
 
     let mut index_args = vec!["ls-files", "--stage", "-z", "--"];
     index_args.extend(paths.iter().copied());
-    let index_output = git(cx, &root, &index_args).await?;
+    let index_output = git(&root, &index_args).await?;
     let index = path_modes(&index_output)?;
     // HEAD is absent in a new repository. Only skip the tree read in that case.
-    let head_output = if git(cx, &root, &["rev-parse", "--verify", "HEAD"])
-        .await
-        .is_ok()
-    {
+    let head_probe = crate::workspace::workspace_git::capture_git(
+        cx,
+        &root,
+        &["rev-parse", "--verify", "--quiet", "HEAD"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>(),
+        until,
+        GIT_CAPTURE_BYTES,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    if !head_probe.complete() || !matches!(head_probe.exit_code, Some(0 | 1)) {
+        bail!("could not determine HEAD safely: {}", head_probe.facts());
+    }
+    let head_output = if head_probe.exit_code == Some(0) {
         let mut tree_args = vec!["ls-tree", "-r", "-z", "HEAD", "--"];
         tree_args.extend(paths.iter().copied());
-        git(cx, &root, &tree_args).await?
+        git(&root, &tree_args).await?
     } else {
         Vec::new()
     };
@@ -223,9 +261,9 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
     if !stage.is_empty() {
         let mut add = vec!["add", "--"];
         add.extend(stage);
-        git(cx, &root, &add).await?;
+        git(&root, &add).await?;
     }
-    commit_only(cx, &root, &args.message, paths).await
+    commit_only(cx, &root, &args.message, paths, until).await
 }
 
 async fn commit_only(
@@ -233,11 +271,36 @@ async fn commit_only(
     root: &Path,
     message: &str,
     paths: BTreeSet<&str>,
+    until: tokio::time::Instant,
 ) -> anyhow::Result<String> {
     let mut commit_args = vec!["commit", "--only", "-m", message, "--"];
     commit_args.extend(paths);
-    let output = git(cx, root, &commit_args).await?;
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    let output = git_at(
+        cx,
+        root,
+        &commit_args
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>(),
+        until,
+    )
+    .await
+    .context(
+        "commit did not return a complete success receipt; earlier staging or a commit may have changed repository state. No rollback was attempted",
+    )?;
+    let invalid = std::str::from_utf8(&output).is_err();
+    let mut text = String::from_utf8_lossy(&output).into_owned();
+    if invalid {
+        text.push_str(
+            "\n[git commit output contained invalid UTF-8; replacement characters were used]\n",
+        );
+    }
+    let cap = if cx.output_budget == 0 {
+        8000
+    } else {
+        cx.output_budget.min(8000)
+    };
+    Ok(crate::output::truncate_text(&text, cap))
 }
 
 #[cfg(test)]
@@ -256,6 +319,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
             let cx = ToolCx {
+                tool_observations: Default::default(),
+                instruction_generation: 0,
+                instruction_policy: None,
                 root,
                 safety: Arc::new(crate::SafetyPolicy::new()),
                 http: reqwest::Client::new(),
@@ -299,6 +365,55 @@ mod tests {
         async fn git(&self, args: &[&str]) -> Vec<u8> {
             git(&self.cx, &self.cx.root, args).await.unwrap()
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_commit_hook_is_reaped_and_reports_potential_index_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new().await;
+        fixture.write("mine.txt", "selected").await;
+        fixture
+            .write(
+                ".git/hooks/pre-commit",
+                "#!/bin/sh\nprintf started > hook-started\nsleep 30\nprintf leaked > hook-leaked\n",
+            )
+            .await;
+        tokio::fs::set_permissions(
+            fixture.cx.root.join(".git/hooks/pre-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .await
+        .unwrap();
+        let cx = fixture.cx.clone();
+        let root = cx.root.clone();
+        let cancel = cx.cancellation.clone();
+        let invocation = tokio::spawn(async move {
+            GitCommit
+                .call(json!({"message":"bounded hook", "paths":["mine.txt"]}), &cx)
+                .await
+        });
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.join("hook-started").exists() && tokio::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(root.join("hook-started").exists());
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), invocation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error());
+        let text = result.into_content().0;
+        assert!(
+            text.contains("cancelled") && text.contains("No rollback"),
+            "{text}"
+        );
+        assert!(!root.join("hook-leaked").exists());
+        // Forced termination may leave Git lock files; the receipt does not claim rollback.
+        assert!(text.contains("lock files"));
+        assert!(text.contains("a commit may have changed repository state"));
+        assert!(!text.contains("staging remains"));
     }
 
     #[cfg(unix)]
@@ -365,6 +480,7 @@ mod tests {
             &fixture.cx.root,
             "selected change",
             BTreeSet::from(["mine.txt"]),
+            tokio::time::Instant::now() + COMMIT_TIME,
         )
         .await
         .unwrap();

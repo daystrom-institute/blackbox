@@ -29,6 +29,8 @@ const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 
 #[derive(Clone, Debug)]
 pub struct ExecuteRequest {
+    /// Local addition (not vendored): immutable host context of the authoring request.
+    pub context_id: Option<u64>,
     pub tool_call_id: String,
     pub enabled_tools: Vec<ToolDefinition>,
     pub source: String,
@@ -122,6 +124,8 @@ pub enum RuntimeResponse {
 /// if their tool-call graph requires globally unique ids.
 #[derive(Debug)]
 pub struct CodeModeNestedToolCall {
+    /// Local addition (not vendored): retained across cell yields and waits.
+    pub context_id: Option<u64>,
     pub cell_id: CellId,
     pub runtime_tool_call_id: String,
     pub tool_name: ToolName,
@@ -187,6 +191,9 @@ pub(crate) fn spawn_runtime(
     ),
     String,
 > {
+    // Local addition (not vendored): reject ambiguous catalogs before starting
+    // an isolate or admitting any nested work.
+    crate::description::validate_tool_catalog(&request.enabled_tools)?;
     initialize_v8()?;
 
     let (command_tx, command_rx) = std_mpsc::channel();
@@ -475,6 +482,7 @@ mod tests {
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
+            context_id: None,
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),

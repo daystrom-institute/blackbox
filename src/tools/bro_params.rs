@@ -55,10 +55,11 @@ pub(crate) struct ExecParams {
     /// `in-box`, `out-box`, or `both`.
     #[serde(default)]
     pub(crate) tool_placement: Option<BTreeMap<String, String>>,
-    /// Per-dispatch tool argument defaults. These override both ambient and
+    /// Per-dispatch tool argument defaults with explicit JSON values (strings stay strings).
+    /// These override both ambient and
     /// brofile defaults for this invocation only.
     #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
+    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     /// Retired compatibility flag, not part of the caller schema.
     #[serde(skip_deserializing)]
     #[schemars(skip)]
@@ -195,7 +196,7 @@ pub(crate) struct ResumeParams {
     /// Per-dispatch tool argument defaults. These override ambient defaults
     /// and named-bro defaults for this resumed invocation.
     #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
+    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     /// Retired compatibility flag, not part of the caller schema.
     #[serde(skip_deserializing)]
     #[schemars(skip)]
@@ -686,7 +687,7 @@ pub(crate) struct BrofileParams {
     pub(crate) env: Option<std::collections::HashMap<String, String>>,
     /// Durable tool argument defaults embedded in the brofile.
     #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
+    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     /// Brofile store to address: global (default) or project. list/get read
     /// only the selected store; project requires project_dir, and global
     /// rejects it. Unknown scopes are refused before any store access.
@@ -800,6 +801,28 @@ pub(crate) struct TeamMemberSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_tool_defaults_decode_explicit_json_values() {
+        let params: ExecParams = serde_json::from_value(serde_json::json!({
+            "prompt":"synthetic fixture", "provider":"glm",
+            "tool_defaults":{
+                "default:shell_run.timeout_ms":30000,
+                "default:file_read.line_numbers":true,
+                "default:fixture.label":"false"
+            }
+        }))
+        .unwrap();
+        let defaults = params.tool_defaults.unwrap();
+        assert_eq!(defaults["default:shell_run.timeout_ms"], 30000);
+        assert_eq!(defaults["default:file_read.line_numbers"], true);
+        assert_eq!(defaults["default:fixture.label"], "false");
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(ExecParams)).unwrap();
+        assert_ne!(
+            schema["properties"]["tool_defaults"]["additionalProperties"]["type"],
+            "string"
+        );
+    }
 
     // Dispatch params advertise `cwd` (the contract-bottom canonical name,
     // design/bro-harness/tool-arg-defaulting.md §4) and accept `project_dir`

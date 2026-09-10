@@ -1,0 +1,187 @@
+{
+  "baseline_commit": "47d2aef3a0e65c83f00ab004acee54c78c189d10",
+  "candidate": "source committed with this receipt",
+  "reference_codex_commit": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "comparison_limit": "Deterministic boundary regressions and four exploratory live smoke tasks per cohort; not a statistical model efficacy benchmark.",
+  "session_before": [
+    {
+      "case": "scoped-flat",
+      "contract_passed": false,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "scoped-read-write",
+      "contract_passed": false,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "scoped-caught-retry",
+      "contract_passed": false,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "resume-missing",
+      "contract_passed": false,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "resume-corrupt",
+      "contract_passed": true,
+      "requests": 0,
+      "exit": 1
+    },
+    {
+      "case": "resume-unsequenced-tail",
+      "contract_passed": false,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "resume-valid",
+      "contract_passed": false,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "resume-schema",
+      "contract_passed": false,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "session-writer-lock",
+      "contract_passed": false,
+      "requests": 1,
+      "exit": 0
+    }
+  ],
+  "validation": {
+    "full_before_final_review_followups": {
+      "passed": 6930,
+      "failed": 0,
+      "skipped": 19,
+      "seconds": 171.858
+    },
+    "clippy_before_final_review_followups": "passed with existing repository warnings",
+    "concurrency_lint": "passed, 108 handlers",
+    "final_focused": {
+      "passed": 866,
+      "failed": 0,
+      "skipped": 4,
+      "seconds": 14.236
+    },
+    "final_reader_boundaries": {
+      "passed": 3,
+      "failed": 0,
+      "seconds": 0.52
+    },
+    "final_clippy": "passed with existing repository warnings",
+    "pinned_rustfmt": "passed",
+    "linux_executable_probes": {
+      "session": 9,
+      "provider": 16,
+      "workspace": 10,
+      "authority": 8,
+      "cancellation": 6,
+      "shell_output": 7,
+      "code_readers": 4,
+      "all_passed": true
+    },
+    "authority_fixture_note": "Git diff now disables external diff commands. Its revised canary observes the actual argv-spawned Git child via a fixture PATH wrapper; script source printed in a diff is not execution evidence."
+  },
+  "prior_deployment": {
+    "commit": "771c054a2533f3e1b35e68b990896f940dac02b1",
+    "installed_platform": "macOS arm64",
+    "installed_probe_passes": 47,
+    "image_workflow": "build-bbox-image-gztt7",
+    "image_tag": "771c054a2533",
+    "digest": "sha256:4d12547f8fbdd80c81e6323a8f485630fac28a1fe30d94648f005f81dd33bce82",
+    "ready_replicas": 1,
+    "health_http_status": 200
+  },
+  "session_after_linux": [
+    {
+      "case": "scoped-flat",
+      "contract_passed": true,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "scoped-read-write",
+      "contract_passed": true,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "scoped-caught-retry",
+      "contract_passed": true,
+      "requests": 3,
+      "exit": 0
+    },
+    {
+      "case": "resume-missing",
+      "contract_passed": true,
+      "requests": 0,
+      "exit": 1
+    },
+    {
+      "case": "resume-corrupt",
+      "contract_passed": true,
+      "requests": 0,
+      "exit": 1
+    },
+    {
+      "case": "resume-unsequenced-tail",
+      "contract_passed": true,
+      "requests": 0,
+      "exit": 1
+    },
+    {
+      "case": "resume-valid",
+      "contract_passed": true,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "resume-schema",
+      "contract_passed": true,
+      "requests": 1,
+      "exit": 0
+    },
+    {
+      "case": "session-writer-lock",
+      "contract_passed": true,
+      "requests": 0,
+      "exit": 1
+    }
+  ],
+  "wire_catalog": {
+    "format": "UTF-8 compact JSON of first Chat request tools; same synthetic fixture, explicit empty system prompt, no MCP servers",
+    "before": {
+      "off": {
+        "tools": 14,
+        "bytes": 19593
+      },
+      "optional": {
+        "tools": 16,
+        "bytes": 95620,
+        "exec_description_bytes": 72909
+      }
+    },
+    "after": {
+      "off": {
+        "tools": 14,
+        "bytes": 20785
+      },
+      "optional": {
+        "tools": 16,
+        "bytes": 29387,
+        "exec_description_bytes": 6289
+      }
+    }
+  }
+}

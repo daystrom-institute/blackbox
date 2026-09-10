@@ -271,6 +271,8 @@ impl CodeModeService {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let stored_values = self.inner.stored_values.lock().await.clone();
+        // Local addition (not vendored): freeze host context before moving the request.
+        let context_id = request.context_id;
         let cancellation_token = CancellationToken::new();
         let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = {
             let mut cells = self.inner.cells.lock().await;
@@ -298,6 +300,7 @@ impl CodeModeService {
         tokio::spawn(run_cell_control(
             Arc::clone(&self.inner),
             CellControlContext {
+                context_id,
                 cell_id,
                 runtime_tx,
                 runtime_control_tx,
@@ -389,6 +392,13 @@ impl CodeModeService {
         self.inner.shutting_down.store(true, Ordering::Release);
         self.cancel_all().await;
         Ok(())
+    }
+
+    /// Local addition (not vendored): unfinished cells and completed cells with
+    /// unconsumed terminal results prevent a checkpoint from promising resume.
+    /// The host calls this without admitting new execute/wait requests.
+    pub async fn has_outstanding_work(&self) -> bool {
+        !self.inner.cells.lock().await.is_empty()
     }
 
     /// Local addition (not vendored): close current cells without closing the
@@ -489,6 +499,8 @@ struct PendingResult {
 }
 
 struct CellControlContext {
+    // Local addition (not vendored): never replaced by a later wait request.
+    context_id: Option<u64>,
     cell_id: CellId,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_control_tx: std::sync::mpsc::Sender<RuntimeControlCommand>,
@@ -524,15 +536,16 @@ fn send_terminal_response(response_tx: CellResponseSender, response: RuntimeResp
     }
 }
 
-fn send_or_buffer_result(
+fn prepare_or_buffer_result(
     cell_id: &CellId,
     result: PendingResult,
     response_tx: &mut Option<CellResponseSender>,
     pending_result: &mut Option<PendingResult>,
+    terminal_reply: &mut Option<(CellResponseSender, RuntimeResponse)>,
 ) -> bool {
     if let Some(response_tx) = response_tx.take() {
         let response = pending_result_response(cell_id, result);
-        send_terminal_response(response_tx, response);
+        *terminal_reply = Some((response_tx, response));
         return true;
     }
 
@@ -674,6 +687,7 @@ async fn run_cell_control(
     initial_yield_time_ms: Option<u64>,
 ) {
     let CellControlContext {
+        context_id,
         cell_id,
         runtime_tx,
         runtime_control_tx,
@@ -684,6 +698,9 @@ async fn run_cell_control(
     let mut content_items = Vec::new();
     let mut pending_tool_call_ids = Vec::new();
     let mut pending_result: Option<PendingResult> = None;
+    // Local addition (not vendored): terminal observation follows callback
+    // cleanup and catalog removal, so immediate checkpoints see quiescence.
+    let mut terminal_reply = None;
     let mut response_tx = Some(initial_response_tx);
     let mut termination_requested = false;
     let mut runtime_closed = false;
@@ -721,7 +738,7 @@ async fn run_cell_control(
                                 cell_id: cell_id.clone(),
                                 content_items: std::mem::take(&mut content_items),
                             };
-                            send_terminal_response(response_tx, response);
+                            terminal_reply = Some((response_tx, response));
                         }
                         break;
                     }
@@ -734,11 +751,12 @@ async fn run_cell_control(
                             content_items: std::mem::take(&mut content_items),
                             error_text: Some("exec runtime ended unexpectedly".to_string()),
                         };
-                        if send_or_buffer_result(
+                        if prepare_or_buffer_result(
                             &cell_id,
                             result,
                             &mut response_tx,
                             &mut pending_result,
+                            &mut terminal_reply,
                         ) {
                             break;
                         }
@@ -814,6 +832,7 @@ async fn run_cell_control(
                             pending_tool_call_ids.push(id.clone());
                         }
                         let tool_call = CodeModeNestedToolCall {
+                            context_id,
                             cell_id: cell_id.clone(),
                             runtime_tool_call_id: id.clone(),
                             tool_name: name,
@@ -851,7 +870,7 @@ async fn run_cell_control(
                                     cell_id: cell_id.clone(),
                                     content_items: std::mem::take(&mut content_items),
                                 };
-                                send_terminal_response(response_tx, response);
+                                terminal_reply = Some((response_tx, response));
                             }
                             break;
                         }
@@ -870,11 +889,12 @@ async fn run_cell_control(
                             content_items: std::mem::take(&mut content_items),
                             error_text,
                         };
-                        if send_or_buffer_result(
+                        if prepare_or_buffer_result(
                             &cell_id,
                             result,
                             &mut response_tx,
                             &mut pending_result,
+                            &mut terminal_reply,
                         ) {
                             break;
                         }
@@ -916,7 +936,10 @@ async fn run_cell_control(
                         response_tx: next_response_tx,
                     } => {
                         if let Some(result) = pending_result.take() {
-                            let _ = next_response_tx.send(pending_result_response(&cell_id, result));
+                            terminal_reply = Some((
+                                CellResponseSender::Runtime(next_response_tx),
+                                pending_result_response(&cell_id, result),
+                            ));
                             break;
                         }
                         response_tx = Some(CellResponseSender::Runtime(next_response_tx));
@@ -929,8 +952,10 @@ async fn run_cell_control(
                     } => {
                         if let Some(result) = pending_result.take() {
                             let response = pending_result_response(&cell_id, result);
-                            let _ = next_response_tx
-                                .send(ExecuteToPendingOutcome::Completed(response));
+                            terminal_reply = Some((
+                                CellResponseSender::ExecuteToPending(next_response_tx),
+                                response,
+                            ));
                             break;
                         }
                         response_tx =
@@ -941,7 +966,10 @@ async fn run_cell_control(
                     }
                     CellControlCommand::Terminate { response_tx: next_response_tx } => {
                         if let Some(result) = pending_result.take() {
-                            let _ = next_response_tx.send(pending_result_response(&cell_id, result));
+                            terminal_reply = Some((
+                                CellResponseSender::Runtime(next_response_tx),
+                                pending_result_response(&cell_id, result),
+                            ));
                             break;
                         }
 
@@ -961,7 +989,7 @@ async fn run_cell_control(
                                     cell_id: cell_id.clone(),
                                     content_items: std::mem::take(&mut content_items),
                                 };
-                                send_terminal_response(response_tx, response);
+                                terminal_reply = Some((response_tx, response));
                             }
                             break;
                         } else {
@@ -990,6 +1018,9 @@ async fn run_cell_control(
     terminate_paused_runtime(&runtime_control_tx, pending_mode);
     inner.cells.lock().await.remove(&cell_id);
     inner.delegate.cell_closed(&cell_id);
+    if let Some((response_tx, response)) = terminal_reply {
+        send_terminal_response(response_tx, response);
+    }
 }
 
 async fn drain_notification_tasks(notification_tasks: &mut JoinSet<()>) {
@@ -1059,6 +1090,7 @@ mod tests {
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
+            context_id: None,
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),
@@ -1301,6 +1333,7 @@ mod tests {
         let actor = tokio::spawn(run_cell_control(
             inner,
             CellControlContext {
+                context_id: None,
                 cell_id: cell_id("delayed-result"),
                 runtime_tx: tool_response_tx,
                 runtime_control_tx,
@@ -1482,6 +1515,80 @@ mod tests {
                 error_text: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn outstanding_work_includes_completed_unconsumed_cell_output() {
+        let service = CodeModeService::new();
+        assert!(!service.has_outstanding_work().await);
+        let response = service
+            .execute(ExecuteRequest {
+                source:
+                    "yield_control(); store('terminal_processed', true); text('terminal receipt');"
+                        .into(),
+                yield_time_ms: None,
+                ..execute_request("")
+            })
+            .await
+            .unwrap()
+            .initial_response()
+            .await
+            .unwrap();
+        let RuntimeResponse::Yielded { cell_id, .. } = response else {
+            panic!("explicit yield must precede the terminal result: {response:?}");
+        };
+        // Stored values are committed by the controller's terminal branch,
+        // after nested work drains. This proves the result has been processed,
+        // without consuming that result or relying on a scheduling delay.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service
+                    .inner
+                    .stored_values
+                    .lock()
+                    .await
+                    .contains_key("terminal_processed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.has_outstanding_work().await);
+        let response = service
+            .wait(WaitRequest {
+                cell_id,
+                yield_time_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
+                error_text: None,
+                ..
+            })
+        ));
+        assert!(!service.has_outstanding_work().await);
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                source: "text('immediate completion');".into(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            RuntimeResponse::Result {
+                error_text: None,
+                ..
+            }
+        ));
+        assert!(!service.has_outstanding_work().await);
     }
 
     #[tokio::test]
@@ -2481,6 +2588,7 @@ image({
         tokio::spawn(run_cell_control(
             inner,
             CellControlContext {
+                context_id: None,
                 cell_id: cell_id("cell-1"),
                 runtime_tx: runtime_tx.clone(),
                 runtime_control_tx,

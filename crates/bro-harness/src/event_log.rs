@@ -59,7 +59,7 @@ static WARNED: AtomicBool = AtomicBool::new(false);
 /// Message to the writer thread: a line to append, or a flush rendezvous.
 enum LogMsg {
     Line(Value),
-    Flush(SyncSender<()>),
+    Flush(SyncSender<Result<(), String>>),
 }
 
 /// Bound on queued-but-unwritten lines. Generous — at streaming-agent event
@@ -74,6 +74,8 @@ pub struct EventLog {
     /// Set after the first failed open/write; later appends become no-ops.
     /// Shared with the writer thread, which observes failures.
     disabled: Arc<AtomicBool>,
+    // Explicit inert test seam, distinct from a production writer failure.
+    inert: bool,
 }
 
 impl EventLog {
@@ -92,6 +94,7 @@ impl EventLog {
             path,
             writer: Mutex::new(None),
             disabled: Arc::new(AtomicBool::new(false)),
+            inert: false,
         }
     }
 
@@ -102,6 +105,7 @@ impl EventLog {
             path: PathBuf::new(),
             writer: Mutex::new(None),
             disabled: Arc::new(AtomicBool::new(true)),
+            inert: true,
         }
     }
 
@@ -245,7 +249,10 @@ impl EventLog {
             // Queue full: the disk is stalled. Block (backpressure) rather
             // than dropping — the log feeds the transcript corpus.
             Err(TrySendError::Full(msg)) => {
-                let _ = tx.send(msg);
+                if tx.send(msg).is_err() {
+                    self.disabled.store(true, Ordering::Relaxed);
+                    *guard = None;
+                }
             }
             Err(TrySendError::Disconnected(_)) => {
                 // Writer thread died (open/write failure path warns there).
@@ -258,14 +265,58 @@ impl EventLog {
     /// Block until every line enqueued before this call is written to the
     /// OS. Called from `spawn_blocking` at turn boundaries (bounds the
     /// crash-durability gap to the current turn) and from tests before
-    /// reading the file. No-op when disabled or never written.
+    /// reading the file. Best-effort compatibility wrapper; durable session
+    /// persistence uses the checked variant below.
     pub fn flush_blocking(&self) {
-        let guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(tx) = guard.as_ref() else { return };
-        let (ack_tx, ack_rx) = sync_channel(1);
-        if tx.send(LogMsg::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = self.flush_blocking_checked();
+    }
+
+    /// Durably flush all prior records or explicitly fail the persistence boundary.
+    /// Only an explicitly inert test log is exempt from writer failures.
+    pub fn flush_blocking_checked(&self) -> anyhow::Result<()> {
+        self.flush_checked_with_timeout(std::time::Duration::from_secs(30))
+    }
+
+    fn flush_checked_with_timeout(&self, timeout: std::time::Duration) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        if self.inert {
+            return Ok(());
         }
+        anyhow::ensure!(
+            !self.disabled.load(Ordering::Relaxed),
+            "event log writer previously failed: {}",
+            self.path.display()
+        );
+        let mut guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = self.spawn_writer();
+        }
+        let tx = guard
+            .as_ref()
+            .context("event log writer could not start for flush")?;
+        let (ack_tx, ack_rx) = sync_channel(1);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut message = LogMsg::Flush(ack_tx);
+        loop {
+            match tx.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("event log writer disconnected before flush")
+                }
+                Err(TrySendError::Full(returned)) => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "event log flush timed out while queueing checkpoint"
+                    );
+                    message = returned;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        ack_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .context("event log flush failed or timed out")?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Spawn the writer thread that owns serialization and the append handle.
@@ -301,6 +352,7 @@ impl EventLog {
 fn writer_loop(rx: Receiver<LogMsg>, path: PathBuf, disabled: Arc<AtomicBool>) {
     let mut file = None;
     let mut failed = false;
+    let mut failure = None;
     while let Ok(msg) = rx.recv() {
         match msg {
             LogMsg::Line(line) => {
@@ -312,6 +364,7 @@ fn writer_loop(rx: Receiver<LogMsg>, path: PathBuf, disabled: Arc<AtomicBool>) {
                         Ok(f) => file = Some(f),
                         Err(err) => {
                             failed = true;
+                            failure = Some(err.to_string());
                             disabled.store(true, Ordering::Relaxed);
                             warn_unwritable(&path, &err);
                             continue;
@@ -324,17 +377,52 @@ fn writer_loop(rx: Receiver<LogMsg>, path: PathBuf, disabled: Arc<AtomicBool>) {
                 let f = file.as_mut().expect("opened above");
                 if let Err(err) = f.write_all(format!("{line}\n").as_bytes()) {
                     failed = true;
+                    failure = Some(err.to_string());
                     disabled.store(true, Ordering::Relaxed);
                     warn_unwritable(&path, &err);
                 }
             }
             LogMsg::Flush(ack) => {
-                // Everything enqueued before the flush is already written
-                // (in-order drain); just acknowledge.
-                let _ = ack.try_send(());
+                if !failed && file.is_none() {
+                    match open_append(&path) {
+                        Ok(opened) => file = Some(opened),
+                        Err(error) => {
+                            failed = true;
+                            failure = Some(error.to_string());
+                            disabled.store(true, Ordering::Relaxed);
+                            warn_unwritable(&path, &error);
+                        }
+                    }
+                }
+                if !failed {
+                    let synced = file.as_ref().map_or(Ok(()), |file| {
+                        file.sync_all()?;
+                        sync_parent(&path)
+                    });
+                    if let Err(error) = synced {
+                        failed = true;
+                        failure = Some(error.to_string());
+                        disabled.store(true, Ordering::Relaxed);
+                        warn_unwritable(&path, &error);
+                    }
+                }
+                let result = failure.clone().map_or(Ok(()), Err);
+                let _ = ack.try_send(result);
             }
         }
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "event-log writer syncs directory metadata on its own thread"
+)]
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
 }
 
 // runs on the event-log writer thread (wave 14).
@@ -649,5 +737,54 @@ mod tests {
 
         assert_eq!(EventLog::max_seq_in_log(log.path()), 3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn checked_flush_distinguishes_inert_logs_from_failed_production_writers() {
+        EventLog::disabled().flush_blocking_checked().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, "fixture").unwrap();
+        let log = EventLog::at_path(blocker.join("events.jsonl"));
+        // Even an empty durable checkpoint must verify that its log is usable.
+        assert!(log.flush_blocking_checked().is_err());
+        assert!(log.disabled.load(Ordering::Relaxed));
+        assert!(log.flush_blocking_checked().is_err());
+    }
+
+    #[test]
+    fn checked_flush_reports_disconnection_queue_timeout_and_missing_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for (index, full, disconnected) in [(0, false, true), (1, true, false), (2, false, false)] {
+            let log = EventLog::at_path(root.join(format!("fixture-{index}.jsonl")));
+            let (tx, rx) = sync_channel(1);
+            if full {
+                tx.send(LogMsg::Line(json!({}))).unwrap();
+            }
+            *log.writer.lock().unwrap() = Some(tx);
+            let receiver = (!disconnected).then_some(rx);
+            let result = log.flush_checked_with_timeout(std::time::Duration::from_millis(5));
+            assert!(
+                result.is_err(),
+                "flush must not acknowledge incomplete durability: case {index}"
+            );
+            drop(receiver);
+        }
+    }
+
+    #[test]
+    fn checked_flush_creates_and_syncs_empty_production_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = EventLog::at_path(root.join("events.jsonl"));
+        log.flush_blocking_checked().unwrap();
+        assert_eq!(std::fs::metadata(log.path()).unwrap().len(), 0);
+        log.append_event(&json!({"type":"user","message":{"content":"durable"}}));
+        log.flush_blocking_checked().unwrap();
+        let rows = std::fs::read_to_string(log.path()).unwrap();
+        assert!(rows.ends_with('\n'));
+        let row: Value = serde_json::from_str(rows.trim()).unwrap();
+        assert_eq!(row["event"]["message"]["content"], "durable");
     }
 }

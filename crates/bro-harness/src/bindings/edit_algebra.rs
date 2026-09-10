@@ -688,6 +688,24 @@ fn finding(kind: &str, file: &str, detail: String, hint: &str) -> Value {
     json!({ "kind": kind, "file": file, "detail": detail, "resolution_hint": hint })
 }
 
+fn edit_set_instruction_paths(
+    set: &EditSetState,
+    cx: &ToolCx,
+) -> Result<bro_tools::InstructionPaths, ToolResult> {
+    let paths = set
+        .files
+        .keys()
+        .map(String::as_str)
+        .chain(set.creates.iter().map(|create| create.path.as_str()))
+        .chain(set.deletes.iter().map(|delete| delete.path.as_str()))
+        .map(|path| bro_tools::workspace::resolve_in_root(&cx.root, path).map_err(err))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(bro_tools::InstructionPaths {
+        access: bro_tools::InstructionAccess::Mutate,
+        paths,
+    })
+}
+
 /// `edits.apply` — the choke point: the only binding that writes.
 pub struct EditsApply(pub Arc<EditStore>);
 
@@ -729,6 +747,19 @@ impl Tool for EditsApply {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("edits".to_string(), "apply".to_string()))
     }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<bro_tools::InstructionPaths>, ToolResult> {
+        let params: ApplyParams = decode(
+            "edits.apply",
+            "{ es: string, validations?: string[] }",
+            input.clone(),
+        )?;
+        let set = self.0.snapshot(&params.es).map_err(err)?;
+        edit_set_instruction_paths(&set, cx).map(Some)
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: ApplyParams = match decode(
             "edits.apply",
@@ -754,6 +785,18 @@ impl Tool for EditsApply {
         };
         if set.files.is_empty() && set.creates.is_empty() && set.deletes.is_empty() {
             return err(format!("edits.apply: EditSet `{}` is empty", params.es));
+        }
+
+        // Admit the exact snapshot that will be applied, even when an
+        // embedding calls the tool without the shared workspace admission lock.
+        if let Some(policy) = &cx.instruction_policy {
+            let paths = match edit_set_instruction_paths(&set, cx) {
+                Ok(paths) => paths,
+                Err(error) => return error,
+            };
+            if let Err(error) = policy.check(paths, cx.instruction_generation).await {
+                return error;
+            }
         }
 
         // Lineage recomputed at the choke point from the host-recorded tiers
@@ -1148,6 +1191,9 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1161,6 +1207,52 @@ mod tests {
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_instruction_barrier_keeps_exact_set_and_files_for_next_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("child")).unwrap();
+        std::fs::write(root.join("child/AGENTS.md"), "Read before creating files.").unwrap();
+        let policy = Arc::new(crate::project_doc::ScopedProjectDocs::new(
+            root.clone(),
+            None,
+        ));
+        let mut cx = cx_in(&root);
+        cx.instruction_generation = 1;
+        cx.instruction_policy = Some(policy.clone());
+        let store = Arc::new(EditStore::default());
+        let es = store.begin();
+        store
+            .with_set(&es, |set| {
+                set.creates.push(CreateFile {
+                    path: "child/new.txt".into(),
+                    content: "created\n".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let tool = EditsApply(store.clone());
+        let input = json!({"es": es, "validations": []});
+        // Direct body entry checks the same snapshot used by the actual apply.
+        let result = tool.call(input.clone(), &cx).await;
+        assert!(
+            matches!(result, ToolResult::Error(error) if error.contains("instructions_required"))
+        );
+        assert!(!root.join("child/new.txt").exists());
+        assert!(store.snapshot(&es).is_ok());
+        let batch = policy.pending_batch(2).unwrap();
+        policy.acknowledge(&batch);
+        assert!(tool.call(input.clone(), &cx).await.is_error());
+        cx.instruction_generation = 2;
+        let result = tool.call(input, &cx).await;
+        assert_eq!(json_of(result)["applied"], true);
+        assert_eq!(
+            std::fs::read(root.join("child/new.txt")).unwrap(),
+            b"created\n"
+        );
+        assert!(store.snapshot(&es).is_err());
     }
 
     fn json_of(result: ToolResult) -> Value {

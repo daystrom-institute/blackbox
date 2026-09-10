@@ -100,9 +100,12 @@ pub fn start_tool_invocation(
     let cancellation = cx.cancellation.clone();
     let (result_tx, result_rx) = watch::channel(None);
     let completion = CompletionOwner { result: result_tx };
-    // Only these host-owned process controls bypass workspace admission.
-    // Their process supervisor provides its own synchronization.
-    let execution = if matches!(tool.name(), "shell_poll" | "shell_kill" | "shell_list") {
+    // Host-owned process controls and operator status bypass workspace admission.
+    // They own their synchronization and do not mutate workspace files.
+    let execution = if matches!(
+        tool.name(),
+        "shell_poll" | "shell_kill" | "shell_list" | "report"
+    ) {
         None
     } else {
         execution
@@ -161,6 +164,9 @@ mod tests {
 
     fn cx(root: &std::path::Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_owned(),
             cancellation: Default::default(),
             safety: Arc::new(crate::SafetyPolicy::new()),

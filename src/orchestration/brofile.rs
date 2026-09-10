@@ -29,7 +29,7 @@ pub struct Brofile {
     /// Durable persona-bound tool argument defaults. Dispatch merges these
     /// after ambient defaults and before the per-dispatch overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_defaults: Option<BTreeMap<String, String>>,
+    pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     /// Persona-bound tool filter overlay. Merges between project mcp.json
     /// and per-dispatch ExecParams overrides at dispatch time. Lets a
     /// brofile (e.g. "auditor") restrict the tool surface every member

@@ -19,7 +19,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Effective workspace root. Normally this is the harness launch root. After
 /// `exit_worktree(publish)` removes a managed fleet worktree, the harness
@@ -95,18 +94,13 @@ impl Tool for SandboxStatus {
             Ok(args) => args,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        // git_status_manifest shells out via sync `Command::output` — keep
-        // the child-process wait off the runtime workers.
-        let cx = cx.clone();
-        crate::tool::call_blocking(move || ToolResult::from_result(sandbox_status(&cx, args))).await
+        ToolResult::from_result(
+            sandbox_status_manifest(cx, args.root.as_deref(), args.status_limit).await,
+        )
     }
 }
 
-fn sandbox_status(cx: &ToolCx, args: SandboxStatusInput) -> anyhow::Result<Value> {
-    sandbox_status_manifest(cx, args.root.as_deref(), args.status_limit)
-}
-
-pub(crate) fn sandbox_status_manifest(
+pub(crate) async fn sandbox_status_manifest(
     cx: &ToolCx,
     root: Option<&str>,
     status_limit: Option<usize>,
@@ -118,6 +112,9 @@ pub(crate) fn sandbox_status_manifest(
     if !root.exists() {
         anyhow::bail!("root does not exist: {}", root.display());
     }
+    let git = workspace_git::status_manifest(cx, &root, status_limit.unwrap_or(12)).await;
+    let cx = cx.clone();
+    tokio::task::spawn_blocking(move || {
     let session_env = redact_env(&cx.session_env);
     let process_env = visible_process_env();
     let shell_path = shell_path_manifest();
@@ -126,7 +123,7 @@ pub(crate) fn sandbox_status_manifest(
         "launch_root": cx.root,
         "inspected_root": root,
         "root_source": root_source,
-        "git": git_status_manifest(cx, &root, status_limit.unwrap_or(12)),
+        "git": git,
         "fleet_worktree": {
             "base_repo": std::env::var("BRO_FLEET_BASE_REPO").ok(),
             "parent_worktree": std::env::var("BRO_FLEET_PARENT_WORKTREE").ok(),
@@ -153,46 +150,7 @@ pub(crate) fn sandbox_status_manifest(
             "tool_resolution checks common operator/project commands against PATH as seen by this harness process; MCP workspace shell tools may have their own path augmentation",
         ],
     }))
-}
-
-fn git_status_manifest(cx: &ToolCx, root: &Path, status_limit: usize) -> Value {
-    json!({
-        "toplevel": git_capture(cx, root, &["rev-parse", "--show-toplevel"]),
-        "branch": git_capture(cx, root, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "head": git_capture(cx, root, &["rev-parse", "--short=12", "HEAD"]),
-        "status": git_status_summary(cx, root, status_limit),
-    })
-}
-
-fn git_status_summary(cx: &ToolCx, root: &Path, status_limit: usize) -> Value {
-    let Some(raw) = git_capture(cx, root, &["status", "--short", "--branch"]) else {
-        return Value::Null;
-    };
-    let mut lines = raw.lines();
-    let branch = lines.next().unwrap_or_default().to_string();
-    let entries: Vec<String> = lines.map(str::to_string).collect();
-    let dirty_count = entries.len();
-    let limit = status_limit.max(1);
-    json!({
-        "branch_line": branch,
-        "dirty_count": dirty_count,
-        "entries": entries.iter().take(limit).cloned().collect::<Vec<_>>(),
-        "truncated": dirty_count > limit,
-    })
-}
-
-// called from sandbox_status's call_blocking closure (wave 13).
-#[allow(clippy::disallowed_methods)]
-fn git_capture(cx: &ToolCx, root: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root).args(args);
-    cx.child_env.apply(&mut command);
-    command.envs(cx.shell_env.iter());
-    let out = command.output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    }).await?
 }
 
 fn visible_process_env() -> BTreeMap<String, String> {
@@ -444,7 +402,7 @@ impl Tool for FileWrite {
         "file_write"
     }
     fn description(&self) -> &str {
-        "Create or overwrite a file in the worktree with the given contents."
+        "Create or overwrite a regular file with the given contents. Existing contents are replaced completely; this is not a compare-and-swap operation. Read failures stop before writing, and write failures disclose potentially partial effects."
     }
     fn input_schema(&self) -> Value {
         schema_for::<FileWriteInput>()
@@ -454,6 +412,20 @@ impl Tool for FileWrite {
             destructive: true,
             ..Default::default()
         }
+    }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<crate::InstructionPaths>, ToolResult> {
+        let args: FileWriteInput = serde_json::from_value(input.clone())
+            .map_err(|error| ToolResult::Error(format!("bad input: {error}")))?;
+        let path = resolve_in_root(&cx.root, &args.file_path)
+            .map_err(|error| ToolResult::Error(error.to_string()))?;
+        Ok(Some(crate::InstructionPaths {
+            access: crate::InstructionAccess::Mutate,
+            paths: vec![path],
+        }))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let args: FileWriteInput = match serde_json::from_value(input) {
@@ -465,22 +437,63 @@ impl Tool for FileWrite {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
+        let pre_image = match regular_file_bytes(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return ToolResult::Error(format!(
+                    "read preimage {}: {error}; file write not attempted",
+                    path.display()
+                ));
+            }
+        };
         if let Some(parent) = path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
+            && let Err(error) = tokio::fs::create_dir_all(parent).await
         {
-            return ToolResult::Error(format!("mkdir {}: {e}", parent.display()));
+            return ToolResult::Error(format!(
+                "mkdir {}: {error}; some parent directories may have been created",
+                parent.display()
+            ));
         }
-        // Capture the pre-image BEFORE the write so the post-write edit event
-        // carries both ends. A missing file (fresh write) → empty pre-image.
-        let pre_image = tokio::fs::read(&path).await.unwrap_or_default();
         match tokio::fs::write(&path, content.as_bytes()).await {
             Ok(()) => {
                 record_edit(cx, &path, &pre_image, content.as_bytes());
                 ToolResult::Json(json!({"ok": true, "bytes": content.len()}))
             }
-            Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
+            Err(error) => failed_file_write(cx, &path, &pre_image, error).await,
         }
     }
+}
+
+async fn regular_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    if !tokio::fs::metadata(path).await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target is not a regular file",
+        ));
+    }
+    tokio::fs::read(path).await
+}
+
+async fn failed_file_write(
+    cx: &ToolCx,
+    path: &Path,
+    before: &[u8],
+    error: std::io::Error,
+) -> ToolResult {
+    let current = regular_file_bytes(path).await.ok();
+    if let Some(after) = &current
+        && after != before
+    {
+        record_edit(cx, path, before, after);
+    }
+    ToolResult::Error(json!({
+        "error":"file_write_failed", "path":path, "cause":error.to_string(),
+        "message":"The write may have changed or truncated the file; no rollback was attempted.",
+        "before_sha256":crate::slice_core::sha256_hex(before),
+        "observed_after_sha256":current.as_ref().map(|bytes| crate::slice_core::sha256_hex(bytes)),
+        "final_state_observed":current.is_some(),
+    }).to_string())
 }
 
 /// Push an `EditEvent` onto `cx.edits` after a successful file mutation.
@@ -589,204 +602,10 @@ impl Tool for ListDir {
     }
 }
 
-// ---------------------------------------------------------------------------
-// git tools (read-only via shell)
-// ---------------------------------------------------------------------------
-
-async fn git(cx: &ToolCx, args: &[&str]) -> ToolResult {
-    let root = effective_root(&cx.root);
-    let mut command = tokio::process::Command::new("git");
-    command.args(args).current_dir(&root);
-    cx.child_env.apply(command.as_std_mut());
-    command.envs(cx.shell_env.iter());
-    let out = command.output().await;
-    match out {
-        Ok(o) if o.status.success() => {
-            ToolResult::Text(String::from_utf8_lossy(&o.stdout).into_owned())
-        }
-        Ok(o) => ToolResult::Error(String::from_utf8_lossy(&o.stderr).into_owned()),
-        Err(e) => ToolResult::Error(format!("git {args:?}: {e}")),
-    }
-}
-
-macro_rules! read_git_tool {
-    ($ty:ident, $name:literal, $desc:literal, $argv:expr) => {
-        pub struct $ty;
-        #[async_trait]
-        impl Tool for $ty {
-            fn name(&self) -> &str {
-                $name
-            }
-            fn description(&self) -> &str {
-                $desc
-            }
-            fn input_schema(&self) -> Value {
-                json!({"type": "object", "properties": {}})
-            }
-            fn annotations(&self) -> ToolAnnotations {
-                ToolAnnotations {
-                    read_only: true,
-                    ..Default::default()
-                }
-            }
-            async fn call(&self, _input: Value, cx: &ToolCx) -> ToolResult {
-                git(cx, $argv).await
-            }
-        }
-    };
-}
-
-read_git_tool!(
-    GitStatus,
-    "git_status",
-    "Show `git status --short`.",
-    &["status", "--short"]
-);
-read_git_tool!(
-    GitLog,
-    "git_log",
-    "Show recent commits (`git log --oneline -20`).",
-    &["log", "--oneline", "-20"]
-);
-
-#[derive(Deserialize, JsonSchema)]
-struct GitDiffInput {
-    /// Include untracked files as new-file patches.
-    include_untracked: Option<bool>,
-}
-
-pub struct GitDiff;
-
-#[async_trait]
-impl Tool for GitDiff {
-    fn name(&self) -> &str {
-        "git_diff"
-    }
-    fn description(&self) -> &str {
-        "Show the unstaged working-tree diff. Set include_untracked=true to include untracked files as new-file patches."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<GitDiffInput>()
-    }
-    fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations {
-            read_only: true,
-            ..Default::default()
-        }
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GitDiffInput = match serde_json::from_value(input) {
-            Ok(v) => v,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        if args.include_untracked.unwrap_or(false) {
-            git_diff_include_untracked(cx).await
-        } else {
-            git(cx, &["diff"]).await
-        }
-    }
-}
-
-async fn git_diff_include_untracked(cx: &ToolCx) -> ToolResult {
-    let root = effective_root(&cx.root);
-    let mut diff = match git_stdout(cx, &root, &["diff"]).await {
-        Ok(diff) => diff,
-        Err(e) => return ToolResult::Error(e),
-    };
-    let raw_untracked = match git_stdout(
-        cx,
-        &root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )
-    .await
-    {
-        Ok(raw) => raw,
-        Err(e) => return ToolResult::Error(e),
-    };
-    for path in raw_untracked.split('\0').filter(|path| !path.is_empty()) {
-        match git_no_index_new_file(cx, &root, path).await {
-            Ok(patch) if !patch.is_empty() => {
-                if !diff.is_empty() && !diff.ends_with('\n') {
-                    diff.push('\n');
-                }
-                diff.push_str(&patch);
-            }
-            Ok(_) => {}
-            Err(e) => return ToolResult::Error(e),
-        }
-    }
-    ToolResult::Text(diff)
-}
-
-async fn git_stdout(cx: &ToolCx, root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("git");
-    command.args(args).current_dir(root);
-    cx.child_env.apply(command.as_std_mut());
-    command.envs(cx.shell_env.iter());
-    let out = command
-        .output()
-        .await
-        .map_err(|e| format!("git {args:?}: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
-    }
-}
-
-async fn git_no_index_new_file(cx: &ToolCx, root: &Path, path: &str) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .args(["diff", "--no-index", "--", "/dev/null", path])
-        .current_dir(root);
-    cx.child_env.apply(command.as_std_mut());
-    command.envs(cx.shell_env.iter());
-    let out = command
-        .output()
-        .await
-        .map_err(|e| format!("git diff --no-index {path}: {e}"))?;
-    let code = out.status.code().unwrap_or(1);
-    if code == 0 || code == 1 {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct GitShowInput {
-    /// Commit-ish to show (default HEAD).
-    rev: Option<String>,
-}
-
-pub struct GitShow;
-
-#[async_trait]
-impl Tool for GitShow {
-    fn name(&self) -> &str {
-        "git_show"
-    }
-    fn description(&self) -> &str {
-        "Show a commit (`git show <rev>`, default HEAD)."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<GitShowInput>()
-    }
-    fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations {
-            read_only: true,
-            ..Default::default()
-        }
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GitShowInput = match serde_json::from_value(input) {
-            Ok(args) => args,
-            Err(error) => return ToolResult::Error(format!("bad input: {error}")),
-        };
-        let rev = args.rev.unwrap_or_else(|| "HEAD".into());
-        git(cx, &["show", "--end-of-options", &rev]).await
-    }
-}
+// Git commands share the finite subprocess supervisor; no shell tool dispatch.
+#[path = "workspace_git.rs"]
+pub(crate) mod workspace_git;
+pub use workspace_git::{GitDiff, GitLog, GitShow, GitStatus};
 
 pub use crate::git_commit::GitCommit;
 
@@ -827,6 +646,20 @@ impl Tool for FileEdit {
             ..Default::default()
         }
     }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<crate::InstructionPaths>, ToolResult> {
+        let args: FileEditInput = serde_json::from_value(input.clone())
+            .map_err(|error| ToolResult::Error(format!("bad input: {error}")))?;
+        let path = resolve_in_root(&cx.root, &args.file_path)
+            .map_err(|error| ToolResult::Error(error.to_string()))?;
+        Ok(Some(crate::InstructionPaths {
+            access: crate::InstructionAccess::Mutate,
+            paths: vec![path],
+        }))
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let args: FileEditInput = match serde_json::from_value(input) {
             Ok(a) => a,
@@ -842,7 +675,10 @@ impl Tool for FileEdit {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
-        let body = match tokio::fs::read_to_string(&path).await {
+        let body = match regular_file_bytes(&path).await.and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
         };
@@ -867,7 +703,7 @@ impl Tool for FileEdit {
                     json!({"ok": true, "replacements": count.min(if args.replace_all { count } else { 1 })}),
                 )
             }
-            Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
+            Err(error) => failed_file_write(cx, &path, body.as_bytes(), error).await,
         }
     }
 }
@@ -1335,6 +1171,20 @@ impl Tool for SmartRead {
             ..Default::default()
         }
     }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<crate::InstructionPaths>, ToolResult> {
+        let args: SmartReadInput = serde_json::from_value(input.clone())
+            .map_err(|error| ToolResult::Error(format!("bad input: {error}")))?;
+        let path = resolve_read_path(&cx.root, &args.file_path)
+            .map_err(|error| ToolResult::Error(error.to_string()))?;
+        Ok(Some(crate::InstructionPaths {
+            access: crate::InstructionAccess::Read,
+            paths: vec![path],
+        }))
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let args: SmartReadInput = match serde_json::from_value(input) {
             Ok(a) => a,
@@ -1357,6 +1207,22 @@ impl Tool for SmartRead {
 /// tool. Only meaningful on transports that honor the lark grammar (Responses);
 /// the harness drops it elsewhere via the grammar-transport rule, so it never
 /// degrades to an unconstrained JSON-string editor competing with `file_edit`.
+fn patch_source(input: &Value) -> Result<&str, ToolResult> {
+    input
+        .as_str()
+        .or_else(|| {
+            input
+                .get("source")
+                .or_else(|| input.get("patch"))
+                .or_else(|| input.get("input"))
+                .and_then(Value::as_str)
+        })
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            ToolResult::Error("apply_patch expects the patch envelope text (as `source`)".into())
+        })
+}
+
 pub struct ApplyPatch;
 
 #[async_trait]
@@ -1402,6 +1268,35 @@ impl Tool for ApplyPatch {
             destructive: true,
         }
     }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<crate::InstructionPaths>, ToolResult> {
+        let patch = patch_source(input)?;
+        let parsed = bro_apply_patch::parse_patch(patch)
+            .map_err(|error| ToolResult::Error(format!("invalid patch: {error}")))?;
+        let mut paths = Vec::new();
+        for hunk in parsed.hunks {
+            use bro_apply_patch::Hunk;
+            let (source, destination) = match hunk {
+                Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => (path, None),
+                Hunk::UpdateFile {
+                    path, move_path, ..
+                } => (path, move_path),
+            };
+            // Match the apply layer's lexical path resolution before the
+            // instruction policy canonicalizes existing filesystem ancestry.
+            paths.push(normalize_lexical(&cx.root.join(source)));
+            if let Some(destination) = destination {
+                paths.push(normalize_lexical(&cx.root.join(destination)));
+            }
+        }
+        Ok(Some(crate::InstructionPaths {
+            access: crate::InstructionAccess::Mutate,
+            paths,
+        }))
+    }
     // The fs reads below run inside the call_blocking closure; clippy's
     // disallowed_methods is syntactic and cannot see the blocking context.
     #[allow(clippy::disallowed_methods)]
@@ -1410,20 +1305,9 @@ impl Tool for ApplyPatch {
         // runtime workers (round-2 invariant audit, thread-935b467d).
         let cx = cx.clone();
         crate::tool::call_blocking(move || {
-            // The custom_tool_call freeform channel maps raw text to `source`; also
-            // accept `patch`/`input` for the JSON-function fallback.
-            let patch_text = input
-                .get("source")
-                .or_else(|| input.get("patch"))
-                .or_else(|| input.get("input"))
-                .and_then(|v| v.as_str());
-            let patch_text = match patch_text {
-                Some(s) if !s.trim().is_empty() => s,
-                _ => {
-                    return ToolResult::Error(
-                        "apply_patch expects the patch envelope text (as `source`)".to_string(),
-                    );
-                }
+            let patch_text = match patch_source(&input) {
+                Ok(text) => text,
+                Err(error) => return error,
             };
 
             let (outcome, failure) = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
@@ -1469,6 +1353,7 @@ impl Tool for ApplyPatch {
                 ));
             }
 
+            if summary.is_empty() { return ToolResult::Text("No-op patch: no files changed".into()); }
             ToolResult::Text(format!(
                 "Applied patch ({} change{}):\n{}",
                 summary.len(),
@@ -1571,6 +1456,9 @@ mod tests {
 
     fn cx_at(root: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_path_buf(),
             safety: std::sync::Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -2415,5 +2303,140 @@ mod tests {
 
         // drain() resets the sink.
         assert!(cx.edits.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn file_writers_reject_nonregular_preimages_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep"), "original").unwrap();
+        let cx = cx_at(&root);
+        let write = FileWrite
+            .call(
+                json!({"file_path":"directory", "content":"replacement"}),
+                &cx,
+            )
+            .await;
+        assert!(
+            matches!(write, ToolResult::Error(ref error) if error.contains("not a regular file"))
+        );
+        let edit = FileEdit.call(json!({"file_path":"directory", "old_string":"original", "new_string":"replacement"}), &cx).await;
+        assert!(
+            matches!(edit, ToolResult::Error(ref error) if error.contains("not a regular file"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("keep")).unwrap(),
+            "original"
+        );
+        assert!(cx.edits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_write_receipt_records_observed_partial_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("partial.txt");
+        std::fs::write(&path, "part").unwrap();
+        let cx = cx_at(&root);
+        let result = failed_file_write(
+            &cx,
+            &path,
+            b"original",
+            std::io::Error::other("synthetic write failure"),
+        )
+        .await;
+        let ToolResult::Error(text) = result else {
+            panic!("expected failure")
+        };
+        let receipt: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(receipt["final_state_observed"], true);
+        let edits = cx.edits.lock().unwrap().drain();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].pre_image, b"original");
+        assert_eq!(edits[0].post_sha256, crate::slice_core::sha256_hex(b"part"));
+        std::fs::remove_file(&path).unwrap();
+        let ToolResult::Error(text) = failed_file_write(
+            &cx,
+            &path,
+            b"original",
+            std::io::Error::other("synthetic write failure"),
+        )
+        .await
+        else {
+            panic!("expected failure")
+        };
+        let receipt: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(receipt["final_state_observed"], false);
+        assert!(receipt["observed_after_sha256"].is_null());
+    }
+    #[tokio::test]
+    async fn git_diff_bounds_untracked_fanout_and_accepts_literal_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_at(&root);
+        let init = workspace_git::capture_git(
+            &cx,
+            &root,
+            &["init".into(), "-q".into()],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(init.exit_code, Some(0));
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), "known content\n").unwrap();
+        }
+        let result = GitDiff
+            .call(
+                json!({"include_untracked":true,"max_untracked_files":2}),
+                &cx,
+            )
+            .await;
+        assert!(!result.is_error(), "{result:?}");
+        let text = result.into_content().0;
+        assert!(text.contains("omitted=1"), "{text}");
+        assert!(text.len() <= 8000);
+        let result = GitDiff
+            .call(json!({"include_untracked":true,"paths":["c.txt"]}), &cx)
+            .await;
+        let text = result.into_content().0;
+        assert!(text.contains("+known content"), "{text}");
+        assert!(!text.contains("omitted="), "{text}");
+        assert!(
+            GitDiff
+                .call(
+                    json!({"include_untracked":true,"max_untracked_files":0}),
+                    &cx
+                )
+                .await
+                .is_error()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_uses_original_non_utf8_untracked_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_at(&root);
+        let init = workspace_git::capture_git(
+            &cx,
+            &root,
+            &["init".into(), "-q".into()],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(init.exit_code, Some(0));
+        let filename = std::ffi::OsString::from_vec(b"odd\xff; touch injected".to_vec());
+        std::fs::write(root.join(filename), "RAW_FILENAME_CONTENT\n").unwrap();
+        let result = GitDiff.call(json!({"include_untracked":true}), &cx).await;
+        assert!(!result.is_error(), "{result:?}");
+        assert!(result.into_content().0.contains("+RAW_FILENAME_CONTENT"));
+        assert!(!root.join("injected").exists());
     }
 }

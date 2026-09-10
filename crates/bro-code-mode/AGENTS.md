@@ -14,12 +14,11 @@ Two disciplines follow from that and are not negotiable:
 The string assembled by the description builder is model-facing prompt text,
 not documentation. Rendering rules that bite:
 
-- The **schema-rendered flat tool catalog renders only in code-mode-only**;
-  the template + **namespace sections render in every mode**. Namespace
-  declarations are hand-authored TS (`ToolNamespaceDescription.declarations`)
-  — there is no compiler keeping them honest, only probes. Drift between a
-  declaration and the serde reality is a real bug class; fix the declaration
-  in the same change as the shape.
+- The default description contains runtime guidance and a compact index of
+  admitted namespace methods in every mode. Full schemas and schema-derived
+  per-method declarations live in `ALL_TOOLS` discovery, alongside canonical
+  names and actual JavaScript invocation coordinates. Hand-authored namespace
+  manuals are reference material, never the authority for callable membership.
 - Several template lines exist because live probe agents burned cells on the
   gap they close (no Node stdlib; reserved-global shadowing; fresh-scope
   redeclare; one-arg `store()`). They look like fluff. Do not trim them.

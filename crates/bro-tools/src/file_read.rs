@@ -49,6 +49,20 @@ impl Tool for FileRead {
             ..Default::default()
         }
     }
+    fn instruction_paths(
+        &self,
+        input: &Value,
+        cx: &ToolCx,
+    ) -> Result<Option<crate::InstructionPaths>, ToolResult> {
+        let args: FileReadInput = serde_json::from_value(input.clone())
+            .map_err(|error| ToolResult::Error(format!("bad input: {error}")))?;
+        let path = crate::workspace::resolve_read_path(&cx.root, &args.file_path)
+            .map_err(|error| ToolResult::Error(error.to_string()))?;
+        Ok(Some(crate::InstructionPaths {
+            access: crate::InstructionAccess::Read,
+            paths: vec![path],
+        }))
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         match read(input, cx).await {
             Ok(text) => ToolResult::Text(text),
@@ -188,6 +202,9 @@ mod tests {
 
     fn cx(root: &std::path::Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_owned(),
             safety: Arc::new(crate::SafetyPolicy::new()),
             http: reqwest::Client::new(),

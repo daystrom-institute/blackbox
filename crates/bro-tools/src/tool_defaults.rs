@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 enum Flavor {
     Default,
     Pin,
+    Grant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +54,7 @@ struct Rule {
     flavor: Flavor,
     pattern: Pattern,
     param: String,
-    value: String,
+    value: Value,
 }
 
 /// Host-supplied per-(tool,param) default and pin table.
@@ -62,7 +63,7 @@ pub struct ToolArgDefaults {
     rules: Vec<Rule>,
 }
 
-/// Visible rider describing default/pin handling for a single tool call.
+/// Structured observation of default/pin handling for a single tool call.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolArgRider {
     pub defaults_applied: BTreeMap<String, Value>,
@@ -99,13 +100,6 @@ impl ToolArgRider {
         }
         Value::Object(obj)
     }
-
-    fn as_text_rider(&self) -> String {
-        format!(
-            "\n\ntool_arg_context: {}",
-            serde_json::to_string(&self.to_value()).unwrap_or_else(|_| self.to_value().to_string())
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,88 +123,164 @@ impl PinConflict {
     }
 
     pub fn into_tool_result(self, tool_name: &str) -> ToolResult {
-        let rider = self.rider();
         ToolResult::Error(format!(
-            "pin conflict for tool '{tool_name}' param '{}': expected {}, got {}\n{}",
-            self.param,
-            self.expected,
-            self.actual,
-            serde_json::to_string(&rider.to_value())
-                .unwrap_or_else(|_| rider.to_value().to_string())
+            "pin conflict for tool '{tool_name}' param '{}': expected {}, got {}; nothing executed",
+            self.param, self.expected, self.actual,
         ))
     }
 }
 
 impl ToolArgDefaults {
+    /// Compatibility input: every existing host string remains a JSON string.
     pub fn parse_map(raw: BTreeMap<String, String>) -> Result<Self, String> {
-        let mut rules = Vec::new();
-        for (key, value) in raw {
-            rules.push(parse_rule(key, value)?);
-        }
-        Ok(Self { rules })
+        Self::parse_values(
+            raw.into_iter()
+                .map(|(key, value)| (key, Value::String(value)))
+                .collect(),
+        )
+    }
+
+    pub fn parse_values(raw: BTreeMap<String, Value>) -> Result<Self, String> {
+        Ok(Self {
+            rules: raw
+                .into_iter()
+                .map(|(key, value)| parse_rule(key, value))
+                .collect::<Result<_, _>>()?,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 
-    /// Host-side grant lookup for operator-authority flags (RX-V1): the value
-    /// of the Default rule exactly matching (tool, param), if any. Bindings
-    /// query this instead of reading merged tool input, so a cell-authored
-    /// flag of the same name stays a schema error. Pin rules are enforcement,
-    /// not grants, and are ignored here. Values are raw strings; bindings
-    /// parse their own booleans.
+    /// String-only compatibility lookup for ordinary wrapper arguments.
     pub fn lookup(&self, tool_name: &str, param: &str) -> Option<&str> {
+        self.lookup_value(tool_name, param).and_then(Value::as_str)
+    }
+
+    pub fn lookup_value(&self, tool_name: &str, param: &str) -> Option<&Value> {
         self.selected_rules(tool_name, Flavor::Default)
             .into_iter()
             .find(|rule| rule.param == param)
-            .map(|rule| rule.value.as_str())
+            .map(|rule| &rule.value)
     }
 
-    pub fn apply(
+    /// Host-only operator grant lookup. Legacy default keys are supported for
+    /// declared grant parameters; pins never grant authority. Ordinary JSON
+    /// strings are not coerced by this API; the binding interprets its grant.
+    pub fn lookup_grant(&self, tool_name: &str, param: &str) -> Option<&Value> {
+        self.selected_rules(tool_name, Flavor::Grant)
+            .into_iter()
+            .find(|rule| rule.param == param)
+            .map(|rule| &rule.value)
+            .or_else(|| self.lookup_value(tool_name, param))
+    }
+
+    pub fn apply_schema(
         &self,
         tool_name: &str,
         input: Value,
-    ) -> Result<(Value, ToolArgRider), PinConflict> {
-        if self.rules.is_empty() {
-            return Ok((input, ToolArgRider::default()));
-        }
-
-        let mut input_obj = match input {
-            Value::Object(map) => map,
+        schema: &Value,
+        grants: &[&str],
+    ) -> Result<(Value, ToolArgRider), ToolPolicyError> {
+        let mut object = match input {
+            Value::Object(object) => object,
             other => return Ok((other, ToolArgRider::default())),
         };
+        for grant in grants {
+            if object.contains_key(*grant) {
+                return Err(ToolPolicyError::Invalid(format!(
+                    "'{grant}' is host-only authority and cannot be authored in tool arguments"
+                )));
+            }
+        }
         let mut rider = ToolArgRider::default();
-
-        for rule in self.selected_rules(tool_name, Flavor::Default) {
-            if !input_obj.contains_key(&rule.param) {
-                let value = Value::String(rule.value.clone());
-                input_obj.insert(rule.param.clone(), value.clone());
-                rider.defaults_applied.insert(rule.param.clone(), value);
-            }
-        }
-
-        for rule in self.selected_rules(tool_name, Flavor::Pin) {
-            // A pin only acts on a model-supplied value: mismatch refuses,
-            // match records the enforcement. An absent param is a no-op and
-            // MUST stay rider-silent — `pin:*` globs match every tool, so an
-            // unconditional rider would stamp the pinned paths onto every
-            // tool result in the session (observed: vibebh cockpit dispatch
-            // drowning one-line results under two worktree paths per call).
-            let expected = Value::String(rule.value.clone());
-            if let Some(actual) = input_obj.get(&rule.param) {
-                if actual != &expected {
-                    return Err(PinConflict {
-                        param: rule.param.clone(),
-                        expected,
-                        actual: actual.clone(),
-                    });
+        for flavor in [Flavor::Grant, Flavor::Default, Flavor::Pin] {
+            for rule in self.selected_rules(tool_name, flavor) {
+                if grants.contains(&rule.param.as_str()) {
+                    if flavor == Flavor::Pin {
+                        return Err(ToolPolicyError::Invalid(format!(
+                            "{}: pins cannot grant host authority",
+                            rule.key
+                        )));
+                    }
+                    let grant = self
+                        .lookup_grant(tool_name, &rule.param)
+                        .expect("selected host grant");
+                    if !(grant.is_boolean()
+                        || grant.as_str().is_some_and(|value| {
+                            value.eq_ignore_ascii_case("true")
+                                || value.eq_ignore_ascii_case("false")
+                        }))
+                    {
+                        return Err(ToolPolicyError::Invalid(format!(
+                            "{}: host boolean grant expects true or false",
+                            rule.key
+                        )));
+                    }
+                    continue;
                 }
-                rider.pin_enforced.insert(rule.param.clone(), expected);
+                if flavor == Flavor::Grant {
+                    if rule.pattern.is_glob() {
+                        continue;
+                    }
+                    return Err(ToolPolicyError::Invalid(format!(
+                        "{}: tool '{tool_name}' does not declare this host authority grant",
+                        rule.key
+                    )));
+                }
+                if !schema_has_param(schema, &rule.param) {
+                    if rule.pattern.is_glob() {
+                        continue;
+                    }
+                    return Err(ToolPolicyError::Invalid(format!(
+                        "{}: unknown parameter '{}' on tool '{tool_name}'",
+                        rule.key, rule.param
+                    )));
+                }
+                validate_rule_value(schema, rule)?;
+                match flavor {
+                    Flavor::Default if !object.contains_key(&rule.param) => {
+                        object.insert(rule.param.clone(), rule.value.clone());
+                        rider
+                            .defaults_applied
+                            .insert(rule.param.clone(), rule.value.clone());
+                    }
+                    Flavor::Pin => {
+                        if let Some(actual) = object.get(&rule.param) {
+                            if actual != &rule.value {
+                                return Err(ToolPolicyError::Pin(PinConflict {
+                                    param: rule.param.clone(),
+                                    expected: rule.value.clone(),
+                                    actual: actual.clone(),
+                                }));
+                            }
+                            rider
+                                .pin_enforced
+                                .insert(rule.param.clone(), rule.value.clone());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
+        Ok((Value::Object(object), rider))
+    }
 
-        Ok((Value::Object(input_obj), rider))
+    // Existing pure selection tests use permissive property schemas. Runtime
+    // admission always supplies the actual tool schema through apply_schema.
+    #[cfg(test)]
+    fn apply(&self, tool_name: &str, input: Value) -> Result<(Value, ToolArgRider), PinConflict> {
+        let properties: Map<String, Value> = self
+            .rules
+            .iter()
+            .map(|rule| (rule.param.clone(), json!({})))
+            .collect();
+        self.apply_schema(tool_name, input, &json!({"properties":properties}), &[])
+            .map_err(|error| match error {
+                ToolPolicyError::Pin(conflict) => conflict,
+                ToolPolicyError::Invalid(message) => panic!("unexpected schema failure: {message}"),
+            })
     }
 
     pub fn validation_warnings<'a, I>(&self, schemas: I) -> Vec<String>
@@ -272,54 +342,65 @@ impl ToolArgDefaults {
     }
 }
 
-pub fn apply_rider(result: ToolResult, rider: &ToolArgRider) -> ToolResult {
-    if rider.is_empty() {
-        return result;
+#[derive(Debug, Clone)]
+pub enum ToolPolicyError {
+    Pin(PinConflict),
+    Invalid(String),
+}
+
+impl ToolPolicyError {
+    pub fn observation(&self) -> Value {
+        match self {
+            Self::Pin(conflict) => conflict.rider().to_value(),
+            Self::Invalid(message) => json!({"policy_error": message}),
+        }
     }
-    match result {
-        ToolResult::Json(Value::Object(mut obj)) => {
-            if !rider.defaults_applied.is_empty() {
-                obj.insert(
-                    "defaults_applied".to_string(),
-                    Value::Object(rider.defaults_applied.clone().into_iter().collect()),
-                );
-            }
-            if !rider.pin_enforced.is_empty() {
-                obj.insert(
-                    "pin_enforced".to_string(),
-                    Value::Object(rider.pin_enforced.clone().into_iter().collect()),
-                );
-            }
-            if !rider.pin_conflict.is_empty() {
-                obj.insert(
-                    "pin_conflict".to_string(),
-                    Value::Object(rider.pin_conflict.clone().into_iter().collect()),
-                );
-            }
-            ToolResult::Json(Value::Object(obj))
-        }
-        ToolResult::Json(v) => ToolResult::Json(json!({
-            "result": v,
-            "tool_arg_context": rider.to_value(),
-        })),
-        ToolResult::Text(mut text) => {
-            text.push_str(&rider.as_text_rider());
-            ToolResult::Text(text)
-        }
-        ToolResult::Error(mut text) => {
-            text.push_str(&rider.as_text_rider());
-            ToolResult::Error(text)
+    pub fn into_tool_result(self, tool: &str) -> ToolResult {
+        match self {
+            Self::Pin(conflict) => conflict.into_tool_result(tool),
+            Self::Invalid(message) => ToolResult::Error(format!(
+                "invalid host tool policy for '{tool}': {message}; nothing executed"
+            )),
         }
     }
 }
 
-fn parse_rule(key: String, value: String) -> Result<Rule, String> {
+fn validate_rule_value(schema: &Value, rule: &Rule) -> Result<(), ToolPolicyError> {
+    // Validate a one-property object while retaining local reference targets.
+    // Other required parameters are supplied by the actual invocation, not by
+    // this host rule. Real JSON typing is preserved, including null and arrays.
+    let mut check =
+        json!({"type":"object", "properties":schema["properties"], "required":[rule.param]});
+    for key in ["$defs", "definitions"] {
+        if let Some(value) = schema.get(key) {
+            check[key] = value.clone();
+        }
+    }
+    let validator = jsonschema::JSONSchema::compile(&check).map_err(|error| {
+        ToolPolicyError::Invalid(format!(
+            "{}: cannot validate tool schema: {error}",
+            rule.key
+        ))
+    })?;
+    let mut instance = Map::new();
+    instance.insert(rule.param.clone(), rule.value.clone());
+    if !validator.is_valid(&Value::Object(instance)) {
+        return Err(ToolPolicyError::Invalid(format!(
+            "{}: configured value does not satisfy the declared parameter schema",
+            rule.key
+        )));
+    }
+    Ok(())
+}
+
+fn parse_rule(key: String, value: Value) -> Result<Rule, String> {
     let (flavor_raw, rest) = key
         .split_once(':')
         .ok_or_else(|| format!("tool arg default key '{key}' is missing '<flavor>:'"))?;
     let flavor = match flavor_raw {
         "default" => Flavor::Default,
         "pin" => Flavor::Pin,
+        "grant" => Flavor::Grant,
         other => {
             return Err(format!(
                 "tool arg default key '{key}' has unsupported flavor '{other}'"
@@ -527,22 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn riders_are_inserted_into_json_results() {
-        let mut rider = ToolArgRider::default();
-        rider
-            .defaults_applied
-            .insert("session_id".into(), json!("host"));
-        rider.pin_enforced.insert("cwd".into(), json!("/repo/wt"));
-
-        let result = apply_rider(ToolResult::Json(json!({"ok": true})), &rider);
-        let ToolResult::Json(v) = result else {
-            panic!("expected json result");
-        };
-        assert_eq!(v["defaults_applied"]["session_id"], "host");
-        assert_eq!(v["pin_enforced"]["cwd"], "/repo/wt");
-    }
-
-    #[test]
     fn worktree_pin_covers_both_cwd_and_project_dir_spellings() {
         // The pin guards by the literal param key in the tool input, and the
         // table applies BEFORE the daemon's serde alias normalization
@@ -649,6 +714,140 @@ mod tests {
             warnings
                 .iter()
                 .any(|w| w.contains("matched no loaded tool"))
+        );
+    }
+    #[test]
+    fn typed_values_are_preserved_and_validated_against_real_properties() {
+        let schema = json!({"type":"object", "properties":{
+            "limit":{"type":"integer", "minimum":1}, "enabled":{"type":"boolean"},
+            "items":{"type":"array", "items":{"type":"string"}}, "maybe":{"type":["string","null"]},
+            "label":{"type":"string"}
+        }});
+        let defaults = ToolArgDefaults::parse_values(BTreeMap::from([
+            ("default:fixture.limit".into(), json!(10)),
+            ("pin:fixture.limit".into(), json!(10)),
+            ("default:fixture.enabled".into(), json!(true)),
+            ("default:fixture.items".into(), json!(["a", "b"])),
+            ("default:fixture.maybe".into(), Value::Null),
+            ("default:fixture.label".into(), json!("false")),
+        ]))
+        .unwrap();
+        let (result, observation) = defaults
+            .apply_schema("fixture", json!({}), &schema, &[])
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"limit":10,"enabled":true,"items":["a","b"],"maybe":null,"label":"false"})
+        );
+        assert_eq!(observation.pin_enforced["limit"], 10);
+        let legacy = table(&[("default:fixture.enabled", "true")]);
+        assert!(
+            legacy
+                .apply_schema("fixture", json!({}), &schema, &[])
+                .is_err()
+        );
+        let bad = ToolArgDefaults::parse_values(BTreeMap::from([(
+            "default:fixture.limit".into(),
+            json!(0),
+        )]))
+        .unwrap();
+        assert!(
+            bad.apply_schema("fixture", json!({}), &schema, &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_absent_wildcards_skip_but_exact_rules_fail_closed() {
+        let glob = table(&[("default:*.cwd", "/fixture"), ("pin:*.cwd", "/fixture")]);
+        let (result, observation) = glob
+            .apply_schema(
+                "fixture",
+                json!({"query":"text"}),
+                &json!({"properties":{"query":{"type":"string"}}}),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result, json!({"query":"text"}));
+        assert!(observation.is_empty());
+        let exact = table(&[("default:fixture.cwd", "/fixture")]);
+        assert!(
+            exact
+                .apply_schema("fixture", json!({}), &json!({"properties":{}}), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_schema_refs_validate_defaults_and_typed_pins() {
+        let schema = json!({"$defs":{"Kind":{"type":"string","enum":["one","two"]}}, "properties":{"kind":{"$ref":"#/$defs/Kind"}}});
+        for (value, allowed) in [
+            (json!("one"), true),
+            (json!("three"), false),
+            (json!(1), false),
+        ] {
+            let defaults = ToolArgDefaults::parse_values(BTreeMap::from([(
+                "default:fixture.kind".into(),
+                value,
+            )]))
+            .unwrap();
+            assert_eq!(
+                defaults
+                    .apply_schema("fixture", json!({}), &schema, &[])
+                    .is_ok(),
+                allowed
+            );
+        }
+    }
+
+    #[test]
+    fn declared_grants_stay_out_of_inputs_and_observations() {
+        for value in [json!(true), json!("true")] {
+            let defaults = ToolArgDefaults::parse_values(BTreeMap::from([(
+                "default:fixture.acknowledge".into(),
+                value.clone(),
+            )]))
+            .unwrap();
+            let schema = json!({"properties":{"file":{"type":"string"}}});
+            let (result, observation) = defaults
+                .apply_schema("fixture", json!({"file":"a.rs"}), &schema, &["acknowledge"])
+                .unwrap();
+            assert_eq!(result, json!({"file":"a.rs"}));
+            assert!(observation.is_empty());
+            assert_eq!(
+                defaults.lookup_grant("fixture", "acknowledge"),
+                Some(&value)
+            );
+            assert!(
+                defaults
+                    .apply_schema(
+                        "fixture",
+                        json!({"file":"a.rs", "acknowledge":true}),
+                        &schema,
+                        &["acknowledge"]
+                    )
+                    .is_err()
+            );
+        }
+        let explicit = ToolArgDefaults::parse_values(BTreeMap::from([(
+            "grant:fixture.acknowledge".into(),
+            json!(true),
+        )]))
+        .unwrap();
+        assert!(
+            explicit
+                .apply_schema(
+                    "fixture",
+                    json!({}),
+                    &json!({"properties":{}}),
+                    &["acknowledge"]
+                )
+                .is_ok()
+        );
+        assert!(
+            explicit
+                .apply_schema("fixture", json!({}), &json!({"properties":{}}), &[])
+                .is_err()
         );
     }
 }

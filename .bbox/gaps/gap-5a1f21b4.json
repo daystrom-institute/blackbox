@@ -13,8 +13,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/resume-and-control-lifecycle",
   "notes": "Source: missing resume snapshot starts empty with same ID, cleared reference_context becomes present on restore, active /compact discarded. Scoped-doc sibling gap-41e7593e remains distinct.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T19:08:00Z",
-  "updated_at": "2026-09-10T19:08:00Z"
+  "updated_at": "2026-09-10T22:56:08Z",
+  "resolved_at": "2026-09-10T22:56:08Z",
+  "resolution_note": "Implemented strict versioned/native snapshot and event-log checkpoints, lifetime writer locks, durable queued inputs and applied-control acknowledgments, restored output schemas, and explicit refusal of outstanding runtime or unknown remote outcomes. Executable session fixture passes all 9 cases versus baseline 1/9; full workspace 6930 passed, final focused 866 passed. Contracts and limits: design/bro-harness/model-facing-audit/session-and-catalog-repair.md."
 }

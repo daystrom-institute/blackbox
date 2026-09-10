@@ -108,8 +108,8 @@ struct Cli {
     /// Load MCP servers from a `{"mcpServers":{...}}` JSON file and expose
     /// their tools as `mcp__<server>__<tool>`, so a cell can reach an installed
     /// capability (e.g. `@playwright/mcp` → `tools.mcp__playwright__*`) without
-    /// the daemon. Best-effort: a server that can't be reached or listed is
-    /// logged to stderr and skipped.
+    /// the daemon. Required startup failures abort; optional servers publish
+    /// sanitized readiness. Catalogs are fixed for the invocation.
     #[arg(long, value_name = "PATH")]
     mcp_config: Option<PathBuf>,
 
@@ -139,9 +139,9 @@ struct IsolateSurface {
 /// installed capability (`mcp__playwright__*`) directly, where the daemon path
 /// injects them through its own MCP registry.
 ///
-/// MCP loading is best-effort: a server that can't be reached or listed is
-/// logged to stderr and skipped, so MCP unavailability never aborts a run.
-async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
+/// Malformed configuration and required server failures abort startup. Optional
+/// failures emit sanitized readiness. Catalogs are fixed for this invocation.
+async fn build_surface(mcp_config: Option<&str>) -> anyhow::Result<IsolateSurface> {
     let binding_session = BindingToolSession::new();
     let mut tools = builtin_tools();
     tools.extend(binding_session.tools());
@@ -149,12 +149,16 @@ async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
         // Permissive filter: a standalone validator admits everything a server
         // lists. The recursion guard is agent-loop-only — no nested dispatch
         // here to protect against.
-        tools.extend(load_mcp_tools(Some(cfg), &ToolFilter::default()).await);
+        let loaded = load_mcp_tools(Some(cfg), &ToolFilter::default()).await?;
+        for readiness in &loaded.readiness {
+            eprintln!("MCP readiness: {}", serde_json::to_string(readiness)?);
+        }
+        tools.extend(loaded.tools);
     }
-    IsolateSurface {
+    Ok(IsolateSurface {
         tools: bro_tools::prune_tool_dependencies(tools),
         binding_session,
-    }
+    })
 }
 
 /// Minimal `ToolCx` rooted at `root` — same shape as the test helper, all
@@ -162,6 +166,9 @@ async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
 /// edit sinks are wired so `edits.*`/`shell_run` also work when exercised.
 fn make_cx(root: PathBuf, tool_arg_defaults: ToolArgDefaults) -> ToolCx {
     ToolCx {
+        tool_observations: Default::default(),
+        instruction_generation: 0,
+        instruction_policy: None,
         root,
         safety: Arc::new(SafetyPolicy::new()),
         http: reqwest::Client::new(),
@@ -182,15 +189,15 @@ fn make_cx(root: PathBuf, tool_arg_defaults: ToolArgDefaults) -> ToolCx {
 /// --additional-context path), else empty.
 fn load_tool_defaults(cli_json: Option<&str>) -> Result<ToolArgDefaults> {
     let raw = match cli_json {
-        Some(raw) => serde_json::from_str::<BTreeMap<String, String>>(raw)
-            .context("parse --tool-defaults as a JSON string map")?,
+        Some(raw) => serde_json::from_str::<BTreeMap<String, Value>>(raw)
+            .context("parse --tool-defaults as a JSON value map")?,
         None => match std::env::var("BRO_HARNESS_TOOL_DEFAULTS") {
             Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
-                .context("parse BRO_HARNESS_TOOL_DEFAULTS as a JSON string map")?,
+                .context("parse BRO_HARNESS_TOOL_DEFAULTS as a JSON value map")?,
             _ => BTreeMap::new(),
         },
     };
-    ToolArgDefaults::parse_map(raw).map_err(anyhow::Error::msg)
+    ToolArgDefaults::parse_values(raw).map_err(anyhow::Error::msg)
 }
 
 fn find_tool<'a>(tools: &'a [Arc<dyn Tool>], name: &str) -> Result<&'a Arc<dyn Tool>> {
@@ -455,7 +462,7 @@ async fn main() -> Result<()> {
         Some(path) => Some(read_cli_file(path)?),
         None => None,
     };
-    let surface = build_surface(mcp_config.as_deref()).await;
+    let surface = build_surface(mcp_config.as_deref()).await?;
     let tool_defaults = load_tool_defaults(cli.tool_defaults.as_deref())?;
 
     if cli.list {
@@ -544,7 +551,7 @@ mod tests {
     async fn cell_mode_preserves_kv_and_functions_across_cells() {
         let dir = tempfile::tempdir().unwrap();
         let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
-        let surface = build_surface(None).await;
+        let surface = build_surface(None).await.unwrap();
         let results = execute_cell_sources(
             vec![
                 "store('k', { n: 7 }); store('helpers.double', (n) => n * 2);".to_string(),
@@ -570,7 +577,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("probe.txt"), "hello from cell").unwrap();
         let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
-        let surface = build_surface(None).await;
+        let surface = build_surface(None).await.unwrap();
         let results = execute_cell_sources(
             vec![
                 "const body = await tools.file_read({ file_path: 'probe.txt' }); text(body);"
@@ -593,7 +600,7 @@ mod tests {
     async fn cell_mode_auto_waits_until_a_yielded_cell_completes() {
         let dir = tempfile::tempdir().unwrap();
         let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
-        let surface = build_surface(None).await;
+        let surface = build_surface(None).await.unwrap();
         let results = execute_cell_sources(
             vec![
                 r#"// @exec: {"yield_time_ms": 1}
@@ -701,6 +708,7 @@ text("after");"#
                     name: "echo".to_string(),
                     description: "echo the input".to_string(),
                     input_schema: json!({"type": "object"}),
+                    ..Default::default()
                 }])
             }
             async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult> {
@@ -714,10 +722,16 @@ text("after");"#
                 server: Arc::new(EchoSurface),
             }],
             tool_placement: ToolPlacementMap::new(),
+            server_policies: Default::default(),
         };
         let mut tools = builtin_tools();
         tools.extend(BindingToolSession::new().tools());
-        tools.extend(load_mcp_tools_from_config(&cfg, &ToolFilter::default()).await);
+        tools.extend(
+            load_mcp_tools_from_config(&cfg, &ToolFilter::default())
+                .await
+                .unwrap()
+                .tools,
+        );
         assert!(
             tools.iter().any(|t| t.name() == "mcp__fake__echo"),
             "MCP tool must merge into the surface"

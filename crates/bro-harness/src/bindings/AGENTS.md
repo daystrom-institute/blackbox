@@ -112,17 +112,20 @@ Footguns that bit:
 
 ## The trust model (don't re-litigate per binding)
 
-- **One mutation path.** `edits.apply` is the only binding that writes.
-  Everything else returns data: facts return Spans, authorities return
-  `{changes, findings}` for `edits.merge`. New mutating capability routes
-  through the existing choke point, not a second writer.
+- **One structured file mutation path.** `edits.apply` owns structured file
+  changes: facts return Spans and authorities return `{changes, findings}`
+  for `edits.merge`. The expert `lsp.executeCommand` seam runs arbitrary
+  trusted server commands under exclusive admission and is conservatively
+  marked destructive. Refusing `workspace/applyEdit` does not establish that
+  arbitrary server commands are side-effect free. New structured file mutations
+  route through `edits.apply`.
 - **No confirm flags, ever.** A confirm/ack a cell can author is theater.
   The gate is detection — stale_span, invalid_edits, create_exists,
   parse_error_after_apply — bouncing with `applied: false` + findings
   `{kind, file, detail, resolution_hint}` and byte-exact rollback. Findings
   must be repairable without re-running discovery. Operator authority
   (RX-V1 flags) arrives dispatch-side, never as a cell argument: the binding
-  reads it host-side via `cx.tool_arg_defaults.lookup(tool, param)`, and the
+  reads it host-side via `cx.tool_arg_defaults.lookup_grant(tool, param)`, and the
   daemon fills that map from ambient context, then the brofile's
   `tool_defaults`, then per-dispatch `ExecParams.tool_defaults` (most
   specific wins), forwarded to the harness child via `--additional-context`.

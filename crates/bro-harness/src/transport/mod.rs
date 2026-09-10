@@ -18,12 +18,17 @@
 //! never sees wire shapes. `snapshot`/`restore` persist it for `--resume`.
 
 pub mod anthropic;
+mod catalog_prompt;
 pub mod codex_auth;
 pub mod http;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod openai_responses_ws;
 pub mod responses_common;
+mod snapshot;
+
+pub use catalog_prompt::base_instructions_for_capabilities;
+pub(crate) use snapshot::validate_snapshot;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

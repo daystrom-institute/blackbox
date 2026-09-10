@@ -71,22 +71,19 @@ impl Tool for SandboxGrounding {
             Ok(args) => args,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        // Delegates to sandbox_status_manifest's sync git captures — keep the
-        // child-process waits off the runtime workers.
-        let cx = cx.clone();
-        crate::tool::call_blocking(move || ToolResult::from_result(sandbox_grounding(&cx, args)))
-            .await
+        ToolResult::from_result(sandbox_grounding(cx, args).await)
     }
 }
 
-fn sandbox_grounding(cx: &ToolCx, args: SandboxGroundingInput) -> anyhow::Result<Value> {
+async fn sandbox_grounding(cx: &ToolCx, args: SandboxGroundingInput) -> anyhow::Result<Value> {
     if args.enter_worktree.unwrap_or(false) {
         anyhow::bail!(
             "sandbox_grounding no longer creates worktrees from inside a harness session; use bro fleet dispatch or workflow WorktreeCreate so the harness starts with the correct cwd"
         );
     }
-    let before =
-        crate::workspace::sandbox_status_manifest(cx, None, args.status_limit).map_err(|err| {
+    let before = crate::workspace::sandbox_status_manifest(cx, None, args.status_limit)
+        .await
+        .map_err(|err| {
             anyhow::anyhow!("launch sandbox_status failed before worktree entry: {err:#}")
         })?;
     let out = json!({
@@ -2803,6 +2800,9 @@ mod tests {
 
     fn cx(root: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_path_buf(),
             safety: Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),

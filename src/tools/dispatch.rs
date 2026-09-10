@@ -37,8 +37,8 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) allow_tools: Option<Vec<String>>,
     pub(crate) disallow_tools: Option<Vec<String>>,
     pub(crate) tool_placement: Option<std::collections::BTreeMap<String, String>>,
-    pub(crate) brofile_tool_defaults: Option<BTreeMap<String, String>>,
-    pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
+    pub(crate) brofile_tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
@@ -2732,7 +2732,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
-            Option<BTreeMap<String, String>>,
+            Option<BTreeMap<String, Value>>,
             bool,
             Option<orchestration::brofile::BrofileContext>,
         ),
@@ -2932,7 +2932,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
-            Option<BTreeMap<String, String>>,
+            Option<BTreeMap<String, Value>>,
             bool,
             Option<orchestration::allocator::RuntimeLease>,
         ),
@@ -5002,7 +5002,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"synthetic provider ref
                 .and_then(|defaults| {
                     defaults.get("default:rust.moveStructFields.acknowledge_repr")
                 })
-                .map(String::as_str),
+                .and_then(Value::as_str),
             Some("true")
         );
     }

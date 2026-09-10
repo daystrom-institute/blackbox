@@ -11,94 +11,39 @@
 //! Dropping the last tool drops the connection; stdio children are reaped via
 //! `kill_on_drop(true)`.
 //!
-//! Failures are best-effort: a server that can't be reached or listed is
-//! logged (to stderr) and skipped — MCP unavailability never aborts the
-//! harness.
+//! Startup is bounded per server. Required failures abort session construction;
+//! optional failures publish sanitized readiness. Catalogs are fixed for the
+//! session. Dynamic list-change reconciliation is not implemented.
 
 use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use http::{HeaderName, HeaderValue};
-use rmcp::RoleClient;
+
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
+use rmcp::model::CallToolRequestParams;
+
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-mod result;
+mod admission;
+mod config;
+mod remote;
+pub(crate) mod result;
+pub use admission::{
+    McpLoad, McpServerReadiness, load_mcp_tools, load_mcp_tools_from_config,
+    load_mcp_tools_from_config_with_capability_aliases, load_mcp_tools_with_capability_aliases,
+};
+pub use config::McpServerPolicy;
+use remote::ServerConn;
 
 #[derive(Clone)]
 pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
     pub tool_placement: ToolPlacementMap,
-}
-
-impl McpConfig {
-    pub fn from_json(cfg: &str) -> anyhow::Result<Self> {
-        let v: Value = serde_json::from_str(cfg)?;
-        let mut servers = Vec::new();
-        if let Some(obj) = v["mcpServers"].as_object() {
-            for (name, sc) in obj {
-                let transport_type = sc
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .or_else(|| sc.get("command").map(|_| "stdio"))
-                    .or_else(|| sc.get("url").map(|_| "http"));
-                let Some(transport_type) = transport_type else {
-                    tracing::warn!(server = %name, "ignoring MCP server with no transport fields");
-                    continue;
-                };
-                match transport_type {
-                    "http" => {
-                        if let Some(url) = sc["url"].as_str() {
-                            servers.push(McpServerConfig::Http {
-                                name: name.clone(),
-                                url: url.to_string(),
-                                headers: parse_string_map(sc.get("headers")),
-                                exclude_tools: parse_string_array(sc.get("exclude_tools")),
-                            });
-                        } else {
-                            tracing::warn!(server = %name, "ignoring MCP server with no url");
-                        }
-                    }
-                    "sse" => {
-                        if let Some(url) = sc["url"].as_str() {
-                            servers.push(McpServerConfig::Sse {
-                                name: name.clone(),
-                                url: url.to_string(),
-                                headers: parse_string_map(sc.get("headers")),
-                                exclude_tools: parse_string_array(sc.get("exclude_tools")),
-                            });
-                        } else {
-                            tracing::warn!(server = %name, "ignoring MCP server with no url");
-                        }
-                    }
-                    "stdio" => {
-                        if let Some(command) = sc["command"].as_str() {
-                            servers.push(McpServerConfig::Stdio {
-                                name: name.clone(),
-                                command: command.to_string(),
-                                args: parse_string_array(sc.get("args")),
-                                env: parse_string_map(sc.get("env")),
-                            });
-                        } else {
-                            tracing::warn!(server = %name, "ignoring stdio MCP server with no command");
-                        }
-                    }
-                    other => {
-                        tracing::warn!(server = %name, transport = %other, "ignoring unsupported MCP transport");
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            servers,
-            tool_placement: parse_tool_placement_value(&v),
-        })
-    }
+    pub server_policies: BTreeMap<String, McpServerPolicy>,
 }
 
 #[derive(Clone)]
@@ -148,11 +93,14 @@ impl McpServerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct McpToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub title: Option<String>,
+    pub annotations: Option<rmcp::model::ToolAnnotations>,
+    pub output_schema: Option<Value>,
 }
 
 #[async_trait]
@@ -160,91 +108,6 @@ pub trait McpSurface: Send + Sync {
     async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>>;
     /// Native host result, projected into the same MCP envelope as remote tools.
     async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult>;
-}
-
-/// Parse `--mcp-config` (`{"mcpServers":{name:{...}}}`), connect to each
-/// server, list its tools, and return those admitted by `filter`. Denied tools
-/// are dropped here so they never enter the registry — not listed to the model,
-/// not loadable via tool_search, not dispatchable.
-pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Vec<Arc<dyn Tool>> {
-    load_mcp_tools_with_capability_aliases(mcp_config, filter, None).await
-}
-
-pub async fn load_mcp_tools_with_capability_aliases(
-    mcp_config: Option<&str>,
-    filter: &ToolFilter,
-    capability_server: Option<&str>,
-) -> Vec<Arc<dyn Tool>> {
-    let Some(cfg) = mcp_config else {
-        return Vec::new();
-    };
-    let config = match McpConfig::from_json(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("ignoring --mcp-config (parse failed): {e:#}");
-            return Vec::new();
-        }
-    };
-    load_mcp_tools_from_config_with_capability_aliases(&config, filter, capability_server).await
-}
-
-pub async fn load_mcp_tools_from_config(
-    config: &McpConfig,
-    filter: &ToolFilter,
-) -> Vec<Arc<dyn Tool>> {
-    load_mcp_tools_from_config_with_capability_aliases(config, filter, None).await
-}
-
-pub async fn load_mcp_tools_from_config_with_capability_aliases(
-    config: &McpConfig,
-    filter: &ToolFilter,
-    capability_server: Option<&str>,
-) -> Vec<Arc<dyn Tool>> {
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for server in &config.servers {
-        match server_backend_and_specs(server).await {
-            Ok((backend, specs)) => {
-                let total = specs.len();
-                let mut admitted = 0;
-                for (call_name, description, schema) in specs {
-                    let description = format!("{description}\n{}", result::RESULT_GUIDANCE);
-                    let qname = format!("mcp__{}__{}", server.name(), call_name);
-                    if capability_server == Some(server.name())
-                        && !server.excludes(&call_name, &qname)
-                        && let Some(alias) = capability_alias(&call_name)
-                        && !filter.denied(&qname)
-                        && filter.permits(alias)
-                    {
-                        tools.push(Arc::new(McpTool {
-                            backend: backend.clone(),
-                            call_name: call_name.clone(),
-                            name: alias.to_string(),
-                            description: description.clone(),
-                            schema: schema.clone(),
-                        }));
-                    }
-                    if !server.excludes(&call_name, &qname) && filter.permits(&qname) {
-                        admitted += 1;
-                        tools.push(Arc::new(McpTool {
-                            backend: backend.clone(),
-                            call_name,
-                            name: qname,
-                            description,
-                            schema,
-                        }));
-                    }
-                }
-                tracing::info!(
-                    server = %server.name(),
-                    admitted,
-                    denied = total - admitted,
-                    "MCP tools loaded"
-                );
-            }
-            Err(e) => tracing::warn!(server = %server.name(), "MCP server unavailable: {e:#}"),
-        }
-    }
-    tools
 }
 
 fn capability_alias(call_name: &str) -> Option<&'static str> {
@@ -274,45 +137,16 @@ impl ToolPlacement {
 pub type ToolPlacementMap = BTreeMap<String, ToolPlacement>;
 pub type ToolList = Vec<Arc<dyn Tool>>;
 
-/// Parse the top-level `tool_placement` map from the same JSON blob that carries
-/// `mcpServers`. Missing and invalid entries fail safe to the default out-box
-/// placement; the caller applies this map only after [`ToolFilter`] admission.
-pub fn parse_tool_placement(mcp_config: Option<&str>) -> ToolPlacementMap {
-    let Some(cfg) = mcp_config else {
-        return ToolPlacementMap::new();
-    };
-    let v: Value = match serde_json::from_str(cfg) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("ignoring tool_placement (MCP config parse failed): {e:#}");
-            return ToolPlacementMap::new();
-        }
-    };
-    parse_tool_placement_value(&v)
-}
-
-fn parse_tool_placement_value(v: &Value) -> ToolPlacementMap {
-    let mut out = ToolPlacementMap::new();
-    let Some(obj) = v.get("tool_placement").and_then(Value::as_object) else {
-        return out;
-    };
-    for (name, placement) in obj {
-        let Some(placement) = placement.as_str() else {
-            tracing::warn!(tool = %name, "ignoring non-string tool_placement entry");
-            continue;
-        };
-        let parsed = match placement {
-            "in-box" => ToolPlacement::InBox,
-            "out-box" => ToolPlacement::OutBox,
-            "both" => ToolPlacement::Both,
-            other => {
-                tracing::warn!(tool = %name, placement = %other, "ignoring unknown tool_placement");
-                continue;
-            }
-        };
-        out.insert(name.clone(), parsed);
-    }
-    out
+/// Read placement through the same strict config validation used for admission.
+pub fn parse_tool_placement(mcp_config: Option<&str>) -> anyhow::Result<ToolPlacementMap> {
+    mcp_config
+        .map(McpConfig::from_json)
+        .transpose()
+        .map(|config| {
+            config
+                .map(|config| config.tool_placement)
+                .unwrap_or_default()
+        })
 }
 
 pub fn split_mcp_tools_by_placement(
@@ -392,40 +226,6 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-fn parse_string_array(v: Option<&Value>) -> Vec<String> {
-    v.and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect()
-}
-
-fn parse_string_map(v: Option<&Value>) -> BTreeMap<String, String> {
-    v.and_then(|v| v.as_object())
-        .into_iter()
-        .flatten()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-        .collect()
-}
-
-/// A persistent connection to one MCP server. Started once when its tools are
-/// loaded and Arc-shared by every `McpTool` it produces, so a stateful server
-/// (e.g. `@playwright/mcp` holding a browser across calls) sees the same
-/// session on every call instead of a fresh subprocess. Dropping the last tool
-/// drops the connection; stdio children are reaped via `kill_on_drop(true)`.
-struct ServerConn {
-    running: RunningService<RoleClient, ()>,
-}
-
-impl ServerConn {
-    async fn list_tools(&self) -> anyhow::Result<Vec<rmcp::model::Tool>> {
-        Ok(self.running.peer().list_all_tools().await?)
-    }
-    async fn call_tool(&self, params: CallToolRequestParams) -> anyhow::Result<CallToolResult> {
-        Ok(self.running.peer().call_tool(params).await?)
-    }
-}
-
 /// The shared backend an `McpTool` dispatches through. `Remote` is one
 /// persistent rmcp connection; `InProcess` is a shared `McpSurface` (already
 /// session-stable by construction). Cloned cheaply into each tool of a server.
@@ -437,7 +237,10 @@ enum McpBackend {
 
 /// Start one persistent connection to a remote (stdio/http/sse) MCP server.
 /// InProcess servers have no rmcp connection and are handled by the caller.
-async fn start_remote_server(server: &McpServerConfig) -> anyhow::Result<Arc<ServerConn>> {
+async fn start_remote_server(
+    server: &McpServerConfig,
+    tool_timeout_ms: u64,
+) -> anyhow::Result<Arc<ServerConn>> {
     let running = match server {
         McpServerConfig::Stdio {
             command, args, env, ..
@@ -447,51 +250,60 @@ async fn start_remote_server(server: &McpServerConfig) -> anyhow::Result<Arc<Ser
             let transport = TokioChildProcess::new(cmd.configure(|_| {}))?;
             ().serve(transport).await?
         }
-        McpServerConfig::Http { url, headers, .. } | McpServerConfig::Sse { url, headers, .. } => {
+        McpServerConfig::Http { url, headers, .. } => {
             let transport =
                 StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
             ().serve(transport).await?
         }
+        McpServerConfig::Sse { .. } => anyhow::bail!("legacy SSE MCP transport is unsupported"),
         McpServerConfig::InProcess { .. } => {
             return Err(anyhow::anyhow!(
                 "in-process servers have no remote connection"
             ));
         }
     };
-    Ok(Arc::new(ServerConn { running }))
+    Ok(Arc::new(ServerConn::new(
+        running,
+        server.name().to_owned(),
+        tool_timeout_ms,
+    )))
 }
 
-/// Resolve a server's shared backend and its raw tool specs as `(call_name,
-/// description, input_schema)`. Remote servers start one persistent connection
-/// here; InProcess servers share the surface directly.
+/// Resolve one persistent backend and retain the server's declared tool metadata.
 async fn server_backend_and_specs(
     server: &McpServerConfig,
-) -> anyhow::Result<(McpBackend, Vec<(String, String, Value)>)> {
+    tool_timeout_ms: u64,
+) -> anyhow::Result<(McpBackend, Vec<McpToolSpec>)> {
     match server {
-        McpServerConfig::InProcess { server: svc, .. } => Ok((
-            McpBackend::InProcess(svc.clone()),
-            svc.list_tools()
-                .await?
-                .into_iter()
-                .map(|s| (s.name, s.description, s.input_schema))
-                .collect(),
-        )),
+        McpServerConfig::InProcess { server: svc, .. } => {
+            Ok((McpBackend::InProcess(svc.clone()), svc.list_tools().await?))
+        }
         remote => {
-            let conn = start_remote_server(remote).await?;
+            let conn = start_remote_server(remote, tool_timeout_ms).await?;
             let specs = conn
                 .list_tools()
                 .await?
                 .into_iter()
-                .map(|t| {
-                    (
-                        t.name.to_string(),
-                        t.description.map(|d| d.to_string()).unwrap_or_default(),
-                        Value::Object((*t.input_schema).clone()),
-                    )
-                })
+                .map(remote_tool_spec)
                 .collect();
             Ok((McpBackend::Remote(conn), specs))
         }
+    }
+}
+
+fn remote_tool_spec(tool: rmcp::model::Tool) -> McpToolSpec {
+    McpToolSpec {
+        name: tool.name.to_string(),
+        description: tool
+            .description
+            .map(|description| description.to_string())
+            .unwrap_or_default(),
+        input_schema: Value::Object((*tool.input_schema).clone()),
+        title: tool.title,
+        annotations: tool.annotations,
+        output_schema: tool
+            .output_schema
+            .map(|schema| Value::Object((*schema).clone())),
     }
 }
 
@@ -503,6 +315,8 @@ struct McpTool {
     name: String,
     description: String,
     schema: Value,
+    output_schema: Value,
+    annotations: bro_tools::ToolAnnotations,
 }
 
 #[async_trait]
@@ -516,8 +330,20 @@ impl Tool for McpTool {
     fn input_schema(&self) -> Value {
         self.schema.clone()
     }
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        match self.call_inner(input).await {
+    fn output_schema(&self) -> Option<Value> {
+        Some(self.output_schema.clone())
+    }
+    fn annotations(&self) -> bro_tools::ToolAnnotations {
+        self.annotations
+    }
+    fn uncertain_outcome(&self) -> Option<String> {
+        match &self.backend {
+            McpBackend::Remote(connection) => connection.uncertain_outcome(),
+            McpBackend::InProcess(_) => None,
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        match self.call_inner(input, &cx.cancellation).await {
             Ok(r) => r,
             Err(e) => ToolResult::Error(format!("mcp call '{}' failed: {e:#}", self.name)),
         }
@@ -525,27 +351,30 @@ impl Tool for McpTool {
 }
 
 impl McpTool {
-    async fn call_inner(&self, input: Value) -> anyhow::Result<ToolResult> {
+    async fn call_inner(
+        &self,
+        input: Value,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<ToolResult> {
         // Always send an arguments object (even empty) — some servers reject a
         // missing `arguments` field with -32602.
         let input_args = match input {
             Value::Object(m) => m,
-            _ => serde_json::Map::new(),
+            _ => anyhow::bail!("MCP tool arguments must be an object"),
         };
-        let resp = match &self.backend {
+        match &self.backend {
             McpBackend::Remote(conn) => {
                 let params = CallToolRequestParams::new(self.call_name.clone())
                     .with_arguments(input_args.into_iter().collect());
-                conn.call_tool(params).await?
+                Ok(conn.call_tool(params, cancellation).await)
             }
             McpBackend::InProcess(svc) => {
                 let native = svc
                     .call_tool(&self.call_name, Value::Object(input_args))
                     .await?;
-                return Ok(result::from_native_result(native));
+                Ok(result::from_native_result(native))
             }
-        };
-        Ok(result::to_tool_result(&resp))
+        }
     }
 }
 
@@ -819,11 +648,13 @@ mod tests {
                     name: "placed".to_string(),
                     description: "placed".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    ..Default::default()
                 },
                 McpToolSpec {
                     name: "default_out".to_string(),
                     description: "default out".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    ..Default::default()
                 },
             ])
         }
@@ -847,9 +678,13 @@ mod tests {
                 "mcp__sdk__placed".to_string(),
                 ToolPlacement::InBox,
             )]),
+            server_policies: Default::default(),
         };
 
-        let tools = load_mcp_tools_from_config(&config, &ToolFilter::default()).await;
+        let tools = load_mcp_tools_from_config(&config, &ToolFilter::default())
+            .await
+            .unwrap()
+            .tools;
         let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["mcp__sdk__placed", "mcp__sdk__default_out"]);
         assert!(
@@ -875,16 +710,19 @@ mod tests {
                     name: "bbox_corpus_search".to_string(),
                     description: "corpus".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    ..Default::default()
                 },
                 McpToolSpec {
                     name: "external_action".to_string(),
                     description: "qualified external capability".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    ..Default::default()
                 },
                 McpToolSpec {
                     name: "bbox_search".to_string(),
                     description: "full catalog member".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    ..Default::default()
                 },
             ])
         }
@@ -902,6 +740,7 @@ mod tests {
                 server: Arc::new(CapabilitySurface),
             }],
             tool_placement: ToolPlacementMap::new(),
+            server_policies: Default::default(),
         };
 
         let tools = load_mcp_tools_from_config_with_capability_aliases(
@@ -909,7 +748,9 @@ mod tests {
             &ToolFilter::default(),
             Some("blackbox"),
         )
-        .await;
+        .await
+        .unwrap()
+        .tools;
         let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(
             names,
@@ -926,7 +767,9 @@ mod tests {
             &ToolFilter::from_csv(None, Some("corpus_search")),
             Some("blackbox"),
         )
-        .await;
+        .await
+        .unwrap()
+        .tools;
         assert_eq!(
             flat_only.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
             vec!["corpus_search"]
@@ -940,7 +783,9 @@ mod tests {
             ),
             Some("blackbox"),
         )
-        .await;
+        .await
+        .unwrap()
+        .tools;
         assert!(
             source_denied.is_empty(),
             "a qualified-source deny must also close its flat alias"

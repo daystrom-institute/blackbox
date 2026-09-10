@@ -163,6 +163,14 @@ impl Tool for LocalRenderTool {
         self.upstream.input_schema()
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        self.upstream.output_schema()
+    }
+
+    fn uncertain_outcome(&self) -> Option<String> {
+        self.upstream.uncertain_outcome()
+    }
+
     fn freeform_grammar(&self) -> Option<FreeformGrammar> {
         self.upstream.freeform_grammar()
     }
@@ -200,9 +208,7 @@ impl Tool for LocalRenderTool {
         let selector = match self.runtime.render_selector(requested) {
             Ok(selector) => selector,
             Err(error) => {
-                return ToolResult::Error(format!(
-                    "local project render target refused: {error:#}"
-                ));
+                return local_error(format!("local project render target refused: {error:#}"));
             }
         };
         public.insert("project".into(), Value::String(selector));
@@ -232,14 +238,14 @@ impl Tool for LocalRenderTool {
                 Ok(Some(assembled)) => break assembled,
                 Ok(None) => {
                     let Some(next_offset) = next_offset else {
-                        return ToolResult::Error(
+                        return local_error(
                             "daemon project render plan ended before assembly completed".into(),
                         );
                     };
                     offset = next_offset;
                 }
                 Err(error) => {
-                    return ToolResult::Error(format!(
+                    return local_error(format!(
                         "daemon returned an invalid render plan: {error:#}"
                     ));
                 }
@@ -256,10 +262,10 @@ impl Tool for LocalRenderTool {
             {
                 Ok(Ok(execution)) => execution,
                 Ok(Err(error)) => {
-                    return ToolResult::Error(format!("local project render failed: {error:#}"));
+                    return local_error(format!("local project render failed: {error:#}"));
                 }
                 Err(error) => {
-                    return ToolResult::Error(format!("local project render task failed: {error}"));
+                    return local_error(format!("local project render task failed: {error}"));
                 }
             };
 
@@ -286,7 +292,7 @@ impl Tool for LocalRenderTool {
             output.push('\n');
             output.push_str(&diagnostics);
         }
-        ToolResult::Text(output)
+        crate::mcp::result::from_native_result(ToolResult::Text(output))
     }
 }
 
@@ -296,19 +302,21 @@ fn parse_render_plan_chunk(
     let value = parse_json_tool_result(result, "project render plan")?;
     if value.get("status").and_then(Value::as_str) != Some("render_locality_plan_chunk") {
         if value.get("error").and_then(Value::as_str) == Some("response_too_large") {
-            return Err(ToolResult::Error(
+            return Err(local_error(
                 "daemon project render plan chunk exceeded the MCP response cap".into(),
             ));
         }
-        return Err(ToolResult::Error(
+        return Err(local_error(
             "daemon returned an unexpected project render plan status".into(),
         ));
     }
-    serde_json::from_value(value.get("chunk").cloned().ok_or_else(|| {
-        ToolResult::Error("daemon project render response omitted its chunk".into())
-    })?)
+    serde_json::from_value(
+        value.get("chunk").cloned().ok_or_else(|| {
+            local_error("daemon project render response omitted its chunk".into())
+        })?,
+    )
     .map_err(|error| {
-        ToolResult::Error(format!(
+        local_error(format!(
             "daemon returned an invalid render plan chunk: {error}"
         ))
     })
@@ -317,7 +325,7 @@ fn parse_render_plan_chunk(
 fn parse_render_completion(result: ToolResult) -> std::result::Result<Option<String>, ToolResult> {
     let value = parse_json_tool_result(result, "project render completion")?;
     if value.get("status").and_then(Value::as_str) != Some("render_locality_complete") {
-        return Err(ToolResult::Error(
+        return Err(local_error(
             "daemon returned an unexpected project render completion status".into(),
         ));
     }
@@ -325,24 +333,58 @@ fn parse_render_completion(result: ToolResult) -> std::result::Result<Option<Str
         .get("diagnostics")
         .filter(|value| !value.is_null())
         .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                ToolResult::Error("daemon returned invalid render diagnostics".into())
-            })
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| local_error("daemon returned invalid render diagnostics".into()))
         })
         .transpose()
 }
 
+/// Consume the MCP envelope only at this internal plan boundary. Final remote
+/// results and remote error receipts remain unchanged.
 fn parse_json_tool_result(
     result: ToolResult,
     label: &str,
 ) -> std::result::Result<Value, ToolResult> {
-    match result {
-        ToolResult::Json(value) => Ok(value),
-        ToolResult::Text(text) => serde_json::from_str(&text).map_err(|error| {
-            ToolResult::Error(format!("daemon returned an invalid {label}: {error}"))
-        }),
-        error @ ToolResult::Error(_) => Err(error),
+    let envelope = match result {
+        ToolResult::Json(value) => value,
+        error @ ToolResult::Error(_) => return Err(error),
+        ToolResult::Text(text) => {
+            return Err(local_error(format!(
+                "daemon returned a non-envelope {label}: {text}"
+            )));
+        }
+    };
+    let invalid = |reason: &str| {
+        local_error(format!(
+            "daemon returned an invalid {label}: {reason}; MCP evidence: {envelope}"
+        ))
+    };
+    let content = envelope
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("missing content array"))?;
+    match envelope.get("isError").and_then(Value::as_bool) {
+        Some(true) => return Err(ToolResult::Error(envelope.to_string())),
+        Some(false) => {}
+        None => return Err(invalid("missing isError boolean")),
     }
+    if let Some(structured) = envelope.get("structuredContent") {
+        return Ok(structured.clone());
+    }
+    if content.len() != 1 || content[0].get("type").and_then(Value::as_str) != Some("text") {
+        return Err(invalid("expected structuredContent or one JSON text block"));
+    }
+    let text = content[0]
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("text block omitted text"))?;
+    serde_json::from_str(text).map_err(|error| invalid(&error.to_string()))
+}
+
+fn local_error(message: String) -> ToolResult {
+    crate::mcp::result::from_native_result(ToolResult::Error(message))
 }
 
 #[async_trait]
@@ -357,6 +399,14 @@ impl Tool for LocalBlameTool {
 
     fn input_schema(&self) -> Value {
         self.upstream.input_schema()
+    }
+
+    fn output_schema(&self) -> Option<Value> {
+        self.upstream.output_schema()
+    }
+
+    fn uncertain_outcome(&self) -> Option<String> {
+        self.upstream.uncertain_outcome()
     }
 
     fn freeform_grammar(&self) -> Option<FreeformGrammar> {
@@ -396,10 +446,10 @@ impl Tool for LocalBlameTool {
             {
                 Ok(Ok(fact)) => fact,
                 Ok(Err(error)) => {
-                    return ToolResult::Error(format!("local blame execution failed: {error:#}"));
+                    return local_error(format!("local blame execution failed: {error:#}"));
                 }
                 Err(error) => {
-                    return ToolResult::Error(format!("local blame task failed: {error}"));
+                    return local_error(format!("local blame task failed: {error}"));
                 }
             };
 
@@ -418,20 +468,13 @@ impl Tool for LocalBlameTool {
 fn parse_blame_plan(
     result: ToolResult,
 ) -> std::result::Result<bbox_corpus_core::blame_transport::BlameExecutionPlanV1, ToolResult> {
-    let value = match result {
-        ToolResult::Json(value) => value,
-        ToolResult::Text(text) => serde_json::from_str(&text).map_err(|error| {
-            ToolResult::Error(format!("daemon returned an invalid blame plan: {error}"))
-        })?,
-        error @ ToolResult::Error(_) => return Err(error),
-    };
+    let value = parse_json_tool_result(result, "blame plan")?;
     let plan = value
         .get("plan")
         .cloned()
-        .ok_or_else(|| ToolResult::Error("daemon blame plan response omitted plan".into()))?;
-    serde_json::from_value(plan).map_err(|error| {
-        ToolResult::Error(format!("daemon returned an invalid blame plan: {error}"))
-    })
+        .ok_or_else(|| local_error("daemon blame plan response omitted plan".into()))?;
+    serde_json::from_value(plan)
+        .map_err(|error| local_error(format!("daemon returned an invalid blame plan: {error}")))
 }
 
 #[async_trait]
@@ -446,6 +489,14 @@ impl Tool for ProjectMutationTool {
 
     fn input_schema(&self) -> Value {
         self.upstream.input_schema()
+    }
+
+    fn output_schema(&self) -> Option<Value> {
+        self.upstream.output_schema()
+    }
+
+    fn uncertain_outcome(&self) -> Option<String> {
+        self.upstream.uncertain_outcome()
     }
 
     fn freeform_grammar(&self) -> Option<FreeformGrammar> {
@@ -466,12 +517,12 @@ impl Tool for ProjectMutationTool {
         let kind = self.kind;
         let local = tokio::task::spawn_blocking(move || runtime.mutate(kind, local_input)).await;
         match local {
-            Ok(Ok(Some(result))) => self.runtime.finish_local_mutation(result).await,
+            Ok(Ok(Some(result))) => crate::mcp::result::from_native_result(
+                self.runtime.finish_local_mutation(result).await,
+            ),
             Ok(Ok(None)) => self.upstream.call(input, cx).await,
-            Ok(Err(error)) => {
-                ToolResult::Error(format!("local project mutation failed: {error:#}"))
-            }
-            Err(error) => ToolResult::Error(format!("local project mutation task failed: {error}")),
+            Ok(Err(error)) => local_error(format!("local project mutation failed: {error:#}")),
+            Err(error) => local_error(format!("local project mutation task failed: {error}")),
         }
     }
 }
@@ -1072,6 +1123,9 @@ mod tests {
 
     fn tool_cx(root: &Path) -> ToolCx {
         ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
             root: root.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1116,6 +1170,8 @@ mod tests {
 
     fn git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .arg("-C")
             .arg(root)
             .args(args)
@@ -1165,6 +1221,119 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn plan_consumer_decodes_one_envelope_and_preserves_remote_error_evidence() {
+        let plan = json!({"plan":{"content":[{"type":"text","text":"source data"}]}});
+        for result in [
+            crate::mcp::result::from_native_result(ToolResult::Json(plan.clone())),
+            crate::mcp::result::from_native_result(ToolResult::Text(plan.to_string())),
+        ] {
+            assert_eq!(parse_json_tool_result(result, "fixture").unwrap(), plan);
+        }
+        let evidence = json!({
+            "content":[{"type":"text","text":"partial operation"}],
+            "structuredContent":{"completed":["first"],"code":"partial_failure"},
+            "isError":true,
+        })
+        .to_string();
+        let error =
+            parse_json_tool_result(ToolResult::Error(evidence.clone()), "fixture").unwrap_err();
+        assert_eq!(error.into_content(), (evidence, true));
+        let ambiguous = ToolResult::Json(json!({
+            "content":[{"type":"text","text":"{}"},{"type":"text","text":"{}"}],
+            "isError":false,
+        }));
+        assert!(
+            parse_json_tool_result(ambiguous, "fixture")
+                .unwrap_err()
+                .is_error()
+        );
+    }
+
+    #[tokio::test]
+    async fn locality_wrappers_preserve_metadata_and_envelope_local_mutations() {
+        struct Backend;
+        #[async_trait]
+        impl Tool for Backend {
+            fn name(&self) -> &str {
+                "mcp__fixture__remember"
+            }
+            fn description(&self) -> &str {
+                "fixture backend"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object","properties":{"scope":{"type":"string"}}})
+            }
+            fn output_schema(&self) -> Option<Value> {
+                Some(json!({
+                    "type":"object", "required":["content","isError"],
+                    "properties":{"content":{"type":"array"},"isError":{"type":"boolean"}},
+                    "x-mcp":{"title":"Fixture", "annotations":{"readOnlyHint":false}}
+                }))
+            }
+            fn annotations(&self) -> ToolAnnotations {
+                ToolAnnotations {
+                    read_only: false,
+                    destructive: true,
+                }
+            }
+            fn uncertain_outcome(&self) -> Option<String> {
+                Some("remote outcome unresolved".into())
+            }
+            async fn call(&self, _: Value, _: &ToolCx) -> ToolResult {
+                crate::mcp::result::from_native_result(ToolResult::Text("remote unchanged".into()))
+            }
+        }
+        let (_directory, root, runtime) = runtime();
+        let upstream: Arc<dyn Tool> = Arc::new(Backend);
+        let mutation = ProjectMutationTool {
+            upstream: upstream.clone(),
+            runtime: runtime.clone(),
+            kind: MutationKind::Remember,
+        };
+        let render = LocalRenderTool {
+            upstream: upstream.clone(),
+            runtime: runtime.clone(),
+        };
+        let blame = LocalBlameTool {
+            upstream: upstream.clone(),
+            runtime: runtime.clone(),
+        };
+        for tool in [&mutation as &dyn Tool, &render, &blame] {
+            assert_eq!(tool.input_schema(), upstream.input_schema());
+            assert_eq!(tool.output_schema(), upstream.output_schema());
+            assert_eq!(tool.uncertain_outcome(), upstream.uncertain_outcome());
+            assert_eq!(
+                tool.annotations().read_only,
+                upstream.annotations().read_only
+            );
+            assert_eq!(
+                tool.annotations().destructive,
+                upstream.annotations().destructive
+            );
+        }
+        let cx = tool_cx(&root);
+        let response = mutation
+            .call(
+                json!({"scope":"project","content":"local envelope fixture"}),
+                &cx,
+            )
+            .await;
+        let ToolResult::Json(envelope) = response else {
+            panic!("local mutation must return the MCP envelope");
+        };
+        assert_eq!(envelope["isError"], false);
+        assert!(envelope["content"].is_array());
+        assert_eq!(knowledge_files(&root).len(), 1);
+        let global = json!({"scope":"global","content":"remote fixture"});
+        let expected = upstream.call(global.clone(), &cx).await.into_content();
+        assert_eq!(
+            mutation.call(global.clone(), &cx).await.into_content(),
+            expected
+        );
+        assert_eq!(render.call(global, &cx).await.into_content(), expected);
     }
 
     #[test]
@@ -1349,11 +1518,13 @@ mod tests {
             async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
                 self.calls.lock().unwrap().push(input.clone());
                 match input["_blame_locality"]["phase"].as_str() {
-                    Some("plan") => ToolResult::Json(json!({
-                        "status": "blame_locality_plan",
-                        "plan": self.plan,
+                    Some("plan") => crate::mcp::result::from_native_result(ToolResult::Text(
+                        json!({"status":"blame_locality_plan", "plan":self.plan}).to_string(),
+                    )),
+                    Some("resolve") => ToolResult::Json(json!({
+                        "content":[{"type":"text","text":"joined-result"}],
+                        "structuredContent":{"source":"remote"}, "isError":false,
                     })),
-                    Some("resolve") => ToolResult::Text("joined-result".into()),
                     other => ToolResult::Error(format!("unexpected phase {other:?}")),
                 }
             }
@@ -1395,7 +1566,14 @@ mod tests {
                 &tool_cx(&root),
             )
             .await;
-        assert!(matches!(response, ToolResult::Text(ref text) if text == "joined-result"));
+        assert_eq!(
+            response.into_content().0,
+            json!({
+                "content":[{"type":"text","text":"joined-result"}],
+                "structuredContent":{"source":"remote"}, "isError":false,
+            })
+            .to_string()
+        );
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -1440,15 +1618,15 @@ mod tests {
                         let offset = input["_render_locality"]["offset"].as_u64().unwrap() as usize;
                         let expected = input["_render_locality"]["plan_sha256"].as_str();
                         let chunk = self.plan.transport_chunk(offset, expected, None).unwrap();
-                        ToolResult::Json(json!({
+                        crate::mcp::result::from_native_result(ToolResult::Json(json!({
                             "status": "render_locality_plan_chunk",
                             "chunk": chunk,
-                        }))
+                        })))
                     }
-                    Some("complete") => ToolResult::Json(json!({
-                        "status": "render_locality_complete",
-                        "diagnostics": null,
-                    })),
+                    Some("complete") => crate::mcp::result::from_native_result(ToolResult::Text(
+                        json!({"status":"render_locality_complete", "diagnostics":null})
+                            .to_string(),
+                    )),
                     other => ToolResult::Error(format!("unexpected phase {other:?}")),
                 }
             }
@@ -1507,7 +1685,16 @@ mod tests {
                 &tool_cx(&root),
             )
             .await;
-        assert!(matches!(response, ToolResult::Text(ref text) if text.contains("Wrote project")));
+        let ToolResult::Json(envelope) = response else {
+            panic!("local render must return the MCP envelope");
+        };
+        assert_eq!(envelope["isError"], false);
+        assert!(
+            envelope["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Wrote project")
+        );
         assert!(
             fs::read_to_string(root.join("CLAUDE.md"))
                 .unwrap()
