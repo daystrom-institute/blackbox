@@ -28,6 +28,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness child environment policy survives spawned code-mode calls and applies
+  to model-facing Git subprocesses, commit hooks and language servers. Explicit
+  project environment overlays remain available after inherited transport credentials are scrubbed.
+- Tool wrappers declare required capabilities: denying `shell_run` also removes
+  `build.gate`, which now applies the same host shell argument defaults and pins.
+
 - Harness file reads return bounded exact source pages with line/byte continuations.
   Oversized tool output uses explicit omissions instead of recursive dump files;
   shell metadata and code-mode continuation handles remain visible.

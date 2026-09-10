@@ -520,32 +520,10 @@ fn shell_path_env() -> Option<OsString> {
     )
 }
 
-tokio::task_local! {
-    /// Env var names to scrub from spawned child processes — bound by an
-    /// in-process host (the daemon) so its own service config does not leak
-    /// into the user shell commands an agent runs. Unbound for the standalone
-    /// binary, where there's nothing host-internal to hide.
-    static SPAWN_SCRUB: std::sync::Arc<Vec<String>>;
-}
-
-/// Run `fut` with a child-process env scrub list bound. Spawned shell children
-/// get these env vars removed (harness-daemon-boundary.md §3) — the in-process
-/// replacement for the daemon's old "remove service env, restore after" dance
-/// that forced sessions to serialize under a lock.
-pub async fn with_spawn_scrub<F>(keys: Vec<String>, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    SPAWN_SCRUB.scope(std::sync::Arc::new(keys), fut).await
-}
-
 /// Apply the standard child-process environment for a non-interactive shell
 /// command: augmented PATH, clean/uncolored output, and the host scrub set.
 /// Per-command `args.env` is layered on top by the caller and wins.
-fn apply_child_env(
-    cmd: &mut tokio::process::Command,
-    shell_env: &std::collections::BTreeMap<String, String>,
-) {
+fn apply_child_env(cmd: &mut tokio::process::Command, cx: &ToolCx) {
     // Non-interactive execution: deterministic, uncolored output for the model.
     cmd.env("NO_COLOR", "1");
     cmd.env("FORCE_COLOR", "0");
@@ -553,16 +531,11 @@ fn apply_child_env(
     if let Some(path) = shell_path_env() {
         cmd.env("PATH", path);
     }
-    // No-op outside a with_spawn_scrub scope (the standalone binary).
-    let _ = SPAWN_SCRUB.try_with(|keys| {
-        for k in keys.iter() {
-            cmd.env_remove(k);
-        }
-    });
+    cx.child_env.apply(cmd.as_std_mut());
     // Host-supplied non-secret overlay (ToolCx::shell_env), applied after the
     // scrub so an explicit host choice is never scrubbed away. Callers apply
     // the model's per-call `env` after this, so the model still wins.
-    for (k, v) in shell_env {
+    for (k, v) in cx.shell_env.iter() {
         cmd.env(k, v);
     }
 }
@@ -674,7 +647,7 @@ impl Tool for ShellRun {
             // (codex-rs does the equivalent via setsid/setpgid in pre_exec).
             // kill_on_drop alone only reaps the direct bash child.
             .process_group(0);
-        apply_child_env(&mut cmd, &cx.shell_env);
+        apply_child_env(&mut cmd, cx);
         for (k, v) in &args.env {
             cmd.env(k, v);
         }
@@ -1065,6 +1038,7 @@ mod tests {
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -1125,50 +1099,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_scrub_hides_host_vars_from_shell_children() {
-        // SAFETY: unique key, not touched by any other test.
-        unsafe {
-            std::env::set_var("BRO_TEST_SCRUB_K9", "leaked-value");
-        }
-
-        // Under a scrub scope (the daemon's in-process session), the child must
-        // NOT inherit the scrubbed var.
-        let scrubbed = with_spawn_scrub(vec!["BRO_TEST_SCRUB_K9".to_string()], async {
-            as_json(
+    async fn spawned_shell_calls_keep_scrub_policy_and_explicit_env_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = cx();
+        cx.root = dir.path().canonicalize().unwrap();
+        // ShellRun installs this known non-secret value before the scrub. It
+        // exercises real shell dispatch without mutating the test process env.
+        cx.child_env = Arc::new(crate::ChildEnvironment::new(["NO_COLOR".into()]));
+        let results = tokio::spawn(async move {
+            let input = json!({"command": "printf '%s' \"${NO_COLOR-unset}\"", "yield_time_ms": 0});
+            let scrubbed = as_json(ShellRun.call(input.clone(), &cx).await);
+            cx.shell_env = Arc::new(std::collections::BTreeMap::from([(
+                "NO_COLOR".into(),
+                "explicit-host".into(),
+            )]));
+            let host = as_json(ShellRun.call(input, &cx).await);
+            let model = as_json(
                 ShellRun
                     .call(
-                        json!({"command": "printf '%s' \"$BRO_TEST_SCRUB_K9\""}),
-                        &cx(),
+                        json!({
+                            "command": "printf '%s' \"$NO_COLOR\"",
+                            "yield_time_ms": 0,
+                            "env": {"NO_COLOR": "explicit-call"}
+                        }),
+                        &cx,
                     )
                     .await,
-            )
+            );
+            (scrubbed, host, model)
         })
-        .await;
-        assert_eq!(
-            scrubbed["stdout"], "",
-            "scrubbed host var must not reach the child"
-        );
-
-        // Outside any scrub scope (standalone binary), the child inherits it.
-        let leaked = as_json(
-            ShellRun
-                .call(
-                    json!({"command": "printf '%s' \"$BRO_TEST_SCRUB_K9\""}),
-                    &cx(),
-                )
-                .await,
-        );
-        assert_eq!(leaked["stdout"], "leaked-value");
-
-        // SAFETY: cleanup of this test's unique key.
-        unsafe {
-            std::env::remove_var("BRO_TEST_SCRUB_K9");
-        }
+        .await
+        .unwrap();
+        assert_eq!(results.0["stdout"], "unset");
+        assert_eq!(results.1["stdout"], "explicit-host");
+        assert_eq!(results.2["stdout"], "explicit-call");
     }
 
     #[tokio::test]
     async fn shell_children_get_uncolored_output_env() {
-        // apply_child_env sets NO_COLOR regardless of scrub scope.
+        // apply_child_env sets NO_COLOR when no session policy removes it.
         let v = as_json(
             ShellRun
                 .call(json!({"command": "printf '%s' \"$NO_COLOR\""}), &cx())

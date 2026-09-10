@@ -495,6 +495,7 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -656,6 +657,35 @@ text('CD' + 'z'.repeat(20000) + 'UV');
     }
 
     #[tokio::test]
+    async fn cell_shell_children_keep_session_environment_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = test_cx();
+        cx.root = dir.path().canonicalize().unwrap();
+        // ShellRun sets NO_COLOR before applying the session policy. Use this
+        // harmless known value to test the real V8 -> spawned delegate -> shell
+        // path without reading credentials or changing process environment.
+        cx.child_env = Arc::new(bro_tools::ChildEnvironment::new(["NO_COLOR".into()]));
+        let callable: Vec<Arc<dyn Tool>> = vec![Arc::new(bro_tools::ShellRun)];
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            cx.clone(),
+        ));
+        let session = CodeModeToolSession::new(&callable, seam, CodeMode::Only, &BTreeMap::new());
+        let result = session.tools()[0]
+            .call(
+                json!({"source": r#"text(await tools.shell_run({command: "printf '%s' \"${NO_COLOR-unset}\"", yield_time_ms: 0}));"#}),
+                &cx,
+            )
+            .await;
+        session.shutdown().await.unwrap();
+        let ToolResult::Text(text) = result else {
+            panic!("expected shell result, got {result:?}");
+        };
+        assert!(text.contains("\"stdout\":\"unset\""), "{text}");
+        assert!(text.contains("\"exit_code\":0"), "{text}");
+    }
+
+    #[tokio::test]
     async fn cell_shell_run_output_filter_arrays_return_terminal_result() {
         let exec = exec_with(vec![Arc::new(bro_tools::ShellRun) as Arc<dyn Tool>]);
         let source = r#"
@@ -749,6 +779,7 @@ text(JSON.stringify(result));
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -971,6 +1002,7 @@ text(JSON.stringify(result));
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
@@ -1019,6 +1051,7 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),

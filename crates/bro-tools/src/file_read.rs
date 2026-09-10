@@ -194,6 +194,7 @@ mod tests {
             todos: Arc::new(Mutex::new(Default::default())),
             shell_sessions: Arc::new(Mutex::new(Default::default())),
             edits: Arc::new(Mutex::new(Default::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(Default::default()),
             shell_env: Arc::new(Default::default()),
             tool_arg_defaults: Arc::new(Default::default()),

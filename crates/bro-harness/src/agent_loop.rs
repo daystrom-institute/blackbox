@@ -106,16 +106,6 @@ impl Tool for FinalResultTool {
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
-    if cli.daemon_worker {
-        let scrub = std::env::var("BRO_HARNESS_SPAWN_SCRUB")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string)
-            .collect();
-        return bro_tools::shell::with_spawn_scrub(scrub, run_with_emitter(cli, None, None)).await;
-    }
     run_with_emitter(cli, None, None).await
 }
 
@@ -850,6 +840,16 @@ impl Session {
         let tool_arg_defaults =
             load_tool_arg_defaults(additional_context, cli.additional_context.as_deref())?;
         let shell_env = load_shell_env(shell_env, cli.shell_env.as_deref())?;
+        let child_env = if cli.daemon_worker {
+            bro_tools::ChildEnvironment::new(
+                std::env::var("BRO_HARNESS_SPAWN_SCRUB")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::to_string),
+            )
+        } else {
+            bro_tools::ChildEnvironment::default()
+        };
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
@@ -860,9 +860,11 @@ impl Session {
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
+            child_env: Arc::new(child_env),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
             shell_env: Arc::new(shell_env),
         };
+        let lsp_config = crate::bindings::lsp_config_for_context(&cx);
         // Stage 1 has no rollout reconstruction yet. On resume, seed the
         // context baseline gate for legacy sessions with no persisted
         // `reference_context` so the already-persisted conversation is not
@@ -963,10 +965,12 @@ impl Session {
             // name — but never the flat wire registry: a binding exists only
             // inside cells.
             cm_callable.extend(
-                crate::bindings::binding_tools()
+                crate::bindings::BindingToolSession::with_lsp_config(lsp_config.clone())
+                    .tools()
                     .into_iter()
                     .filter(|t| tool_filter.permits(t.name())),
             );
+            cm_callable = bro_tools::prune_tool_dependencies(cm_callable);
             let cm_seam: Arc<dyn bro_capabilities::ToolCapability> =
                 Arc::new(crate::capabilities::HostTools::with_dispatch_gate(
                     cm_callable.clone(),
@@ -1113,7 +1117,7 @@ impl Session {
             prior_side,
             todos,
             lsp_baselines,
-            lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
+            lsp_pool: bro_lsp::SessionPool::new(lsp_config),
             lsp_documents: BTreeMap::new(),
             total_usage: Usage::default(),
             turns: 0,
@@ -3052,6 +3056,7 @@ mod tests {
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),

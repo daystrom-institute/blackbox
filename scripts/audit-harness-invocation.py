@@ -2,10 +2,11 @@
 """Diagnostic recorder: successful execution is not a claim of passing contracts."""
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import argparse, json, os, subprocess, tempfile, threading
+import argparse, json, os, shlex, subprocess, tempfile, threading
 
 parser = argparse.ArgumentParser(description="Synthetic full-harness credential-scrub and wrapper-admission observations; no real credentials or model requests.")
 parser.add_argument('--harness', default='bro-harness')
+parser.add_argument('--check', action='store_true', help='Fail unless the repaired invocation contracts hold')
 parser.add_argument('--output-dir', type=Path, help='New, nonexistent fixture/output directory')
 options = parser.parse_args()
 if options.output_dir:
@@ -37,19 +38,73 @@ command = 'if [ -n "${AUDIT_CANARY:-}" ]; then printf CANARY_PRESENT; else print
 cases = [
     ('flat-scrub', 'shell_run', {'command':command,'yield_time_ms':0}, []),
     ('nested-scrub', 'exec', {'source':'text(await tools.shell_run('+json.dumps({'command':command,'yield_time_ms':0})+'));'}, []),
-    ('denied-shell-build-gate', 'exec', {'source':'text(await build.gate({command:"printf AUDIT_GATE_RAN; exit 23"}));'}, ['--deny-tools','shell_*']),
+    ('wrapped-scrub', 'exec', {'source':'text(await build.gate('+json.dumps({'command':command+' > gate-observation.txt'})+'));'}, []),
+    ('nested-git-diff-scrub', 'exec', {'source':'text(await tools.git_diff({include_untracked:true}));'}, []),
+    ('nested-git-hook-scrub', 'exec', {'source':'text(await tools.git_commit({message:"fixture change",paths:["fixture.txt"]}));'}, []),
+    ('nested-lsp-scrub', 'exec', {'source':'text(await lsp.executeCommand({language:"rust",command:"fixture"}));'}, []),
+    ('diagnostic-lsp-scrub', 'file_write', {'file_path':'fixture.rs','content':'pub fn fixture() {}\n'}, []),
+    ('denied-shell-build-gate', 'exec', {'source':'text(await build.gate({command:"printf AUDIT_GATE_RAN > denied-gate-ran.txt; exit 23"}));'}, ['--deny-tools','shell_*']),
 ]
 results = []
 try:
     for label, name, args, extra in cases:
         requests.clear(); current = (name,args)
         env = os.environ.copy()
-        env.update({'BRO_HOME':str(root/label),'CODEX_HOME':str(root/'empty-codex'),'BRO_HARNESS_TRANSPORT':'openai-chat','OPENAI_BASE_URL':f'http://127.0.0.1:{server.server_port}/v1','OPENAI_API_KEY':'synthetic-fixture','BRO_HARNESS_WEB_SEARCH':'0','BRO_HARNESS_MAX_TURNS':'3','BRO_HARNESS_NUDGES':'0','BRO_HARNESS_SPAWN_SCRUB':'AUDIT_CANARY','AUDIT_CANARY':'synthetic'})
-        invocation = [options.harness,'--daemon-worker','--cwd',str(root),'--model','gpt-5.5','--code-mode','optional','--system-prompt','','--mcp-config','{"mcpServers":{}}','-p','Complete the fixture task.',*extra]
+        env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','BRO_HOME':str(root/label),'CODEX_HOME':str(root/'empty-codex'),'BRO_HARNESS_TRANSPORT':'openai-chat','OPENAI_BASE_URL':f'http://127.0.0.1:{server.server_port}/v1','OPENAI_API_KEY':'synthetic-fixture','BRO_HARNESS_WEB_SEARCH':'0','BRO_HARNESS_MAX_TURNS':'3','BRO_HARNESS_NUDGES':'0','BRO_HARNESS_SPAWN_SCRUB':'AUDIT_CANARY','AUDIT_CANARY':'synthetic'})
+        cwd = root
+        if label in ('nested-git-hook-scrub', 'nested-git-diff-scrub'):
+            cwd = root/(label+'-repo')
+            cwd.mkdir()
+            git_env = os.environ.copy()
+            git_env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null'})
+            for git_args in [['init','-q'], ['config','user.name','Fixture'], ['config','user.email','fixture@example.invalid'], ['config','commit.gpgsign','false']]:
+                subprocess.run(['git','-C',str(cwd),*git_args],env=git_env,check=True,capture_output=True)
+            (cwd/'fixture.txt').write_text('synthetic fixture\n')
+            hook = cwd/'.git/hooks/pre-commit'
+            hook.write_text('#!/bin/sh\n'+command+' > hook-observation.txt\n')
+            hook.chmod(0o755)
+            if label == 'nested-git-diff-scrub':
+                subprocess.run(['git','-C',str(cwd),'add','--','fixture.txt'],env=git_env,check=True,capture_output=True)
+                subprocess.run(['git','-C',str(cwd),'commit','-qm','fixture baseline'],env=git_env,check=True,capture_output=True)
+                (cwd/'fixture.txt').write_text('changed synthetic fixture\n')
+                (cwd/'untracked.txt').write_text('new synthetic fixture\n')
+                diff_helper = cwd/'diff-helper.sh'
+                diff_helper.write_text('#!/bin/sh\n'+command+'\n')
+                diff_helper.chmod(0o755)
+                env['GIT_EXTERNAL_DIFF'] = str(diff_helper)
+        if label in ('nested-lsp-scrub', 'diagnostic-lsp-scrub'):
+            cwd = root/(label+'-repo')
+            cwd.mkdir()
+            launcher = cwd/'fake-lsp.sh'
+            observation = cwd/'lsp-observation.txt'
+            launcher.write_text('#!/bin/sh\n'+command+' > '+shlex.quote(str(observation))+'\nexit 1\n')
+            launcher.chmod(0o755)
+            env['BRO_LSP_RUST_ANALYZER_BIN'] = str(launcher)
+        invocation = [options.harness,'--daemon-worker','--cwd',str(cwd),'--model','gpt-5.5','--code-mode','optional','--system-prompt','','--mcp-config','{"mcpServers":{}}','-p','Complete the fixture task.',*extra]
         process = subprocess.run(invocation, env=env, capture_output=True, text=True, timeout=25)
         outputs = [m.get('content') for request in requests[1:] for m in request.get('messages',[]) if m.get('role')=='tool']
         names = [t['function']['name'] for t in requests[0].get('tools',[])] if requests else []
         row = {'case':label,'exit':process.returncode,'requests':len(requests),'tool_outputs':outputs,'shell_run_visible':'shell_run' in names}
+        if label == 'nested-git-hook-scrub':
+            observed = cwd/'hook-observation.txt'
+            row['hook_observation'] = observed.read_text() if observed.exists() else None
+        if label in ('flat-scrub', 'nested-scrub', 'nested-git-diff-scrub'):
+            rendered = json.dumps(outputs)
+            row['contract_passed'] = bool(outputs) and 'CANARY_ABSENT' in rendered and 'CANARY_PRESENT' not in rendered
+        elif label == 'wrapped-scrub':
+            observed = root/'gate-observation.txt'
+            row['gate_observation'] = observed.read_text() if observed.exists() else None
+            row['contract_passed'] = row['gate_observation'] == 'CANARY_ABSENT'
+        elif label in ('nested-lsp-scrub', 'diagnostic-lsp-scrub'):
+            observation = cwd/'lsp-observation.txt'
+            row['lsp_observation'] = observation.read_text() if observation.exists() else None
+            row['contract_passed'] = row['lsp_observation'] == 'CANARY_ABSENT'
+        elif label == 'nested-git-hook-scrub':
+            row['contract_passed'] = row['hook_observation'] == 'CANARY_ABSENT'
+        else:
+            row['gate_executed'] = (root/'denied-gate-ran.txt').exists()
+            row['contract_passed'] = bool(outputs) and not row['shell_run_visible'] and not row['gate_executed']
+        row['contract_passed'] = row['contract_passed'] and process.returncode == 0
         results.append(row)
         (root/(label+'-wire.json')).write_text(json.dumps(requests,indent=2))
         (root/(label+'-stdout.jsonl')).write_text(process.stdout)
@@ -59,3 +114,6 @@ finally:
     server.shutdown(); server.server_close()
 (root/'results.json').write_text(json.dumps(results,indent=2))
 print('Artifacts:',root)
+
+if options.check and not all(row['contract_passed'] for row in results):
+    raise SystemExit(1)

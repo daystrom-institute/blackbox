@@ -1,0 +1,188 @@
+{
+  "recorded": "2026-09-10",
+  "probe": "scripts/audit-harness-invocation.py --check",
+  "baseline": {
+    "source": "c384fb8a1cc022f7a8bc00f94ad0462373ca1a8e",
+    "platform": "macOS arm64",
+    "binary": "previously installed bro-harness"
+  },
+  "candidate": {
+    "source": "repair implementation committed with this receipt; built from working tree before commit",
+    "base": "ede74966777b2aef2d19837b1387acd7ac2b9576",
+    "platform": "Linux amd64 lane",
+    "binary": "cargo build -p bro-harness --bin bro-harness --bin isolate"
+  },
+  "limits": [
+    "Local scripted provider endpoint and synthetic canary only; no real model requests.",
+    "Fake language servers record the canary then fail initialization deliberately. These cases validate child environment, not LSP semantic correctness.",
+    "These fixtures cover invocation authority only, not cancellation, process deadlines, output fidelity or model efficacy."
+  ],
+  "before": [
+    {
+      "case": "flat-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_ABSENT\",\"timed_out\":false}"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": true
+    },
+    {
+      "case": "nested-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_PRESENT\",\"timed_out\":false}"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": false
+    },
+    {
+      "case": "wrapped-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\n{\"counts\":{\"errors\":0,\"warnings\":0},\"diagnostics\":[],\"duration_ms\":12,\"exit_code\":0,\"ok\":true,\"status_lines\":[],\"tool\":\"generic\",\"truncated\":false}"
+      ],
+      "shell_run_visible": true,
+      "gate_observation": "CANARY_PRESENT",
+      "contract_passed": false
+    },
+    {
+      "case": "nested-git-diff-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\nCANARY_PRESENT\nCANARY_PRESENT\nCANARY_PRESENT\nCANARY_PRESENT"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": false
+    },
+    {
+      "case": "nested-git-hook-scrub",
+      "exit": 0,
+      "requests": 2,
+      "shell_run_visible": true,
+      "hook_observation": "CANARY_PRESENT",
+      "contract_passed": false
+    },
+    {
+      "case": "nested-lsp-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script failed\nScript error:\nlsp.executeCommand: lsp protocol error: LSP server closed stdout\nOutput:\n"
+      ],
+      "shell_run_visible": true,
+      "lsp_observation": "CANARY_PRESENT",
+      "contract_passed": false
+    },
+    {
+      "case": "diagnostic-lsp-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "{\"bytes\":20,\"ok\":true}"
+      ],
+      "shell_run_visible": true,
+      "lsp_observation": "CANARY_PRESENT",
+      "contract_passed": false
+    },
+    {
+      "case": "denied-shell-build-gate",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\n{\"counts\":{\"errors\":1,\"warnings\":0},\"diagnostics\":[{\"message\":\"command exited without recognized diagnostics\",\"severity\":\"error\"}],\"duration_ms\":13,\"exit_code\":23,\"ok\":false,\"status_lines\":[],\"tool\":\"generic\",\"truncated\":false}"
+      ],
+      "shell_run_visible": false,
+      "gate_executed": true,
+      "contract_passed": false
+    }
+  ],
+  "after": [
+    {
+      "case": "flat-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_ABSENT\",\"timed_out\":false}"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": true
+    },
+    {
+      "case": "nested-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\n{\"exit_code\":0,\"running\":false,\"stderr\":\"\",\"stdout\":\"CANARY_ABSENT\",\"timed_out\":false}"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": true
+    },
+    {
+      "case": "wrapped-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\n{\"counts\":{\"errors\":0,\"warnings\":0},\"diagnostics\":[],\"duration_ms\":12,\"exit_code\":0,\"ok\":true,\"status_lines\":[],\"tool\":\"generic\",\"truncated\":false}"
+      ],
+      "shell_run_visible": true,
+      "gate_observation": "CANARY_ABSENT",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-diff-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script completed\nOutput:\nCANARY_ABSENT\nCANARY_ABSENT\nCANARY_ABSENT\nCANARY_ABSENT"
+      ],
+      "shell_run_visible": true,
+      "contract_passed": true
+    },
+    {
+      "case": "nested-git-hook-scrub",
+      "exit": 0,
+      "requests": 2,
+      "shell_run_visible": true,
+      "hook_observation": "CANARY_ABSENT",
+      "contract_passed": true
+    },
+    {
+      "case": "nested-lsp-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script failed\nScript error:\nlsp.executeCommand: lsp protocol error: LSP server closed stdout\nOutput:\n"
+      ],
+      "shell_run_visible": true,
+      "lsp_observation": "CANARY_ABSENT",
+      "contract_passed": true
+    },
+    {
+      "case": "diagnostic-lsp-scrub",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "{\"bytes\":20,\"ok\":true}"
+      ],
+      "shell_run_visible": true,
+      "lsp_observation": "CANARY_ABSENT",
+      "contract_passed": true
+    },
+    {
+      "case": "denied-shell-build-gate",
+      "exit": 0,
+      "requests": 2,
+      "tool_outputs": [
+        "Script failed\nScript error:\nReferenceError: build is not defined\n    at exec_main.mjs:1:12\nOutput:\n"
+      ],
+      "shell_run_visible": false,
+      "gate_executed": false,
+      "contract_passed": true
+    }
+  ]
+}

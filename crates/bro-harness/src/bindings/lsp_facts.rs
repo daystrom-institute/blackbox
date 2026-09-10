@@ -47,23 +47,24 @@ struct DocEntry {
 
 impl Default for LspState {
     fn default() -> Self {
-        Self {
-            pool: SessionPool::new(LspConfig::default()),
-            docs: tokio::sync::Mutex::new(HashMap::new()),
-        }
+        Self::with_config(LspConfig::default())
     }
 }
 
 impl LspState {
+    pub(super) fn with_config(config: LspConfig) -> Self {
+        Self {
+            pool: SessionPool::new(config),
+            docs: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Test-only constructor: assemble an [`LspState`] with a custom
     /// pool config (e.g. point at a non-existent binary to exercise the
     /// RX-V3 fail-closed path without touching the real workspace).
     #[cfg(test)]
     pub(super) fn for_test_with_config(config: bro_lsp::LspConfig) -> Self {
-        Self {
-            pool: SessionPool::new(config),
-            docs: tokio::sync::Mutex::new(HashMap::new()),
-        }
+        Self::with_config(config)
     }
 }
 
@@ -2035,6 +2036,7 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),

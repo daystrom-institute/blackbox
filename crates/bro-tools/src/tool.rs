@@ -42,6 +42,9 @@ pub struct ToolCx {
     /// separate from process env so shell children do not inherit credentials.
     /// Tools that expose it must redact sensitive values.
     pub session_env: Arc<BTreeMap<String, String>>,
+    /// Session-owned policy for child-process credential isolation. Unlike a
+    /// task-local binding, it survives nested cells and blocking-pool dispatch.
+    pub child_env: Arc<crate::child_env::ChildEnvironment>,
     /// Host-supplied, NON-SECRET env overlay for shell children (e.g. a
     /// project's `RUSTC_WRAPPER=sccache` from fleet.json `project_dispatch`).
     /// Deliberately a separate lane from `session_env`: credentials stay out
@@ -133,6 +136,11 @@ pub trait Tool: Send + Sync {
     /// Domain bindings (`code.*`, `lsp.*`, …) set this; ordinary tools don't.
     fn namespace_binding(&self) -> Option<(String, String)> {
         None
+    }
+    /// Canonical capabilities this tool invokes internally. A catalog must
+    /// exclude this tool when any dependency was denied or is unavailable.
+    fn required_tools(&self) -> &[&str] {
+        &[]
     }
 }
 

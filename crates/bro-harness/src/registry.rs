@@ -162,6 +162,12 @@ impl Registry {
             tools.insert(t.name().to_string(), Entry { tool: t, tier });
         }
 
+        let admitted = bro_tools::prune_tool_dependencies(
+            tools.values().map(|entry| entry.tool.clone()).collect(),
+        );
+        let admitted_names: HashSet<_> = admitted.iter().map(|tool| tool.name()).collect();
+        tools.retain(|name, _| admitted_names.contains(name.as_str()));
+
         let activated = Arc::new(Mutex::new(HashSet::new()));
 
         // tool_search is added unless explicitly denied. It ignores allow-list
@@ -394,19 +400,7 @@ impl Registry {
     }
 }
 
-pub(crate) async fn call_tool_with_arg_defaults(
-    tool: &dyn Tool,
-    name: &str,
-    input: Value,
-    cx: &ToolCx,
-) -> ToolResult {
-    let (input, rider) = match cx.tool_arg_defaults.apply(name, input) {
-        Ok(applied) => applied,
-        Err(conflict) => return conflict.into_tool_result(name),
-    };
-    let result = tool.call(input, cx).await;
-    bro_tools::apply_rider(result, &rider)
-}
+pub(crate) use bro_tools::call_tool_with_arg_defaults;
 
 fn short_desc(d: &str) -> String {
     let line = d.lines().next().unwrap_or("").trim();
@@ -584,6 +578,7 @@ mod tests {
             todos: Arc::new(std::sync::Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(defaults),
             shell_env: Arc::new(Default::default()),
@@ -698,6 +693,42 @@ mod tests {
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"bbox_stats".to_string()));
         assert!(!reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
+    }
+
+    #[tokio::test]
+    async fn denied_dependency_removes_wrapper_from_registry_and_discovery() {
+        let builtins: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(crate::bindings::build_gate::BuildGate),
+            Arc::new(bro_tools::ShellRun),
+        ];
+        let registry = Registry::new(
+            builtins,
+            vec![],
+            &PinPolicy::default(),
+            &ToolFilter::from_csv(Some("shell_run"), None),
+        );
+        assert!(!registry.contains("build.gate"));
+        assert!(
+            !registry
+                .wire_specs()
+                .iter()
+                .any(|spec| spec.name == "build.gate")
+        );
+        assert!(
+            !registry
+                .manifest()
+                .iter()
+                .any(|(name, _)| name == "build.gate")
+        );
+        let result = registry
+            .dispatch(
+                "build.gate",
+                json!({"command":"exit 97"}),
+                &test_cx(bro_tools::ToolArgDefaults::default()),
+            )
+            .await;
+        assert!(result.is_error());
+        assert!(result.into_content().0.contains("unknown tool"));
     }
 
     #[tokio::test]

@@ -152,7 +152,7 @@ async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
         tools.extend(load_mcp_tools(Some(cfg), &ToolFilter::default()).await);
     }
     IsolateSurface {
-        tools,
+        tools: bro_tools::prune_tool_dependencies(tools),
         binding_session,
     }
 }
@@ -168,6 +168,7 @@ fn make_cx(root: PathBuf, tool_arg_defaults: ToolArgDefaults) -> ToolCx {
         todos: Arc::new(StdMutex::new(TodoList::default())),
         shell_sessions: Arc::new(StdMutex::new(ShellSessions::default())),
         edits: Arc::new(StdMutex::new(EditSink::default())),
+        child_env: Arc::new(Default::default()),
         session_env: Arc::new(BTreeMap::new()),
         shell_env: Arc::new(BTreeMap::new()),
         tool_arg_defaults: Arc::new(tool_arg_defaults),

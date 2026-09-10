@@ -17,6 +17,7 @@
 // this target without cfg(test) too, with the deny in force.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod child_env;
 pub mod edits;
 pub mod file_read;
 pub mod fleet_worktree;
@@ -29,9 +30,11 @@ pub mod slice_core;
 pub mod todo;
 pub mod tool;
 pub mod tool_defaults;
+pub mod tool_dispatch;
 pub mod web;
 pub mod workspace;
 
+pub use child_env::ChildEnvironment;
 pub use edits::{EditEvent, EditSink};
 pub use promise::{PromiseProgress, StreamKind};
 pub use safety::SafetyPolicy;
@@ -39,6 +42,9 @@ pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
 pub use tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 pub use tool_defaults::{PinConflict, ToolArgDefaults, ToolArgRider, apply_rider};
+pub use tool_dispatch::{
+    call_tool_with_arg_defaults, call_tool_with_arg_defaults_and_fallbacks, prune_tool_dependencies,
+};
 
 use std::sync::Arc;
 

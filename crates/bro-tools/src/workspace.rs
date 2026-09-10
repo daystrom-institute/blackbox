@@ -124,7 +124,7 @@ pub(crate) fn sandbox_status_manifest(
         "launch_root": cx.root,
         "inspected_root": root,
         "root_source": root_source,
-        "git": git_status_manifest(&root, status_limit.unwrap_or(12)),
+        "git": git_status_manifest(cx, &root, status_limit.unwrap_or(12)),
         "fleet_worktree": {
             "base_repo": std::env::var("BRO_FLEET_BASE_REPO").ok(),
             "parent_worktree": std::env::var("BRO_FLEET_PARENT_WORKTREE").ok(),
@@ -153,17 +153,17 @@ pub(crate) fn sandbox_status_manifest(
     }))
 }
 
-fn git_status_manifest(root: &Path, status_limit: usize) -> Value {
+fn git_status_manifest(cx: &ToolCx, root: &Path, status_limit: usize) -> Value {
     json!({
-        "toplevel": git_capture(root, &["rev-parse", "--show-toplevel"]),
-        "branch": git_capture(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "head": git_capture(root, &["rev-parse", "--short=12", "HEAD"]),
-        "status": git_status_summary(root, status_limit),
+        "toplevel": git_capture(cx, root, &["rev-parse", "--show-toplevel"]),
+        "branch": git_capture(cx, root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "head": git_capture(cx, root, &["rev-parse", "--short=12", "HEAD"]),
+        "status": git_status_summary(cx, root, status_limit),
     })
 }
 
-fn git_status_summary(root: &Path, status_limit: usize) -> Value {
-    let Some(raw) = git_capture(root, &["status", "--short", "--branch"]) else {
+fn git_status_summary(cx: &ToolCx, root: &Path, status_limit: usize) -> Value {
+    let Some(raw) = git_capture(cx, root, &["status", "--short", "--branch"]) else {
         return Value::Null;
     };
     let mut lines = raw.lines();
@@ -181,13 +181,12 @@ fn git_status_summary(root: &Path, status_limit: usize) -> Value {
 
 // called from sandbox_status's call_blocking closure (wave 13).
 #[allow(clippy::disallowed_methods)]
-fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
+fn git_capture(cx: &ToolCx, root: &Path, args: &[&str]) -> Option<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    cx.child_env.apply(&mut command);
+    command.envs(cx.shell_env.iter());
+    let out = command.output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -636,11 +635,11 @@ impl Tool for ListDir {
 
 async fn git(cx: &ToolCx, args: &[&str]) -> ToolResult {
     let root = effective_root(&cx.root);
-    let out = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(&root)
-        .output()
-        .await;
+    let mut command = tokio::process::Command::new("git");
+    command.args(args).current_dir(&root);
+    cx.child_env.apply(command.as_std_mut());
+    command.envs(cx.shell_env.iter());
+    let out = command.output().await;
     match out {
         Ok(o) if o.status.success() => {
             ToolResult::Text(String::from_utf8_lossy(&o.stdout).into_owned())
@@ -730,17 +729,22 @@ impl Tool for GitDiff {
 
 async fn git_diff_include_untracked(cx: &ToolCx) -> ToolResult {
     let root = effective_root(&cx.root);
-    let mut diff = match git_stdout(&root, &["diff"]).await {
+    let mut diff = match git_stdout(cx, &root, &["diff"]).await {
         Ok(diff) => diff,
         Err(e) => return ToolResult::Error(e),
     };
-    let raw_untracked =
-        match git_stdout(&root, &["ls-files", "--others", "--exclude-standard", "-z"]).await {
-            Ok(raw) => raw,
-            Err(e) => return ToolResult::Error(e),
-        };
+    let raw_untracked = match git_stdout(
+        cx,
+        &root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(e) => return ToolResult::Error(e),
+    };
     for path in raw_untracked.split('\0').filter(|path| !path.is_empty()) {
-        match git_no_index_new_file(&root, path).await {
+        match git_no_index_new_file(cx, &root, path).await {
             Ok(patch) if !patch.is_empty() => {
                 if !diff.is_empty() && !diff.ends_with('\n') {
                     diff.push('\n');
@@ -754,10 +758,12 @@ async fn git_diff_include_untracked(cx: &ToolCx) -> ToolResult {
     ToolResult::Text(diff)
 }
 
-async fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
+async fn git_stdout(cx: &ToolCx, root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = tokio::process::Command::new("git");
+    command.args(args).current_dir(root);
+    cx.child_env.apply(command.as_std_mut());
+    command.envs(cx.shell_env.iter());
+    let out = command
         .output()
         .await
         .map_err(|e| format!("git {args:?}: {e}"))?;
@@ -768,10 +774,14 @@ async fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-async fn git_no_index_new_file(root: &Path, path: &str) -> Result<String, String> {
-    let out = tokio::process::Command::new("git")
+async fn git_no_index_new_file(cx: &ToolCx, root: &Path, path: &str) -> Result<String, String> {
+    let mut command = tokio::process::Command::new("git");
+    command
         .args(["diff", "--no-index", "--", "/dev/null", path])
-        .current_dir(root)
+        .current_dir(root);
+    cx.child_env.apply(command.as_std_mut());
+    command.envs(cx.shell_env.iter());
+    let out = command
         .output()
         .await
         .map_err(|e| format!("git diff --no-index {path}: {e}"))?;
@@ -1580,6 +1590,7 @@ mod tests {
             session_env: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: std::sync::Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
             shell_env: std::sync::Arc::new(Default::default()),
+            child_env: std::sync::Arc::new(Default::default()),
         }
     }
 

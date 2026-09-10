@@ -145,7 +145,15 @@ impl Tool for BuildGate {
         Some(("build".to_string(), "gate".to_string()))
     }
 
+    fn required_tools(&self) -> &[&str] {
+        &["shell_run"]
+    }
+
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        // Option deserialization accepts null, but host pins distinguish a
+        // present null from an absent field. Preserve presence across aliases.
+        let cwd_present = input.get("cwd").is_some();
+        let timeout_present = input.get("timeout_ms").is_some() || input.get("timeoutMs").is_some();
         let args: BuildGateInput = match serde_json::from_value(input) {
             Ok(args) => args,
             Err(e) => return ToolResult::Error(format!("build.gate: bad input: {e}")),
@@ -154,33 +162,35 @@ impl Tool for BuildGate {
             return ToolResult::Error("build.gate: command must not be empty".to_string());
         }
 
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let max_diagnostics = args
             .max_diagnostics
             .unwrap_or(DEFAULT_MAX_DIAGNOSTICS)
             .max(1);
-        let cwd_arg = args.cwd.as_deref().unwrap_or(".");
-        let cwd_abs = match bro_tools::workspace::resolve_in_root(&cx.root, cwd_arg) {
-            Ok(path) => path,
-            Err(e) => return ToolResult::Error(format!("build.gate: {e}")),
-        };
-
+        let command = args.command.clone();
+        let mut shell_input = json!({
+            "command": command,
+            "yield_time_ms": 0,
+            "max_output_tokens": SHELL_CAPTURE_TOKENS,
+            "close_stdin": true,
+        });
+        if cwd_present {
+            shell_input["cwd"] = json!(args.cwd);
+        }
+        if timeout_present {
+            shell_input["timeout_ms"] = json!(args.timeout_ms);
+        }
         let started = Instant::now();
         let shell = bro_tools::ShellRun;
-        let command = args.command.clone();
-        let shell_result = shell
-            .call(
-                json!({
-                    "command": command.clone(),
-                    "cwd": args.cwd.unwrap_or_else(|| ".".to_string()),
-                    "timeout_ms": timeout_ms,
-                    "yield_time_ms": 0,
-                    "max_output_tokens": SHELL_CAPTURE_TOKENS,
-                    "close_stdin": true
-                }),
-                cx,
-            )
-            .await;
+        // Host authority evaluates the authored input once. The wrapper's
+        // documented timeout fills only an omission remaining after that pass.
+        let shell_result = bro_tools::call_tool_with_arg_defaults_and_fallbacks(
+            &shell,
+            "shell_run",
+            shell_input,
+            cx,
+            &[("timeout_ms", json!(DEFAULT_TIMEOUT_MS))],
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let shell_json = match shell_result {
@@ -190,6 +200,26 @@ impl Tool for BuildGate {
                 return ToolResult::Error(format!("build.gate: unexpected shell result: {t}"));
             }
         };
+        let cwd_arg = shell_json
+            .get("defaults_applied")
+            .and_then(|defaults| defaults.get("cwd"))
+            .and_then(Value::as_str)
+            .or(args.cwd.as_deref())
+            .unwrap_or(".");
+        let cwd_abs = match bro_tools::workspace::resolve_in_root(&cx.root, cwd_arg) {
+            Ok(path) => path,
+            Err(e) => return ToolResult::Error(format!("build.gate: {e}")),
+        };
+        let shell_arg_context: serde_json::Map<String, Value> =
+            ["defaults_applied", "pin_enforced", "pin_conflict"]
+                .into_iter()
+                .filter_map(|key| {
+                    shell_json
+                        .get(key)
+                        .cloned()
+                        .map(|value| (key.to_owned(), value))
+                })
+                .collect();
         // Parsing is pure, but span anchoring reads files; run the tail on
         // the blocking pool so no fs I/O lands on a tokio worker (I2).
         let root = cx.root.clone();
@@ -219,7 +249,7 @@ impl Tool for BuildGate {
                 anchor_diagnostics(&root, &cwd_abs, &mut parsed.diagnostics);
             }
 
-            ToolResult::Json(json!({
+            let mut result = json!({
                 "ok": exit_code == 0 && !timed_out,
                 "exit_code": exit_code,
                 "tool": parsed.tool,
@@ -228,7 +258,11 @@ impl Tool for BuildGate {
                 "truncated": parsed.truncated,
                 "status_lines": parsed.status_lines,
                 "duration_ms": duration_ms
-            }))
+            });
+            if !shell_arg_context.is_empty() {
+                result["shell_arg_context"] = Value::Object(shell_arg_context);
+            }
+            ToolResult::Json(result)
         })
         .await
     }
@@ -809,6 +843,7 @@ mod tests {
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
             shell_env: Arc::new(Default::default()),
+            child_env: Arc::new(Default::default()),
         }
     }
 
@@ -817,6 +852,253 @@ mod tests {
             ToolResult::Json(value) => value,
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_gate_is_unavailable_when_shell_is_denied_or_missing() {
+        use bro_capabilities::{ToolCapability, ToolInvocation};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for filter in [
+            crate::mcp::ToolFilter::from_csv(Some("shell_run"), None),
+            crate::mcp::ToolFilter::from_csv(Some("shell_*"), None),
+            crate::mcp::ToolFilter::from_csv(None, Some("build.gate")),
+        ] {
+            let tools: Vec<Arc<dyn Tool>> =
+                vec![Arc::new(BuildGate), Arc::new(bro_tools::ShellRun)];
+            let admitted = tools
+                .into_iter()
+                .filter(|tool| filter.permits(tool.name()))
+                .collect();
+            let host = crate::capabilities::HostTools::new(admitted, cx_in(&root));
+            let result = host
+                .call_tool(ToolInvocation {
+                    name: "build.gate".into(),
+                    input_json: json!({"command":"printf forbidden > forbidden.txt"}),
+                })
+                .await;
+            assert_eq!(
+                result
+                    .expect_err("dependency denial must remove build.gate")
+                    .code,
+                "tool_unavailable"
+            );
+            assert!(!root.join("forbidden.txt").exists());
+        }
+        let host = crate::capabilities::HostTools::new(vec![Arc::new(BuildGate)], cx_in(&root));
+        let result = host
+            .call_tool(ToolInvocation {
+                name: "build.gate".into(),
+                input_json: json!({"command":"printf forbidden > forbidden.txt"}),
+            })
+            .await;
+        assert_eq!(
+            result
+                .expect_err("missing shell must remove build.gate")
+                .code,
+            "tool_unavailable"
+        );
+        assert!(!root.join("forbidden.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn admitted_build_gate_enforces_shell_command_and_cwd_pins() {
+        use bro_capabilities::{ToolCapability, ToolInvocation};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let permitted = root.join("permitted");
+        tokio::fs::create_dir(&permitted).await.unwrap();
+        let command = "printf approved > approved.txt";
+        let mut cx = cx_in(&root);
+        cx.shell_env = Arc::new(BTreeMap::from([(
+            "HOME".into(),
+            root.to_string_lossy().into_owned(),
+        )]));
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([
+                ("pin:shell_run.command".into(), command.into()),
+                (
+                    "pin:shell_run.cwd".into(),
+                    permitted.to_string_lossy().into_owned(),
+                ),
+            ]))
+            .unwrap(),
+        );
+        let host = crate::capabilities::HostTools::new(
+            vec![Arc::new(BuildGate), Arc::new(bro_tools::ShellRun)],
+            cx,
+        );
+        for input in [
+            json!({"command":"printf forbidden > forbidden.txt","cwd":permitted}),
+            json!({"command":command,"cwd":root}),
+            json!({"command":command,"cwd":null}),
+        ] {
+            let rejected = host
+                .call_tool(ToolInvocation {
+                    name: "build.gate".into(),
+                    input_json: input,
+                })
+                .await
+                .unwrap();
+            assert!(rejected.is_error, "{}", rejected.content);
+            assert!(
+                rejected.content.contains("pin conflict"),
+                "{}",
+                rejected.content
+            );
+            assert!(!root.join("approved.txt").exists());
+            assert!(!permitted.join("approved.txt").exists());
+            assert!(!permitted.join("forbidden.txt").exists());
+        }
+        let accepted = host
+            .call_tool(ToolInvocation {
+                name: "build.gate".into(),
+                input_json: json!({"command":command,"cwd":permitted}),
+            })
+            .await
+            .unwrap();
+        assert!(!accepted.is_error, "{}", accepted.content);
+        let value: Value = serde_json::from_str(&accepted.content).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(
+            value["shell_arg_context"]["pin_enforced"]["command"],
+            command
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(permitted.join("approved.txt"))
+                .await
+                .unwrap(),
+            "approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_gate_uses_shell_cwd_default_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let work = root.join("work");
+        tokio::fs::create_dir(&work).await.unwrap();
+        let mut cx = cx_in(&root);
+        cx.shell_env = Arc::new(BTreeMap::from([(
+            "HOME".into(),
+            root.to_string_lossy().into_owned(),
+        )]));
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([
+                (
+                    "default:shell_run.cwd".into(),
+                    work.to_string_lossy().into_owned(),
+                ),
+                (
+                    "pin:shell_run.cwd".into(),
+                    work.to_string_lossy().into_owned(),
+                ),
+            ]))
+            .unwrap(),
+        );
+        let result = json_of(
+            BuildGate
+                .call(json!({"command":"printf defaulted > marker.txt"}), &cx)
+                .await,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["shell_arg_context"]["defaults_applied"]["cwd"],
+            work.to_string_lossy().as_ref()
+        );
+        assert!(!root.join("marker.txt").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(work.join("marker.txt"))
+                .await
+                .unwrap(),
+            "defaulted"
+        );
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([(
+                "default:shell_run.cwd".into(),
+                work.to_string_lossy().into_owned(),
+            )]))
+            .unwrap(),
+        );
+        let result = json_of(
+            BuildGate
+                .call(
+                    json!({"command":"printf null > null-marker.txt", "cwd":null}),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result.get("shell_arg_context").is_none());
+        assert!(!work.join("null-marker.txt").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("null-marker.txt"))
+                .await
+                .unwrap(),
+            "null"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_gate_preserves_omitted_pin_semantics_and_explicit_timeout_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut cx = cx_in(&root);
+        cx.shell_env = Arc::new(BTreeMap::from([(
+            "HOME".into(),
+            root.to_string_lossy().into_owned(),
+        )]));
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([
+                ("pin:shell_run.cwd".into(), "other".into()),
+                ("pin:shell_run.timeout_ms".into(), "1".into()),
+            ]))
+            .unwrap(),
+        );
+        // Direct shell pins do not invent missing arguments. The wrapper's
+        // implementation timeout is also not authored input to a pin check.
+        let result = json_of(
+            BuildGate
+                .call(json!({"command":"printf omitted > marker.txt"}), &cx)
+                .await,
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result.get("shell_arg_context").is_none());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("marker.txt"))
+                .await
+                .unwrap(),
+            "omitted"
+        );
+        for input in [
+            json!({"command":"printf forbidden > forbidden.txt", "timeout_ms":2}),
+            json!({"command":"printf forbidden > forbidden.txt", "timeout_ms":null}),
+            json!({"command":"printf forbidden > forbidden.txt", "timeoutMs":null}),
+        ] {
+            let result = BuildGate.call(input, &cx).await;
+            assert!(result.is_error());
+            assert!(result.into_content().0.contains("pin conflict"));
+            assert!(!root.join("forbidden.txt").exists());
+        }
+
+        cx.tool_arg_defaults = Arc::new(
+            bro_tools::ToolArgDefaults::parse_map(BTreeMap::from([
+                ("default:shell_run.timeout_ms".into(), "1".into()),
+                ("pin:shell_run.timeout_ms".into(), "1".into()),
+            ]))
+            .unwrap(),
+        );
+        // The current host table stores strings; shell rejects a string timeout.
+        // Preserve that direct-shell failure instead of replacing the host value
+        // with the wrapper's numeric fallback or widening typing in this repair.
+        let result = BuildGate
+            .call(json!({"command":"printf forbidden > forbidden.txt"}), &cx)
+            .await;
+        assert!(result.is_error());
+        let error = result.into_content().0;
+        assert!(error.contains("invalid type"), "{error}");
+        assert!(!error.contains("pin conflict"), "{error}");
+        assert!(!root.join("forbidden.txt").exists());
     }
 
     #[test]

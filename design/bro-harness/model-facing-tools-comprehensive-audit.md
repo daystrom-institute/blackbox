@@ -23,6 +23,9 @@ result rewriting, and unconditional domain manuals from that ordinary workflow.
 Fix the authority and lifecycle defects before treating a reduced catalog as
 the solution by itself.
 
+Implementation sequencing and acceptance criteria now live in the
+[prioritized repair plan](model-facing-tools-repair-plan.md).
+
 ## Snapshot, evidence, and deliverables
 
 Audited 2026-09-10 at Blackbox

@@ -1078,6 +1078,7 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            child_env: Arc::new(Default::default()),
             session_env: Arc::new(Default::default()),
             shell_env: Arc::new(Default::default()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),

@@ -47,8 +47,12 @@ pub struct BindingToolSession {
 
 impl BindingToolSession {
     pub fn new() -> Self {
+        Self::with_lsp_config(bro_lsp::LspConfig::default())
+    }
+
+    pub fn with_lsp_config(config: bro_lsp::LspConfig) -> Self {
         let ledger = Arc::new(ledger::ProvenanceLedger::default());
-        let lsp_state = Arc::new(lsp_facts::LspState::default());
+        let lsp_state = Arc::new(lsp_facts::LspState::with_config(config));
         let rust_ledger = Arc::clone(&ledger);
         let mut tools = code_facts::tools();
         tools.extend(edit_algebra::tools(
@@ -80,6 +84,16 @@ impl Default for BindingToolSession {
 
 pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
     BindingToolSession::new().tools()
+}
+
+/// Both automatic diagnostics and cell bindings use the session's captured
+/// child policy. Provider transport credentials never enter this config.
+pub(crate) fn lsp_config_for_context(cx: &bro_tools::ToolCx) -> bro_lsp::LspConfig {
+    bro_lsp::LspConfig {
+        child_env_scrub_keys: cx.child_env.scrub_keys().map(str::to_string).collect(),
+        child_env: (*cx.shell_env).clone(),
+        ..Default::default()
+    }
 }
 
 /// Namespace documentation + hand-authored TS declarations, keyed by

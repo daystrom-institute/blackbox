@@ -4,7 +4,7 @@
 //! harness and daemon may share this crate, but the harness must not call back
 //! into the daemon at runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -119,6 +119,11 @@ pub struct ReadinessStatus {
 
 #[derive(Clone, Debug)]
 pub struct LspConfig {
+    /// Session-captured private environment keys removed from server children.
+    pub child_env_scrub_keys: Vec<String>,
+    /// Explicit nonsecret host environment, applied after inherited values are scrubbed.
+    /// Lane host-build normalization still removes wrappers and lane PATH shims.
+    pub child_env: BTreeMap<String, String>,
     pub idle_timeout: Duration,
     pub request_timeout: Duration,
     pub init_timeout: Duration,
@@ -144,6 +149,8 @@ pub struct LspConfig {
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
+            child_env_scrub_keys: Vec::new(),
+            child_env: BTreeMap::new(),
             idle_timeout: Duration::from_secs(env_u64("BRO_LSP_IDLE_SECS", 600)),
             request_timeout: Duration::from_secs(env_u64("BRO_LSP_REQUEST_TIMEOUT_SECS", 30)),
             init_timeout: Duration::from_secs(env_u64("BRO_LSP_INIT_TIMEOUT_SECS", 60)),
@@ -1907,6 +1914,38 @@ fn scrub_lane_shim_from_path(path_value: &str, shim_dir: &Path) -> String {
         .join(":")
 }
 
+fn apply_child_environment(command: &mut Command, config: &LspConfig) {
+    for key in &config.child_env_scrub_keys {
+        command.env_remove(key);
+    }
+    command.envs(&config.child_env);
+}
+
+/// Preserve the command's explicit removals and host overlay when the lane
+/// launcher rebuilds its environment. Otherwise env_clear + ambient copying
+/// would restore the credentials the session just removed.
+fn apply_lane_environment(
+    command: &mut Command,
+    root: &Path,
+    base_env: impl IntoIterator<Item = (String, String)>,
+    shim_dir: &Path,
+    target_dir: &Path,
+) {
+    let mut env: BTreeMap<String, String> = base_env.into_iter().collect();
+    for (key, value) in command.as_std().get_envs() {
+        let key = key.to_string_lossy().into_owned();
+        if let Some(value) = value {
+            env.insert(key, value.to_string_lossy().into_owned());
+        } else {
+            env.remove(&key);
+        }
+    }
+    let env: Vec<_> = env.into_iter().collect();
+    command
+        .env_clear()
+        .envs(lane_host_build_env(root, &env, shim_dir, target_dir));
+}
+
 async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> {
     let argv = key.language.launch_argv(config);
     // A failed readiness wait (or any error path after spawn) must not
@@ -1921,12 +1960,17 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    apply_child_environment(&mut command, config);
     if matches!(key.language, Language::Rust) && is_lane_host_build(&key.root) {
         let shim_dir = lane_shim_dir();
         let target_dir = lane_host_build_target_dir(&key.root)?;
-        let base_env: Vec<(String, String)> = std::env::vars().collect();
-        let scrubbed = lane_host_build_env(&key.root, &base_env, &shim_dir, &target_dir);
-        command.env_clear().envs(scrubbed);
+        apply_lane_environment(
+            &mut command,
+            &key.root,
+            std::env::vars(),
+            &shim_dir,
+            &target_dir,
+        );
     }
     let mut child = command.spawn().map_err(|err| Error::LspUnavailable {
         language: key.language,
@@ -2330,6 +2374,70 @@ mod tests {
         let config = LspConfig::default();
         assert!(config.idle_timeout > Duration::ZERO);
         assert!(config.request_timeout > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn server_child_environment_survives_spawned_tasks() {
+        let config = LspConfig {
+            child_env_scrub_keys: vec!["AUDIT_CANARY".into()],
+            child_env: BTreeMap::from([("AUDIT_BUILD_ENV".into(), "host-overlay".into())]),
+            ..LspConfig::default()
+        };
+        let output = tokio::spawn(async move {
+            // A fake launcher observes the same command setup as a language
+            // server, without a real server or process-global env mutation.
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s:%s' \"${AUDIT_CANARY-unset}\" \"$AUDIT_BUILD_ENV\"",
+                ])
+                .env("AUDIT_CANARY", "synthetic")
+                .env("AUDIT_BUILD_ENV", "inherited");
+            apply_child_environment(&mut command, &config);
+            command.output().await.unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"unset:host-overlay");
+    }
+
+    #[tokio::test]
+    async fn lane_server_environment_cannot_restore_scrubbed_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let shim = root.join("shims");
+        let target = root.join("target");
+        let config = LspConfig {
+            child_env_scrub_keys: vec!["AUDIT_CANARY".into()],
+            child_env: BTreeMap::from([
+                ("AUDIT_BUILD_ENV".into(), "host-overlay".into()),
+                ("RUSTC_WRAPPER".into(), "host-wrapper".into()),
+                ("PATH".into(), format!("{}:/bin", shim.display())),
+            ]),
+            ..LspConfig::default()
+        };
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%s:%s:%s:%s:%s' \"${AUDIT_CANARY-unset}\" \"$AUDIT_BUILD_ENV\" \"${RUSTC_WRAPPER-unset}\" \"$PATH\" \"$CARGO_TARGET_DIR\""]);
+        apply_child_environment(&mut command, &config);
+        apply_lane_environment(
+            &mut command,
+            &root,
+            [
+                ("AUDIT_CANARY".into(), "synthetic".into()),
+                ("AUDIT_BUILD_ENV".into(), "inherited".into()),
+                ("PATH".into(), "/ambient/bin".into()),
+            ],
+            &shim,
+            &target,
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("unset:host-overlay:unset:/bin:{}", target.display()),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

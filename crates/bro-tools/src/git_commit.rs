@@ -54,12 +54,14 @@ impl Tool for GitCommit {
     }
 }
 
-async fn git(root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+async fn git(cx: &ToolCx, root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut command = tokio::process::Command::new("git");
     command
         .arg("--literal-pathspecs")
         .args(args)
         .current_dir(root);
+    cx.child_env.apply(command.as_std_mut());
+    command.envs(cx.shell_env.iter());
     // Fixture subprocesses must not read the operator's Git configuration.
     #[cfg(test)]
     command
@@ -131,18 +133,19 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
         validate_literal(path, &cx.safety)?;
     }
     let effective_root = crate::workspace::effective_root(&cx.root);
-    let root_output = git(&effective_root, &["rev-parse", "--show-toplevel"]).await?;
+    let root_output = git(cx, &effective_root, &["rev-parse", "--show-toplevel"]).await?;
     let root_text = std::str::from_utf8(&root_output).context("repository path is not UTF-8")?;
     let root = PathBuf::from(root_text.strip_suffix('\n').unwrap_or(root_text));
     let paths: BTreeSet<&str> = args.paths.iter().map(String::as_str).collect();
 
-    if !git(&root, &["ls-files", "--unmerged", "-z"])
+    if !git(cx, &root, &["ls-files", "--unmerged", "-z"])
         .await?
         .is_empty()
     {
         bail!("refused: resolve the repository's unmerged index entries before committing");
     }
     let staged = git(
+        cx,
         &root,
         &["diff", "--cached", "--name-only", "--no-renames", "-z"],
     )
@@ -162,13 +165,16 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
 
     let mut index_args = vec!["ls-files", "--stage", "-z", "--"];
     index_args.extend(paths.iter().copied());
-    let index_output = git(&root, &index_args).await?;
+    let index_output = git(cx, &root, &index_args).await?;
     let index = path_modes(&index_output)?;
     // HEAD is absent in a new repository. Only skip the tree read in that case.
-    let head_output = if git(&root, &["rev-parse", "--verify", "HEAD"]).await.is_ok() {
+    let head_output = if git(cx, &root, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .is_ok()
+    {
         let mut tree_args = vec!["ls-tree", "-r", "-z", "HEAD", "--"];
         tree_args.extend(paths.iter().copied());
-        git(&root, &tree_args).await?
+        git(cx, &root, &tree_args).await?
     } else {
         Vec::new()
     };
@@ -217,15 +223,20 @@ async fn commit(cx: &ToolCx, args: GitCommitInput) -> anyhow::Result<String> {
     if !stage.is_empty() {
         let mut add = vec!["add", "--"];
         add.extend(stage);
-        git(&root, &add).await?;
+        git(cx, &root, &add).await?;
     }
-    commit_only(&root, &args.message, paths).await
+    commit_only(cx, &root, &args.message, paths).await
 }
 
-async fn commit_only(root: &Path, message: &str, paths: BTreeSet<&str>) -> anyhow::Result<String> {
+async fn commit_only(
+    cx: &ToolCx,
+    root: &Path,
+    message: &str,
+    paths: BTreeSet<&str>,
+) -> anyhow::Result<String> {
     let mut commit_args = vec!["commit", "--only", "-m", message, "--"];
     commit_args.extend(paths);
-    let output = git(root, &commit_args).await?;
+    let output = git(cx, root, &commit_args).await?;
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
@@ -244,16 +255,6 @@ mod tests {
         async fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            git(&root, &["init", "-q"]).await.unwrap();
-            for (key, value) in [
-                ("user.name", "Test"),
-                ("user.email", "test@example.invalid"),
-                ("commit.gpgsign", "false"),
-            ] {
-                git(&root, &["config", "--local", key, value])
-                    .await
-                    .unwrap();
-            }
             let cx = ToolCx {
                 root,
                 safety: Arc::new(crate::SafetyPolicy::new()),
@@ -263,8 +264,19 @@ mod tests {
                 edits: Arc::new(Mutex::new(Default::default())),
                 session_env: Arc::new(Default::default()),
                 shell_env: Arc::new(Default::default()),
+                child_env: Arc::new(Default::default()),
                 tool_arg_defaults: Arc::new(Default::default()),
             };
+            git(&cx, &cx.root, &["init", "-q"]).await.unwrap();
+            for (key, value) in [
+                ("user.name", "Test"),
+                ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ] {
+                git(&cx, &cx.root, &["config", "--local", key, value])
+                    .await
+                    .unwrap();
+            }
             Self { _dir: dir, cx }
         }
 
@@ -283,8 +295,38 @@ mod tests {
         }
 
         async fn git(&self, args: &[&str]) -> Vec<u8> {
-            git(&self.cx.root, args).await.unwrap()
+            git(&self.cx, &self.cx.root, args).await.unwrap()
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_hooks_receive_explicit_project_environment_after_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new().await;
+        fixture.cx.shell_env = Arc::new(BTreeMap::from([(
+            "AUDIT_PROJECT_FLAG".into(),
+            "expected".into(),
+        )]));
+        fixture.cx.child_env =
+            Arc::new(crate::ChildEnvironment::new(["AUDIT_PROJECT_FLAG".into()]));
+        fixture.write("mine.txt", "selected").await;
+        fixture
+            .write(
+                ".git/hooks/pre-commit",
+                "#!/bin/sh\n[ \"$AUDIT_PROJECT_FLAG\" = expected ]\n",
+            )
+            .await;
+        tokio::fs::set_permissions(
+            fixture.cx.root.join(".git/hooks/pre-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .await
+        .unwrap();
+        let result = tokio::spawn(async move { fixture.commit(&["mine.txt"]).await })
+            .await
+            .unwrap();
+        assert!(!result.is_error(), "{result:?}");
     }
 
     #[tokio::test]
@@ -317,6 +359,7 @@ mod tests {
             .git(&["ls-files", "--stage", "-z", "--", "foreign.txt"])
             .await;
         commit_only(
+            &fixture.cx,
             &fixture.cx.root,
             "selected change",
             BTreeSet::from(["mine.txt"]),
