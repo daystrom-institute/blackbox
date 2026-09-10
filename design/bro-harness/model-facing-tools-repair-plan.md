@@ -69,8 +69,8 @@ code 3 as `ok:false`.
 
 Final candidate gates: pinned `scripts/fmt.sh --check`, workspace nextest full
 profile (6,782 passed; 19 skipped), `cargo clippy --workspace` and concurrency
-lint passed. Clippy reports existing repository warnings. These are lane gates;
-this slice has not replaced the installed macOS binaries or restarted services.
+lint passed. Clippy reports existing repository warnings. These were lane gates. The deployment milestone below records installation of
+the combined authority, cancellation and output repairs.
 
 ## Second implementation slice
 
@@ -101,6 +101,21 @@ The shell lifecycle portion of `gap-cf64b0da` is repaired. The follow-on
 paging, streaming UTF-8 and filtering, serialized budget accounting and wrapper
 collection. Both implementations are landed directly in beta.
 
-Next: provider/result integrity (order 3).
-Other audit gaps remain open. No repair slice here has replaced the installed
-macOS binaries or restarted shared services.
+Order 3 is implemented in the [provider/result integrity milestone](model-facing-audit/result-integrity-repair.md), including search/edit observation integrity.
+Next: instructions, context and resume (order 4), then catalog/default simplification (order 5).
+Other audit gaps remain open.
+
+## Deployment milestone
+
+On 2026-09-10, beta revision `47d2aef3a0e65c83f00ab004acee54c78c189d10`
+was rebuilt for native macOS and installed as `bro-harness` and `isolate` with
+persistent signing and prior binary backups. All 21 executable authority,
+cancellation and shell-output probes passed against the installed paths.
+Fleetd launches a fresh standalone harness per dispatch, so the binary swap
+requires no fleetd restart. No local corpus daemon exists on this host.
+
+Cluster workflow `build-bbox-image-vssnp` built the same revision and published
+image tag `47d2aef3a0e6`. The operator-owned converge script updated the cage
+Deployment; the new pod reached Ready with no restarts. This installs the
+completed correctness slices; provider/result, context/resume and catalog
+repairs remain subsequent milestones.

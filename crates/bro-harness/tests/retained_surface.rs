@@ -137,9 +137,10 @@ async fn corpus_only_catalog_dispatches_without_atom_or_workflow_capabilities() 
     assert!(!registry.contains("mcp__blackbox__bbox_reindex"));
     assert_native_read(&registry, &host, &cx).await;
     let input = json!({"query": "retained corpus 語", "limit": 1});
+    let expected = json!({"content":[],"structuredContent":corpus_evidence(),"isError":false});
     for name in ["corpus_search", "mcp__blackbox__bbox_corpus_search"] {
         match registry.dispatch(name, input.clone(), &cx).await {
-            ToolResult::Json(value) => assert_eq!(value, corpus_evidence()),
+            ToolResult::Json(value) => assert_eq!(value, expected),
             other => panic!("corpus flat dispatch failed: {other:?}"),
         }
         let nested = host
@@ -153,7 +154,7 @@ async fn corpus_only_catalog_dispatches_without_atom_or_workflow_capabilities() 
         assert_eq!(nested.content_type, "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(&nested.content).unwrap(),
-            corpus_evidence()
+            expected
         );
     }
     assert_eq!(

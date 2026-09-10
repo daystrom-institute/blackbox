@@ -35,6 +35,17 @@ out explicitly under `Changed` or `Removed`.
 - `build.gate` collects retained output before parsing diagnostics and reports
   incomplete capture with continuation instead of treating a preview as complete.
 
+- Harness provider responses require valid object arguments and explicit stream
+  completion before tool admission. Output limits and step exhaustion emit
+  incomplete results; structured final results require schema validation and
+  a single terminal call.
+- MCP results retain text, structured data and resource references together.
+  Unsupported media carries explicit omission details; server error evidence
+  survives flat and nested calls.
+- Failed patches report completed mutations and retain their edit evidence.
+  Search and glob disclose skipped files and traversal/output limits, and honor
+  explicitly named build directories.
+
 - Harness cancellation stops queued calls and waits for admitted work to return
   its actual outcome before acknowledging interruption. Nested code-mode calls
   retain bounded completion receipts, including calls left pending by JavaScript.

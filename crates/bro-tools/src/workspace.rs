@@ -11,7 +11,9 @@
 use crate::tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
 use globset::{Glob as GlobPattern, GlobBuilder};
-use ignore::WalkBuilder;
+#[path = "workspace_observation.rs"]
+mod observation;
+use observation::{Observation, ObservedWalk};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -394,11 +396,8 @@ fn walk_base(root: &Path, rel: Option<&str>) -> anyhow::Result<PathBuf> {
     resolve_in_root(root, rel.unwrap_or("."))
 }
 
-/// Directory names that are pruned from every recursive workspace walk
-/// (`glob`, `content_search`). These are build/dependency/VCS trees that an
-/// agent never wants to grep and that can be enormous — a single Cargo
-/// `target/` in this very repo is 30 GB / 65k files. Pruning them by name is
-/// defense-in-depth that does not depend on any ignore file being present.
+/// Heuristic descendant exclusions for recursive workspace observations.
+/// Explicit walk roots are always admitted; omitted subtrees are disclosed.
 const PRUNE_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -417,45 +416,6 @@ const PRUNE_DIRS: &[&str] = &[
     ".gradle",
     ".cargo",
 ];
-
-/// A recursive directory walker hardened against runaway traversals.
-///
-/// Two protections layered together:
-///   1. `require_git(false)` — honor `.gitignore` even when the walk root is not
-///      a *recognized* git repository. This is essential inside a linked git
-///      **worktree**, whose `.git` is a file (a `gitdir:` pointer), not a
-///      directory: `ignore`'s default git detection misses it, so without this
-///      it silently skips `.gitignore` and descends straight into the gitignored
-///      `target/`. (That is exactly how the in-process harness wedged the daemon
-///      — every `glob`/`content_search` walked 30 GB of build output.)
-///   2. `filter_entry` hard-prunes [`PRUNE_DIRS`] by name, so even a directory
-///      with no `.gitignore` at all (or one that doesn't list `target/`) can't
-///      trigger a catastrophic walk. Only directories are pruned; files that
-///      happen to share a name are still visited.
-fn hardened_walk(base: &Path) -> ignore::Walk {
-    WalkBuilder::new(base)
-        .require_git(false)
-        .filter_entry(|e| {
-            if e.file_type().is_some_and(|t| t.is_dir()) {
-                let name = e.file_name().to_str().unwrap_or_default();
-                !PRUNE_DIRS.contains(&name)
-            } else {
-                true
-            }
-        })
-        .build()
-}
-
-/// Read a file as UTF-8, returning None for binary/oversized/unreadable.
-// called from content_search's call_blocking closure (wave 13).
-#[allow(clippy::disallowed_methods)]
-fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > max_bytes {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
-}
 
 // ---------------------------------------------------------------------------
 // file_read
@@ -839,7 +799,7 @@ struct FileEditInput {
     /// Path to the file. Relative paths resolve against the worktree root;
     /// absolute paths are accepted as-is.
     file_path: String,
-    /// Exact text to find. Must be unique in the file unless `replace_all`.
+    /// Nonempty exact text to find. Must be unique in the file unless `replace_all`.
     old_string: String,
     /// Replacement text.
     new_string: String,
@@ -856,7 +816,7 @@ impl Tool for FileEdit {
         "file_edit"
     }
     fn description(&self) -> &str {
-        "Replace an exact string in a file. Fails if old_string is absent, or present more than once when replace_all is false."
+        "Replace an exact string in a file. Fails if old_string is empty, absent, or present more than once when replace_all is false."
     }
     fn input_schema(&self) -> Value {
         schema_for::<FileEditInput>()
@@ -872,6 +832,9 @@ impl Tool for FileEdit {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
+        if args.old_string.is_empty() {
+            return ToolResult::Error("old_string must not be empty".into());
+        }
         if args.old_string == args.new_string {
             return ToolResult::Error("old_string and new_string are identical".into());
         }
@@ -971,7 +934,7 @@ fn content_search_refinement_hint(args: &ContentSearchInput, cap: usize) -> Stri
     let path_hint = args.path.as_deref().unwrap_or("<subdir>");
     let glob_hint = args.glob.as_deref().unwrap_or("*.rs");
     format!(
-        "[refine: narrow path=\"{path_hint}\" and glob=\"{glob_hint}\", use mode=\"files\" or mode=\"count\" to size the hit set first, lower max_results for a compact sample, or raise max_results up to {CONTENT_SEARCH_HARD_MAX_RESULTS} for a deliberate exhaustive search; current result cap {cap}, byte cap {CONTENT_SEARCH_OUTPUT_BYTE_CAP}]"
+        "[refine: narrow path=\"{path_hint}\" and glob=\"{glob_hint}\", use mode=\"files\" or mode=\"count\" to size the hit set first, lower max_results for a compact sample, or raise max_results up to {CONTENT_SEARCH_HARD_MAX_RESULTS} for a larger bounded sample within the declared scope; current result cap {cap}, byte cap {CONTENT_SEARCH_OUTPUT_BYTE_CAP}]"
     )
 }
 
@@ -981,7 +944,7 @@ impl Tool for ContentSearch {
         "content_search"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex across the worktree (respects .gitignore). Returns compact relpath:line:text results by default, capped with explicit truncation/refinement hints. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, case_insensitive, and max_results."
+        "Search UTF-8 file contents by regex within a visible, unignored regular-file scope. Descendant build/dependency directories and symlinks are excluded; an explicit root named build/target is admitted. Files over 2 MB, binary/non-UTF8 data, IO errors, and the 20000-entry traversal ceiling are disclosed in an observation footer. Returns bounded relpath:line:text results with refinement hints. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, case_insensitive, and max_results."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ContentSearchInput>()
@@ -1001,6 +964,9 @@ impl Tool for ContentSearch {
                 Ok(a) => a,
                 Err(e) => return ToolResult::Error(format!("bad input: {e}")),
             };
+            if args.max_results == Some(0) {
+                return ToolResult::Error("max_results must be greater than zero".into());
+            }
             let re = match regex::RegexBuilder::new(&args.pattern)
                 .case_insensitive(args.case_insensitive)
                 .build()
@@ -1032,7 +998,14 @@ impl Tool for ContentSearch {
             // `files`/`count` modes count files; `content` counts lines.
             let mut total_matches = 0usize;
             let mut matched_files = 0usize;
-            'walk: for entry in hardened_walk(&base).flatten() {
+            let observation = std::sync::Arc::new(std::sync::Mutex::new(Observation::default()));
+            'walk: for entry in
+                ObservedWalk::new(&base, observation.clone(), observation::VISIT_LIMIT)
+            {
+                if cx.cancellation.is_cancelled() {
+                    observation.lock().unwrap().cancelled = true;
+                    break;
+                }
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     continue;
                 }
@@ -1043,7 +1016,7 @@ impl Tool for ContentSearch {
                         continue;
                     }
                 }
-                let Some(text) = read_text_capped(p, 2_000_000) else {
+                let Some(text) = observation::read_text(p, &mut observation.lock().unwrap()) else {
                     continue;
                 };
                 let rel = p.strip_prefix(&root).unwrap_or(p).display().to_string();
@@ -1126,7 +1099,7 @@ impl Tool for ContentSearch {
             }
 
             if hits.is_empty() {
-                return ToolResult::Text("no matches".into());
+                hits.push("no matches in inspected files".into());
             }
             if args.mode == SearchMode::Count {
                 hits.push(format!(
@@ -1136,7 +1109,9 @@ impl Tool for ContentSearch {
             if truncated {
                 hits.push(content_search_refinement_hint(&args, cap));
             }
-            let output = hits.join("\n");
+            let mut observation = observation.lock().unwrap();
+            observation.result_limit = truncated;
+            let output = observation::finish(&hits.join("\n"), &mut observation, cx.output_budget);
             ToolResult::Text(output)
         })
         .await
@@ -1201,7 +1176,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &str {
-        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths as ONE newline-delimited STRING (not an array; in code-mode cells use `result.split(\"\\n\")`), capped by max_results (default 200, maximum 2000) and 8000 output bytes with an explicit omission marker. Sorted lexicographically by default; sort=\"mtime\" explicitly requests newest first."
+        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths as ONE newline-delimited STRING followed by a bracketed observation footer (not an array; ignore bracketed metadata rows when consuming paths), capped by max_results (default 200, maximum 2000) and 8000 output bytes with an explicit omission marker. Hidden/ignored paths, symlinks, and descendant build/dependency directories are excluded. Explicit root targets override name pruning. Traversal stops after 20000 visible entries and discloses partial sorting. Sorted lexicographically by default; sort=\"mtime\" requests newest first."
     }
     fn input_schema(&self) -> Value {
         schema_for::<GlobInput>()
@@ -1221,6 +1196,9 @@ impl Tool for Glob {
                 Ok(a) => a,
                 Err(e) => return ToolResult::Error(format!("bad input: {e}")),
             };
+            if args.max_results == Some(0) {
+                return ToolResult::Error("max_results must be greater than zero".into());
+            }
             let matcher = match relpath_glob(&args.pattern) {
                 Ok(m) => m,
                 Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
@@ -1237,27 +1215,50 @@ impl Tool for Glob {
             let root = effective_root(&cx.root);
             // Collect (relpath, mtime) so we can order before formatting.
             let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
-            for entry in hardened_walk(&base).flatten() {
+            let observation = std::sync::Arc::new(std::sync::Mutex::new(Observation::default()));
+            for entry in ObservedWalk::new(&base, observation.clone(), observation::VISIT_LIMIT) {
+                if cx.cancellation.is_cancelled() {
+                    observation.lock().unwrap().cancelled = true;
+                    break;
+                }
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     continue;
                 }
+                observation.lock().unwrap().inspected_files += 1;
                 let p = entry.path();
-                let rel = p.strip_prefix(&base).unwrap_or(p);
+                let rel = if p == base.as_path() {
+                    Path::new(p.file_name().unwrap_or_default())
+                } else {
+                    p.strip_prefix(&base).unwrap_or(p)
+                };
                 let name_hit = match_basename
                     && p.file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| matcher.is_match(n));
                 if matcher.is_match(rel) || name_hit {
-                    let mtime = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::UNIX_EPOCH);
+                    let mtime = if args.sort == GlobSort::Mtime {
+                        match entry
+                            .metadata()
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                        {
+                            Some(mtime) => mtime,
+                            None => {
+                                let mut observation = observation.lock().unwrap();
+                                observation.read_errors += 1;
+                                observation.skip(p, "mtime_error");
+                                std::time::UNIX_EPOCH
+                            }
+                        }
+                    } else {
+                        std::time::UNIX_EPOCH
+                    };
                     out.push((
                         p.strip_prefix(&root).unwrap_or(p).display().to_string(),
                         mtime,
                     ));
                     if out.len() >= GLOB_SCAN_CEILING {
+                        observation.lock().unwrap().traversal_limit = true;
                         break;
                     }
                 }
@@ -1267,23 +1268,33 @@ impl Tool for Glob {
                 GlobSort::Mtime => out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
                 GlobSort::Name => out.sort_by(|a, b| a.0.cmp(&b.0)),
             }
-            if out.is_empty() {
-                return ToolResult::Text("no files matched".into());
-            }
+
             // Cap AFTER sorting, so the returned slice is the true top-N by the
             // chosen order (not an arbitrary walk-order prefix).
             let cap = args.max_results.unwrap_or(200).clamp(1, 2000);
             let total = out.len();
             let mut lines: Vec<String> = out.into_iter().take(cap).map(|(rel, _)| rel).collect();
             if total > lines.len() {
+                observation.lock().unwrap().result_limit = true;
                 lines.push(format!(
                     "[showing {} of {total} matches; raise max_results for more]",
                     lines.len()
                 ));
             }
-            ToolResult::Text(crate::output::truncate_text(
+            if lines.is_empty() {
+                lines.push("no files matched in inspected paths".into());
+            }
+            let mut observation = observation.lock().unwrap();
+            if observation.traversal_limit {
+                lines.push(format!(
+                    "[traversal stopped at {} entries; sorting covers only observed matches]",
+                    observation::VISIT_LIMIT
+                ));
+            }
+            ToolResult::Text(observation::finish(
                 &lines.join("\n"),
-                crate::output::DEFAULT_OUTPUT_BYTES,
+                &mut observation,
+                cx.output_budget,
             ))
         })
         .await
@@ -1359,7 +1370,9 @@ impl Tool for ApplyPatch {
          `*** Move to:`) hunks; update lines are prefixed ' ' (context), '+' \
          (add), or '-' (remove). This is a FREEFORM tool — emit the patch text \
          directly, do not wrap it in JSON. Paths are relative to the worktree \
-         root; absolute paths are accepted as-is."
+         root; absolute paths are accepted as-is. Hunks apply sequentially; a \
+         failure reports completed mutations that were not rolled back, and \
+         identifies failed writes whose final state may be uncertain."
     }
     fn input_schema(&self) -> Value {
         // JSON-function fallback shape. The freeform/grammar channel delivers
@@ -1413,54 +1426,19 @@ impl Tool for ApplyPatch {
                 }
             };
 
-            // Snapshot pre-images of every source path the patch touches, so applied
-            // changes feed the edit-diagnostics sink the same way file_edit does.
-            let parsed = match bro_apply_patch::parse_patch(patch_text) {
-                Ok(p) => p,
-                Err(e) => return ToolResult::Error(format!("apply_patch parse error: {e}")),
+            let (outcome, failure) = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
+                Ok(outcome) => (outcome, None),
+                Err(failure) => (*failure.outcome, Some(failure.error.to_string())),
             };
-            let mut pre_images: std::collections::HashMap<PathBuf, Vec<u8>> =
-                std::collections::HashMap::new();
-            for hunk in &parsed.hunks {
-                let src = match hunk {
-                    bro_apply_patch::Hunk::AddFile { path, .. } => path,
-                    bro_apply_patch::Hunk::DeleteFile { path } => path,
-                    bro_apply_patch::Hunk::UpdateFile { path, .. } => path,
-                };
-                let abs = cx.root.join(src);
-                pre_images.insert(src.clone(), std::fs::read(&abs).unwrap_or_default());
+            // Use evidence captured at each completed mutation. Re-reading after
+            // the entire envelope would erase repeated-path intermediate states.
+            for edit in &outcome.edits {
+                record_edit(&cx, &cx.root.join(&edit.path), &edit.before, &edit.after);
             }
-
-            let outcome = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
-                Ok(o) => o,
-                Err(e) => return ToolResult::Error(format!("apply_patch failed: {e}")),
-            };
 
             use bro_apply_patch::FileAction;
             let mut summary = Vec::with_capacity(outcome.changes.len());
             for ch in &outcome.changes {
-                let abs = cx.root.join(&ch.path);
-                match ch.action {
-                    FileAction::Added | FileAction::Updated => {
-                        let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
-                        let post = std::fs::read(&abs).unwrap_or_default();
-                        record_edit(&cx, &abs, &pre, &post);
-                    }
-                    FileAction::Deleted => {
-                        let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
-                        record_edit(&cx, &abs, &pre, &[]);
-                    }
-                    FileAction::Moved => {
-                        // Old path removed, new path created.
-                        if let Some(from) = &ch.moved_from {
-                            let from_abs = cx.root.join(from);
-                            let pre = pre_images.get(from).cloned().unwrap_or_default();
-                            record_edit(&cx, &from_abs, &pre, &[]);
-                            let post = std::fs::read(&abs).unwrap_or_default();
-                            record_edit(&cx, &abs, &[], &post);
-                        }
-                    }
-                }
                 let verb = match ch.action {
                     FileAction::Added => "added",
                     FileAction::Updated => "updated",
@@ -1475,6 +1453,20 @@ impl Tool for ApplyPatch {
                     )),
                     _ => summary.push(format!("{verb} {}", ch.path.display())),
                 }
+            }
+
+            if let Some(error) = failure {
+                let evidence: Vec<_> = outcome.edits.iter().map(|edit| {
+                    format!("{}: {} -> {}", edit.path.display(),
+                        crate::slice_core::sha256_hex(&edit.before),
+                        crate::slice_core::sha256_hex(&edit.after))
+                }).collect();
+                return ToolResult::Error(format!(
+                    "apply_patch failed: {error}\nCompleted file mutations ({}; not rolled back):\n{}\nCompleted changes:\n{}\nCreated directories: {}\nPotentially changed paths from failed writes (exact state unknown): {}",
+                    outcome.edits.len(), evidence.join("\n"), summary.join("\n"),
+                    outcome.created_directories.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                    outcome.uncertain_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                ));
             }
 
             ToolResult::Text(format!(
@@ -1631,6 +1623,31 @@ mod tests {
             v["session_env"]["BRO_HARNESS_PROJECT_DOC_FILES"]["value"],
             "AGENTS_BETA.md"
         );
+    }
+
+    #[tokio::test]
+    async fn file_edit_rejects_empty_needle_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("a.txt");
+        let before = b"unchanged\r\n";
+        std::fs::write(&path, before).unwrap();
+        let cx = cx_at(&root);
+        for replace_all in [false, true] {
+            let result = FileEdit
+                .call(
+                    json!({
+                        "file_path": "a.txt", "old_string": "", "new_string": "inserted",
+                        "replace_all": replace_all
+                    }),
+                    &cx,
+                )
+                .await;
+            assert!(
+                matches!(result, ToolResult::Error(ref error) if error == "old_string must not be empty")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 
     #[tokio::test]
@@ -1791,6 +1808,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_reports_oversized_binary_and_invalid_utf8_exclusions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut large = vec![b'x'; observation::FILE_BYTES as usize + 1];
+        large[..6].copy_from_slice(b"NEEDLE");
+        std::fs::write(root.join("large.txt"), large).unwrap();
+        std::fs::write(root.join("invalid.txt"), b"NEEDLE\xff").unwrap();
+        std::fs::write(root.join("binary.txt"), b"NEEDLE\0").unwrap();
+        let cx = cx_at(&root);
+        let ToolResult::Text(result) = ContentSearch.call(json!({"pattern":"NEEDLE"}), &cx).await
+        else {
+            panic!("expected text");
+        };
+        assert!(
+            result.starts_with("no matches in inspected files"),
+            "{result}"
+        );
+        for counter in [
+            "oversized=1",
+            "invalid_utf8=1",
+            "binary=1",
+            "complete_within_scope=false",
+        ] {
+            assert!(result.contains(counter), "missing {counter}: {result}");
+        }
+        let ToolResult::Text(explicit) = ContentSearch
+            .call(json!({"pattern":"NEEDLE", "path":"large.txt"}), &cx)
+            .await
+        else {
+            panic!("expected text");
+        };
+        assert!(explicit.contains("oversized=1"), "{explicit}");
+        assert!(explicit.contains("large.txt"), "{explicit}");
+    }
+
+    #[tokio::test]
+    async fn explicit_build_directory_and_file_targets_override_name_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("build")).unwrap();
+        std::fs::write(root.join("build/data.txt"), b"NEEDLE\n").unwrap();
+        let cx = cx_at(&root);
+        let ToolResult::Text(default) = ContentSearch.call(json!({"pattern":"NEEDLE"}), &cx).await
+        else {
+            panic!("expected text");
+        };
+        assert!(default.contains("pruned_dirs=1"), "{default}");
+        assert!(default.contains("complete_within_scope=false"), "{default}");
+        for path in ["build", "build/data.txt"] {
+            let ToolResult::Text(found) = ContentSearch
+                .call(json!({"pattern":"NEEDLE", "path":path}), &cx)
+                .await
+            else {
+                panic!("expected text");
+            };
+            assert!(found.contains("build/data.txt:1:NEEDLE"), "{found}");
+            assert!(found.contains("pruned_dirs=0"), "{found}");
+            let ToolResult::Text(paths) = Glob
+                .call(json!({"pattern":"*.txt", "path":path}), &cx)
+                .await
+            else {
+                panic!("expected text");
+            };
+            assert!(paths.starts_with("build/data.txt\n"), "{paths}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_search_and_glob_limits_are_rejected_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), b"NEEDLE\n").unwrap();
+        let cx = cx_at(&root);
+        for result in [
+            ContentSearch
+                .call(json!({"pattern":"NEEDLE", "max_results":0}), &cx)
+                .await,
+            Glob.call(json!({"pattern":"*.txt", "max_results":0}), &cx)
+                .await,
+        ] {
+            assert!(
+                matches!(result, ToolResult::Error(ref message) if message.contains("greater than zero"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_footer_survives_bounded_output_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "NEEDLE details\n".repeat(1000)).unwrap();
+        let mut cx = cx_at(&root);
+        cx.output_budget = 1024;
+        let ToolResult::Text(result) = ContentSearch
+            .call(json!({"pattern":"NEEDLE", "max_results":1000}), &cx)
+            .await
+        else {
+            panic!("expected text");
+        };
+        assert!(result.len() <= 1024, "{}", result.len());
+        assert!(result.contains("[observation "), "{result}");
+        assert!(result.contains("output_limit=true"), "{result}");
+        assert!(result.contains("complete_within_scope=false"), "{result}");
+    }
+
+    #[tokio::test]
     async fn content_search_modes_and_context() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1857,7 +1980,10 @@ mod tests {
             .call(json!({"pattern":"HIT","mode":"files"}), &cx)
             .await;
         match r {
-            ToolResult::Text(t) => assert_eq!(t, "no matches", "case-sensitive default: {t}"),
+            ToolResult::Text(t) => assert!(
+                t.starts_with("no matches in inspected files\n"),
+                "case-sensitive default: {t}"
+            ),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -1909,7 +2035,10 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(lines, vec!["zzz.rs", "aaa.rs"], "mtime order: {t}");
             }
             other => panic!("expected text, got {other:?}"),
@@ -1921,7 +2050,10 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(lines, vec!["aaa.rs", "zzz.rs"], "name order: {t}");
             }
             other => panic!("expected text, got {other:?}"),
@@ -1933,7 +2065,10 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(lines[0], "aaa.rs", "capped slice is top-by-sort: {t}");
                 assert!(
                     lines.len() == 2 && lines[1].contains("of 2 matches"),
@@ -1968,7 +2103,10 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(lines, vec!["fleet_tui.rs"], "only the fleet file: {t}");
             }
             other => panic!("expected text, got {other:?}"),
@@ -1980,7 +2118,10 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(
                     lines,
                     vec!["fleet_tui.rs", "nested/deep.rs", "plain.rs"],
@@ -1997,11 +2138,110 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => {
-                let lines: Vec<&str> = t.lines().collect();
+                let lines: Vec<&str> = t
+                    .lines()
+                    .filter(|line| !line.starts_with("[observation "))
+                    .collect();
                 assert_eq!(lines, vec!["nested/deep.rs"], "anchored subdir: {t}");
             }
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_patch_failure_preserves_completed_mutations_in_result_and_tracker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cx = cx_at(&root);
+        let result = ApplyPatch.call(json!({"source": "*** Begin Patch\n*** Add File: first.txt\n+one\n*** Update File: first.txt\n@@\n-one\n+two\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch"}), &cx).await;
+        let ToolResult::Error(error) = result else {
+            panic!("expected partial failure");
+        };
+        assert!(
+            error.contains("Completed file mutations (2; not rolled back)"),
+            "{error}"
+        );
+        assert!(error.contains("added first.txt"), "{error}");
+        assert!(error.contains("updated first.txt"), "{error}");
+        assert!(error.contains("missing.txt"), "{error}");
+        assert_eq!(std::fs::read(root.join("first.txt")).unwrap(), b"two\n");
+        assert!(!root.join("missing.txt").exists());
+        let sink = cx.edits.lock().unwrap();
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].path, root.join("first.txt"));
+        assert_eq!(events[0].pre_image, b"");
+        assert_eq!(
+            events[0].post_sha256,
+            crate::slice_core::sha256_hex(b"one\n")
+        );
+        assert_eq!(events[1].pre_image, b"one\n");
+        assert_eq!(
+            events[1].post_sha256,
+            crate::slice_core::sha256_hex(b"two\n")
+        );
+        assert!(error.contains(&events[0].post_sha256));
+        assert!(error.contains(&events[1].post_sha256));
+    }
+
+    #[tokio::test]
+    async fn apply_patch_failed_write_keeps_prior_edit_and_discloses_uncertain_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("obstacle"), b"not a directory").unwrap();
+        let cx = cx_at(&root);
+        let result = ApplyPatch.call(json!({"source": "*** Begin Patch\n*** Add File: first.txt\n+done\n*** Add File: obstacle/child.txt\n+blocked\n*** End Patch"}), &cx).await;
+        let ToolResult::Error(error) = result else {
+            panic!("expected IO failure");
+        };
+        assert!(
+            error.contains("Completed file mutations (1; not rolled back)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("exact state unknown): obstacle/child.txt"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(root.join("first.txt")).unwrap(), b"done\n");
+        assert_eq!(
+            std::fs::read(root.join("obstacle")).unwrap(),
+            b"not a directory"
+        );
+        assert_eq!(cx.edits.lock().unwrap().events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_move_records_overwritten_destination_before_later_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.txt"), b"source\n").unwrap();
+        std::fs::write(root.join("destination.txt"), b"previous destination\n").unwrap();
+        let cx = cx_at(&root);
+        let result = ApplyPatch.call(json!({"source": "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-source\n+updated\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch"}), &cx).await;
+        let ToolResult::Error(error) = result else {
+            panic!("expected partial failure");
+        };
+        assert!(
+            error.contains("moved source.txt -> destination.txt"),
+            "{error}"
+        );
+        assert!(!root.join("source.txt").exists());
+        assert_eq!(
+            std::fs::read(root.join("destination.txt")).unwrap(),
+            b"updated\n"
+        );
+        let sink = cx.edits.lock().unwrap();
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].path, root.join("destination.txt"));
+        assert_eq!(events[0].pre_image, b"previous destination\n");
+        assert_eq!(
+            events[0].post_sha256,
+            crate::slice_core::sha256_hex(b"updated\n")
+        );
+        assert_eq!(events[1].path, root.join("source.txt"));
+        assert_eq!(events[1].pre_image, b"source\n");
+        assert_eq!(events[1].post_sha256, crate::slice_core::sha256_hex(b""));
     }
 
     #[tokio::test]

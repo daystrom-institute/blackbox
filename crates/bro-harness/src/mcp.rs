@@ -20,13 +20,15 @@ use bro_tools::{Tool, ToolCx, ToolResult};
 use http::{HeaderName, HeaderValue};
 use rmcp::RoleClient;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+mod result;
 
 #[derive(Clone)]
 pub struct McpConfig {
@@ -156,6 +158,7 @@ pub struct McpToolSpec {
 #[async_trait]
 pub trait McpSurface: Send + Sync {
     async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>>;
+    /// Native host result, projected into the same MCP envelope as remote tools.
     async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult>;
 }
 
@@ -204,6 +207,7 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
                 let total = specs.len();
                 let mut admitted = 0;
                 for (call_name, description, schema) in specs {
+                    let description = format!("{description}\n{}", result::RESULT_GUIDANCE);
                     let qname = format!("mcp__{}__{}", server.name(), call_name);
                     if capability_server == Some(server.name())
                         && !server.excludes(&call_name, &qname)
@@ -535,12 +539,13 @@ impl McpTool {
                 conn.call_tool(params).await?
             }
             McpBackend::InProcess(svc) => {
-                return svc
+                let native = svc
                     .call_tool(&self.call_name, Value::Object(input_args))
-                    .await;
+                    .await?;
+                return Ok(result::from_native_result(native));
             }
         };
-        Ok(to_tool_result(resp))
+        Ok(result::to_tool_result(&resp))
     }
 }
 
@@ -575,34 +580,6 @@ fn http_transport_config(
         config = config.custom_headers(custom_headers);
     }
     Ok(config)
-}
-
-fn to_tool_result(r: CallToolResult) -> ToolResult {
-    let text = collect_text(&r.content);
-    if r.is_error.unwrap_or(false) {
-        return ToolResult::Error(if text.is_empty() {
-            "tool returned is_error=true with no text".to_string()
-        } else {
-            text
-        });
-    }
-    if let Some(sc) = r.structured_content {
-        return ToolResult::Json(sc);
-    }
-    ToolResult::Text(text)
-}
-
-fn collect_text(content: &[Content]) -> String {
-    let mut out = String::new();
-    for c in content {
-        if let RawContent::Text(t) = &c.raw {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&t.text);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -875,6 +852,11 @@ mod tests {
         let tools = load_mcp_tools_from_config(&config, &ToolFilter::default()).await;
         let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["mcp__sdk__placed", "mcp__sdk__default_out"]);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.description().contains(result::RESULT_GUIDANCE))
+        );
 
         let (in_box, out_box) = split_mcp_tools_by_placement(&tools, &config.tool_placement);
         let in_names: Vec<_> = in_box.iter().map(|t| t.name()).collect();

@@ -50,90 +50,210 @@ pub struct FileChange {
     pub moved_from: Option<PathBuf>,
 }
 
+/// One completed filesystem mutation, captured before another hunk can change
+/// the same path again. Empty bytes represent an absent file for the edit sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedEdit {
+    pub path: PathBuf,
+    pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub changes: Vec<FileChange>,
+    pub edits: Vec<AppliedEdit>,
+    /// Directories actually created while preparing successful or failed writes.
+    pub created_directories: Vec<PathBuf>,
+    /// A failed write may have truncated or partially written these paths.
+    /// They are not presented as exact, completed mutations in `edits`.
+    pub uncertain_paths: Vec<PathBuf>,
 }
 
-/// Apply a codex `*** Begin Patch` envelope under `base`. Every hunk path is
-/// resolved against `base`: relative paths join `base` (with `..` components
-/// collapsed lexically), absolute paths are accepted as-is. There is no
-/// containment check — see module docs.
-pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyError> {
-    let parsed = parse_patch(patch_text)?;
+/// Failure preserves the completed prefix. Applying a patch is sequential and
+/// does not roll back earlier mutations when a later operation fails.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct ApplyFailure {
+    #[source]
+    pub error: ApplyError,
+    pub outcome: Box<ApplyOutcome>,
+}
+
+impl From<ApplyError> for ApplyFailure {
+    fn from(error: ApplyError) -> Self {
+        Self {
+            error,
+            outcome: Box::default(),
+        }
+    }
+}
+
+/// Apply a codex envelope sequentially under `base`, preserving committed edit
+/// evidence on failure. Paths retain the existing permissive resolution rules;
+/// this function does not promise containment, rollback, or atomic multi-file IO.
+pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyFailure> {
+    let parsed = parse_patch(patch_text).map_err(ApplyError::from)?;
     let mut outcome = ApplyOutcome::default();
-
     for hunk in &parsed.hunks {
-        match hunk {
-            Hunk::AddFile { path, contents } => {
-                let abs = resolve_within(base, path)?;
-                if abs.exists() {
-                    return Err(ApplyError::Conflict(format!(
-                        "{}: Add File target already exists",
-                        path.display()
-                    )));
-                }
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| io_err("create dir for", path, e))?;
-                }
-                std::fs::write(&abs, contents).map_err(|e| io_err("write", path, e))?;
-                outcome.changes.push(FileChange {
-                    path: path.clone(),
-                    action: FileAction::Added,
-                    moved_from: None,
-                });
-            }
-            Hunk::DeleteFile { path } => {
-                let abs = resolve_within(base, path)?;
-                std::fs::remove_file(&abs).map_err(|e| io_err("delete", path, e))?;
-                outcome.changes.push(FileChange {
-                    path: path.clone(),
-                    action: FileAction::Deleted,
-                    moved_from: None,
-                });
-            }
-            Hunk::UpdateFile {
-                path,
-                move_path,
-                chunks,
-            } => {
-                let src_abs = resolve_within(base, path)?;
-                let original =
-                    std::fs::read_to_string(&src_abs).map_err(|e| io_err("read", path, e))?;
-                let new_contents = derive_new_contents(&original, path, chunks)?;
+        if let Err(error) = apply_hunk(hunk, base, &mut outcome) {
+            return Err(ApplyFailure {
+                error,
+                outcome: Box::new(outcome),
+            });
+        }
+    }
+    Ok(outcome)
+}
 
-                let dest_rel = move_path.as_deref().unwrap_or(path);
-                let dest_abs = resolve_within(base, dest_rel)?;
-                if move_path.is_some()
-                    && let Some(parent) = dest_abs.parent()
-                {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| io_err("create dir for", dest_rel, e))?;
+// Synchronous apply-layer IO; the harness adapter owns the blocking executor.
+#[allow(clippy::disallowed_methods)]
+fn apply_hunk(hunk: &Hunk, base: &Path, outcome: &mut ApplyOutcome) -> Result<(), ApplyError> {
+    match hunk {
+        Hunk::AddFile { path, contents } => {
+            let abs = resolve_within(base, path)?;
+            if abs.exists() {
+                return Err(ApplyError::Conflict(format!(
+                    "{}: Add File target already exists",
+                    path.display()
+                )));
+            }
+            create_parents(&abs, base, outcome)?;
+            write_file(path, &abs, &[], contents.as_bytes(), outcome)?;
+            outcome.changes.push(FileChange {
+                path: path.clone(),
+                action: FileAction::Added,
+                moved_from: None,
+            });
+        }
+        Hunk::DeleteFile { path } => {
+            let abs = resolve_within(base, path)?;
+            let before = std::fs::read(&abs).map_err(|error| io_err("read", path, error))?;
+            std::fs::remove_file(&abs).map_err(|error| io_err("delete", path, error))?;
+            outcome.edits.push(AppliedEdit {
+                path: path.clone(),
+                before,
+                after: Vec::new(),
+            });
+            outcome.changes.push(FileChange {
+                path: path.clone(),
+                action: FileAction::Deleted,
+                moved_from: None,
+            });
+        }
+        Hunk::UpdateFile {
+            path,
+            move_path,
+            chunks,
+        } => {
+            let src_abs = resolve_within(base, path)?;
+            let original =
+                std::fs::read_to_string(&src_abs).map_err(|error| io_err("read", path, error))?;
+            let new_contents = derive_new_contents(&original, path, chunks)?;
+            let dest_rel = move_path.as_deref().unwrap_or(path);
+            let dest_abs = resolve_within(base, dest_rel)?;
+            let moved = move_path.is_some() && dest_abs != src_abs;
+            let before_destination = if moved {
+                match std::fs::read(&dest_abs) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(io_err("read destination", dest_rel, error)),
                 }
-                std::fs::write(&dest_abs, &new_contents)
-                    .map_err(|e| io_err("write", dest_rel, e))?;
-
-                if move_path.is_some() && dest_abs != src_abs {
-                    std::fs::remove_file(&src_abs)
-                        .map_err(|e| io_err("remove original", path, e))?;
-                    outcome.changes.push(FileChange {
-                        path: dest_rel.to_path_buf(),
-                        action: FileAction::Moved,
-                        moved_from: Some(path.clone()),
-                    });
+            } else {
+                Some(original.as_bytes().to_vec())
+            };
+            if move_path.is_some() {
+                create_parents(&dest_abs, base, outcome)?;
+            }
+            write_file(
+                dest_rel,
+                &dest_abs,
+                before_destination.as_deref().unwrap_or_default(),
+                new_contents.as_bytes(),
+                outcome,
+            )?;
+            // Account for the completed destination write even if removing the
+            // source fails. A move is complete only after both mutations succeed.
+            outcome.changes.push(FileChange {
+                path: dest_rel.to_path_buf(),
+                action: if before_destination.is_some() {
+                    FileAction::Updated
                 } else {
-                    outcome.changes.push(FileChange {
-                        path: path.clone(),
-                        action: FileAction::Updated,
-                        moved_from: None,
-                    });
-                }
+                    FileAction::Added
+                },
+                moved_from: None,
+            });
+            if moved {
+                // A destination alias can also change the source bytes. Capture
+                // the deletion pre-image after the completed destination write.
+                let before_delete = std::fs::read(&src_abs)
+                    .map_err(|error| io_err("read before remove", path, error))?;
+                std::fs::remove_file(&src_abs)
+                    .map_err(|error| io_err("remove original", path, error))?;
+                outcome.edits.push(AppliedEdit {
+                    path: path.clone(),
+                    before: before_delete,
+                    after: Vec::new(),
+                });
+                let change = outcome
+                    .changes
+                    .last_mut()
+                    .expect("destination write recorded");
+                change.action = FileAction::Moved;
+                change.moved_from = Some(path.clone());
             }
         }
     }
+    Ok(())
+}
 
-    Ok(outcome)
+// Synchronous apply-layer IO; the harness adapter owns the blocking executor.
+#[allow(clippy::disallowed_methods)]
+fn write_file(
+    path: &Path,
+    absolute: &Path,
+    before: &[u8],
+    after: &[u8],
+    outcome: &mut ApplyOutcome,
+) -> Result<(), ApplyError> {
+    if let Err(error) = std::fs::write(absolute, after) {
+        outcome.uncertain_paths.push(path.to_path_buf());
+        return Err(io_err("write", path, error));
+    }
+    outcome.edits.push(AppliedEdit {
+        path: path.to_path_buf(),
+        before: before.to_vec(),
+        after: after.to_vec(),
+    });
+    Ok(())
+}
+
+// Synchronous apply-layer IO; the harness adapter owns the blocking executor.
+#[allow(clippy::disallowed_methods)]
+fn create_parents(path: &Path, base: &Path, outcome: &mut ApplyOutcome) -> Result<(), ApplyError> {
+    let mut missing = Vec::new();
+    let mut cursor = path.parent();
+    while let Some(parent) = cursor {
+        if parent.exists() {
+            break;
+        }
+        missing.push(parent.to_path_buf());
+        cursor = parent.parent();
+    }
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => outcome.created_directories.push(
+                directory
+                    .strip_prefix(base)
+                    .unwrap_or(&directory)
+                    .to_path_buf(),
+            ),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(io_err("create dir", &directory, error)),
+        }
+    }
+    Ok(())
 }
 
 fn derive_new_contents(
@@ -141,6 +261,22 @@ fn derive_new_contents(
     path: &Path,
     chunks: &[UpdateFileChunk],
 ) -> Result<String, ApplyError> {
+    // Only a uniformly CRLF source selects CRLF output. Mixed line endings
+    // retain the existing per-line bytes rather than guessing a dominant style.
+    let bytes = original.as_bytes();
+    let uniform_crlf = original.contains("\r\n")
+        && bytes.iter().enumerate().all(|(i, byte)| match byte {
+            b'\n' => i > 0 && bytes[i - 1] == b'\r',
+            b'\r' => bytes.get(i + 1) == Some(&b'\n'),
+            _ => true,
+        });
+    let normalized;
+    let original = if uniform_crlf {
+        normalized = original.replace("\r\n", "\n");
+        normalized.as_str()
+    } else {
+        original
+    };
     let mut original_lines: Vec<String> = original.split('\n').map(String::from).collect();
     // Drop the trailing empty element from the final newline so line counts
     // match standard `diff` behaviour.
@@ -153,7 +289,12 @@ fn derive_new_contents(
     if !new_lines.last().is_some_and(String::is_empty) {
         new_lines.push(String::new());
     }
-    Ok(new_lines.join("\n"))
+    let result = new_lines.join("\n");
+    Ok(if uniform_crlf {
+        result.replace("\n", "\r\n")
+    } else {
+        result
+    })
 }
 
 /// Compute `(start_index, old_len, new_lines)` replacements that transform
@@ -296,6 +437,130 @@ mod tests {
     }
 
     #[test]
+    fn update_preserves_uniform_crlf_bytes_and_edit_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("source.txt");
+        let before = b"first\r\nold\r\nlast\r\n";
+        let after = b"first\r\nnew\r\nextra\r\nlast\r\n";
+        std::fs::write(&path, before).unwrap();
+        let outcome = apply_patch("*** Begin Patch\n*** Update File: source.txt\n@@\n first\n-old\n+new\n+extra\n last\n*** End Patch", &root).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+        assert_eq!(outcome.edits[0].before, before);
+        assert_eq!(outcome.edits[0].after, after);
+    }
+
+    #[test]
+    fn mixed_newlines_do_not_select_uniform_crlf_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, b"first\r\nold\nlast\r\n").unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Update File: source.txt\n@@\n-old\n+new\n*** End Patch",
+            &root,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\r\nnew\nlast\r\n");
+    }
+
+    #[test]
+    fn later_context_failure_preserves_ordered_exact_delta() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let failure = apply_patch("*** Begin Patch\n*** Add File: nested/item.txt\n+first\n*** Update File: nested/item.txt\n@@\n-first\n+second\n*** Update File: nested/item.txt\n@@\n-not present\n+third\n*** End Patch", &root).unwrap_err();
+        assert!(matches!(&failure.error, ApplyError::Context { .. }));
+        assert_eq!(
+            std::fs::read(root.join("nested/item.txt")).unwrap(),
+            b"second\n"
+        );
+        assert_eq!(
+            failure.outcome.edits,
+            vec![
+                AppliedEdit {
+                    path: "nested/item.txt".into(),
+                    before: Vec::new(),
+                    after: b"first\n".to_vec()
+                },
+                AppliedEdit {
+                    path: "nested/item.txt".into(),
+                    before: b"first\n".to_vec(),
+                    after: b"second\n".to_vec()
+                },
+            ]
+        );
+        assert_eq!(
+            failure.outcome.created_directories,
+            vec![PathBuf::from("nested")]
+        );
+        assert!(failure.outcome.uncertain_paths.is_empty());
+    }
+
+    #[test]
+    fn failed_write_keeps_completed_delete_and_marks_attempt_uncertain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("old.bin"), [0xff, 0x00]).unwrap();
+        std::fs::write(root.join("obstacle"), b"file").unwrap();
+        let failure = apply_patch("*** Begin Patch\n*** Delete File: old.bin\n*** Add File: obstacle/child.txt\n+blocked\n*** End Patch", &root).unwrap_err();
+        assert!(matches!(&failure.error, ApplyError::Io { op: "write", .. }));
+        assert!(!root.join("old.bin").exists());
+        assert_eq!(
+            failure.outcome.edits,
+            vec![AppliedEdit {
+                path: "old.bin".into(),
+                before: vec![0xff, 0],
+                after: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            failure.outcome.uncertain_paths,
+            vec![PathBuf::from("obstacle/child.txt")]
+        );
+        assert_eq!(std::fs::read(root.join("obstacle")).unwrap(), b"file");
+    }
+
+    #[test]
+    fn overwritten_move_destination_is_part_of_completed_delta() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.txt"), b"old\n").unwrap();
+        std::fs::write(root.join("target.txt"), [0xff, 0x00]).unwrap();
+        let outcome = apply_patch("*** Begin Patch\n*** Update File: source.txt\n*** Move to: target.txt\n@@\n-old\n+new\n*** End Patch", &root).unwrap();
+        assert_eq!(outcome.changes[0].action, FileAction::Moved);
+        assert_eq!(
+            outcome.edits,
+            vec![
+                AppliedEdit {
+                    path: "target.txt".into(),
+                    before: vec![0xff, 0],
+                    after: b"new\n".to_vec()
+                },
+                AppliedEdit {
+                    path: "source.txt".into(),
+                    before: b"old\n".to_vec(),
+                    after: Vec::new()
+                },
+            ]
+        );
+        assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"new\n");
+        assert!(!root.join("source.txt").exists());
+    }
+
+    #[test]
+    fn moved_alias_records_the_actual_deletion_preimage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.txt"), b"old\n").unwrap();
+        std::fs::hard_link(root.join("source.txt"), root.join("alias.txt")).unwrap();
+        let outcome = apply_patch("*** Begin Patch\n*** Update File: source.txt\n*** Move to: alias.txt\n@@\n-old\n+new\n*** End Patch", &root).unwrap();
+        assert_eq!(outcome.edits[0].before, b"old\n");
+        assert_eq!(outcome.edits[1].before, b"new\n");
+        assert_eq!(std::fs::read(root.join("alias.txt")).unwrap(), b"new\n");
+        assert!(!root.join("source.txt").exists());
+    }
+
+    #[test]
     fn add_then_update_then_move_then_delete() {
         let dir = base();
         let root = dir.path();
@@ -355,7 +620,7 @@ mod tests {
             dir.path(),
         )
         .unwrap_err();
-        assert!(matches!(err, ApplyError::Conflict(_)), "{err:?}");
+        assert!(matches!(&err.error, ApplyError::Conflict(_)), "{err:?}");
     }
 
     #[test]
@@ -468,6 +733,9 @@ mod tests {
             dir.path(),
         )
         .unwrap_err();
-        assert!(matches!(err, ApplyError::Io { op: "read", .. }), "{err:?}");
+        assert!(
+            matches!(&err.error, ApplyError::Io { op: "read", .. }),
+            "{err:?}"
+        );
     }
 }

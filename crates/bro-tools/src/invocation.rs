@@ -238,7 +238,7 @@ mod tests {
                 started: Mutex::new(Some(started_tx)),
                 release: Mutex::new(Some(release_rx)),
             }),
-            Value::Null,
+            serde_json::json!({}),
             cx.clone(),
             Some(gate.clone()),
         );
@@ -254,7 +254,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let mut queued = start_tool_invocation(
             Arc::new(Counter(count.clone())),
-            Value::Null,
+            serde_json::json!({}),
             cx,
             Some(gate.clone()),
         );
@@ -319,7 +319,7 @@ mod tests {
             Arc::new(Cooperative {
                 started: Mutex::new(Some(started_tx)),
             }),
-            Value::Null,
+            serde_json::json!({}),
             cx(&root),
             Some(Arc::new(RwLock::new(()))),
         );

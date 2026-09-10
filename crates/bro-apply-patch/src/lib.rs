@@ -12,7 +12,9 @@ mod seek_sequence;
 
 use std::path::PathBuf;
 
-pub use apply::{ApplyError, ApplyOutcome, FileAction, FileChange, apply_patch};
+pub use apply::{
+    AppliedEdit, ApplyError, ApplyFailure, ApplyOutcome, FileAction, FileChange, apply_patch,
+};
 pub use parser::{Hunk, ParseError, UpdateFileChunk, parse_patch};
 
 /// The Lark grammar that constrains `apply_patch` output on grammar-capable

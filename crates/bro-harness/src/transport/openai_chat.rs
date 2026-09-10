@@ -331,6 +331,93 @@ fn extract_thinking_text(thinking: &Value) -> String {
     out
 }
 
+fn chat_failure(
+    error: anyhow::Error,
+    text: &str,
+    thinking: &str,
+    tools: &[ChatToolAcc],
+    tail: &str,
+) -> anyhow::Error {
+    super::rejected_provider_response(
+        error,
+        "chat",
+        json!({
+            "text": text, "thinking": thinking, "unparsed_data": tail,
+            "tool_calls": tools.iter().map(|call| json!({
+                "id": call.id, "name": call.name, "arguments": call.args,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn finalize_chat(
+    text_out: &str,
+    reasoning_out: &str,
+    tools_acc: &[ChatToolAcc],
+    finish: Option<&str>,
+    done: bool,
+    usage: Usage,
+) -> Result<(Value, TurnOutput)> {
+    anyhow::ensure!(done, "Chat stream closed before [DONE]");
+    // Reconstruct the OpenAI-native assistant message for the next request.
+    let mut assistant = json!({"role": "assistant"});
+    assistant["content"] = if text_out.is_empty() {
+        Value::Null
+    } else {
+        json!(text_out)
+    };
+    let mut tool_calls = Vec::new();
+    let mut native_tcs = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for a in tools_acc {
+        super::validate_tool_identity(&a.id, &a.name)?;
+        anyhow::ensure!(ids.insert(&a.id), "duplicate Chat tool call id");
+        tool_calls.push(super::ToolCall {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            args: super::parse_tool_arguments(&a.args)?,
+        });
+        native_tcs.push(json!({
+            "id": a.id, "type": "function",
+            "function": {"name": a.name, "arguments": a.args},
+        }));
+    }
+    if !native_tcs.is_empty() {
+        assistant["tool_calls"] = json!(native_tcs);
+    }
+
+    let stop = match finish {
+        Some("tool_calls") => StopReason::ToolCalls,
+        Some("stop") => StopReason::Done,
+        Some("length") => StopReason::Length,
+        Some(other) => StopReason::Other(other.to_string()),
+        None => anyhow::bail!("Chat stream missing finish_reason"),
+    };
+    anyhow::ensure!(
+        (stop == StopReason::ToolCalls) == !tool_calls.is_empty(),
+        "Chat terminal does not match tool calls"
+    );
+
+    Ok((
+        assistant,
+        TurnOutput {
+            observation_content: None,
+            text: text_out.to_owned(),
+            // Display-only: thinking is surfaced for the assistant turn block
+            // but never replayed into `self.messages` (the assistant message
+            // above carries text + tool_calls only), matching the Anthropic
+            // transport and keeping multi-turn requests reasoning-free.
+            thinking: reasoning_out.to_owned(),
+            tool_calls,
+            stop,
+            // OpenAI Chat has no Responses-style `response.end_turn`
+            // follow-up signal; normal stop is represented by `finish_reason`.
+            end_turn: None,
+            usage,
+        },
+    ))
+}
+
 #[async_trait]
 impl Transport for OpenAiChatTransport {
     fn name(&self) -> &'static str {
@@ -396,25 +483,63 @@ impl Transport for OpenAiChatTransport {
         let mut tools_acc: Vec<ChatToolAcc> = Vec::new();
         let mut finish: Option<String> = None;
         let mut usage = Usage::default();
+        let mut done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read chat SSE chunk")?;
+        'consume: while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read chat SSE chunk").map_err(|error| {
+                chat_failure(
+                    error,
+                    &text_out,
+                    &reasoning_out,
+                    &tools_acc,
+                    &String::from_utf8_lossy(&buf),
+                )
+            })?;
             buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let raw: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&raw);
+                let line = std::str::from_utf8(&raw)
+                    .context("invalid UTF-8 in Chat stream")
+                    .map_err(|error| {
+                        chat_failure(
+                            error,
+                            &text_out,
+                            &reasoning_out,
+                            &tools_acc,
+                            &String::from_utf8_lossy(&raw),
+                        )
+                    })?;
                 let line = line.trim_end();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
                 let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
+                if data.is_empty() {
                     continue;
                 }
-                let Ok(ev) = serde_json::from_str::<Value>(data) else {
-                    tracing::warn!("openai chat SSE parse skipped a line");
-                    continue;
-                };
+                if data == "[DONE]" {
+                    done = true;
+                    break 'consume;
+                }
+                let ev: Value = serde_json::from_str(data)
+                    .context("invalid Chat SSE JSON")
+                    .map_err(|error| {
+                        chat_failure(error, &text_out, &reasoning_out, &tools_acc, data)
+                    })?;
+                if ev.get("error").is_some()
+                    || (finish.is_some()
+                        && ev["choices"]
+                            .as_array()
+                            .is_some_and(|choices| !choices.is_empty()))
+                {
+                    return Err(chat_failure(
+                        anyhow::anyhow!("Chat error or content after finish_reason"),
+                        &text_out,
+                        &reasoning_out,
+                        &tools_acc,
+                        data,
+                    ));
+                }
 
                 // Final usage chunk (include_usage) carries `usage` with empty
                 // `choices`. `prompt_tokens` is cache-INCLUSIVE; subtract the
@@ -490,7 +615,49 @@ impl Transport for OpenAiChatTransport {
 
                 if let Some(tcs) = delta["tool_calls"].as_array() {
                     for tc in tcs {
-                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        let idx = tc["index"]
+                            .as_u64()
+                            .filter(|index| *index <= tools_acc.len() as u64)
+                            .context("invalid or non-contiguous Chat tool index")
+                            .map_err(|error| {
+                                chat_failure(error, &text_out, &reasoning_out, &tools_acc, data)
+                            })? as usize;
+                        if tc["function"]
+                            .get("arguments")
+                            .is_some_and(|value| !value.is_string())
+                        {
+                            return Err(chat_failure(
+                                anyhow::anyhow!("Chat tool arguments delta must be a string"),
+                                &text_out,
+                                &reasoning_out,
+                                &tools_acc,
+                                data,
+                            ));
+                        }
+                        if let Some(previous) = tools_acc.get(idx) {
+                            for (key, prior) in [("id", &previous.id), ("name", &previous.name)] {
+                                let incoming = if key == "id" {
+                                    &tc["id"]
+                                } else {
+                                    &tc["function"]["name"]
+                                };
+                                if !incoming.is_null()
+                                    && (!incoming.is_string()
+                                        || (!prior.is_empty()
+                                            && incoming.as_str().is_some_and(|value| {
+                                                !value.is_empty() && value != prior
+                                            })))
+                                {
+                                    return Err(chat_failure(
+                                        anyhow::anyhow!("Chat tool identity changed during stream"),
+                                        &text_out,
+                                        &reasoning_out,
+                                        &tools_acc,
+                                        data,
+                                    ));
+                                }
+                            }
+                        }
                         while tools_acc.len() <= idx {
                             tools_acc.push(ChatToolAcc::default());
                         }
@@ -526,62 +693,25 @@ impl Transport for OpenAiChatTransport {
             }
         }
 
-        // Reconstruct the OpenAI-native assistant message for the next request.
-        let mut assistant = json!({"role": "assistant"});
-        assistant["content"] = if text_out.is_empty() {
-            Value::Null
-        } else {
-            json!(text_out)
-        };
-        let mut tool_calls: Vec<super::ToolCall> = Vec::new();
-        let native_tcs: Vec<Value> = tools_acc
-            .iter()
-            .filter(|a| !a.id.is_empty() || !a.name.is_empty())
-            .map(|a| {
-                let args_str = if a.args.is_empty() { "{}" } else { &a.args };
-                tool_calls.push(super::ToolCall {
-                    id: a.id.clone(),
-                    name: a.name.clone(),
-                    args: serde_json::from_str(args_str).unwrap_or(json!({})),
-                });
-                json!({
-                    "id": a.id,
-                    "type": "function",
-                    "function": {"name": a.name, "arguments": args_str},
-                })
-            })
-            .collect();
-        if !native_tcs.is_empty() {
-            assistant["tool_calls"] = json!(native_tcs);
-        }
-        self.messages.push(assistant);
-
-        let mut stop = match finish.as_deref() {
-            Some("tool_calls") => StopReason::ToolCalls,
-            Some("stop") => StopReason::Done,
-            Some("length") => StopReason::Length,
-            Some(other) => StopReason::Other(other.to_string()),
-            None => StopReason::Done,
-        };
-        if !tool_calls.is_empty() {
-            stop = StopReason::ToolCalls;
-        }
-
-        Ok(TurnOutput {
-            observation_content: None,
-            text: text_out,
-            // Display-only: thinking is surfaced for the assistant turn block
-            // but never replayed into `self.messages` (the assistant message
-            // above carries text + tool_calls only), matching the Anthropic
-            // transport and keeping multi-turn requests reasoning-free.
-            thinking: reasoning_out,
-            tool_calls,
-            stop,
-            // OpenAI Chat has no Responses-style `response.end_turn`
-            // follow-up signal; normal stop is represented by `finish_reason`.
-            end_turn: None,
+        let (assistant, output) = finalize_chat(
+            &text_out,
+            &reasoning_out,
+            &tools_acc,
+            finish.as_deref(),
+            done,
             usage,
-        })
+        )
+        .map_err(|error| {
+            chat_failure(
+                error,
+                &text_out,
+                &reasoning_out,
+                &tools_acc,
+                &String::from_utf8_lossy(&buf),
+            )
+        })?;
+        self.messages.push(assistant);
+        Ok(output)
     }
 
     fn snapshot(&self) -> Value {
@@ -740,6 +870,100 @@ fn render_chat_transcript(messages: &[Value], tool_cap: usize) -> String {
 mod tests {
     use super::*;
     use crate::transport::{BaseInstructions, SystemPrompt};
+
+    fn call_delta(arguments: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call-1","type":"function",
+                "function":{"name":"file_write","arguments":arguments}
+            }]}}]})
+        )
+    }
+
+    async fn chat_fixture(body: String) -> (Result<TurnOutput>, Vec<Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct NoSink;
+        impl super::super::TurnSink for NoSink {
+            fn stream_event(&self, _: Value) {}
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        });
+        let mut tx = transport();
+        tx.base_url = format!("http://{addr}");
+        tx.messages.clear();
+        tx.push_user_text("write a synthetic fixture");
+        let result = tx
+            .run_turn(&[], &opts(SystemPrompt::default()), &NoSink)
+            .await;
+        server.await.unwrap();
+        (result, tx.messages)
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_invalid_arguments_and_incomplete_terminals_without_replay() {
+        let finish = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let mut cases = Vec::new();
+        for args in ["{", "", "null", "[]", "1", "\"text\""] {
+            cases.push(format!("{}{finish}", call_delta(args)));
+        }
+        cases.push(call_delta("{}"));
+        cases.push(format!("{}data: [DONE]\n\n", call_delta("{}")));
+        cases.push(format!(
+            "{}data: {{\"choices\":[{{\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+            call_delta("{}")
+        ));
+        cases.push(format!(
+            "{}{finish}",
+            call_delta("{}").replace("call-1", "")
+        ));
+        cases.push(format!(
+            "{}{finish}",
+            call_delta("{}").replace("\"index\":0", "\"index\":1000000000")
+        ));
+        cases.push(format!("{}{finish}", call_delta("{}")).replace(
+            "\"finish_reason\":\"tool_calls\"",
+            "\"finish_reason\":\"length\"",
+        ));
+        cases.push(format!("{}data: {{bad\n\n{finish}", call_delta("{}")));
+        for body in cases {
+            let (result, messages) = chat_fixture(body.clone()).await;
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("accepted invalid stream: {body}"));
+            assert!(
+                error
+                    .downcast_ref::<super::super::FailedTurnObservation>()
+                    .is_some()
+            );
+            assert_eq!(
+                messages.len(),
+                1,
+                "invalid assistant must not enter replay history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_accepts_authored_empty_object_and_keeps_text_length_distinct() {
+        let (result, messages) = chat_fixture(format!(
+            "{}data: {{\"choices\":[{{\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            call_delta("{}")
+        ))
+        .await;
+        assert_eq!(result.unwrap().tool_calls[0].args, json!({}));
+        assert_eq!(messages.len(), 2);
+        let (result, _) = chat_fixture("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n".into()).await;
+        let out = result.unwrap();
+        assert_eq!(out.stop, StopReason::Length);
+        assert_eq!(out.text, "partial");
+    }
 
     fn transport() -> OpenAiChatTransport {
         OpenAiChatTransport {

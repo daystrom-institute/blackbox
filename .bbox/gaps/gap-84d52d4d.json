@@ -13,8 +13,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/provider-result-integrity",
   "notes": "Synthetic full Chat harness accepts unterminated SSE as success and accepts boolean final_result for integer schema; live turn exhaustion reports prior narration as success.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T19:08:00Z",
-  "updated_at": "2026-09-10T19:08:00Z"
+  "updated_at": "2026-09-10T22:03:00Z",
+  "resolved_at": "2026-09-10T22:03:00Z",
+  "resolution_note": "Repaired on beta in the provider/result integrity milestone: strict object arguments across provider and nested admission, explicit terminal streams, schema-valid single final_result, and distinct incomplete outcomes. All 16 executable boundary cases pass; baseline passed only the two valid controls. See design/bro-harness/model-facing-audit/result-integrity-repair.md and result-integrity-repair-receipts.json."
 }

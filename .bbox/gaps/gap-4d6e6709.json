@@ -13,8 +13,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/workspace-observation-integrity",
   "notes": "Installed probes: content_search says no matches for a matching file above2MB; empty file_edit needle expands between characters; patch error can follow prior successful mutation. See builtins audit for reference similarities.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T19:08:00Z",
-  "updated_at": "2026-09-10T19:08:00Z"
+  "updated_at": "2026-09-10T22:03:00Z",
+  "resolved_at": "2026-09-10T22:03:00Z",
+  "resolution_note": "Repaired bounded search/glob observation disclosure and explicit target handling; empty replacement needles reject before file access; uniform CRLF patches preserve source line endings; failed patches retain completed mutations and exact edit-tracker evidence. All 10 executable workspace cases pass. See design/bro-harness/model-facing-audit/result-integrity-repair.md and receipts."
 }

@@ -25,7 +25,7 @@ pub mod openai_responses;
 pub mod openai_responses_ws;
 pub mod responses_common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -136,6 +136,44 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub args: Value,
+}
+
+/// Provider arguments must be authored JSON objects. Substituting an empty
+/// object on a parse failure would authorize host defaults the model never sent.
+fn parse_tool_arguments(raw: &str) -> anyhow::Result<Value> {
+    let args: Value = serde_json::from_str(raw).context("invalid tool arguments JSON")?;
+    anyhow::ensure!(args.is_object(), "tool arguments must be a JSON object");
+    Ok(args)
+}
+
+fn validate_tool_identity(id: &str, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!id.trim().is_empty(), "tool call has no correlation id");
+    anyhow::ensure!(!name.trim().is_empty(), "tool call has no name");
+    Ok(())
+}
+
+/// Keep rejected provider data in the durable error path, never in a replay
+/// buffer that could make an unexecuted call look like an admitted invocation.
+fn rejected_provider_response(
+    error: anyhow::Error,
+    provider: &str,
+    evidence: Value,
+) -> anyhow::Error {
+    let prior = error.downcast_ref::<FailedTurnObservation>();
+    let native_blocks = prior
+        .map(|value| value.native_blocks.clone())
+        .unwrap_or_default();
+    let mut tool_diagnostics = prior
+        .map(|value| value.tool_diagnostics.clone())
+        .unwrap_or_default();
+    tool_diagnostics.push(serde_json::json!({
+        "kind": "rejected_provider_response", "provider": provider,
+        "client_dispatched": false, "evidence": evidence,
+    }));
+    error.context(FailedTurnObservation {
+        native_blocks,
+        tool_diagnostics,
+    })
 }
 
 /// Result of dispatching a [`ToolCall`].

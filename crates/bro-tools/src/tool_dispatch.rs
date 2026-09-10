@@ -48,6 +48,9 @@ pub async fn call_tool_with_arg_defaults_and_fallbacks(
     if cx.cancellation.is_cancelled() {
         return ToolResult::Error("tool invocation cancelled before execution".into());
     }
+    if !input.is_object() && !(input.is_string() && tool.freeform_grammar().is_some()) {
+        return ToolResult::Error("invalid tool arguments: expected a JSON object; no defaults applied and nothing executed".into());
+    }
     let (mut input, rider) = match cx.tool_arg_defaults.apply(name, input) {
         Ok(applied) => applied,
         Err(conflict) => return conflict.into_tool_result(name),

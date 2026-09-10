@@ -390,10 +390,39 @@ pub(super) fn parse_sse(
     custom_tool_call_ids: &mut HashSet<String>,
     sse: &str,
 ) -> Result<TurnOutput> {
+    parse_sse_validated(input, custom_tool_call_ids, sse)
+        .map_err(|error| responses_failure(error, sse))
+}
+
+pub(super) fn responses_failure(error: anyhow::Error, sse: &str) -> anyhow::Error {
+    super::rejected_provider_response(error, "responses", json!({"sse": sse}))
+}
+
+fn validate_completed_item(added: &Value, completed: &Value) -> Result<()> {
+    for field in ["type", "id", "call_id", "name"] {
+        if let Some(value) = added[field].as_str().filter(|value| !value.is_empty()) {
+            anyhow::ensure!(
+                completed[field].as_str() == Some(value),
+                "Responses output item identity changed during stream"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_sse_validated(
+    input: &mut Vec<Value>,
+    custom_tool_call_ids: &mut HashSet<String>,
+    sse: &str,
+) -> Result<TurnOutput> {
     let mut output_items: Vec<Value> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = StopReason::Done;
     let mut end_turn = None;
+    let mut terminal = false;
+    let mut open_items = std::collections::HashMap::new();
+    let mut final_output = None;
+    let mut observed_call_items = HashSet::new();
 
     for line in sse.lines() {
         let line = line.trim();
@@ -404,17 +433,65 @@ pub(super) fn parse_sse(
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        let Ok(ev) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
+        let ev: Value = serde_json::from_str(data).context("invalid Responses SSE JSON")?;
+        anyhow::ensure!(!terminal, "Responses event after terminal response");
         match ev["type"].as_str().unwrap_or("") {
+            "response.output_item.added" => {
+                let index = ev["output_index"]
+                    .as_u64()
+                    .context("output item missing index")?;
+                let item = ev
+                    .get("item")
+                    .context("added output item missing payload")?;
+                anyhow::ensure!(
+                    open_items.insert(index, item.clone()).is_none(),
+                    "duplicate open output item"
+                );
+            }
             "response.output_item.done" => {
-                if let Some(item) = ev.get("item") {
-                    output_items.push(item.clone());
+                let item = ev
+                    .get("item")
+                    .context("completed output item missing payload")?;
+                if let Some(index) = ev["output_index"].as_u64()
+                    && let Some(added) = open_items.remove(&index)
+                {
+                    validate_completed_item(&added, item)?;
                 }
+                output_items.push(item.clone());
+            }
+            "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done" => {
+                let id = ev["item_id"]
+                    .as_str()
+                    .context("tool argument event missing item_id")?;
+                observed_call_items.insert(id.to_string());
             }
             "response.completed" | "response.incomplete" => {
+                terminal = true;
                 let r = &ev["response"];
+                anyhow::ensure!(r.is_object(), "Responses terminal missing response object");
+                let incomplete = ev["type"] == "response.incomplete";
+                if let Some(status) = r["status"].as_str() {
+                    anyhow::ensure!(
+                        status
+                            == if incomplete {
+                                "incomplete"
+                            } else {
+                                "completed"
+                            },
+                        "inconsistent Responses terminal status"
+                    );
+                }
+                if let Some(output) = r.get("output") {
+                    final_output = Some(
+                        output
+                            .as_array()
+                            .context("terminal output must be an array")?
+                            .clone(),
+                    );
+                }
                 end_turn = r["end_turn"].as_bool();
                 // OpenAI Responses `input_tokens` is cache-INCLUSIVE; the
                 // cached subset lives in `input_tokens_details.cached_tokens`.
@@ -429,7 +506,7 @@ pub(super) fn parse_sse(
                     cached_input_tokens: cached,
                     cache_creation_input_tokens: 0,
                 };
-                if r["status"].as_str() == Some("incomplete") {
+                if incomplete {
                     stop = StopReason::Length;
                     // Otherwise-silent path: the model stopped short (e.g.
                     // max_output_tokens, content filter). Surface the reason
@@ -471,6 +548,38 @@ pub(super) fn parse_sse(
         }
     }
 
+    anyhow::ensure!(terminal, "Responses stream closed before terminal response");
+    if let Some(output) = final_output {
+        for (index, added) in &open_items {
+            let completed = usize::try_from(*index)
+                .ok()
+                .and_then(|index| output.get(index))
+                .context("terminal output omitted an unfinished item")?;
+            validate_completed_item(added, completed)?;
+        }
+        for done in &output_items {
+            anyhow::ensure!(
+                output.contains(done),
+                "terminal output disagrees with completed item"
+            );
+        }
+        output_items = output;
+    } else {
+        anyhow::ensure!(
+            open_items.is_empty(),
+            "Responses stream contains unfinished output items"
+        );
+    }
+
+    for id in observed_call_items {
+        anyhow::ensure!(
+            output_items
+                .iter()
+                .any(|item| item["id"].as_str() == Some(&id)),
+            "Responses argument stream has no completed tool item"
+        );
+    }
+
     // Echo the model's output items back into the buffer for continuity.
     // Reasoning items need care under `store:false` (required by the ChatGPT
     // backend): a reasoning item replayed *by reference* (`rs_…` with no
@@ -480,23 +589,24 @@ pub(super) fn parse_sse(
     // and safe to replay, preserving cross-turn reasoning continuity. So:
     // keep reasoning items that carry `encrypted_content`; drop the rest;
     // keep every non-reasoning item.
-    input.extend(
-        output_items
-            .iter()
-            .filter(|item| {
-                item["type"].as_str() != Some("reasoning")
-                    || item
-                        .get("encrypted_content")
-                        .and_then(Value::as_str)
-                        .is_some()
-            })
-            .cloned(),
-    );
 
     let mut text = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
+    let mut call_ids = HashSet::new();
+    let mut new_custom_ids = Vec::new();
     for item in &output_items {
+        anyhow::ensure!(
+            item.is_object() && item["type"].as_str().is_some_and(|kind| !kind.is_empty()),
+            "invalid Responses output item"
+        );
+        anyhow::ensure!(
+            stop == StopReason::Length
+                || item["status"]
+                    .as_str()
+                    .is_none_or(|status| status == "completed"),
+            "unfinished Responses output item"
+        );
         match item["type"].as_str().unwrap_or("") {
             "message" => {
                 if let Some(parts) = item["content"].as_array() {
@@ -522,29 +632,35 @@ pub(super) fn parse_sse(
                     }
                 }
             }
-            "function_call" => {
-                let args_str = item["arguments"].as_str().unwrap_or("{}");
-                if let (Some(call_id), Some(name)) =
-                    (item["call_id"].as_str(), item["name"].as_str())
-                {
-                    tool_calls.push(ToolCall {
-                        id: call_id.to_string(),
-                        name: name.to_string(),
-                        args: serde_json::from_str(args_str).unwrap_or(json!({})),
-                    });
-                }
-            }
-            "custom_tool_call" => {
-                if let (Some(call_id), Some(name)) =
-                    (item["call_id"].as_str(), item["name"].as_str())
-                {
-                    custom_tool_call_ids.insert(call_id.to_string());
-                    tool_calls.push(ToolCall {
-                        id: call_id.to_string(),
-                        name: name.to_string(),
-                        args: json!({ "source": item["input"].as_str().unwrap_or("") }),
-                    });
-                }
+            "function_call" | "custom_tool_call" => {
+                anyhow::ensure!(
+                    stop != StopReason::Length,
+                    "incomplete response contains client tool calls"
+                );
+                let call_id = item["call_id"]
+                    .as_str()
+                    .context("tool call missing call_id")?;
+                let name = item["name"].as_str().context("tool call missing name")?;
+                super::validate_tool_identity(call_id, name)?;
+                anyhow::ensure!(call_ids.insert(call_id), "duplicate tool call id");
+                let args = if item["type"] == "function_call" {
+                    super::parse_tool_arguments(
+                        item["arguments"]
+                            .as_str()
+                            .context("tool arguments must be a JSON string")?,
+                    )?
+                } else {
+                    let source = item["input"]
+                        .as_str()
+                        .context("custom tool input must be a string")?;
+                    new_custom_ids.push(call_id.to_string());
+                    json!({"source": source})
+                };
+                tool_calls.push(ToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    args,
+                });
             }
             _ => {} // reasoning / other items carried in buffer, not surfaced
         }
@@ -553,6 +669,20 @@ pub(super) fn parse_sse(
     if !tool_calls.is_empty() {
         stop = StopReason::ToolCalls;
     }
+
+    input.extend(
+        output_items
+            .iter()
+            .filter(|item| {
+                item["type"].as_str() != Some("reasoning")
+                    || item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some()
+            })
+            .cloned(),
+    );
+    custom_tool_call_ids.extend(new_custom_ids);
 
     Ok(TurnOutput {
         observation_content: None,
@@ -847,6 +977,7 @@ pub(super) struct ResponsesStreamTrace {
     event_count: u64,
     bytes_consumed: u64,
     emitted_text: bool,
+    observed_output: bool,
     terminal_seen: bool,
 }
 
@@ -866,10 +997,23 @@ impl ResponsesStreamTrace {
         self.event_count = self.event_count.saturating_add(1);
         if let Some(kind) = ev["type"].as_str() {
             self.last_event_type = Some(kind.to_string());
+            self.observed_output |= kind.starts_with("response.")
+                && !matches!(
+                    kind,
+                    "response.created"
+                        | "response.in_progress"
+                        | "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                );
         }
         if let Some(id) = ev["response"]["id"].as_str() {
             self.response_id = Some(id.to_string());
         }
+    }
+
+    pub(super) fn replay_safe(&self) -> bool {
+        !self.observed_output && !self.emitted_text
     }
 
     pub(super) fn mark_emitted_text(&mut self) {
@@ -882,10 +1026,6 @@ impl ResponsesStreamTrace {
 
     pub(super) fn terminal_seen(&self) -> bool {
         self.terminal_seen
-    }
-
-    pub(super) fn emitted_text(&self) -> bool {
-        self.emitted_text
     }
 
     pub(super) fn fault_context(&self, transport: &str, attempt: u32, max_attempts: u32) -> String {
@@ -950,6 +1090,141 @@ mod tests {
             .filter(|it| it["role"] == "developer")
             .map(|it| it["content"][0]["text"].as_str().unwrap_or("").to_string())
             .collect()
+    }
+
+    fn response_events(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    #[test]
+    fn responses_rejects_invalid_calls_atomically_and_retains_evidence() {
+        let valid =
+            json!({"type":"custom_tool_call","call_id":"custom-1","name":"exec","input":"text(1)"});
+        for args in [
+            json!("{"),
+            json!(""),
+            json!("null"),
+            json!("[]"),
+            json!("1"),
+            Value::Null,
+            json!({}),
+        ] {
+            let invalid = json!({"type":"function_call","call_id":"call-1","name":"file_write","arguments":args});
+            let sse = response_events(&[
+                json!({"type":"response.output_item.done","item":valid}),
+                json!({"type":"response.output_item.done","item":invalid}),
+                json!({"type":"response.completed","response":{"status":"completed"}}),
+            ]);
+            let mut s = state();
+            s.push_user_text("fixture");
+            let before = s.input.clone();
+            let error = s
+                .parse_sse(&sse)
+                .err()
+                .expect("invalid arguments cannot authorize defaults");
+            assert_eq!(s.input, before);
+            assert!(
+                s.custom_tool_call_ids.is_empty(),
+                "failed batch cannot leave a custom-call routing entry"
+            );
+            let evidence = error
+                .downcast_ref::<super::super::FailedTurnObservation>()
+                .unwrap();
+            assert_eq!(evidence.tool_diagnostics[0]["evidence"]["sse"], sse);
+        }
+    }
+
+    #[test]
+    fn responses_requires_terminal_and_completed_consistent_calls() {
+        let call =
+            json!({"type":"function_call","call_id":"call-1","name":"file_write","arguments":"{}"});
+        let done = json!({"type":"response.output_item.done","output_index":0,"item":call});
+        let completed = json!({"type":"response.completed","response":{"status":"completed"}});
+        let cases = [
+            vec![done.clone()],
+            vec![
+                done.clone(),
+                json!({"type":"response.incomplete","response":{"status":"incomplete"}}),
+            ],
+            vec![
+                json!({"type":"response.output_item.added","output_index":0,"item":call}),
+                completed.clone(),
+            ],
+            vec![done.clone(), done.clone(), completed.clone()],
+            vec![
+                done.clone(),
+                json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            ],
+            vec![
+                done.clone(),
+                json!({"type":"response.completed","response":{"status":"in_progress"}}),
+            ],
+            vec![completed.clone(), done.clone()],
+            vec![
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc-1","delta":"{}"}),
+                completed.clone(),
+            ],
+            vec![
+                json!({"type":"response.output_item.added","output_index":0,"item":call}),
+                json!({"type":"response.completed","response":{"output":[]}}),
+            ],
+            vec![
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"different"}}),
+                done.clone(),
+                completed.clone(),
+            ],
+        ];
+        for events in cases {
+            let mut s = state();
+            let before = s.input.clone();
+            assert!(
+                s.parse_sse(&response_events(&events)).is_err(),
+                "{events:?}"
+            );
+            assert_eq!(s.input, before);
+        }
+        let mut s = state();
+        let output = s.parse_sse(&response_events(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":call}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[call]}}),
+        ])).unwrap();
+        assert_eq!(
+            output.tool_calls[0].args,
+            json!({}),
+            "complete terminal snapshot is authoritative"
+        );
+    }
+
+    #[test]
+    fn responses_partial_output_disables_replay_even_without_visible_text() {
+        for event in [
+            json!({"type":"response.output_item.added","item":{"type":"function_call"}}),
+            json!({"type":"response.web_search_call.in_progress"}),
+            json!({"type":"response.reasoning_text.delta","delta":"thinking"}),
+        ] {
+            let mut trace = ResponsesStreamTrace::default();
+            trace.observe_event(&json!({"type":"response.created"}));
+            assert!(trace.replay_safe());
+            trace.observe_event(&event);
+            assert!(
+                !trace.replay_safe(),
+                "observed provider work must not be silently replayed"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_preserves_text_only_incomplete_status() {
+        let output = state().parse_sse(&response_events(&[
+            json!({"type":"response.incomplete","response":{"status":"incomplete","output":[{
+                "type":"message","status":"incomplete","content":[{"type":"output_text","text":"partial"}]
+            }]}}),
+        ])).unwrap();
+        assert_eq!(output.stop, StopReason::Length);
+        assert_eq!(output.text, "partial");
     }
 
     #[test]

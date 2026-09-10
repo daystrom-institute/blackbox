@@ -282,8 +282,15 @@ impl WsChannel {
                         accum.push_str("data: ");
                         accum.push_str(&text);
                         accum.push('\n');
-                        let Ok(ev) = serde_json::from_str::<Value>(&text) else {
-                            continue;
+                        let ev: Value = match serde_json::from_str(&text) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                self.reset();
+                                return WsOutcome::Api(super::responses_common::responses_failure(
+                                    error.into(),
+                                    &accum,
+                                ));
+                            }
                         };
                         trace.observe_event(&ev);
                         if is_ws_error_code(&ev, PREVIOUS_RESPONSE_NOT_FOUND) {
@@ -362,7 +369,7 @@ impl WsChannel {
             if let Some(err) = fault {
                 self.reset();
                 let diagnostics = trace.fault_context("responses WebSocket", attempt, 2);
-                if !trace.emitted_text() && attempt < 2 {
+                if trace.replay_safe() && attempt < 2 {
                     tracing::warn!(
                         error = %err,
                         diagnostics = %diagnostics,
@@ -370,21 +377,29 @@ impl WsChannel {
                     );
                     continue;
                 }
-                return WsOutcome::Transport(err.context(if trace.emitted_text() {
-                    format!("websocket stream fault after partial output; {diagnostics}")
+                let error = super::responses_common::responses_failure(
+                    err.context(if !trace.replay_safe() {
+                        format!("websocket stream fault after partial output; {diagnostics}")
+                    } else {
+                        format!("websocket stream unusable; {diagnostics}")
+                    }),
+                    &accum,
+                );
+                return if trace.replay_safe() {
+                    WsOutcome::Transport(error)
                 } else {
-                    format!("websocket stream unusable; {diagnostics}")
-                }));
+                    WsOutcome::Api(error)
+                };
             }
 
-            if connection_limit_reached {
+            if connection_limit_reached && trace.replay_safe() {
                 self.reset();
                 return WsOutcome::Transport(anyhow::anyhow!(
                     "Responses WebSocket connection limit reached; falling back to HTTP-SSE"
                 ));
             }
 
-            if stale_previous_response && prev_id.is_some() && attempt < 2 {
+            if stale_previous_response && trace.replay_safe() && prev_id.is_some() && attempt < 2 {
                 tracing::warn!(
                     diagnostics = %trace.fault_context("responses WebSocket", attempt, 2),
                     "Responses WebSocket previous_response_id was stale; retrying with full input"
@@ -404,7 +419,10 @@ impl WsChannel {
                     self.last_nonfields = Some(cur_nonfields);
                     return WsOutcome::Done(out);
                 }
-                Err(e) => return WsOutcome::Api(e),
+                Err(e) => {
+                    self.reset();
+                    return WsOutcome::Api(e);
+                }
             }
         }
         WsOutcome::Transport(anyhow::anyhow!("websocket run retry loop exhausted"))
@@ -526,6 +544,43 @@ mod tests {
     struct NoSink;
     impl crate::transport::TurnSink for NoSink {
         fn stream_event(&self, _event: Value) {}
+    }
+
+    #[tokio::test]
+    async fn websocket_partial_tool_or_malformed_frame_does_not_retry_or_fallback() {
+        use crate::transport::responses_common::{Auth, ResponsesState};
+        for frame in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "type":"function_call","id":"fc-1","call_id":"call-1","name":"file_write","arguments":""
+            }}).to_string(),
+            "{malformed".into(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                ws.next().await.unwrap().unwrap();
+                ws.send(Message::Text(frame.into())).await.unwrap();
+                ws.close(None).await.unwrap();
+            });
+            let mut ch = WsChannel::new(format!("ws://{addr}/responses"));
+            let mut state = ResponsesState::new(Auth::ApiKey("fixture".into()));
+            state.push_user_text("synthetic fixture");
+            let before = state.input.clone();
+            let opts = TurnOpts {
+                model: "gpt-5-codex".into(), max_tokens: 16, base_instructions: None,
+                system: crate::transport::SystemPrompt::default(), effort: None,
+                web_search: false, service_tier: None,
+            };
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), ch.run(&mut state, &[], &opts, &NoSink)).await.unwrap();
+            server.await.unwrap();
+            let WsOutcome::Api(error) = outcome else { panic!("partial or malformed response must not fall back to HTTP"); };
+            assert!(error.downcast_ref::<crate::transport::FailedTurnObservation>().is_some());
+            assert_eq!(state.input, before);
+            assert!(ch.last_full_input.is_none());
+            assert!(ch.conn.is_none());
+        }
     }
 
     #[tokio::test]

@@ -1488,6 +1488,7 @@ dependencies = [
  "futures-util",
  "http",
  "iana-time-zone",
+ "jsonschema",
  "lsp-types",
  "reqwest 0.12.28",
  "rmcp",

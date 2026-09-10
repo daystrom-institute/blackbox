@@ -170,7 +170,13 @@ impl OpenAiResponsesTransport {
                 buf.extend_from_slice(&chunk);
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=pos).collect();
-                    let line_cow = String::from_utf8_lossy(&raw);
+                    let line_cow = match std::str::from_utf8(&raw) {
+                        Ok(line) => line,
+                        Err(error) => {
+                            accum.push_str(&String::from_utf8_lossy(&raw));
+                            return Err(responses_common::responses_failure(error.into(), &accum));
+                        }
+                    };
                     accum.push_str(&line_cow);
                     let line = line_cow.trim();
                     let Some(data) = line.strip_prefix("data:") else {
@@ -180,9 +186,9 @@ impl OpenAiResponsesTransport {
                     if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
-                    let Ok(ev) = serde_json::from_str::<Value>(data) else {
-                        continue;
-                    };
+                    let ev: Value = serde_json::from_str(data)
+                        .context("invalid Responses SSE JSON")
+                        .map_err(|error| responses_common::responses_failure(error, &accum))?;
                     trace.observe_event(&ev);
                     match ev["type"].as_str().unwrap_or("") {
                         "response.output_text.delta" => {
@@ -228,6 +234,13 @@ impl OpenAiResponsesTransport {
                 }
             }
 
+            if !buf.iter().all(u8::is_ascii_whitespace) {
+                accum.push_str(&String::from_utf8_lossy(&buf));
+                return Err(responses_common::responses_failure(
+                    anyhow::anyhow!("unfinished Responses SSE line"),
+                    &accum,
+                ));
+            }
             if fault.is_none() && !trace.terminal_seen() {
                 fault = Some(anyhow::anyhow!(
                     "responses stream closed before a terminal event (response.completed/incomplete/failed)"
@@ -237,7 +250,7 @@ impl OpenAiResponsesTransport {
             if let Some(err) = fault {
                 let max_attempts = max.saturating_add(1);
                 let diagnostics = trace.fault_context("responses HTTP-SSE", attempt, max_attempts);
-                if !trace.emitted_text() && attempt <= max {
+                if trace.replay_safe() && attempt <= max {
                     let wait = super::http::backoff(attempt);
                     tracing::warn!(
                         attempt,
@@ -249,13 +262,13 @@ impl OpenAiResponsesTransport {
                     tokio::time::sleep(wait).await;
                     continue 'attempt;
                 }
-                return Err(err.context(if trace.emitted_text() {
+                return Err(responses_common::responses_failure(err.context(if !trace.replay_safe() {
                     format!(
                         "responses stream fault after partial output; not retried (would duplicate); {diagnostics}"
                     )
                 } else {
                     format!("responses stream retries exhausted; {diagnostics}")
-                }));
+                }), &accum));
             }
 
             return self.state.parse_sse(&accum);

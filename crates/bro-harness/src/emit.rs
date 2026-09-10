@@ -384,9 +384,9 @@ impl Emitter {
 
     /// Terminal `result` event with usage/turns/cost. `suspicious_turn_end`
     /// carries the turn-end diagnostics when the loop flagged the stop as
-    /// suspicious (empty-output stop, outstanding async work) — the session
-    /// still ends `subtype: success`, but orchestrators can see the
-    /// deliverable may be missing instead of trusting `result` blindly.
+    /// suspicious. Mechanical incomplete stops carry `subtype: incomplete`
+    /// and `is_error: true`; outstanding background work alone remains an
+    /// observation and does not claim the model's task is incomplete.
     #[allow(
         clippy::too_many_arguments,
         reason = "The result envelope carries separate usage and context measurements"
@@ -423,6 +423,11 @@ impl Emitter {
         }
         if let Some(diag) = suspicious_turn_end {
             v["suspicious_turn_end"] = diag.clone();
+            if diag["incomplete"].as_bool() == Some(true) {
+                v["subtype"] = json!("incomplete");
+                v["is_error"] = json!(true);
+                v["stop_reason"] = diag["break_reason"].clone();
+            }
         }
         if let Some(t) = compaction_threshold {
             v["compaction_threshold"] = json!(t);

@@ -178,7 +178,7 @@ impl ToolArgDefaults {
 
         let mut input_obj = match input {
             Value::Object(map) => map,
-            _ => Map::new(),
+            other => return Ok((other, ToolArgRider::default())),
         };
         let mut rider = ToolArgRider::default();
 

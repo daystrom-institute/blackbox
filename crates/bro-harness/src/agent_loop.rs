@@ -60,8 +60,8 @@ const FINAL_RESULT_TOOL: &str = "final_result";
 /// System-prompt instruction appended when structured output is active.
 const STRUCTURED_OUTPUT_INSTRUCTION: &str = "\
 When you have your final answer, call the `final_result` tool with arguments \
-that conform to its input schema. That call ends the session — do not make any \
-further tool calls after it.";
+that conform to its input schema. Submit it alone in its response. That call ends \
+the session; do not make further tool calls after it.";
 
 // ---------------------------------------------------------------------------
 // FinalResultTool — synthetic terminal tool for structured output
@@ -102,6 +102,39 @@ impl Tool for FinalResultTool {
         // so this body is a fallback. Return the captured args as JSON.
         bro_tools::ToolResult::Json(input)
     }
+}
+
+fn compile_output_schema(schema: &Value) -> Result<jsonschema::JSONSchema> {
+    let mut options = jsonschema::JSONSchema::options();
+    if schema.get("$schema").is_none() {
+        options.with_draft(jsonschema::Draft::Draft202012);
+    }
+    options
+        .compile(schema)
+        .map_err(|error| anyhow::anyhow!("invalid output schema: {error}"))
+}
+
+fn final_result_rejection(schema: Option<&Value>, calls: &[transport::ToolCall]) -> Option<String> {
+    let schema = schema?;
+    let terminal = calls.iter().find(|call| call.name == FINAL_RESULT_TOOL)?;
+    if calls.len() != 1 {
+        return Some("final_result must be the only call in its response. No calls in this batch were executed; complete other work before submitting the final result.".into());
+    }
+    let compiled = match compile_output_schema(schema) {
+        Ok(compiled) => compiled,
+        Err(error) => return Some(error.to_string()),
+    };
+    if let Err(errors) = compiled.validate(&terminal.args) {
+        let details = errors
+            .take(8)
+            .map(|error| format!("{}: {}", error.instance_path, error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(format!(
+            "final_result did not match the output schema: {details}. Correct the result; nothing was executed."
+        ));
+    }
+    None
 }
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
@@ -1032,8 +1065,11 @@ impl Session {
             .or_else(|| std::env::var("BRO_HARNESS_OUTPUT_SCHEMA").ok());
         let output_schema = output_schema
             .as_deref()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .context("invalid output schema JSON")?;
         if let Some(ref schema) = output_schema {
+            compile_output_schema(schema)?;
             builtins.push(Arc::new(FinalResultTool::new(schema.clone())));
             pin.also_pin(FINAL_RESULT_TOOL);
         }
@@ -1518,6 +1554,29 @@ impl Session {
                 );
             }
 
+            // Incomplete provider responses cannot authorize any accumulated calls.
+            if !matches!(out.stop, StopReason::Done | StopReason::ToolCalls) {
+                let results: Vec<_> = out
+                    .tool_calls
+                    .iter()
+                    .map(|call| transport::ToolResult {
+                        id: call.id.clone(),
+                        content: "Tool not executed: provider response did not complete normally."
+                            .into(),
+                        is_error: true,
+                    })
+                    .collect();
+                if !results.is_empty() {
+                    self.emitter.tool_results(&results);
+                    self.tx.push_tool_results(results);
+                }
+                break if out.stop == StopReason::Length {
+                    "output_limit"
+                } else {
+                    "provider_stop"
+                };
+            }
+
             // A rejected batch stays visible and replayable, but no client
             // action (including final_result) runs. Supply a result for every
             // ID before either requesting correction or terminating.
@@ -1529,7 +1588,9 @@ impl Session {
                     out.tool_calls.len()
                 ))
             } else {
-                self.tx.tool_batch_rejection(&out)
+                self.tx.tool_batch_rejection(&out).or_else(|| {
+                    final_result_rejection(self.output_schema.as_ref(), &out.tool_calls)
+                })
             };
             if let Some(reason) = batch_rejection {
                 last_tool_results = out
@@ -1614,61 +1675,24 @@ impl Session {
                 continue;
             }
 
-            // Structured output interception: when an output schema is active and
-            // the model called `final_result`, capture the first call's arguments as
-            // the structured result, emit a synthetic tool_result back, and terminate
-            // the turn cleanly. The model should only call this once; ignore
-            // subsequent calls if it fires multiple times.
-            if self.output_schema.is_some() {
-                if let Some(fr) = out
+            // Admission above requires a single schema-valid terminal call.
+            if self.output_schema.is_some()
+                && let Some(fr) = out
                     .tool_calls
-                    .iter()
-                    .find(|tc| tc.name == FINAL_RESULT_TOOL)
-                {
-                    let structured = fr.args.clone();
-                    tracing::info!("final_result captured; terminating turn");
-                    // Emit a tool_result so the transport buffer stays valid
-                    // (every tool_use gets a matching result).
-                    let fr_result = transport::ToolResult {
-                        id: fr.id.clone(),
-                        content: serde_json::to_string(&structured).unwrap_or_default(),
-                        is_error: false,
-                    };
-                    self.emitter.tool_results(std::slice::from_ref(&fr_result));
-                    // Pad any sibling tool calls that were NOT final_result with
-                    // interrupted markers so the buffer stays balanced.
-                    let mut padding: Vec<transport::ToolResult> = Vec::new();
-                    for tc in &out.tool_calls {
-                        if tc.name != FINAL_RESULT_TOOL {
-                            padding.push(transport::ToolResult {
-                                id: tc.id.clone(),
-                                content: INTERRUPTED_TOOL_RESULT.to_string(),
-                                is_error: true,
-                            });
-                        }
-                    }
-                    if !padding.is_empty() {
-                        self.emitter.tool_results(&padding);
-                    }
-                    let mut transport_results = Vec::with_capacity(1 + padding.len());
-                    transport_results.push(fr_result);
-                    transport_results.extend(padding);
-                    self.tx.push_tool_results(transport_results);
-                    // Emit the structured result as the final assistant result.
-                    self.emitter.result(
-                        &serde_json::to_string(&structured).unwrap_or_default(),
-                        &self.total_usage,
-                        self.turns,
-                        None,
-                        None,
-                        self.compact_threshold,
-                        (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
-                    );
-                    // Turn-boundary event-log drain (see end of user_turn).
-                    let log = self.event_log.clone();
-                    let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
-                    return Ok(());
-                }
+                    .first()
+                    .filter(|tc| tc.name == FINAL_RESULT_TOOL)
+            {
+                let text = serde_json::to_string(&fr.args)?;
+                let result = transport::ToolResult {
+                    id: fr.id.clone(),
+                    content: text.clone(),
+                    is_error: false,
+                };
+                self.emitter.tool_results(std::slice::from_ref(&result));
+                self.tx.push_tool_results(vec![result]);
+                final_text = text.clone();
+                last_step_text = text;
+                break "structured_result";
             }
 
             // Preserve the model's call order across mutations. Only adjacent
@@ -1927,12 +1951,23 @@ impl Session {
                 (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
             );
         } else {
+            let incomplete = matches!(
+                break_reason,
+                "max_turns" | "output_limit" | "provider_stop" | "tool_calls_empty"
+            ) || (break_reason == "model_stop"
+                && last_step_text.trim().is_empty())
+                || (self.output_schema.is_some() && break_reason != "structured_result");
+            let mut terminal = turn_end.clone();
+            terminal["incomplete"] = json!(incomplete);
+            if self.output_schema.is_some() && break_reason != "structured_result" {
+                terminal["missing_structured_result"] = json!(true);
+            }
             self.emitter.result(
-                &final_text,
+                &last_step_text,
                 &self.total_usage,
                 self.turns,
                 None,
-                suspicious.then_some(&turn_end),
+                (suspicious || incomplete).then_some(&terminal),
                 self.compact_threshold,
                 (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens),
             );
@@ -2780,6 +2815,7 @@ mod tests {
         /// Return text immediately (Done, no tool calls).
         Text(String),
         NativeSearch(Vec<Value>),
+        Terminal(StopReason, String, Vec<transport::ToolCall>),
         HighUsageFollowUp,
         ContextOverflow,
         Failure,
@@ -2861,6 +2897,15 @@ mod tests {
                 .pop_front()
                 .unwrap_or(MockTurn::Text("ok".into()));
             match script {
+                MockTurn::Terminal(stop, text, tool_calls) => Ok(transport::TurnOutput {
+                    observation_content: None,
+                    text,
+                    thinking: String::new(),
+                    tool_calls,
+                    stop,
+                    end_turn: None,
+                    usage: Usage::default(),
+                }),
                 MockTurn::ContextOverflow => {
                     Err(transport::ContextWindowExceeded("test overflow".into()).into())
                 }
@@ -3381,6 +3426,101 @@ mod tests {
         assert_eq!(pushed[0][0].id, "final-1");
         assert_eq!(pushed[0][0].content, r#"{"ok":true}"#);
         assert!(!pushed[0][0].is_error);
+    }
+
+    #[tokio::test]
+    async fn final_result_rejects_invalid_and_sibling_calls_before_dispatch() {
+        for calls in [
+            vec![dispatch_call(
+                "bad",
+                FINAL_RESULT_TOOL,
+                json!({"ok":"wrong"}),
+            )],
+            vec![
+                dispatch_call("one", FINAL_RESULT_TOOL, json!({"ok":true})),
+                dispatch_call("two", FINAL_RESULT_TOOL, json!({"ok":true})),
+            ],
+            vec![
+                dispatch_call("mutation", "slow_tool", json!({})),
+                dispatch_call("final", FINAL_RESULT_TOOL, json!({"ok":true})),
+            ],
+        ] {
+            let count = calls.len();
+            let (mut session, shared) =
+                mk_session(vec![MockTurn::ToolCalls(calls), MockTurn::FinalResult]);
+            session.output_schema = Some(
+                json!({"type":"object", "properties":{"ok":{"type":"boolean"}}, "required":["ok"]}),
+            );
+            shared.tool_gate.notify_one();
+            run_user_turn(&mut session, "structured result").await;
+            assert_eq!(shared.tool_started.load(Ordering::SeqCst), 0);
+            let results = shared.pushed_tool_results.lock().unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].len(), count);
+            assert!(results[0].iter().all(|result| result.is_error));
+            assert!(!results[1][0].is_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn mechanical_incomplete_stops_never_emit_success_or_dispatch_calls() {
+        for (scripts, limit, schema, reason) in [
+            (
+                vec![MockTurn::Terminal(
+                    StopReason::Length,
+                    "partial".into(),
+                    vec![dispatch_call("uncommitted", "slow_tool", json!({}))],
+                )],
+                50,
+                false,
+                "output_limit",
+            ),
+            (
+                vec![MockTurn::TextWithEndTurn(
+                    "still working".into(),
+                    Some(false),
+                )],
+                1,
+                false,
+                "max_turns",
+            ),
+            (
+                vec![MockTurn::Text("plain text".into())],
+                50,
+                true,
+                "model_stop",
+            ),
+            (
+                vec![MockTurn::Text("".into()), MockTurn::Text("".into())],
+                50,
+                false,
+                "model_stop",
+            ),
+        ] {
+            let (mut session, shared) = mk_session(scripts);
+            session.max_turns = limit;
+            if schema {
+                session.output_schema = Some(json!({"type":"object"}));
+            }
+            let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = events.clone();
+            session.emitter = Emitter::with_callback(
+                "terminal-fixture".into(),
+                Arc::new(move |event| captured.lock().unwrap().push(event)),
+            );
+            shared.tool_gate.notify_one();
+            run_user_turn(&mut session, "finish").await;
+            assert_eq!(shared.tool_started.load(Ordering::SeqCst), 0);
+            let events = events.lock().unwrap();
+            let result = events
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "result")
+                .unwrap();
+            assert_eq!(result["subtype"], "incomplete");
+            assert_eq!(result["is_error"], true);
+            assert_eq!(result["stop_reason"], reason);
+        }
     }
 
     #[tokio::test]
@@ -3917,6 +4057,13 @@ mod tests {
                     .as_bool()
                     .unwrap_or(false),
                 expected_error.is_some()
+                    || (session.output_schema.is_some()
+                        && !expected_responses
+                            .last()
+                            .unwrap()
+                            .iter()
+                            .any(|block| block["name"] == FINAL_RESULT_TOOL)),
+                "{label}: a schema session without final_result is incomplete"
             );
             for message in messages.iter().filter(|m| m["role"] == "assistant") {
                 assert!(rows.iter().any(|r| r["event"]["type"] == "assistant"
@@ -4061,7 +4208,12 @@ mod tests {
             let observation = &observations[0]["event"];
             assert_eq!(observation["replayable"], false);
             assert_eq!(observation["native_blocks"], json!(expected_native));
-            let diagnostics = observation["tool_diagnostics"].as_array().unwrap();
+            let diagnostics: Vec<_> = observation["tool_diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|diagnostic| diagnostic["kind"] != "rejected_provider_response")
+                .collect();
             if malformed_client {
                 assert_eq!(diagnostics.len(), 3);
                 assert_eq!(diagnostics[0]["kind"], "incomplete_tool_input");

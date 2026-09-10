@@ -381,7 +381,7 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
                     b.raw = Some(cb.clone());
                     b.tool_id = cb["id"].as_str().unwrap_or("").to_string();
                     b.tool_name = cb["name"].as_str().unwrap_or("").to_string();
-                    if let Some(input) = cb.get("input").filter(|v| !v.is_null()) {
+                    if let Some(input) = cb.get("input") {
                         b.tool_input_start = Some(input.clone());
                     }
                 }
@@ -459,17 +459,97 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
 const MAX_PAUSE_RESUMES: u32 = 8;
 
 fn parse_tool_input(block: &SseBlock) -> Result<Value> {
-    if block.tool_json.is_empty() {
-        return Ok(block.tool_input_start.clone().unwrap_or_else(|| json!({})));
+    let input = if block.tool_json.is_empty() {
+        block
+            .tool_input_start
+            .clone()
+            .context("tool input missing from stream")?
+    } else {
+        super::parse_tool_arguments(&block.tool_json).with_context(|| {
+            format!(
+                "invalid JSON streamed for tool input (tool={}, id={}, bytes={})",
+                block.tool_name,
+                block.tool_id,
+                block.tool_json.len()
+            )
+        })?
+    };
+    anyhow::ensure!(input.is_object(), "tool input must be a JSON object");
+    Ok(input)
+}
+
+/// Message termination and block completion are separate protocol events.
+/// A closed connection supplies neither, even when a partial argument parses.
+#[derive(Default)]
+struct AnthropicStreamIntegrity {
+    started: std::collections::HashSet<u64>,
+    open: std::collections::HashSet<u64>,
+    stop_reason_seen: bool,
+    terminal: bool,
+}
+
+impl AnthropicStreamIntegrity {
+    fn observe(&mut self, event: &Value) -> Result<()> {
+        let kind = event["type"]
+            .as_str()
+            .context("Anthropic event missing type")?;
+        anyhow::ensure!(
+            !self.terminal || kind == "ping",
+            "Anthropic content after message_stop"
+        );
+        match kind {
+            "content_block_start" | "content_block_delta" | "content_block_stop" => {
+                anyhow::ensure!(
+                    !self.stop_reason_seen,
+                    "Anthropic content after stop_reason"
+                );
+                let index = event["index"]
+                    .as_u64()
+                    .context("content block missing index")?;
+                anyhow::ensure!(
+                    index < 4096,
+                    "content block index exceeds protocol safety bound"
+                );
+                if kind == "content_block_start" {
+                    anyhow::ensure!(self.started.insert(index), "duplicate content block start");
+                    self.open.insert(index);
+                } else {
+                    anyhow::ensure!(
+                        self.open.contains(&index),
+                        "content event for unopened or closed block"
+                    );
+                    if kind == "content_block_stop" {
+                        self.open.remove(&index);
+                    }
+                    if kind == "content_block_delta" && event["delta"]["type"] == "input_json_delta"
+                    {
+                        anyhow::ensure!(
+                            event["delta"]["partial_json"].is_string(),
+                            "tool input delta must be a string"
+                        );
+                    }
+                }
+            }
+            "message_delta" if event["delta"]["stop_reason"].is_string() => {
+                anyhow::ensure!(!self.stop_reason_seen, "duplicate Anthropic stop_reason");
+                self.stop_reason_seen = true;
+            }
+            "message_stop" => {
+                anyhow::ensure!(
+                    self.stop_reason_seen && self.open.is_empty(),
+                    "message_stop before stop_reason or block completion"
+                );
+                self.terminal = true;
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    serde_json::from_str(&block.tool_json).with_context(|| {
-        format!(
-            "invalid JSON streamed for tool input (tool={}, id={}, bytes={})",
-            block.tool_name,
-            block.tool_id,
-            block.tool_json.len()
-        )
-    })
+
+    fn finish(&self) -> Result<()> {
+        anyhow::ensure!(self.terminal, "Anthropic stream closed before message_stop");
+        Ok(())
+    }
 }
 
 fn failed_turn_observation(
@@ -490,6 +570,12 @@ fn failed_turn_observation(
     let mut tool_ids = std::collections::HashMap::new();
     for (index, block) in blocks.iter().enumerate() {
         match block.kind.as_str() {
+            "text" if !block.text.is_empty() => {
+                native_blocks.push(json!({"type":"text", "text":block.text}))
+            }
+            "thinking" if !block.text.is_empty() => {
+                native_blocks.push(json!({"type":"thinking", "thinking":block.text}))
+            }
             "tool_use" | "server_tool_use" => {
                 if let Some(previous) = tool_ids.insert(block.tool_id.as_str(), index) {
                     tool_diagnostics.push(json!({
@@ -507,15 +593,16 @@ fn failed_turn_observation(
                         native["input"] = input;
                         native_blocks.push(native);
                     }
-                    Ok(_) => tool_diagnostics.push(json!({
+                    Ok(input) => tool_diagnostics.push(json!({
                         "kind": "client_tool_not_dispatched", "block_index": index,
-                        "id": block.tool_id, "name": block.tool_name,
+                        "id": block.tool_id, "name": block.tool_name, "input": input,
+                        "client_dispatched": false,
                     })),
                     Err(error) => tool_diagnostics.push(json!({
                         "kind": "incomplete_tool_input", "block_index": index,
                         "block_type": block.kind, "id": block.tool_id,
                         "name": block.tool_name, "error": format!("{error:#}"),
-                        "input_json": block.tool_json,
+                        "input_json": block.tool_json, "input_start": block.tool_input_start,
                         "client_dispatched": false,
                     })),
                 }
@@ -577,6 +664,7 @@ fn reconstruct_segment(
     let mut text_out = String::new();
     let mut thinking_out = String::new();
     let mut tool_calls: Vec<super::ToolCall> = Vec::new();
+    let mut client_ids = std::collections::HashSet::new();
     for b in blocks {
         match b.kind.as_str() {
             "text" if !b.text.is_empty() => {
@@ -601,6 +689,8 @@ fn reconstruct_segment(
                 thinking_out.push_str(&b.text);
             }
             "tool_use" => {
+                super::validate_tool_identity(&b.tool_id, &b.tool_name)?;
+                anyhow::ensure!(client_ids.insert(&b.tool_id), "duplicate client tool id");
                 let args = parse_tool_input(b)?;
                 content.push(json!({
                     "type": "tool_use", "id": b.tool_id, "name": b.tool_name, "input": args.clone(),
@@ -819,6 +909,7 @@ impl Transport for AnthropicTransport {
             // duplicate output or provider-side execution. Empty text/thinking
             // starts alone still allow a retry before actual content arrives.
             let mut streamed_content = false;
+            let mut integrity = AnthropicStreamIntegrity::default();
 
             'consume: loop {
                 // The request-level timeout can't catch a connection that stays
@@ -848,7 +939,16 @@ impl Transport for AnthropicTransport {
                 buf.extend_from_slice(&chunk);
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&raw);
+                    let line = match std::str::from_utf8(&raw) {
+                        Ok(line) => line,
+                        Err(error) => {
+                            return Err(super::rejected_provider_response(
+                                self.fail_response(error.into(), &blocks, assistant_idx),
+                                "anthropic",
+                                json!({"unparsed_data": String::from_utf8_lossy(&raw)}),
+                            ));
+                        }
+                    };
                     let line = line.trim_end();
                     let Some(data) = line.strip_prefix("data:") else {
                         continue; // `event:` lines and blanks: the data JSON carries `type`
@@ -867,6 +967,13 @@ impl Transport for AnthropicTransport {
                                     Some((format!("{code}: {msg}"), inband_error_retryable(&ev)));
                                 break 'consume;
                             }
+                            integrity.observe(&ev).map_err(|error| {
+                                super::rejected_provider_response(
+                                    self.fail_response(error, &blocks, assistant_idx),
+                                    "anthropic",
+                                    ev.clone(),
+                                )
+                            })?;
                             streamed_content |= sse_event_has_content(&ev);
                             sink.stream_event(ev.clone());
                             fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
@@ -879,7 +986,13 @@ impl Transport for AnthropicTransport {
                             // consumer.
                             self.last_segment_usage = usage;
                         }
-                        Err(e) => tracing::warn!("anthropic SSE parse error: {e}"),
+                        Err(error) => {
+                            return Err(super::rejected_provider_response(
+                                self.fail_response(error.into(), &blocks, assistant_idx),
+                                "anthropic",
+                                json!({"unparsed_data": data}),
+                            ));
+                        }
                     }
                 }
             }
@@ -910,10 +1023,28 @@ impl Transport for AnthropicTransport {
                 ));
             }
 
+            integrity.finish().map_err(|error| {
+                super::rejected_provider_response(
+                    self.fail_response(error, &blocks, assistant_idx),
+                    "anthropic",
+                    json!({"unparsed_data": String::from_utf8_lossy(&buf)}),
+                )
+            })?;
+
             // Reconstruct this segment and merge it into the single assistant
             // message that represents the (possibly multi-segment) turn.
             let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks)
                 .map_err(|error| self.fail_response(error, &blocks, assistant_idx))?;
+
+            if (!tool_calls.is_empty() && stop != StopReason::ToolCalls)
+                || (tool_calls.is_empty() && stop == StopReason::ToolCalls)
+            {
+                return Err(self.fail_response(
+                    anyhow::anyhow!("Anthropic terminal does not match client tool calls"),
+                    &blocks,
+                    assistant_idx,
+                ));
+            }
 
             // Spurious empty stop: some Anthropic-compatible endpoints (observed:
             // MiniMax-M3 — ~12% on history turns whose prior assistant message has
@@ -1326,6 +1457,133 @@ mod tests {
             web_search: false,
             service_tier: None,
         }
+    }
+
+    async fn anthropic_integrity_fixture(events: &[Value]) -> (Result<TurnOutput>, Vec<Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct NoSink;
+        impl super::super::TurnSink for NoSink {
+            fn stream_event(&self, _: Value) {}
+        }
+        let body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        });
+        let mut tx = AnthropicTransport {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            provider: None,
+            auth: Auth::Bearer("fixture".into()),
+            version: "2023-06-01".into(),
+            messages: Vec::new(),
+            last_segment_usage: Usage::default(),
+        };
+        tx.push_user_text("synthetic fixture");
+        let result = tx
+            .run_turn(&[], &opts(SystemPrompt::default()), &NoSink)
+            .await;
+        server.await.unwrap();
+        (result, tx.messages)
+    }
+
+    fn anthropic_tool_events(input: Option<Value>, delta: Option<&str>) -> Vec<Value> {
+        let mut block = json!({"type":"tool_use","id":"call-1","name":"file_write"});
+        if let Some(input) = input {
+            block["input"] = input;
+        }
+        let mut events =
+            vec![json!({"type":"content_block_start","index":0,"content_block":block})];
+        if let Some(delta) = delta {
+            events.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}));
+        }
+        events.extend([
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        events
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_nonobject_missing_and_truncated_tool_input_without_replay() {
+        let mut cases = Vec::new();
+        for input in [None, Some(Value::Null), Some(json!([])), Some(json!(1))] {
+            cases.push(anthropic_tool_events(input, None));
+        }
+        for delta in ["null", "[]", "1", "{"] {
+            cases.push(anthropic_tool_events(Some(json!({})), Some(delta)));
+        }
+        let valid = anthropic_tool_events(Some(json!({})), None);
+        cases.push(valid[..valid.len() - 1].to_vec());
+        cases.push(
+            valid
+                .iter()
+                .filter(|event| event["type"] != "content_block_stop")
+                .cloned()
+                .collect(),
+        );
+        cases.push(
+            valid
+                .iter()
+                .filter(|event| event["type"] != "message_delta")
+                .cloned()
+                .collect(),
+        );
+        let mut length = valid.clone();
+        length[2]["delta"]["stop_reason"] = json!("max_tokens");
+        cases.push(length);
+        let mut missing_id = valid.clone();
+        missing_id[0]["content_block"]["id"] = json!("");
+        cases.push(missing_id);
+        for events in cases {
+            let (result, messages) = anthropic_integrity_fixture(&events).await;
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("invalid stream accepted: {events:?}"));
+            assert!(
+                error
+                    .downcast_ref::<super::super::FailedTurnObservation>()
+                    .is_some()
+            );
+            assert_eq!(
+                messages.len(),
+                1,
+                "failed assistant cannot enter replay history"
+            );
+        }
+        let (result, messages) = anthropic_integrity_fixture(&valid).await;
+        assert_eq!(result.unwrap().tool_calls[0].args, json!({}));
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_integrity_rejects_unopened_delta_duplicate_stop_and_content_after_terminal() {
+        let mut integrity = AnthropicStreamIntegrity::default();
+        assert!(integrity.observe(&json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}})).is_err());
+        assert!(
+            integrity
+                .observe(&json!({"type":"content_block_start","index":1000000000}))
+                .is_err()
+        );
+        integrity
+            .observe(&json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}))
+            .unwrap();
+        integrity.observe(&json!({"type":"message_stop"})).unwrap();
+        integrity.finish().unwrap();
+        assert!(integrity.observe(&json!({"type":"message_stop"})).is_err());
+        assert!(
+            integrity
+                .observe(&json!({"type":"content_block_start","index":0}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2299,6 +2557,8 @@ mod tests {
         // run reported as `input=0/output=94`. message_start carries a
         // zeroed input_tokens; the real prompt count is in
         // message_delta.usage.input_tokens.
+        // The native call/result pair below is synthetic coverage for replay
+        // preservation; its block lifecycle follows the Messages protocol.
         let body = concat!(
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[]",
             ",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
@@ -2306,7 +2566,9 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"native-1\",\"name\":\"web_search_prime\",\"input\":{\"search_query\":\"synthetic\"}}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_result\",\"tool_use_id\":\"native-1\",\"content\":\"[]\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1808,\"output_tokens\":94}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -2375,6 +2637,7 @@ mod tests {
         let recovered_body = concat!(
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );

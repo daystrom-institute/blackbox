@@ -1,0 +1,722 @@
+{
+  "baseline_commit": "47d2aef3a0e65c83f00ab004acee54c78c189d10",
+  "candidate": "source committed with this receipt",
+  "platforms": {
+    "baseline": "macOS arm64",
+    "candidate": "Linux amd64"
+  },
+  "comparison_limit": "Deterministic correctness probes, not a performance or model-efficacy comparison.",
+  "provider": {
+    "before": [
+      {
+        "case": "malformed",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "null",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "array",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "nested-null",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "nested-array",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "truncated-call",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "truncated-text",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "fixture complete"
+          }
+        ]
+      },
+      {
+        "case": "length-call",
+        "exit": 0,
+        "requests": 3,
+        "mutated": true,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "length-text",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "unfinished response"
+          }
+        ]
+      },
+      {
+        "case": "invalid-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "{\"ok\":\"invalid\"}"
+          }
+        ]
+      },
+      {
+        "case": "duplicate-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "{\"ok\":true}"
+          }
+        ]
+      },
+      {
+        "case": "sibling-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "{\"ok\":true}"
+          }
+        ]
+      },
+      {
+        "case": "missing-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "fixture complete"
+          }
+        ]
+      },
+      {
+        "case": "max-turns",
+        "exit": 0,
+        "requests": 0,
+        "mutated": false,
+        "contract_passed": false,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "valid-call",
+        "exit": 0,
+        "requests": 2,
+        "mutated": true,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "fixture complete"
+          }
+        ]
+      },
+      {
+        "case": "valid-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "{\"ok\":true}"
+          }
+        ]
+      }
+    ],
+    "after": [
+      {
+        "case": "malformed",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: invalid tool arguments JSON: EOF while parsing a value at line 1 column 13"
+          }
+        ]
+      },
+      {
+        "case": "null",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: tool arguments must be a JSON object"
+          }
+        ]
+      },
+      {
+        "case": "array",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: tool arguments must be a JSON object"
+          }
+        ]
+      },
+      {
+        "case": "nested-null",
+        "exit": 0,
+        "requests": 3,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "incomplete",
+            "is_error": true,
+            "stop_reason": "max_turns",
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "nested-array",
+        "exit": 0,
+        "requests": 3,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "incomplete",
+            "is_error": true,
+            "stop_reason": "max_turns",
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "truncated-call",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: Chat stream closed before [DONE]"
+          }
+        ]
+      },
+      {
+        "case": "truncated-text",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: Chat stream closed before [DONE]"
+          }
+        ]
+      },
+      {
+        "case": "length-call",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: Chat terminal does not match tool calls"
+          }
+        ]
+      },
+      {
+        "case": "length-text",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "incomplete",
+            "is_error": true,
+            "stop_reason": "output_limit",
+            "result": "unfinished response"
+          }
+        ]
+      },
+      {
+        "case": "invalid-final",
+        "exit": 1,
+        "requests": 2,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "final_result did not match the output schema: /ok: \"invalid\" is not of type \"boolean\". Correct the result; nothing was executed. Automatic correction was already attempted for this user turn; stopping."
+          }
+        ]
+      },
+      {
+        "case": "duplicate-final",
+        "exit": 1,
+        "requests": 2,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "final_result must be the only call in its response. No calls in this batch were executed; complete other work before submitting the final result. Correction protocol violation: this response contains 2 client calls; at most one client call per response is permitted for the remainder of this user turn. None of the client tools in this correction batch were executed. Automatic correction was already attempted for this user turn; stopping."
+          }
+        ]
+      },
+      {
+        "case": "sibling-final",
+        "exit": 1,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "error",
+            "is_error": true,
+            "stop_reason": null,
+            "result": "failed response retained 0 native blocks and 1 tool diagnostics: invalid or non-contiguous Chat tool index"
+          }
+        ]
+      },
+      {
+        "case": "missing-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "incomplete",
+            "is_error": true,
+            "stop_reason": "model_stop",
+            "result": "fixture complete"
+          }
+        ]
+      },
+      {
+        "case": "max-turns",
+        "exit": 0,
+        "requests": 0,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "incomplete",
+            "is_error": true,
+            "stop_reason": "max_turns",
+            "result": ""
+          }
+        ]
+      },
+      {
+        "case": "valid-call",
+        "exit": 0,
+        "requests": 2,
+        "mutated": true,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "fixture complete"
+          }
+        ]
+      },
+      {
+        "case": "valid-final",
+        "exit": 0,
+        "requests": 1,
+        "mutated": false,
+        "contract_passed": true,
+        "terminal": [
+          {
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": null,
+            "result": "{\"ok\":true}"
+          }
+        ]
+      }
+    ]
+  },
+  "workspace": {
+    "before": [
+      {
+        "case": "oversized-file-search",
+        "actual": {
+          "exit": 0,
+          "output": "no matches",
+          "error": ""
+        },
+        "expected": "match or explicit incomplete-search disclosure",
+        "passed": false
+      },
+      {
+        "case": "explicit-pruned-directory",
+        "actual": {
+          "exit": 0,
+          "output": "build/logic.txt:1:KNOWN_NEEDLE",
+          "error": ""
+        },
+        "expected": "match or explicit excluded-directory disclosure",
+        "passed": false
+      },
+      {
+        "case": "default-pruned-directory",
+        "actual": {
+          "exit": 0,
+          "output": "no matches",
+          "error": ""
+        },
+        "expected": "match or explicit incomplete-search disclosure",
+        "passed": false
+      },
+      {
+        "case": "zero-search-limit",
+        "actual": {
+          "exit": 0,
+          "output": "small.txt:1:MATCH\n[truncated at 0 matches]\n[refine: narrow path=\"small.txt\" and glob=\"*.rs\", use mode=\"files\" or mode=\"count\" to size the hit set first, lower max_results for a compact sample, or raise max_results up to 5000 for a deliberate exhaustive search; current result cap 0, byte cap 8000]",
+          "error": ""
+        },
+        "expected": "reject zero or return zero matches",
+        "passed": false
+      },
+      {
+        "case": "empty-edit-needle-false",
+        "actual": {
+          "exit": 1,
+          "output": "",
+          "error": "error: old_string occurs 12 times; pass replace_all or add context to make it unique",
+          "unchanged": true
+        },
+        "passed": false
+      },
+      {
+        "case": "empty-edit-needle-true",
+        "actual": {
+          "exit": 0,
+          "output": "{\n  \"ok\": true,\n  \"replacements\": 12\n}",
+          "error": "",
+          "unchanged": false
+        },
+        "passed": false
+      },
+      {
+        "case": "patch-uniform-crlf",
+        "actual": {
+          "exit": 0,
+          "output": "Applied patch (1 change):\nupdated crlf.txt",
+          "error": "",
+          "bytes_preserved": false
+        },
+        "passed": false
+      },
+      {
+        "case": "explicit-file-search",
+        "actual": {
+          "exit": 0,
+          "output": "build/logic.txt:1:KNOWN_NEEDLE",
+          "error": ""
+        },
+        "passed": true
+      },
+      {
+        "case": "explicit-file-glob",
+        "actual": {
+          "exit": 0,
+          "output": "no files matched",
+          "error": ""
+        },
+        "passed": false
+      },
+      {
+        "case": "zero-glob-limit",
+        "actual": {
+          "exit": 0,
+          "output": "crlf.txt\n[showing 1 of 4 matches; raise max_results for more]",
+          "error": ""
+        },
+        "passed": false
+      }
+    ],
+    "after": [
+      {
+        "case": "oversized-file-search",
+        "actual": {
+          "exit": 0,
+          "output": "no matches in inspected files\n[observation output_limit=false; complete_within_scope=false; inspected_files=0; oversized=1; invalid_utf8=0; binary=0; read_errors=0; walk_errors=0; pruned_dirs=0; skipped_symlinks=0; visited=1; traversal_limit=false; result_limit=false; cancelled=false; scope=visible unignored regular files, descendant build/dependency directories excluded; examples=oversized=/tmp/harness-contract-audit-gy05j78s/large.txt]",
+          "error": ""
+        },
+        "expected": "match or explicit incomplete-search disclosure",
+        "passed": true
+      },
+      {
+        "case": "explicit-pruned-directory",
+        "actual": {
+          "exit": 0,
+          "output": "build/logic.txt:1:KNOWN_NEEDLE\n[observation output_limit=false; complete_within_scope=true; inspected_files=1; oversized=0; invalid_utf8=0; binary=0; read_errors=0; walk_errors=0; pruned_dirs=0; skipped_symlinks=0; visited=2; traversal_limit=false; result_limit=false; cancelled=false; scope=visible unignored regular files, descendant build/dependency directories excluded]",
+          "error": ""
+        },
+        "expected": "match or explicit excluded-directory disclosure",
+        "passed": true
+      },
+      {
+        "case": "default-pruned-directory",
+        "actual": {
+          "exit": 0,
+          "output": "no matches in inspected files\n[observation output_limit=false; complete_within_scope=false; inspected_files=0; oversized=1; invalid_utf8=0; binary=0; read_errors=0; walk_errors=0; pruned_dirs=1; skipped_symlinks=0; visited=6; traversal_limit=false; result_limit=false; cancelled=false; scope=visible unignored regular files, descendant build/dependency directories excluded; examples=pruned=/tmp/harness-contract-audit-gy05j78s/build, oversized=/tmp/harness-contract-audit-gy05j78s/large.txt]",
+          "error": ""
+        },
+        "expected": "match or explicit incomplete-search disclosure",
+        "passed": true
+      },
+      {
+        "case": "zero-search-limit",
+        "actual": {
+          "exit": 1,
+          "output": "",
+          "error": "error: max_results must be greater than zero"
+        },
+        "expected": "reject zero or return zero matches",
+        "passed": true
+      },
+      {
+        "case": "empty-edit-needle-false",
+        "actual": {
+          "exit": 1,
+          "output": "",
+          "error": "error: old_string must not be empty",
+          "unchanged": true
+        },
+        "passed": true
+      },
+      {
+        "case": "empty-edit-needle-true",
+        "actual": {
+          "exit": 1,
+          "output": "",
+          "error": "error: old_string must not be empty",
+          "unchanged": true
+        },
+        "passed": true
+      },
+      {
+        "case": "patch-uniform-crlf",
+        "actual": {
+          "exit": 0,
+          "output": "Applied patch (1 change):\nupdated crlf.txt",
+          "error": "",
+          "bytes_preserved": true
+        },
+        "passed": true
+      },
+      {
+        "case": "explicit-file-search",
+        "actual": {
+          "exit": 0,
+          "output": "build/logic.txt:1:KNOWN_NEEDLE\n[observation output_limit=false; complete_within_scope=true; inspected_files=1; oversized=0; invalid_utf8=0; binary=0; read_errors=0; walk_errors=0; pruned_dirs=0; skipped_symlinks=0; visited=1; traversal_limit=false; result_limit=false; cancelled=false; scope=visible unignored regular files, descendant build/dependency directories excluded]",
+          "error": ""
+        },
+        "passed": true
+      },
+      {
+        "case": "explicit-file-glob",
+        "actual": {
+          "exit": 0,
+          "output": "build/logic.txt\n[observation output_limit=false; complete_within_scope=true; inspected_files=1; oversized=0; invalid_utf8=0; binary=0; read_errors=0; walk_errors=0; pruned_dirs=0; skipped_symlinks=0; visited=1; traversal_limit=false; result_limit=false; cancelled=false; scope=visible unignored regular files, descendant build/dependency directories excluded]",
+          "error": ""
+        },
+        "passed": true
+      },
+      {
+        "case": "zero-glob-limit",
+        "actual": {
+          "exit": 1,
+          "output": "",
+          "error": "error: max_results must be greater than zero"
+        },
+        "passed": true
+      }
+    ]
+  },
+  "validation": {
+    "focused_passed": 797,
+    "full_before_final_edit_guards": {
+      "passed": 6848,
+      "skipped": 19
+    },
+    "full_final": {
+      "passed": 6849,
+      "failed": 2,
+      "skipped": 19,
+      "failures": [
+        "migration_apply_contends_on_accepted_publication_and_publisher_source_locks",
+        "migration_apply_contends_on_code_owned_auxiliary_store_locks"
+      ],
+      "reason": "Existing auxiliary store-lock tests exceeded their three-second completion deadlines under full-suite load.",
+      "isolated_rerun": {
+        "passed": 2,
+        "elapsed_seconds": 0.466
+      }
+    },
+    "clippy": "passed with existing repository warnings",
+    "pinned_rustfmt": "passed",
+    "concurrency_lint": "passed, 108 handlers",
+    "prior_authority_cancellation_output_probes": {
+      "passed": 21
+    }
+  }
+}
