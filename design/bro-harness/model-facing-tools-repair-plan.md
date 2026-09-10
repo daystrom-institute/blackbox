@@ -1,13 +1,27 @@
 ---
 title: "Model-facing tools: prioritized repair plan"
 kind: design
-lifecycle: archived
+lifecycle: partial
 corpus: blackbox-design
 topic: [bro-harness, tools, context-management]
 brief: "Ordered implementation slices and acceptance criteria following the comprehensive Codex comparison."
 ---
 
 # Prioritized repairs
+
+The overall audit remains open. The implementation milestones below close the
+identified shared-contract defects, not validation of every model-facing tool.
+The complete schema inventory and source review do not establish practical
+usability or semantic correctness of every specialized binding. The
+[hands-on pass](model-facing-audit/hands-on-isolate.md) exercised selected
+repository read/search/edit/discovery/shell flows and records its limits.
+
+Remaining closure work is tool-by-tool practical coverage of the specialized
+families, representative end-to-end loop use, and disposition of the remaining
+inventory/output-volume friction. Each tool needs evidence for its advertised
+use and recoverable failure behavior, or an explicit reason to change, retire
+or defer it. Passing workspace gates and deploying a repair do not close those
+coverage gaps.
 
 The [comprehensive audit](model-facing-tools-comprehensive-audit.md) is the
 finding inventory and reference snapshot. This plan sequences implementation;
@@ -134,5 +148,8 @@ completion correction in `26b02877`. The [final session/catalog receipt](model-f
 records every original finding's disposition, migration requirements, 6,930
 passing full-workspace tests, final focused checks, 60 passing installed-binary
 probes, and the eight retained comparative live trials. Both native binaries and
-the cage are converged on `26b02877`. Correctness and catalog size improved;
-the small live comparison does not show consistent step-count improvement.
+the cage were converged on `26b02877` at that milestone. Correctness repairs and
+catalog byte reductions have separate evidence. The low-effort toy comparison
+does not support an agent-efficiency conclusion; that conclusion is withdrawn.
+The later hands-on fixes and deployment are recorded separately and likewise do
+not establish completion of the overall audit.
