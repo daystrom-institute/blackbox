@@ -315,7 +315,8 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
 
 fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Minimax => CLAUDE_EFFORTS,
+        Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
+        Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
         Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
@@ -477,6 +478,37 @@ static GLM_MODELS: &[ModelInfo] = &[
     },
 ];
 
+// DeepSeek defaults to high. Keep accepted compatibility values for existing
+// pins, labeled as aliases of the native effort levels.
+// https://api-docs.deepseek.com/guides/thinking_mode/
+static DEEPSEEK_EFFORTS: &[EffortInfo] = &[
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Compatibility alias for high reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "high",
+        description: "High reasoning (DeepSeek default)",
+        default: true,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Compatibility alias for high reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "max",
+        description: "Maximum reasoning depth",
+        default: false,
+    },
+];
+
 static DEEPSEEK_MODELS: &[ModelInfo] = &[
     // Canonical API name for V4.1 Flash; the versioned V4 Flash names are
     // compatibility aliases. https://api-docs.deepseek.com/quick_start/pricing/
@@ -484,7 +516,7 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
         id: "deepseek-flash",
         description: "DeepSeek V4.1 Flash, vision and 1M context via bro-harness",
         default: true,
-        efforts: &["low", "high", "max"],
+        efforts: &[],
         default_effort: Some("high"),
     },
     ModelInfo {
@@ -505,7 +537,7 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
         id: "deepseek-v4-flash-vision-exp",
         description: "Legacy vision alias for DeepSeek V4.1 Flash via bro-harness",
         default: false,
-        efforts: &["low", "high", "max"],
+        efforts: &[],
         default_effort: Some("high"),
     },
     ModelInfo {
@@ -841,7 +873,7 @@ mod tests {
         assert_eq!(defaults[0].id, "deepseek-flash");
         assert_eq!(
             provider.model_efforts("deepseek-flash"),
-            ["low", "high", "max"]
+            ["low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             provider.model_default_effort("deepseek-flash"),
@@ -853,7 +885,15 @@ mod tests {
                 .iter()
                 .map(|e| e.id)
                 .collect::<Vec<_>>(),
-            ["low", "high", "max"]
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            provider
+                .model_effort_infos("deepseek-flash")
+                .iter()
+                .find(|e| e.default)
+                .map(|e| e.id),
+            Some("high")
         );
         // Existing pins keep their accepted compatibility effort values.
         for legacy in ["deepseek-v4-pro", "deepseek-v4-flash"] {

@@ -2134,6 +2134,37 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_model_less_pins_keep_compatible_efforts() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            for effort in ["medium", "xhigh"] {
+                let allocation = allocate(
+                    RuntimeRequest {
+                        pin: Some(RuntimePin {
+                            provider: Some(Provider::Deepseek),
+                            effort: Some(effort.into()),
+                            authority: PinAuthority::Operator,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &cfg,
+                    &BroConfig::default(),
+                    &AllocationContext::default(),
+                );
+                assert!(
+                    allocation.trace.error.is_none(),
+                    "{:?}",
+                    allocation.trace.error
+                );
+                assert_eq!(allocation.lane.provider, Provider::Deepseek);
+                assert_eq!(allocation.lane.model.as_deref(), Some("deepseek-flash"));
+                assert_eq!(allocation.lane.effort.as_deref(), Some(effort));
+            }
+        });
+    }
+
+    #[test]
     fn operator_model_pin_overrides_tier_mapping_when_valid() {
         with_provider_bins(|| {
             let cfg = built_in_config();
