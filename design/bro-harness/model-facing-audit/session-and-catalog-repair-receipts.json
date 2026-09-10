@@ -1,6 +1,6 @@
 {
   "baseline_commit": "47d2aef3a0e65c83f00ab004acee54c78c189d10",
-  "candidate": "source committed with this receipt",
+  "candidate": "runtime source revision 26b02877d0d3ec6a9df1bcd413ee44a07f3aa1a4",
   "reference_codex_commit": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
   "comparison_limit": "Deterministic boundary regressions and four exploratory live smoke tasks per cohort; not a statistical model efficacy benchmark.",
   "session_before": [
@@ -185,7 +185,7 @@
     }
   },
   "native_executable_probes": {
-    "source_commit": "764479470cdd681891a7873749812f1710d7341b",
+    "source_commit": "26b02877d0d3ec6a9df1bcd413ee44a07f3aa1a4",
     "passed": 60,
     "failed": 0,
     "codesign": "persistent identity, strict verification passed"
@@ -200,7 +200,267 @@
     "repair_validation": {
       "responses_tests_passed": 31,
       "seconds": 0.017,
-      "native_live_rerun": "pending rebuilt binary"
+      "native_live_rerun": "All four tasks passed with success terminals after repair 26b02877."
     }
+  },
+  "live_comparison": {
+    "model": "gpt-5.5",
+    "effort": "low",
+    "max_steps": 12,
+    "platform": "macOS arm64 for both cohorts",
+    "before": [
+      {
+        "cohort": "baseline",
+        "code_mode": "off",
+        "task": "edit",
+        "exit": 0,
+        "seconds": 36.06,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 11,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 75264,
+          "input_tokens": 32872,
+          "output_tokens": 796
+        },
+        "tool_calls": [
+          "list_dir",
+          "file_read",
+          "file_read",
+          "tool_search",
+          "git_status",
+          "apply_patch",
+          "shell_run",
+          "shell_run",
+          "tool_search",
+          "git_diff"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "baseline",
+        "code_mode": "only",
+        "task": "edit",
+        "exit": 0,
+        "seconds": 29.63,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 6,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 131840,
+          "input_tokens": 34056,
+          "output_tokens": 1056
+        },
+        "tool_calls": [
+          "exec",
+          "exec",
+          "exec",
+          "exec",
+          "exec"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "baseline-explicit-key",
+        "code_mode": "off",
+        "task": "retrieval",
+        "exit": 0,
+        "seconds": 24.9,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 8,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 58624,
+          "input_tokens": 15196,
+          "output_tokens": 728
+        },
+        "tool_calls": [
+          "list_dir",
+          "file_read",
+          "content_search",
+          "file_read",
+          "shell_run",
+          "apply_patch",
+          "shell_run"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "baseline-explicit-key",
+        "code_mode": "only",
+        "task": "retrieval",
+        "exit": 0,
+        "seconds": 21.91,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 6,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 161280,
+          "input_tokens": 6115,
+          "output_tokens": 792
+        },
+        "tool_calls": [
+          "exec",
+          "exec",
+          "exec",
+          "exec",
+          "exec"
+        ],
+        "verification_success_observed": true
+      }
+    ],
+    "after": [
+      {
+        "cohort": "candidate-26b02877",
+        "code_mode": "off",
+        "task": "edit",
+        "exit": 0,
+        "seconds": 33.11,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 12,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 49664,
+          "input_tokens": 19388,
+          "output_tokens": 771
+        },
+        "tool_calls": [
+          "list_dir",
+          "file_read",
+          "file_read",
+          "file_read",
+          "todo_write",
+          "apply_patch",
+          "todo_write",
+          "shell_run",
+          "shell_run",
+          "todo_write",
+          "shell_run"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "candidate-26b02877",
+        "code_mode": "off",
+        "task": "retrieval",
+        "exit": 0,
+        "seconds": 17.04,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 7,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 27136,
+          "input_tokens": 10844,
+          "output_tokens": 438
+        },
+        "tool_calls": [
+          "list_dir",
+          "file_read",
+          "content_search",
+          "shell_run",
+          "file_write",
+          "shell_run"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "candidate-26b02877",
+        "code_mode": "only",
+        "task": "edit",
+        "exit": 0,
+        "seconds": 23.54,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 10,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 49920,
+          "input_tokens": 19186,
+          "output_tokens": 586
+        },
+        "tool_calls": [
+          "exec",
+          "tool_search",
+          "shell_run",
+          "file_read",
+          "file_read",
+          "file_read",
+          "apply_patch",
+          "shell_run",
+          "git_status"
+        ],
+        "verification_success_observed": true
+      },
+      {
+        "cohort": "candidate-26b02877",
+        "code_mode": "only",
+        "task": "retrieval",
+        "exit": 0,
+        "seconds": 24.05,
+        "artifact_passed": true,
+        "verification_call_observed": true,
+        "model_steps": 10,
+        "terminal_type": "success",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 47360,
+          "input_tokens": 25533,
+          "output_tokens": 659
+        },
+        "tool_calls": [
+          "tool_search",
+          "list_dir",
+          "file_read",
+          "content_search",
+          "tool_search",
+          "shell_run",
+          "file_write",
+          "shell_run",
+          "git_status"
+        ],
+        "verification_success_observed": true
+      }
+    ],
+    "verification_method": "Independent artifact assertions plus manual review of each matching verification tool result; all eight retained trials include exit_code0. An attempted command alone is not considered verification success.",
+    "limits": [
+      "One trial per task and starting configuration, no statistical efficacy claim.",
+      "The code_mode=only configuration defers builtins but permits tool_search activation and direct calls. Candidate only-mode trials used this documented escape, so these are not forced-JavaScript comparisons.",
+      "Mutable harness state and logs are beneath synthetic fixture roots; Git observations may include fixture runtime artifacts. Do not treat elapsed time or token totals as a clean performance benchmark.",
+      "Earlier retrieval trials with ambiguous property naming were excluded; the retained prompt explicitly requests a property named value."
+    ],
+    "interpretation": "All four baseline and four repaired tasks pass. Optional catalog bytes are substantially lower. Model steps did not consistently improve."
+  },
+  "deployment": {
+    "source_commit": "26b02877d0d3ec6a9df1bcd413ee44a07f3aa1a4",
+    "native_build_seconds": 37.64,
+    "native_binaries": {
+      "bro-harness": {
+        "sha256": "1db2b88b73e4c8a1f2d2cd49098286105ffc259b1f5c80d31f5e08367a042d46",
+        "signature": "persistent identity; strict verification passed"
+      },
+      "isolate": {
+        "sha256": "d640452268816f3c63935931ccb3d82c120ef32c4bef272828da8041f6cefd5a",
+        "signature": "persistent identity; strict verification passed"
+      }
+    },
+    "image_workflow": "build-bbox-image-4jjlx",
+    "image_tag": "26b02877d0d3",
+    "image_digest": "sha256:d1e976f1c04eea19d97dfa44a0c0094947fa1ac655c6c602f61a14a798ed0bec",
+    "converge_seconds": 18,
+    "ready_replicas": 1,
+    "health_http_status": 200
   }
 }

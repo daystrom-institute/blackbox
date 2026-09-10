@@ -1,7 +1,7 @@
 ---
 title: "Harness cancellation ownership repair"
 kind: design
-lifecycle: implemented
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, cancellation]
 brief: "Completion ownership, process supervision and cancellation regression receipts."

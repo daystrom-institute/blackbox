@@ -1,7 +1,7 @@
 ---
 title: "Session integrity and model-facing catalog repair"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, context-management]
 brief: "Typed instruction delivery, strict resume/control persistence, and smaller truthful tool catalogs."
@@ -225,7 +225,8 @@ The [machine-readable receipt](session-and-catalog-repair-receipts.json) records
 these checks. Optional-mode tool definitions fell from 95,620 to 29,387 bytes,
 including an exec description reduction from 72,909 to 6,289 bytes. Flat-mode
 definitions grew from 19,593 to 20,785 bytes as contracts became more explicit.
-Installation and live comparison follow the source milestone.
+The final native installation repeats all 60 executable checks successfully.
+The deployment and live results below complete the milestone.
 
 Source changes and deterministic tests establish specific boundaries, not broad
 model efficacy. Live comparisons use synthetic editing and retrieval tasks with
@@ -251,3 +252,34 @@ custom-call and reasoning fixtures exercise the observed shape; malformed,
 duplicate, changed and unfinished cases retain their refusal coverage. The
 failed live cohort remains in the receipt and is not presented as a successful
 comparison.
+
+
+## Final installation and live comparison
+
+The final runtime revision is `26b02877d0d3ec6a9df1bcd413ee44a07f3aa1a4`, pushed
+directly to `beta/blackbox-v2`. Native `bro-harness` and `isolate` are rebuilt,
+installed and verified with persistent signing. All 60 executable probes pass
+against those installed paths. Cluster workflow `build-bbox-image-4jjlx` built
+image tag `26b02877d0d3`; convergence completed with the new deployment ready and
+HTTP health status 200. The machine-readable receipt records binary hashes and
+the immutable image digest. The failed `76447947` image was not rolled out.
+
+Both cohorts used the same model (`gpt-5.5`), low effort, a 12-step budget, and
+macOS arm64. Each retained task passed the independent artifact assertions and
+had a successful verification command in the event record.
+
+| Starting mode | Task | Baseline steps | Repaired steps | Baseline seconds | Repaired seconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| off | edit | 11 | 12 | 36.06 | 33.11 |
+| off | retrieval | 8 | 7 | 24.90 | 17.04 |
+| only | edit | 6 | 10 | 29.63 | 23.54 |
+| only | retrieval | 6 | 10 | 21.91 | 24.05 |
+
+There is no consistent step-count improvement. The catalog reduction and fixed
+correctness boundaries are established; this small sample does not establish
+broad model efficacy. `only` is the existing compatibility mode that defers
+builtins but permits direct activation through `tool_search`. Both repaired
+`only` trials used direct tools, so the table compares starting configurations,
+not forced JavaScript execution. Fixture runtime files can enter Git observations,
+which further limits timing and token comparisons. The initial provider failure
+and the ambiguous-prompt exclusions remain explicit in the receipt.

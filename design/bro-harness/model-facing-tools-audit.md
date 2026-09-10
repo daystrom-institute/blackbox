@@ -1,7 +1,7 @@
 ---
 title: "Model-facing tool audit: read recovery and Codex comparison"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -310,3 +310,8 @@ These checks demonstrate repaired contracts. Whether the simpler default
 surface improves completion rate or cost needs a controlled task-level trial
 after rollout. The open scoped-instruction lifecycle gap is not covered by a
 claim of parity with Codex.
+
+
+The [completed repair plan](model-facing-tools-repair-plan.md) and
+[final implementation dispositions and live receipts](model-facing-audit/session-and-catalog-repair.md)
+record the follow-up. Findings in this document describe the audited baseline.

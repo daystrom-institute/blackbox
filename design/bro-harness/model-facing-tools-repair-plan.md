@@ -1,7 +1,7 @@
 ---
 title: "Model-facing tools: prioritized repair plan"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, context-management]
 brief: "Ordered implementation slices and acceptance criteria following the comprehensive Codex comparison."
@@ -102,14 +102,14 @@ paging, streaming UTF-8 and filtering, serialized budget accounting and wrapper
 collection. Both implementations are landed directly in beta.
 
 Order 3 is implemented in the [provider/result integrity milestone](model-facing-audit/result-integrity-repair.md), including search/edit observation integrity.
-Orders 4 and 5 are implemented in the working candidate described by
+Orders 4 and 5 are implemented and deployed as described by
 [session and catalog repair](model-facing-audit/session-and-catalog-repair.md).
 That document maps the original finding IDs to repaired contracts and deliberate
 limits, and records operator migration for typed defaults and MCP server policy.
 It includes scoped instruction generations, strict durable resume/control state,
 retained-work recovery markers, compact discovery, bounded activation, collision
 admission, finite Git subprocesses, and remote MCP uncertainty/quarantine.
-Candidate verification and deployment receipts remain separate milestones.
+Final verification, deployment and live comparison receipts appear below.
 
 ## Deployment milestone
 
@@ -122,6 +122,17 @@ requires no fleetd restart. No local corpus daemon exists on this host.
 
 Cluster workflow `build-bbox-image-vssnp` built the same revision and published
 image tag `47d2aef3a0e6`. The operator-owned converge script updated the cage
-Deployment; the new pod reached Ready with no restarts. This installs the
-completed correctness slices; provider/result, context/resume and catalog
-repairs remain subsequent milestones.
+Deployment; the new pod reached Ready with no restarts. At that milestone,
+provider/result, context/resume and catalog repairs were still subsequent work;
+the final milestone below records their completion.
+
+
+## Completed remaining milestones
+
+Orders 4 and 5 are landed in `76447947`, followed by the live-discovered Responses
+completion correction in `26b02877`. The [final session/catalog receipt](model-facing-audit/session-and-catalog-repair.md)
+records every original finding's disposition, migration requirements, 6,930
+passing full-workspace tests, final focused checks, 60 passing installed-binary
+probes, and the eight retained comparative live trials. Both native binaries and
+the cage are converged on `26b02877`. Correctness and catalog size improved;
+the small live comparison does not show consistent step-count improvement.

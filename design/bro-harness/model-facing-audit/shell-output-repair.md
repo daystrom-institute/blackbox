@@ -1,7 +1,7 @@
 ---
 title: "Harness shell output integrity repair"
 kind: design
-lifecycle: implemented
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, output]
 brief: "Bounded retained pages, streaming decoding and filtering, and complete build-gate capture."

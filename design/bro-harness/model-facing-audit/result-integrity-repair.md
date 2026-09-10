@@ -1,7 +1,7 @@
 ---
 title: "Provider and result integrity repair"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, audit]
 brief: "Strict provider admission, truthful terminal outcomes, MCP evidence, patch prefixes and bounded workspace observations."
@@ -22,7 +22,8 @@ or admitting client tools.
 
 Chat requires a finish reason and terminal marker, with stream idle protection.
 Anthropic requires terminal message and closed blocks. Responses reconciles
-completed items with the terminal output snapshot. Partial client calls cannot
+completed items with nonempty terminal output snapshots; metadata-only empty
+terminal output retains fully completed streamed items. Partial client calls cannot
 execute on length/incomplete outcomes. Responses refuses retry/fallback after
 provider output has begun, including tool/item events before visible text.
 
@@ -94,3 +95,8 @@ three final edit regressions, the full run passed 6,849 and hit two existing
 three-second store-lock test deadlines; both passed in isolation in 0.466 seconds.
 Nineteen tests were skipped by configuration. Pinned formatting, workspace
 Clippy and concurrency lint passed; Clippy retains existing repository warnings.
+
+
+The later [session/catalog milestone](session-and-catalog-repair.md) records
+installation of this slice, the live-discovered empty Responses terminal-output
+compatibility correction, and successful live verification of the repaired build.

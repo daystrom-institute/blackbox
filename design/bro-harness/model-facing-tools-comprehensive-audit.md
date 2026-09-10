@@ -1,7 +1,7 @@
 ---
 title: "Model-facing tools and agent loop: comprehensive contract audit"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, context-management, audit]
 brief: "Complete local tool-interface inventory, execution-path comparison with Codex, synthetic contract probes, and ten live fixture trials. Establishes repair priorities and a smaller default surface; does not claim the findings are repaired."
@@ -255,3 +255,8 @@ probe ran, not that the observed contracts are correct. They make no live model
 requests. The live-trial receipt file includes task definitions, configuration,
 outcome checks and measurements for the separate provider runs. No shared
 service was restarted or reconfigured during this audit pass.
+
+
+The [completed repair plan](model-facing-tools-repair-plan.md) and
+[final implementation dispositions and live receipts](model-facing-audit/session-and-catalog-repair.md)
+record the follow-up. Findings in this document describe the audited baseline.
