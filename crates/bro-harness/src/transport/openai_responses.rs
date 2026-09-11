@@ -413,6 +413,18 @@ impl Transport for OpenAiResponsesTransport {
         "openai-responses"
     }
 
+    fn prepare_request_context(&mut self, opts: &TurnOpts) -> u64 {
+        let before = self.state.input.len();
+        self.state.sync_ambient(opts.system.ambient_text());
+        if self.state.input.len() == before {
+            return 0;
+        }
+        self.state.input[before..]
+            .iter()
+            .map(|item| crate::context::budget::text_tokens(&item.to_string()))
+            .fold(0u64, u64::saturating_add)
+    }
+
     fn set_session_id(&mut self, id: String) {
         self.state.session_id = id;
     }
@@ -613,5 +625,42 @@ mod tests {
                 .any(|i| i["type"] == "message" && i["role"] == "user"),
             "compacted history should retain user messages"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn changed_ambient_context_is_charged_once_even_at_equal_size() {
+        let mut tx = OpenAiResponsesTransport {
+            state: ResponsesState::new(Auth::ApiKey("fixture".into())),
+            http: reqwest::Client::new(),
+            http_endpoint: "http://127.0.0.1:1".into(),
+            ws: None,
+            ws_turn_state: None,
+        };
+        let mut opts = TurnOpts {
+            model: "gpt-5.5".into(),
+            max_tokens: 1024,
+            base_instructions: None,
+            system: super::super::SystemPrompt::default(),
+            effort: None,
+            web_search: false,
+            service_tier: None,
+        };
+        opts.system.ambient = Some("catalog A ".repeat(100));
+        let first = tx.prepare_request_context(&opts);
+        assert!(first > 0);
+        assert_eq!(tx.prepare_request_context(&opts), 0);
+        let before = crate::context::budget::RequestEstimate::new(&tx.snapshot(), &[], &opts);
+        opts.system.ambient = Some("catalog B ".repeat(100));
+        let added = tx.prepare_request_context(&opts);
+        assert_eq!(added, first);
+        let after = crate::context::budget::RequestEstimate::new(&tx.snapshot(), &[], &opts);
+        assert_eq!(before.overhead_tokens, after.overhead_tokens);
+        assert!(after.history_tokens > before.history_tokens);
+        assert_eq!(tx.prepare_request_context(&opts), 0);
     }
 }

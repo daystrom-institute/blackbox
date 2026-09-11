@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::path::PathBuf;
 
+pub(crate) mod budget;
 pub mod dispatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

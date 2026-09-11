@@ -482,6 +482,13 @@ pub trait Transport: Send {
     /// wire events to `sink` as they arrive.
     fn normalize_for_prompt(&mut self) {}
 
+    /// Materialize provider-owned context before request budgeting. Return the
+    /// estimated tokens newly appended to history, excluding unchanged context.
+    /// The subsequent run_turn must observe the same prepared state.
+    fn prepare_request_context(&mut self, _opts: &TurnOpts) -> u64 {
+        0
+    }
+
     async fn run_turn(
         &mut self,
         tools: &[ToolSpec],

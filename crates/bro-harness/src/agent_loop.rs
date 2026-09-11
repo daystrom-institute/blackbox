@@ -466,7 +466,19 @@ async fn apply_pending_control(
                 pending.push_front(prompt);
             }
         }
-        SessionControl::SetModel(model) => session.apply_control(&model),
+        SessionControl::SetModel(model) => {
+            if let Err(error) = session.apply_control(&model).await {
+                // Draining work can append durable outcomes even when the
+                // compaction fails. Checkpoint them under the unchanged model.
+                session.pending_user_inputs = pending.clone();
+                session.persist().await?;
+                emitter.control_response_error(
+                    control.request_id.as_deref(),
+                    &format!("model change rejected: {error:#}"),
+                );
+                return Ok(());
+            }
+        }
     }
     session.pending_user_inputs = pending.clone();
     match session.persist().await {
@@ -746,16 +758,11 @@ struct Session {
     total_usage: Usage,
     turns: u64,
     last_prompt_tokens: u64,
-    /// Estimated tokens appended to the transport buffer since `last_prompt_tokens`
-    /// was last observed — tool results, mid-turn inputs, and the new user
-    /// message. Added to `last_prompt_tokens` for the proactive compaction
-    /// trigger, so an appended item that would push the *next* request over the
-    /// window triggers compaction before it is sent (rather than reacting one
-    /// step late, or relying on the overflow safety net). Mirrors codex's
-    /// `get_total_token_usage` = last observed total + estimate of items after
-    /// the last model turn (`context_manager/history.rs`). Reset to 0 on each
-    /// model call (the sent input is then measured) and on compaction.
+    /// Retained response output and locally appended context since the last
+    /// measured request. Persisted atomically with the native history and its
+    /// request overhead so resume never treats a populated transcript as empty.
     pending_input_estimate: u64,
+    last_request_overhead_tokens: u64,
     /// Volatile system-tail nudge to surface on the upcoming model call.
     tail_nudge: Option<String>,
     /// When set, a synthetic `final_result` tool was registered whose
@@ -886,6 +893,8 @@ impl Session {
         // restores persona/pins/non-`needs_scope` directives from side-state
         // with scope dropped. Strict parse — daemon-authored payloads fail
         // loudly, they do not degrade.
+        let restored_budget =
+            crate::context::budget::BudgetCheckpoint::restore(&prior_side["context_budget"]);
         let dispatch_arg =
             crate::context::dispatch::resolve_dispatch_context_arg(cli.dispatch_context.as_deref())
                 .map_err(anyhow::Error::msg)
@@ -910,7 +919,7 @@ impl Session {
         let model = cli
             .model
             .clone()
-            .or(restored_model)
+            .or(restored_model.clone())
             .or_else(|| transport::session_var("ANTHROPIC_MODEL"))
             .or_else(|| std::env::var("BRO_HARNESS_MODEL").ok())
             .context(
@@ -1198,7 +1207,7 @@ impl Session {
             }),
         );
 
-        Ok(Self {
+        let mut session = Self {
             tx,
             reg,
             code_mode,
@@ -1233,11 +1242,26 @@ impl Session {
             lsp_documents: BTreeMap::new(),
             total_usage: Usage::default(),
             turns: 0,
-            last_prompt_tokens: 0,
-            pending_input_estimate: 0,
+            last_prompt_tokens: restored_budget.last_input_tokens,
+            pending_input_estimate: restored_budget.pending_tokens,
+            last_request_overhead_tokens: restored_budget.overhead_tokens,
             tail_nudge: None,
             output_schema,
-        })
+        };
+        if let Some(previous_model) = restored_model
+            && previous_model != session.base_opts.model
+        {
+            let requested_model = session.base_opts.model.clone();
+            session.base_opts.model = previous_model;
+            session.context_window = session.compaction.context_window(&session.base_opts.model);
+            session.compact_threshold = session.compaction.threshold(&session.base_opts.model);
+            let transition = session.apply_control(&requested_model).await;
+            // Startup compaction and cancellation observations must share the
+            // checkpoint even if changing models is rejected.
+            session.persist().await?;
+            transition?;
+        }
+        Ok(session)
     }
 
     fn session_id(&self) -> &str {
@@ -1258,12 +1282,100 @@ impl Session {
         self.seq_counter.clone()
     }
 
-    /// Apply a validated model control at a quiescent turn boundary.
-    fn apply_control(&mut self, model: &str) {
+    /// Fit history with the previous model before committing a smaller model.
+    async fn apply_control(&mut self, model: &str) -> Result<()> {
+        let next_window = self.compaction.context_window(model);
+        let next_threshold = self.compaction.threshold(model);
+        if model != self.base_opts.model
+            && let (Some(previous_window), Some(window)) = (self.context_window, next_window)
+            && previous_window > window
+        {
+            self.reg.validate_resume_tool_schemas()?;
+            let tools = self.reg.wire_specs();
+            let opts = TurnOpts {
+                system: compose_system(
+                    &self.system_sections(),
+                    &self.reg,
+                    self.output_schema.is_some(),
+                ),
+                ..self.base_opts.clone()
+            };
+            let projected = self.projected_request_tokens(&tools, &opts);
+            let limit = next_threshold
+                .unwrap_or(window)
+                .min(window.saturating_sub(u64::from(opts.max_tokens)));
+            if projected > limit {
+                self.drain_cancelled_work().await;
+                // Cancellation can add durable outcome observations to history.
+                let projected = self.projected_request_tokens(&tools, &opts);
+                self.event_log.append_milestone("compaction_start", self.emitter.session_id(),
+                    json!({"reason":"model_change", "from":self.base_opts.model, "to":model, "projected_tokens":projected}));
+                let summary = self
+                    .tx
+                    .compact(
+                        self.compaction.params(),
+                        crate::compaction::COMPACTION_INSTRUCTION,
+                        &tools,
+                        &opts,
+                    )
+                    .await
+                    .context("compact with previous model before downshift")?
+                    .context("history cannot be compacted before model downshift")?;
+                self.emitter
+                    .compact_boundary("model_change", projected, summary.len());
+                self.reset_compaction_context();
+                self.deliver_instruction_context().await?;
+                self.prepare_context_for_user_turn();
+                let destination_opts = TurnOpts {
+                    model: model.to_owned(),
+                    system: compose_system(
+                        &self.system_sections(),
+                        &self.reg,
+                        self.output_schema.is_some(),
+                    ),
+                    ..self.base_opts.clone()
+                };
+                let added = self.tx.prepare_request_context(&destination_opts);
+                self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
+                anyhow::ensure!(
+                    self.projected_request_tokens(&tools, &destination_opts) <= limit,
+                    "compacted history still exceeds destination model budget; previous model retained"
+                );
+            }
+        }
+        if model != self.base_opts.model {
+            // Usage was measured with the previous model's tokenizer. Estimate
+            // the retained history until the new model reports its first input.
+            self.last_prompt_tokens = 0;
+            self.pending_input_estimate = 0;
+            self.last_request_overhead_tokens = 0;
+        }
         self.base_opts.model = model.to_owned();
-        self.compact_threshold = self.compaction.threshold(model);
-        self.context_window = self.compaction.context_window(model);
+        self.compact_threshold = next_threshold;
+        self.context_window = next_window;
         tracing::info!(model, "set_model");
+        Ok(())
+    }
+
+    fn projected_request_tokens(&self, tools: &[transport::ToolSpec], opts: &TurnOpts) -> u64 {
+        crate::context::budget::RequestEstimate::new(&self.tx.snapshot(), tools, opts)
+            .projected(&self.budget_checkpoint())
+    }
+
+    fn budget_checkpoint(&self) -> crate::context::budget::BudgetCheckpoint {
+        crate::context::budget::BudgetCheckpoint::new(
+            self.last_prompt_tokens,
+            self.pending_input_estimate,
+            self.last_request_overhead_tokens,
+        )
+    }
+
+    fn reset_compaction_context(&mut self) {
+        self.last_prompt_tokens = 0;
+        self.pending_input_estimate = 0;
+        self.last_request_overhead_tokens = 0;
+        self.reference_context_item = None;
+        self.scoped_project_docs.invalidate_delivery();
     }
 
     /// Manual `/compact`: summarize-and-replace the prefix and emit a manual
@@ -1271,6 +1383,14 @@ impl Session {
     async fn compact_manual(&mut self) -> Result<()> {
         self.reg.validate_resume_tool_schemas()?;
         let tool_specs = self.reg.wire_specs();
+        let opts = TurnOpts {
+            system: compose_system(
+                &self.system_sections(),
+                &self.reg,
+                self.output_schema.is_some(),
+            ),
+            ..self.base_opts.clone()
+        };
         self.event_log.append_milestone(
             "compaction_start",
             self.emitter.session_id(),
@@ -1282,15 +1402,14 @@ impl Session {
                 self.compaction.params(),
                 crate::compaction::COMPACTION_INSTRUCTION,
                 &tool_specs,
-                &self.base_opts,
+                &opts,
             )
             .await?
         {
             Some(summary) => {
                 self.emitter
                     .compact_boundary("manual", self.last_prompt_tokens, summary.len());
-                self.reference_context_item = None;
-                self.scoped_project_docs.invalidate_delivery();
+                self.reset_compaction_context();
             }
             None => tracing::info!("manual /compact: nothing compactible yet"),
         }
@@ -1336,6 +1455,7 @@ impl Session {
         self.cx.cancellation = tokio_util::sync::CancellationToken::new();
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
+        let mut request_overhead_tokens = self.last_request_overhead_tokens;
 
         let mut final_text = String::new();
         // The TERMINAL step's text, tracked separately from `final_text`:
@@ -1365,56 +1485,6 @@ impl Session {
 
             let tool_specs = self.reg.wire_specs();
 
-            // Compact before composing when the projected next prompt crosses the
-            // model's window threshold. "Projected" = last observed input plus an
-            // estimate of items appended since (tool results, mid-turn inputs, the
-            // new user message), so an appended item that would overflow the next
-            // request triggers compaction *before* it's sent. Tools are forwarded
-            // so the server-side compaction path (brodex) can faithfully process
-            // tool-call history.
-            let pending_prompt_estimate = pending_prompt
-                .as_ref()
-                .map(|_| prompt_estimate)
-                .unwrap_or_default();
-            let projected_tokens = self
-                .last_prompt_tokens
-                .saturating_add(self.pending_input_estimate)
-                .saturating_add(pending_prompt_estimate);
-            if let Some(thresh) = self.compact_threshold
-                && projected_tokens > thresh
-            {
-                self.event_log.append_milestone(
-                    "compaction_start",
-                    self.emitter.session_id(),
-                    json!({"reason": "auto", "projected_tokens": projected_tokens}),
-                );
-                match self
-                    .tx
-                    .compact(
-                        self.compaction.params(),
-                        crate::compaction::COMPACTION_INSTRUCTION,
-                        &tool_specs,
-                        &self.base_opts,
-                    )
-                    .await
-                {
-                    Ok(Some(summary)) => {
-                        tracing::info!(pre_tokens = projected_tokens, "compacted");
-                        self.emitter
-                            .compact_boundary("auto", projected_tokens, summary.len());
-                        // The buffer was rewritten; its size will be re-measured
-                        // by the upcoming call, so the appended-tail estimate no
-                        // longer applies.
-                        self.pending_input_estimate = 0;
-                        self.reference_context_item = None;
-                        self.scoped_project_docs.invalidate_delivery();
-                        // The next request boundary restores typed instructions
-                        // before environment and any pending user input.
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("compaction failed: {e:#}"),
-                }
-            }
             // Preserve the same tail across an overflow retry while rebuilding
             // the strategy's system section from the refreshed instruction state.
             let mut tail_nudge = None;
@@ -1426,26 +1496,12 @@ impl Session {
             // one shot. Without it, the typed `ContextWindowExceeded` would fail
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
+            let mut proactive_checked = false;
             let out = 'attempt: loop {
                 self.deliver_instruction_context().await?;
                 if pending_prompt.is_some() || self.reference_context_item.is_none() {
                     self.prepare_context_for_user_turn();
                 }
-                if let Some(prompt) = pending_prompt.take() {
-                    // Record the task at the same boundary/order seen by the
-                    // model, after authoritative context has been delivered.
-                    self.event_log.append_event(&json!({
-                        "type": "user",
-                        "session_id": self.session_id(),
-                        "message": {
-                            "role": "user",
-                            "content": [{"type": "text", "text": prompt}],
-                        },
-                    }));
-                    self.push_user_text_raw(prompt);
-                }
-                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
-                    .await?;
                 if let Some(nudge) = self.tail_nudge.take() {
                     tail_nudge = Some(nudge);
                 }
@@ -1478,7 +1534,81 @@ impl Session {
                     system: sys,
                     ..self.base_opts.clone()
                 };
+                let added = self.tx.prepare_request_context(&opts);
+                self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
+                let estimate = crate::context::budget::RequestEstimate::new(
+                    &self.tx.snapshot(),
+                    &tool_specs,
+                    &opts,
+                );
+                let queued_estimate = mid_turn_user_inputs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .map(|prompt| est_tokens(prompt))
+                    .fold(0u64, u64::saturating_add);
+                let projected = estimate
+                    .projected(&self.budget_checkpoint())
+                    .saturating_add(queued_estimate)
+                    .saturating_add(if pending_prompt.is_some() {
+                        prompt_estimate
+                    } else {
+                        0
+                    });
+                if !proactive_checked {
+                    proactive_checked = true;
+                    if self
+                        .compact_threshold
+                        .is_some_and(|threshold| projected > threshold)
+                    {
+                        self.event_log.append_milestone(
+                            "compaction_start",
+                            self.emitter.session_id(),
+                            json!({"reason":"auto", "projected_tokens":projected}),
+                        );
+                        match self
+                            .tx
+                            .compact(
+                                self.compaction.params(),
+                                crate::compaction::COMPACTION_INSTRUCTION,
+                                &tool_specs,
+                                &opts,
+                            )
+                            .await
+                        {
+                            Ok(Some(summary)) => {
+                                self.emitter
+                                    .compact_boundary("auto", projected, summary.len());
+                                self.reset_compaction_context();
+                                continue 'attempt;
+                            }
+                            Ok(None) => {}
+                            Err(error) => tracing::warn!("compaction failed: {error:#}"),
+                        }
+                    }
+                }
+                if let Some(prompt) = pending_prompt.take() {
+                    // Record the task at the same boundary/order seen by the
+                    // model, after authoritative context has been delivered.
+                    self.event_log.append_event(&json!({
+                        "type": "user",
+                        "session_id": self.session_id(),
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": prompt}],
+                        },
+                    }));
+                    self.push_user_text_raw(prompt);
+                }
+                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
+                    .await?;
+                // A queued manual compaction invalidates the context/options
+                // assembled above. Restore current instructions before sampling.
+                if self.reference_context_item.is_none() {
+                    continue 'attempt;
+                }
                 self.tx.normalize_for_prompt();
+                request_overhead_tokens = estimate.overhead_tokens;
                 let r = tokio::select! {
                     biased;
                     _ = cancel.changed() => {
@@ -1507,7 +1637,7 @@ impl Session {
                                 self.compaction.params(),
                                 crate::compaction::COMPACTION_INSTRUCTION,
                                 &tool_specs,
-                                &self.base_opts,
+                                &opts,
                             )
                             .await
                         {
@@ -1517,9 +1647,7 @@ impl Session {
                                     self.last_prompt_tokens,
                                     summary.len(),
                                 );
-                                self.pending_input_estimate = 0;
-                                self.reference_context_item = None;
-                                self.scoped_project_docs.invalidate_delivery();
+                                self.reset_compaction_context();
                             }
                             // Nothing compactible, or compaction itself failed:
                             // a retry would just re-overflow — surface the
@@ -1548,9 +1676,10 @@ impl Session {
                 self.context_window,
                 self.compact_threshold,
             );
-            // The just-sent input is now reflected in last_prompt_tokens; clear
-            // the appended-tail estimate so it only counts items added afterward.
-            self.pending_input_estimate = 0;
+            // The response is retained history for the next request. Provider
+            // output usage includes reasoning, which visible text alone misses.
+            self.pending_input_estimate = out.usage.output_tokens;
+            self.last_request_overhead_tokens = request_overhead_tokens;
             last_model_stop = Some(out.stop.clone());
             last_model_tool_call_count = out.tool_calls.len();
             last_step_text = out.text.clone();
@@ -1917,6 +2046,10 @@ impl Session {
         // Even an early cancellation or a zero-step budget must preserve the
         // accepted, logged input in the snapshot before checkpointing its event.
         if let Some(prompt) = pending_prompt.take() {
+            self.event_log.append_event(&json!({
+                "type":"user", "session_id":self.session_id(),
+                "message":{"role":"user", "content":[{"type":"text", "text":prompt}]},
+            }));
             self.prepare_context_for_user_turn();
             self.push_user_text_raw(prompt);
         }
@@ -1942,7 +2075,8 @@ impl Session {
                     || partial.cache_creation_input_tokens > 0
                 {
                     self.last_prompt_tokens = partial.total_input_tokens();
-                    self.pending_input_estimate = 0;
+                    self.pending_input_estimate = partial.output_tokens;
+                    self.last_request_overhead_tokens = request_overhead_tokens;
                 }
             }
             self.tx.note_interrupted();
@@ -2495,6 +2629,8 @@ impl Session {
             Value::Object(m) => Value::Object(m),
             _ => json!({}),
         };
+        side["context_budget"] =
+            serde_json::to_value(self.budget_checkpoint()).expect("budget checkpoint serializes");
         side["pending_user_inputs"] = json!(self.pending_user_inputs);
         side["todos"] = self
             .todos
@@ -2726,11 +2862,11 @@ fn extract_user_text(v: &Value) -> Option<String> {
     None
 }
 
-/// Rough token estimate (~4 chars/token) for the proactive compaction trigger.
+/// Rough UTF-8 byte estimate (~4 bytes/token) for the compaction trigger.
 /// Deliberately coarse: it only needs to flag an appended item large enough to
 /// push the next request over the window, and the threshold leaves headroom.
 fn est_tokens(s: &str) -> u64 {
-    (s.chars().count() / 4) as u64
+    crate::context::budget::text_tokens(s)
 }
 
 /// Estimated tokens for a batch of tool results about to be appended.
@@ -3775,6 +3911,7 @@ mod tests {
             turns: 0,
             last_prompt_tokens: 0,
             pending_input_estimate: 0,
+            last_request_overhead_tokens: 0,
             tail_nudge: None,
         };
         (session, shared)
@@ -5913,11 +6050,12 @@ mod tests {
         let (mut session, shared) =
             mk_session(vec![MockTurn::Text("1".into()), MockTurn::Text("2".into())]);
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Input::User("alpha".into())).unwrap();
-        tx.send(Input::User("beta".into())).unwrap();
-        drop(tx); // EOF after both
+        drop(tx);
+        // Pending turns are distinct accepted tasks. Live stdin arriving while
+        // a task is active intentionally becomes a mid-turn steer instead.
+        let pending = VecDeque::from(["alpha".into(), "beta".into()]);
         let ctrl = Emitter::new("ctrl".into());
-        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+        session_loop(&mut session, rx, &ctrl, pending)
             .await
             .unwrap();
         let users = shared.pushed_users.lock().unwrap().clone();
@@ -5966,11 +6104,12 @@ mod tests {
             mk_session(vec![MockTurn::Text("1".into()), MockTurn::Text("2".into())]);
         session.max_turns = 1;
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Input::User("alpha".into())).unwrap();
-        tx.send(Input::User("beta".into())).unwrap();
         drop(tx);
+        // Pending turns are distinct accepted tasks. Live stdin arriving while
+        // a task is active intentionally becomes a mid-turn steer instead.
+        let pending = VecDeque::from(["alpha".into(), "beta".into()]);
         let ctrl = Emitter::new("ctrl".into());
-        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+        session_loop(&mut session, rx, &ctrl, pending)
             .await
             .unwrap();
         let users = shared.pushed_users.lock().unwrap().clone();
@@ -6135,9 +6274,11 @@ mod tests {
     }
 
     #[test]
-    fn est_tokens_counts_chars_over_four() {
+    fn est_tokens_counts_utf8_bytes_and_rounds_up() {
         assert_eq!(est_tokens(""), 0);
         assert_eq!(est_tokens("abcd"), 1);
+        assert_eq!(est_tokens("abc"), 1);
+        assert_eq!(est_tokens("你好世界"), 3);
         assert_eq!(est_tokens(&"x".repeat(400)), 100);
     }
 
