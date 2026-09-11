@@ -2086,6 +2086,8 @@
     },
     {
       "name": "java.extractColumnSpec",
+      "audit_disposition": "retired",
+      "audit_evidence": "java-binding-audit.md: original runtime proposal failed application; unsafe synthesis removed from callable catalog",
       "family": "java",
       "placement": "cell",
       "required": [

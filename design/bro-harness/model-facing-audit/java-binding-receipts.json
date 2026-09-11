@@ -1,0 +1,1898 @@
+{
+  "contract": "Actual native isolate tool invocation, proposal application, clean Java compilation, and bounded observable behavior; not proof of semantic identity outside fixture scope.",
+  "date": "2026-09-10",
+  "compiler": "javac 25.0.4",
+  "original_java_catalog_count": 33,
+  "retained_java_catalog_count": 32,
+  "original_runtime_observed": [
+    "java.addImport",
+    "java.changeSignature",
+    "java.changeSignaturePreview",
+    "java.describe",
+    "java.encapsulateField",
+    "java.encapsulateFieldPreview",
+    "java.extractClass",
+    "java.extractClassPreviewPlan",
+    "java.extractColumnSpec",
+    "java.extractInterface",
+    "java.extractMethodCodeBlock",
+    "java.fieldInjectToConstructor",
+    "java.fieldInjectToConstructorPreview",
+    "java.hygiene",
+    "java.inlineMethod",
+    "java.inlineMethodPreview",
+    "java.migrateTypeUsages",
+    "java.migrateTypeUsagesPreview",
+    "java.moveClass",
+    "java.moveMember",
+    "java.moveMemberPreview",
+    "java.movePackage",
+    "java.normalizeWhitespace",
+    "java.organizeImports",
+    "java.pullUpMembers",
+    "java.pullUpPreview",
+    "java.pushDownMembers",
+    "java.pushDownMembersPreview",
+    "java.removeUnusedConstructorParams",
+    "java.renameSymbol",
+    "java.replaceConstructorWithFactory",
+    "java.replaceConstructorWithFactoryPreview",
+    "java.synthesizeHelperWrappers"
+  ],
+  "retained_runtime_observed": [
+    "java.addImport",
+    "java.changeSignature",
+    "java.changeSignaturePreview",
+    "java.describe",
+    "java.encapsulateField",
+    "java.encapsulateFieldPreview",
+    "java.extractClass",
+    "java.extractClassPreviewPlan",
+    "java.extractInterface",
+    "java.extractMethodCodeBlock",
+    "java.fieldInjectToConstructor",
+    "java.fieldInjectToConstructorPreview",
+    "java.hygiene",
+    "java.inlineMethod",
+    "java.inlineMethodPreview",
+    "java.migrateTypeUsages",
+    "java.migrateTypeUsagesPreview",
+    "java.moveClass",
+    "java.moveMember",
+    "java.moveMemberPreview",
+    "java.movePackage",
+    "java.normalizeWhitespace",
+    "java.organizeImports",
+    "java.pullUpMembers",
+    "java.pullUpPreview",
+    "java.pushDownMembers",
+    "java.pushDownMembersPreview",
+    "java.removeUnusedConstructorParams",
+    "java.renameSymbol",
+    "java.replaceConstructorWithFactory",
+    "java.replaceConstructorWithFactoryPreview",
+    "java.synthesizeHelperWrappers"
+  ],
+  "verification": {
+    "multiline": {
+      "passed": true,
+      "failures": []
+    },
+    "compact": {
+      "passed": true,
+      "failures": []
+    },
+    "multiline_cases": 38,
+    "compact_cases": 11
+  },
+  "per_tool": [
+    {
+      "tool": "java.addImport",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:addimport",
+        "multiline:addimport"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.changeSignature",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:signature",
+        "multiline:signature",
+        "multiline:signature-added",
+        "multiline:signature-literals",
+        "multiline:signature-overload"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.changeSignaturePreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:signature",
+        "multiline:signature",
+        "multiline:signature-added",
+        "multiline:signature-literals",
+        "multiline:signature-overload"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.describe",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:column",
+        "multiline:describe"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.encapsulateField",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:encapsulate",
+        "multiline:staticfield"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.encapsulateFieldPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:encapsulate",
+        "multiline:staticfield"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.extractClass",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:extract",
+        "multiline:extract"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.extractClassPreviewPlan",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:extract",
+        "multiline:extract"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.extractColumnSpec",
+      "disposition": "retired",
+      "final_cases": [],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.extractInterface",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:interface",
+        "multiline:annotated-interface",
+        "multiline:interface"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.extractMethodCodeBlock",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:extractblock",
+        "multiline:extractblock",
+        "multiline:extractblock-control"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.fieldInjectToConstructor",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:inject",
+        "compact:inject-existing",
+        "multiline:inject",
+        "multiline:inject-existing"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.fieldInjectToConstructorPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:inject",
+        "compact:inject-existing",
+        "multiline:inject",
+        "multiline:inject-existing"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.hygiene",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:hygiene"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.inlineMethod",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:inline",
+        "multiline:inline-state"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.inlineMethodPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:inline",
+        "multiline:inline-state"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.migrateTypeUsages",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:migrate"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.migrateTypeUsagesPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:migrate"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.moveClass",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:moveclass",
+        "multiline:moveclass-project"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.moveMember",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:movefield",
+        "compact:movemethod",
+        "multiline:moveconstant",
+        "multiline:movefield",
+        "multiline:movemethod"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.moveMemberPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:movefield",
+        "compact:movemethod",
+        "multiline:moveconstant",
+        "multiline:movefield",
+        "multiline:movemethod",
+        "multiline:movemethod-copy"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.movePackage",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:movepackage",
+        "multiline:movepackage-project"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.normalizeWhitespace",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:whitespace"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.organizeImports",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:imports"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.pullUpMembers",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:pullup",
+        "multiline:pullup"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.pullUpPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:interface",
+        "compact:pullup",
+        "multiline:annotated-interface",
+        "multiline:interface",
+        "multiline:pullup"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.pushDownMembers",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:pushdown",
+        "multiline:pushdown"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.pushDownMembersPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "compact:pushdown",
+        "multiline:pushdown"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.removeUnusedConstructorParams",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:unusedctor",
+        "multiline:unusedctor-callers",
+        "multiline:unusedctor-noinject"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.renameSymbol",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:rename"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.replaceConstructorWithFactory",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:factory"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.replaceConstructorWithFactoryPreview",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:factory"
+      ],
+      "original_runtime_evidence": true
+    },
+    {
+      "tool": "java.synthesizeHelperWrappers",
+      "disposition": "keep_with_documented_limits_and_repairs",
+      "final_cases": [
+        "multiline:wrappers"
+      ],
+      "original_runtime_evidence": true
+    }
+  ],
+  "original_counterexamples": [
+    {
+      "case": "addimport",
+      "observation": "Import inserted after same-line class.",
+      "tools_observed": [
+        "java.addImport",
+        "java.addImport",
+        "java.addImport"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": null,
+      "final_stdout": null
+    },
+    {
+      "case": "inject",
+      "observation": "Inline injection field deleted.",
+      "tools_observed": [
+        "java.fieldInjectToConstructorPreview",
+        "java.fieldInjectToConstructor"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": null,
+      "final_stdout": null
+    },
+    {
+      "case": "signature-added",
+      "observation": "Receiver invocation omitted from added-parameter rewrite.",
+      "tools_observed": [
+        "java.changeSignaturePreview",
+        "java.changeSignature"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": "5\n",
+      "final_stdout": null
+    },
+    {
+      "case": "signature-literals",
+      "observation": "Literal text changed despite successful compilation.",
+      "tools_observed": [
+        "java.changeSignaturePreview",
+        "java.changeSignature"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "x=value\n",
+      "final_stdout": "input=value\n"
+    },
+    {
+      "case": "staticfield",
+      "observation": "Static setter emitted this reference.",
+      "tools_observed": [
+        "java.encapsulateFieldPreview",
+        "java.encapsulateField"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": null,
+      "final_stdout": null
+    },
+    {
+      "case": "unusedctor-callers",
+      "observation": "Manual constructor caller broke after unused parameter removal.",
+      "tools_observed": [
+        "java.removeUnusedConstructorParams"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": "ready\n",
+      "final_stdout": null
+    },
+    {
+      "case": "annotated-interface",
+      "observation": "Generated interface omitted selected method despite compilation success.",
+      "tools_observed": [
+        "java.pullUpPreview",
+        "java.extractInterface"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null
+    },
+    {
+      "case": "interface",
+      "observation": "Compact member trivia included enclosing class header.",
+      "tools_observed": [
+        "java.pullUpPreview",
+        "java.extractInterface",
+        "java.extractInterface"
+      ],
+      "applications": [
+        false
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n"
+    },
+    {
+      "case": "extractblock",
+      "observation": "Compact helper indentation included source code.",
+      "tools_observed": [
+        "java.extractMethodCodeBlock"
+      ],
+      "applications": [
+        false
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n"
+    },
+    {
+      "case": "extract",
+      "observation": "Shared endpoint edit ordering corrupted inserted wiring.",
+      "tools_observed": [
+        "java.extractClassPreviewPlan",
+        "java.extractClass",
+        "java.extractClass"
+      ],
+      "applications": [
+        false
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "3\n",
+      "final_stdout": "3\n"
+    },
+    {
+      "case": "movemethod-copy",
+      "observation": "keepCopy silently ignored; source client broke.",
+      "tools_observed": [
+        "java.moveMemberPreview",
+        "java.moveMember"
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 1,
+      "baseline_stdout": "5\n",
+      "final_stdout": null
+    },
+    {
+      "case": "column",
+      "observation": "Unrelated fixed receiver, lost providers, invalid generated accessors, and unrelated method span; proposal rolled back.",
+      "tools_observed": [
+        "java.extractColumnSpec"
+      ],
+      "applications": [
+        false
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null
+    }
+  ],
+  "final_observations": [
+    {
+      "case": "signature",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.changeSignaturePreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "error": "java.changeSignature: stale methodRef; re-run java.changeSignaturePreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "encapsulate",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.encapsulateFieldPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.encapsulateField",
+          "error": "java.encapsulateField: stale fieldRef; re-run java.encapsulateFieldPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.encapsulateField",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "0\n",
+      "final_stdout": "0\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "factory",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.replaceConstructorWithFactoryPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.replaceConstructorWithFactory",
+          "error": "java.replaceConstructorWithFactory: stale constructorRef; re-run preview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.replaceConstructorWithFactory",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "7\n",
+      "final_stdout": "7\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "inline",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.inlineMethodPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.inlineMethod",
+          "error": "java.inlineMethod: stale methodRef; re-run java.inlineMethodPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.inlineMethod",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "migrate",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.migrateTypeUsagesPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.migrateTypeUsages",
+          "error": "java.migrateTypeUsages: stale migrationRef; re-run java.migrateTypeUsagesPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.migrateTypeUsages",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "9\n",
+      "final_stdout": "9\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "interface",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractInterface",
+          "error": "java.extractInterface: stale or unknown memberRefs: [\"stale\"]; re-run java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractInterface",
+          "change_files": 1,
+          "created_files": 1
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "pullup",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pullUpMembers",
+          "error": "java.pullUpMembers: stale or unknown memberRefs: [\"stale\"]; re-run java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pullUpMembers",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "pushdown",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.pushDownMembersPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pushDownMembers",
+          "error": "java.pushDownMembers: stale or unknown memberRefs: [\"stale\"]; re-run java.pushDownMembersPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pushDownMembers",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "movefield",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "error": "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "moveconstant",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "error": "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "movemethod",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "error": "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview with the same memberNames",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "inject",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.fieldInjectToConstructorPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "error": "java.fieldInjectToConstructor: stale or unknown fieldRefs: stale",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "unusedctor",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.removeUnusedConstructorParams",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "extract",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.extractClassPreviewPlan",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractClass",
+          "change_files": 3,
+          "created_files": 1
+        },
+        {
+          "tool": "java.extractClass",
+          "error": "java.extractClass: extract_java_class currently requires a missing or empty target file - if a prior cell already applied this extraction, the work is DONE (verify with code.items on the source file); re-calling the transform is only valid against a clean target. store() the transform result when you need it in later cells.",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "3\n",
+      "final_stdout": "3\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "wrappers",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.synthesizeHelperWrappers",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 1,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "extractblock",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.extractMethodCodeBlock",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "rename",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.renameSymbol",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "addimport",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.addImport",
+          "change_files": 1,
+          "created_files": 0
+        },
+        {
+          "tool": "java.addImport",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.addImport",
+          "error": "java.addImport: conflicting imports for List: import java.util.List; and import java.awt.List;; use a fully qualified type name instead",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "imports",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.organizeImports",
+          "error": "java.organizeImports: Missing.java: failed to read <fixtures>/imports/Missing.java: No such file or directory (os error 2)",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.organizeImports",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "whitespace",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.normalizeWhitespace",
+          "error": "java.normalizeWhitespace: `files` must not be empty",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.normalizeWhitespace",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "hygiene",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.hygiene",
+          "error": "java.hygiene: at least one of `imports` or `whitespace` must be true",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.hygiene",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "moveclass",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveClass",
+          "error": "java.moveClass: JDTLS did not offer target package `relocated` as a move destination. Available packages: [(default package)]",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "movepackage",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.movePackage",
+          "error": "java.movePackage: JDTLS did not offer target package `relocated` as a move destination. Available packages: [(default package)]",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "describe",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.describe",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.describe",
+          "error": "java.describe: unknown transform `missingTransform` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, fieldInjectToConstructorPreview, fieldInjectToConstructor, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "signature-added",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.changeSignaturePreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "signature-literals",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.changeSignaturePreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "x=value\n",
+      "final_stdout": "x=value\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "staticfield",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.encapsulateFieldPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.encapsulateField",
+          "change_files": 1,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "unusedctor-callers",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.removeUnusedConstructorParams",
+          "error": "java.removeUnusedConstructorParams: @Inject does not exclude manual construction; found new Service(...) callers in {\"AuditMain.java\": 1}. Update those callers explicitly before removing constructor parameters",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "ready\n",
+      "final_stdout": "ready\n",
+      "final_java_exit": 0,
+      "source_changed": false
+    },
+    {
+      "case": "moveclass-project",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveClass",
+          "change_files": 2,
+          "created_files": 1
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "movepackage-project",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.movePackage",
+          "change_files": 1,
+          "created_files": 2
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "annotated-interface",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractInterface",
+          "change_files": 1,
+          "created_files": 1
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "unusedctor-noinject",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.removeUnusedConstructorParams",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "extractblock-control",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.extractMethodCodeBlock",
+          "error": "java.extractMethodCodeBlock: error.non_local_control_flow(return): the range contains a `return` that targets a method or loop outside the selection. Extracting would change control-flow semantics. Either widen the range to include the target, or refactor the early-exit into a single return at the end of the range. - run analysis.methodRegions to locate the return/break/continue gate before mutating",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "inline-state",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.inlineMethodPreview",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.inlineMethod",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "signature-overload",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.changeSignaturePreview",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "movemethod-copy",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "error": "java.moveMemberPreview: method moves do not support keepCopy, visibility, or targetPrelude; omit these options for a move preserving visibility, or use explicit edits for a copy",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": false
+    },
+    {
+      "case": "inject-existing",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.fieldInjectToConstructorPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "change_files": 4,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "column",
+      "layout": "multiline",
+      "calls": [
+        {
+          "tool": "java.describe",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": false
+    },
+    {
+      "case": "signature",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.changeSignaturePreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "error": "java.changeSignature: stale methodRef; re-run java.changeSignaturePreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "blocked": true,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.changeSignature",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "interface",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractInterface",
+          "error": "java.extractInterface: stale or unknown memberRefs: [\"stale\"]; re-run java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractInterface",
+          "change_files": 1,
+          "created_files": 1
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "pullup",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pullUpMembers",
+          "error": "java.pullUpMembers: stale or unknown memberRefs: [\"stale\"]; re-run java.pullUpPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pullUpMembers",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "pushdown",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.pushDownMembersPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pushDownMembers",
+          "error": "java.pushDownMembers: stale or unknown memberRefs: [\"stale\"]; re-run java.pushDownMembersPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.pushDownMembers",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "movefield",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "error": "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "movemethod",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.moveMemberPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "error": "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview with the same memberNames",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.moveMember",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "inject",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.fieldInjectToConstructorPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "error": "java.fieldInjectToConstructor: stale or unknown fieldRefs: stale",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "extract",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.extractClassPreviewPlan",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.extractClass",
+          "change_files": 3,
+          "created_files": 1
+        },
+        {
+          "tool": "java.extractClass",
+          "error": "java.extractClass: extract_java_class currently requires a missing or empty target file - if a prior cell already applied this extraction, the work is DONE (verify with code.items on the source file); re-calling the transform is only valid against a clean target. store() the transform result when you need it in later cells.",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "3\n",
+      "final_stdout": "3\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "extractblock",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.extractMethodCodeBlock",
+          "change_files": 2,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": "5\n",
+      "final_stdout": "5\n",
+      "final_java_exit": 0,
+      "source_changed": true
+    },
+    {
+      "case": "addimport",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.addImport",
+          "change_files": 1,
+          "created_files": 0
+        },
+        {
+          "tool": "java.addImport",
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.addImport",
+          "error": "java.addImport: conflicting imports for List: import java.util.List; and import java.awt.List;; use a fully qualified type name instead",
+          "change_files": 0,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    },
+    {
+      "case": "inject-existing",
+      "layout": "compact",
+      "calls": [
+        {
+          "tool": "java.fieldInjectToConstructorPreview",
+          "blocked": false,
+          "change_files": 0,
+          "created_files": 0
+        },
+        {
+          "tool": "java.fieldInjectToConstructor",
+          "change_files": 4,
+          "created_files": 0
+        }
+      ],
+      "applications": [
+        true
+      ],
+      "baseline_javac": 0,
+      "final_javac": 0,
+      "baseline_stdout": null,
+      "final_stdout": null,
+      "final_java_exit": null,
+      "source_changed": true
+    }
+  ]
+}

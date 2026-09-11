@@ -109,7 +109,7 @@ result is the status table below, evaluated against the shipped surface:
 | C4 | Extract-method-from-region | shipped | `java.extractMethodCodeBlock` (+ result-record synthesis) |
 | C11 | Cleanup bundle | mostly | hygiene / organizeImports / normalizeWhitespace / removeUnusedConstructorParams; missing region-scoped whitespace (gap-eaddf7aa), spacing-aware removal (gap-e3c9be8c), dead-field removal |
 | C5 | Callback externals | partial | `java.synthesizeHelperWrappers` (same-class callers only; no functional-interface callback params) |
-| C6 | Grid / column-spec extractor | shipped-buggy | `java.extractColumnSpec` exists, emits invalid patches (gap-b51e39e2) |
+| C6 | Grid / column-spec extractor | retired | Invalid receiver/provider/range synthesis removed from the callable catalog. Use `code.query` plus explicit `edits.*`; see [Java binding audit](model-facing-audit/java-binding-audit.md). |
 | C2 | Caller **role** classification | open | `analysis.references` gives prod/test counts, not UI/report/calc/**framework-dispatched** roles |
 | C7 | Query-object w/ context preservation | open | recipe rides generic `extractClass`; no tx/query-context-aware transform |
 | C8 | Parameter-object / record extractor | open | no `java.extractParameterObject`; wide-ctor pressure blocks decomposition |
@@ -157,8 +157,9 @@ boundary-ratchet / write-seam frontier.
 
 **Tier 2 — start cross-file, not by polishing one class**
 
-4. **Clone-family / structural-similarity analyzer (C12)** + **harden
-   `extractColumnSpec` (C6 / gap-b51e39e2).** Together they mechanize the
+4. **Clone-family / structural-similarity analyzer (C12)** + **design a replacement for the retired
+   column-spec synthesis (C6 / gap-b51e39e2).** A replacement must preserve
+   receivers, providers, fluent options and exact method ranges before it can mechanize the
    least-mechanized recipe (grid/column dedup) and the sibling-class
    consolidation that pattern-to-library and vendored-module campaigns need.
 5. **Caller-role + framework-reachability (C2 / C10)**, one reduction.

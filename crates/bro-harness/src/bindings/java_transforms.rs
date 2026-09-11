@@ -7692,7 +7692,10 @@ fn discover_field_inject_ctors(path: &Path, class_name: &str) -> Vec<FieldInject
             };
             Some(FieldInjectCtor {
                 byte_start: capture.byte_start,
-                is_inject: sig.annotations.iter().any(|annotation| java_annotation_is_inject_text(annotation)),
+                is_inject: sig
+                    .annotations
+                    .iter()
+                    .any(|annotation| java_annotation_is_inject_text(annotation)),
                 params_start: params_span.byte_start,
                 params_end: params_span.byte_end,
                 body_end: capture.byte_start + close_rel,
@@ -8082,14 +8085,27 @@ fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Resu
             byte_end: ctor.params_end,
             replacement: new_params,
         });
-        let close_line_start = data.source[..ctor.body_end].rfind('\n').map(|index| index + 1).unwrap_or(0);
-        let closing_alone = data.source[close_line_start..ctor.body_end].trim().is_empty();
-        let insertion = if closing_alone { close_line_start } else { ctor.body_end };
+        let close_line_start = data.source[..ctor.body_end]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let closing_alone = data.source[close_line_start..ctor.body_end]
+            .trim()
+            .is_empty();
+        let insertion = if closing_alone {
+            close_line_start
+        } else {
+            ctor.body_end
+        };
         let assignments = render_field_inject_assignments(&selected);
         edits.push(bbox_refactor::TextEdit {
             byte_start: insertion,
             byte_end: insertion,
-            replacement: if closing_alone { assignments } else { format!("\n{assignments}    ") },
+            replacement: if closing_alone {
+                assignments
+            } else {
+                format!("\n{assignments}    ")
+            },
         });
     } else {
         if let Some(import_edit) = ensure_inject_import_edit(&data) {
