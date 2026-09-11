@@ -7581,6 +7581,8 @@ struct FieldInjectCandidate {
 
 #[derive(Clone)]
 struct FieldInjectCtor {
+    byte_start: usize,
+    is_inject: bool,
     params_start: usize,
     params_end: usize,
     body_end: usize,
@@ -7689,6 +7691,8 @@ fn discover_field_inject_ctors(path: &Path, class_name: &str) -> Vec<FieldInject
                 body_inner.starts_with("this(") || body_inner.starts_with("this (")
             };
             Some(FieldInjectCtor {
+                byte_start: capture.byte_start,
+                is_inject: sig.annotations.iter().any(|annotation| java_annotation_is_inject_text(annotation)),
                 params_start: params_span.byte_start,
                 params_end: params_span.byte_end,
                 body_end: capture.byte_start + close_rel,
@@ -8049,6 +8053,16 @@ fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Resu
         .collect::<Vec<_>>()
         .join(", ");
     if let Some(ctor) = data.ctors.first() {
+        if !ctor.is_inject {
+            edits.push(bbox_refactor::TextEdit {
+                byte_start: ctor.byte_start,
+                byte_end: ctor.byte_start,
+                replacement: "@Inject ".into(),
+            });
+            if let Some(import_edit) = ensure_inject_import_edit(&data) {
+                edits.push(import_edit);
+            }
+        }
         let old_params = data
             .source
             .get(ctor.params_start..ctor.params_end)
@@ -8068,10 +8082,14 @@ fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Resu
             byte_end: ctor.params_end,
             replacement: new_params,
         });
+        let close_line_start = data.source[..ctor.body_end].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let closing_alone = data.source[close_line_start..ctor.body_end].trim().is_empty();
+        let insertion = if closing_alone { close_line_start } else { ctor.body_end };
+        let assignments = render_field_inject_assignments(&selected);
         edits.push(bbox_refactor::TextEdit {
-            byte_start: ctor.body_end,
-            byte_end: ctor.body_end,
-            replacement: render_field_inject_assignments(&selected),
+            byte_start: insertion,
+            byte_end: insertion,
+            replacement: if closing_alone { assignments } else { format!("\n{assignments}    ") },
         });
     } else {
         if let Some(import_edit) = ensure_inject_import_edit(&data) {
@@ -10900,7 +10918,10 @@ fn move_method_preview_value(
     root: &Path,
     params: &JavaMoveMemberPreviewParams,
 ) -> Result<Value, String> {
-    if params.keep_copy == Some(true) || params.visibility.is_some() || params.target_prelude.is_some() {
+    if params.keep_copy == Some(true)
+        || params.visibility.is_some()
+        || params.target_prelude.is_some()
+    {
         return Err("java.moveMemberPreview: method moves do not support keepCopy, visibility, or targetPrelude; omit these options for a move preserving visibility, or use explicit edits for a copy".into());
     }
     if params.member_names.is_empty() {
@@ -11150,13 +11171,27 @@ impl Tool for JavaMoveMember {
                 "targetPrelude": params.target_prelude, "targetClassName": params.target_class_name,
             }), cx).await;
             let allowed = match preview {
-                ToolResult::Json(value) => value["members"].as_array().into_iter().flatten()
-                    .filter_map(|member| member["ref"].as_str()).map(str::to_owned).collect::<BTreeSet<_>>(),
-                ToolResult::Error(error) => return err(error.replace("java.moveMemberPreview", "java.moveMember")),
+                ToolResult::Json(value) => value["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|member| member["ref"].as_str())
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>(),
+                ToolResult::Error(error) => {
+                    return err(error.replace("java.moveMemberPreview", "java.moveMember"));
+                }
                 other => return other,
             };
-            if params.member_refs.is_empty() || params.member_refs.iter().any(|reference| !allowed.contains(reference)) {
-                return err("java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview with the same memberNames");
+            if params.member_refs.is_empty()
+                || params
+                    .member_refs
+                    .iter()
+                    .any(|reference| !allowed.contains(reference))
+            {
+                return err(
+                    "java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview with the same memberNames",
+                );
             }
             let push_args = json!({
                 "file": params.file,
@@ -11184,7 +11219,8 @@ impl Tool for JavaMoveMember {
                     value["title"] = json!("move Java method member");
                     ToolResult::Json(value)
                 }
-                ToolResult::Error(error) => err(error.replace("java.pushDownMembersPreview", "java.moveMemberPreview")
+                ToolResult::Error(error) => err(error
+                    .replace("java.pushDownMembersPreview", "java.moveMemberPreview")
                     .replace("java.pushDownMembers", "java.moveMember")),
                 other => other,
             };
@@ -15404,6 +15440,7 @@ public class Service {
             ),
             "{rewritten}"
         );
+        assert!(rewritten.contains("@Inject public Service("), "{rewritten}");
         assert!(!rewritten.contains("@Inject\n    @Named(\"main\")\n    private Repo repo"));
         assert!(
             result["findings"]
