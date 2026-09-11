@@ -783,15 +783,45 @@ fn web_search_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// External resources for session construction. Embedders may supply a transport
+/// and explicit durable paths without changing process environment or host state.
+struct SessionBuildRuntime {
+    kind: TransportKind,
+    tx: Box<dyn Transport>,
+    store: SessionStore,
+    event_log: Arc<EventLog>,
+    /// Already prepared locality routes, or None to install them during startup.
+    project_mutation_routes: Option<Vec<Arc<dyn Tool>>>,
+}
+
 impl Session {
-    // one-time session construction; cwd canonicalize happens before the loop serves turns.
-    #[allow(clippy::disallowed_methods)]
     async fn build(
         cli: &Cli,
         callback: Option<EventCallback>,
         injected_mcp: Option<mcp::McpConfig>,
         additional_context: Option<BTreeMap<String, Value>>,
         shell_env: Option<BTreeMap<String, String>>,
+    ) -> Result<Self> {
+        Self::build_with_runtime(
+            cli,
+            callback,
+            injected_mcp,
+            additional_context,
+            shell_env,
+            None,
+        )
+        .await
+    }
+
+    // one-time session construction; cwd canonicalize happens before the loop serves turns.
+    #[allow(clippy::disallowed_methods)]
+    async fn build_with_runtime(
+        cli: &Cli,
+        callback: Option<EventCallback>,
+        injected_mcp: Option<mcp::McpConfig>,
+        additional_context: Option<BTreeMap<String, Value>>,
+        shell_env: Option<BTreeMap<String, String>>,
+        runtime: Option<SessionBuildRuntime>,
     ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
@@ -824,13 +854,28 @@ impl Session {
             .filter(|text| !text.is_empty())
             .map(str::to_owned);
 
-        let kind = TransportKind::from_env();
-        let mut tx = transport::build_transport(kind).await?;
-
-        let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
-        // Sidecar append-only event log next to the snapshot — the durable
-        // timestamped record of this session (event_log.rs).
-        let event_log = Arc::new(EventLog::for_session(&store.id));
+        let SessionBuildRuntime {
+            kind,
+            mut tx,
+            store,
+            event_log,
+            project_mutation_routes,
+        } = match runtime {
+            Some(runtime) => runtime,
+            None => {
+                let kind = TransportKind::from_env();
+                let tx = transport::build_transport(kind).await?;
+                let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
+                let event_log = Arc::new(EventLog::for_session(&store.id));
+                SessionBuildRuntime {
+                    kind,
+                    tx,
+                    store,
+                    event_log,
+                    project_mutation_routes: None,
+                }
+            }
+        };
         // Seed the live seq counter (emit.rs) from the persisted snapshot,
         // reconciled against the event log's own tail. The snapshot alone can
         // be stale: it only persists at turn boundaries, so a crash between
@@ -1016,12 +1061,17 @@ impl Session {
         )
         .mcp_readiness(&mcp_loaded.readiness);
         let remote_outcome_sources = mcp_loaded.tools.clone();
-        let mcp_tools = crate::locality::install_project_mutation_routes(
-            mcp_loaded.tools,
-            &cx,
-            cli.capability_mcp_server.as_deref(),
-        )
-        .await?;
+        let mcp_tools = match project_mutation_routes {
+            Some(tools) => tools,
+            None => {
+                crate::locality::install_project_mutation_routes(
+                    mcp_loaded.tools,
+                    &cx,
+                    cli.capability_mcp_server.as_deref(),
+                )
+                .await?
+            }
+        };
         let (mcp_in_box, mcp_out_box) =
             mcp::split_mcp_tools_by_placement(&mcp_tools, &tool_placement);
         // Code-mode projects the full tool surface (builtins + all MCP) into the
@@ -6993,3 +7043,7 @@ mod shell_env_tests {
         assert!(load_shell_env(None, Some("not json")).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "session_startup_tests.rs"]
+mod session_startup_tests;
