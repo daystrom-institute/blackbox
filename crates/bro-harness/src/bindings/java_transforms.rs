@@ -3896,7 +3896,7 @@ fn selected_signature_identifiers(
     for candidate in candidates {
         text.push('\n');
         let signature = if matches!(annotation_policy, "safe" | "omit") {
-            strip_signature_annotations(&candidate.signature_text)
+            strip_signature_annotations(&candidate.signature_text, &candidate.annotations)
         } else {
             candidate.signature_text.clone()
         };
@@ -4507,12 +4507,16 @@ struct JavaPushDownMembersParams {
     preview_only: Option<bool>,
 }
 
-fn strip_signature_annotations(signature: &str) -> String {
-    signature
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('@'))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn strip_signature_annotations(signature: &str, annotations: &[String]) -> String {
+    let mut text = signature.to_owned();
+    let mut annotations = annotations.iter().map(|annotation| annotation.trim()).collect::<Vec<_>>();
+    annotations.sort_by_key(|annotation| std::cmp::Reverse(annotation.len()));
+    for annotation in annotations {
+        if let Some(start) = text.find(annotation) {
+            text.replace_range(start..start + annotation.len(), "");
+        }
+    }
+    text
 }
 
 fn strip_modifier_words(signature: &str, words: &[&str]) -> String {
@@ -4530,7 +4534,7 @@ fn strip_modifier_words(signature: &str, words: &[&str]) -> String {
 fn interface_signature(candidate: &PullUpCandidate, annotation_policy: &str) -> String {
     let mut sig = candidate.signature_text.clone();
     if annotation_policy == "omit" || annotation_policy == "safe" {
-        sig = strip_signature_annotations(&sig);
+        sig = strip_signature_annotations(&sig, &candidate.annotations);
     }
     sig = strip_modifier_words(
         &sig,
@@ -4560,7 +4564,7 @@ fn abstract_signature(
 ) -> String {
     let mut sig = candidate.signature_text.clone();
     if annotation_policy == "omit" || annotation_policy == "safe" {
-        sig = strip_signature_annotations(&sig);
+        sig = strip_signature_annotations(&sig, &candidate.annotations);
     }
     sig = strip_modifier_words(
         &sig,
