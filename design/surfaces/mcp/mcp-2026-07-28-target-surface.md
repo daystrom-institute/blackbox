@@ -42,89 +42,101 @@ is the largest protocol break since Streamable HTTP:
   Logging deprecated. `structuredContent` relaxed to any JSON value;
   schemas loosened to full JSON Schema 2020-12 (SEP-2106).
 
-### Client landscape (verified 2026-08-04, Claude Code 2.1.221; re-verified 2026-08-14, 2.1.233 - posture unchanged; re-verified 2026-08-24, 2.1.243 - tasks consumption now LIVE in legacy flavor, see below)
+### Claude Code client landscape (2.1.267 audited 2026-09-10)
 
-Anthropic authored the spec revision, and Claude Code support has now
-shipped in part. Strings probe against
-`~/.local/share/claude/versions/2.1.221` (all findings re-confirmed
-against 2.1.233 on 2026-08-14 with near-identical counts):
+**Standard listen works by opt-in; tasks are disabled in this build.** The
+installed macOS arm64 2.1.267 binary was inspected and exercised against an
+isolated loopback MCP fixture. All model responses came from a deterministic
+local stub. The [audit record](claude-2.1.267-mcp-audit.json) contains the
+binary SHA-256, build identity, selectors, notification filters, ordered
+wire observations, and evidence limits. Earlier 2.1.220 through 2.1.243
+observations remain historical entries in the migration plan.
 
-- **Modern core present**: `2026-07-28` (25 hits), `server/discover` (28),
-  `subscriptions/listen` (27), `input_required`/`resultType` (43/23, MRTR),
-  `ttlMs`/`cacheScope` (7/11), `Mcp-Method` (2), and the SEP-2575 `_meta`
-  keys (`protocolVersion`, `clientCapabilities`, `clientInfo`,
-  `serverInfo`, `subscriptionId`, `logLevel`).
-- **Legacy retained** (dual-stack client, as expected): `Mcp-Session-Id`,
-  `Last-Event-ID`, `resources/subscribe`.
-- **Tasks are the OLD flavor, not the extension**: `tasks/get`,
-  `tasks/cancel` present, but so are `tasks/result` and `tasks/list`
-  (methods SEP-2663 removed), while `tasks/update` and the
-  `io.modelcontextprotocol/tasks` extension key are absent. Until a live
-  capture shows the extension key negotiated, treat Claude Code's tasks
-  support as legacy experimental and serve it plain JSON, never
-  `CreateTaskResult`.
-- **Update 2026-08-24 (2.1.243)**: Claude Code now actively CONSUMES
-  tasks as first-class `mcp_task` background tasks (poll loop honoring
-  `pollIntervalMs`, `tasks/result` payload fetch, reconnect/reconcile
-  after restart, kill support) - but via the legacy experimental API
-  (top-level `tasks` capability, legacy method quadruple,
-  `notifications/tasks/status`). The `io.modelcontextprotocol/tasks`
-  extension key is now bundled in a vendored SDK copy with
-  capability-gated task acceptance, but no `tasks/update` and no
-  evidence of outbound extension declaration: the verdict stays legacy,
-  the flip may be close, and the strict extension-key gate is now
-  load-bearing rather than precautionary - a looser "declares tasks"
-  gate would hand `CreateTaskResult` to a legacy-flavor consumer.
-  Details in the migration plan's probe history.
+| Surface | 2.1.267 evidence | Consequence for Blackbox |
+| --- | --- | --- |
+| Default negotiation | Isolated `--bare` run: legacy `initialize` at 2025-11-25, session ID echo and GET stream attempt. `MCP_SDK_GENERATION=v2` alone also stays legacy | A bundled modern SDK does not establish modern negotiation |
+| Modern opt-in | `MCP_SDK_GENERATION=v2` plus `MCP_PROTOCOL_NEGOTIATION=auto`: `server/discover` at 2026-07-28, self-describing request metadata, no initialize/session ID/GET on discover success | A second live-tested modern HTTP client alongside Codex |
+| Legacy fallback | With both selectors, discover rejected with `-32601` falls back to initialize at 2025-11-25 | Keep the dual-stack endpoint while serving the current client mix |
+| Standard listen | Automatically opens `subscriptions/listen` when the modern server advertises catalog `listChanged`; observed filter has `toolsListChanged`, `promptsListChanged`, `resourcesListChanged` | Phase 3 catalog-change delivery has an external consumer now |
+| Notification effect | After the fixture emitted list-change notifications, Claude issued a second `tools/list` | Tool-change push is acted on, not merely logged. Empty prompt/resource catalogs were only initially listed in this probe |
+| Reconnect | After the first listen stream was dropped, Claude opened `listen:1`, refetched tools after reopening, and handled another tool-list notification | Reopen plus reconciliation is live-tested; long backoff/parking behavior remains static evidence |
+| Tasks | No top-level `tasks` capability or `io.modelcontextprotocol/tasks` extension declared in any tested mode, even with server task support advertised | Keep plain tool JSON; no task handles or task wake-on-done for this build |
 
-Baseline 2026-08-03 (v2.1.220, four days older): all modern strings absent,
-`2025-11-25` max. The core protocol landed in 2.1.221.
+The task result corrects the earlier tendency to treat bundled task code as
+active support. The embedded capability gate (`LI` in this exact build) is
+literally false. Both legacy task capabilities and the v2 extension
+insertion are conditional on it; task restoration returns early too.
+`mcp_task`, SEP-2663 sidecar/UI scaffolding, and the extension-key literal
+remain bundled, but do not prove an enabled consumer. The exact task-method
+vocabulary is still `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`;
+there is no `tasks/update` or bare `notifications/tasks`.
 
-Consequences:
+The two selectors above are implementation controls observed in 2.1.267.
+Runtime selection also consults `tengu_brindle_causeway`, and HTTP automatic
+negotiation consults `tengu_mcp_protocol_negotiation_http`; both have disabled
+fallbacks. There are server negotiation/listen denylists, plus a bounded
+listen retry/parking path. These are decoded implementation findings
+(medium confidence), not a promise about any account's remote rollout.
+The wire behaviors in the table are directly observed (high confidence).
+No installed settings or production connections were changed.
 
-- The dual-shape gate on `bro_exec`/`bro_resume` keys STRICTLY on the
-  `io.modelcontextprotocol/tasks` extension declaration in per-request
-  capabilities, not on any looser "client mentions tasks" signal.
-- The modern core (stateless lifecycle, discover, listen, MRTR, cache
-  hints) has a real dominant client today; the Q2 version gate becomes
-  testable as soon as Phase 1 lands.
-- Strings probes show what is bundled, not what is negotiated. The daemon
-  should trace-log client `protocolVersion` + capabilities at initialize
-  (one line) so the tripwire measures reality.
+For notification semantics, distinguish catalog invalidation from task
+completion: this listen filter validates list-change delivery. It does not
+establish per-URI `resourceSubscriptions`, task notifications, or arbitrary
+messages that wake the model. The harness pair remains the proving ground
+for the tasks extension and task wake-on-done. The strict extension-key gate
+on `bro_exec`/`bro_resume` remains necessary.
 
-**Tripwire**: re-run the strings probe on each Claude Code update
-(migration plan has the command). The bro-harness child pair remains the
-proving ground for the tasks extension specifically, since no client we
-consume declares it yet.
+### Codex (OpenAI) as second data point (source rechecked 2026-09-10)
 
-### Codex (OpenAI) as second data point (verified 2026-08-04; re-verified 2026-08-14 at HEAD 233739e76a - posture unchanged; re-verified 2026-08-24 at HEAD cbfd999db7 plus a LIVE wire capture of shipped 0.149.1 - rmcp bumped to =3.1.3, modern core VERIFIED WORKING behind `features.mcp_2026_07_28=true` including full stateless operation on discover success, default still Legacy, still no tasks/listen)
+Current source snapshot: local `../codex`, clean HEAD
+`242c5ce01cd3388f7d23a87b68615b2042a04bfc` (815 commits after the
+2026-08-24 snapshot `cbfd999db7`). This is source inspection, not a new
+binary or live-wire validation. The 2026-08-24 capture of shipped 0.149.1
+remains the latest live evidence recorded here: HTTP modern opt-in worked
+with stateless discover success and clean legacy fallback. Earlier probes
+and the capture details remain in the companion plan's probe history.
 
-Source-level probe of the codex-rs workspace (local checkout, HEAD
-78306a32af; ~180 commits later at 233739e76a nothing below has moved -
-still rmcp =3.0.0, feature still default-OFF UnderDevelopment, still no
-tasks/listen. Their new MCP work is OAuth hardening plus a bespoke
-non-spec `events/list`/`events/stream` CustomRequest surface for the
-hosted Plugin Runtime, built beside SEP-2575 listen rather than on it):
+| Surface | Current source behavior | Consequence for Blackbox |
+| --- | --- | --- |
+| SDK | Workspace manifest and lockfile pin `rmcp = "=3.2.0"`, upgraded by #42383 from `=3.1.3` | Evaluate 3.2.0 for the migration; the old 3.1 spike does not validate the newer SDK |
+| Ordinary MCP servers | `features.mcp_2026_07_28` remains UnderDevelopment, default false. Legacy uses `Initialize` at 2025-06-18; modern uses `Auto` with 2026-07-28 preferred and 2025-06-18 fallback | Codex is a useful opt-in modern HTTP client; its SDK bump does not flip Q2 or retire legacy |
+| Hosted Codex Apps | New independent `features.codex_apps_mcp_2026_07_28`, also UnderDevelopment/default false (#44318). HTTP registrations may explicitly override the selected mode | The ordinary-server flag no longer describes all connections; probe the actual endpoint and both gates |
+| Stdio | Modern requires both the ordinary-server feature and server-config env `CODEX_MCP_PROTOCOL_VERSION=2026-07-28`; absent marker keeps legacy | The single-feature-key recipe from the HTTP capture is not a stdio recipe |
+| Tasks extension | No standard tasks declaration or consumer. Host extension selection still excludes `io.modelcontextprotocol/tasks`; modern `tools/call` accepts complete/input-required results and rejects other result variants | Keep ordinary tool JSON for Codex; no evidence to flip the task-result gate |
+| Listen | No `subscriptions/listen` consumer. The custom `events/list` / `events/stream` transport remains, with event subscriptions retained across task unloading (#41899) | Proprietary event streams do not validate SEP-2575 listen or task wake-on-done |
+| MRTR | Modern tool calls now use a Codex-owned continuation driver, including `openai/elicitation/create` form and native user-verification inputs (#44346) | More concrete MRTR interoperability cases for Phase 5, independent of tasks/listen |
+| Server role | Deprecated `codex mcp-server` command and `codex-mcp-server` crate removed (#42993) | Retire the earlier “server returns unsupported tasks” probe target; Codex app-server remains a separate API |
 
-- Pins `rmcp = "=3.0.0"` exactly, with a dedicated `codex-rmcp-client`
-  crate and a full 2026 test suite (discovery, MRTR, message limits,
-  stdio, SSE).
-- Client protocol mode is `McpProtocolMode::{Legacy, V20260728}`; modern
-  mode uses `ClientLifecycleMode::Auto` (discover probe, legacy fallback),
-  gated behind `Feature::Mcp20260728`, default OFF (Legacy negotiates
-  V_2025_06_18 + initialize).
-- No tasks extension and no `subscriptions/listen` consumption anywhere in
-  the tree; their own MCP server shows no 2026-07-28 surface either.
+MRTR details matter for our approval design: the driver accepts both typed
+`InputRequiredResult` and custom `resultType: input_required` envelopes,
+returns `inputResponses` with `requestState`, bounds continuation rounds,
+and avoids restarting an operation after submitting a native verification
+proof. Upstream tests cover malformed/unadvertised inputs, cancellation,
+auth challenges, and session expiry after proof submission. Those tests
+were inspected, not run in this refresh. Native user verification is
+restricted to the host-owned Apps service by `server_mcp_extensions`;
+Blackbox cannot infer access to it from Codex's generic elicitation support.
+Use standard elicitation for the portable Phase 5 path.
 
-Takeaways: both major harness vendors shipped rmcp-3.0-based dual-stack
-clients within a week of the spec, and NEITHER consumes the tasks
-extension or listen yet. That validates the strict extension-key gate
-(Phase 2) and confirms the harness pair is the only near-term tasks/listen
-consumer. Codex's gating posture (modern off by default, Auto lifecycle
-with legacy fallback) mirrors our Q2 recommendation. Note Brodex rides OUR
-bro-harness MCP client, not codex CLI, so Codex support does not gate any
-blackbox dispatch path; it matters only if codex CLI itself is pointed at
-the daemon as an MCP client.
+Source anchors at this exact snapshot:
+
+- [SDK pin](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/Cargo.toml#L430)
+  and [feature defaults](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/features/src/lib.rs#L1310).
+- [Lifecycle and stdio policy](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/rmcp-client/src/protocol_mode.rs)
+  and [per-server mode selection](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/codex-mcp/src/connection_manager.rs#L316).
+- [Extension selection and hosted-only verification](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/codex-mcp/src/client_capabilities.rs),
+  [MRTR driver](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/rmcp-client/src/tool_input.rs),
+  and [continuation tests](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/rmcp-client/tests/mcp_2026_mrtr/native_verification_tests.rs).
+- [Custom event transport](https://github.com/openai/codex/blob/242c5ce01cd3388f7d23a87b68615b2042a04bfc/codex-rs/rmcp-client/src/event_notification_transport.rs)
+  and [MCP-server removal](https://github.com/openai/codex/commit/531f3836a1e38ea61eaaba3dccda6711eb6c0dca).
+
+Takeaways: modern HTTP remains usable by explicit opt-in. Codex still lacks
+standard tasks/listen consumption; Claude Code 2.1.267 now supplies live
+catalog-listen evidence as described above. Task wake-on-done still needs
+our harness pair as the proving ground. Brodex uses OUR bro-harness MCP
+client, so Codex support only matters when Codex itself connects to the
+daemon.
 
 ### Convergence with locality-first decomposition
 
@@ -474,7 +486,9 @@ Recommendations stated; operator red-lines here.
 - **Q2 (version advertisement)**: advertise `V_2026_07_28` in discover
   immediately after Phase 1, or dark-launch behind a config gate until the
   harness loop is proven? Recommend config-gated, default on for dev daemon,
-  flip prod on the strings-probe tripwire.
+  flip prod after a live round-trip confirms the selected endpoint and
+  negotiated protocol/capabilities. Source or strings probes select test
+  candidates; they do not establish negotiation.
 - **Q3 (task scope)**: bro dispatches only, or workflow runs as tasks too?
   Recommend bro first, workflow runs fast-follow or `blackbox://run/{id}`.
 - **Q4 (checkout authority cache)**: invalidation for the per-request

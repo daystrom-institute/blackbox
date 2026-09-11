@@ -1,0 +1,263 @@
+{
+  "audit_date": "2026-09-10",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "version": "2.1.267",
+    "platform": "macos-arm64",
+    "size_bytes": 200489184,
+    "sha256": "a681f3008f0050029aeebcab3af51bb6a55ddeb625a3af3141a4416d43cd2558",
+    "embedded_build_time": "2026-09-09T17:26:03Z",
+    "embedded_git_sha": "a9e1808c8204fef901336d54bac7d4ab442955cb"
+  },
+  "methodology": {
+    "static": "Exact-byte vocabulary enumeration and bounded inspection of embedded JavaScript. Literal presence is distinct from reachable behavior. Minified call-graph interpretations are medium confidence.",
+    "live": "Unmodified installed binary, --bare -p, empty built-in tool set, --setting-sources empty, --strict-mcp-config, explicit loopback-only MCP fixture. Each case used a fresh temporary cwd and CLAUDE_CONFIG_DIR. ANTHROPIC_API_KEY was a dummy value and ANTHROPIC_BASE_URL pointed to a local deterministic Messages stub. No real model inference or shared MCP service was used.",
+    "fixture": "Discover advertised 2026-07-28, all three catalog listChanged capabilities and the tasks extension. Listen acknowledged the requested filter, then emitted tools/resources/prompts list_changed. Catalogs were empty. The fallback fixture rejected discover with -32601 and answered initialize at 2025-11-25 with legacy tasks advertised. The reconnect fixture closed the first listen response without a terminal JSON-RPC result; the second stream remained open.",
+    "limits": [
+      "Account-specific remote rollout flags were not inspected; isolated defaults are not a universal rollout verdict.",
+      "Tool catalog refetch and listen reopening were observed; prompt/resource catalogs were empty and only their initial lists were observed.",
+      "No task result was returned to a client that did not declare support. Task execution and task notifications were not tested.",
+      "No per-URI resource subscription, MRTR elicitation interaction, or prolonged reconnect/parking behavior was live-tested."
+    ]
+  },
+  "static_findings": {
+    "task_methods": [
+      "tasks/cancel",
+      "tasks/get",
+      "tasks/list",
+      "tasks/result"
+    ],
+    "tasks_extension_literal_present": true,
+    "bare_tasks_notification_present": false,
+    "task_gate": {
+      "byte_offset": 165358974,
+      "symbol": "LI",
+      "body": "return!1",
+      "effect": "Both the legacy tasks capability and the v2 tasks-extension declaration are conditional on this false gate; task restore also returns early."
+    },
+    "runtime_selector": {
+      "byte_offset": 162911051,
+      "env": "MCP_SDK_GENERATION",
+      "values": [
+        "v1",
+        "v2"
+      ],
+      "rollout_flag": "tengu_brindle_causeway",
+      "fallback": "v1"
+    },
+    "negotiation_selector": {
+      "byte_offset": 187328083,
+      "env": "MCP_PROTOCOL_NEGOTIATION",
+      "values": [
+        "legacy",
+        "auto"
+      ],
+      "http_rollout_flag": "tengu_mcp_protocol_negotiation_http",
+      "fallback": "legacy"
+    },
+    "listen_reopen": {
+      "byte_offset": 187306549,
+      "filter": [
+        "toolsListChanged",
+        "promptsListChanged",
+        "resourcesListChanged"
+      ],
+      "listen_denylist_flag": "tengu_mcp_listen_server_denylist",
+      "note": "App opens/reopens listen and invokes registered catalog refresh handlers; no tasks filter observed."
+    }
+  },
+  "cases": [
+    {
+      "name": "isolated-default",
+      "environment_selectors": {},
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-only",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-auto-discover-success",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-auto-discover-rejected",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-auto-listen-stream-dropped",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "drop_first_listen_stream",
+        "tools/list",
+        "subscriptions/listen",
+        "tools/list",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 4,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    }
+  ]
+}
