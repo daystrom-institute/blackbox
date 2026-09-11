@@ -860,6 +860,7 @@ impl Session {
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
         let restored_code_mode = store.restored.as_ref().and_then(|r| r.code_mode.clone());
         let restored_service_tier = store.restored.as_ref().and_then(|r| r.service_tier.clone());
+        let restored_effort = store.restored.as_ref().and_then(|r| r.effort.clone());
         // Loop-level side cells restored from a prior turn. Each cell
         // deserializes its own slot tolerantly (absent/garbage → empty).
         let prior_side = store
@@ -1165,7 +1166,7 @@ impl Session {
             model,
             max_tokens,
             system: SystemPrompt::default(),
-            effort: cli.effort.clone(),
+            effort: cli.effort.clone().or(restored_effort),
             web_search,
             service_tier: cli
                 .service_tier
@@ -2445,6 +2446,7 @@ impl Session {
         let model = self.base_opts.model.clone();
         let code_mode = self.code_mode.as_str().to_owned();
         let service_tier = self.base_opts.service_tier.clone();
+        let effort = self.base_opts.effort.clone();
         let snapshot = self.tx.snapshot();
         let mut side = self.side_state();
         side["runtime_work_outstanding"] = json!(cells_outstanding || shells_outstanding);
@@ -2471,6 +2473,7 @@ impl Session {
                     model: &model,
                     code_mode: &code_mode,
                     service_tier: service_tier.as_deref(),
+                    effort: effort.as_deref(),
                     snapshot,
                     side,
                     last_event_seq,
