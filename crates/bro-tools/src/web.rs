@@ -15,6 +15,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -24,6 +25,12 @@ struct WebFetchInput {
     url: String,
     /// Max characters of extracted text to return (default 8000, clamped 500..=20000).
     max_chars: Option<usize>,
+    /// Start character in the returned text representation (default 0). HTML is
+    /// reduced to text; other textual media preserve their original UTF-8 content.
+    start_char: Option<usize>,
+    /// SHA-256 from a previous page. Refuse if the fetched text changed before
+    /// continuing; use with start_char to avoid joining different versions.
+    expected_sha256: Option<String>,
 }
 
 pub struct WebFetch;
@@ -34,7 +41,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &str {
-        "Fetch a web page and return its text content (HTML stripped, bounded by max_chars and 8000 bytes, with omission markers). Client-side; no external dependency."
+        "Fetch UTF-8 text over HTTP(S). HTML is reduced to text; plain text, code and JSON preserve whitespace and angle brackets. Bodies over 2 MiB and binary media are refused. Pages are bounded by max_chars and 8000 output bytes; follow start_char and expected_sha256 from the continuation."
     }
     fn input_schema(&self) -> Value {
         schema_for::<WebFetchInput>()
@@ -61,23 +68,114 @@ impl Tool for WebFetch {
             .timeout(Duration::from_secs(15))
             .send()
             .await;
-        let body = match resp {
-            Ok(r) => match r.error_for_status() {
-                Ok(r) => match r.text().await {
-                    Ok(t) => t,
-                    Err(e) => return ToolResult::Error(format!("read body: {e}")),
-                },
-                Err(e) => return ToolResult::Error(format!("http status: {e}")),
+        let mut response = match resp {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response,
+                Err(error) => return ToolResult::Error(format!("http status: {error}")),
             },
-            Err(e) => return ToolResult::Error(format!("fetch {}: {e}", args.url)),
+            Err(error) => return ToolResult::Error(format!("fetch {}: {error}", args.url)),
         };
-        let text = strip_html(&body);
-        let excerpt: String = text.chars().take(max_chars).collect();
-        let mut out = crate::output::truncate_text(&excerpt, crate::output::DEFAULT_OUTPUT_BYTES);
-        if excerpt.len() < text.len() {
-            out.push_str("\n[page text truncated at max_chars; raise max_chars or request a narrower source]");
+        let media = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let html = matches!(media.as_str(), "text/html" | "application/xhtml+xml");
+        if !media.is_empty()
+            && !media.starts_with("text/")
+            && !matches!(
+                media.as_str(),
+                "application/json" | "application/xml" | "application/javascript"
+            )
+            && !media.ends_with("+json")
+            && !media.ends_with("+xml")
+        {
+            return ToolResult::Error(format!(
+                "web_fetch: unsupported media type {media}; use a client for that format"
+            ));
         }
-        ToolResult::Text(out)
+        const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+        {
+            return ToolResult::Error(
+                "web_fetch: response exceeds 2 MiB; request a narrower source".into(),
+            );
+        }
+        let mut body = Vec::new();
+        loop {
+            let chunk = tokio::select! {
+                _ = cx.cancellation.cancelled() => return ToolResult::Error("web_fetch: cancelled before complete response".into()),
+                chunk = response.chunk() => chunk,
+            };
+            match chunk {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                        return ToolResult::Error(
+                            "web_fetch: response exceeds 2 MiB; request a narrower source".into(),
+                        );
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => return ToolResult::Error(format!("read body: {error}")),
+            }
+        }
+        let body =
+            match String::from_utf8(body) {
+                Ok(body) => body,
+                Err(_) => return ToolResult::Error(
+                    "web_fetch: response is not UTF-8 text; use a client supporting its encoding"
+                        .into(),
+                ),
+            };
+        let text = if html { strip_html(&body) } else { body };
+        let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+        if args
+            .expected_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != digest)
+        {
+            return ToolResult::Error("web_fetch: source text changed since the previous page; restart from start_char=0 without expected_sha256".into());
+        }
+        let start = args.start_char.unwrap_or(0);
+        let total = text.chars().count();
+        if start > total {
+            return ToolResult::Error(format!(
+                "web_fetch: start_char {start} exceeds text length {total}"
+            ));
+        }
+        // Reserve continuation metadata before selecting a contiguous prefix.
+        // The final backstop must never clip a page whose continuation skips it.
+        let budget = if cx.output_budget == 0 {
+            crate::output::DEFAULT_OUTPUT_BYTES
+        } else {
+            cx.output_budget.min(crate::output::DEFAULT_OUTPUT_BYTES)
+        };
+        let mut page = String::new();
+        let mut count = 0usize;
+        for ch in text.chars().skip(start).take(max_chars) {
+            if page.len() + ch.len_utf8() > budget.saturating_sub(256) {
+                break;
+            }
+            page.push(ch);
+            count += 1;
+        }
+        if start + count < total {
+            if count == 0 {
+                return ToolResult::Error(
+                    "web_fetch: output budget is too small for a text page".into(),
+                );
+            }
+            page.push_str(&format!("\n[page truncated; continue SAME url with start_char={} and expected_sha256=\"{digest}\"]", start + count));
+        }
+        ToolResult::Text(page)
     }
 }
 

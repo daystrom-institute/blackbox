@@ -4,7 +4,8 @@
 use bro_code_mode::{FunctionCallOutputContentItem, RuntimeResponse};
 use bro_tools::ToolResult;
 
-pub(super) const MAX_RESULT_BYTES: usize = 12 * 1024;
+#[cfg(test)]
+const MAX_RESULT_BYTES: usize = 16 * 1024;
 const DIAGNOSTIC_BYTES: usize = 2 * 1024;
 const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const TRUNCATION_MARKER: &str = "\n[output truncated; the cell output budget omitted content here. Re-run affected reads separately with smaller ranges. Tool continuation hints below do not recover this omission.]\n";
@@ -38,6 +39,7 @@ pub(super) fn response_to_result(
     response: RuntimeResponse,
     notifications: Vec<String>,
     max_output_tokens: Option<usize>,
+    result_cap: usize,
 ) -> ToolResult {
     let (mut status, items, error_text) = match response {
         RuntimeResponse::Result {
@@ -82,6 +84,22 @@ pub(super) fn response_to_result(
             FunctionCallOutputContentItem::InputImage { .. } => image_unsupported = true,
         }
     }
+    let result_cap = if result_cap == 0 {
+        usize::MAX
+    } else {
+        result_cap
+    };
+    let sections = usize::from(error_text.is_some())
+        + usize::from(!notifications.is_empty())
+        + usize::from(!nested_outcomes.is_empty());
+    // Reserve each truncation marker plus lifecycle labels before allocating
+    // diagnostics. Small operator budgets must not trigger a second backstop.
+    let diagnostic_bytes = result_cap
+        .saturating_sub(status.len() + IMAGE_ERROR.len() + 64)
+        .saturating_sub((sections + 1) * TRUNCATION_MARKER.len())
+        .checked_div(sections)
+        .unwrap_or(DIAGNOSTIC_BYTES)
+        .min(DIAGNOSTIC_BYTES);
     let failed = error_text.is_some() || image_unsupported;
     if image_unsupported {
         if status == "Script completed\n" {
@@ -92,22 +110,29 @@ pub(super) fn response_to_result(
     }
     if let Some(error) = error_text {
         status.push_str("Script error:\n");
-        status.push_str(&bounded_text(&error, DIAGNOSTIC_BYTES));
+        status.push_str(&bounded_text(&error, diagnostic_bytes));
         status.push('\n');
     }
     if !notifications.is_empty() {
         status.push_str("[notifications]\n");
-        status.push_str(&bounded_text(&notifications.join("\n"), DIAGNOSTIC_BYTES));
+        status.push_str(&bounded_text(&notifications.join("\n"), diagnostic_bytes));
         status.push('\n');
     }
     // Cancellation receipts are lifecycle evidence. Even max_tokens=0 must
     // retain their bounded actual outcomes rather than only a stopped label.
     if !nested_outcomes.is_empty() {
-        status.push_str(&bounded_text(&nested_outcomes.join("\n"), DIAGNOSTIC_BYTES));
+        status.push_str(&bounded_text(&nested_outcomes.join("\n"), diagnostic_bytes));
         status.push('\n');
     }
     status.push_str("Output:\n");
-    let available_bytes = MAX_RESULT_BYTES
+    // One host result policy, shared with the final loop backstop. Zero is the
+    // operator's existing unbounded opt-out; the authored token budget still applies.
+    let result_cap = if result_cap == 0 {
+        usize::MAX
+    } else {
+        result_cap
+    };
+    let available_bytes = result_cap
         .saturating_sub(status.len())
         .saturating_sub(TRUNCATION_MARKER.len());
     let payload_bytes = max_output_tokens
@@ -126,6 +151,60 @@ pub(super) fn response_to_result(
 mod tests {
     use super::*;
     use bro_code_mode::CellId;
+
+    fn response_to_result(
+        response: RuntimeResponse,
+        notifications: Vec<String>,
+        max_output_tokens: Option<usize>,
+    ) -> ToolResult {
+        super::response_to_result(response, notifications, max_output_tokens, MAX_RESULT_BYTES)
+    }
+
+    #[test]
+    fn two_bounded_reads_fit_the_shared_host_budget_without_an_extra_cell_cap() {
+        let first = format!("READ_ONE\n{}\ncontinue source one", "a".repeat(7900));
+        let second = format!("READ_TWO\n{}\ncontinue source two", "b".repeat(7900));
+        let output = result_text(super::response_to_result(
+            RuntimeResponse::Result {
+                cell_id: CellId::new("paired".into()),
+                content_items: vec![text_item(first.clone()), text_item(second.clone())],
+                error_text: None,
+            },
+            vec![],
+            None,
+            16 * 1024,
+        ));
+        assert!(output.contains(&first) && output.contains(&second));
+        assert!(!output.contains("output truncated"));
+        assert!(output.len() <= 16 * 1024);
+    }
+
+    #[test]
+    fn small_host_budget_preserves_lifecycle_without_second_truncation() {
+        let output = result_text(super::response_to_result(
+            RuntimeResponse::Yielded {
+                cell_id: CellId::new("recover-me".into()),
+                content_items: vec![
+                    text_item("body".repeat(5000)),
+                    text_item(format!(
+                        "[nested tool outcomes]\n{}",
+                        "receipt".repeat(5000)
+                    )),
+                ],
+            },
+            vec!["notice".repeat(5000)],
+            None,
+            1024,
+        ));
+        assert!(output.contains("recover-me"));
+        assert!(output.contains("[notifications]"));
+        assert!(output.contains("[nested tool outcomes]"));
+        assert!(output.len() <= 1024, "{}", output.len());
+        assert_eq!(
+            crate::bound::bound_tool_result("exec", output.clone(), 1024),
+            output
+        );
+    }
 
     fn text_item(text: String) -> FunctionCallOutputContentItem {
         FunctionCallOutputContentItem::InputText { text }

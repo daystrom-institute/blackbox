@@ -311,7 +311,8 @@ impl CodeModeToolSession {
             .map(|response| {
                 let cell_id = response_cell_id(&response).clone();
                 let notifications = self.surface.drain_notifications(&cell_id);
-                let result = response_to_result(response, notifications, None);
+                let result =
+                    response_to_result(response, notifications, None, crate::bound::cap_bytes());
                 let (content, is_error) = result.into_content();
                 let content = format!("Code-mode cell {cell_id}:\n{content}");
                 if is_error {
@@ -416,7 +417,7 @@ impl Tool for ExecTool {
                 let notifications = self
                     .surface
                     .drain_notifications(response_cell_id(&response));
-                response_to_result(response, notifications, max_output_tokens)
+                response_to_result(response, notifications, max_output_tokens, cx.output_budget)
             }
             Err(e) => ToolResult::Error(format!("exec failed: {e}")),
         }
@@ -518,7 +519,7 @@ impl Tool for WaitTool {
                 let notifications = self
                     .surface
                     .drain_notifications(response_cell_id(&response));
-                response_to_result(response, notifications, max_tokens)
+                response_to_result(response, notifications, max_tokens, cx.output_budget)
             }
             Err(e) => ToolResult::Error(format!("wait failed: {e}")),
         }

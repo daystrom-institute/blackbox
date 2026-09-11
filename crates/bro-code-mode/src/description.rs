@@ -21,7 +21,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - The code is JavaScript source, without markdown fences. If this tool is exposed as a freeform tool, send the source directly. If its input schema is an object, send `{ "source": "...JavaScript..." }`.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call may still be in flight when the cell yields; call `wait` with the returned cell id to observe the eventual tool response and final result.
-- `max_output_tokens` sets the text output budget for direct `exec` results, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers. Large text keeps its beginning and end; print a smaller selection to inspect omitted content. This cell-level clipping is separate from tool paging: source continuation hints cannot recover text omitted by the cell budget. Print large reads separately or select smaller ranges.
+- `max_output_tokens` sets the text output budget for direct `exec` results, estimated at four bytes per token. Defaults to 10000 tokens. The host result limit also applies (normally 16 KiB, configurable by the operator), with space reserved for status, errors, notifications, and truncation markers. Large text keeps its beginning and end; print a smaller selection to inspect omitted content. This cell-level clipping is separate from tool paging: source continuation hints cannot recover text omitted by the cell budget. Print large reads separately or select smaller ranges.
 - Await every tool call you need. When JavaScript finishes, its callbacks stop; pending tool calls are cancelled and admitted work is drained before the terminal result. Already-started mutations may finish, with bounded outcome receipts. Each `exec` cell is a FRESH scope: locals from earlier cells are gone; redeclare them, or pass values across cells via `store()`/`load()`.
 
 - Global helpers:
@@ -40,7 +40,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
-- `max_tokens` limits new text output for this wait call, estimated at four bytes per token. Defaults to 10000 tokens. The complete response is capped at 12 KiB, with space reserved for status, errors, notifications, and truncation markers.
+- `max_tokens` limits new text output for this wait call, estimated at four bytes per token. Defaults to 10000 tokens. The host result limit also applies (normally 16 KiB, configurable by the operator), with space reserved for status, errors, notifications, and truncation markers.
 - `terminate: true` stops JavaScript, requests cancellation of nested work, and waits for admitted calls to return actual outcomes. Blocking work may delay the response; termination does not roll back completed changes. False or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
 - Queued `notify(...)` payloads from the cell are delivered in a `[notifications]` section of the result.
@@ -811,12 +811,12 @@ mod tests {
     fn exec_and_wait_describe_the_harness_output_contract() {
         let description = build_exec_tool_description(&[], &BTreeMap::new(), false, false);
         assert!(description.contains("four bytes per token"));
-        assert!(description.contains("12 KiB"));
+        assert!(description.contains("16 KiB"));
         assert!(description.contains("no image is delivered"));
         assert!(!description.contains("Appends an image item"));
         let wait = super::build_wait_tool_description();
         assert!(wait.contains("`max_tokens`"));
-        assert!(wait.contains("12 KiB"));
+        assert!(wait.contains("16 KiB"));
     }
 
     #[test]

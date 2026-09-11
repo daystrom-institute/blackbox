@@ -125,7 +125,7 @@ impl Tool for BuildGate {
     }
 
     fn description(&self) -> &str {
-        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects cargo/rustc JSON (`--message-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Collects retained shell output pages before parsing; diagnostics_complete=false discloses lost or unread output. Uses shell_run and shell_poll but never returns raw logs."
+        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Collects retained shell output pages before parsing; diagnostics_complete=false discloses lost or unread output. Uses shell_run and shell_poll but never returns raw logs."
     }
 
     fn input_schema(&self) -> Value {
@@ -134,8 +134,8 @@ impl Tool for BuildGate {
             "properties": {
                 "command": { "type": "string", "description": "Shell command line to execute through bash -lc." },
                 "cwd": { "type": "string", "description": "Working directory relative to the session root. Defaults to root." },
-                "timeout_ms": { "type": "number", "description": "Hard timeout in milliseconds. Default 600000." },
-                "max_diagnostics": { "type": "number", "description": "Maximum diagnostics returned. Default 100." },
+                "timeout_ms": { "type": "integer", "minimum": 0, "description": "Hard timeout in milliseconds. Default 600000." },
+                "max_diagnostics": { "type": "integer", "minimum": 0, "description": "Maximum diagnostics returned. Default 100." },
                 "anchor_spans": { "type": "boolean", "description": "When true, attach hash-anchored line spans for diagnostics whose files exist under the session root." }
             },
             "required": ["command"]
@@ -412,8 +412,8 @@ fn parse_build_output(
         );
     }
 
-    // cargo/rustc `--message-format=json` output is unambiguous: it is
-    // newline-delimited JSON whose lines carry `"reason":"compiler-message"`.
+    // Accept both Cargo compiler-message envelopes and raw rustc diagnostic
+    // objects. Their suggestions are the repair-loop input for rust.fixRound.
     // When present, parse it into structured diagnostics with codes and
     // machine-applicable suggestions; this is the repair-loop input shape
     // rust.fixRound consumes. Detect by content so a wrapper script that
@@ -471,15 +471,13 @@ fn parse_build_output(
 /// applicability is actionable (`MachineApplicable`, `MaybeIncorrect`, or
 /// `HasPlaceholders`); `Unspecified` is dropped as non-actionable.
 ///
-/// Reuses `bbox_refactor::parse_rustc_json_output` for the line-level
-/// decode (it already tolerates malformed/non-compiler-message lines), then
-/// re-walks the raw JSON to preserve the suggestion spans the v1 classifier
-/// needs verbatim.
+/// Cargo wraps diagnostics in `message`; raw rustc emits the diagnostic object
+/// directly. Preserve suggestion spans from both representations.
 fn parse_cargo_json_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
     // Fast path: skip the per-line JSON parse entirely when the output does
     // not look like cargo JSON at all. This keeps the javac/generic path
     // zero-cost for the common case.
-    if !output.contains("\"compiler-message\"") {
+    if !output.contains("\"compiler-message\"") && !output.contains("\"spans\"") {
         return Vec::new();
     }
 
@@ -492,20 +490,24 @@ fn parse_cargo_json_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
         let Ok(val) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if val.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
-            continue;
-        }
-        let Some(msg) = val.get("message") else {
+        let msg = if val.get("reason").and_then(Value::as_str) == Some("compiler-message") {
+            let Some(message) = val.get("message").filter(|message| message.is_object()) else {
+                continue;
+            };
+            message
+        } else if val.get("message").is_some_and(Value::is_string)
+            && val.get("level").is_some_and(Value::is_string)
+            && val.get("spans").is_some_and(Value::is_array)
+        {
+            &val
+        } else {
             continue;
         };
         let level = msg.get("level").and_then(|v| v.as_str()).unwrap_or("error");
         let severity = match level {
             "warning" => DiagnosticSeverity::Warning,
-            // rustc emits `error`, `ice`, `failure-note`; treat anything not
-            // explicitly a warning as an error so the counts surface real
-            // failures. `note`/`help` arrive as children of a real diagnostic
-            // and never as a top-level compiler-message in practice.
-            _ => DiagnosticSeverity::Error,
+            "error" | "ice" | "failure-note" => DiagnosticSeverity::Error,
+            _ => DiagnosticSeverity::Info,
         };
         let code = msg
             .get("code")
@@ -795,6 +797,7 @@ fn command_emits_cargo_json(command_lower: &str) -> bool {
         return false;
     }
     command_lower.contains("--message-format=json")
+        || command_lower.contains("--error-format=json")
         || command_lower.contains("--message-format compact")
         || command_lower.contains("--error-format=json")
 }
@@ -932,7 +935,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "build".to_string(),
-        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses cargo/rustc JSON (`--message-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. It collects retained output pages before parsing; diagnostics_complete=false means capture or diagnostic results are incomplete, with session_id/output_pending when further raw pages remain. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
+        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. It collects retained output pages before parsing; diagnostics_complete=false means capture or diagnostic results are incomplete, with session_id/output_pending when further raw pages remain. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
             .to_string(),
         declarations: r#"type BuildSpan = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type BuildSuggestion = { file: string; byte_start: number; byte_end: number; replacement: string; applicability: "MachineApplicable" | "MaybeIncorrect" | "HasPlaceholders"; span?: BuildSpan };
@@ -1423,6 +1426,25 @@ BUILD FAILED in 1s
         assert_eq!(fixed["ok"], true);
         assert_eq!(fixed["exit_code"], 0);
         assert_eq!(fixed["diagnostics"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn raw_rustc_warning_preserves_repair_suggestion_on_successful_exit() {
+        let output = r#"{"$message_type":"diagnostic","message":"variable does not need to be mutable","code":{"code":"unused_mut"},"level":"warning","spans":[{"file_name":"src/lib.rs","byte_start":21,"byte_end":25,"line_start":2,"column_start":9,"is_primary":true}],"children":[{"message":"remove this mut","level":"help","spans":[{"file_name":"src/lib.rs","byte_start":21,"byte_end":25,"suggested_replacement":"","suggestion_applicability":"MachineApplicable"}]}]}"#;
+        let parsed = parse_build_output(
+            "rustc --crate-type lib --error-format=json src/lib.rs",
+            output,
+            0,
+            false,
+            100,
+        );
+        assert_eq!(parsed.tool, BuildTool::Cargo);
+        assert_eq!(parsed.counts.errors, 0);
+        assert_eq!(parsed.counts.warnings, 1);
+        let diagnostic = &parsed.diagnostics[0];
+        assert_eq!(diagnostic.code.as_deref(), Some("unused_mut"));
+        assert_eq!(diagnostic.suggestions[0].replacement, "");
+        assert_eq!(diagnostic.suggestions[0].byte_start, 21);
     }
 
     // ---- cargo / rustc JSON diagnostics ----

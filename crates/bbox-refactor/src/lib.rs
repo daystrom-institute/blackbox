@@ -5269,7 +5269,9 @@ pub fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
     ensure_non_overlapping(edits)?;
     let mut out = source.to_string();
     let mut sorted = edits.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|edit| edit.byte_start);
+    // Match overlap validation: a replacement beginning at an insertion's
+    // coordinate consumes original bytes before the insertion adds new bytes.
+    sorted.sort_by_key(|edit| (edit.byte_start, edit.byte_end));
     for edit in sorted.into_iter().rev() {
         if edit.byte_start > edit.byte_end || edit.byte_end > out.len() {
             bail!("invalid edit range {}..{}", edit.byte_start, edit.byte_end);
@@ -5284,6 +5286,31 @@ pub fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
         out.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod edit_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn insertion_at_replacement_start_is_order_independent() {
+        let replacement = TextEdit {
+            byte_start: 1,
+            byte_end: 4,
+            replacement: "new".into(),
+        };
+        let insertion = TextEdit {
+            byte_start: 1,
+            byte_end: 1,
+            replacement: "prefix:".into(),
+        };
+        for edits in [
+            vec![replacement.clone(), insertion.clone()],
+            vec![insertion, replacement],
+        ] {
+            assert_eq!(apply_text_edits("[old]", &edits).unwrap(), "[prefix:new]");
+        }
+    }
 }
 
 fn read_original_for_edit(path: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
