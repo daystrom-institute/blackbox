@@ -24,6 +24,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+#[path = "openai_responses_compaction.rs"]
+mod compaction;
+
 pub struct OpenAiResponsesTransport {
     state: ResponsesState,
     http: reqwest::Client,
@@ -306,33 +309,7 @@ impl OpenAiResponsesTransport {
             let t = resp.text().await.unwrap_or_default();
             anyhow::bail!("openai responses compact {status}: {t}");
         }
-        let mut out = String::new();
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read responses compact chunk")?;
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let raw: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&raw);
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let Ok(ev) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if ev["type"].as_str() == Some("response.output_text.delta")
-                    && let Some(t) = ev["delta"].as_str()
-                {
-                    out.push_str(t);
-                }
-            }
-        }
+        let out = compaction::collect_summary(resp).await?;
         // Keep only the durable `<summary>` block, dropping the `<analysis>`
         // scratchpad the structured prompt asks for.
         let summary = super::extract_summary(&out);
@@ -360,14 +337,13 @@ impl OpenAiResponsesTransport {
         rb
     }
 
-    /// Canonical OAI-idiomatic compaction: POST the full structured history to the
-    /// backend's unary `responses/compact` endpoint and replace the buffer with
-    /// the returned replacement `input[]` (retained user/developer/system messages
-    /// plus one encrypted `compaction_summary` item). The server does retention and
-    /// summarization; nothing is rendered to plaintext or capped client-side.
-    /// Contract validated live — see design/bro-harness/brodex-compaction.md §5.
-    /// Returns the encrypted summary blob (for the `compact_boundary` size signal)
-    /// or `None` when there is nothing to compact / the server returned no output.
+    /// Unary compaction uses structured history and opaque encrypted summaries.
+    /// Fit only tool-output payloads when the model window is known; preserve all
+    /// source history until a valid replacement arrives. The endpoint owns
+    /// retention and summarization. Both native encrypted-summary aliases are
+    /// accepted without rewriting their wire representation.
+    /// Returns the encrypted blob for the boundary size signal, or `None` when
+    /// there is nothing to compact. Invalid output is an error.
     async fn remote_compact(
         &mut self,
         tools: &[super::ToolSpec],
@@ -379,6 +355,10 @@ impl OpenAiResponsesTransport {
         }
         let url = format!("{}/compact", self.http_endpoint);
         let body = responses_common::build_compaction_input(&self.state.input, tools, opts);
+        // Fit a copy: neither rejected requests nor invalid summaries may consume
+        // the source history. Unknown model windows remain provider-validated.
+        let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
+        let body = compaction::fit_input(body, window)?;
 
         let mut resp = super::http::send_with_retry("openai-responses/compact", || {
             self.apply_compact_headers(self.http.post(&url))
@@ -413,18 +393,7 @@ impl OpenAiResponsesTransport {
             anyhow::bail!("openai responses compact {status}: {text}");
         }
         let v: Value = serde_json::from_str(&text).context("parse compact response")?;
-        let output = v["output"].as_array().cloned().unwrap_or_default();
-        if output.is_empty() {
-            tracing::warn!("responses/compact returned no output; leaving history unchanged");
-            return Ok(None);
-        }
-        // The encrypted summary blob — its size is the `compact_boundary` signal.
-        let summary = output
-            .iter()
-            .find(|it| it["type"] == "compaction_summary")
-            .and_then(|it| it["encrypted_content"].as_str())
-            .map(str::to_string)
-            .unwrap_or_default();
+        let (output, summary) = compaction::validate_output(v)?;
         self.state.input = output;
         // The rebuilt buffer no longer carries the persisted ambient manifest;
         // reset the hash so the next turn re-injects it.
