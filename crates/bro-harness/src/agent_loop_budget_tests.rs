@@ -1,0 +1,363 @@
+// Included from agent_loop::tests so these exercise the real Session loop.
+mod budget_behavior {
+    use super::*;
+
+    #[derive(Clone)]
+    struct Boundary {
+        kind: &'static str,
+        model: String,
+        history: Value,
+        system: SystemPrompt,
+        tool_names: Vec<String>,
+    }
+
+    struct BudgetTransport {
+        history: Vec<Value>,
+        usage: VecDeque<Usage>,
+        boundaries: Arc<Mutex<Vec<Boundary>>>,
+        fail_compaction: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Transport for BudgetTransport {
+        fn name(&self) -> &'static str {
+            "budget-probe"
+        }
+
+        fn push_user_text(&mut self, text: &str) {
+            self.history.push(json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]}));
+        }
+
+        fn push_tool_results(&mut self, results: Vec<transport::ToolResult>) {
+            for result in results {
+                self.history.push(json!({"type":"function_call_output", "call_id":result.id, "output":result.content}));
+            }
+        }
+
+        fn snapshot(&self) -> Value {
+            json!({"input":self.history})
+        }
+
+        fn restore(&mut self, snapshot: Value) {
+            self.history = snapshot
+                .get("input")
+                .unwrap_or(&snapshot)
+                .as_array()
+                .unwrap()
+                .clone();
+        }
+
+        async fn run_turn(
+            &mut self,
+            tools: &[transport::ToolSpec],
+            opts: &TurnOpts,
+            _: &dyn transport::TurnSink,
+        ) -> Result<transport::TurnOutput> {
+            self.boundaries.lock().unwrap().push(Boundary {
+                kind: "request",
+                model: opts.model.clone(),
+                history: self.snapshot(),
+                system: opts.system.clone(),
+                tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+            });
+            let usage = self.usage.pop_front().unwrap_or_default();
+            // Model output can be replayable reasoning rather than visible text.
+            // Preserve native content in the same history that the loop budgets.
+            if usage.output_tokens > 0 {
+                self.history.push(json!({"type":"reasoning", "encrypted_content":"x".repeat(usage.output_tokens as usize * 4)}));
+            }
+            self.history.push(json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}));
+            Ok(transport::TurnOutput {
+                observation_content: None,
+                text: "done".into(),
+                thinking: String::new(),
+                tool_calls: vec![],
+                stop: StopReason::Done,
+                end_turn: None,
+                usage,
+            })
+        }
+
+        async fn compact(
+            &mut self,
+            _: transport::CompactionParams,
+            _: &str,
+            tools: &[transport::ToolSpec],
+            opts: &TurnOpts,
+        ) -> Result<Option<String>> {
+            self.boundaries.lock().unwrap().push(Boundary {
+                kind: "compact",
+                model: opts.model.clone(),
+                history: self.snapshot(),
+                system: opts.system.clone(),
+                tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+            });
+            anyhow::ensure!(
+                !self.fail_compaction.load(Ordering::SeqCst),
+                "synthetic compaction failure"
+            );
+            self.history = vec![
+                json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Prior work summary."}]}),
+            ];
+            Ok(Some("Prior work summary.".into()))
+        }
+    }
+
+    fn probe(
+        usage: Vec<Usage>,
+    ) -> (
+        Session,
+        Arc<Mutex<Vec<Boundary>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (mut session, _) = mk_session(vec![]);
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        session.tx = Box::new(BudgetTransport {
+            history: vec![],
+            usage: usage.into(),
+            boundaries: boundaries.clone(),
+            fail_compaction: fail.clone(),
+        });
+        (session, boundaries, fail)
+    }
+
+    #[tokio::test]
+    async fn retained_output_crosses_threshold_before_next_task_is_inserted() {
+        let (mut session, boundaries, _) = probe(vec![Usage {
+            input_tokens: 195_000,
+            output_tokens: 20_000,
+            ..Usage::default()
+        }]);
+        session.compact_threshold = Some(200_000);
+        run_user_turn(&mut session, "initial task").await;
+        assert_eq!(session.last_prompt_tokens, 195_000);
+        run_user_turn(&mut session, "NEW_TASK_AFTER_OUTPUT").await;
+        let events = boundaries.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec!["request", "compact", "request"]
+        );
+        assert!(events[1].history.to_string().contains("encrypted_content"));
+        assert!(
+            !events[1]
+                .history
+                .to_string()
+                .contains("NEW_TASK_AFTER_OUTPUT")
+        );
+        assert!(
+            events[2]
+                .history
+                .to_string()
+                .contains("NEW_TASK_AFTER_OUTPUT")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_history_without_usage_checkpoint_compacts_before_first_continuation() {
+        let (mut session, boundaries, _) = probe(vec![]);
+        session.tx.restore(json!({"input":[{"type":"message", "role":"user", "content":[{"type":"input_text", "text":"legacy-history ".repeat(40_000)}]}]}));
+        session.compact_threshold = Some(100_000);
+        assert_eq!(session.last_prompt_tokens, 0);
+        assert_eq!(session.pending_input_estimate, 0);
+        run_user_turn(&mut session, "RESUMED_NEW_TASK").await;
+        let events = boundaries.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec!["compact", "request"]
+        );
+        assert!(events[0].history.to_string().contains("legacy-history"));
+        assert!(!events[0].history.to_string().contains("RESUMED_NEW_TASK"));
+        assert!(events[1].history.to_string().contains("RESUMED_NEW_TASK"));
+    }
+
+    struct ExpandedSchema;
+
+    #[async_trait]
+    impl Tool for ExpandedSchema {
+        fn name(&self) -> &str {
+            "expanded_budget_schema"
+        }
+        fn description(&self) -> &str {
+            "Synthetic expanded schema fixture"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object", "properties":{"value":{"type":"string", "enum":["allowed-value".repeat(4_000)]}}})
+        }
+        async fn call(&self, _: Value, _: &ToolCx) -> bro_tools::ToolResult {
+            bro_tools::ToolResult::Text("unused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn newly_available_schema_is_budgeted_before_the_imminent_request() {
+        let (mut session, boundaries, _) = probe(vec![Usage {
+            input_tokens: 100,
+            ..Usage::default()
+        }]);
+        session.compact_threshold = Some(10_000);
+        run_user_turn(&mut session, "small schema task").await;
+        session.reg = Registry::new(
+            vec![Arc::new(ExpandedSchema)],
+            vec![],
+            &PinPolicy::from_env(),
+            &mcp::ToolFilter::default(),
+        )
+        .unwrap();
+        run_user_turn(&mut session, "TASK_WITH_EXPANDED_SCHEMA").await;
+        let events = boundaries.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec!["request", "compact", "request"]
+        );
+        assert!(
+            events[1]
+                .tool_names
+                .iter()
+                .any(|name| name == "expanded_budget_schema")
+        );
+        assert!(
+            !events[1]
+                .history
+                .to_string()
+                .contains("TASK_WITH_EXPANDED_SCHEMA")
+        );
+        assert!(
+            events[2]
+                .tool_names
+                .iter()
+                .any(|name| name == "expanded_budget_schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_instruction_batch_is_budgeted_before_the_new_task() {
+        use crate::context::dispatch::CompositionStrategy;
+        for strategy in [
+            CompositionStrategy::CodexShaped,
+            CompositionStrategy::VibeShaped,
+        ] {
+            let (mut session, boundaries, _) = probe(vec![Usage {
+                input_tokens: 100,
+                ..Usage::default()
+            }]);
+            session.strategy = strategy;
+            let _directory = install_startup_instructions(&mut session, "SMALL_INITIAL_RULE").await;
+            session.compact_threshold = Some(10_000);
+            run_user_turn(&mut session, "initial instruction task").await;
+            std::fs::write(
+                session.cx.root.join("AGENTS.md"),
+                "LARGE_CURRENT_RULE ".repeat(4_000),
+            )
+            .unwrap();
+            run_user_turn(&mut session, "TASK_AFTER_RULE_GROWTH").await;
+            let events = boundaries.lock().unwrap();
+            assert_eq!(
+                events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+                vec!["request", "compact", "request"]
+            );
+            assert!(
+                !events[1]
+                    .history
+                    .to_string()
+                    .contains("TASK_AFTER_RULE_GROWTH")
+            );
+            for event in &events[1..] {
+                if strategy.context_rides_user_lane() {
+                    assert!(event.history.to_string().contains("LARGE_CURRENT_RULE"));
+                } else {
+                    assert!(
+                        event
+                            .system
+                            .stable_text()
+                            .unwrap()
+                            .contains("LARGE_CURRENT_RULE")
+                    );
+                }
+            }
+            assert!(
+                events[2]
+                    .history
+                    .to_string()
+                    .contains("TASK_AFTER_RULE_GROWTH")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_resets_checkpoint_and_does_not_recompact_next_turn() {
+        let (mut session, boundaries, _) = probe(vec![]);
+        session.last_prompt_tokens = 195_000;
+        session.pending_input_estimate = 20_000;
+        session.last_request_overhead_tokens = 2_000;
+        session.compact_threshold = Some(200_000);
+        session.compact_manual().await.unwrap();
+        assert_eq!(
+            (
+                session.last_prompt_tokens,
+                session.pending_input_estimate,
+                session.last_request_overhead_tokens
+            ),
+            (0, 0, 0)
+        );
+        assert!(session.reference_context_item.is_none());
+        run_user_turn(&mut session, "continue after manual compaction").await;
+        assert_eq!(
+            boundaries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec!["compact", "request"]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_downshift_compacts_with_previous_model_before_new_model_inference() {
+        let (mut session, boundaries, _) = probe(vec![]);
+        session.base_opts.model = "fixture-large-window".into();
+        session.context_window = Some(1_000_000);
+        session.last_prompt_tokens = 300_000;
+        session.pending_input_estimate = 20_000;
+        session.apply_control("gpt-5.5").await.unwrap();
+        assert_eq!(session.base_opts.model, "gpt-5.5");
+        run_user_turn(&mut session, "task on smaller model").await;
+        let events = boundaries.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec!["compact", "request"]
+        );
+        assert_eq!(events[0].model, "fixture-large-window");
+        assert_eq!(events[1].model, "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn failed_downshift_keeps_previous_model_history_and_budget_checkpoint() {
+        let (mut session, boundaries, fail) = probe(vec![]);
+        session.base_opts.model = "fixture-large-window".into();
+        session.context_window = Some(1_000_000);
+        session.last_prompt_tokens = 300_000;
+        session.pending_input_estimate = 20_000;
+        session.last_request_overhead_tokens = 500;
+        session.tx.push_user_text("DURABLE_PREVIOUS_HISTORY");
+        let before = session.tx.snapshot();
+        fail.store(true, Ordering::SeqCst);
+        assert!(session.apply_control("gpt-5.5").await.is_err());
+        assert_eq!(session.base_opts.model, "fixture-large-window");
+        assert_eq!(session.context_window, Some(1_000_000));
+        assert_eq!(session.tx.snapshot(), before);
+        assert_eq!(
+            (
+                session.last_prompt_tokens,
+                session.pending_input_estimate,
+                session.last_request_overhead_tokens
+            ),
+            (300_000, 20_000, 500)
+        );
+        let events = boundaries.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "compact");
+        assert_eq!(events[0].model, "fixture-large-window");
+    }
+}
