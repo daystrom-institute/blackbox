@@ -694,10 +694,11 @@ struct Session {
     resume_runtime_reset: bool,
     emitter: Emitter,
     base_opts: TurnOpts,
-    /// Explicit caller-supplied system text. Discovered AGENTS/UserInstructions
-    /// lives in `user_instructions`, not in the system slot.
+    /// Explicit caller-supplied system text.
     explicit_system: Option<String>,
-    user_instructions: Option<crate::context::UserInstructions>,
+    /// Captured full instruction section for strategies that rebuild memory in
+    /// system. The typed ledger owns versions and delivery receipts.
+    instruction_system: Option<String>,
     /// Per-transport composition strategy: where persona, directives, memory,
     /// scope, and pins land for this session's transport
     /// (design/bro-harness/dispatch-prompt-slots.md §5).
@@ -798,8 +799,8 @@ impl Session {
         // Three-state --system-prompt:
         //   non-empty ⇒ explicit override, kept verbatim in the system slot;
         //   ""        ⇒ explicit suppress (no system prompt, no AGENTS fragment);
-        //   absent    ⇒ not overridden ⇒ Codex-style AGENTS.md discovery moves
-        //               to UserInstructions in the contextual user message.
+        //   absent    ⇒ discover typed filesystem instructions, delivered at
+        //               the model boundary according to the provider strategy.
         // Per-session working directory: explicit `--cwd` (the daemon's
         // dispatch cwd, passed instead of mutating the process cwd) or the
         // process cwd for the standalone binary. All file/shell tools and
@@ -810,19 +811,11 @@ impl Session {
             None => std::env::current_dir().context("cwd")?,
         };
 
-        let startup_docs = cli
-            .system_prompt
-            .is_none()
-            .then(|| crate::project_doc::discover(&root))
-            .flatten();
         let explicit_system = cli
             .system_prompt
             .as_deref()
             .filter(|text| !text.is_empty())
             .map(str::to_owned);
-        // Filesystem instructions have one typed delivery ledger. Static user
-        // fragments remain available to callers without duplicating discovered docs.
-        let user_instructions = None;
 
         let kind = TransportKind::from_env();
         let mut tx = transport::build_transport(kind).await?;
@@ -844,15 +837,10 @@ impl Session {
         let restored_last_event_seq = store.restored.as_ref().map_or(0, |r| r.last_event_seq);
         let log_tail_seq = EventLog::max_seq_in_log(event_log.path());
         let seq_counter = Arc::new(AtomicU64::new(restored_last_event_seq.max(log_tail_seq)));
-        let scoped_project_docs = Arc::new(crate::project_doc::ScopedProjectDocs::new(
+        let scoped_project_docs = Arc::new(crate::project_doc::ScopedProjectDocs::for_session(
             root.clone(),
-            startup_docs.as_ref(),
+            cli.system_prompt.as_deref(),
         ));
-        if cli.system_prompt.is_some() {
-            scoped_project_docs.suppress_startup_discovery();
-        } else {
-            scoped_project_docs.enroll_global_candidates();
-        }
         // Hand the transport the stable session id, so it can populate the
         // codex-style `session-id` header + `prompt_cache_key` (vs a random
         // per-request id).
@@ -1226,7 +1214,7 @@ impl Session {
             emitter,
             base_opts,
             explicit_system,
-            user_instructions,
+            instruction_system: None,
             max_turns,
             compaction,
             compact_threshold,
@@ -1349,19 +1337,6 @@ impl Session {
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
 
-        // Timestamp the user turn in the sidecar log. The protocol stream
-        // only carries user text when `--replay-user-messages` is on, so the
-        // loop logs the authoritative turn itself, in envelope shape, so the
-        // log stays a single uniform stream for postmortems and indexing.
-        self.event_log.append_event(&json!({
-            "type": "user",
-            "session_id": self.session_id(),
-            "message": {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}],
-            },
-        }));
-
         let mut final_text = String::new();
         // The TERMINAL step's text, tracked separately from `final_text`:
         // `final_text` keeps the last NON-EMPTY text of the whole turn (it is
@@ -1433,49 +1408,16 @@ impl Session {
                         self.pending_input_estimate = 0;
                         self.reference_context_item = None;
                         self.scoped_project_docs.invalidate_delivery();
-                        // Mid-turn compaction must restore authoritative context
-                        // before the model continues without another user turn.
-                        self.emit_initial_context_if_needed();
+                        // The next request boundary restores typed instructions
+                        // before environment and any pending user input.
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
                 }
             }
-            if let Some(prompt) = pending_prompt.take() {
-                self.prepare_context_for_user_turn();
-                self.push_user_text_raw(prompt);
-            }
-            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
-                .await?;
-            let mut sys = compose_system(
-                &self.system_sections(),
-                &self.reg,
-                self.output_schema.is_some(),
-            );
-            if let Some(t) = self.tail_nudge.take() {
-                let v = sys.volatile.get_or_insert_with(String::new);
-                if !v.is_empty() {
-                    v.push('\n');
-                }
-                v.push_str(&t);
-            }
-            // Per-turn directives ride the volatile lane AFTER the existing
-            // channels (structured-output reminder, tail nudges) — design §8.
-            // On openai-chat after-tool turns the transport folds the volatile
-            // tail into the leading system block (Mistral forbids
-            // system-after-tool); everywhere else this is the uncached
-            // trailing slot, late relative to the task.
-            if let Some(per_turn) = self.dispatch.per_turn_text() {
-                let v = sys.volatile.get_or_insert_with(String::new);
-                if !v.is_empty() {
-                    v.push('\n');
-                }
-                v.push_str(&per_turn);
-            }
-            let opts = TurnOpts {
-                system: sys,
-                ..self.base_opts.clone()
-            };
+            // Preserve the same tail across an overflow retry while rebuilding
+            // the strategy's system section from the refreshed instruction state.
+            let mut tail_nudge = None;
 
             // Run the model call, recovering once from a context-window
             // rejection by compacting and retrying. This is the reactive safety
@@ -1486,6 +1428,56 @@ impl Session {
             let mut overflow_compacted = false;
             let out = 'attempt: loop {
                 self.deliver_instruction_context().await?;
+                if pending_prompt.is_some() || self.reference_context_item.is_none() {
+                    self.prepare_context_for_user_turn();
+                }
+                if let Some(prompt) = pending_prompt.take() {
+                    // Record the task at the same boundary/order seen by the
+                    // model, after authoritative context has been delivered.
+                    self.event_log.append_event(&json!({
+                        "type": "user",
+                        "session_id": self.session_id(),
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": prompt}],
+                        },
+                    }));
+                    self.push_user_text_raw(prompt);
+                }
+                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
+                    .await?;
+                if let Some(nudge) = self.tail_nudge.take() {
+                    tail_nudge = Some(nudge);
+                }
+                let mut sys = compose_system(
+                    &self.system_sections(),
+                    &self.reg,
+                    self.output_schema.is_some(),
+                );
+                if let Some(t) = &tail_nudge {
+                    let v = sys.volatile.get_or_insert_with(String::new);
+                    if !v.is_empty() {
+                        v.push('\n');
+                    }
+                    v.push_str(t);
+                }
+                // Per-turn directives ride the volatile lane AFTER the existing
+                // channels (structured-output reminder, tail nudges), design §8.
+                // On openai-chat after-tool turns the transport folds the volatile
+                // tail into the leading system block (Mistral forbids
+                // system-after-tool); everywhere else this is the uncached
+                // trailing slot, late relative to the task.
+                if let Some(per_turn) = self.dispatch.per_turn_text() {
+                    let v = sys.volatile.get_or_insert_with(String::new);
+                    if !v.is_empty() {
+                        v.push('\n');
+                    }
+                    v.push_str(&per_turn);
+                }
+                let opts = TurnOpts {
+                    system: sys,
+                    ..self.base_opts.clone()
+                };
                 self.tx.normalize_for_prompt();
                 let r = tokio::select! {
                     biased;
@@ -1528,7 +1520,6 @@ impl Session {
                                 self.pending_input_estimate = 0;
                                 self.reference_context_item = None;
                                 self.scoped_project_docs.invalidate_delivery();
-                                self.emit_initial_context_if_needed();
                             }
                             // Nothing compactible, or compaction itself failed:
                             // a retry would just re-overflow — surface the
@@ -2114,10 +2105,7 @@ impl Session {
             ..SystemSections::default()
         };
         if !self.strategy.context_rides_user_lane() {
-            sections.memory = self
-                .user_instructions
-                .as_ref()
-                .map(crate::context::ContextualUserFragment::render);
+            sections.memory = self.instruction_system.clone();
             sections.environment = Some(crate::context::ContextualUserFragment::render(
                 &crate::context::EnvironmentContext::from_tool_cx(&self.cx),
             ));
@@ -2152,17 +2140,14 @@ impl Session {
         // the stable system slot, so the initial-context emitter contributes
         // NOTHING to the user lane.
         if self.strategy.context_rides_user_lane() {
-            // Turn-1 contextual user message ordering (codex order):
-            // UserInstructions (AGENTS.md) → scope → pins → environment LAST.
+            // The typed instruction batch is delivered first at the request
+            // boundary; scope, pins and environment follow before the task.
             if self.dispatch.scope_render().is_none() && self.dispatch.emitted_scope.is_some()
                 || self.dispatch.pins_render().is_none() && self.dispatch.emitted_pins.is_some()
             {
                 self.emit_dispatch_context_changes_if_needed();
             }
             let mut sections = Vec::new();
-            if let Some(instructions) = &self.user_instructions {
-                sections.push(crate::context::ContextualUserFragment::render(instructions));
-            }
             if let Some(scope) = self.dispatch.scope_render() {
                 self.dispatch.emitted_scope = Some(scope.clone());
                 sections.push(scope);
@@ -2304,14 +2289,22 @@ impl Session {
             .scoped_project_docs
             .pending_batch(self.cx.instruction_generation)
         {
-            // Publish exactly the bytes entering provider history. A caught JS
-            // exception or a parsed source-file string cannot acknowledge them.
-            self.tx.push_user_text(&batch.text);
+            let batch = if self.strategy.context_rides_user_lane() {
+                self.tx.push_user_text(&batch.text);
+                self.pending_input_estimate = self
+                    .pending_input_estimate
+                    .saturating_add(est_tokens(&batch.text));
+                batch
+            } else {
+                let snapshot = self.scoped_project_docs.snapshot_batch(batch.generation);
+                self.instruction_system = Some(snapshot.text.clone());
+                snapshot
+            };
+            // These exact bytes are now captured in transport history or the
+            // leading system section used by the imminent request. Tool output
+            // and old yielded cells cannot acknowledge this generation.
             self.emitter
                 .instruction_context(batch.generation, &batch.text, &batch.documents);
-            self.pending_input_estimate = self
-                .pending_input_estimate
-                .saturating_add(est_tokens(&batch.text));
             self.scoped_project_docs.acknowledge(&batch);
         }
         Ok(())
@@ -3018,6 +3011,7 @@ mod tests {
         /// SystemPrompt observed by each run_turn call, for slot-routing
         /// assertions (volatile-lane ordering, stable composition).
         seen_systems: Arc<Mutex<Vec<SystemPrompt>>>,
+        seen_users: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     struct MockTransport {
@@ -3051,6 +3045,11 @@ mod tests {
             _sink: &dyn transport::TurnSink,
         ) -> Result<transport::TurnOutput> {
             self.shared.started.fetch_add(1, Ordering::SeqCst);
+            self.shared
+                .seen_users
+                .lock()
+                .unwrap()
+                .push(self.shared.pushed_users.lock().unwrap().clone());
             self.shared
                 .seen_systems
                 .lock()
@@ -3209,9 +3208,11 @@ mod tests {
             }
         }
         fn snapshot(&self) -> Value {
-            json!([])
+            json!(*self.shared.pushed_users.lock().unwrap())
         }
-        fn restore(&mut self, _snapshot: Value) {}
+        fn restore(&mut self, snapshot: Value) {
+            *self.shared.pushed_users.lock().unwrap() = serde_json::from_value(snapshot).unwrap();
+        }
         async fn compact(
             &mut self,
             _params: transport::CompactionParams,
@@ -3755,7 +3756,7 @@ mod tests {
                 service_tier: None,
             },
             explicit_system: None,
-            user_instructions: None,
+            instruction_system: None,
             max_turns: 50,
             compaction: crate::compaction::CompactionPolicy::from_env(),
             compact_threshold: None,
@@ -3777,6 +3778,36 @@ mod tests {
             tail_nudge: None,
         };
         (session, shared)
+    }
+
+    async fn startup_docs_at(root: &std::path::Path) -> crate::project_doc::ScopedProjectDocs {
+        transport::with_session_env(
+            BTreeMap::from([
+                (
+                    "CODEX_HOME".into(),
+                    root.join("codex-home").display().to_string(),
+                ),
+                (
+                    "BRO_HARNESS_PROJECT_DOC_FILES".into(),
+                    "AGENTS.override.md,AGENTS.md".into(),
+                ),
+            ]),
+            async { crate::project_doc::ScopedProjectDocs::for_session(root.to_path_buf(), None) },
+        )
+        .await
+    }
+
+    async fn install_startup_instructions(session: &mut Session, body: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("codex-home")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), body).unwrap();
+        let docs = startup_docs_at(&root).await;
+        session.cx.root = root;
+        session.scoped_project_docs = Arc::new(docs);
+        session.cx.instruction_policy = Some(session.scoped_project_docs.clone());
+        directory
     }
 
     async fn run_user_turn(session: &mut Session, prompt: &str) {
@@ -5196,78 +5227,95 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_and_overflow_compaction_restore_instructions_before_continuing() {
-        for overflow in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().canonicalize().unwrap();
-            let first = if overflow {
-                MockTurn::ContextOverflow
-            } else {
-                MockTurn::HighUsageFollowUp
-            };
-            let (mut session, shared) = mk_session_with_store(
-                vec![first, MockTurn::Text("done".into())],
-                Some(SessionStore::for_test(root.join("session.json"))),
-            );
-            session.cx.root = root.clone();
-            session.compact_threshold = Some(5_000);
-            session.user_instructions = Some(crate::context::UserInstructions {
-                directory: root.display().to_string(),
-                text: "EXACT_COMPACTION_INSTRUCTIONS".into(),
-                loaded_paths: Vec::new(),
-            });
-            run_user_turn(&mut session, "continue through compaction").await;
-            assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(shared.started.load(Ordering::SeqCst), 2);
-            let users = shared.pushed_users.lock().unwrap();
-            assert_eq!(
-                users
-                    .iter()
-                    .filter(|text| text.contains("EXACT_COMPACTION_INSTRUCTIONS"))
-                    .count(),
-                2,
-                "initial context must be restored without waiting for another user turn"
-            );
-            assert!(
-                users
-                    .last()
-                    .unwrap()
-                    .contains("EXACT_COMPACTION_INSTRUCTIONS")
-            );
-            assert!(session.reference_context_item.is_some());
+        use crate::context::dispatch::CompositionStrategy;
+        for strategy in [
+            CompositionStrategy::CodexShaped,
+            CompositionStrategy::VibeShaped,
+        ] {
+            for overflow in [false, true] {
+                let first = if overflow {
+                    MockTurn::ContextOverflow
+                } else {
+                    MockTurn::HighUsageFollowUp
+                };
+                let (mut session, shared) = mk_session(vec![first, MockTurn::Text("done".into())]);
+                session.strategy = strategy;
+                let _directory =
+                    install_startup_instructions(&mut session, "EXACT_COMPACTION_INSTRUCTIONS")
+                        .await;
+                session.compact_threshold = Some(5_000);
+                run_user_turn(&mut session, "continue through compaction").await;
+                assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(shared.started.load(Ordering::SeqCst), 2);
+                let requests = shared.seen_users.lock().unwrap();
+                let systems = shared.seen_systems.lock().unwrap();
+                if strategy.context_rides_user_lane() {
+                    assert_eq!(
+                        requests[1]
+                            .iter()
+                            .filter(|text| text.contains("EXACT_COMPACTION_INSTRUCTIONS"))
+                            .count(),
+                        2
+                    );
+                    ordered(
+                        &requests[0].join("\n"),
+                        &[
+                            "EXACT_COMPACTION_INSTRUCTIONS",
+                            "<environment_context>",
+                            "continue through compaction",
+                        ],
+                    );
+                    ordered(
+                        &requests[1][requests[0].len()..].join("\n"),
+                        &["EXACT_COMPACTION_INSTRUCTIONS", "<environment_context>"],
+                    );
+                } else {
+                    assert_eq!(requests[0], vec!["continue through compaction"]);
+                    assert_eq!(requests[1], requests[0]);
+                    for system in systems.iter() {
+                        assert!(
+                            system
+                                .stable_text()
+                                .unwrap()
+                                .contains("EXACT_COMPACTION_INSTRUCTIONS")
+                        );
+                    }
+                }
+                assert!(
+                    session
+                        .scoped_project_docs
+                        .pending_batch(session.cx.instruction_generation)
+                        .is_none()
+                );
+            }
         }
     }
 
     #[tokio::test]
     async fn compaction_clear_persists_null_and_next_turn_reinjects_full_context() {
         let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
-        let env = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
-        session.reference_context_item = Some(env.to_turn_context_item());
-        session.user_instructions = Some(crate::context::UserInstructions {
-            directory: "/repo".into(),
-            text: "AGENTS_AFTER_COMPACT".into(),
-            loaded_paths: Vec::new(),
-        });
-
+        let _directory = install_startup_instructions(&mut session, "AGENTS_AFTER_COMPACT").await;
+        session.reference_context_item = Some(
+            crate::context::EnvironmentContext::from_tool_cx(&session.cx).to_turn_context_item(),
+        );
         session.compact_manual().await.unwrap();
-
         assert_eq!(session.reference_context_item, None);
         assert_eq!(session.side_state()["reference_context"], Value::Null);
-
         run_user_turn(&mut session, "after compact").await;
-
-        let pushed = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(pushed.len(), 2, "{pushed:?}");
-        assert!(pushed[0].contains("# AGENTS.md instructions"), "{pushed:?}");
-        assert!(pushed[0].contains("AGENTS_AFTER_COMPACT"), "{pushed:?}");
-        assert!(pushed[0].contains("<environment_context>"), "{pushed:?}");
-        assert!(pushed[0].contains("<cwd>"), "{pushed:?}");
-        assert!(pushed[0].contains("<current_date>"), "{pushed:?}");
-        assert!(pushed[0].contains("<timezone>"), "{pushed:?}");
-        assert_eq!(pushed[1], "after compact");
-        assert!(
-            session.reference_context_item.is_some(),
-            "full re-inject should re-establish the baseline"
+        let requests = shared.seen_users.lock().unwrap();
+        ordered(
+            &requests[0].join("\n"),
+            &[
+                "AGENTS_AFTER_COMPACT",
+                "<environment_context>",
+                "after compact",
+            ],
         );
+        assert_eq!(
+            requests[0].last().map(String::as_str),
+            Some("after compact")
+        );
+        assert!(session.reference_context_item.is_some());
     }
 
     #[tokio::test]
@@ -5339,35 +5387,25 @@ mod tests {
         haystack.match_indices(needle).count()
     }
 
-    #[test]
-    fn discovered_agents_move_to_context_before_environment() {
+    #[tokio::test]
+    async fn discovered_agents_move_to_context_before_environment() {
         let (mut session, shared) = mk_session(vec![]);
-        let agents = "AGENTS_UNIQUE_RULE";
-        session.user_instructions = Some(crate::context::UserInstructions {
-            directory: "/repo".into(),
-            text: agents.into(),
-            loaded_paths: Vec::new(),
-        });
-
-        let system = compose_system(&session.system_sections(), &session.reg, false);
-        assert!(
-            !system.stable_text().unwrap_or("").contains(agents),
-            "AGENTS text must not stay in system stable on the codex-shaped strategy"
+        let _directory = install_startup_instructions(&mut session, "AGENTS_UNIQUE_RULE").await;
+        run_user_turn(&mut session, "hello").await;
+        let requests = shared.seen_users.lock().unwrap();
+        ordered(
+            &requests[0].join("\n"),
+            &["AGENTS_UNIQUE_RULE", "<environment_context>", "hello"],
         );
-
-        session.push_user_text("hello");
-
-        let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(pushed.len(), 2);
-        let context = &pushed[0];
-        let user_idx = context.find("# AGENTS.md instructions").unwrap();
-        let env_idx = context.find("<environment_context>").unwrap();
-        assert!(user_idx < env_idx, "{context}");
         assert_eq!(
-            occurrences(system.stable_text().unwrap_or(""), agents)
-                + occurrences(context, agents)
-                + occurrences(&pushed[1], agents),
+            occurrences(&requests[0].join("\n"), "AGENTS_UNIQUE_RULE"),
             1
+        );
+        assert!(
+            !shared.seen_systems.lock().unwrap()[0]
+                .stable_text()
+                .unwrap()
+                .contains("AGENTS_UNIQUE_RULE")
         );
     }
 
@@ -5394,7 +5432,7 @@ mod tests {
         let (mut session, shared) = mk_session(vec![]);
         let explicit = "EXPLICIT_SYSTEM_UNIQUE";
         session.explicit_system = Some(explicit.into());
-        session.user_instructions = None;
+        session.instruction_system = None;
 
         let system = compose_system(&session.system_sections(), &session.reg, false);
         assert!(system.stable_text().unwrap().contains(explicit));
@@ -5464,21 +5502,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn codex_shaped_initial_context_orders_agents_scope_pins_env() {
+    #[tokio::test]
+    async fn codex_shaped_initial_context_orders_agents_scope_pins_env() {
         let (mut session, shared) = mk_session(vec![]);
-        session.user_instructions = Some(crate::context::UserInstructions {
-            directory: "/repo".into(),
-            text: "AGENTS_UNIQUE_RULE".into(),
-            loaded_paths: Vec::new(),
-        });
+        let _directory = install_startup_instructions(&mut session, "AGENTS_UNIQUE_RULE").await;
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
-
-        // Persona + standing directives ride the stable system slot; per-turn
-        // directives do NOT (they ride the volatile tail per request); memory/
-        // scope/pins do NOT (contextual user lane).
-        let system = compose_system(&session.system_sections(), &session.reg, false);
-        let stable = system.stable_text().unwrap();
+        run_user_turn(&mut session, "hello").await;
+        let systems = shared.seen_systems.lock().unwrap();
+        let stable = systems[0].stable_text().unwrap();
         ordered(stable, &["PERSONA_UNIQUE", "STANDING_UNIQUE"]);
         for absent in [
             "PER_TURN_UNIQUE",
@@ -5489,45 +5520,33 @@ mod tests {
         ] {
             assert!(!stable.contains(absent), "{absent} must not ride stable");
         }
-
-        session.push_user_text("hello");
-        let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(pushed.len(), 2);
-        // Turn-1 contextual user message ordering (codex order): AGENTS →
-        // scope → pins → environment LAST.
+        let requests = shared.seen_users.lock().unwrap();
         ordered(
-            &pushed[0],
+            &requests[0].join("\n"),
             &[
-                "# AGENTS.md instructions",
+                "AGENTS_UNIQUE_RULE",
                 "<bbox_scope>",
                 "task: task-1",
                 "<bbox_pins>",
                 "PINS_UNIQUE",
                 "<environment_context>",
+                "hello",
             ],
         );
-        assert_eq!(pushed[1], "hello");
-        // Baselines recorded for change/compaction re-emit.
+        assert_eq!(requests[0].last().map(String::as_str), Some("hello"));
         assert!(session.dispatch.emitted_scope.is_some());
         assert!(session.dispatch.emitted_pins.is_some());
     }
 
-    #[test]
-    fn vibe_shaped_folds_context_into_stable_and_keeps_user_lane_clean() {
+    #[tokio::test]
+    async fn vibe_shaped_folds_context_into_stable_and_keeps_user_lane_clean() {
         let (mut session, shared) = mk_session(vec![]);
         session.strategy = crate::context::dispatch::CompositionStrategy::VibeShaped;
-        session.user_instructions = Some(crate::context::UserInstructions {
-            directory: "/repo".into(),
-            text: "AGENTS_UNIQUE_RULE".into(),
-            loaded_paths: Vec::new(),
-        });
+        let _directory = install_startup_instructions(&mut session, "AGENTS_UNIQUE_RULE").await;
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
-
-        // The leading-block ordering trades cache granularity for salience:
-        // stable-first, per-resume-mutable sections (scope/pins) at the
-        // suffix (design §5).
-        let system = compose_system(&session.system_sections(), &session.reg, false);
-        let stable = system.stable_text().unwrap();
+        run_user_turn(&mut session, "one-line task").await;
+        let systems = shared.seen_systems.lock().unwrap();
+        let stable = systems[0].stable_text().unwrap();
         ordered(
             stable,
             &[
@@ -5541,12 +5560,7 @@ mod tests {
             ],
         );
         assert!(!stable.contains("PER_TURN_UNIQUE"));
-
-        // The initial-context emitter contributes NOTHING to the user lane:
-        // the task is the only user message (the gap-00efeb12 fix).
-        session.push_user_text("one-line task");
-        let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(*pushed, vec!["one-line task".to_string()]);
+        assert_eq!(shared.seen_users.lock().unwrap()[0], vec!["one-line task"]);
     }
 
     #[test]
@@ -5596,6 +5610,221 @@ mod tests {
         assert_eq!(shared.pushed_users.lock().unwrap().len(), 3);
     }
 
+    #[tokio::test]
+    async fn restored_dispatch_clear_revokes_history_before_new_task() {
+        use crate::context::dispatch::{
+            DispatchContextArg, DispatchState, resolve_dispatch_context_arg,
+        };
+        let (mut original, _) = mk_session(vec![]);
+        original.dispatch = test_dispatch_state(Some(test_scope("old-task")));
+        run_user_turn(&mut original, "original task").await;
+        let persisted = serde_json::to_string(
+            &json!({"side": original.side_state(), "history": original.tx.snapshot()}),
+        )
+        .unwrap();
+        for clear in ["{}", ""] {
+            let prior: Value = serde_json::from_str(&persisted).unwrap();
+            let (mut resumed, shared) = mk_session(vec![]);
+            resumed.tx.restore(prior["history"].clone());
+            resumed.dispatch = DispatchState::from_arg(
+                resolve_dispatch_context_arg(Some(clear)).unwrap(),
+                &prior["side"],
+            );
+            run_user_turn(&mut resumed, "new task").await;
+            let first = shared.seen_users.lock().unwrap()[0].join("\n");
+            ordered(
+                &first,
+                &[
+                    "task: old-task",
+                    "Prior dispatch scope has been cleared",
+                    "Prior dispatch pins have been cleared",
+                    "new task",
+                ],
+            );
+            assert_eq!(resumed.dispatch.emitted_to_side(), Value::Null);
+            run_user_turn(&mut resumed, "next task").await;
+            let requests = shared.seen_users.lock().unwrap();
+            assert_eq!(
+                occurrences(
+                    &requests[1].join("\n"),
+                    "Prior dispatch scope has been cleared"
+                ),
+                1
+            );
+            assert!(
+                !shared.seen_systems.lock().unwrap()[0]
+                    .stable_text()
+                    .unwrap()
+                    .contains("PERSONA_UNIQUE")
+            );
+        }
+        for arg in [
+            DispatchContextArg::Absent,
+            DispatchContextArg::Provided(Box::new(original.dispatch.context.clone().unwrap())),
+        ] {
+            let (mut resumed, shared) = mk_session(vec![]);
+            resumed.tx.restore(original.tx.snapshot());
+            let absent = matches!(&arg, DispatchContextArg::Absent);
+            resumed.dispatch = DispatchState::from_arg(arg, &original.side_state());
+            run_user_turn(&mut resumed, "continue").await;
+            let request = shared.seen_users.lock().unwrap()[0].join("\n");
+            assert_eq!(
+                request.contains("Prior dispatch scope has been cleared"),
+                absent
+            );
+            assert!(!request.contains("Prior dispatch pins have been cleared"));
+        }
+        let (mut fresh, shared) = mk_session(vec![]);
+        fresh.dispatch = DispatchState::from_arg(DispatchContextArg::Clear, &Value::Null);
+        run_user_turn(&mut fresh, "fresh task").await;
+        assert!(
+            !shared.seen_users.lock().unwrap()[0]
+                .join("\n")
+                .contains("has been cleared")
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_updates_resume_and_revocations_follow_strategy_and_generation() {
+        use crate::context::dispatch::CompositionStrategy;
+        use bro_tools::{InstructionAccess, InstructionPaths, InstructionPolicy};
+        for strategy in [
+            CompositionStrategy::CodexShaped,
+            CompositionStrategy::VibeShaped,
+        ] {
+            let (mut session, shared) = mk_session(vec![]);
+            session.strategy = strategy;
+            let _directory = install_startup_instructions(&mut session, "FIRST_RULE").await;
+            run_user_turn(&mut session, "first task").await;
+            let root = session.cx.root.clone();
+            let old_generation = session.cx.instruction_generation;
+            std::fs::write(root.join("AGENTS.md"), "UPDATED_RULE").unwrap();
+            let mutation = || InstructionPaths {
+                paths: vec![root.join("value.txt")],
+                access: InstructionAccess::Mutate,
+            };
+            assert!(
+                session
+                    .scoped_project_docs
+                    .check(mutation(), old_generation)
+                    .await
+                    .is_err()
+            );
+            run_user_turn(&mut session, "second task").await;
+            assert!(
+                session
+                    .scoped_project_docs
+                    .check(mutation(), old_generation)
+                    .await
+                    .is_err()
+            );
+            session
+                .scoped_project_docs
+                .check(mutation(), session.cx.instruction_generation)
+                .await
+                .unwrap();
+            {
+                let requests = shared.seen_users.lock().unwrap();
+                let systems = shared.seen_systems.lock().unwrap();
+                if strategy.context_rides_user_lane() {
+                    ordered(
+                        &requests[1].join("\n"),
+                        &["FIRST_RULE", "first task", "UPDATED_RULE", "second task"],
+                    );
+                } else {
+                    assert_eq!(requests[1], vec!["first task", "second task"]);
+                    assert!(!systems[1].stable_text().unwrap().contains("FIRST_RULE"));
+                    assert!(systems[1].stable_text().unwrap().contains("UPDATED_RULE"));
+                }
+            }
+
+            run_user_turn(&mut session, "unchanged task").await;
+            {
+                let requests = shared.seen_users.lock().unwrap();
+                assert_eq!(requests[2].len(), requests[1].len() + 1);
+                assert_eq!(
+                    requests[2].last().map(String::as_str),
+                    Some("unchanged task")
+                );
+                if !strategy.context_rides_user_lane() {
+                    let systems = shared.seen_systems.lock().unwrap();
+                    assert_eq!(systems[2].stable_text(), systems[1].stable_text());
+                }
+            }
+
+            // Reconstruct from serialized side state and history; no delivery
+            // receipts or captured system text survive this process boundary.
+            let side: Value =
+                serde_json::from_str(&serde_json::to_string(&session.side_state()).unwrap())
+                    .unwrap();
+            let (mut resumed, resumed_shared) = mk_session(vec![]);
+            resumed.strategy = strategy;
+            resumed.cx.root = root.clone();
+            resumed.tx.restore(session.tx.snapshot());
+            resumed.scoped_project_docs = Arc::new(startup_docs_at(&root).await);
+            resumed.scoped_project_docs.restore_observed_paths(
+                serde_json::from_value(side["instruction_observed_paths"].clone()).unwrap(),
+            );
+            resumed
+                .scoped_project_docs
+                .restore_documents(
+                    serde_json::from_value(side["instruction_documents"].clone()).unwrap(),
+                )
+                .await
+                .unwrap();
+            resumed.cx.instruction_policy = Some(resumed.scoped_project_docs.clone());
+            resumed.resume_runtime_reset = true;
+            std::fs::write(root.join("AGENTS.md"), "RESUMED_RULE").unwrap();
+            run_user_turn(&mut resumed, "resumed task").await;
+            let generation = resumed.cx.instruction_generation;
+            resumed
+                .scoped_project_docs
+                .check(mutation(), generation)
+                .await
+                .unwrap();
+            std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+            assert!(
+                resumed
+                    .scoped_project_docs
+                    .check(mutation(), generation)
+                    .await
+                    .is_err()
+            );
+            run_user_turn(&mut resumed, "after removal").await;
+            resumed
+                .scoped_project_docs
+                .check(mutation(), resumed.cx.instruction_generation)
+                .await
+                .unwrap();
+            let requests = resumed_shared.seen_users.lock().unwrap();
+            let systems = resumed_shared.seen_systems.lock().unwrap();
+            if strategy.context_rides_user_lane() {
+                ordered(
+                    &requests[0].join("\n"),
+                    &["Session runtime reset", "RESUMED_RULE", "resumed task"],
+                );
+                ordered(
+                    &requests[1].join("\n"),
+                    &[
+                        "resumed task",
+                        "revoke its previously delivered instructions",
+                        "after removal",
+                    ],
+                );
+            } else {
+                assert!(systems[0].stable_text().unwrap().contains("RESUMED_RULE"));
+                assert!(!systems[1].stable_text().unwrap().contains("RESUMED_RULE"));
+                assert!(
+                    systems[1]
+                        .stable_text()
+                        .unwrap()
+                        .contains("revoke its previously delivered instructions")
+                );
+                assert!(!requests[1].join("\n").contains("RESUMED_RULE"));
+            }
+        }
+    }
+
     #[test]
     fn removed_dispatch_scope_is_explicitly_cleared_once() {
         let (mut session, shared) = mk_session(vec![]);
@@ -5617,40 +5846,30 @@ mod tests {
         assert_eq!(shared.pushed_users.lock().unwrap().len(), count);
     }
 
-    #[test]
-    fn codex_shaped_post_compaction_re_emits_current_context() {
+    #[tokio::test]
+    async fn codex_shaped_post_compaction_re_emits_current_context() {
         let (mut session, shared) = mk_session(vec![]);
-        session.user_instructions = Some(crate::context::UserInstructions {
-            directory: "/repo".into(),
-            text: "AGENTS_UNIQUE_RULE".into(),
-            loaded_paths: Vec::new(),
-        });
+        let _directory = install_startup_instructions(&mut session, "AGENTS_UNIQUE_RULE").await;
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
-        session.push_user_text("turn one");
-
-        // Simulate a resume that changed the scope, then compaction resetting
-        // the reference item (agent_loop compaction paths set it to None):
-        // the deterministic re-emit renders the CURRENT in-memory context.
+        run_user_turn(&mut session, "turn one").await;
         session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-9"));
-        session.reference_context_item = None;
-        session.prepare_context_for_user_turn();
-
-        let pushed = shared.pushed_users.lock().unwrap();
-        let re_emitted = pushed.last().unwrap();
+        session.compact_manual().await.unwrap();
+        run_user_turn(&mut session, "turn two").await;
+        let requests = shared.seen_users.lock().unwrap();
         ordered(
-            re_emitted,
+            &requests[1][requests[0].len()..].join("\n"),
             &[
-                "# AGENTS.md instructions",
+                "AGENTS_UNIQUE_RULE",
                 "<bbox_scope>",
                 "task: task-9",
                 "<bbox_pins>",
                 "<environment_context>",
+                "turn two",
             ],
         );
         assert_eq!(
             session.dispatch.emitted_scope.as_deref(),
-            session.dispatch.scope_render().as_deref(),
-            "post-compaction re-emit must update the baseline"
+            session.dispatch.scope_render().as_deref()
         );
     }
 
@@ -5661,7 +5880,7 @@ mod tests {
         // in stable (design §8): base + persona + directives, no AGENTS.
         let (mut session, _shared) = mk_session(vec![]);
         session.explicit_system = None;
-        session.user_instructions = None;
+        session.instruction_system = None;
         session.dispatch = test_dispatch_state(None);
         let system = compose_system(&session.system_sections(), &session.reg, false);
         let stable = system.stable_text().unwrap();

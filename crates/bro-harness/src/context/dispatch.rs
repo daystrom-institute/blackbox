@@ -108,7 +108,11 @@ impl DispatchState {
                 emitted_scope,
                 emitted_pins,
             },
-            DispatchContextArg::Clear => Self::default(),
+            DispatchContextArg::Clear => Self {
+                context: None,
+                emitted_scope,
+                emitted_pins,
+            },
             DispatchContextArg::Absent => {
                 // Side-cell convention: tolerant restore (absent/garbage →
                 // empty). Scope is structurally absent from the persisted
@@ -401,15 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn clear_wipes_context_and_baselines() {
+    fn clear_retains_baselines_until_history_receives_revocations() {
         let side = json!({
             "dispatch_context": {"v": 1, "persona": "p"},
             "dispatch_emitted": {"scope": "s", "pins": "p"},
         });
         let state = DispatchState::from_arg(DispatchContextArg::Clear, &side);
-        assert_eq!(state, DispatchState::default());
+        assert_eq!(state.context, None);
         assert_eq!(state.context_to_side(), Value::Null);
-        assert_eq!(state.emitted_to_side(), Value::Null);
+        assert_eq!(state.emitted_to_side(), side["dispatch_emitted"]);
     }
 
     #[test]
