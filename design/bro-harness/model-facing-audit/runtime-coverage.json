@@ -1,0 +1,662 @@
+{
+  "runtime_source_ref": "3822401645743652e6979ad671da5f9d712cc6e4",
+  "codex_source_ref": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "scope": "104 original local tools plus five conditional harness tools. One original Java tool retired; 103 local tools remain. Shared MCP adapter and loop/projection contracts are covered separately; third-party implementations are not enumerated here.",
+  "evidence_kind": "actual local tool use and compiled fixtures; scripted transport is protocol verification, not model inference or efficacy comparison",
+  "tools": [
+    {
+      "name": "analysis.cohesionClusters",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.describe",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.fieldClassification",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.fieldInitializerClosure",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.implPartition",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.methodRegions",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.references",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "analysis.topLevelDeps",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "apply_patch",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "build.gate",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.fields",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.files",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.items",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.query",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.read",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.readLines",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.signature",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "code.spanUnion",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "content_search",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.apply",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.begin",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.createFile",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.delete",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.deleteFile",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.insertAfter",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.insertBefore",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.merge",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.replace",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "edits.replaceText",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "file_edit",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "file_read",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "file_write",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "git_commit",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "git_diff",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "git_log",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "git_show",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "git_status",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "glob",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.addImport",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.changeSignature",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.changeSignaturePreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.describe",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.encapsulateField",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.encapsulateFieldPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.extractClass",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.extractClassPreviewPlan",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.extractColumnSpec",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retired; broken implementation removed from callable and advertised catalogs"
+    },
+    {
+      "name": "java.extractInterface",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.extractMethodCodeBlock",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.fieldInjectToConstructor",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.fieldInjectToConstructorPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.hygiene",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.inlineMethod",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.inlineMethodPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.migrateTypeUsages",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.migrateTypeUsagesPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.moveClass",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.moveMember",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.moveMemberPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.movePackage",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.normalizeWhitespace",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.organizeImports",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.pullUpMembers",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.pullUpPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.pushDownMembers",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.pushDownMembersPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.removeUnusedConstructorParams",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.renameSymbol",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.replaceConstructorWithFactory",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.replaceConstructorWithFactoryPreview",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "java.synthesizeHelperWrappers",
+      "runtime_evidence": "scripts/probe-java-binding-contracts.py",
+      "report": "java-binding-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "list_dir",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.assist",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.definition",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.executeCommand",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.hover",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.references",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.rename",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.status",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "lsp.willRenameFiles",
+      "runtime_evidence": "scripts/audit-harness-analysis-lsp.py",
+      "report": "analysis-lsp-runtime-repair.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.describe",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.extractImplMethods",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.extractItems",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.extractTrait",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.fixRound",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.inlineModToFile",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.liftToFree",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.migrateErrorType",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.migrateTypeUsages",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained with operator-authority prerequisite; refusal verified without fabricating a grant"
+    },
+    {
+      "name": "rust.moduleWiring",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.moveStructFields",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.organizeImports",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.rewriteModuleCallers",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.setVisibility",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "rust.updateCallers",
+      "runtime_evidence": "scripts/audit-rust-bindings-runtime.py",
+      "report": "rust-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "sandbox_grounding",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "sandbox_status",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained deferred inspection/helper"
+    },
+    {
+      "name": "shell_kill",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "shell_list",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "shell_poll",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "shell_run",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "smart_read",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "deferred compatibility alias of exact file_read"
+    },
+    {
+      "name": "todo_write",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "web_fetch",
+      "runtime_evidence": "scripts/probes/core-binding-contract-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained"
+    },
+    {
+      "name": "exec",
+      "runtime_evidence": "scripts/probes/harness-repository-loop-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained conditional harness tool"
+    },
+    {
+      "name": "wait",
+      "runtime_evidence": "scripts/probes/harness-repository-loop-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained conditional harness tool"
+    },
+    {
+      "name": "tool_search",
+      "runtime_evidence": "scripts/probes/harness-repository-loop-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained conditional harness tool"
+    },
+    {
+      "name": "report",
+      "runtime_evidence": "scripts/probes/harness-repository-loop-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained conditional harness tool"
+    },
+    {
+      "name": "final_result",
+      "runtime_evidence": "scripts/probes/harness-repository-loop-audit.py",
+      "report": "core-runtime-audit.md",
+      "disposition": "retained conditional harness tool"
+    }
+  ]
+}

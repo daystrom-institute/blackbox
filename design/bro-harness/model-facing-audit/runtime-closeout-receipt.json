@@ -1,0 +1,57 @@
+{
+  "runtime_source_ref": "3822401645743652e6979ad671da5f9d712cc6e4",
+  "branch": "beta/blackbox-v2",
+  "codex_source_ref": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+  "inventory": {
+    "original_local": 104,
+    "retained_local": 103,
+    "conditional_harness": 5,
+    "retired": [
+      "java.extractColumnSpec"
+    ],
+    "uncovered_installed_tools": []
+  },
+  "native": {
+    "bro-harness_sha256": "7d75c870c10987746efa9d9255afd9674c396737f4cd6a9e6cc0eefb66aeb39a",
+    "isolate_sha256": "a836f4283a646f4695e8b0ab040a2d9d22299f7a73052a587270bfe742f48c2e",
+    "persistent_signature_verified": true,
+    "prior_binaries_backed_up": true,
+    "installed_core_recorder": "passed",
+    "installed_surface_recorder": "passed",
+    "installed_repository_loop_with_compaction": "passed"
+  },
+  "focused_nextest": {
+    "passed": 1792,
+    "skipped": 11
+  },
+  "full_verification": {
+    "workflow": "bbox-verify-xnb5j",
+    "phase": "Succeeded",
+    "profile": "full",
+    "passed": 6972,
+    "skipped": 19,
+    "clippy": "passed",
+    "concurrency": "passed"
+  },
+  "runtime_evidence": {
+    "java_multiline": 38,
+    "java_compact": 11,
+    "rust_cases": 21,
+    "analysis_lsp_checks": 58,
+    "model_inference_for_these_recorders": false
+  },
+  "image_build": {
+    "workflow": "build-bbox-image-jjvqr",
+    "phase": "Succeeded",
+    "tag": "382240164574",
+    "digest": "sha256:9c0d6ee1cb55ab583dee0b516dfee323f1f3cb9796047c9e2c592d98cbefafb9",
+    "git_url_override": "https://github.com/daystrom-institute/blackbox.git"
+  },
+  "deployment": {
+    "namespace": "blackbox",
+    "deployment": "blackboxd",
+    "rollout": "succeeded",
+    "health_http_status": 200
+  },
+  "interpretation": "Correctness and usability evidence for the enumerated local contracts. No model-efficiency conclusion."
+}

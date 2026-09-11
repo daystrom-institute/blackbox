@@ -1,7 +1,7 @@
 ---
 title: "Core tools: executable contracts and repository loop replay"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, audit]
 brief: "Direct use of every ordinary tool, source-fact and edit binding, plus a compiled repository repair through the harness loop."
@@ -81,3 +81,5 @@ lifecycle behavior; they do not establish the quality of any provider model.
 The shared MCP adapter's envelope, metadata, admission and uncertainty behavior
 remains covered by the earlier composition/invocation repairs and regressions.
 Individual third-party server implementations are outside this local-tool audit.
+
+Final shared gates and deployment: [runtime audit closeout](runtime-audit-closeout.md).

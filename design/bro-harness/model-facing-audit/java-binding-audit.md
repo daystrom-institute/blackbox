@@ -125,3 +125,5 @@ relocation moved two source files.
 Results are recorded in [java-binding-receipts.json](java-binding-receipts.json).
 The original failing observations are retained there as compact public-fixture
 receipts; raw generated legacy column content is intentionally not copied.
+
+Final shared gates and deployment: [runtime audit closeout](runtime-audit-closeout.md).

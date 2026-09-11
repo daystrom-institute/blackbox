@@ -1,7 +1,7 @@
 ---
 title: "Rust binding runtime and compiler audit"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, audit, rust]
 brief: "Executable coverage of every installed rust.* binding, applied edits, compiler outcomes, authority refusals, and source-integrity repairs."
@@ -54,3 +54,5 @@ The [rebuilt-binary verification](rust-runtime-verified.json) passes all 21 case
 These are syntax-tier tools, not whole-program semantic refactors. Compiler and call-site checks remain required. The module caller rewrite still uses simple module segments and does not resolve aliases or split grouped imports. Trait imports use conventional file/module geometry; nonstandard `#[path]` layouts and moved-method dependencies may need explicit import repair. Dot-method scope reports are candidates because receiver types are not resolved. An unimplemented organize mode and a missing operator grant are explicit refusals, not evidence of a successful operation.
 
 Substrate tracking: `gap-9b56878c`, dedupe `refactor_primitive/refactor-tools/rust-runtime-proposal-integrity`. The unrelated pre-existing gap file is outside this audit's ownership.
+
+Final shared gates and deployment: [runtime audit closeout](runtime-audit-closeout.md).

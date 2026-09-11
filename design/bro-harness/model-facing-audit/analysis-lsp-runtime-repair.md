@@ -1,7 +1,7 @@
 ---
 title: "Analysis and LSP binding runtime audit"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, refactor]
 brief: "Per-tool execution evidence and repairs for all eight analysis and eight LSP bindings."
@@ -142,3 +142,5 @@ Parent-coordinated focused tests passed the analysis, LSP, and facts regressions
 The surrounding gate had three failures in other work areas, so this receipt
 does not claim an overall workspace gate pass. Full integration and deployment
 receipts belong to the parent campaign.
+
+Final shared gates and deployment: [runtime audit closeout](runtime-audit-closeout.md).

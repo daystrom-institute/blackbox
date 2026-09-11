@@ -1,7 +1,7 @@
 ---
 title: "Model-facing tools: prioritized repair plan"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic: [bro-harness, tools, context-management]
 brief: "Ordered implementation slices and acceptance criteria following the comprehensive Codex comparison."
@@ -9,19 +9,18 @@ brief: "Ordered implementation slices and acceptance criteria following the comp
 
 # Prioritized repairs
 
-The overall audit remains open. The implementation milestones below close the
-identified shared-contract defects, not validation of every model-facing tool.
-The complete schema inventory and source review do not establish practical
-usability or semantic correctness of every specialized binding. The
-[hands-on pass](model-facing-audit/hands-on-isolate.md) exercised selected
-repository read/search/edit/discovery/shell flows and records its limits.
+The audit and repair work is complete for the enumerated local tools and shared
+harness contracts. The [runtime closeout](model-facing-audit/runtime-audit-closeout.md)
+records every original tool's disposition, applied-source/compiler evidence,
+loop replay with compaction, full verification, and deployment. The
+[per-tool ledger](model-facing-audit/runtime-coverage.json) covers all 104 original
+local tools plus the five conditional harness tools. One broken Java transform
+was retired; all 103 retained local tools match the installed catalog.
 
-Remaining closure work is tool-by-tool practical coverage of the specialized
-families, representative end-to-end loop use, and disposition of the remaining
-inventory/output-volume friction. Each tool needs evidence for its advertised
-use and recoverable failure behavior, or an explicit reason to change, retire
-or defer it. Passing workspace gates and deploying a repair do not close those
-coverage gaps.
+This completion is grounded in direct tool use and concrete correctness checks.
+It does not establish model-efficiency improvements or revive the withdrawn
+low-effort toy-workload comparison. The milestone history below records the
+sequence; the runtime closeout is the current completion receipt.
 
 The [comprehensive audit](model-facing-tools-comprehensive-audit.md) is the
 finding inventory and reference snapshot. This plan sequences implementation;
@@ -151,5 +150,5 @@ probes, and the eight retained comparative live trials. Both native binaries and
 the cage were converged on `26b02877` at that milestone. Correctness repairs and
 catalog byte reductions have separate evidence. The low-effort toy comparison
 does not support an agent-efficiency conclusion; that conclusion is withdrawn.
-The later hands-on fixes and deployment are recorded separately and likewise do
-not establish completion of the overall audit.
+The subsequent complete runtime matrix, repairs and deployment close the
+overall audit as recorded in the runtime closeout linked above.
