@@ -448,7 +448,7 @@ fn walk_for_rewrites(
                         // RHS / rvalue: check Copy whitelist.
                         let field_ty = field_types.get(&fname).map(String::as_str).unwrap_or("");
                         if !field_ty.is_empty() && rust_deep::is_copy_whitelist(field_ty) {
-                            let replacement = format!("self.{delegate_field}.{fname}()");
+                            let replacement = format!("self.{delegate_field}.{fname}");
                             let in_sr = is_in_self_receiver_fn(source_bytes, node);
                             candidates.push(Candidate {
                                 byte_start: node.start_byte(),
@@ -726,8 +726,12 @@ impl BigServer {
         let plan_json = plan_update_callers(&p).unwrap();
         let result = apply_plan(&plan_json);
         assert!(
-            result.contains("self.state.count()"),
+            result.contains("self.state.count"),
             "expected rewritten accessor:\n{result}"
+        );
+        assert!(
+            !result.contains("self.state.count()"),
+            "field reads must not become getter calls"
         );
         assert!(
             !result.contains("self.count\n") && !result.contains("self.count;"),
@@ -983,7 +987,7 @@ impl BigServer {
             "expected helper rewritten:\n{result}"
         );
         assert!(
-            result.contains("self.state.count()"),
+            result.contains("self.state.count"),
             "expected count rewritten:\n{result}"
         );
     }

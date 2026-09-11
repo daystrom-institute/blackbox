@@ -182,10 +182,10 @@ impl RustExtractImplMethods {
         let candidates: Vec<&RustImplMethod> = methods
             .iter()
             .filter(|method| {
-                params
-                    .impl_name
-                    .as_deref()
-                    .is_none_or(|impl_name| method.impl_name == impl_name)
+                params.impl_name.as_deref().is_none_or(|impl_name| {
+                    method.impl_name == impl_name
+                        || method.impl_name.strip_prefix("impl ") == Some(impl_name)
+                })
             })
             .collect();
         if candidates.is_empty() {
@@ -293,7 +293,11 @@ impl RustExtractImplMethods {
         let rebase_super_paths = rust_target_is_child_module_of_source(&source_path, &target_path);
 
         // Read target and compute target edits.
-        let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+        let (target_source, target_is_new) = match fs::read_to_string(&target_path) {
+            Ok(source) => (source, false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+            Err(error) => return ToolResult::Error(format!("read target: {error}")),
+        };
         let target_sha = sha256_hex(target_source.as_bytes());
         let target_edits = match rust_impl_methods_target_edits(
             &target_path,
@@ -319,14 +323,15 @@ impl RustExtractImplMethods {
             &path_string(&source_path),
             &source_sha,
         ));
-        changes.extend(text_edits_to_span_changes(
-            &target_edits,
-            &path_string(&target_path),
-            &target_sha,
-        ));
+        if !target_is_new {
+            changes.extend(text_edits_to_span_changes(
+                &target_edits,
+                &path_string(&target_path),
+                &target_sha,
+            ));
+        }
 
-        // Track if target is new (empty or non-existent).
-        let target_is_new = target_source.trim().is_empty();
+        // Missing targets are creates; existing empty files are still edits.
         let creates: Vec<Value> = if target_is_new {
             // The target edits already contain the full replacement (including
             // prelude). We report creates so the cell can use edits.createFile.
@@ -575,6 +580,43 @@ mod tests {
                 );
             }
             _ => panic!("expected error, got {result:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn missing_target_is_only_a_create_and_type_name_selects_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(
+            root.join("source.rs"),
+            "pub struct Widget;\nimpl Widget {\n    pub fn value(&self)->u32 { 4 }\n}\n",
+        )
+        .unwrap();
+        for exists in [false, true] {
+            if exists {
+                fs::write(root.join("target.rs"), "").unwrap();
+            }
+            let result = RustExtractImplMethods.call(json!({
+                "source":"source.rs", "target":"target.rs", "item_names":["value"], "impl_name":"Widget"
+            }), &cx_in(&root)).await;
+            let ToolResult::Json(value) = result else {
+                panic!("{result:?}")
+            };
+            assert_eq!(
+                value["creates"].as_array().unwrap().len(),
+                usize::from(!exists)
+            );
+            let target_changes = value["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|change| {
+                    change["span"]["file"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("target.rs")
+                })
+                .count();
+            assert_eq!(target_changes, usize::from(exists));
         }
     }
 }

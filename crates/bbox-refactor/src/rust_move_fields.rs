@@ -162,8 +162,34 @@ pub fn plan_move_struct_fields(p: &RefactorPlanParams) -> anyhow::Result<String>
         anyhow!("could not locate field_declaration_list closing brace in target struct")
     })?;
 
-    let mut inserted = String::new();
+    let target_fields = collect_field_decls_in_struct(&parsed_tgt.source, tgt_struct_node);
     for field in &fields_to_move {
+        if target_fields
+            .iter()
+            .any(|existing| existing.name == field.name)
+        {
+            bail!(
+                "target struct already declares field `{}`; choose a non-conflicting destination",
+                field.name
+            );
+        }
+    }
+    let needs_comma = target_fields.last().is_some_and(|field| {
+        !parsed_tgt.source[field.byte_end..insert_byte]
+            .trim_start()
+            .starts_with(',')
+    });
+    let mut inserted = if needs_comma {
+        String::from(",\n")
+    } else {
+        String::new()
+    };
+    for field in &fields_to_move {
+        for attribute in &field.attributes {
+            inserted.push_str("    ");
+            inserted.push_str(attribute);
+            inserted.push('\n');
+        }
         let vis_prefix = match visibility_override {
             Some(v) if !v.is_empty() => format!("{v} "),
             Some(_) => String::new(), // explicit empty = strip visibility
@@ -286,6 +312,7 @@ struct FieldDecl {
     name: String,
     type_text: String,
     visibility: Option<String>,
+    attributes: Vec<String>,
     byte_end: usize,
     /// Start of removal range: the indentation/newline before the field.
     leading_start: usize,
@@ -335,13 +362,36 @@ fn collect_field_decls_recursive(
             .unwrap_or("")
             .to_string();
         let visibility = field_visibility(node, source_bytes);
-        // leading_start = start of the line containing the field
-        let leading = line_start_before(source_str, node.start_byte());
+        let mut attributes = Vec::new();
+        let mut declaration_start = node.start_byte();
+        let mut previous = node.prev_named_sibling();
+        while let Some(sibling) = previous {
+            let text = sibling.utf8_text(source_bytes).unwrap_or("");
+            if sibling.kind() != "attribute_item"
+                && !text.starts_with("///")
+                && !text.starts_with("/**")
+            {
+                break;
+            }
+            attributes.push(text.to_string());
+            declaration_start = sibling.start_byte();
+            previous = sibling.prev_named_sibling();
+        }
+        attributes.reverse();
+        // Only consume indentation, never the struct header or a preceding
+        // field that shares this line.
+        let line_start = line_start_before(source_str, declaration_start);
+        let leading = if source_str[line_start..declaration_start].trim().is_empty() {
+            line_start
+        } else {
+            declaration_start
+        };
         if !name.is_empty() {
             decls.push(FieldDecl {
                 name,
                 type_text,
                 visibility,
+                attributes,
                 byte_end: node.end_byte(),
                 leading_start: leading,
             });
@@ -988,6 +1038,67 @@ impl<T: Send> Server<T> {
         assert!(
             tgt_text.contains("pub count: u32"),
             "expected pub visibility"
+        );
+    }
+    #[test]
+    fn compact_struct_fields_preserve_headers_and_insert_required_comma() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("owner.rs");
+        let target = root.join("state.rs");
+        fs::write(
+            &source,
+            "pub struct Owner { pub count:u32, pub name:String }\n",
+        )
+        .unwrap();
+        fs::write(&target, "pub struct State { pub label:String }\n").unwrap();
+        let plan =
+            plan_move_struct_fields(&params_for(&source, &target, "Owner", &["count"])).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        for edit in serde_json::from_value::<Vec<FileEdit>>(value["edits"].clone()).unwrap() {
+            let source = fs::read_to_string(&edit.path).unwrap();
+            let changed = apply_text_edits(&source, &edit.edits).unwrap();
+            fs::write(&edit.path, &changed).unwrap();
+            assert!(changed.starts_with("pub struct "));
+            assert!(
+                !parse_rust_file(std::path::Path::new(&edit.path))
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_error()
+            );
+        }
+        assert!(!fs::read_to_string(source).unwrap().contains("count"));
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains("pub count: u32")
+        );
+    }
+    #[test]
+    fn field_attributes_move_with_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("owner.rs");
+        let target = root.join("state.rs");
+        fs::write(
+            &source,
+            "pub struct Owner {\n    #[cfg(any())]\n    pub count:u32,\n    pub name:String,\n}\n",
+        )
+        .unwrap();
+        fs::write(&target, "pub struct State {\n    pub label:String,\n}\n").unwrap();
+        let plan =
+            plan_move_struct_fields(&params_for(&source, &target, "Owner", &["count"])).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        for edit in serde_json::from_value::<Vec<FileEdit>>(value["edits"].clone()).unwrap() {
+            let source = fs::read_to_string(&edit.path).unwrap();
+            fs::write(&edit.path, apply_text_edits(&source, &edit.edits).unwrap()).unwrap();
+        }
+        assert!(!fs::read_to_string(source).unwrap().contains("#[cfg"));
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains("#[cfg(any())]\n    pub count")
         );
     }
 }

@@ -1,0 +1,25 @@
+{
+  "id": "gap-9b56878c",
+  "title": "Rust binding proposals need runtime source and result integrity",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools",
+  "wanted_capability": "Apply Rust binding proposals through edits.* without changing literal data, losing field attributes, synthesizing getter calls for field reads, duplicating new-file changes, or overstating trait object safety.",
+  "missing_primitive": "Runtime and compiler validated Rust binding proposal contracts",
+  "fallback_used": "Isolated multi-module fixtures, exact edits.* application, compiled runtime assertions, and explicit compiler-guided caller repair.",
+  "evidence": [
+    "scripts/audit-rust-bindings-runtime.py",
+    "crates/bbox-refactor/src/rust_move_fields.rs",
+    "crates/bbox-refactor/src/rust_extract_trait.rs",
+    "crates/bro-harness/src/bindings/rust_transforms/rewrite_callers.rs"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/rust-runtime-proposal-integrity",
+  "notes": "Live installed-isolate probes reproduced data-literal rewrites, cfg-field attribute loss, impossible getter calls, duplicate create/edit targets, and false dyn compatibility. Source repairs are being validated through a rebuilt native isolate. No operator acknowledgement grants were supplied.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-11T00:19:18Z",
+  "updated_at": "2026-09-11T00:29:20Z",
+  "resolved_at": "2026-09-11T00:29:20Z",
+  "resolution_note": "Repaired literal/comment protection, create/edit separation, field attributes and access syntax, trait extraction and object-safety reports, diagnostic anchoring disclosure, bounded caller rewriting, and default extraction visibility. All 21 executable Rust cases pass through rebuilt isolate across 15 bindings, with edits application and rustc/runtime evidence. Baseline has 8 pass/13 fail. Evidence: scripts/audit-rust-bindings-runtime.py and design/bro-harness/model-facing-audit/rust-runtime-{audit.md,baseline.json,verified.json}. Operator authority refusals remain intact; no acknowledge_* grants invented."
+}

@@ -189,3 +189,26 @@ pub(super) fn record_in_ledger(
         .collect();
     ledger.record_changes(producer, AuthorityTier::SyntaxOnly, refs.iter().copied());
 }
+
+/// Literal and comment bytes are source data, never refactor targets for
+/// textual identifier planners. The caller parses the same captured bytes.
+pub(super) fn protected_source_ranges(parsed: &bbox_refactor::ParsedSource) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut pending = vec![parsed.tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "string_literal"
+                | "raw_string_literal"
+                | "char_literal"
+                | "line_comment"
+                | "block_comment"
+        ) {
+            ranges.push((node.start_byte(), node.end_byte()));
+        } else {
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    ranges
+}

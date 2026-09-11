@@ -18,6 +18,8 @@ struct ObjectSafetyReport {
     #[serde(default)]
     associated_constants: Vec<String>,
     #[serde(default)]
+    non_dispatchable_methods: Vec<String>,
+    #[serde(default)]
     dyn_compatible: bool,
 }
 
@@ -144,8 +146,37 @@ pub fn plan_extract_trait(p: &crate::RefactorPlanParams) -> Result<String> {
     let source_impl_target =
         infer_impl_target_type(&source_path, &parsed, &impl_methods, impl_start)?;
 
-    let object_safety = ObjectSafetyReport {
+    let mut object_safety = ObjectSafetyReport {
         dyn_compatible: true,
+        non_dispatchable_methods: selected
+            .iter()
+            .filter_map(|method| {
+                let signature = method.signature_without_visibility.as_str();
+                let params = signature
+                    .split_once('(')
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .map(|(params, _)| params)
+                    .unwrap_or("");
+                let has_receiver = params.split(',').next().is_some_and(|first| {
+                    first
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|word| word == "self")
+                });
+                let other_self = params
+                    .split(',')
+                    .skip(1)
+                    .any(|param| param.contains("Self"))
+                    || signature
+                        .split_once(')')
+                        .is_some_and(|(_, tail)| tail.contains("Self"));
+                let asynchronous = signature
+                    .split("fn ")
+                    .next()
+                    .is_some_and(|prefix| prefix.split_whitespace().any(|word| word == "async"));
+                (asynchronous || !has_receiver || other_self || signature.contains("impl "))
+                    .then(|| method.method_name.clone())
+            })
+            .collect(),
         generic_methods: selected
             .iter()
             .filter(|method| method.method_has_generics)
@@ -163,9 +194,27 @@ pub fn plan_extract_trait(p: &crate::RefactorPlanParams) -> Result<String> {
             impl_start,
         )?,
     };
-    let dyn_compatible = object_safety.generic_methods.is_empty()
-        && object_safety.self_by_value_methods.is_empty()
-        && object_safety.associated_constants.is_empty();
+    // `where Self: Sized` excludes a method from dynamic dispatch without
+    // preventing trait objects. This includes the bound we add for by-value
+    // receivers, as well as explicit bounds on generic or async methods.
+    let sized_bound = Regex::new(r"\bSelf\s*:\s*([^,{]+)").expect("static Sized-bound expression");
+    let dyn_compatible = object_safety.associated_constants.is_empty()
+        && selected.iter().all(|method| {
+            let exempt = method
+                .signature_without_visibility
+                .split_once("where")
+                .is_some_and(|(_, bounds)| {
+                    sized_bound
+                        .captures_iter(bounds)
+                        .any(|capture| capture[1].split('+').any(|bound| bound.trim() == "Sized"))
+                });
+            exempt
+                || (!method.method_has_generics
+                    && !object_safety
+                        .non_dispatchable_methods
+                        .contains(&method.method_name))
+        });
+    object_safety.dyn_compatible = dyn_compatible;
 
     let selected_ids = selected
         .iter()
@@ -229,6 +278,16 @@ pub fn plan_extract_trait(p: &crate::RefactorPlanParams) -> Result<String> {
         &source_impl_target,
         &selected_by_byte,
     )?;
+    // The trait implementation lives in the target module. Bring its concrete
+    // receiver type into scope using the conventional src/ module geometry.
+    let source_module = module_path_for_file(&source_path, p.project_dir.as_deref().map(Path::new));
+    let import = source_module.map(|module| format!("use {module}::{source_impl_target};\n"));
+    let target_edit = match import {
+        Some(import) if !target_source.contains(import.trim()) => {
+            format!("\n{import}{target_edit}")
+        }
+        _ => target_edit,
+    };
     let target_edits = vec![TextEdit {
         byte_start: target_source.len(),
         byte_end: target_source.len(),
@@ -356,6 +415,15 @@ fn collect_impl_methods(parsed: &ParsedSource) -> Result<Vec<LiftMethod>> {
             let visibility_public = signature_is_public(method_signature, signature_start)?;
             let signature_without_visibility =
                 signature_without_visibility(method_signature, signature_start)?;
+            if signature_without_visibility
+                .split("fn ")
+                .next()
+                .is_some_and(|prefix| prefix.split_whitespace().any(|word| word == "const"))
+            {
+                bail!(
+                    "extract_rust_trait cannot preserve const methods in an ordinary trait; select a non-const method"
+                );
+            }
 
             methods.push(LiftMethod {
                 item,
@@ -441,19 +509,10 @@ fn signature_is_public(signature: &str, signature_start: usize) -> Result<bool> 
 }
 
 fn signature_without_visibility(signature: &str, signature_start: usize) -> Result<String> {
-    let head = signature
-        .get(0..signature_start)
-        .ok_or_else(|| anyhow!("invalid signature range"))?;
-    let mut idx = head.len();
-    let bytes = signature.as_bytes();
-    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    let visible = signature
-        .get(idx..)
-        .ok_or_else(|| anyhow!("invalid signature range"))?;
-    if !visible.starts_with("pub") {
-        return Ok(signature.get(idx..).unwrap_or("").to_string());
+    let _ = signature_start;
+    let visible = signature.trim_start();
+    if !visible.starts_with("pub ") && !visible.starts_with("pub(") {
+        return Ok(visible.to_string());
     }
     let _after_pub = &visible[3..];
     let mut cursor = 3;
@@ -573,6 +632,11 @@ fn infer_impl_target_type(
     if let Some(where_pos) = header.rfind(" where ") {
         header = header[..where_pos].trim().to_string();
     }
+    if !header.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        bail!(
+            "extract_rust_trait currently requires a simple concrete inherent impl type; generic or qualified impl targets are unsupported"
+        );
+    }
     if header.is_empty() {
         bail!(
             "failed to infer struct type from impl header in {}",
@@ -631,15 +695,9 @@ fn compose_trait_edit(
     trait_lines.push_str(&format!("pub trait {trait_name} {{\n"));
     for method in methods {
         trait_lines.push('\n');
-        let maybe_attrs = method
-            .item
-            .leading_trivia_start
-            .checked_sub(method.item.byte_start)
-            .and_then(|_| {
-                parsed
-                    .source
-                    .get(method.item.leading_trivia_start..method.item.byte_start)
-            });
+        let maybe_attrs = parsed
+            .source
+            .get(method.item.leading_trivia_start..method.item.byte_start);
         if let Some(attrs) = maybe_attrs {
             trait_lines.push_str(attrs);
         }
@@ -651,10 +709,11 @@ fn compose_trait_edit(
     trait_lines.push_str(&format!("impl {trait_name} for {impl_target} {{\n"));
     for method in methods {
         trait_lines.push('\n');
-        let body_text = parsed
-            .source
-            .get(method.item.leading_trivia_start..method.item.byte_end)
-            .ok_or_else(|| anyhow!("invalid body range for {}", method.item.plan_local_id))?;
+        let trivia = &parsed.source[method.item.leading_trivia_start..method.item.byte_start];
+        trait_lines.push_str(trivia);
+        let signature = &parsed.source[method.item.byte_start..method.body_start];
+        trait_lines.push_str(&signature_without_visibility(signature, 0)?);
+        let body_text = &parsed.source[method.body_start..method.body_end];
         trait_lines.push_str(body_text);
         if !body_text.ends_with('\n') {
             trait_lines.push('\n');
@@ -708,7 +767,8 @@ fn scan_trait_call_sites(
         methods_pattern
     ))?;
 
-    let source_module = module_path_for_file(source_file, Some(&root));
+    let _ = source_file;
+    let method_re = Regex::new(&format!(r"\.\s*(?:{})\s*\(", methods_pattern))?;
 
     let mut warnings = BTreeSet::new();
     let mut caller_modules = BTreeSet::new();
@@ -725,6 +785,12 @@ fn scan_trait_call_sites(
             Ok(text) => text,
             Err(_) => continue,
         };
+        if method_re.is_match(&text) {
+            warnings.insert(format!("possible_method_call:{}: receiver types are not resolved; import the extracted trait where needed", path_string(path)));
+            if let Some(module_path) = module_path_for_file(path, Some(&root)) {
+                caller_modules.insert(module_path);
+            }
+        }
         for cap in ufcs_re.captures_iter(&text) {
             if let Some(m) = cap.get(0) {
                 let (line, column) = line_col(&text, m.start());
@@ -759,10 +825,7 @@ fn scan_trait_call_sites(
 
     let call_site_warnings = warnings.into_iter().collect::<Vec<_>>();
 
-    let mut trait_in_scope_required = caller_modules
-        .into_iter()
-        .filter(|module| source_module.as_deref() != Some(module.as_str()))
-        .collect::<Vec<_>>();
+    let mut trait_in_scope_required = caller_modules.into_iter().collect::<Vec<_>>();
 
     trait_in_scope_required.sort();
     Ok((call_site_warnings, trait_in_scope_required))
@@ -915,12 +978,14 @@ mod tests {
         let target_text = fs::read_to_string(&target).unwrap();
         assert!(target_text.contains("pub trait StoreApi"));
         assert!(target_text.contains("impl StoreApi for Store"));
+        assert!(!target_text.contains("pub fn get"));
+        assert!(target_text.contains("use crate::Store;"));
         assert!(target_text.contains("fn get"));
         assert!(target_text.contains("fn set"));
     }
 
     #[test]
-    fn extract_trait_marks_self_by_value_with_sized_and_not_dyn_compatible() {
+    fn extract_trait_marks_self_by_value_with_sized_and_dyn_compatible() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src/main.rs");
         let target = dir.path().join("src/trait_api.rs");
@@ -954,7 +1019,7 @@ mod tests {
         .unwrap();
 
         let parsed = read_plan_fields(&plan_text);
-        assert!(!parsed.dyn_compatible);
+        assert!(parsed.dyn_compatible);
         assert!(
             parsed.object_safety_report["dyn_compatible"]
                 .as_bool()
@@ -1145,6 +1210,34 @@ mod tests {
                 .trait_in_scope_required
                 .iter()
                 .any(|path| path.ends_with("remote"))
+        );
+    }
+    #[test]
+    fn async_trait_method_is_reported_non_dispatchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("src/store.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "pub struct Store;\nimpl Store {\n    pub async fn value(&self)->u32 { 4 }\n}\n",
+        )
+        .unwrap();
+        let result = plan_extract_trait(&RefactorPlanParams {
+            source: path_string(&source),
+            target: Some(path_string(&root.join("src/api.rs"))),
+            impl_name: Some("impl Store".into()),
+            module_name: Some("Api".into()),
+            item_names: Some(vec!["value".into()]),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["dyn_compatible"], false);
+        assert_eq!(
+            value["object_safety_report"]["non_dispatchable_methods"],
+            serde_json::json!(["value"])
         );
     }
 }

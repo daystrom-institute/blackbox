@@ -13,12 +13,14 @@
 //! - `module_name`: defaults to the target file stem. Used for the
 //!   `mod <module_name>;` declaration on the parent.
 //! - `visibility`: visibility floor applied to moved items AND their
-//!   struct fields (when moving a struct). Defaults to `pub(super)`.
+//!   struct fields (when moving a struct). By default existing visibility is
+//!   preserved, with private declarations promoted to `pub(super)`.
 //! - `target_prelude`: text inserted at the top of the new file before
 //!   the moved items. Defaults to `use super::*;`. Ignored when
 //!   `merge_into_existing_target=true` (existing prelude survives).
 //! - `toml_entries.use_decl_visibility`: visibility of the auto-emitted
-//!   re-export in the parent. `private` (default), `pub`, `pub(crate)`,
+//!   re-export in the parent. Defaults to each moved item's original visibility.
+//!   Explicit values are `private`, `pub`, `pub(crate)`,
 //!   or `pub(super)`. Set to `pub(crate)` when the parent's `use M::*;`
 //!   pattern is what brings moved entry-points into the dispatcher's
 //!   scope.
@@ -98,11 +100,14 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
             &parsed,
             item,
             visibility_prefix,
+            p.visibility.is_none(),
         )?);
     }
 
     // v2 knobs out of toml_entries.
-    let use_decl_visibility = read_toml_str(&p.toml_entries, "use_decl_visibility")
+    let explicit_use_decl_visibility = read_toml_str(&p.toml_entries, "use_decl_visibility");
+    let use_decl_visibility = explicit_use_decl_visibility
+        .clone()
         .unwrap_or_else(|| "private".to_string());
     let use_decl_visibility_prefix = match use_decl_visibility.trim() {
         "" | "private" => "",
@@ -124,7 +129,51 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
 
     let glob_reexport =
         use_decl_visibility_prefix == "pub(super) " && explicit_use_decl_items.is_none();
-    let use_decl_edit = if glob_reexport {
+    let use_decl_edit = if explicit_use_decl_visibility.is_none() && p.visibility.is_none() {
+        let deletion_ranges: Vec<_> = selected
+            .iter()
+            .map(|item| (item.leading_trivia_start, item.trailing_trivia_end))
+            .collect();
+        let referenced =
+            survivors_referenced_in_source(&parsed.source, &deletion_ranges, &selected);
+        if let Some(names) = &explicit_use_decl_items {
+            for name in names {
+                if !selected.iter().any(|item| item.name.as_ref() == Some(name)) {
+                    bail!("use_decl_items entry `{name}` is not in item_names");
+                }
+            }
+        }
+        let mut grouped = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for item in &selected {
+            let Some(name) = &item.name else { continue };
+            let keyword = rust_visibility_keyword_byte(&parsed.source, item)?;
+            let start = rust_item_visibility_start_byte(&parsed.source, item, keyword);
+            let visibility = declared_visibility(&parsed.source[start..keyword]);
+            let include = explicit_use_decl_items.as_ref().map_or_else(
+                || !visibility.is_empty() || referenced.contains(name),
+                |names| names.contains(name),
+            );
+            if include {
+                grouped.entry(visibility).or_default().push(name.clone());
+            }
+        }
+        // These declarations all share one insertion point. Coalesce them so
+        // visibility groups do not depend on same-offset edit ordering.
+        let mut combined: Option<TextEdit> = None;
+        for (visibility, names) in grouped {
+            let path = build_use_path_for_names(&module_name, &names);
+            if let Some(edit) =
+                compute_use_decl_edit_idempotent(&parsed.source, &items, &path, &visibility)?
+            {
+                if let Some(existing) = &mut combined {
+                    existing.replacement.push_str(&edit.replacement);
+                } else {
+                    combined = Some(edit);
+                }
+            }
+        }
+        combined
+    } else if glob_reexport {
         let use_path_str = format!("{module_name}::*");
         compute_use_decl_edit_idempotent(
             &parsed.source,
@@ -344,13 +393,57 @@ fn select_top_level_items_local<'a>(
     Ok(selected)
 }
 
-/// Render an item's full text (leading_trivia_start..byte_end) with
-/// item-level visibility rewritten to `visibility_prefix` and, for
+/// Extract only the visibility modifier, retaining method/item qualifiers.
+fn declared_visibility(prefix: &str) -> String {
+    let Some(tail) = prefix.trim_start().strip_prefix("pub") else {
+        return String::new();
+    };
+    if tail.starts_with('(') || tail.starts_with(char::is_whitespace) {
+        let tail = tail.trim_start();
+        if tail.starts_with('(') {
+            if let Some(end) = tail.find(')') {
+                return format!("pub{} ", &tail[..=end]);
+            }
+        } else {
+            return "pub ".to_string();
+        }
+    } else if tail.is_empty() {
+        return "pub ".to_string();
+    }
+    String::new()
+}
+
+/// Preserve the ancestor scope after descending exactly one module level.
+fn child_visibility(original: &str) -> Result<String> {
+    let compact: String = original.chars().filter(|c| !c.is_whitespace()).collect();
+    Ok(match compact.as_str() {
+        "" | "pub(self)" | "pub(inself)" => "pub(super) ".to_string(),
+        "pub" => "pub ".to_string(),
+        "pub(crate)" => "pub(crate) ".to_string(),
+        "pub(super)" => "pub(in super::super) ".to_string(),
+        _ => {
+            let scope = compact
+                .strip_prefix("pub(in")
+                .and_then(|s| s.strip_suffix(')'))
+                .ok_or_else(|| anyhow!("unsupported moved visibility `{original}`"))?;
+            if scope == "crate" || scope.starts_with("crate::") {
+                format!("pub(in {scope}) ")
+            } else if scope == "super" || scope.starts_with("super::") {
+                format!("pub(in super::{scope}) ")
+            } else {
+                bail!("cannot preserve moved visibility `{original}` in a child module");
+            }
+        }
+    })
+}
+
+/// Render the full item with item-level visibility and, for
 /// struct items, every named field's visibility likewise bumped.
 fn render_item_with_visibility_bumped(
     parsed: &ParsedSource,
     item: &SyntaxItem,
     visibility_prefix: &str,
+    preserve_visibility: bool,
 ) -> Result<String> {
     let base = item.leading_trivia_start;
     let original = parsed
@@ -368,7 +461,12 @@ fn render_item_with_visibility_bumped(
     let vis_start = rust_item_visibility_start_byte(&parsed.source, item, keyword);
     let current_prefix = &parsed.source[vis_start..keyword];
     let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
-    let new_prefix = format!("{visibility_prefix}{qualifier_prefix}");
+    let item_visibility = if preserve_visibility {
+        child_visibility(&declared_visibility(current_prefix))?
+    } else {
+        visibility_prefix.to_string()
+    };
+    let new_prefix = format!("{item_visibility}{qualifier_prefix}");
     if current_prefix != new_prefix {
         edits.push((vis_start, keyword, new_prefix));
     }
@@ -383,12 +481,13 @@ fn render_item_with_visibility_bumped(
                     field.name_byte_start,
                 );
                 let f_current = &parsed.source[f_vis_start..field.name_byte_start];
-                if f_current != visibility_prefix {
-                    edits.push((
-                        f_vis_start,
-                        field.name_byte_start,
-                        visibility_prefix.to_string(),
-                    ));
+                let field_visibility = if preserve_visibility {
+                    child_visibility(&declared_visibility(f_current))?
+                } else {
+                    visibility_prefix.to_string()
+                };
+                if f_current != field_visibility {
+                    edits.push((f_vis_start, field.name_byte_start, field_visibility));
                 }
             }
         }
@@ -648,6 +747,55 @@ mod tests {
             out.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
         }
         out
+    }
+
+    #[test]
+    fn default_extraction_preserves_external_only_item_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let src = root.join("parent.rs");
+        let tgt = root.join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(
+            &src,
+            "pub fn entry()->u32 { 7 }\npub(super) struct State { pub value:u32 }\n",
+        )
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(
+            &plan_extract_rust_items_to_submodule(&make_params(
+                &src,
+                &tgt,
+                &["entry", "State"],
+                None,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let source_edit = &plan.edits[0];
+        let inserts: String = source_edit
+            .edits
+            .iter()
+            .filter(|edit| edit.byte_start == edit.byte_end)
+            .map(|edit| edit.replacement.as_str())
+            .collect();
+        assert!(inserts.contains("pub use child::entry;"), "{inserts}");
+        assert!(
+            inserts.contains("pub(super) use child::State;"),
+            "{inserts}"
+        );
+        let target_edit = &plan.edits[1];
+        let target = &target_edit.edits[0].replacement;
+        assert!(target.contains("pub fn entry"), "{target}");
+        assert!(
+            target.contains("pub(in super::super) struct State"),
+            "{target}"
+        );
+        assert!(target.contains("pub value"), "{target}");
+        assert_eq!(
+            child_visibility("pub(in super::super) ").unwrap(),
+            "pub(in super::super::super) "
+        );
+        assert_eq!(declared_visibility("pub (crate) async "), "pub(crate) ");
     }
 
     // Gate: end-to-end — struct + free fn moved, mod_decl emitted,

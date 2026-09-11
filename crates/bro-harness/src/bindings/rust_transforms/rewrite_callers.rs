@@ -16,6 +16,7 @@
 //! - No alias awareness. `use foo::Item as X;` works the same as non-aliased.
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 
 use async_trait::async_trait;
@@ -93,11 +94,11 @@ impl Tool for RustRewriteModuleCallers {
             "properties": {
                 "project_dir": { "type": "string", "description": "Project directory for the caller walk. Skips target/, build/, node_modules/, .git/." },
                 "item_names": { "type": "array", "items": {"type": "string"}, "description": "Names of the moved items (required, non-empty)." },
-                "module_name": { "type": "string", "description": "Source module's simple name. Defaults to the source file stem (lib/main/mod rejected without explicit override)." },
-                "target_prelude": { "type": "string", "description": "Target module's simple name. Defaults to the target file stem." },
+                "module_name": { "type": "string", "description": "Source module's simple name. Required; no source-file argument is available for inference." },
+                "target_prelude": { "type": "string", "description": "Target module's simple name. Required; no target-file argument is available for inference." },
                 "skip_files": { "type": "array", "items": {"type": "string"}, "description": "File paths to skip during the walk (source/target of the extract/move)." }
             },
-            "required": ["project_dir", "item_names"]
+            "required": ["project_dir", "item_names", "module_name", "target_prelude"]
         })
     }
     fn annotations(&self) -> ToolAnnotations {
@@ -193,9 +194,33 @@ impl RustRewriteModuleCallers {
         let mut findings: Vec<Value> = Vec::new();
 
         for entry in walkdir::WalkDir::new(&project_dir)
+            .sort_by_file_name()
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir()
+                    || !matches!(
+                        entry.file_name().to_str(),
+                        Some("target" | "build" | ".gradle" | "node_modules" | ".git")
+                    )
+            })
+            .take(10_001)
+            .enumerate()
         {
+            let (index, entry) = entry;
+            if index == 10_000 {
+                findings.push(json!({"finding":"walk_cap_reached", "detail":"narrow project_dir; traversal stopped after 10000 entries"}));
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    findings.push(json!({"finding":"walk_error", "detail":error.to_string()}));
+                    continue;
+                }
+            };
+            if entry.file_type().is_symlink() {
+                continue;
+            }
             let path = entry.path();
             if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("rs") {
                 continue;
@@ -215,27 +240,55 @@ impl RustRewriteModuleCallers {
                 continue;
             }
 
-            let caller_source = match fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => continue,
+            match path.metadata() {
+                Ok(metadata) if metadata.len() <= 1024 * 1024 => {}
+                Ok(_) => {
+                    findings.push(json!({"finding":"source_too_large", "file":path_string(path), "detail":"source exceeds the 1 MiB parse budget"}));
+                    continue;
+                }
+                Err(error) => {
+                    findings.push(json!({"finding":"source_unreadable", "file":path_string(path), "detail":error.to_string()}));
+                    continue;
+                }
+            }
+            let parsed = match bbox_refactor::parse_rust_file(path) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    findings.push(json!({"finding":"source_unreadable", "file":path_string(path), "detail":error.to_string()}));
+                    continue;
+                }
             };
-            let edits = rust_move_with_callers::compute_caller_rewrite_edits(
+            if parsed.tree.root_node().has_error() {
+                findings.push(json!({"finding":"parse_error", "file":path_string(path)}));
+                continue;
+            }
+            let protected = super::helpers::protected_source_ranges(&parsed);
+            let caller_source = parsed.source;
+            let mut edits = rust_move_with_callers::compute_caller_rewrite_edits(
                 &caller_source,
                 &source_simple,
                 &target_simple,
                 &moved_names,
             );
+            edits.retain(|edit| {
+                !protected
+                    .iter()
+                    .any(|&(start, end)| edit.byte_start < end && start < edit.byte_end)
+            });
             if edits.is_empty() {
                 continue;
             }
             let sha = sha256_hex(caller_source.as_bytes());
             let changes = text_edits_to_span_changes(&edits, &path_string(path), &sha);
-            total_rewrites += changes.len() as u64;
-            files_touched += 1;
-            all_changes.extend(changes);
+            let remaining = 2000usize.saturating_sub(all_changes.len());
+            let capped = changes.len() > remaining;
+            let keep = changes.len().min(remaining);
+            total_rewrites += keep as u64;
+            files_touched += u64::from(keep > 0);
+            all_changes.extend(changes.into_iter().take(keep));
 
-            // Bound payload per isolate-heap discipline.
-            if all_changes.len() > 2000 {
+            // Bound the emitted payload before extending it.
+            if capped {
                 findings.push(json!({
                     "finding": "rewrite_cap_reached",
                     "files_touched": files_touched,
@@ -507,5 +560,23 @@ mod tests {
             }
             _ => panic!("expected error, got {result:?}"),
         }
+    }
+    #[tokio::test]
+    async fn callers_leave_literals_and_comments_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = "fn run() { old::moved(); let _ = \"old::moved\"; } // old::moved\n";
+        fs::write(root.join("caller.rs"), source).unwrap();
+        let result = RustRewriteModuleCallers.call(json!({
+            "project_dir":".", "item_names":["moved"], "module_name":"old", "target_prelude":"new"
+        }), &cx_in(&root)).await;
+        let ToolResult::Json(value) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(value["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["changes"][0]["span"]["byte_start"],
+            source.find("old::").unwrap()
+        );
     }
 }

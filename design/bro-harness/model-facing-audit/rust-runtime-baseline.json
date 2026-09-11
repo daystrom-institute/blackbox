@@ -1,0 +1,432 @@
+{
+  "isolate_sha256": "0f3c6f8eb38fab6863bdfef395a341f438c6ba458fc45ca0cda34d90a64b9761",
+  "inventory": [
+    "rust.describe",
+    "rust.extractImplMethods",
+    "rust.extractItems",
+    "rust.extractTrait",
+    "rust.fixRound",
+    "rust.inlineModToFile",
+    "rust.liftToFree",
+    "rust.migrateErrorType",
+    "rust.migrateTypeUsages",
+    "rust.moduleWiring",
+    "rust.moveStructFields",
+    "rust.organizeImports",
+    "rust.rewriteModuleCallers",
+    "rust.setVisibility",
+    "rust.updateCallers"
+  ],
+  "receipts": [
+    {
+      "case": "describe",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"describe\",\"transform\":\"extractImplMethods\",\"contract_bytes\":2579}\n{\"tool\":\"describe\",\"transform\":\"extractItems\",\"contract_bytes\":3711}\n{\"tool\":\"describe\",\"transform\":\"extractTrait\",\"contract_bytes\":1717}\n{\"tool\":\"describe\",\"transform\":\"fixRound\",\"contract_bytes\":3675}\n{\"tool\":\"describe\",\"transform\":\"inlineModToFile\",\"contract_bytes\":1409}\n{\"tool\":\"describe\",\"transform\":\"liftToFree\",\"contract_bytes\":1420}\n{\"tool\":\"describe\",\"transform\":\"migrateErrorType\",\"contract_bytes\":1504}\n{\"tool\":\"describe\",\"transform\":\"migrateTypeUsages\",\"contract_bytes\":1282}\n{\"tool\":\"describe\",\"transform\":\"moduleWiring\",\"contract_bytes\":1101}\n{\"tool\":\"describe\",\"transform\":\"moveStructFields\",\"contract_bytes\":2051}\n{\"tool\":\"describe\",\"transform\":\"organizeImports\",\"contract_bytes\":1721}\n{\"tool\":\"describe\",\"transform\":\"rewriteModuleCallers\",\"contract_bytes\":1845}\n{\"tool\":\"describe\",\"transform\":\"setVisibility\",\"contract_bytes\":1258}\n{\"tool\":\"describe\",\"transform\":\"updateCallers\",\"contract_bytes\":1628}\n{\"tool\":\"describe\",\"refusal\":\"rust.describe: unknown transform `missingTransform` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, migrateErrorType, migrateTypeUsages, updateCallers, extractTrait, liftToFree, rewriteModuleCallers)\"}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/lib.rs": ""
+      }
+    },
+    {
+      "case": "extract_items",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"extractItems\",\"proposal\":{\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":33,\"byte_start\":0,\"content_sha256\":\"792ebaae6cae14102bbda25044e2df46b458191655013bb343e5777bb7b95125\",\"file\":\"src/math.rs\"}},{\"new_text\":\"mod scoring;\\n\",\"span\":{\"byte_end\":0,\"byte_start\":0,\"content_sha256\":\"792ebaae6cae14102bbda25044e2df46b458191655013bb343e5777bb7b95125\",\"file\":\"src/math.rs\"}},{\"new_text\":\"\\nuse scoring::score;\\n\",\"span\":{\"byte_end\":0,\"byte_start\":0,\"content_sha256\":\"792ebaae6cae14102bbda25044e2df46b458191655013bb343e5777bb7b95125\",\"file\":\"src/math.rs\"}}],\"creates\":[{\"content\":\"use super::*;\\n\\npub(super) fn score(n:u32)->u32 { n+1 }\\n\",\"path\":\"src/math/scoring.rs\"}],\"findings\":[{\"count\":1,\"finding\":\"external_references\",\"samples\":[{\"context\":\"mod math; pub fn run()->u32 { math::score(3) }\",\"item\":\"score\",\"line\":1,\"path\":\"$FIXTURES/extract_items/src/lib.rs\"}]},{\"clusters\":[{\"external_references\":1,\"id\":\"cluster-1\",\"internal_edges\":1,\"items\":[\"other\",\"score\"],\"reason\":\"1 internal dependency edge(s)\"}],\"finding\":\"suggested_clusters\"},{\"attributes\":[],\"byte_end\":32,\"byte_start\":0,\"finding\":\"moved_item\",\"kind\":\"function_item\",\"leading_trivia_start\":0,\"line_end\":1,\"line_start\":1,\"name\":\"score\",\"plan_local_id\":\"$FIXTURES/extract_items/src/math.rs:0:32:function_item:score\",\"trailing_trivia_end\":33}],\"mode\":\"compound\",\"preview_only\":false,\"provenance\":\"syntax_only\",\"title\":\"extract 1 Rust item(s) from $FIXTURES/extract_items/src/math.rs into submodule `scoring` at $FIXTURES/extract_items/src/math/scoring.rs\",\"would_change_files\":[{\"edit_count\":3,\"path\":\"src/math.rs\",\"replacement_bytes\":34}],\"would_create_files\":[{\"bytes\":55,\"path\":\"src/math/scoring.rs\"}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":4},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":67,\"bytes_before\":66,\"content_sha256\":\"6c97d5f4e63abf7ff5d1d09ca8c87b3826a8f1a5691a2e092c4933db4621dbdc\",\"edits\":3,\"file\":\"src/math.rs\"},{\"content_sha256\":\"2c8003a397a3d36fa892e97bfcce7959021b64d54b55a0a52be7483979208286\",\"created\":true,\"file\":\"src/math/scoring.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n{\"tool\":\"extractItems\",\"refusal\":\"rust.extractItems: target file $FIXTURES/extract_items/src/math/scoring.rs already exists and is non-empty; pass toml_entries.merge_into_existing_target=true to append moved items to the existing content - if a prior cell already applied this transform, the work is DONE (verify with code.items on the source file); re-calling is only valid against a clean target. store() the result when you need it in later cells.\"}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/lib.rs": "mod math; pub fn run()->u32 { math::score(3) }\n#[test] fn runtime_contract() { assert_eq!(run(),4); }\n",
+        "src/math.rs": "\npub fn score(n:u32)->u32 { n+1 }\npub fn other()->u32 { score(2) }\n",
+        "src/math/scoring.rs": "use super::*;\n\npub(super) fn score(n:u32)->u32 { n+1 }\n"
+      }
+    },
+    {
+      "case": "extract_visibility",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nError: proposal did not apply: {\"applied\":false,\"es\":\"es-1\",\"findings\":[{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/math.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"}],\"rollback_errors\":[],\"rolled_back\":true,\"semantic_status\":\"syntax_only\"}\n    at apply (exec_main.mjs:8:30)\n    at async propose (exec_main.mjs:12:67)\n    at async exec_main.mjs:22:1\nOutput:\n{\"tool\":\"extractItems\",\"proposal\":{\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":26,\"byte_start\":0,\"content_sha256\":\"2f21dc13397b2c73f31f7ca3f043fb1853629c6f9c472c1511cc3f74217db5a3\",\"file\":\"src/math.rs\"}},{\"new_text\":\"mod scoring;\\n\",\"span\":{\"byte_end\":0,\"byte_start\":0,\"content_sha256\":\"2f21dc13397b2c73f31f7ca3f043fb1853629c6f9c472c1511cc3f74217db5a3\",\"file\":\"src/math.rs\"}},{\"new_text\":\"\",\"span\":{\"byte_end\":62,\"byte_start\":26,\"content_sha256\":\"2f21dc13397b2c73f31f7ca3f043fb1853629c6f9c472c1511cc3f74217db5a3\",\"file\":\"src/math.rs\"}},{\"new_text\":\"\",\"span\":{\"byte_end\":104,\"byte_start\":62,\"content_sha256\":\"2f21dc13397b2c73f31f7ca3f043fb1853629c6f9c472c1511cc3f74217db5a3\",\"file\":\"src/math.rs\"}}],\"creates\":[{\"content\":\"use super::*;\\n\\npub(super) fn score()->u32 { 7 }\\n\\npub(super) fn internal()->u32 { 3 }\\n\\npub(super) struct State { pub(super) value:u32 }\\n\",\"path\":\"src/math/scoring.rs\"}],\"findings\":[{\"count\":3,\"finding\":\"external_references\",\"samples\":[{\"context\":\"#[test] fn runtime_contract() { assert_eq!(math::score(),7); assert_eq!(math::internal(),3); assert_eq!(math::State { value:9 }.value,9); }\",\"item\":\"State\",\"line\":2,\"path\":\"$FIXTURES/extract_visibility/src/lib.rs\"},{\"context\":\"#[test] fn runtime_contract() { assert_eq!(math::score(),7); assert_eq!(math::internal(),3); assert_eq!(math::State { value:9 }.value,9); }\",\"item\":\"internal\",\"line\":2,\"path\":\"$FIXTURES/extract_visibility/src/lib.rs\"},{\"context\":\"#[test] fn runtime_contract() { assert_eq!(math::score(),7); assert_eq!(math::internal(),3); assert_eq!(math::State { value:9 }.value,9); }\",\"item\":\"score\",\"line\":2,\"path\":\"$FIXTURES/extract_visibility/src/lib.rs\"}]},{\"clusters\":[{\"external_references\":1,\"id\":\"cluster-1\",\"internal_edges\":0,\"items\":[\"State\"],\"reason\":\"isolated item; no internal dependency edges found\"},{\"external_references\":1,\"id\":\"cluster-2\",\"internal_edges\":0,\"items\":[\"internal\"],\"reason\":\"isolated item; no internal dependency edges found\"},{\"external_references\":1,\"id\":\"cluster-3\",\"internal_edges\":0,\"items\":[\"score\"],\"reason\":\"isolated item; no internal dependency edges found\"}],\"finding\":\"suggested_clusters\"},{\"attributes\":[],\"byte_end\":25,\"byte_start\":0,\"finding\":\"moved_item\",\"kind\":\"function_item\",\"leading_trivia_start\":0,\"line_end\":1,\"line_start\":1,\"name\":\"score\",\"plan_local_id\":\"$FIXTURES/extract_visibility/src/math.rs:0:25:function_item:score\",\"trailing_trivia_end\":26},{\"attributes\":[],\"byte_end\":61,\"byte_start\":26,\"finding\":\"moved_item\",\"kind\":\"function_item\",\"leading_trivia_start\":26,\"line_end\":2,\"line_start\":2,\"name\":\"internal\",\"plan_local_id\":\"$FIXTURES/extract_visibility/src/math.rs:26:61:function_item:internal\",\"trailing_trivia_end\":62},{\"attributes\":[],\"byte_end\":103,\"byte_start\":62,\"finding\":\"moved_item\",\"kind\":\"struct_item\",\"leading_trivia_start\":62,\"line_end\":3,\"line_start\":3,\"name\":\"State\",\"plan_local_id\":\"$FIXTURES/extract_visibility/src/math.rs:62:103:struct_item:State\",\"trailing_trivia_end\":104}],\"mode\":\"compound\",\"preview_only\":false,\"provenance\":\"syntax_only\",\"title\":\"extract 3 Rust item(s) from $FIXTURES/extract_visibility/src/math.rs into submodule `scoring` at $FIXTURES/extract_visibility/src/math/scoring.rs\",\"would_change_files\":[{\"edit_count\":4,\"path\":\"src/math.rs\",\"replacement_bytes\":13}],\"would_create_files\":[{\"bytes\":135,\"path\":\"src/math/scoring.rs\"}]}}\n{\"applied\":{\"applied\":false,\"es\":\"es-1\",\"findings\":[{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/math.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"}],\"rollback_errors\":[],\"rolled_back\":true,\"semantic_status\":\"syntax_only\"}}\n"
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "mod math;\n#[test] fn runtime_contract() { assert_eq!(math::score(),7); assert_eq!(math::internal(),3); assert_eq!(math::State { value:9 }.value,9); }\n",
+        "src/math.rs": "pub fn score()->u32 { 7 }\npub(crate) fn internal()->u32 { 3 }\npub(super) struct State { pub value:u32 }\n"
+      }
+    },
+    {
+      "case": "inline_mod",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"inlineModToFile\",\"proposal\":{\"changes\":[{\"new_text\":\";\",\"span\":{\"byte_end\":44,\"byte_start\":14,\"content_sha256\":\"693d1c25d1d733b11d0c30ea6213c622503457fbdea371731a44901832867e5b\",\"file\":\"src/service.rs\"}}],\"creates\":[{\"content\":\"pub fn value()->u32 { 7 } \\n\",\"path\":\"src/service/nested.rs\"}],\"findings\":[],\"preview_only\":false,\"provenance\":\"syntax_only\",\"target\":\"src/service/nested.rs\",\"title\":\"extract inline `mod nested` from $FIXTURES/inline_mod/src/service.rs into submodule file $FIXTURES/inline_mod/src/service/nested.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/service.rs\",\"replacement_bytes\":1}],\"would_create_files\":[{\"bytes\":27,\"path\":\"src/service/nested.rs\"}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":2},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":16,\"bytes_before\":45,\"content_sha256\":\"6869691b5800f0800b610b7dcb6af5b7d835ac8a08af0c2af3409ef5b2678fb4\",\"edits\":1,\"file\":\"src/service.rs\"},{\"content_sha256\":\"eb7fb00f19cd3746283c4b658058c8a67780a897dfff804b2d14b3c315621efa\",\"created\":true,\"file\":\"src/service/nested.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/lib.rs": "mod service;\n#[test] fn runtime_contract() { assert_eq!(service::nested::value(),7); }\n",
+        "src/service.rs": "pub mod nested;\n",
+        "src/service/nested.rs": "pub fn value()->u32 { 7 } \n"
+      }
+    },
+    {
+      "case": "wiring",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"moduleWiring\",\"proposal\":{\"action\":\"add_mod\",\"changes\":[{\"new_text\":\"mod widget;\\n\",\"span\":{\"byte_end\":0,\"byte_start\":0,\"content_sha256\":\"49aabb6a5f6350f13bd3afa4148a35655c170bde4899bba77663904596a18ae3\",\"file\":\"src/lib.rs\"}}],\"findings\":[],\"provenance\":\"syntax_only\",\"title\":\"add Rust module declaration mod widget; in $FIXTURES/wiring/src/lib.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/lib.rs\",\"replacement_bytes\":12}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":105,\"bytes_before\":93,\"content_sha256\":\"b023b993e6e18a9117082ae31634b5046e58bf7fa40e775829ca055a008c3621\",\"edits\":1,\"file\":\"src/lib.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/widget.rs": "pub fn value()->u32 { 7 }\n",
+        "src/lib.rs": "mod widget;\npub fn run()->u32 { widget::value() }\n#[test] fn runtime_contract() { assert_eq!(run(),7); }\n"
+      }
+    },
+    {
+      "case": "visibility",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"setVisibility\",\"proposal\":{\"changes\":[{\"new_text\":\"pub(crate) const \",\"span\":{\"byte_end\":6,\"byte_start\":0,\"content_sha256\":\"b1be7a871d90c4cab588eb3ec9fb91aa29c586ba781fadb8018ce06dfb79ed63\",\"file\":\"src/widget.rs\"}}],\"findings\":[{\"attributes\":[],\"byte_end\":27,\"byte_start\":0,\"finding\":\"visibility_rewritten\",\"kind\":\"function_item\",\"leading_trivia_start\":0,\"line_end\":1,\"line_start\":1,\"name\":\"value\",\"plan_local_id\":\"$FIXTURES/visibility/src/widget.rs:0:27:function_item:value\",\"trailing_trivia_end\":28}],\"provenance\":\"syntax_only\",\"target_kind\":\"item\",\"title\":\"rewrite visibility for 1 Rust item(s) in $FIXTURES/visibility/src/widget.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/widget.rs\",\"replacement_bytes\":17}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":39,\"bytes_before\":28,\"content_sha256\":\"833c65c03486749de8625e4fb543f74b83fea1942418a09f873fed015b2c1630\",\"edits\":1,\"file\":\"src/widget.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/widget.rs": "pub(crate) const fn value()->u32 { 7 }\n",
+        "src/lib.rs": "mod widget;\n#[test] fn runtime_contract() { assert_eq!(widget::value(),7); }\n"
+      }
+    },
+    {
+      "case": "impl_create",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nno impl block matching `Widget` found\nOutput:\n\n"
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0583]: file not found for module `methods`\n --> src/widget.rs:1:1\n  |\n1 | mod methods;\n  | ^^^^^^^^^^^^\n  |\n  = help: to create the module `methods`, create file \"src/widget/methods.rs\" or \"src/widget/methods/mod.rs\"\n  = note: if there is a `mod methods` elsewhere in the crate already, import it with `use crate::...` instead\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0583`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/widget.rs": "mod methods;\npub struct Widget;\nimpl Widget {\n    pub fn score(&self)->u32 { super::OFFSET }\n}\n",
+        "src/lib.rs": "pub const OFFSET:u32=3; mod widget;\n#[test] fn runtime_contract() { assert_eq!(widget::Widget.score(),3); }\n"
+      }
+    },
+    {
+      "case": "impl_existing",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nno impl block matching `Widget` found\nOutput:\n\n"
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/widget.rs": "mod methods;\npub struct Widget;\nimpl Widget {\n    pub fn score(&self)->u32 { super::OFFSET }\n}\n",
+        "src/lib.rs": "pub const OFFSET:u32=3; mod widget;\n#[test] fn runtime_contract() { assert_eq!(widget::Widget.score(),3); }\n",
+        "src/widget/methods.rs": ""
+      }
+    },
+    {
+      "case": "imports",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"organizeImports\",\"proposal\":{\"changes\":[{\"new_text\":\"use crate::values::{Used};\",\"span\":{\"byte_end\":21,\"byte_start\":0,\"content_sha256\":\"4052d0275a0bf599c8610a2823ce0cf473cd32c8b35aec07f79f9e9d5233d2f9\",\"file\":\"src/worker.rs\"}}],\"creates\":[],\"findings\":[],\"mode\":\"minimize\",\"provenance\":\"syntax_only\",\"title\":\"minimize Rust wildcard imports in $FIXTURES/imports/src/worker.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/worker.rs\",\"replacement_bytes\":26}],\"would_create_files\":[]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":67,\"bytes_before\":62,\"content_sha256\":\"785e9413b81840dc00a65abd273e4833e5fc5caf290acd0d3a273db07ed7b075\",\"edits\":1,\"file\":\"src/worker.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/values.rs": "pub struct Used; pub struct Unused;\n",
+        "src/lib.rs": "mod values; mod worker;\n#[test] fn runtime_contract() { assert_eq!(worker::value(),3); }\n",
+        "src/worker.rs": "use crate::values::{Used}; pub fn value()->u32 { let _ = Used; 3 }\n"
+      }
+    },
+    {
+      "case": "compact_fields",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nError: proposal did not apply: {\"applied\":false,\"es\":\"es-1\",\"findings\":[{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/owner.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"},{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/state.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"}],\"rollback_errors\":[],\"rolled_back\":true,\"semantic_status\":\"syntax_only\"}\n    at apply (exec_main.mjs:8:30)\n    at async propose (exec_main.mjs:12:67)\n    at async exec_main.mjs:22:1\nOutput:\n{\"tool\":\"moveStructFields\",\"proposal\":{\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":33,\"byte_start\":0,\"content_sha256\":\"9ade63c9cbc132831525d51ef68ea005119579f7eeab4be0a161da69af6f3bd3\",\"file\":\"src/owner.rs\"}},{\"new_text\":\"    pub count: u32,\\n\",\"span\":{\"byte_end\":36,\"byte_start\":36,\"content_sha256\":\"d63976d4b2a03162d7991bfccfc38c63ae6de071974ee001655e3f9143271737\",\"file\":\"src/state.rs\"}}],\"creates\":[],\"findings\":[],\"operator_opt_outs_used\":[],\"provenance\":\"syntax_only\",\"title\":\"move 1 field(s) from `Owner` to target struct\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/owner.rs\",\"replacement_bytes\":0},{\"edit_count\":1,\"path\":\"src/state.rs\",\"replacement_bytes\":20}],\"would_create_files\":[]}}\n{\"applied\":{\"applied\":false,\"es\":\"es-1\",\"findings\":[{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/owner.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"},{\"detail\":\"1 error node(s), 0 missing node(s) after applying edits\",\"file\":\"src/state.rs\",\"kind\":\"parse_error_after_apply\",\"resolution_hint\":\"the edits produced syntactically broken code; rebuild with corrected spans/text\"}],\"rollback_errors\":[],\"rolled_back\":true,\"semantic_status\":\"syntax_only\"}}\n"
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0560]: struct `State` has no field named `count`\n --> src/lib.rs:2:73\n  |\n2 | #[test] fn runtime_contract() { let x=state::State {label:String::new(),count:7}; assert_eq!(x.count,7); let _=owner::Owner {name:Str...\n  |                                                                         ^^^^^ `State` does not have this field\n  |\n  = note: all struct fields are already assigned\n\nerror[E0609]: no field `count` on type `State`\n --> src/lib.rs:2:96\n  |\n2 | #[test] fn runtime_contract() { let x=state::State {label:String::new(),count:7}; assert_eq!(x.count,7); let _=owner::Owner {name:Str...\n  |                                                                                                ^^^^^ unknown field\n  |\n  = note: available field is: `label`\n\nerror[E0063]: missing field `count` in initializer of `Owner`\n --> src/lib.rs:2:112\n  |\n2 | ...ring::new(),count:7}; assert_eq!(x.count,7); let _=owner::Owner {name:String::new()}; }\n  |                                                       ^^^^^^^^^^^^ missing `count`\n\nerror: aborting due to 3 previous errors\n\nSome errors have detailed explanations: E0063, E0560, E0609.\nFor more information about an error, try `rustc --explain E0063`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/owner.rs": "pub struct Owner { pub count:u32, pub name:String }\n",
+        "src/lib.rs": "mod state; mod owner;\n#[test] fn runtime_contract() { let x=state::State {label:String::new(),count:7}; assert_eq!(x.count,7); let _=owner::Owner {name:String::new()}; }\n",
+        "src/state.rs": "pub struct State { pub label:String }\n"
+      }
+    },
+    {
+      "case": "field_attributes",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"moveStructFields\",\"proposal\":{\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":56,\"byte_start\":37,\"content_sha256\":\"977793a90d3ee437a55f664e49de99e2df4e24c0a815fabd1db8f62d32cb871a\",\"file\":\"src/owner.rs\"}},{\"new_text\":\"    pub count: u32,\\n\",\"span\":{\"byte_end\":41,\"byte_start\":41,\"content_sha256\":\"bc455f32e379f175b590cd3e630fdcf33f6a5d719001631508a2e45ae30869dc\",\"file\":\"src/state.rs\"}}],\"creates\":[],\"findings\":[],\"operator_opt_outs_used\":[],\"provenance\":\"syntax_only\",\"title\":\"move 1 field(s) from `Owner` to target struct\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/owner.rs\",\"replacement_bytes\":0},{\"edit_count\":1,\"path\":\"src/state.rs\",\"replacement_bytes\":20}],\"would_create_files\":[]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":2},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":60,\"bytes_before\":79,\"content_sha256\":\"28d503682224979399c2dcc7971dc30e53bdbfcde9a401a5274ac816a3a706f6\",\"edits\":1,\"file\":\"src/owner.rs\"},{\"bytes_after\":63,\"bytes_before\":43,\"content_sha256\":\"b76607acdb49476e4cb2d9f804878d092eb77bb80e6a2fa5e76923029c7136aa\",\"edits\":1,\"file\":\"src/state.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0560]: struct `Owner` has no field named `name`\n --> src/lib.rs:2:53\n  |\n2 | #[test] fn runtime_contract() { let _=owner::Owner {name:String::new()}; let _=state::State {label:String::new()}; }\n  |                                                     ^^^^ `Owner` does not have this field\n  |\n  = note: all struct fields are already assigned\n\nerror[E0063]: missing field `count` in initializer of `State`\n --> src/lib.rs:2:80\n  |\n2 | #[test] fn runtime_contract() { let _=owner::Owner {name:String::new()}; let _=state::State {label:String::new()}; }\n  |                                                                                ^^^^^^^^^^^^ missing `count`\n\nerror: aborting due to 2 previous errors\n\nSome errors have detailed explanations: E0063, E0560.\nFor more information about an error, try `rustc --explain E0063`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/owner.rs": "pub struct Owner {\n    #[cfg(any())]\n    pub name:String,\n}\n",
+        "src/lib.rs": "mod owner; mod state;\n#[test] fn runtime_contract() { let _=owner::Owner {name:String::new()}; let _=state::State {label:String::new()}; }\n",
+        "src/state.rs": "pub struct State {\n    pub label:String,\n    pub count: u32,\n}\n"
+      }
+    },
+    {
+      "case": "update_callers",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"updateCallers\",\"proposal\":{\"changes\":[{\"new_text\":\"self.state.count()\",\"span\":{\"byte_end\":101,\"byte_start\":91,\"content_sha256\":\"9edb4d4b279befbda75b1352d8cd4f6e0fd5972ceb60aca03b004327f9c19104\",\"file\":\"src/owner.rs\"}}],\"counts\":{\"files_touched\":1,\"rewrites\":1},\"findings\":[{\"detail\":[{\"column\":92,\"context\":\"pub struct Owner { pub state:crate::state::State } impl Owner { pub fn count(&self)->u32 { self.count } }\",\"kind\":\"borrow_promotion\",\"line\":1}],\"finding\":\"borrow_promotions\"}],\"provenance\":\"syntax_only\"}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":114,\"bytes_before\":106,\"content_sha256\":\"63b2d6d89572b18fb32769a065bbae77e2fad332245174aeb7f0962e5b8b34f3\",\"edits\":1,\"file\":\"src/owner.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0599]: `State` is not an iterator\n  --> src/owner.rs:1:103\n   |\n 1 | pub struct Owner { pub state:crate::state::State } impl Owner { pub fn count(&self)->u32 { self.state.count() } }\n   |                                                                                                       ^^^^^-- help: remove the arguments\n   |                                                                                                       |\n   |                                                                                                       `State` is not an iterator\n   |                                                                                                       field, not a method\n   |\n  ::: src/state.rs:1:1\n   |\n 1 | pub struct State { pub count:u32 }\n   | ---------------- method `count` not found for this struct because it doesn't satisfy `State: Iterator`\n   |\n   = note: the following trait bounds were not satisfied:\n           `State: Iterator`\n           which is required by `&mut State: Iterator`\nnote: the trait `Iterator` must be implemented\n  --> $RUST_TOOLCHAIN/lib/rustlib/src/rust/library/core/src/iter/traits/iterator.rs:42:1\n   |\n42 | pub const trait Iterator {\n   | ^^^^^^^^^^^^^^^^^^^^^^^^\n   = help: items from traits can only be used if the trait is implemented and in scope\n   = note: the following trait defines an item `count`, perhaps you need to implement it:\n           candidate #1: `Iterator`\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0599`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/owner.rs": "pub struct Owner { pub state:crate::state::State } impl Owner { pub fn count(&self)->u32 { self.state.count() } }\n",
+        "src/lib.rs": "mod state; mod owner;\n#[test] fn runtime_contract() { let x=owner::Owner {state:state::State {count:7}}; assert_eq!(x.count(),7); }\n",
+        "src/state.rs": "pub struct State { pub count:u32 }\n"
+      }
+    },
+    {
+      "case": "trait",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"extractTrait\",\"proposal\":{\"call_site_warnings\":[],\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":66,\"byte_start\":31,\"content_sha256\":\"640d6ec98595ffb2cfabbdd90bbcaa1f5a65c4ae224bdcd35758759767148846\",\"file\":\"src/store.rs\"}}],\"creates\":[{\"content\":\"pub trait StoreApi {\\n\\nfn value(&self)->u32;\\n}\\n\\nimpl StoreApi for Store {\\n\\n    pub fn value(&self)->u32 { 4 }\\n}\\n\",\"path\":\"src/store_api.rs\"}],\"dyn_compatible\":true,\"findings\":[{\"detail\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[]},\"finding\":\"object_safety_report\"}],\"object_safety_report\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[]},\"provenance\":\"syntax_only\",\"title\":\"extract 1 Rust impl method(s) from $FIXTURES/trait/src/store.rs into trait StoreApi in $FIXTURES/trait/src/store_api.rs\",\"trait_in_scope_required\":[],\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/store.rs\",\"replacement_bytes\":0}],\"would_create_files\":[{\"bytes\":111,\"path\":\"src/store_api.rs\"}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":2},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":33,\"bytes_before\":68,\"content_sha256\":\"19a76db0afcd506228e676b022dc5b1ba44eead4f8bb3d28e0d75f2cbdce543e\",\"edits\":1,\"file\":\"src/store.rs\"},{\"content_sha256\":\"0b6858aff86c4ec7c78e478d9f62e6e09bd9fc061c8ce4b307de5cf2eb4d8c18\",\"created\":true,\"file\":\"src/store_api.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0449]: visibility qualifiers are not permitted here\n --> src/store_api.rs:8:5\n  |\n8 |     pub fn value(&self)->u32 { 4 }\n  |     ^^^ help: remove the qualifier\n  |\n  = note: trait items always share the visibility of their trait\n\nerror[E0425]: cannot find type `Store` in this scope\n --> src/store_api.rs:6:19\n  |\n6 | impl StoreApi for Store {\n  |                   ^^^^^ not found in this scope\n  |\nhelp: consider importing this struct\n  |\n1 + use crate::store::Store;\n  |\n\nerror[E0599]: no method named `value` found for struct `Store` in the current scope\n --> src/lib.rs:1:60\n  |\n1 | mod store; mod store_api; pub fn run()->u32 { store::Store.value() }\n  |                                                            ^^^^^ method not found in `Store`\n  |\n ::: src/store.rs:1:1\n  |\n1 | pub struct Store;\n  | ---------------- method `value` not found for this struct\n  |\n  = help: items from traits can only be used if the trait is implemented and in scope\nnote: `StoreApi` defines an item `value`, perhaps you need to implement it\n --> src/store_api.rs:1:1\n  |\n1 | pub trait StoreApi {\n  | ^^^^^^^^^^^^^^^^^^\n\nerror: aborting due to 3 previous errors\n\nSome errors have detailed explanations: E0425, E0449, E0599.\nFor more information about an error, try `rustc --explain E0425`.\n"
+      },
+      "recovery": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"moduleWiring\",\"proposal\":{\"action\":\"add_use\",\"changes\":[{\"new_text\":\"\\nuse crate::store_api::StoreApi;\\n\",\"span\":{\"byte_end\":26,\"byte_start\":26,\"content_sha256\":\"ed3dca4592bcc9d54d5b8a1e29e4d75216082dbd8182c5affb53ddaed351d0f3\",\"file\":\"src/lib.rs\"}}],\"findings\":[],\"provenance\":\"syntax_only\",\"title\":\"add Rust use declaration use crate::store_api::StoreApi; in $FIXTURES/trait/src/lib.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/lib.rs\",\"replacement_bytes\":33}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":157,\"bytes_before\":124,\"content_sha256\":\"511e1e01740a39158332d80454963128b492ddfb8e34cbd98ce5456e191a58c3\",\"edits\":1,\"file\":\"src/lib.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "after_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0449]: visibility qualifiers are not permitted here\n --> src/store_api.rs:8:5\n  |\n8 |     pub fn value(&self)->u32 { 4 }\n  |     ^^^ help: remove the qualifier\n  |\n  = note: trait items always share the visibility of their trait\n\nerror[E0425]: cannot find type `Store` in this scope\n --> src/store_api.rs:6:19\n  |\n6 | impl StoreApi for Store {\n  |                   ^^^^^ not found in this scope\n  |\nhelp: consider importing this struct\n  |\n1 + use crate::store::Store;\n  |\n\nerror[E0599]: no method named `value` found for struct `Store` in the current scope\n --> src/lib.rs:3:34\n  |\n3 | pub fn run()->u32 { store::Store.value() }\n  |                                  ^^^^^ method not found in `Store`\n  |\n ::: src/store.rs:1:1\n  |\n1 | pub struct Store;\n  | ---------------- method `value` not found for this struct\n  |\n  = help: items from traits can only be used if the trait is implemented and in scope\nnote: `StoreApi` defines an item `value`, perhaps you need to implement it\n --> src/store_api.rs:1:1\n  |\n1 | pub trait StoreApi {\n  | ^^^^^^^^^^^^^^^^^^\n\nerror: aborting due to 3 previous errors\n\nSome errors have detailed explanations: E0425, E0449, E0599.\nFor more information about an error, try `rustc --explain E0425`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "mod store; mod store_api; \nuse crate::store_api::StoreApi;\npub fn run()->u32 { store::Store.value() }\n#[test] fn runtime_contract() { assert_eq!(run(),4); }\n",
+        "src/store.rs": "pub struct Store;\nimpl Store {\n}\n",
+        "src/store_api.rs": "pub trait StoreApi {\n\nfn value(&self)->u32;\n}\n\nimpl StoreApi for Store {\n\n    pub fn value(&self)->u32 { 4 }\n}\n"
+      }
+    },
+    {
+      "case": "async_trait_report",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nError: false dyn compatibility claim\n    at exec_main.mjs:22:260\nOutput:\n{\"tool\":\"extractTrait\",\"proposal\":{\"call_site_warnings\":[],\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":72,\"byte_start\":31,\"content_sha256\":\"0ae682c2de2f9c404f1557d15cb78306d701aa720abc242564a8f14a650e3801\",\"file\":\"src/store.rs\"}}],\"creates\":[{\"content\":\"pub trait Api {\\n\\nfn value(&self)->u32;\\n}\\n\\nimpl Api for Store {\\n\\n    pub async fn value(&self)->u32 { 4 }\\n}\\n\",\"path\":\"src/api.rs\"}],\"dyn_compatible\":true,\"findings\":[{\"detail\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[]},\"finding\":\"object_safety_report\"}],\"object_safety_report\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[]},\"provenance\":\"syntax_only\",\"title\":\"extract 1 Rust impl method(s) from $FIXTURES/async_trait_report/src/store.rs into trait Api in $FIXTURES/async_trait_report/src/api.rs\",\"trait_in_scope_required\":[],\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/store.rs\",\"replacement_bytes\":0}],\"would_create_files\":[{\"bytes\":107,\"path\":\"src/api.rs\"}]}}\n"
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0583]: file not found for module `api`\n --> src/lib.rs:1:12\n  |\n1 | mod store; mod api; fn requires_dyn(_: &dyn api::Api) {}\n  |            ^^^^^^^^\n  |\n  = help: to create the module `api`, create file \"src/api.rs\" or \"src/api/mod.rs\"\n  = note: if there is a `mod api` elsewhere in the crate already, import it with `use crate::...` instead\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0583`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "mod store; mod api; fn requires_dyn(_: &dyn api::Api) {}\n",
+        "src/store.rs": "pub struct Store;\nimpl Store {\n    pub async fn value(&self)->u32 { 4 }\n}\n"
+      }
+    },
+    {
+      "case": "sized_trait_report",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nError: Self:Sized exemption lost\n    at exec_main.mjs:22:260\nOutput:\n{\"tool\":\"extractTrait\",\"proposal\":{\"call_site_warnings\":[],\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":71,\"byte_start\":31,\"content_sha256\":\"91ceca3918844208ce77596f81d51df2f56c9b4a3def285389172a72d15d9251\",\"file\":\"src/store.rs\"}}],\"creates\":[{\"content\":\"pub trait Api {\\n\\nfn consume(self)->Self where Self: Sized;\\n}\\n\\nimpl Api for Store {\\n\\n    pub fn consume(self)->Self { self }\\n}\\n\",\"path\":\"src/api.rs\"}],\"dyn_compatible\":false,\"findings\":[{\"detail\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[\"consume\"]},\"finding\":\"object_safety_report\"}],\"object_safety_report\":{\"associated_constants\":[],\"dyn_compatible\":true,\"generic_methods\":[],\"self_by_value_methods\":[\"consume\"]},\"provenance\":\"syntax_only\",\"title\":\"extract 1 Rust impl method(s) from $FIXTURES/sized_trait_report/src/store.rs into trait Api in $FIXTURES/sized_trait_report/src/api.rs\",\"trait_in_scope_required\":[],\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/store.rs\",\"replacement_bytes\":0}],\"would_create_files\":[{\"bytes\":126,\"path\":\"src/api.rs\"}]}}\n"
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0583]: file not found for module `api`\n --> src/lib.rs:1:12\n  |\n1 | mod store; mod api; fn accepts_dyn(_: &dyn api::Api) {}\n  |            ^^^^^^^^\n  |\n  = help: to create the module `api`, create file \"src/api.rs\" or \"src/api/mod.rs\"\n  = note: if there is a `mod api` elsewhere in the crate already, import it with `use crate::...` instead\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0583`.\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "mod store; mod api; fn accepts_dyn(_: &dyn api::Api) {}\n#[test] fn runtime_contract() { accepts_dyn(&store::Store); }\n",
+        "src/store.rs": "pub struct Store;\nimpl Store {\n    pub fn consume(self)->Self { self }\n}\n"
+      }
+    },
+    {
+      "case": "lift",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"liftToFree\",\"proposal\":{\"changes\":[{\"new_text\":\"\",\"span\":{\"byte_end\":70,\"byte_start\":33,\"content_sha256\":\"b9c228e14bcba6cf012fd22adad687e03704768f2fe72297bcf48f5ccae578a8\",\"file\":\"src/helper.rs\"}}],\"creates\":[{\"content\":\"    pub fn value(n:u32)->u32 { n+1 }\",\"path\":\"src/free.rs\"}],\"findings\":[],\"provenance\":\"syntax_only\",\"refusal_reasons\":[],\"title\":\"lift 1 Rust impl method(s) from $FIXTURES/lift/src/helper.rs to $FIXTURES/lift/src/free.rs\",\"would_change_files\":[{\"edit_count\":1,\"path\":\"src/helper.rs\",\"replacement_bytes\":0}],\"would_create_files\":[{\"bytes\":36,\"path\":\"src/free.rs\"}]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":2},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":35,\"bytes_before\":72,\"content_sha256\":\"2c31f2ef42b405544e4a7a847b7b19aa6b4307d6ea995de82585ebd3ffe739bb\",\"edits\":1,\"file\":\"src/helper.rs\"},{\"content_sha256\":\"40a51413bda95b78b065c3f8842416d9706d40830fe17b8d0b1090ef59962817\",\"created\":true,\"file\":\"src/free.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 1,
+        "diagnostics": "error[E0599]: no associated function or constant named `value` found for struct `Helper` in the current scope\n --> src/lib.rs:1:59\n  |\n1 | mod helper; mod free; pub fn run()->u32 { helper::Helper::value(2) }\n  |                                                           ^^^^^ associated function or constant not found in `Helper`\n  |\n ::: src/helper.rs:1:1\n  |\n1 | pub struct Helper;\n  | ----------------- associated function or constant `value` not found for this struct\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0599`.\n"
+      },
+      "recovery": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"recovery\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":1},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":114,\"bytes_before\":124,\"content_sha256\":\"28c7e6a5d66248e22791af8e12dfb8b19eee08d04503afbca5e838b7036850aa\",\"edits\":1,\"file\":\"src/lib.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "after_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/lib.rs": "mod helper; mod free; pub fn run()->u32 { free::value(2) }\n#[test] fn runtime_contract() { assert_eq!(run(),3); }\n",
+        "src/helper.rs": "pub struct Helper;\nimpl Helper {\n}\n",
+        "src/free.rs": "    pub fn value(n:u32)->u32 { n+1 }"
+      }
+    },
+    {
+      "case": "error_type",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"migrateErrorType\",\"proposal\":{\"changes\":[{\"new_text\":\"New\",\"span\":{\"byte_end\":58,\"byte_start\":55,\"content_sha256\":\"07c378611a607546d5b13a38f1f531a72580610150cf8d350bac99f9975cd46c\",\"file\":\"src/work.rs\"}},{\"new_text\":\"New::Bad\",\"span\":{\"byte_end\":84,\"byte_start\":76,\"content_sha256\":\"07c378611a607546d5b13a38f1f531a72580610150cf8d350bac99f9975cd46c\",\"file\":\"src/work.rs\"}},{\"new_text\":\"New::Bad\",\"span\":{\"byte_end\":99,\"byte_start\":91,\"content_sha256\":\"07c378611a607546d5b13a38f1f531a72580610150cf8d350bac99f9975cd46c\",\"file\":\"src/work.rs\"}}],\"creates\":[],\"findings\":[{\"detail\":[],\"finding\":\"question_mark_sites\"}],\"operator_opt_outs_used\":[],\"provenance\":\"syntax_only\",\"title\":\"rewrite error type `Old` to `New` in $FIXTURES/error_type/src/work.rs\",\"would_change_files\":[{\"edit_count\":3,\"path\":\"src/work.rs\",\"replacement_bytes\":19}],\"would_create_files\":[]}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":3},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":142,\"bytes_before\":142,\"content_sha256\":\"418dd8cea7b838c49ff566fb32c24963943775c9c753b0ef6e9fd7c426947a24\",\"edits\":3,\"file\":\"src/work.rs\"}],\"validations\":[{\"files_checked\":1,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "mod work;\n#[test] fn runtime_contract() { assert!(work::run()); }\n",
+        "src/work.rs": "enum Old { Bad } enum New { Bad } fn work()->Result<(),New> { let _message=\"New::Bad\"; Err(New::Bad) }\npub fn run()->bool { work().is_err() }\n"
+      }
+    },
+    {
+      "case": "module_callers",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"rewriteModuleCallers\",\"proposal\":{\"changes\":[{\"new_text\":\"new\",\"span\":{\"byte_end\":123,\"byte_start\":120,\"content_sha256\":\"1e8fe6b8f22e5698f41e1cbcf2c6f282cedcbafdc07377af86b03b1a5eca2fc5\",\"file\":\"$FIXTURES/module_callers/./src/lib.rs\"}},{\"new_text\":\"new\",\"span\":{\"byte_end\":14,\"byte_start\":11,\"content_sha256\":\"50212718b06fe1817c1e3c35db7c9694f81b083f61973f3717183c41ec647969\",\"file\":\"$FIXTURES/module_callers/./src/caller.rs\"}},{\"new_text\":\"new\",\"span\":{\"byte_end\":53,\"byte_start\":50,\"content_sha256\":\"50212718b06fe1817c1e3c35db7c9694f81b083f61973f3717183c41ec647969\",\"file\":\"$FIXTURES/module_callers/./src/caller.rs\"}},{\"new_text\":\"new\",\"span\":{\"byte_end\":101,\"byte_start\":98,\"content_sha256\":\"50212718b06fe1817c1e3c35db7c9694f81b083f61973f3717183c41ec647969\",\"file\":\"$FIXTURES/module_callers/./src/caller.rs\"}},{\"new_text\":\"new\",\"span\":{\"byte_end\":117,\"byte_start\":114,\"content_sha256\":\"50212718b06fe1817c1e3c35db7c9694f81b083f61973f3717183c41ec647969\",\"file\":\"$FIXTURES/module_callers/./src/caller.rs\"}}],\"counts\":{\"files_touched\":2,\"rewrites\":5},\"findings\":[],\"provenance\":\"syntax_only\"}}\n{\"applied\":{\"applied\":true,\"es\":\"es-1\",\"lineage\":{\"compiler_suggested\":0,\"lsp_verified\":0,\"syntax_only\":5},\"semantic_status\":\"syntax_only\",\"summary\":[{\"bytes_after\":134,\"bytes_before\":134,\"content_sha256\":\"b989a573520efa688c0e8a36a02b44bc8fe5c76b681d0fade25bccf8f4d90587\",\"edits\":4,\"file\":\"$FIXTURES/module_callers/./src/caller.rs\"},{\"bytes_after\":136,\"bytes_before\":136,\"content_sha256\":\"cde0b972fc3c0b92d3d112425b6ff99082d1c4d421d43d8f6164bb77933c55ac\",\"edits\":1,\"file\":\"$FIXTURES/module_callers/./src/lib.rs\"}],\"validations\":[{\"files_checked\":2,\"status\":\"passed\",\"validation\":\"tree_sitter_no_errors\"}]}}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/old.rs": "pub fn moved()->u32 { 1 }\n",
+        "src/lib.rs": "mod old; mod new; mod caller;\n#[test] fn runtime_contract() { assert_eq!(caller::run(),4); assert_eq!(caller::EXPECTED,\"new::moved\"); }\n",
+        "src/caller.rs": "use crate::new::moved; pub fn run()->u32 { crate::new::moved()+moved() }\npub const EXPECTED:&str=\"new::moved\"; // new::moved is prose\n",
+        "src/new.rs": "pub fn moved()->u32 { 2 }\n"
+      }
+    },
+    {
+      "case": "authority_refusals",
+      "invocation": {
+        "exit": 0,
+        "stdout": "Script completed\nOutput:\n{\"tool\":\"moveStructFields\",\"refusal\":\"rust.moveStructFields: error.bad_input(code=repr_unacknowledged): struct `Owner` has a non-default #[repr(...)] attribute; pass acknowledge_repr=true to proceed - operator authority arrives dispatch-side; set default:rust.moveStructFields.acknowledge_repr=true in dispatch config (ToolArgDefaults) to grant this opt-out\"}\n{\"tool\":\"migrateErrorType\",\"refusal\":\"rust.migrateErrorType: error.bad_input(code=public_api_change_unacknowledged): error type `Old` is pub in $FIXTURES/authority_refusals/src/lib.rs; set acknowledge_public_api_change=true to proceed - operator authority arrives dispatch-side; set `default:rust.migrateErrorType.acknowledge_public_api_change=true` via `isolate --tool-defaults '{\\\"default:rust.migrateErrorType.acknowledge_public_api_change\\\":\\\"true\\\"}'` to grant this opt-out\"}\n{\"tool\":\"migrateTypeUsages\",\"refusal\":\"rust.migrateTypeUsages: error.bad_input(code=public_api_change_unacknowledged): migrating type usages can change the public API - operator authority arrives dispatch-side; set `default:rust.migrateTypeUsages.acknowledge_public_api_change=true` via `isolate --tool-defaults '{\\\"default:rust.migrateTypeUsages.acknowledge_public_api_change\\\":\\\"true\\\"}'` to grant this opt-out\"}\n{\"tool\":\"organizeImports\",\"refusal\":\"organize mode lands with lsp.assist (phase 2); use mode=minimize for the syntactic wildcard minimizer\"}\n",
+        "stderr": ""
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": true,
+      "after": {
+        "src/lib.rs": "#[repr(C)] struct Owner { count:u32 } struct State {}\npub enum Old { Bad } pub enum New { Bad } pub fn work()->Result<(),Old> { Err(Old::Bad) }\n"
+      }
+    },
+    {
+      "case": "fixround",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nError: compiler diagnostic disappeared\n    at exec_main.mjs:22:262\nOutput:\n{\"gate\":{\"cancelled\":false,\"counts\":{\"errors\":0,\"warnings\":0},\"diagnostics\":[],\"diagnostics_complete\":true,\"duration_ms\":26,\"exit_code\":0,\"ok\":true,\"output\":{\"stderr\":{\"pending_bytes\":0},\"stdout\":{\"pending_bytes\":0}},\"output_pending\":false,\"running\":false,\"status_lines\":[],\"timed_out\":false,\"tool\":\"cargo\",\"truncated\":false}}\n"
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "pub fn value()->u32 { let mut x=1; x+2 }\n#[test] fn runtime_contract() { assert_eq!(value(),3); }\n"
+      }
+    },
+    {
+      "case": "fixround_raw",
+      "invocation": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "error: Script failed\nScript error:\nrust.fixRound: no diagnostics to classify (pass build.gate diagnostics[] or raw_json)\nOutput:\n\n"
+      },
+      "before_recovery": {
+        "compile_exit": 0,
+        "diagnostics": "",
+        "run_exit": 0,
+        "output": "\nrunning 1 test\ntest runtime_contract ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "passed": false,
+      "after": {
+        "src/lib.rs": "pub fn value()->u32 { let mut x=1; x+2 }\n#[test] fn runtime_contract() { assert_eq!(value(),3); }\n"
+      }
+    }
+  ]
+}

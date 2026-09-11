@@ -58,7 +58,7 @@ struct ExtractItemsInput {
     #[serde(default, rename = "moduleName", alias = "module_name")]
     module_name: Option<String>,
     /// Visibility floor for moved items AND struct fields. Compound mode
-    /// only. Defaults to `pub(super)`.
+    /// only. Default preserves existing visibility and promotes private items to `pub(super)`.
     #[serde(default)]
     visibility: Option<String>,
     /// Prelude inserted at the top of the new file. Compound mode only.
@@ -83,7 +83,7 @@ struct ExtractItemsInput {
     )]
     merge_into_existing_target: Option<bool>,
     /// Knob (§8.3): visibility of the auto-emitted parent re-export.
-    /// Compound mode only. `private` (default), `pub`, `pub(crate)`,
+    /// Compound mode only. Defaults to original item visibility. `private`, `pub`, `pub(crate)`,
     /// `pub(super)`.
     #[serde(default, rename = "useDeclVisibility", alias = "use_decl_visibility")]
     use_decl_visibility: Option<String>,
@@ -234,7 +234,7 @@ impl Tool for RustExtractItems {
                 "itemNames": { "type": "array", "items": { "type": "string" }, "description": "Top-level item names to move. Required unless section bounds select the region." },
                 "itemKinds": { "type": "array", "items": { "type": "string" }, "description": "Optional syntax item kinds to narrow ambiguous names." },
                 "moduleName": { "type": "string", "description": "Module name for the parent `mod <name>;` declaration. Defaults to the target file stem (must match it)." },
-                "visibility": { "type": "string", "description": "Visibility floor for moved items AND struct fields. Defaults to `pub(super)`." },
+                "visibility": { "type": "string", "description": "Explicit visibility override for moved items AND struct fields. Default preserves existing visibility and promotes private declarations to `pub(super)`." },
                 "targetPrelude": { "type": "string", "description": "Prelude at the top of the new file. Defaults to `use super::*;`." },
                 "withLocalDeps": { "type": "boolean", "description": "Move the exclusive private dependency closure of the seed items." },
                 "section": {
@@ -248,7 +248,7 @@ impl Tool for RustExtractItems {
                     "description": "Section addressing mode: select items by source-region bounds."
                 },
                 "mergeIntoExistingTarget": { "type": "boolean", "description": "Append to an existing non-empty target instead of refusing." },
-                "useDeclVisibility": { "type": "string", "enum": ["private", "pub", "pub(crate)", "pub(super)"], "description": "Visibility of the auto-emitted parent re-export." },
+                "useDeclVisibility": { "type": "string", "enum": ["private", "pub", "pub(crate)", "pub(super)"], "description": "Visibility override of the auto-emitted parent re-export. Default preserves each moved item visibility and retains externally visible names." },
                 "useDeclItems": { "type": "array", "items": { "type": "string" }, "description": "Explicit subset of itemNames to re-export. Defaults to auto-prune." },
                 "previewOnly": { "type": "boolean", "description": "Return findings + metadata but zero changes/creates." }
             },

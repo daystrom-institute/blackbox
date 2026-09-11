@@ -101,10 +101,31 @@ fn project_plan(
         Ok(value) => value,
         Err(error) => return ToolResult::Error(format!("{tool}: plan decode: {error}")),
     };
-    let edits = match file_edits(&plan_value, tool) {
+    let mut edits = match file_edits(&plan_value, tool) {
         Ok(edits) => edits,
         Err(error) => return error,
     };
+    for file in &mut edits {
+        let parsed = match bbox_refactor::parse_rust_file(std::path::Path::new(&file.path)) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return ToolResult::Error(format!("{tool}: parse proposal source: {error}"));
+            }
+        };
+        if parsed.tree.root_node().has_error()
+            || bbox_refactor::sha256_hex(parsed.source.as_bytes()) != file.original_sha256
+        {
+            return ToolResult::Error(format!(
+                "{tool}: proposal source is invalid or changed; rerun discovery"
+            ));
+        }
+        let protected = super::helpers::protected_source_ranges(&parsed);
+        file.edits.retain(|edit| {
+            !protected
+                .iter()
+                .any(|&(start, end)| edit.byte_start < end && start < edit.byte_end)
+        });
+    }
     let PlanProjection {
         changes,
         creates,
@@ -162,7 +183,7 @@ impl Tool for RustMigrateErrorType {
                 "oldText": { "type": "string", "description": "Existing error type name." },
                 "newText": { "type": "string", "description": "Replacement error type name." },
                 "itemNames": { "type": "array", "items": { "type": "string" }, "description": "Named functions whose return signatures should change." },
-                "errorMapping": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Old error variant to new error variant mapping for construction sites." }
+                "errorMapping": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Bare old variant name to bare new variant name (for example Bad to Invalid), without type prefixes." }
             },
             "required": ["source", "oldText", "newText", "itemNames"]
         })

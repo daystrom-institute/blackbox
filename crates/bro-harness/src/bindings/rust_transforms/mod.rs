@@ -177,9 +177,9 @@ PARAMS
                                worktree root, or absolute). Skips target/,
                                build/, node_modules/, .git/.
   item_names: string[]      Names of the moved items (required, non-empty).
-  module_name?: string      Source module's simple name. Required in the
+  module_name: string       Source module's simple name. Required in the
                                decomposed model (no attached source file).
-  target_prelude?: string   Target module's simple name. Required in the
+  target_prelude: string    Target module's simple name. Required in the
                                decomposed model.
   skip_files?: string[]     File paths to skip during the walk (source/target
                                of the extract/move; already covered).
@@ -216,8 +216,9 @@ PARAMS
   itemKinds?: string[]               Optional syntax item kinds to narrow names.
   moduleName?: string                Module name for `mod <name>;`. Defaults to
                                        the target file stem (must match it).
-  visibility?: string                Visibility floor for items + fields.
-                                       Compound mode. Defaults to `pub(super)`.
+  visibility?: string                Visibility override for items + fields.
+                                       Default preserves visibility, promoting
+                                       private declarations to `pub(super)`.
   targetPrelude?: string             New file prelude. Defaults to `use super::*;`.
   withLocalDeps?: boolean            Move the exclusive private dependency
                                        closure of the seeds (not just the seeds).
@@ -225,11 +226,12 @@ PARAMS
               startLine?, endLine?}     source-region bounds.
   mergeIntoExistingTarget?: boolean  Append to a non-empty target instead of
                                        refusing.
-  useDeclVisibility?: string         Visibility of the parent re-export
-                                       (private | pub | pub(crate) | pub(super)).
+  useDeclVisibility?: string         Visibility override of the parent re-export
+                                       (private | pub | pub(crate) | pub(super));
+                                       default preserves each item visibility.
   useDeclItems?: string[]            Explicit re-export subset of itemNames
-                                       (defaults to auto-prune: only names still
-                                       referenced in the post-deletion source).
+                                       (defaults to externally visible names plus
+                                       surviving references in the source).
   previewOnly?: boolean              Return findings + metadata but zero
                                        changes/creates.
 
@@ -436,7 +438,7 @@ PARAMS
   oldText: string                      Existing error type name.
   newText: string                      Replacement error type name.
   itemNames: string[]                  Function names whose return signatures change.
-  errorMapping?: Record<string,string> Old variant to new variant mapping.
+  errorMapping?: Record<string,string> Bare variant to bare variant, e.g. Bad to Invalid (no type prefixes).
 
 RETURNS { changes, creates, findings, operator_opt_outs_used, provenance }
   findings includes `question_mark_sites`, each classified as text_compatible
@@ -700,7 +702,7 @@ type RustOrganizeImportsResult = { title: string; changes: RustSpanChange[]; cre
 type RustMoveStructFieldsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
 type RustMigrationResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
 type RustUpdateCallersResult = { changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
-type RustExtractTraitResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; dyn_compatible: boolean; object_safety_report: { generic_methods: string[]; self_by_value_methods: string[]; associated_constants: string[]; dyn_compatible: boolean }; call_site_warnings: string[]; trait_in_scope_required: string[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
+type RustExtractTraitResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; dyn_compatible: boolean; object_safety_report: { generic_methods: string[]; self_by_value_methods: string[]; associated_constants: string[]; non_dispatchable_methods: string[]; dyn_compatible: boolean }; call_site_warnings: string[]; trait_in_scope_required: string[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 type RustLiftRefusalReason = { method: string; reason: string };
 type RustLiftToFreeResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; refusal_reasons: RustLiftRefusalReason[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 declare const rust: {
@@ -733,7 +735,7 @@ declare const rust: {
   /** Lift selected inherent methods that do not depend on instance state into free functions. Explicit lifetimes are preserved; mixed selections report per-method refusals. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
   liftToFree(args: { source: string; target: string; itemNames: string[] }): Promise<RustLiftToFreeResult>;
   /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
-  rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name?: string; target_prelude?: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
+  rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name: string; target_prelude: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
 };"#
             .to_string(),
     }

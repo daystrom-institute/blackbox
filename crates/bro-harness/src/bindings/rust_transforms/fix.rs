@@ -128,6 +128,10 @@ impl RustFixRound {
                         continue;
                     }
                     let Some(proposal) = suggestion_to_change(s, code.as_deref()) else {
+                        findings.push(json!({
+                            "finding":"unanchored_suggestion", "suggestion":s,
+                            "detail":"Suggestion has no valid content-hash span. Rebuild through build.gate with anchor_spans=true before applying; raw historical diagnostics cannot prove current file bytes."
+                        }));
                         continue;
                     };
                     machine_applicable_found = true;
@@ -422,7 +426,21 @@ impl Tool for RustFixRound {
 /// stdout into the same `{code, message, file, suggestions[]}` shape
 /// `build.gate` emits, so the classifier sees one uniform input.
 fn parse_raw_json_to_gate_shape(raw: &str) -> Vec<Value> {
-    let parsed = bbox_refactor::parse_rustc_json_output(raw.as_bytes());
+    // The substrate parser consumes Cargo compiler-message envelopes. Direct
+    // rustc writes diagnostic objects, so normalize that one explicit shape.
+    let normalized = raw
+        .lines()
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(value)
+                if value.get("$message_type").and_then(Value::as_str) == Some("diagnostic") =>
+            {
+                json!({"reason":"compiler-message", "message":value}).to_string()
+            }
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed = bbox_refactor::parse_rustc_json_output(normalized.as_bytes());
     parsed
         .into_iter()
         .map(|d| {
@@ -719,5 +737,17 @@ mod tests {
         assert!(result["changes"].as_array().unwrap().is_empty());
         assert_eq!(result["leftovers"].as_array().unwrap().len(), 1);
         assert_eq!(result["leftovers"][0]["code"], "clippy::needless_return");
+    }
+    #[test]
+    fn direct_rustc_diagnostics_report_missing_hash_authority() {
+        let raw = json!({"$message_type":"diagnostic", "level":"warning", "code":{"code":"unused_mut"},
+            "message":"variable does not need to be mutable", "spans":[{"file_name":"src/lib.rs","byte_start":10,"byte_end":14,"is_primary":true}],
+            "children":[{"spans":[{"file_name":"src/lib.rs","byte_start":10,"byte_end":14,"suggested_replacement":"","suggestion_applicability":"MachineApplicable"}]}]
+        }).to_string();
+        let diagnostics = parse_raw_json_to_gate_shape(&raw);
+        assert_eq!(diagnostics.len(), 1);
+        let result = result_json(fix_round().classify(&diagnostics, None));
+        assert!(result["changes"].as_array().unwrap().is_empty());
+        assert_eq!(result["findings"][0]["finding"], "unanchored_suggestion");
     }
 }
