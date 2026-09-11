@@ -800,7 +800,12 @@ fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
                 while line_start > 0 && bytes[line_start - 1] != b'\n' {
                     line_start -= 1;
                 }
-                return source[line_start..start].to_string();
+                let prefix = &source[line_start..start];
+                return if prefix.trim().is_empty() {
+                    prefix.to_string()
+                } else {
+                    "    ".to_string()
+                };
             }
         }
     }

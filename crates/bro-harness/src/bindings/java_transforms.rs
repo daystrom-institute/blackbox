@@ -1965,21 +1965,46 @@ fn is_java_reserved_identifier(name: &str) -> bool {
     )
 }
 
-fn extract_package_name(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("package ") {
-            return rest
-                .trim_end_matches(';')
-                .split_whitespace()
-                .next()
-                .map(str::to_string);
+// Read declaration boundaries, not whole lines: Java permits package/import
+// declarations and the first type on the same line.
+fn java_preamble(source: &str) -> Vec<(&str, usize, usize)> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < source.len() {
+        let rest = &source[offset..];
+        let trimmed = rest.trim_start();
+        offset += rest.len() - trimmed.len();
+        if trimmed.starts_with("//") {
+            offset += trimmed.find('\n').unwrap_or(trimmed.len());
+            continue;
         }
-        if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
-            break;
+        if trimmed.starts_with("/*") {
+            let Some(end) = trimmed.find("*/") else { break };
+            offset += end + 2;
+            continue;
         }
+        let kind = ["package", "import"].into_iter().find(|kind| {
+            trimmed
+                .strip_prefix(kind)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        });
+        let Some(kind) = kind else { break };
+        let Some(end) = trimmed.find(';') else { break };
+        result.push((kind, offset, offset + end + 1));
+        offset += end + 1;
     }
-    None
+    result
+}
+
+fn extract_package_name(source: &str) -> Option<String> {
+    java_preamble(source)
+        .into_iter()
+        .find(|(kind, _, _)| *kind == "package")
+        .map(|(_, start, end)| {
+            source[start + "package".len()..end - 1]
+                .split_whitespace()
+                .collect()
+        })
 }
 
 fn package_path(pkg: &str) -> PathBuf {
@@ -3654,11 +3679,15 @@ fn pullup_ref(
 }
 
 fn source_imports(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("import ") && line.ends_with(';'))
-        .map(str::to_string)
+    java_preamble(source)
+        .into_iter()
+        .filter(|(kind, _, _)| *kind == "import")
+        .map(|(_, start, end)| {
+            source[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .collect()
 }
 
@@ -6773,33 +6802,56 @@ fn replace_last_identifier(text: &str, old_name: &str, new_name: &str) -> String
     }
 }
 
-fn replace_word_all(text: &str, old_name: &str, new_name: &str) -> String {
-    if old_name == new_name {
-        return text.to_string();
+fn parameter_rename_edits(
+    path: &Path,
+    method: &ChangeSignatureMethod,
+    specs: &[JavaChangeParamSpec],
+) -> Result<Vec<bbox_refactor::TextEdit>, String> {
+    let names = specs
+        .iter()
+        .filter_map(|spec| {
+            let old = spec.source_name.as_deref().unwrap_or(&spec.name);
+            (old != spec.name && method.params.iter().any(|param| param.name == old))
+                .then_some((old, spec.name.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if names.is_empty() {
+        return Ok(Vec::new());
     }
-    let mut out = String::with_capacity(text.len());
-    let mut idx = 0usize;
-    while let Some(rel) = text[idx..].find(old_name) {
-        let pos = idx + rel;
-        let before_ok = text[..pos]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
-        let after = pos + old_name.len();
-        let after_ok = text[after..]
-            .chars()
-            .next()
-            .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
-        out.push_str(&text[idx..pos]);
-        if before_ok && after_ok {
-            out.push_str(new_name);
-        } else {
-            out.push_str(old_name);
+    let facts = bbox_refactor::facts::file_query(path,
+        "(identifier) @id (field_access field: (identifier) @skip) (method_invocation name: (identifier) @skip) [(class_declaration) (interface_declaration) (enum_declaration) (record_declaration)] @nested", None)
+        .map_err(|error| format!("java.changeSignature: identifier scan failed: {error:#}"))?;
+    let mut edits = Vec::new();
+    for cap in facts.captures.iter().filter(|cap| {
+        cap.capture == "id"
+            && cap.byte_start >= method.params_span_end
+            && cap.byte_end <= method.byte_end
+    }) {
+        let Some(replacement) = names.get(cap.text.as_str()) else {
+            continue;
+        };
+        if facts.captures.iter().any(|other| {
+            other.capture == "skip"
+                && other.byte_start == cap.byte_start
+                && other.byte_end == cap.byte_end
+        }) {
+            continue;
         }
-        idx = after;
+        if facts.captures.iter().any(|other| {
+            other.capture == "nested"
+                && other.byte_start >= method.params_span_end
+                && other.byte_start <= cap.byte_start
+                && other.byte_end >= cap.byte_end
+        }) {
+            return Err("java.changeSignature: renamed parameter appears inside a nested type; use binding-aware lsp.rename before changing the signature".into());
+        }
+        edits.push(bbox_refactor::TextEdit {
+            byte_start: cap.byte_start,
+            byte_end: cap.byte_end,
+            replacement: (*replacement).to_owned(),
+        });
     }
-    out.push_str(&text[idx..]);
-    out
+    Ok(edits)
 }
 
 fn java_method_ref(
@@ -6998,7 +7050,7 @@ fn validate_change_signature_target(
                 "finding": "parameter_rename",
                 "from": source_name,
                 "to": spec.name,
-                "detail": "method body references are rewritten by syntax-only word replacement inside the method body",
+                "detail": "method body identifier references are rewritten syntactically; strings, comments, and qualified member names are preserved",
             }));
         }
     }
@@ -7041,17 +7093,6 @@ fn render_change_signature_params(
         .collect()
 }
 
-fn invocation_name(text: &str) -> Option<&str> {
-    let paren = text.find('(')?;
-    let before = text[..paren].trim_end();
-    let end = before.len();
-    let start = before[..end]
-        .rfind(|c: char| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()))
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    before.get(start..end).filter(|name| !name.is_empty())
-}
-
 fn discover_change_signature_call_sites(
     root: &Path,
     source_file: &str,
@@ -7070,36 +7111,68 @@ fn discover_change_signature_call_sites(
     let mut findings = Vec::new();
     for rel in file_list {
         let path = resolve_workspace_file(root, &rel, "java.changeSignaturePreview")?;
-        let facts =
-            match bbox_refactor::facts::file_query(&path, "(method_invocation) @invoc", None) {
-                Ok(facts) => facts,
-                Err(e) => {
-                    findings.push(json!({
-                        "finding": "call_site_scan_error",
-                        "file": rel,
-                        "detail": format!("{e:#}"),
-                    }));
-                    continue;
-                }
-            };
-        for capture in facts.captures {
-            if capture.capture != "invoc" {
-                continue;
-            }
-            if invocation_name(&capture.text) != Some(method.name.as_str()) {
-                continue;
-            }
-            let Some(paren) = capture.text.find('(') else {
+        let facts = bbox_refactor::facts::file_query(&path,
+            "(method_invocation name: (identifier) @name arguments: (argument_list) @args) @invoc (argument_list (_) @arg) @arglist", None)
+            .map_err(|error| format!("java.changeSignaturePreview: call-site scan failed for {rel}: {error:#}"))?;
+        for capture in facts
+            .captures
+            .iter()
+            .filter(|capture| capture.capture == "invoc")
+        {
+            // The invocation's argument list ends at its own closing paren.
+            // Receiver expressions can contain earlier calls and parentheses.
+            let Some(arguments) = facts.captures.iter().find(|cap| {
+                cap.capture == "args"
+                    && cap.byte_start >= capture.byte_start
+                    && cap.byte_end == capture.byte_end
+            }) else {
                 continue;
             };
-            let Some(close) = capture.text.rfind(')') else {
+            let Some(name) = facts
+                .captures
+                .iter()
+                .filter(|cap| {
+                    cap.capture == "name"
+                        && cap.byte_start >= capture.byte_start
+                        && cap.byte_end <= arguments.byte_start
+                })
+                .max_by_key(|cap| cap.byte_start)
+            else {
                 continue;
             };
-            if close < paren {
+            if name.text != method.name {
                 continue;
             }
-            let args_text = &capture.text[paren + 1..close];
-            let args = split_top_level_csv(args_text);
+            let mut argument_nodes = facts
+                .captures
+                .iter()
+                .filter(|cap| {
+                    cap.capture == "arg"
+                        && cap.byte_start > arguments.byte_start
+                        && cap.byte_end < arguments.byte_end
+                })
+                .filter(|cap| {
+                    facts
+                        .captures
+                        .iter()
+                        .filter(|list| {
+                            list.capture == "arglist"
+                                && list.byte_start <= cap.byte_start
+                                && list.byte_end >= cap.byte_end
+                        })
+                        .min_by_key(|list| list.byte_end - list.byte_start)
+                        .is_some_and(|list| {
+                            list.byte_start == arguments.byte_start
+                                && list.byte_end == arguments.byte_end
+                        })
+                })
+                .collect::<Vec<_>>();
+            argument_nodes.sort_by_key(|cap| cap.byte_start);
+            argument_nodes.dedup_by_key(|cap| (cap.byte_start, cap.byte_end));
+            let args = argument_nodes
+                .into_iter()
+                .map(|cap| cap.text.clone())
+                .collect::<Vec<_>>();
             if args.len() != method.params.len() {
                 findings.push(json!({
                     "finding": "call_site_arity_mismatch",
@@ -7123,9 +7196,9 @@ fn discover_change_signature_call_sites(
                 ref_id,
                 byte_start: capture.byte_start,
                 byte_end: capture.byte_end,
-                args_start: capture.byte_start + paren + 1,
-                args_end: capture.byte_start + close,
-                text: capture.text,
+                args_start: arguments.byte_start + 1,
+                args_end: arguments.byte_end - 1,
+                text: capture.text.clone(),
                 args,
             });
         }
@@ -7346,7 +7419,7 @@ impl Tool for JavaChangeSignature {
                     "provenance": "syntax_only",
                 }));
             }
-            let (_path, source, _items, method, _findings) = match find_change_signature_method(&root, &preview_params) {
+            let (source_path, _source, _items, method, _findings) = match find_change_signature_method(&root, &preview_params) {
                 Ok(v) => v,
                 Err(e) => return err(e),
             };
@@ -7384,26 +7457,15 @@ impl Tool for JavaChangeSignature {
                 byte_end: method.params_span_end.saturating_sub(1),
                 replacement: rendered_params.join(", "),
             });
-            if method.byte_end > method.params_span_end {
-                let body_start = method.params_span_end;
-                let body = source.get(body_start..method.byte_end).unwrap_or_default();
-                let mut rewritten = body.to_string();
-                for spec in &params.target_params {
-                    let source_name = spec.source_name.as_deref().unwrap_or(spec.name.as_str());
-                    if source_name != spec.name
-                        && method.params.iter().any(|param| param.name == source_name)
-                    {
-                        rewritten = replace_word_all(&rewritten, source_name, &spec.name);
-                    }
-                }
-                if rewritten != body {
-                    edits_by_file.entry(params.file.clone()).or_default().push(bbox_refactor::TextEdit {
-                        byte_start: body_start,
-                        byte_end: method.byte_end,
-                        replacement: rewritten,
-                    });
-                }
+            let renamed = match parameter_rename_edits(&source_path, &method, &params.target_params) {
+                Ok(edits) => edits,
+                Err(error) => return err(error),
+            };
+            if renamed.iter().any(|edit| call_sites.iter().any(|site| site.file == params.file
+                && site.args_start <= edit.byte_start && site.args_end >= edit.byte_end)) {
+                return err("java.changeSignature: recursive call arguments also rename parameters; rename the parameter with lsp.rename before changing argument order or arity");
             }
+            edits_by_file.entry(params.file.clone()).or_default().extend(renamed);
             for site in &call_sites {
                 let new_args = rewritten_call_args(&method, &params.target_params, &site.args);
                 edits_by_file.entry(site.file.clone()).or_default().push(bbox_refactor::TextEdit {
@@ -7817,25 +7879,20 @@ fn qualifier_annotations(field: &FieldInjectCandidate) -> Vec<String> {
 }
 
 fn strip_field_injection_annotations(field: &FieldInjectCandidate, make_final: bool) -> String {
-    let moved = field
+    let mut text = field.declaration_text.clone();
+    // Remove only annotation syntax, never the remainder of an annotated line.
+    let mut annotations = field
         .annotations
         .iter()
-        .filter(|ann| java_annotation_is_inject_text(ann) || !java_annotation_is_inject_text(ann))
         .map(|ann| ann.trim())
-        .collect::<HashSet<_>>();
-    let mut out = Vec::new();
-    for line in field.declaration_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('@')
-            && moved
-                .iter()
-                .any(|ann| trimmed == *ann || trimmed.starts_with(&format!("{ann} ")))
-        {
-            continue;
+        .collect::<Vec<_>>();
+    annotations.sort_by_key(|ann| std::cmp::Reverse(ann.len()));
+    for annotation in annotations {
+        if let Some(start) = text.find(annotation) {
+            text.replace_range(start..start + annotation.len(), "");
         }
-        out.push(line.to_string());
     }
-    let mut text = out.join("\n");
+    let mut text = text.trim_start().to_owned();
     if make_final && !field.is_final {
         if let Some(type_pos) = text.find(field.type_text.as_str()) {
             text.insert_str(type_pos, "final ");
@@ -7969,7 +8026,7 @@ fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Resu
             }));
         }
         edits.push(bbox_refactor::TextEdit {
-            byte_start: line_start(&data.source, field.byte_start),
+            byte_start: field.byte_start,
             byte_end: field.byte_end,
             replacement: strip_field_injection_annotations(field, make_final),
         });
@@ -8001,8 +8058,8 @@ fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Resu
             replacement: new_params,
         });
         edits.push(bbox_refactor::TextEdit {
-            byte_start: line_start(&data.source, ctor.body_end),
-            byte_end: line_start(&data.source, ctor.body_end),
+            byte_start: ctor.body_end,
+            byte_end: ctor.body_end,
             replacement: render_field_inject_assignments(&selected),
         });
     } else {
@@ -8332,8 +8389,13 @@ fn render_field_accessors(
         field.type_text, getter_name, field.name
     );
     if let Some(setter_name) = setter_name {
+        let receiver = if static_kw.is_empty() {
+            "this"
+        } else {
+            field.owner_class.as_str()
+        };
         out.push_str(&format!(
-            "\n    public{static_kw} void {setter_name}({} {}) {{\n        this.{} = {};\n    }}\n",
+            "\n    public{static_kw} void {setter_name}({} {}) {{\n        {receiver}.{} = {};\n    }}\n",
             field.type_text, field.name, field.name, field.name
         ));
     }
@@ -11587,7 +11649,8 @@ WHAT IT DOES
   Preview inventories one non-overloaded method declaration, target parameter
   shape, and same-name call sites. Apply re-runs preview, refuses stale methodRef,
   rewrites the declaration parameter list, rewrites same-name call argument lists,
-  and does simple renamed-parameter word replacement inside the method body.
+  and rewrites renamed parameter identifier nodes in the method body. Strings,
+  comments and qualified member names are preserved; nested type ambiguity refuses.
 
 REF MODEL
   methodRef is preview-local: method:<name>:<signature-byte-range>:<hash>.
@@ -11983,13 +12046,13 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": PREVIEW_PLAN_CONTRACT }))
             }
             "extractColumnSpec" => ToolResult::Json(
-                json!({ "contract": "java.extractColumnSpec: detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. Params: file, methods[2], target, className?, spec_name?. Returns {changes, creates, common_columns, spec_class, provenance}." }),
+                json!({ "contract": "java.extractColumnSpec is retired and is not callable. Its template did not preserve receivers, value providers, or source ranges. Use code.query to locate exact method/column spans, inspect the full fluent chains with code.read, then propose explicit changes through edits.merge/createFile/apply and compile the result." }),
             ),
             "synthesizeHelperWrappers" => {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, fieldInjectToConstructorPreview, fieldInjectToConstructor, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, fieldInjectToConstructorPreview, fieldInjectToConstructor, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -12039,8 +12102,9 @@ WHAT IT DOES
 
 WHY @Inject only
   A parameter is scoped to the ctor body, so "unused" is decided locally (no whole-class
-  scan). Dropping a param is safe ONLY for a container-constructed (@Inject) ctor — it has
-  no manual `new Source(...)` callers to break. A non-@Inject ctor is refused with a note.
+  scan). Dropping a param is safe ONLY for a container-constructed (@Inject) ctor — its caller scan must find
+  no manual `new Source(...)` callers to break. A non-@Inject ctor is refused with a note. Detected manual new-expression
+  callers also refuse: @Inject alone does not prove exclusive container construction.
 
 ORDERING (important)
   Run this AFTER you have APPLIED the extract. The orphaned `this.dep = dep` assignment
@@ -12241,6 +12305,23 @@ impl Tool for JavaRemoveUnusedCtorParams {
                 Ok(p) => p,
                 Err(e) => return err(format!("java.removeUnusedConstructorParams: {e:#}")),
             };
+            if plan.edit.is_some() {
+                let items = match bbox_refactor::facts::file_items(&abs) {
+                    Ok(items) => items,
+                    Err(error) => return err(format!("java.removeUnusedConstructorParams: caller scan could not identify source type: {error:#}")),
+                };
+                let Some(class_name) = items.items.iter().find(|item| item.item.kind == "class_declaration")
+                    .and_then(|item| item.item.name.as_deref()) else {
+                    return err("java.removeUnusedConstructorParams: source class unavailable for caller scan");
+                };
+                let callers = match discover_constructor_call_counts(&root, class_name) {
+                    Ok(callers) => callers,
+                    Err(error) => return err(error),
+                };
+                if !callers.is_empty() {
+                    return err(format!("java.removeUnusedConstructorParams: @Inject does not exclude manual construction; found new {class_name}(...) callers in {:?}. Update those callers explicitly before removing constructor parameters", callers));
+                }
+            }
             let mut changes: Vec<Value> = Vec::new();
             if let Some((byte_start, byte_end, replacement)) = &plan.edit {
                 changes.push(json!({
@@ -12326,31 +12407,24 @@ fn compilation_unit_type_names(
 }
 
 fn import_insertion_offset(source: &str) -> (usize, bool, bool) {
-    let mut offset = 0usize;
-    let mut insert_at = 0usize;
-    let mut saw_package = false;
-    let mut saw_import = false;
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with("package ") {
-            saw_package = true;
-            offset += line.len();
-            insert_at = offset;
-            continue;
-        }
-        if trimmed.starts_with("import ") {
-            saw_import = true;
-            offset += line.len();
-            insert_at = offset;
-            continue;
-        }
-        if trimmed.is_empty() && (saw_package || saw_import) {
-            offset += line.len();
-            continue;
-        }
-        break;
+    let declarations = java_preamble(source);
+    let mut insert_at = declarations.last().map(|(_, _, end)| *end).unwrap_or(0);
+    if source
+        .get(insert_at..)
+        .is_some_and(|rest| rest.starts_with("\r\n"))
+    {
+        insert_at += 2;
+    } else if source
+        .get(insert_at..)
+        .is_some_and(|rest| rest.starts_with('\n'))
+    {
+        insert_at += 1;
     }
-    (insert_at, saw_package, saw_import)
+    (
+        insert_at,
+        declarations.iter().any(|(kind, _, _)| *kind == "package"),
+        declarations.iter().any(|(kind, _, _)| *kind == "import"),
+    )
 }
 
 // Sync fs access is sanctioned here: callers run inside the call_blocking
@@ -12365,12 +12439,14 @@ fn java_add_import_value(root: &Path, params: JavaAddImportParams) -> Result<Val
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("java.addImport: read {}: {e}", params.file))?;
     let content_sha256 = bbox_refactor::sha256_hex(source.as_bytes());
-    let existing = source
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("import "))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
+    let existing = source_imports(&source).into_iter().collect::<BTreeSet<_>>();
+    let mut imported_names = BTreeMap::new();
+    for line in &existing {
+        let (_, name) = normalize_import_request(line)?;
+        if let Some(name) = name {
+            imported_names.insert(name, line.clone());
+        }
+    }
     let items = bbox_refactor::facts::file_items(&path)
         .map_err(|e| format!("java.addImport: {}: {e:#}", params.file))?;
     let local_types = compilation_unit_type_names(&items);
@@ -12407,6 +12483,14 @@ fn java_add_import_value(root: &Path, params: JavaAddImportParams) -> Result<Val
             }));
             continue;
         }
+        if let Some(name) = simple_name {
+            if let Some(previous) = imported_names.get(&name) {
+                return Err(format!(
+                    "java.addImport: conflicting imports for {name}: {previous} and {line}; use a fully qualified type name instead"
+                ));
+            }
+            imported_names.insert(name, line.clone());
+        }
         findings.push(json!({
             "finding": "import_added",
             "import": line,
@@ -12418,9 +12502,9 @@ fn java_add_import_value(root: &Path, params: JavaAddImportParams) -> Result<Val
         Vec::new()
     } else {
         let (insert_at, saw_package, saw_import) = import_insertion_offset(&source);
-        let prefix = if saw_import {
+        let prefix = if saw_import && source[..insert_at].ends_with('\n') {
             ""
-        } else if saw_package {
+        } else if saw_package || saw_import {
             "\n"
         } else {
             ""
@@ -13509,236 +13593,6 @@ impl Tool for JavaSynthesizeHelperWrappers {
     }
 }
 
-/// `java.extractColumnSpec` — detect repeated Vaadin grid column-builder
-/// chains and extract a typed ColumnSpec record + shared builder method.
-pub struct JavaExtractColumnSpec;
-
-#[derive(Deserialize)]
-struct ColumnSpecParams {
-    file: String,
-    methods: Vec<String>,
-    target: String,
-    #[serde(default, rename = "className", alias = "class_name")]
-    class_name: Option<String>,
-    #[serde(default)]
-    spec_name: Option<String>,
-}
-
-#[async_trait]
-impl Tool for JavaExtractColumnSpec {
-    fn name(&self) -> &str {
-        "java.extractColumnSpec"
-    }
-    fn description(&self) -> &str {
-        "Detect repeated Vaadin Grid addColumn fluent chains across methods, extract common columns into a typed ColumnSpec record + shared builder, and rewrite one method to use the spec. Use for grid/column deduplication before larger UI extraction. Pure; syntax_only; never writes."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "file": { "type": "string" },
-                "methods": { "type": "array", "items": { "type": "string" }, "description": "Two method names to compare (e.g. getInputGasGrid, getOutputGasGrid)." },
-                "target": { "type": "string", "description": "Path for the new ColumnSpec record file." },
-                "className": { "type": "string" },
-                "spec_name": { "type": "string", "description": "Generated record name. Default: <className>ColumnSpec." }
-            },
-            "required": ["file", "methods", "target"]
-        })
-    }
-    fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations {
-            read_only: true,
-            destructive: false,
-        }
-    }
-    fn namespace_binding(&self) -> Option<(String, String)> {
-        Some(("java".to_string(), "extractColumnSpec".to_string()))
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: ColumnSpecParams = match serde_json::from_value(input) {
-            Ok(p) => p,
-            Err(e) => return err(format!("java.extractColumnSpec: {e}")),
-        };
-        if params.methods.len() < 2 {
-            return err("java.extractColumnSpec: at least 2 methods required");
-        }
-        let root = cx.root.clone();
-        bro_tools::tool::call_blocking(move || {
-            let source_path = root.join(&params.file);
-            // Sync fs read inside a call_blocking closure (concurrency-model
-            // section 5).
-            #[allow(clippy::disallowed_methods)]
-            let source = match std::fs::read_to_string(&source_path) {
-                Ok(s) => s,
-                Err(e) => return err(format!("read source: {e}")),
-            };
-            let _target_path = root.join(&params.target);
-
-            // Parse column chains from each method using tree-sitter.
-            // Match columns by position and extract common vs variable parts.
-            #[derive(Debug)]
-            struct ColInfo { key: String, header: String, provider_text: String, align: String }
-            let mut method_cols: Vec<Vec<ColInfo>> = Vec::new();
-            for method_name in &params.methods {
-                let mut cols = Vec::new();
-                if let Ok(facts) = bbox_refactor::facts::file_query(
-                    &source_path,
-                    "(method_invocation name: (identifier) @addcol) @invoc",
-                    None,
-                ) {
-                    // Find addColumn calls within this method's body.
-                    // We need the method's byte range first.
-                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
-                        &source_path,
-                        "(method_declaration name: (identifier) @name) @method",
-                        None,
-                    ) {
-                        let method_range = method_facts.captures.iter()
-                            .find(|mc| mc.capture == "name" && mc.text == *method_name)
-                            .and_then(|nc| method_facts.captures.iter()
-                                .find(|mc| mc.capture == "method"
-                                    && mc.byte_start <= nc.byte_start
-                                    && mc.byte_end >= nc.byte_end))
-                            .map(|mc| (mc.byte_start, mc.byte_end));
-                        if let Some((m_start, m_end)) = method_range {
-                            // Collect addColumn invocations within method.
-                            for cap in &facts.captures {
-                                if cap.capture == "addcol" && cap.text == "addColumn"
-                                    && cap.byte_start >= m_start && cap.byte_end <= m_end
-                                {
-                                    let chain_start = cap.byte_end;
-                                    let chain_end = source[chain_start..]
-                                        .find(';').map(|i| chain_start + i).unwrap_or(m_end);
-                                    let chain = &source[chain_start..chain_end];
-                                    // Skip LitRenderer columns — they have complex
-                                    // templates that the spec record can't represent.
-                                    if chain.contains("LitRenderer") { continue; }
-                                    let key = chain.find(".setKey(\"").and_then(|i| {
-                                        let s = &chain[i+9..];
-                                        s.find('"').map(|j| s[..j].to_string())
-                                    }).unwrap_or_default();
-                                    // If no key, derive from header (lowercase, no spaces).
-                                    let key = if key.is_empty() {
-                                        chain.find(".setHeader(\"").and_then(|i| {
-                                            let s = &chain[i+12..];
-                                            s.find('"').map(|j| s[..j].to_lowercase().replace(' ', "_"))
-                                        }).unwrap_or_else(|| format!("col_{}", cols.len()))
-                                    } else { key };
-                                    let header = chain.find(".setHeader(\"").and_then(|i| {
-                                        let s = &chain[i+12..];
-                                        s.find('"').map(|j| s[..j].to_string())
-                                    }).unwrap_or_default();
-                                    let align = if chain.contains("CENTER") { "CENTER" }
-                                        else if chain.contains("START") { "START" }
-                                        else if chain.contains("END") { "END" }
-                                        else { "CENTER" };
-                                    let provider_text = source[cap.byte_start..chain_start]
-                                        .trim().to_string();
-                                    cols.push(ColInfo { key, header, provider_text, align: align.to_string() });
-                                }
-                            }
-                        }
-                    }
-                }
-                method_cols.push(cols);
-            }
-            if method_cols[0].is_empty() || method_cols[1].is_empty() {
-                return err("java.extractColumnSpec: could not parse column chains");
-            }
-
-            // Match columns by position. The first N columns that share the
-            // same key become the common spec.
-            let common_count = method_cols[0].len().min(method_cols[1].len());
-            let mut spec_cols: Vec<&ColInfo> = Vec::new();
-            for i in 0..common_count {
-                if method_cols[0][i].key == method_cols[1][i].key
-                    && method_cols[0][i].align == method_cols[1][i].align
-                {
-                    spec_cols.push(&method_cols[0][i]);
-                } else {
-                    break;
-                }
-            }
-            if spec_cols.is_empty() {
-                return err("java.extractColumnSpec: no common columns found");
-            }
-
-            // Derive class names.
-            let target_stem = std::path::Path::new(&params.target)
-                .file_stem().and_then(|s| s.to_str()).unwrap_or("ColumnSpec");
-            let spec_class = params
-                .spec_name
-                .clone()
-                .or_else(|| {
-                    params
-                        .class_name
-                        .as_ref()
-                        .map(|class_name| format!("{class_name}ColumnSpec"))
-                })
-                .unwrap_or_else(|| target_stem.to_string());
-            let pkg = source.lines()
-                .find(|l| l.starts_with("package "))
-                .map(|l| l.trim_start_matches("package ").trim_end_matches(';').to_string())
-                .unwrap_or_default();
-
-            // Generate the spec file.
-            let mut spec_src = format!("package {pkg};\n\nimport com.vaadin.flow.component.grid.ColumnTextAlign;\nimport com.vaadin.flow.component.grid.Grid;\nimport com.vaadin.flow.function.ValueProvider;\n\nimport java.util.List;\n\npublic record {spec_class}<T>(\n");
-            for (i, col) in spec_cols.iter().enumerate() {
-                let comma = if i < spec_cols.len() - 1 { "," } else { "" };
-                spec_src.push_str(&format!("    String {}Key,\n    String {}Header,\n    ColumnTextAlign {}Align,\n    ValueProvider<T, ?> {}Provider{comma}\n",
-                    col.key, col.key, col.key, col.key));
-            }
-            spec_src.push_str(") {{\n");
-            spec_src.push_str(&format!("    public static <T> void applyColumns(Grid<T> grid, List<{spec_class}<T>> columns) {{\n"));
-            spec_src.push_str("        for (var col : columns) {\n");
-            spec_src.push_str("            grid.addColumn(col.provider())\n");
-            spec_src.push_str("                .setKey(col.key())\n");
-            spec_src.push_str("                .setHeader(col.header())\n");
-            spec_src.push_str("                .setAutoWidth(true)\n");
-            spec_src.push_str("                .setTextAlign(col.align());\n");
-            spec_src.push_str("        }\n    }\n}\n");
-
-            // Rewrite the first method to use the spec.
-            // Replace the common column block with a spec-list construction.
-            let mut spec_list = String::from("List.of(\n");
-            for col in &spec_cols {
-                spec_list.push_str(&format!("            new {spec_class}<>(\"{key}\", \"{header}\", ColumnTextAlign.{align}, {provider}),\n",
-                    key = col.key, header = col.header, align = col.align,
-                    provider = col.provider_text.trim()));
-            }
-            spec_list.push_str("        )");
-            let new_text = format!("{spec_class}.applyColumns(plantShrinkageInputGasGrid, {spec_list});");
-
-            // Find the byte range of the common column block to replace.
-            // Approximate: find the first "addColumn(" in the source and
-            // replace from there to the last common column's semicolon.
-            let first_addcol = source.find("addColumn(").unwrap_or(0);
-            let last_common_key = &spec_cols.last().unwrap().key;
-            let last_semi = source.rfind(&format!(".setKey(\"{last_common_key}\")"))
-                .and_then(|i| source[i..].find(';').map(|j| i + j + 1))
-                .unwrap_or(source.len());
-
-            let content_sha = bbox_refactor::sha256_hex(source.as_bytes());
-            let changes = vec![json!({
-                "span": { "file": params.file, "byte_start": first_addcol, "byte_end": last_semi,
-                    "content_sha256": content_sha },
-                "new_text": new_text,
-            })];
-            let creates = vec![json!({
-                "path": params.target, "content": spec_src,
-            })];
-
-            ToolResult::Json(json!({
-                "changes": changes,
-                "creates": creates,
-                "common_columns": spec_cols.iter().map(|c| c.key.clone()).collect::<Vec<_>>(),
-                "spec_class": spec_class,
-                "provenance": "syntax_only",
-            }))
-        }).await
-    }
-}
-
 /// The `java.*` binding set.
 pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
     vec![
@@ -13768,7 +13622,6 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaMoveMemberPreview) as Arc<dyn Tool>,
         Arc::new(JavaMoveMember) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
-        Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
         Arc::new(JavaAddImport) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
@@ -13784,7 +13637,7 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + nest access breaks + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; fieldInjectToConstructorPreview/fieldInjectToConstructor - promote selected @Inject instance fields to constructor parameters without rewriting new call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + nest access breaks + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; fieldInjectToConstructorPreview/fieldInjectToConstructor - promote selected @Inject instance fields to constructor parameters without rewriting new call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
@@ -13825,8 +13678,6 @@ declare const java: {
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Preflight a java.extractClass seam: overloads, field closure, external callers, residual references, nest access breaks, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
   extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; nest_access_breaks: JavaNestAccessBreakFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
-  /** Detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. */
-  extractColumnSpec(args: { file: string; methods: string[]; target: string; className?: string; spec_name?: string }): Promise<{ changes: SpanChange[]; creates: { path: string; content: string }[]; common_columns: string[]; spec_class: string; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */

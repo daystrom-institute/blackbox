@@ -31,6 +31,32 @@ struct JavaField {
     is_final: bool,
 }
 
+// A member's line may begin with its enclosing type or a previous member.
+// Keep attached comments/indentation without copying or deleting that syntax.
+fn java_syntax_item(parsed: &ParsedSource, node: Node<'_>, kind: &str) -> SyntaxItem {
+    let mut item = syntax_item_with_kind(parsed, node, kind);
+    let mut floor = node
+        .parent()
+        .filter(|parent| {
+            matches!(
+                parent.kind(),
+                "class_body" | "interface_body" | "enum_body" | "record_body"
+            )
+        })
+        .map(|parent| parent.start_byte() + 1)
+        .unwrap_or(0);
+    let mut sibling = node.prev_named_sibling();
+    while let Some(previous) = sibling {
+        if !matches!(previous.kind(), "line_comment" | "block_comment") {
+            floor = floor.max(previous.end_byte());
+            break;
+        }
+        sibling = previous.prev_named_sibling();
+    }
+    item.leading_trivia_start = item.leading_trivia_start.max(floor).min(item.byte_start);
+    item
+}
+
 pub(crate) fn java_methods(parsed: &ParsedSource) -> Vec<JavaMethod> {
     let mut methods = Vec::new();
     let root = parsed.tree.root_node();
@@ -79,7 +105,7 @@ fn walk_java_methods(
             methods.push(JavaMethod {
                 parent_name: parent_name.to_string(),
                 parent_byte_start,
-                item: syntax_item_with_kind(parsed, child, kind),
+                item: java_syntax_item(parsed, child, kind),
             });
         } else {
             walk_java_methods(parsed, child, parent_name, parent_byte_start, methods);
@@ -124,7 +150,7 @@ fn walk_java_nested_classes(
             classes.push(JavaNestedClass {
                 parent_name: parent_name.to_string(),
                 parent_byte_start,
-                item: syntax_item_with_kind(parsed, child, kind),
+                item: java_syntax_item(parsed, child, kind),
             });
             let name = item_name(child, &parsed.source, parsed.language)
                 .unwrap_or_else(|| "(unnamed)".to_string());
@@ -739,7 +765,7 @@ fn java_fields(parsed: &ParsedSource) -> Vec<JavaField> {
                 fields.push(JavaField {
                     name,
                     type_name,
-                    item: syntax_item_with_kind(parsed, node, "field_declaration"),
+                    item: java_syntax_item(parsed, node, "field_declaration"),
                     is_final,
                 });
             }
@@ -1003,7 +1029,7 @@ fn outer_class_field_map(parsed: &ParsedSource) -> BTreeMap<String, JavaField> {
                 JavaField {
                     name,
                     type_name,
-                    item: syntax_item_with_kind(parsed, child, "field_declaration"),
+                    item: java_syntax_item(parsed, child, "field_declaration"),
                     is_final,
                 },
             );
