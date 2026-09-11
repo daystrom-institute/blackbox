@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -110,6 +111,8 @@ text('PASS edit algebra and rollback');
 let result = await build.gate({{command:{json.dumps(rustc + ' --crate-type=lib --error-format=json warning.rs -o warning.rlib')},anchor_spans:true}});
 check(result.ok && result.diagnostics_complete,'gate failed');
 check(result.counts.warnings > 0 && result.diagnostics.some(d=>d.code==='unused_mut' && d.suggestions.some(s=>s.replacement==='')),'raw rustc warning/suggestion lost');
+result = await build.gate({{command:{json.dumps(rustc + ' --crate-type=lib --error-format=json warning.rs -o warning.rlib')},max_diagnostics:0}});
+check(result.ok && result.counts.warnings > 0 && result.diagnostics.length===0 && !result.diagnostics_complete,'zero diagnostic limit not honored');
 result = await build.gate({{command:'printf "build failed\\\\n" >&2; exit 3'}});
 check(!result.ok && result.exit_code===3 && result.diagnostics.length>0,'generic failure lost');
 text('PASS compiler diagnostics');
@@ -149,12 +152,20 @@ text('PASS shell lifecycle');
               '/html':('text/html',b'<p>Hello &amp; <b>world</b></p>'),
               '/unicode':('application/json',json.dumps({'source':'🦀 x\n'*5000},ensure_ascii=False).encode()),
               '/binary':('application/octet-stream',b'\x00\xff'),
+              '/headers':('text/plain',b'done'),
+              '/body':('text/plain',b'done'),
+              '/invalid-text':('text/plain',b'\xff'),
+              '/stream-big':('text/plain',b'x'*(2*1024*1024+1)),
               '/oversize':('text/plain',b'x'*(2*1024*1024+1))}
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             media, body = bodies.get(self.path, ('text/plain',b'missing'))
+            if self.path == '/headers': time.sleep(2)
             self.send_response(200 if self.path in bodies else 404)
-            self.send_header('Content-Type',media); self.send_header('Content-Length',str(len(body))); self.end_headers()
+            self.send_header('Content-Type',media)
+            if self.path != '/stream-big': self.send_header('Content-Length',str(len(body)))
+            self.end_headers()
+            if self.path == '/body': time.sleep(2)
             try: self.wfile.write(body)
             except (BrokenPipeError,ConnectionResetError): pass
         def log_message(self,*a): pass
@@ -176,8 +187,18 @@ check(JSON.parse(output).source==='🦀 x\\n'.repeat(5000) && pages>1,'web pagin
 await refuses(()=>tools.web_fetch({{url:base+'/source',start_char:1,expected_sha256:'0'.repeat(64)}}),/changed/);
 await refuses(()=>tools.web_fetch({{url:base+'/binary'}}),/media type/);
 await refuses(()=>tools.web_fetch({{url:base+'/oversize'}}),/2 MiB/);
+await refuses(()=>tools.web_fetch({{url:base+'/stream-big'}}),/2 MiB/);
+await refuses(()=>tools.web_fetch({{url:base+'/invalid-text'}}),/UTF-8/);
 await refuses(()=>tools.web_fetch({{url:base+'/missing'}}),/404/);
 text('PASS web content integrity');
 ''','web_fetch exact code, HTML, Unicode paging, changed-source and format refusals')
+    for route in ['headers','body']:
+        started = time.monotonic()
+        cell = 'void tools.web_fetch({url:'+json.dumps(base+'/'+route)+'});await new Promise(resolve=>setTimeout(resolve,150));text("PASS cell finished");'
+        proc = subprocess.run([binary,'--root',str(root),'--cell',cell],capture_output=True,text=True,timeout=10)
+        assert proc.returncode == 0 and 'cancelled before' in proc.stdout, proc.stdout + proc.stderr
+        assert time.monotonic() - started < 1.5, 'cancelled web request waited for slow '+route
+        receipt.append('web_fetch cancellation during '+route)
+        print('PASS web_fetch cancellation during '+route,flush=True)
     server.shutdown();server.server_close();thread.join()
 print(json.dumps({'passed':receipt},indent=2))

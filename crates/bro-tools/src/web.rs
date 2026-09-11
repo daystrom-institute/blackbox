@@ -58,16 +58,19 @@ impl Tool for WebFetch {
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
         let max_chars = args.max_chars.unwrap_or(8000).clamp(500, 20_000);
-        let resp = cx
+        let request = cx
             .http
             .get(&args.url)
             .header(
                 "user-agent",
                 "Mozilla/5.0 (compatible; bro-harness/0.1; +https://github.com)",
             )
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await;
+            .timeout(Duration::from_secs(15));
+        let resp = tokio::select! {
+            biased;
+            _ = cx.cancellation.cancelled() => return ToolResult::Error("web_fetch: cancelled before response headers".into()),
+            response = request.send() => response,
+        };
         let mut response = match resp {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => response,

@@ -451,7 +451,7 @@ impl Tool for WaitTool {
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "description": "Output token budget for this wait call, estimated at four bytes per token. Defaults to 10000; the complete response is capped at 12 KiB with space reserved for status and diagnostics.",
+                    "description": "Output token budget for this wait call, estimated at four bytes per token. Defaults to 10000; the shared host result limit also applies (normally 16 KiB, configurable by the operator), with space reserved for status and diagnostics.",
                     "minimum": 0,
                     "maximum": 9007199254740991_u64
                 },

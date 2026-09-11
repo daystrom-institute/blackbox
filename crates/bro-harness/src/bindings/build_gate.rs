@@ -50,10 +50,7 @@ enum BuildTool {
 enum DiagnosticSeverity {
     Error,
     Warning,
-    /// rustc `note`/`help`/`ice` levels are not diagnostics proper; today
-    /// they surface only as nested suggestions and never as top-level
-    /// BuildDiagnostics, so this variant is reserved for future use.
-    #[allow(dead_code)]
+    /// Informational top-level compiler records, such as note/help messages.
     Info,
 }
 
@@ -135,7 +132,7 @@ impl Tool for BuildGate {
                 "command": { "type": "string", "description": "Shell command line to execute through bash -lc." },
                 "cwd": { "type": "string", "description": "Working directory relative to the session root. Defaults to root." },
                 "timeout_ms": { "type": "integer", "minimum": 0, "description": "Hard timeout in milliseconds. Default 600000." },
-                "max_diagnostics": { "type": "integer", "minimum": 0, "description": "Maximum diagnostics returned. Default 100." },
+                "max_diagnostics": { "type": "integer", "minimum": 0, "description": "Maximum diagnostics returned. Default 100; zero returns counts only and discloses omitted diagnostics." },
                 "anchor_spans": { "type": "boolean", "description": "When true, attach hash-anchored line spans for diagnostics whose files exist under the session root." }
             },
             "required": ["command"]
@@ -163,10 +160,7 @@ impl Tool for BuildGate {
             return ToolResult::Error("build.gate: command must not be empty".to_string());
         }
 
-        let max_diagnostics = args
-            .max_diagnostics
-            .unwrap_or(DEFAULT_MAX_DIAGNOSTICS)
-            .max(1);
+        let max_diagnostics = args.max_diagnostics.unwrap_or(DEFAULT_MAX_DIAGNOSTICS);
         let command = args.command.clone();
         let mut shell_input = json!({
             "command": command,
