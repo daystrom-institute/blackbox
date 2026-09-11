@@ -33,6 +33,7 @@ pub struct Restored {
     pub model: Option<String>,
     pub code_mode: Option<String>,
     pub service_tier: Option<String>,
+    pub effort: Option<String>,
     pub snapshot: Value,
     pub side: Value,
     pub last_event_seq: u64,
@@ -44,6 +45,7 @@ pub struct SaveState<'a> {
     pub model: &'a str,
     pub code_mode: &'a str,
     pub service_tier: Option<&'a str>,
+    pub effort: Option<&'a str>,
     pub snapshot: Value,
     pub side: Value,
     pub last_event_seq: u64,
@@ -253,6 +255,7 @@ impl SessionStore {
             "model":state.model,
             "code_mode":state.code_mode,
             "service_tier":state.service_tier,
+            "effort":state.effort,
             "snapshot":state.snapshot,
             "side":state.side,
             "last_event_seq":state.last_event_seq,
@@ -395,6 +398,7 @@ fn parse_restored(body: &str) -> Result<Restored> {
         model: optional_string(object, "model")?,
         code_mode,
         service_tier: optional_string(object, "service_tier")?,
+        effort: optional_string(object, "effort")?,
         snapshot: snapshot.clone(),
         side,
         last_event_seq,
@@ -582,6 +586,7 @@ mod tests {
             model: "synthetic-model",
             code_mode: "optional",
             service_tier: Some("priority"),
+            effort: Some("high"),
             snapshot: json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]),
             side: json!({"todos":[],"marker":"retained"}),
             last_event_seq: 7,
@@ -644,6 +649,7 @@ mod tests {
         assert_eq!(restored.model.as_deref(), Some("synthetic-model"));
         assert_eq!(restored.code_mode.as_deref(), Some("optional"));
         assert_eq!(restored.service_tier.as_deref(), Some("priority"));
+        assert_eq!(restored.effort.as_deref(), Some("high"));
         assert_eq!(restored.last_event_seq, 7);
     }
 
@@ -854,6 +860,8 @@ mod tests {
             ("model", json!(4)),
             ("code_mode", json!("invalid")),
             ("service_tier", json!(false)),
+            ("effort", json!(false)),
+            ("effort", json!("")),
             ("last_event_seq", json!(-1)),
             ("event_log_offset", json!("12")),
         ];
@@ -894,6 +902,25 @@ mod tests {
         assert_eq!(restored.model, None);
         assert_eq!(restored.code_mode, None);
         assert_eq!(restored.service_tier, None);
+        assert_eq!(restored.effort, None);
+    }
+
+    #[test]
+    fn versioned_snapshot_accepts_absent_or_null_effort() {
+        let mut snapshot: Value =
+            serde_json::from_str(&SessionStore::serialize(&state(), Some(0)).unwrap()).unwrap();
+        snapshot.as_object_mut().unwrap().remove("effort");
+        assert_eq!(parse_restored(&snapshot.to_string()).unwrap().effort, None);
+        snapshot["effort"] = Value::Null;
+        assert_eq!(parse_restored(&snapshot.to_string()).unwrap().effort, None);
+        let mut saved = state();
+        saved.effort = None;
+        assert_eq!(
+            parse_restored(&SessionStore::serialize(&saved, Some(0)).unwrap())
+                .unwrap()
+                .effort,
+            None
+        );
     }
 
     #[test]
