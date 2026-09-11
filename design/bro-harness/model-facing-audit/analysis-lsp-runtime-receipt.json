@@ -1,0 +1,4255 @@
+{
+  "description": "Real isolate calls against disposable source fixtures; repeated cell traces deduplicated without changing observations.",
+  "runs": {
+    "baseline": {
+      "binary_sha256": "0f3c6f8eb38fab6863bdfef395a341f438c6ba458fc45ca0cda34d90a64b9761",
+      "elapsed_seconds": 38.23,
+      "fixture": "scripts/fixtures/harness-analysis-lsp",
+      "full_surface": true,
+      "covered_tools": [
+        "analysis.cohesionClusters",
+        "analysis.describe",
+        "analysis.fieldClassification",
+        "analysis.fieldInitializerClosure",
+        "analysis.implPartition",
+        "analysis.methodRegions",
+        "analysis.references",
+        "analysis.topLevelDeps",
+        "lsp.assist",
+        "lsp.definition",
+        "lsp.executeCommand",
+        "lsp.hover",
+        "lsp.references",
+        "lsp.rename",
+        "lsp.status",
+        "lsp.willRenameFiles"
+      ],
+      "missing_tools": [],
+      "passed": 41,
+      "failed": 17,
+      "cases": [
+        {
+          "case": "describe-references-java",
+          "tool": "analysis.describe",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "contract": "analysis.references \u2014 count Java symbol references across the workspace without returning full capture payloads.\n\nWHAT IT DOES\n  Walks .java files under the session root and counts AST-grounded references to\n  simple symbol names. It returns per-symbol counts, every file containing each\n  symbol, and up to five example sites per symbol. This is the bounded answer to\n  \"where is this referenced?\" when you need counts for planning, not editable\n  spans. Do NOT fan out code.query across the repo just to count.\n\nPARAMS\n  symbols: string[]   simple names to count (method, field, or type names)\n  kinds?: string[]    optional filter: type_reference | method_invocation |\n                      field_access | method_reference | import\n  declaringClass?: string\n                      optional method-call receiver filter. When set, includes\n                      method invocations whose receiver plausibly resolves to a\n                      field of this class in the enclosing class.\n\nRETURNS { symbols, total_usages, unique_files, production_sites, test_sites,\n          counts_by_symbol, files_by_symbol, examples_by_symbol, provenance }\n  counts_by_symbol: { [symbol]: count }\n  files_by_symbol:  { [symbol]: relative-to-worktree-root files[] }\n  examples_by_symbol: top 5 examples per symbol with path, line, column, context,\n                      usage_kind, is_test_site. Examples are for orientation only;\n                      use code.query/code.items if you need hash-anchored spans.\n\nUSES\n  - Before java.extractClass, count moved public methods with\n    kinds:[\"method_invocation\"] to decide whether wrappers:true is needed.\n  - During seam selection, count candidate fields or delegate names to distinguish\n    real concern-private state from forwarded-field false seams.\n  - Before deleting or moving a type, get cheap production/test usage counts.\n\nRECIPE\n  const refs = await analysis.references({\n    symbols: seam.item_names,\n    kinds: [\"method_invocation\"],\n  });\n  const externalFiles = Object.values(refs.files_by_symbol).flat()\n    .filter(f => f !== file);\n  const hasExternalCallers = externalFiles.length > 0;\n  const r = await java.extractClass({ ..., wrappers: hasExternalCallers });\n"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "describe-references-rust",
+          "tool": "analysis.describe",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "contract": "analysis.references \u2014 count Java symbol references across the workspace without returning full capture payloads.\n\nWHAT IT DOES\n  Walks .java files under the session root and counts AST-grounded references to\n  simple symbol names. It returns per-symbol counts, every file containing each\n  symbol, and up to five example sites per symbol. This is the bounded answer to\n  \"where is this referenced?\" when you need counts for planning, not editable\n  spans. Do NOT fan out code.query across the repo just to count.\n\nPARAMS\n  symbols: string[]   simple names to count (method, field, or type names)\n  kinds?: string[]    optional filter: type_reference | method_invocation |\n                      field_access | method_reference | import\n  declaringClass?: string\n                      optional method-call receiver filter. When set, includes\n                      method invocations whose receiver plausibly resolves to a\n                      field of this class in the enclosing class.\n\nRETURNS { symbols, total_usages, unique_files, production_sites, test_sites,\n          counts_by_symbol, files_by_symbol, examples_by_symbol, provenance }\n  counts_by_symbol: { [symbol]: count }\n  files_by_symbol:  { [symbol]: relative-to-worktree-root files[] }\n  examples_by_symbol: top 5 examples per symbol with path, line, column, context,\n                      usage_kind, is_test_site. Examples are for orientation only;\n                      use code.query/code.items if you need hash-anchored spans.\n\nUSES\n  - Before java.extractClass, count moved public methods with\n    kinds:[\"method_invocation\"] to decide whether wrappers:true is needed.\n  - During seam selection, count candidate fields or delegate names to distinguish\n    real concern-private state from forwarded-field false seams.\n  - Before deleting or moving a type, get cheap production/test usage counts.\n\nRECIPE\n  const refs = await analysis.references({\n    symbols: seam.item_names,\n    kinds: [\"method_invocation\"],\n  });\n  const externalFiles = Object.values(refs.files_by_symbol).flat()\n    .filter(f => f !== file);\n  const hasExternalCallers = externalFiles.length > 0;\n  const r = await java.extractClass({ ..., wrappers: hasExternalCallers });\n"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "describe-unknown",
+          "tool": "analysis.describe",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.describe: unknown analysis `absent` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure, implPartition, topLevelDeps)\n"
+        },
+        {
+          "case": "cohesion-clusters",
+          "tool": "analysis.cohesionClusters",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "class": {
+              "name": "OrderLedger",
+              "package": "com.acme",
+              "source_path": "src/main/java/com/acme/OrderLedger.java"
+            },
+            "cluster_count": 2,
+            "clusters": [
+              {
+                "expected_wiring": "delegate",
+                "id": "cluster-1",
+                "inbound_calls": 1,
+                "internal_calls": 0,
+                "internal_field_touches": 4,
+                "item_names": [
+                  "balance",
+                  "settle"
+                ],
+                "move_fields": [
+                  "settled"
+                ],
+                "name_hint": "balance",
+                "outbound_calls": 0,
+                "score": 0.8
+              },
+              {
+                "expected_wiring": "callback",
+                "id": "cluster-2",
+                "inbound_calls": 0,
+                "internal_calls": 0,
+                "internal_field_touches": 7,
+                "item_names": [
+                  "deposit",
+                  "receipts",
+                  "summary"
+                ],
+                "move_fields": [
+                  "label",
+                  "receipts"
+                ],
+                "name_hint": "deposit",
+                "outbound_calls": 1,
+                "score": 0.875
+              }
+            ],
+            "cross_cluster_calls": [
+              {
+                "from_cluster": "cluster-2",
+                "from_method": "summary",
+                "to_cluster": "cluster-1",
+                "to_method": "balance"
+              }
+            ],
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "cohesion-missing-file",
+          "tool": "analysis.cohesionClusters",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.cohesionClusters: java_class_dependency_analysis prerequisite failed: failed to read /private<fixture-root>/analysis/absent.java: No such file or directory (os error 2)\n"
+        },
+        {
+          "case": "java-reference-counts",
+          "tool": "analysis.references",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "counts_by_symbol": {
+              "balance": 2,
+              "deposit": 1
+            },
+            "examples_by_symbol": {
+              "balance": [
+                {
+                  "byte_end": 731,
+                  "byte_start": 724,
+                  "column": 21,
+                  "context": "        int total = balance();",
+                  "is_test_site": false,
+                  "line": 22,
+                  "matched_name": "balance",
+                  "path": "src/main/java/com/acme/OrderLedger.java",
+                  "usage_kind": "method_invocation"
+                },
+                {
+                  "byte_end": 171,
+                  "byte_start": 164,
+                  "column": 43,
+                  "context": "        return ledger.summary(2) + ledger.balance();",
+                  "is_test_site": false,
+                  "line": 5,
+                  "matched_name": "balance",
+                  "path": "src/main/java/com/acme/ReceiptPrinter.java",
+                  "usage_kind": "method_invocation"
+                }
+              ],
+              "deposit": [
+                {
+                  "byte_end": 116,
+                  "byte_start": 109,
+                  "column": 16,
+                  "context": "        ledger.deposit(10);",
+                  "is_test_site": false,
+                  "line": 4,
+                  "matched_name": "deposit",
+                  "path": "src/main/java/com/acme/ReceiptPrinter.java",
+                  "usage_kind": "method_invocation"
+                }
+              ]
+            },
+            "files_by_symbol": {
+              "balance": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "deposit": [
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ]
+            },
+            "production_sites": 3,
+            "provenance": "syntax_only",
+            "symbols": [
+              "deposit",
+              "balance"
+            ],
+            "test_sites": 0,
+            "total_usages": 3,
+            "unique_files": 2
+          },
+          "stderr": ""
+        },
+        {
+          "case": "rust-reference-counts",
+          "tool": "analysis.references",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "counts_by_symbol": {
+              "normalize": 5
+            },
+            "examples_by_symbol": {
+              "normalize": [
+                {
+                  "column": 62,
+                  "context": "pub fn deposit(&mut self, amount: i64) { self.pending += normalize(amount); }",
+                  "is_test_site": false,
+                  "line": 11,
+                  "matched_name": "normalize",
+                  "path": "/private<fixture-root>/analysis/src/lib.rs",
+                  "usage_kind": "call"
+                },
+                {
+                  "column": 8,
+                  "context": "pub fn normalize(amount: i64) -> i64 { amount.max(0) }",
+                  "is_test_site": false,
+                  "line": 19,
+                  "matched_name": "normalize",
+                  "path": "/private<fixture-root>/analysis/src/lib.rs",
+                  "usage_kind": "path_ref"
+                },
+                {
+                  "column": 38,
+                  "context": "pub fn preview(amount: i64) -> i64 { normalize(amount) + 1 }",
+                  "is_test_site": false,
+                  "line": 20,
+                  "matched_name": "normalize",
+                  "path": "/private<fixture-root>/analysis/src/lib.rs",
+                  "usage_kind": "call"
+                },
+                {
+                  "column": 21,
+                  "context": "use crate::{Ledger, normalize};",
+                  "is_test_site": false,
+                  "line": 1,
+                  "matched_name": "normalize",
+                  "path": "/private<fixture-root>/analysis/src/receipt.rs",
+                  "usage_kind": "path_ref"
+                },
+                {
+                  "column": 36,
+                  "context": "pub fn total(amount: i64) -> i64 { normalize(amount) }",
+                  "is_test_site": false,
+                  "line": 2,
+                  "matched_name": "normalize",
+                  "path": "/private<fixture-root>/analysis/src/receipt.rs",
+                  "usage_kind": "call"
+                }
+              ]
+            },
+            "files_by_symbol": {
+              "normalize": [
+                "/private<fixture-root>/analysis/src/lib.rs",
+                "/private<fixture-root>/analysis/src/receipt.rs"
+              ]
+            },
+            "production_sites": 5,
+            "provenance": "syntax_only",
+            "symbols": [
+              "normalize"
+            ],
+            "test_sites": 0,
+            "total_usages": 5,
+            "truncated": false,
+            "unique_files": 2
+          },
+          "stderr": ""
+        },
+        {
+          "case": "references-empty",
+          "tool": "analysis.references",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.references: `symbols` must be non-empty\n"
+        },
+        {
+          "case": "field-read-write-classification",
+          "tool": "analysis.fieldClassification",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+            "fields": [
+              {
+                "accesses": [
+                  {
+                    "column": 9,
+                    "context": "pending += accepted;",
+                    "kind": "write",
+                    "line": 12,
+                    "method": "deposit"
+                  },
+                  {
+                    "column": 20,
+                    "context": "settled += pending;",
+                    "kind": "read",
+                    "line": 16,
+                    "method": "settle"
+                  },
+                  {
+                    "column": 9,
+                    "context": "pending = 0;",
+                    "kind": "write",
+                    "line": 17,
+                    "method": "settle"
+                  },
+                  {
+                    "column": 45,
+                    "context": "public int balance() { return settled + pending; }",
+                    "kind": "read",
+                    "line": 19,
+                    "method": "balance"
+                  }
+                ],
+                "annotations": [],
+                "injection_style": null,
+                "is_injected": false,
+                "is_mutable_instance": true,
+                "is_provider": false,
+                "is_static_final": false,
+                "modifiers": [
+                  "private"
+                ],
+                "name": "pending",
+                "owner_class": "OrderLedger",
+                "read_by": [
+                  "balance",
+                  "settle"
+                ],
+                "reads": 2,
+                "type": "int",
+                "visibility": "private",
+                "writes": 2,
+                "written_by": [
+                  "deposit",
+                  "settle"
+                ]
+              }
+            ],
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "language": "java",
+            "provenance": "syntax_only",
+            "source_len": 864
+          },
+          "stderr": ""
+        },
+        {
+          "case": "field-unknown",
+          "tool": "analysis.fieldClassification",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+            "fields": [],
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "language": "java",
+            "provenance": "syntax_only",
+            "source_len": 864
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-transitive-closure",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "TOTAL": [
+                "BASE",
+                "TAX"
+              ]
+            },
+            "fields": [
+              "TOTAL"
+            ],
+            "file": "src/main/java/com/acme/Constants.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-multiple-declarators",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "SECOND": [
+                "FIRST"
+              ]
+            },
+            "fields": [
+              "FIRST",
+              "SECOND"
+            ],
+            "file": "Multi.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-owner-isolation",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "VALUE": [
+                "BASE",
+                "OTHER"
+              ]
+            },
+            "fields": [
+              "VALUE"
+            ],
+            "file": "Owners.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-owner-ambiguity",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "BASE": [
+                "OTHER"
+              ]
+            },
+            "fields": [
+              "BASE"
+            ],
+            "file": "Owners.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-unknown",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "closure": {},
+            "fields": [
+              "ABSENT"
+            ],
+            "file": "src/main/java/com/acme/Constants.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-nonstatic-disclosed",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "closure": {},
+            "fields": [
+              "count"
+            ],
+            "file": "src/main/java/com/acme/Constants.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "method-live-outs-and-cap",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "body_line_range": [
+              21,
+              27
+            ],
+            "class_name": "OrderLedger",
+            "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "language": "java",
+            "method_kind": "method_declaration",
+            "method_line_range": [
+              21,
+              27
+            ],
+            "method_name": "summary",
+            "parameters": [
+              {
+                "name": "tax",
+                "type": "int"
+              }
+            ],
+            "provenance": "syntax_only",
+            "requested_contiguous": true,
+            "requested_ranges": [],
+            "source_len": 864,
+            "statement_region_summary": {
+              "filter": {
+                "limit": 2
+              },
+              "included": true,
+              "matched_count": 5,
+              "omitted_count": 3,
+              "returned_count": 2,
+              "total_count": 5
+            },
+            "statement_regions": [
+              {
+                "byte_end": 734,
+                "byte_start": 712,
+                "captures": [],
+                "enclosing_class_refs": [
+                  "balance"
+                ],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 1,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-1",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  22,
+                  22
+                ],
+                "listener_call_count": 0,
+                "live_outs": [
+                  {
+                    "after_use_kinds": [
+                      "expression"
+                    ],
+                    "name": "total",
+                    "type": "int"
+                  }
+                ],
+                "non_local_control_flow": [],
+                "preview": "int total = balance();",
+                "statement_count": 1,
+                "this_super_refs": 0
+              },
+              {
+                "byte_end": 765,
+                "byte_start": 743,
+                "captures": [
+                  {
+                    "name": "tax",
+                    "type": "int"
+                  },
+                  {
+                    "name": "total",
+                    "type": "int"
+                  }
+                ],
+                "enclosing_class_refs": [],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 1,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-2",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  23,
+                  23
+                ],
+                "listener_call_count": 0,
+                "live_outs": [
+                  {
+                    "after_use_kinds": [
+                      "expression"
+                    ],
+                    "name": "due",
+                    "type": "int"
+                  }
+                ],
+                "non_local_control_flow": [],
+                "preview": "int due = total + tax;",
+                "statement_count": 1,
+                "this_super_refs": 0
+              }
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "method-absent",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.methodRegions: method or constructor `absent` not found in class `OrderLedger`\n"
+        },
+        {
+          "case": "impl-partition-multiple-blocks",
+          "tool": "analysis.implPartition",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "edges": [
+              {
+                "from": "method:balance",
+                "kind": "reads",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:balance",
+                "kind": "reads",
+                "to": "field:settled"
+              },
+              {
+                "from": "method:deposit",
+                "kind": "writes",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:label",
+                "kind": "reads",
+                "to": "field:label"
+              },
+              {
+                "from": "method:settle",
+                "kind": "reads",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:settle",
+                "kind": "writes",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:settle",
+                "kind": "writes",
+                "to": "field:settled"
+              }
+            ],
+            "fields": [
+              {
+                "name": "label",
+                "shared_by": [
+                  "label"
+                ],
+                "ty": "String"
+              },
+              {
+                "name": "pending",
+                "shared_by": [
+                  "balance",
+                  "deposit",
+                  "settle"
+                ],
+                "ty": "i64"
+              },
+              {
+                "name": "settled",
+                "shared_by": [
+                  "balance",
+                  "settle"
+                ],
+                "ty": "i64"
+              }
+            ],
+            "file": "src/lib.rs",
+            "impl_name": "Ledger",
+            "methods": [
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "new",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "deposit",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": [
+                  "pending"
+                ]
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "settle",
+                "reads": [
+                  "pending"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": [
+                  "pending",
+                  "settled"
+                ]
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "balance",
+                "reads": [
+                  "pending",
+                  "settled"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "label",
+                "reads": [
+                  "label"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "receipt",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              }
+            ],
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "impl-absent",
+          "tool": "analysis.implPartition",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.implPartition: no impl block for `Absent` found in /private<fixture-root>/analysis/src/lib.rs\n"
+        },
+        {
+          "case": "top-level-relative-root",
+          "tool": "analysis.topLevelDeps",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.topLevelDeps: failed to canonicalize project_dir src: No such file or directory (os error 2)\n"
+        },
+        {
+          "case": "top-level-unknown-project",
+          "tool": "analysis.topLevelDeps",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.topLevelDeps: failed to canonicalize project_dir missing-directory: No such file or directory (os error 2)\n"
+        },
+        {
+          "case": "reduction-overflow-refusal",
+          "tool": "analysis.methodRegions",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "result_body_omitted": true,
+            "serialized_bytes": 1574883,
+            "keys": [
+              "body_line_range",
+              "class_name",
+              "content_sha256",
+              "file",
+              "language",
+              "method_kind",
+              "method_line_range",
+              "method_name",
+              "parameters",
+              "provenance",
+              "requested_contiguous",
+              "requested_ranges",
+              "source_len",
+              "statement_region_summary",
+              "statement_regions"
+            ],
+            "statement_region_summary": {
+              "included": true,
+              "matched_count": 3000,
+              "omitted_count": 0,
+              "returned_count": 3000,
+              "total_count": 3000
+            }
+          },
+          "stderr": ""
+        },
+        {
+          "case": "reduction-overflow-recovery",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "body_line_range": [
+              1,
+              3002
+            ],
+            "class_name": "Large",
+            "content_sha256": "502adde05e6c194d0b6b19322a34c19c73655c227c9ff78313fab8fba78aa0af",
+            "file": "Large.java",
+            "language": "java",
+            "method_kind": "method_declaration",
+            "method_line_range": [
+              1,
+              3002
+            ],
+            "method_name": "render",
+            "parameters": [],
+            "provenance": "syntax_only",
+            "requested_contiguous": true,
+            "requested_ranges": [],
+            "source_len": 63814,
+            "statement_region_summary": {
+              "filter": {
+                "limit": 1
+              },
+              "included": true,
+              "matched_count": 3000,
+              "omitted_count": 2999,
+              "returned_count": 1,
+              "total_count": 3000
+            },
+            "statement_regions": [
+              {
+                "byte_end": 45,
+                "byte_start": 30,
+                "captures": [],
+                "enclosing_class_refs": [],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 0,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-1",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  2,
+                  2
+                ],
+                "listener_call_count": 0,
+                "live_outs": [],
+                "non_local_control_flow": [],
+                "preview": "int value0 = 0;",
+                "statement_count": 1,
+                "this_super_refs": 0
+              }
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "rust-status-cold-ready",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-hover",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-definition-anchored",
+          "tool": "lsp.definition",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-references-cross-file",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-references-cap",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-assist-menu",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-executeCommand",
+          "tool": "lsp.executeCommand",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-file-rename-edits",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-rename-disk-lineage",
+          "tool": "lsp.rename",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "rust-rename-old-span-refused",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e54e17d61030"
+        },
+        {
+          "case": "java-status-cold-ready",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-hover",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-definition-anchored",
+          "tool": "lsp.definition",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-references-cross-file",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-references-cap",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-assist-menu",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-executeCommand",
+          "tool": "lsp.executeCommand",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-file-rename-edits",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-rename-disk-lineage",
+          "tool": "lsp.rename",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "java-rename-old-span-refused",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "a88801cf800b"
+        },
+        {
+          "case": "rust-assist-original-index-beyond-menu-cap-applies",
+          "tool": "lsp.assist",
+          "passed": false,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "8287253e3149"
+        },
+        {
+          "case": "java-assist-resolved-action-applies",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "e577283a77d6"
+        },
+        {
+          "case": "rust-move-references-and-file-move-applied",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "06d1b6fed507"
+        },
+        {
+          "case": "java-move-references-and-file-move-applied",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "02c7b7f41cf3"
+        },
+        {
+          "case": "lsp.hover-split-utf8",
+          "tool": "lsp.hover",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "\nthread 'tokio-rt-worker' (150138674) panicked at crates/bro-harness/src/bindings/lsp_facts.rs:118:27:\nend byte index 30 is not a char boundary; it is inside '\ud83d\ude00' (bytes 29..33 of string)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nerror: tool execution task ended before returning an outcome\n"
+        },
+        {
+          "case": "lsp.rename-split-utf8",
+          "tool": "lsp.rename",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "\nthread 'tokio-rt-worker' (150151496) panicked at crates/bro-harness/src/bindings/lsp_facts.rs:118:27:\nend byte index 30 is not a char boundary; it is inside '\ud83d\ude00' (bytes 29..33 of string)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nerror: tool execution task ended before returning an outcome\n"
+        },
+        {
+          "case": "lsp.definition-split-utf8",
+          "tool": "lsp.definition",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "\nthread 'tokio-rt-worker' (150156047) panicked at crates/bro-harness/src/bindings/lsp_facts.rs:118:27:\nend byte index 30 is not a char boundary; it is inside '\ud83d\ude00' (bytes 29..33 of string)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nerror: tool execution task ended before returning an outcome\n"
+        },
+        {
+          "case": "lsp.references-split-utf8",
+          "tool": "lsp.references",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "\nthread 'tokio-rt-worker' (150157224) panicked at crates/bro-harness/src/bindings/lsp_facts.rs:118:27:\nend byte index 30 is not a char boundary; it is inside '\ud83d\ude00' (bytes 29..33 of string)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nerror: tool execution task ended before returning an outcome\n"
+        },
+        {
+          "case": "lsp.assist-split-utf8",
+          "tool": "lsp.assist",
+          "passed": false,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "\nthread 'tokio-rt-worker' (150158389) panicked at crates/bro-harness/src/bindings/lsp_facts.rs:118:27:\nend byte index 30 is not a char boundary; it is inside '\ud83d\ude00' (bytes 29..33 of string)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nerror: tool execution task ended before returning an outcome\n"
+        },
+        {
+          "case": "lsp-invalid-source",
+          "tool": "lsp.hover",
+          "passed": false,
+          "exit_code": 0,
+          "result": {
+            "contents": null,
+            "language": "rust",
+            "position": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "stderr": ""
+        },
+        {
+          "case": "lsp-status-language-conflict",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.status: file `src/lib.rs` infers `rust`, but language was `java`\n"
+        },
+        {
+          "case": "lsp-file-renames-empty",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.willRenameFiles: renames must not be empty\n"
+        },
+        {
+          "case": "explicit-unavailable-rust",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: lsp_unavailable: lsp_unavailable: Rust backend `<fixture-root>/missing-server` is unavailable: No such file or directory (os error 2) - refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans\n"
+        },
+        {
+          "case": "explicit-unavailable-java",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: lsp_unavailable: lsp_unavailable: Java backend `<fixture-root>/missing-server` is unavailable: No such file or directory (os error 2) - refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans\n"
+        }
+      ],
+      "cell_traces": {
+        "e54e17d61030": [
+          {
+            "name": "status.before",
+            "result": {
+              "detail": "no pooled language server session",
+              "language": "rust",
+              "state": "not_started"
+            }
+          },
+          {
+            "name": "hover",
+            "result": {
+              "contents": "order_audit_fixture\n\npub fn normalize(amount: i64) -> i64",
+              "language": "rust",
+              "position": {
+                "character": 61,
+                "line": 10
+              }
+            }
+          },
+          {
+            "name": "definition",
+            "result": {
+              "authority": "lsp",
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 1,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 737,
+                    "byte_start": 728,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 29,
+                    "byte_start": 20,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 76,
+                    "byte_start": 67,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 5,
+              "total_count": 5,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references.cap",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 5,
+              "truncated": true,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "assist",
+            "result": {
+              "actions": [
+                {
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "refactor.inline",
+                  "title": "Inline `normalize`"
+                }
+              ],
+              "command_only_count": 0,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "executeCommand",
+            "error": "lsp.executeCommand: LSP server returned error for workspace/executeCommand: {\"code\":-32601,\"message\":\"unknown request\"}"
+          },
+          {
+            "name": "willRenameFiles",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "invoice",
+                  "span": {
+                    "byte_end": 15,
+                    "byte_start": 8,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/lib.rs"
+              ],
+              "issuance": "led-1",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 737,
+                    "byte_start": 728,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 29,
+                    "byte_start": 20,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 76,
+                    "byte_start": 67,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                }
+              ],
+              "edit_count": 5,
+              "files": [
+                "src/lib.rs",
+                "src/receipt.rs"
+              ],
+              "issuance": "led-2",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename.apply",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 5,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 1017,
+                  "bytes_before": 1005,
+                  "content_sha256": "6b7c47e22d322f18c06d8cb885f561cf31d6d69806d3bdf096dcba055c998f02",
+                  "edits": 3,
+                  "file": "src/lib.rs"
+                },
+                {
+                  "bytes_after": 157,
+                  "bytes_before": 149,
+                  "content_sha256": "c9c6096cbc11ae4ad38a8d197a77cff7d70f47fdaf4e3eb458ba3a8af8749980",
+                  "edits": 2,
+                  "file": "src/receipt.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "stale",
+            "error": "lsp.hover: stale_span: src/lib.rs changed since the span was minted (span hash d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08, current 6b7c47e22d322f18c06d8cb885f561cf31d6d69806d3bdf096dcba055c998f02); re-derive the span from fresh facts"
+          },
+          {
+            "name": "status.after",
+            "result": {
+              "detail": "rust-analyzer reported quiescent",
+              "language": "rust",
+              "state": "ready"
+            }
+          }
+        ],
+        "a88801cf800b": [
+          {
+            "name": "status.before",
+            "result": {
+              "detail": "no pooled language server session",
+              "language": "java",
+              "state": "not_started"
+            }
+          },
+          {
+            "name": "hover",
+            "result": {
+              "contents": "int com.acme.OrderLedger.balance()\n\nSource: *[order-audit-fixture](file:///private<fixture-root>/java/src/main/java/com/acme/OrderLedger.java#19)*",
+              "language": "java",
+              "position": {
+                "character": 15,
+                "line": 18
+              }
+            }
+          },
+          {
+            "name": "definition",
+            "result": {
+              "authority": "lsp",
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 1,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 733,
+                    "byte_start": 724,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 173,
+                    "byte_start": 164,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 3,
+              "total_count": 3,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references.cap",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 3,
+              "truncated": true,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "assist",
+            "result": {
+              "actions": [
+                {
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "source.generate.finalModifiers",
+                  "title": "Change modifiers to final where possible"
+                }
+              ],
+              "command_only_count": 1,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "executeCommand",
+            "result": {
+              "command": "java.project.getAll",
+              "language": "java",
+              "result": [
+                "file:/private<fixture-root>/java/"
+              ]
+            }
+          },
+          {
+            "name": "willRenameFiles",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 93,
+                    "byte_start": 82,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 83,
+                    "byte_start": 72,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "renamedAmount() { return settled + pending; }\n    public List<String> receipts() { return receipts; }\n    public String summary(int tax) {\n        int total = renamedAmount",
+                  "span": {
+                    "byte_end": 731,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 171,
+                    "byte_start": 164,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-2",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename.apply",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 2,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 876,
+                  "bytes_before": 864,
+                  "content_sha256": "51eca95265a7abfc05eaa42c408b5d0396aa841dadfdfb991885ece7272da688",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                },
+                {
+                  "bytes_after": 189,
+                  "bytes_before": 183,
+                  "content_sha256": "67fb1254b2cebd60154133cf33f358ce7981d05536c8e3aa0fab1fe06f75a3c3",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "stale",
+            "error": "lsp.hover: stale_span: src/main/java/com/acme/OrderLedger.java changed since the span was minted (span hash 10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2, current 51eca95265a7abfc05eaa42c408b5d0396aa841dadfdfb991885ece7272da688); re-derive the span from fresh facts"
+          },
+          {
+            "name": "status.after",
+            "result": {
+              "detail": "JDTLS language/status ServiceReady",
+              "language": "java",
+              "state": "ready"
+            }
+          }
+        ],
+        "8287253e3149": [
+          {
+            "name": "menu",
+            "result": {
+              "actions": [
+                {
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into variable"
+                },
+                {
+                  "index": 1,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into constant"
+                },
+                {
+                  "index": 2,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into static"
+                },
+                {
+                  "index": 3,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into function"
+                }
+              ],
+              "command_only_count": 0,
+              "total_count": 4,
+              "truncated": false
+            }
+          },
+          {
+            "name": "selected",
+            "error": "lsp.assist: select index 3 out of range (1 actions available after filtering)"
+          }
+        ],
+        "e577283a77d6": [
+          {
+            "name": "menu",
+            "result": {
+              "actions": [
+                {
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "source.generate.finalModifiers",
+                  "title": "Change modifiers to final where possible"
+                }
+              ],
+              "command_only_count": 1,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "selected",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "final int amount) {\n        final int accepted = Math.max(0, amount);\n        pending += accepted;\n        receipts.add(label + \":\" + accepted);\n    }\n    public void settle() {\n        settled += pending;\n        pending = 0;\n    }\n    public int balance() { return settled + pending; }\n    public List<String> receipts() { return receipts; }\n    public String summary(final int tax) {\n        final int total = balance();\n        final int due = total + tax;\n        final ",
+                  "span": {
+                    "byte_end": 774,
+                    "byte_start": 335,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java"
+              ],
+              "findings": [],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "applied",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 1,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 900,
+                  "bytes_before": 864,
+                  "content_sha256": "85e8453c9cfdced6d34a5439470d6788946c3cac98ec6046baa4704a9a511a1c",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ],
+        "06d1b6fed507": [
+          {
+            "name": "move.plan",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "invoice",
+                  "span": {
+                    "byte_end": 15,
+                    "byte_start": 8,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/lib.rs"
+              ],
+              "issuance": "led-1",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "move.references",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 1,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 1005,
+                  "bytes_before": 1005,
+                  "content_sha256": "23c83b8e8f26cf93ea888436509a5fba819dcbcb2b69cd8a7ff99f1809ddfd20",
+                  "edits": 1,
+                  "file": "src/lib.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "move.files",
+            "result": {
+              "applied": true,
+              "es": "es-2",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 0,
+                "syntax_only": 2
+              },
+              "semantic_status": "syntax_only",
+              "summary": [
+                {
+                  "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                  "created": true,
+                  "file": "src/invoice.rs"
+                },
+                {
+                  "bytes_after": 0,
+                  "bytes_before": 149,
+                  "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "deleted": true,
+                  "file": "src/receipt.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ],
+        "02c7b7f41cf3": [
+          {
+            "name": "move.plan",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 93,
+                    "byte_start": 82,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 83,
+                    "byte_start": 72,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "move.references",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 2,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 866,
+                  "bytes_before": 864,
+                  "content_sha256": "158212029dfc12ba5e1c88d670e573d98194e7bc47b6d9ac828269800862ef35",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                },
+                {
+                  "bytes_after": 185,
+                  "bytes_before": 183,
+                  "content_sha256": "d02e8493166bc3ec69c1d431c4f443ac7ae76b2d1e330d1014c9ba8b7c2290ef",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "move.files",
+            "result": {
+              "applied": true,
+              "es": "es-2",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 0,
+                "syntax_only": 2
+              },
+              "semantic_status": "syntax_only",
+              "summary": [
+                {
+                  "content_sha256": "158212029dfc12ba5e1c88d670e573d98194e7bc47b6d9ac828269800862ef35",
+                  "created": true,
+                  "file": "src/main/java/com/acme/AccountLedger.java"
+                },
+                {
+                  "bytes_after": 0,
+                  "bytes_before": 866,
+                  "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "deleted": true,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "binary_sha256": "037845e01304403356ea2b193c4955469b1c3b7d1284d69638df4e14cccc127b",
+      "elapsed_seconds": 26.42,
+      "fixture": "scripts/fixtures/harness-analysis-lsp",
+      "full_surface": true,
+      "covered_tools": [
+        "analysis.cohesionClusters",
+        "analysis.describe",
+        "analysis.fieldClassification",
+        "analysis.fieldInitializerClosure",
+        "analysis.implPartition",
+        "analysis.methodRegions",
+        "analysis.references",
+        "analysis.topLevelDeps",
+        "lsp.assist",
+        "lsp.definition",
+        "lsp.executeCommand",
+        "lsp.hover",
+        "lsp.references",
+        "lsp.rename",
+        "lsp.status",
+        "lsp.willRenameFiles"
+      ],
+      "missing_tools": [],
+      "passed": 58,
+      "failed": 0,
+      "cases": [
+        {
+          "case": "describe-references-java",
+          "tool": "analysis.describe",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "contract": "analysis.references \u2014 count Java symbol references across the workspace without returning full capture payloads.\n\nWHAT IT DOES\n  Walks .java files under the session root and counts AST-grounded references to\n  simple symbol names. It returns per-symbol counts, every file containing each\n  symbol, and up to five example sites per symbol. This is the bounded answer to\n  \"where is this referenced?\" when you need counts for planning, not editable\n  spans. Do NOT fan out code.query across the repo just to count.\n\nPARAMS\n  symbols: string[]   simple names to count (method, field, or type names)\n  kinds?: string[]    optional filter: type_reference | method_invocation |\n                      field_access | method_reference | import\n  declaringClass?: string\n                      optional method-call receiver filter. When set, includes\n                      method invocations whose receiver plausibly resolves to a\n                      field of this class in the enclosing class.\n\nRETURNS { symbols, total_usages, unique_files, production_sites, test_sites,\n          counts_by_symbol, files_by_symbol, examples_by_symbol, provenance }\n  counts_by_symbol: { [symbol]: count }\n  files_by_symbol:  { [symbol]: relative-to-worktree-root files[] }\n  examples_by_symbol: top 5 examples per symbol with path, line, column, context,\n                      usage_kind, is_test_site. Examples are for orientation only;\n                      use code.query/code.items if you need hash-anchored spans.\n\nUSES\n  - Before java.extractClass, count moved public methods with\n    kinds:[\"method_invocation\"] to decide whether wrappers:true is needed.\n  - During seam selection, count candidate fields or delegate names to distinguish\n    real concern-private state from forwarded-field false seams.\n  - Before deleting or moving a type, get cheap production/test usage counts.\n\nRECIPE\n  const refs = await analysis.references({\n    symbols: seam.item_names,\n    kinds: [\"method_invocation\"],\n  });\n  const externalFiles = Object.values(refs.files_by_symbol).flat()\n    .filter(f => f !== file);\n  const hasExternalCallers = externalFiles.length > 0;\n  const r = await java.extractClass({ ..., wrappers: hasExternalCallers });\n"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "describe-references-rust",
+          "tool": "analysis.describe",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "contract": "analysis.references (rust): syntactic name occurrence counts across Rust files.\nPARAMS { symbols: string[], language: \"rust\" }. symbols must contain 1..=256 non-empty names.\nJava-only kinds and declaringClass are ignored. Counts include declarations, imports and expression occurrences, not resolved semantic references. Test classification uses file paths and does not recognize inline cfg(test) modules. Unparseable files are skipped.\nRETURNS { language, counting_scope, symbols, total_usages, unique_files, production_sites, test_sites, counts_by_symbol, files_by_symbol, examples_by_symbol, truncated, provenance }.\nPaths are relative to the session root. Up to five examples per symbol; the scanner stops at 500 files or 5000 occurrences and reports truncated. The serialized result is limited to 1 MiB; oversize results fail with a narrowing hint. Use lsp.references for resolved symbol identity and hash-anchored edit addresses.\n"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "describe-unknown",
+          "tool": "analysis.describe",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.describe: unknown analysis `absent` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure, implPartition, topLevelDeps)\n"
+        },
+        {
+          "case": "cohesion-clusters",
+          "tool": "analysis.cohesionClusters",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "class": {
+              "name": "OrderLedger",
+              "package": "com.acme",
+              "source_path": "src/main/java/com/acme/OrderLedger.java"
+            },
+            "cluster_count": 2,
+            "clusters": [
+              {
+                "expected_wiring": "delegate",
+                "id": "cluster-1",
+                "inbound_calls": 1,
+                "internal_calls": 0,
+                "internal_field_touches": 4,
+                "item_names": [
+                  "balance",
+                  "settle"
+                ],
+                "move_fields": [
+                  "settled"
+                ],
+                "name_hint": "balance",
+                "outbound_calls": 0,
+                "score": 0.8
+              },
+              {
+                "expected_wiring": "callback",
+                "id": "cluster-2",
+                "inbound_calls": 0,
+                "internal_calls": 0,
+                "internal_field_touches": 7,
+                "item_names": [
+                  "deposit",
+                  "receipts",
+                  "summary"
+                ],
+                "move_fields": [
+                  "label",
+                  "receipts"
+                ],
+                "name_hint": "deposit",
+                "outbound_calls": 1,
+                "score": 0.875
+              }
+            ],
+            "cross_cluster_calls": [
+              {
+                "from_cluster": "cluster-2",
+                "from_method": "summary",
+                "to_cluster": "cluster-1",
+                "to_method": "balance"
+              }
+            ],
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "cohesion-missing-file",
+          "tool": "analysis.cohesionClusters",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.cohesionClusters: java_class_dependency_analysis prerequisite failed: failed to read /private<fixture-root>/analysis/absent.java: No such file or directory (os error 2)\n"
+        },
+        {
+          "case": "java-reference-counts",
+          "tool": "analysis.references",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "counts_by_symbol": {
+              "balance": 2,
+              "deposit": 1
+            },
+            "examples_by_symbol": {
+              "balance": [
+                {
+                  "byte_end": 731,
+                  "byte_start": 724,
+                  "column": 21,
+                  "context": "        int total = balance();",
+                  "is_test_site": false,
+                  "line": 22,
+                  "matched_name": "balance",
+                  "path": "src/main/java/com/acme/OrderLedger.java",
+                  "usage_kind": "method_invocation"
+                },
+                {
+                  "byte_end": 171,
+                  "byte_start": 164,
+                  "column": 43,
+                  "context": "        return ledger.summary(2) + ledger.balance();",
+                  "is_test_site": false,
+                  "line": 5,
+                  "matched_name": "balance",
+                  "path": "src/main/java/com/acme/ReceiptPrinter.java",
+                  "usage_kind": "method_invocation"
+                }
+              ],
+              "deposit": [
+                {
+                  "byte_end": 116,
+                  "byte_start": 109,
+                  "column": 16,
+                  "context": "        ledger.deposit(10);",
+                  "is_test_site": false,
+                  "line": 4,
+                  "matched_name": "deposit",
+                  "path": "src/main/java/com/acme/ReceiptPrinter.java",
+                  "usage_kind": "method_invocation"
+                }
+              ]
+            },
+            "files_by_symbol": {
+              "balance": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "deposit": [
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ]
+            },
+            "production_sites": 3,
+            "provenance": "syntax_only",
+            "symbols": [
+              "deposit",
+              "balance"
+            ],
+            "test_sites": 0,
+            "total_usages": 3,
+            "unique_files": 2
+          },
+          "stderr": ""
+        },
+        {
+          "case": "rust-reference-counts",
+          "tool": "analysis.references",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "counting_scope": "syntactic name occurrences including declarations; test classification uses file paths, not cfg(test) modules; unparseable files are skipped",
+            "counts_by_symbol": {
+              "normalize": 5
+            },
+            "examples_by_symbol": {
+              "normalize": [
+                {
+                  "column": 62,
+                  "context": "pub fn deposit(&mut self, amount: i64) { self.pending += normalize(amount); }",
+                  "is_test_site": false,
+                  "line": 11,
+                  "matched_name": "normalize",
+                  "path": "src/lib.rs",
+                  "usage_kind": "call"
+                },
+                {
+                  "column": 8,
+                  "context": "pub fn normalize(amount: i64) -> i64 { amount.max(0) }",
+                  "is_test_site": false,
+                  "line": 19,
+                  "matched_name": "normalize",
+                  "path": "src/lib.rs",
+                  "usage_kind": "path_ref"
+                },
+                {
+                  "column": 38,
+                  "context": "pub fn preview(amount: i64) -> i64 { normalize(amount) + 1 }",
+                  "is_test_site": false,
+                  "line": 20,
+                  "matched_name": "normalize",
+                  "path": "src/lib.rs",
+                  "usage_kind": "call"
+                },
+                {
+                  "column": 21,
+                  "context": "use crate::{Ledger, normalize};",
+                  "is_test_site": false,
+                  "line": 1,
+                  "matched_name": "normalize",
+                  "path": "src/receipt.rs",
+                  "usage_kind": "path_ref"
+                },
+                {
+                  "column": 36,
+                  "context": "pub fn total(amount: i64) -> i64 { normalize(amount) }",
+                  "is_test_site": false,
+                  "line": 2,
+                  "matched_name": "normalize",
+                  "path": "src/receipt.rs",
+                  "usage_kind": "call"
+                }
+              ]
+            },
+            "files_by_symbol": {
+              "normalize": [
+                "src/lib.rs",
+                "src/receipt.rs"
+              ]
+            },
+            "language": "rust",
+            "production_sites": 5,
+            "provenance": "syntax_only",
+            "symbols": [
+              "normalize"
+            ],
+            "test_sites": 0,
+            "total_usages": 5,
+            "truncated": false,
+            "unique_files": 2
+          },
+          "stderr": ""
+        },
+        {
+          "case": "references-empty",
+          "tool": "analysis.references",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.references: `symbols` must contain 1..=256 non-empty names\n"
+        },
+        {
+          "case": "field-read-write-classification",
+          "tool": "analysis.fieldClassification",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+            "fields": [
+              {
+                "accesses": [
+                  {
+                    "column": 9,
+                    "context": "pending += accepted;",
+                    "kind": "write",
+                    "line": 12,
+                    "method": "deposit"
+                  },
+                  {
+                    "column": 20,
+                    "context": "settled += pending;",
+                    "kind": "read",
+                    "line": 16,
+                    "method": "settle"
+                  },
+                  {
+                    "column": 9,
+                    "context": "pending = 0;",
+                    "kind": "write",
+                    "line": 17,
+                    "method": "settle"
+                  },
+                  {
+                    "column": 45,
+                    "context": "public int balance() { return settled + pending; }",
+                    "kind": "read",
+                    "line": 19,
+                    "method": "balance"
+                  }
+                ],
+                "annotations": [],
+                "injection_style": null,
+                "is_injected": false,
+                "is_mutable_instance": true,
+                "is_provider": false,
+                "is_static_final": false,
+                "modifiers": [
+                  "private"
+                ],
+                "name": "pending",
+                "owner_class": "OrderLedger",
+                "read_by": [
+                  "balance",
+                  "settle"
+                ],
+                "reads": 2,
+                "type": "int",
+                "visibility": "private",
+                "writes": 2,
+                "written_by": [
+                  "deposit",
+                  "settle"
+                ]
+              }
+            ],
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "language": "java",
+            "provenance": "syntax_only",
+            "source_len": 864
+          },
+          "stderr": ""
+        },
+        {
+          "case": "field-unknown",
+          "tool": "analysis.fieldClassification",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.fieldClassification: fields not found in selected class: [\"absent\"]; inspect code.fields before retrying\n"
+        },
+        {
+          "case": "constant-transitive-closure",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "TOTAL": [
+                "BASE",
+                "TAX"
+              ]
+            },
+            "fields": [
+              "TOTAL"
+            ],
+            "file": "src/main/java/com/acme/Constants.java",
+            "provenance": "syntax_only",
+            "skipped_non_constants": []
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-multiple-declarators",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "FIRST": [
+                "BASE"
+              ],
+              "SECOND": [
+                "BASE",
+                "FIRST"
+              ]
+            },
+            "fields": [
+              "FIRST",
+              "SECOND"
+            ],
+            "file": "Multi.java",
+            "provenance": "syntax_only",
+            "skipped_non_constants": []
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-owner-isolation",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "closure": {
+              "VALUE": [
+                "BASE"
+              ]
+            },
+            "fields": [
+              "VALUE"
+            ],
+            "file": "Owners.java",
+            "provenance": "syntax_only",
+            "skipped_non_constants": []
+          },
+          "stderr": ""
+        },
+        {
+          "case": "constant-owner-ambiguity",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.fieldInitializerClosure: selected fields have multiple owner classes; pass className and analyze one class at a time\n"
+        },
+        {
+          "case": "constant-unknown",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.fieldInitializerClosure: fields not found in selected class: [\"ABSENT\"]; inspect code.fields before retrying\n"
+        },
+        {
+          "case": "constant-nonstatic-disclosed",
+          "tool": "analysis.fieldInitializerClosure",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "closure": {},
+            "fields": [
+              "count"
+            ],
+            "file": "src/main/java/com/acme/Constants.java",
+            "provenance": "syntax_only",
+            "skipped_non_constants": [
+              "count"
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "method-live-outs-and-cap",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "body_line_range": [
+              21,
+              27
+            ],
+            "class_name": "OrderLedger",
+            "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+            "file": "src/main/java/com/acme/OrderLedger.java",
+            "language": "java",
+            "method_kind": "method_declaration",
+            "method_line_range": [
+              21,
+              27
+            ],
+            "method_name": "summary",
+            "parameters": [
+              {
+                "name": "tax",
+                "type": "int"
+              }
+            ],
+            "provenance": "syntax_only",
+            "requested_contiguous": true,
+            "requested_ranges": [],
+            "source_len": 864,
+            "statement_region_summary": {
+              "filter": {
+                "limit": 2
+              },
+              "included": true,
+              "matched_count": 5,
+              "omitted_count": 3,
+              "returned_count": 2,
+              "total_count": 5
+            },
+            "statement_regions": [
+              {
+                "byte_end": 734,
+                "byte_start": 712,
+                "captures": [],
+                "enclosing_class_refs": [
+                  "balance"
+                ],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 1,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-1",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  22,
+                  22
+                ],
+                "listener_call_count": 0,
+                "live_outs": [
+                  {
+                    "after_use_kinds": [
+                      "expression"
+                    ],
+                    "name": "total",
+                    "type": "int"
+                  }
+                ],
+                "non_local_control_flow": [],
+                "preview": "int total = balance();",
+                "statement_count": 1,
+                "this_super_refs": 0
+              },
+              {
+                "byte_end": 765,
+                "byte_start": 743,
+                "captures": [
+                  {
+                    "name": "tax",
+                    "type": "int"
+                  },
+                  {
+                    "name": "total",
+                    "type": "int"
+                  }
+                ],
+                "enclosing_class_refs": [],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 1,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-2",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  23,
+                  23
+                ],
+                "listener_call_count": 0,
+                "live_outs": [
+                  {
+                    "after_use_kinds": [
+                      "expression"
+                    ],
+                    "name": "due",
+                    "type": "int"
+                  }
+                ],
+                "non_local_control_flow": [],
+                "preview": "int due = total + tax;",
+                "statement_count": 1,
+                "this_super_refs": 0
+              }
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "method-absent",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.methodRegions: method or constructor `absent` not found in class `OrderLedger`\n"
+        },
+        {
+          "case": "impl-partition-multiple-blocks",
+          "tool": "analysis.implPartition",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "edges": [
+              {
+                "from": "method:balance",
+                "kind": "reads",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:balance",
+                "kind": "reads",
+                "to": "field:settled"
+              },
+              {
+                "from": "method:deposit",
+                "kind": "writes",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:label",
+                "kind": "reads",
+                "to": "field:label"
+              },
+              {
+                "from": "method:settle",
+                "kind": "reads",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:settle",
+                "kind": "writes",
+                "to": "field:pending"
+              },
+              {
+                "from": "method:settle",
+                "kind": "writes",
+                "to": "field:settled"
+              }
+            ],
+            "fields": [
+              {
+                "name": "label",
+                "shared_by": [
+                  "label"
+                ],
+                "ty": "String"
+              },
+              {
+                "name": "pending",
+                "shared_by": [
+                  "balance",
+                  "deposit",
+                  "settle"
+                ],
+                "ty": "i64"
+              },
+              {
+                "name": "settled",
+                "shared_by": [
+                  "balance",
+                  "settle"
+                ],
+                "ty": "i64"
+              }
+            ],
+            "file": "src/lib.rs",
+            "impl_name": "Ledger",
+            "methods": [
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "new",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "deposit",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": [
+                  "pending"
+                ]
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "settle",
+                "reads": [
+                  "pending"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": [
+                  "pending",
+                  "settled"
+                ]
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "balance",
+                "reads": [
+                  "pending",
+                  "settled"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "label",
+                "reads": [
+                  "label"
+                ],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "name": "receipt",
+                "reads": [],
+                "router": null,
+                "unresolved_callbacks": [],
+                "writes": []
+              }
+            ],
+            "provenance": "syntax_only"
+          },
+          "stderr": ""
+        },
+        {
+          "case": "impl-absent",
+          "tool": "analysis.implPartition",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.implPartition: no impl block for `Absent` found in /private<fixture-root>/analysis/src/lib.rs\n"
+        },
+        {
+          "case": "top-level-relative-root",
+          "tool": "analysis.topLevelDeps",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "edges": [
+              {
+                "from": "impl Ledger",
+                "kind": "type_ref",
+                "to": "Ledger"
+              },
+              {
+                "from": "impl Ledger",
+                "kind": "calls",
+                "to": "normalize"
+              },
+              {
+                "from": "impl Ledger",
+                "kind": "module_ref",
+                "to": "receipt"
+              },
+              {
+                "from": "preview",
+                "kind": "calls",
+                "to": "normalize"
+              },
+              {
+                "from": "tests",
+                "kind": "calls",
+                "to": "Ledger"
+              },
+              {
+                "from": "tests",
+                "kind": "type_ref",
+                "to": "Ledger"
+              }
+            ],
+            "external_references": [
+              {
+                "context": "use crate::{Ledger, normalize};",
+                "item": "Ledger",
+                "line": 1,
+                "path": "src/receipt.rs"
+              },
+              {
+                "context": "pub fn render(ledger: &Ledger) -> String { ledger.receipt() }",
+                "item": "Ledger",
+                "line": 3,
+                "path": "src/receipt.rs"
+              },
+              {
+                "context": "use crate::{Ledger, normalize};",
+                "item": "normalize",
+                "line": 1,
+                "path": "src/receipt.rs"
+              },
+              {
+                "context": "pub fn total(amount: i64) -> i64 { normalize(amount) }",
+                "item": "normalize",
+                "line": 2,
+                "path": "src/receipt.rs"
+              },
+              {
+                "context": "pub fn render(ledger: &Ledger) -> String { ledger.receipt() }",
+                "item": "receipt",
+                "line": 3,
+                "path": "src/receipt.rs"
+              }
+            ],
+            "file": "src/lib.rs",
+            "items": [
+              {
+                "attrs": [],
+                "calls": [],
+                "global_refs": [],
+                "kind": "mod_item",
+                "line_end": 1,
+                "line_start": 1,
+                "module_refs": [],
+                "name": "receipt",
+                "type_refs": [],
+                "warnings": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "global_refs": [],
+                "kind": "struct_item",
+                "line_end": 8,
+                "line_start": 4,
+                "module_refs": [],
+                "name": "Ledger",
+                "type_refs": [],
+                "warnings": []
+              },
+              {
+                "attrs": [],
+                "calls": [
+                  "normalize"
+                ],
+                "global_refs": [],
+                "kind": "impl_item",
+                "line_end": 15,
+                "line_start": 9,
+                "module_refs": [],
+                "name": "impl Ledger",
+                "type_refs": [
+                  "Ledger"
+                ],
+                "warnings": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "global_refs": [],
+                "kind": "impl_item",
+                "line_end": 18,
+                "line_start": 16,
+                "module_refs": [
+                  "receipt"
+                ],
+                "name": "impl Ledger",
+                "type_refs": [
+                  "Ledger"
+                ],
+                "warnings": [
+                  "macro-heavy: 1 macro invocation(s) may hide dependency edges"
+                ]
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "global_refs": [],
+                "kind": "function_item",
+                "line_end": 19,
+                "line_start": 19,
+                "module_refs": [],
+                "name": "normalize",
+                "type_refs": [],
+                "warnings": []
+              },
+              {
+                "attrs": [],
+                "calls": [
+                  "normalize"
+                ],
+                "global_refs": [],
+                "kind": "function_item",
+                "line_end": 20,
+                "line_start": 20,
+                "module_refs": [],
+                "name": "preview",
+                "type_refs": [],
+                "warnings": []
+              },
+              {
+                "attrs": [],
+                "calls": [],
+                "global_refs": [],
+                "kind": "function_item",
+                "line_end": 21,
+                "line_start": 21,
+                "module_refs": [],
+                "name": "explain",
+                "type_refs": [],
+                "warnings": []
+              },
+              {
+                "attrs": [
+                  "#[cfg(test)]"
+                ],
+                "calls": [
+                  "Ledger"
+                ],
+                "global_refs": [],
+                "kind": "mod_item",
+                "line_end": 26,
+                "line_start": 23,
+                "module_refs": [],
+                "name": "tests",
+                "type_refs": [
+                  "Ledger"
+                ],
+                "warnings": [
+                  "macro-heavy: 1 macro invocation(s) may hide dependency edges"
+                ]
+              }
+            ],
+            "provenance": "syntax_only",
+            "suggested_clusters": [
+              {
+                "external_references": 0,
+                "id": "cluster-1",
+                "internal_edges": 0,
+                "items": [
+                  "explain"
+                ],
+                "reason": "isolated item; no internal dependency edges found"
+              },
+              {
+                "external_references": 5,
+                "id": "cluster-2",
+                "internal_edges": 6,
+                "items": [
+                  "Ledger",
+                  "impl Ledger",
+                  "impl Ledger",
+                  "normalize",
+                  "preview",
+                  "receipt",
+                  "tests"
+                ],
+                "reason": "6 internal dependency edge(s)"
+              }
+            ],
+            "warnings": [
+              "macro-heavy items may have unresolved hidden edges: impl Ledger, tests"
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "top-level-unknown-project",
+          "tool": "analysis.topLevelDeps",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis.topLevelDeps: projectDir must name a directory\n"
+        },
+        {
+          "case": "reduction-overflow-refusal",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: analysis result is 1448844 bytes, exceeding the 1048576 byte limit; narrow files, symbols, fields or statement regions before retrying; no partial result returned\n"
+        },
+        {
+          "case": "reduction-overflow-recovery",
+          "tool": "analysis.methodRegions",
+          "passed": true,
+          "exit_code": 0,
+          "result": {
+            "body_line_range": [
+              1,
+              3002
+            ],
+            "class_name": "Large",
+            "content_sha256": "502adde05e6c194d0b6b19322a34c19c73655c227c9ff78313fab8fba78aa0af",
+            "file": "Large.java",
+            "language": "java",
+            "method_kind": "method_declaration",
+            "method_line_range": [
+              1,
+              3002
+            ],
+            "method_name": "render",
+            "parameters": [],
+            "provenance": "syntax_only",
+            "requested_contiguous": true,
+            "requested_ranges": [],
+            "source_len": 63814,
+            "statement_region_summary": {
+              "filter": {
+                "limit": 1
+              },
+              "included": true,
+              "matched_count": 3000,
+              "omitted_count": 2999,
+              "returned_count": 1,
+              "total_count": 3000
+            },
+            "statement_regions": [
+              {
+                "byte_end": 45,
+                "byte_start": 30,
+                "captures": [],
+                "enclosing_class_refs": [],
+                "extractability": {
+                  "can_extract_with_current_tool": true,
+                  "live_out_count": 0,
+                  "mutated_capture_count": 0,
+                  "non_local_control_flow_count": 0,
+                  "stop_reasons": []
+                },
+                "field_touches": [],
+                "id": "stmt-1",
+                "kind": "local_variable_declaration",
+                "lambda_count": 0,
+                "line_range": [
+                  2,
+                  2
+                ],
+                "listener_call_count": 0,
+                "live_outs": [],
+                "non_local_control_flow": [],
+                "preview": "int value0 = 0;",
+                "statement_count": 1,
+                "this_super_refs": 0
+              }
+            ]
+          },
+          "stderr": ""
+        },
+        {
+          "case": "rust-status-cold-ready",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-hover",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-definition-anchored",
+          "tool": "lsp.definition",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-references-cross-file",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-references-cap",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-assist-menu",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-executeCommand",
+          "tool": "lsp.executeCommand",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-file-rename-edits",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-rename-disk-lineage",
+          "tool": "lsp.rename",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "rust-rename-old-span-refused",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "ef02229a601e"
+        },
+        {
+          "case": "java-status-cold-ready",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-hover",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-definition-anchored",
+          "tool": "lsp.definition",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-references-cross-file",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-references-cap",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-assist-menu",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-executeCommand",
+          "tool": "lsp.executeCommand",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-file-rename-edits",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-rename-disk-lineage",
+          "tool": "lsp.rename",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "java-rename-old-span-refused",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66d907379c3d"
+        },
+        {
+          "case": "rust-assist-original-index-beyond-menu-cap-applies",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "1ad4fc220854"
+        },
+        {
+          "case": "java-assist-resolved-action-applies",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "66a6fcaba83a"
+        },
+        {
+          "case": "rust-move-references-and-file-move-applied",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "06d1b6fed507"
+        },
+        {
+          "case": "java-move-references-and-file-move-applied",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 0,
+          "stderr": "",
+          "cell_trace": "02c7b7f41cf3"
+        },
+        {
+          "case": "lsp.hover-split-utf8",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: unicode.rs: invalid_span: 30..30 must be an ordered UTF-8 byte range within 38 bytes; re-derive the span from fresh facts\n"
+        },
+        {
+          "case": "lsp.rename-split-utf8",
+          "tool": "lsp.rename",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.rename: unicode.rs: invalid_span: 30..30 must be an ordered UTF-8 byte range within 38 bytes; re-derive the span from fresh facts\n"
+        },
+        {
+          "case": "lsp.definition-split-utf8",
+          "tool": "lsp.definition",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.definition: unicode.rs: invalid_span: 30..30 must be an ordered UTF-8 byte range within 38 bytes; re-derive the span from fresh facts\n"
+        },
+        {
+          "case": "lsp.references-split-utf8",
+          "tool": "lsp.references",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.references: unicode.rs: invalid_span: 30..30 must be an ordered UTF-8 byte range within 38 bytes; re-derive the span from fresh facts\n"
+        },
+        {
+          "case": "lsp.assist-split-utf8",
+          "tool": "lsp.assist",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.assist: unicode.rs: invalid_span: 30..30 must be an ordered UTF-8 byte range within 38 bytes; re-derive the span from fresh facts\n"
+        },
+        {
+          "case": "lsp-invalid-source",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: invalid.rs: invalid_utf8: invalid utf-8 sequence of 1 bytes from index 30\n"
+        },
+        {
+          "case": "lsp-status-language-conflict",
+          "tool": "lsp.status",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.status: file `src/lib.rs` infers `rust`, but language was `java`\n"
+        },
+        {
+          "case": "lsp-file-renames-empty",
+          "tool": "lsp.willRenameFiles",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.willRenameFiles: renames must not be empty\n"
+        },
+        {
+          "case": "explicit-unavailable-rust",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: lsp_unavailable: lsp_unavailable: Rust backend `<fixture-root>/missing-server` is unavailable: No such file or directory (os error 2) - refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans\n"
+        },
+        {
+          "case": "explicit-unavailable-java",
+          "tool": "lsp.hover",
+          "passed": true,
+          "exit_code": 1,
+          "result": null,
+          "stderr": "error: lsp.hover: lsp_unavailable: lsp_unavailable: Java backend `<fixture-root>/missing-server` is unavailable: No such file or directory (os error 2) - refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans\n"
+        }
+      ],
+      "cell_traces": {
+        "ef02229a601e": [
+          {
+            "name": "status.before",
+            "result": {
+              "detail": "no pooled language server session",
+              "language": "rust",
+              "state": "not_started"
+            }
+          },
+          {
+            "name": "hover",
+            "result": {
+              "contents": "order_audit_fixture\n\npub fn normalize(amount: i64) -> i64",
+              "language": "rust",
+              "position": {
+                "character": 61,
+                "line": 10
+              }
+            }
+          },
+          {
+            "name": "definition",
+            "result": {
+              "authority": "lsp",
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 1,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 737,
+                    "byte_start": 728,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 29,
+                    "byte_start": 20,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 76,
+                    "byte_start": 67,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 5,
+              "total_count": 5,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references.cap",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "rust",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 5,
+              "truncated": true,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "assist",
+            "result": {
+              "actions": [
+                {
+                  "disabled_reason": null,
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "refactor.inline",
+                  "title": "Inline `normalize`"
+                }
+              ],
+              "command_only_count": 0,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "executeCommand",
+            "error": "lsp.executeCommand: LSP server returned error for workspace/executeCommand: {\"code\":-32601,\"message\":\"unknown request\"}"
+          },
+          {
+            "name": "willRenameFiles",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "invoice",
+                  "span": {
+                    "byte_end": 15,
+                    "byte_start": 8,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/lib.rs"
+              ],
+              "issuance": "led-1",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 324,
+                    "byte_start": 315,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 652,
+                    "byte_start": 643,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 737,
+                    "byte_start": 728,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 29,
+                    "byte_start": 20,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 76,
+                    "byte_start": 67,
+                    "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                    "file": "src/receipt.rs"
+                  }
+                }
+              ],
+              "edit_count": 5,
+              "files": [
+                "src/lib.rs",
+                "src/receipt.rs"
+              ],
+              "issuance": "led-2",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename.apply",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 5,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 1017,
+                  "bytes_before": 1005,
+                  "content_sha256": "6b7c47e22d322f18c06d8cb885f561cf31d6d69806d3bdf096dcba055c998f02",
+                  "edits": 3,
+                  "file": "src/lib.rs"
+                },
+                {
+                  "bytes_after": 157,
+                  "bytes_before": 149,
+                  "content_sha256": "c9c6096cbc11ae4ad38a8d197a77cff7d70f47fdaf4e3eb458ba3a8af8749980",
+                  "edits": 2,
+                  "file": "src/receipt.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "stale",
+            "error": "lsp.hover: src/lib.rs: stale_span: src/lib.rs changed since the span was minted; re-derive the span from fresh facts"
+          },
+          {
+            "name": "status.after",
+            "result": {
+              "detail": "rust-analyzer reported quiescent",
+              "language": "rust",
+              "state": "ready"
+            }
+          }
+        ],
+        "66d907379c3d": [
+          {
+            "name": "status.before",
+            "result": {
+              "detail": "no pooled language server session",
+              "language": "java",
+              "state": "not_started"
+            }
+          },
+          {
+            "name": "hover",
+            "result": {
+              "contents": "int com.acme.OrderLedger.balance()\n\nSource: *[order-audit-fixture](file:///private<fixture-root>/java/src/main/java/com/acme/OrderLedger.java#19)*",
+              "language": "java",
+              "position": {
+                "character": 15,
+                "line": 18
+              }
+            }
+          },
+          {
+            "name": "definition",
+            "result": {
+              "authority": "lsp",
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 1,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 733,
+                    "byte_start": 724,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 173,
+                    "byte_start": 164,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 3,
+              "total_count": 3,
+              "truncated": false,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "references.cap",
+            "result": {
+              "authority": "lsp",
+              "includeDeclaration": true,
+              "language": "java",
+              "locations": [
+                {
+                  "anchored": true,
+                  "span": {
+                    "byte_end": 578,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "provenance": "lsp_verified",
+              "returned_count": 1,
+              "total_count": 3,
+              "truncated": true,
+              "unanchored": []
+            }
+          },
+          {
+            "name": "assist",
+            "result": {
+              "actions": [
+                {
+                  "disabled_reason": null,
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "source.generate.finalModifiers",
+                  "title": "Change modifiers to final where possible"
+                }
+              ],
+              "command_only_count": 1,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "executeCommand",
+            "result": {
+              "command": "java.project.getAll",
+              "language": "java",
+              "result": [
+                "file:/private<fixture-root>/java/"
+              ]
+            }
+          },
+          {
+            "name": "willRenameFiles",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 93,
+                    "byte_start": 82,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 83,
+                    "byte_start": 72,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "renamedAmount() { return settled + pending; }\n    public List<String> receipts() { return receipts; }\n    public String summary(int tax) {\n        int total = renamedAmount",
+                  "span": {
+                    "byte_end": 731,
+                    "byte_start": 571,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "renamedAmount",
+                  "span": {
+                    "byte_end": 171,
+                    "byte_start": 164,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-2",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "rename.apply",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 2,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 876,
+                  "bytes_before": 864,
+                  "content_sha256": "51eca95265a7abfc05eaa42c408b5d0396aa841dadfdfb991885ece7272da688",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                },
+                {
+                  "bytes_after": 189,
+                  "bytes_before": 183,
+                  "content_sha256": "67fb1254b2cebd60154133cf33f358ce7981d05536c8e3aa0fab1fe06f75a3c3",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "stale",
+            "error": "lsp.hover: src/main/java/com/acme/OrderLedger.java: stale_span: src/main/java/com/acme/OrderLedger.java changed since the span was minted; re-derive the span from fresh facts"
+          },
+          {
+            "name": "status.after",
+            "result": {
+              "detail": "JDTLS language/status ServiceReady",
+              "language": "java",
+              "state": "ready"
+            }
+          }
+        ],
+        "1ad4fc220854": [
+          {
+            "name": "menu",
+            "result": {
+              "actions": [
+                {
+                  "disabled_reason": null,
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into variable"
+                },
+                {
+                  "disabled_reason": null,
+                  "index": 1,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into constant"
+                },
+                {
+                  "disabled_reason": null,
+                  "index": 2,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into static"
+                },
+                {
+                  "disabled_reason": null,
+                  "index": 3,
+                  "is_preferred": false,
+                  "kind": "refactor.extract",
+                  "title": "Extract into function"
+                }
+              ],
+              "command_only_count": 0,
+              "total_count": 4,
+              "truncated": false
+            }
+          },
+          {
+            "name": "selected",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "fun_name(flag)",
+                  "span": {
+                    "byte_end": 820,
+                    "byte_start": 789,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                },
+                {
+                  "new_text": "\n\nfn fun_name(flag: bool) -> bool {\n    if flag { true } else { false }\n}",
+                  "span": {
+                    "byte_end": 822,
+                    "byte_start": 822,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/lib.rs",
+                "src/lib.rs"
+              ],
+              "findings": [],
+              "issuance": "led-1",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "applied",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 2,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 1061,
+                  "bytes_before": 1005,
+                  "content_sha256": "b59198df1e24c06135cf386bf360fabdbec58742ef9841bf092c689ffd8355c3",
+                  "edits": 2,
+                  "file": "src/lib.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ],
+        "66a6fcaba83a": [
+          {
+            "name": "menu",
+            "result": {
+              "actions": [
+                {
+                  "disabled_reason": null,
+                  "index": 0,
+                  "is_preferred": false,
+                  "kind": "source.generate.finalModifiers",
+                  "title": "Change modifiers to final where possible"
+                }
+              ],
+              "command_only_count": 1,
+              "total_count": 1,
+              "truncated": false
+            }
+          },
+          {
+            "name": "selected",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "final int amount) {\n        final int accepted = Math.max(0, amount);\n        pending += accepted;\n        receipts.add(label + \":\" + accepted);\n    }\n    public void settle() {\n        settled += pending;\n        pending = 0;\n    }\n    public int balance() { return settled + pending; }\n    public List<String> receipts() { return receipts; }\n    public String summary(final int tax) {\n        final int total = balance();\n        final int due = total + tax;\n        final ",
+                  "span": {
+                    "byte_end": 774,
+                    "byte_start": 335,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java"
+              ],
+              "findings": [],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "applied",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 1,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 900,
+                  "bytes_before": 864,
+                  "content_sha256": "85e8453c9cfdced6d34a5439470d6788946c3cac98ec6046baa4704a9a511a1c",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ],
+        "06d1b6fed507": [
+          {
+            "name": "move.plan",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "invoice",
+                  "span": {
+                    "byte_end": 15,
+                    "byte_start": 8,
+                    "content_sha256": "d46ba88db6a7c8fd492a870341a15e0789d85f76ff5a46d4cc499ec48734ef08",
+                    "file": "src/lib.rs"
+                  }
+                }
+              ],
+              "edit_count": 1,
+              "files": [
+                "src/lib.rs"
+              ],
+              "issuance": "led-1",
+              "language": "rust",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "move.references",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 1,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 1005,
+                  "bytes_before": 1005,
+                  "content_sha256": "23c83b8e8f26cf93ea888436509a5fba819dcbcb2b69cd8a7ff99f1809ddfd20",
+                  "edits": 1,
+                  "file": "src/lib.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "move.files",
+            "result": {
+              "applied": true,
+              "es": "es-2",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 0,
+                "syntax_only": 2
+              },
+              "semantic_status": "syntax_only",
+              "summary": [
+                {
+                  "content_sha256": "41121d45b24887b0025bc3375a1cb783b5de427f7f071d00242927df2731c05e",
+                  "created": true,
+                  "file": "src/invoice.rs"
+                },
+                {
+                  "bytes_after": 0,
+                  "bytes_before": 149,
+                  "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "deleted": true,
+                  "file": "src/receipt.rs"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ],
+        "02c7b7f41cf3": [
+          {
+            "name": "move.plan",
+            "result": {
+              "authority": "lsp",
+              "changes": [
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 93,
+                    "byte_start": 82,
+                    "content_sha256": "10adc94d41e20b98429f2ea1b2ccf86c44d4b53c6b0f15dc0546d9c0203489b2",
+                    "file": "src/main/java/com/acme/OrderLedger.java"
+                  }
+                },
+                {
+                  "new_text": "AccountLedger",
+                  "span": {
+                    "byte_end": 83,
+                    "byte_start": 72,
+                    "content_sha256": "d2172e1063e1a20c333b28ddbed891fe4a7ae9bd3141f95e90bd08446e14ab64",
+                    "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                  }
+                }
+              ],
+              "edit_count": 2,
+              "files": [
+                "src/main/java/com/acme/OrderLedger.java",
+                "src/main/java/com/acme/ReceiptPrinter.java"
+              ],
+              "issuance": "led-1",
+              "language": "java",
+              "provenance": "lsp_verified",
+              "resource_ops": []
+            }
+          },
+          {
+            "name": "move.references",
+            "result": {
+              "applied": true,
+              "es": "es-1",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 2,
+                "syntax_only": 0
+              },
+              "semantic_status": "lsp_verified",
+              "summary": [
+                {
+                  "bytes_after": 866,
+                  "bytes_before": 864,
+                  "content_sha256": "158212029dfc12ba5e1c88d670e573d98194e7bc47b6d9ac828269800862ef35",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                },
+                {
+                  "bytes_after": 185,
+                  "bytes_before": 183,
+                  "content_sha256": "d02e8493166bc3ec69c1d431c4f443ac7ae76b2d1e330d1014c9ba8b7c2290ef",
+                  "edits": 1,
+                  "file": "src/main/java/com/acme/ReceiptPrinter.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 2,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          },
+          {
+            "name": "move.files",
+            "result": {
+              "applied": true,
+              "es": "es-2",
+              "lineage": {
+                "compiler_suggested": 0,
+                "lsp_verified": 0,
+                "syntax_only": 2
+              },
+              "semantic_status": "syntax_only",
+              "summary": [
+                {
+                  "content_sha256": "158212029dfc12ba5e1c88d670e573d98194e7bc47b6d9ac828269800862ef35",
+                  "created": true,
+                  "file": "src/main/java/com/acme/AccountLedger.java"
+                },
+                {
+                  "bytes_after": 0,
+                  "bytes_before": 866,
+                  "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "deleted": true,
+                  "file": "src/main/java/com/acme/OrderLedger.java"
+                }
+              ],
+              "validations": [
+                {
+                  "files_checked": 1,
+                  "status": "passed",
+                  "validation": "tree_sitter_no_errors"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

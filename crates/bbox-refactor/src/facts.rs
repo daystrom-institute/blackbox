@@ -523,30 +523,27 @@ pub fn java_field_initializer_closure(
         if !is_static_final {
             continue;
         }
-        // Find the variable_declarator and get name + initializer.
-        let mut decl_name: Option<String> = None;
-        let mut init_node: Option<tree_sitter::Node<'_>> = None;
+        // Each declarator owns an initializer. A comma-separated field
+        // declaration must not overwrite the dependencies of earlier fields.
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                decl_name = child
-                    .child_by_field_name("name")
-                    .map(|n| text_of(&parsed.source, n));
-                init_node = child.child_by_field_name("value");
+            if child.kind() != "variable_declarator" {
+                continue;
             }
+            let (Some(name), Some(init)) = (
+                child.child_by_field_name("name"),
+                child.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            let field_name = text_of(&parsed.source, name);
+            let refs = collect_identifiers_in_subtree(init, &parsed.source);
+            let dep_set: BTreeSet<String> = refs
+                .into_iter()
+                .filter(|r| static_final_names.contains(r.as_str()) && r != &field_name)
+                .collect();
+            initializer_refs.insert(field_name, dep_set);
         }
-        let Some(field_name) = decl_name else {
-            continue;
-        };
-        let Some(init) = init_node else {
-            continue;
-        };
-        let refs = collect_identifiers_in_subtree(init, &parsed.source);
-        let dep_set: BTreeSet<String> = refs
-            .into_iter()
-            .filter(|r| static_final_names.contains(r.as_str()) && r != &field_name)
-            .collect();
-        initializer_refs.insert(field_name, dep_set);
     }
 
     // Compute transitive closure: for each requested field, follow dependency
@@ -1707,5 +1704,20 @@ class OrderView {
         let path = fixture(&root);
         let err = file_query(&path, "(nonsense_node_kind) @x", None).unwrap_err();
         assert!(err.to_string().contains("query"), "got: {err}");
+    }
+    #[test]
+    fn initializer_closure_keeps_every_comma_separated_declarator() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("Constants.java");
+        std::fs::write(&path, "class Constants { static final int BASE=1; static final int FIRST=BASE+1, SECOND=FIRST+2; }").unwrap();
+        let closure = java_field_initializer_closure(
+            &path,
+            &["FIRST".into(), "SECOND".into()],
+            Some("Constants"),
+        )
+        .unwrap();
+        assert_eq!(closure["FIRST"], vec!["BASE"]);
+        assert_eq!(closure["SECOND"], vec!["BASE", "FIRST"]);
     }
 }

@@ -26,11 +26,62 @@ use bro_lsp::{Language, LspConfig, OpenDocument, SessionPool};
 use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use super::code_facts::{Span, span_schema_pub};
 use super::ledger::{AuthorityTier, ProvenanceLedger};
 
 const DEFAULT_WAIT_READY_MS: u64 = 120_000;
+const MAX_LSP_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+// Exact coordinates require the same UTF-8 bytes that were hashed. Refuse
+// non-regular or oversized inputs before starting a language server.
+async fn read_lsp_source(path: &Path) -> Result<(String, String), String> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("source must be a regular file".into());
+    }
+    if metadata.len() > MAX_LSP_SOURCE_BYTES as u64 {
+        return Err(format!("source exceeds {MAX_LSP_SOURCE_BYTES} byte limit"));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LSP_SOURCE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_LSP_SOURCE_BYTES {
+        return Err(format!("source exceeds {MAX_LSP_SOURCE_BYTES} byte limit"));
+    }
+    let sha = bbox_refactor::sha256_hex(&bytes);
+    let source = String::from_utf8(bytes).map_err(|e| format!("invalid_utf8: {e}"))?;
+    Ok((source, sha))
+}
+
+async fn read_span_source(path: &Path, span: &Span) -> Result<(String, String), String> {
+    let (source, sha) = read_lsp_source(path).await?;
+    if sha != span.content_sha256 {
+        return Err(format!(
+            "stale_span: {} changed since the span was minted; re-derive the span from fresh facts",
+            span.file
+        ));
+    }
+    if span.byte_start > span.byte_end
+        || span.byte_end > source.len()
+        || !source.is_char_boundary(span.byte_start)
+        || !source.is_char_boundary(span.byte_end)
+    {
+        return Err(format!(
+            "invalid_span: {}..{} must be an ordered UTF-8 byte range within {} bytes; re-derive the span from fresh facts",
+            span.byte_start,
+            span.byte_end,
+            source.len()
+        ));
+    }
+    Ok((source, sha))
+}
 
 /// Session-scoped LSP binding state: the warm pool plus the documents this
 /// session has opened (with the content generation last sent to the server,
@@ -102,8 +153,12 @@ fn wait_ready_duration(value: Option<u64>) -> Duration {
 
 /// Byte offset → LSP position (UTF-16 line/character), per the LSP default
 /// position encoding.
-fn byte_to_position(source: &str, byte: usize) -> lsp_types::Position {
-    let byte = byte.min(source.len());
+fn byte_to_position(source: &str, byte: usize) -> Result<lsp_types::Position, String> {
+    if !source.is_char_boundary(byte) {
+        return Err(format!(
+            "invalid_span: byte {byte} is outside the source or splits a UTF-8 code point"
+        ));
+    }
     let mut line = 0u32;
     let mut line_start = 0usize;
     for (idx, ch) in source.char_indices() {
@@ -119,7 +174,7 @@ fn byte_to_position(source: &str, byte: usize) -> lsp_types::Position {
         .chars()
         .map(|c| c.len_utf16() as u32)
         .sum();
-    lsp_types::Position { line, character }
+    Ok(lsp_types::Position { line, character })
 }
 
 /// LSP position (UTF-16 line/character) → byte offset.
@@ -144,18 +199,22 @@ fn position_to_byte(source: &str, pos: lsp_types::Position) -> Result<usize, Str
     }
     let mut utf16 = 0u32;
     for (idx, ch) in source[offset..].char_indices() {
-        if utf16 >= pos.character {
+        if utf16 == pos.character {
             return Ok(offset + idx);
         }
-        if ch == '\n' {
+        if ch == '\n' || ch == '\r' && source[offset + idx..].starts_with("\r\n") {
             break;
         }
         utf16 += ch.len_utf16() as u32;
+        if utf16 > pos.character {
+            return Err(format!(
+                "position {}:{} splits a UTF-16 surrogate pair",
+                pos.line, pos.character
+            ));
+        }
     }
-    if utf16 >= pos.character {
-        Ok(source
-            .len()
-            .min(offset + source[offset..].find('\n').unwrap_or(source.len() - offset)))
+    if utf16 == pos.character {
+        Ok(source.len())
     } else {
         Err(format!(
             "position {}:{} out of range",
@@ -229,11 +288,9 @@ impl LspState {
         abs: &Path,
         language: Language,
     ) -> Result<OpenDocument, String> {
-        let bytes = tokio::fs::read(abs)
+        let (source, sha) = read_lsp_source(abs)
             .await
             .map_err(|e| format!("lsp: read {}: {e}", abs.display()))?;
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        let source = String::from_utf8_lossy(&bytes).to_string();
         self.ensure_current(root, abs, language, &source, &sha)
             .await
     }
@@ -422,16 +479,17 @@ pub(super) async fn text_edits_to_changes(
                 Err(e) => return Err(format!("{context}: {e}")),
             },
         };
-        let bytes = tokio::fs::read(&path)
+        let (file_source, file_sha) = read_lsp_source(&path)
             .await
             .map_err(|e| format!("{context}: {rel}: {e}"))?;
-        let file_sha = bbox_refactor::sha256_hex(&bytes);
-        let file_source = String::from_utf8_lossy(&bytes).to_string();
         for text_edit in edits {
             let byte_start = position_to_byte(&file_source, text_edit.range.start)
                 .map_err(|e| format!("{context}: {rel}: {e}"))?;
             let byte_end = position_to_byte(&file_source, text_edit.range.end)
                 .map_err(|e| format!("{context}: {rel}: {e}"))?;
+            if byte_start > byte_end {
+                return Err(format!("{context}: {rel}: inverted server edit range"));
+            }
             changes.push((
                 Span {
                     file: rel.clone(),
@@ -543,18 +601,10 @@ impl Tool for LspRename {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.rename: {e}")),
         };
-        let bytes = match tokio::fs::read(&abs).await {
-            Ok(b) => b,
+        let (source, sha) = match read_span_source(&abs, &span).await {
+            Ok(value) => value,
             Err(e) => return err(format!("lsp.rename: {}: {e}", span.file)),
         };
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        if sha != span.content_sha256 {
-            return err(format!(
-                "lsp.rename: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
-                span.file, span.content_sha256
-            ));
-        }
-        let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
             .ensure_current(&cx.root, &abs, language, &source, &sha)
@@ -584,7 +634,10 @@ impl Tool for LspRename {
             ToolResult::Json(v) => v.as_u64().map(|b| b as usize).unwrap_or(span.byte_start),
             _ => span.byte_start,
         };
-        let position = byte_to_position(&source, aim_byte);
+        let position = match byte_to_position(&source, aim_byte) {
+            Ok(position) => position,
+            Err(e) => return err(format!("lsp.rename: {e}")),
+        };
         let wait_ready = wait_ready_duration(params.wait_ready_ms);
         let edit = match self
             .0
@@ -881,7 +934,7 @@ impl Tool for LspDefinition {
         "lsp.definition"
     }
     fn description(&self) -> &str {
-        "Goto-declaration at a span (rust-analyzer for Rust, JDTLS for Java; warms on first use). Returns `{locations: Span[], unanchored: {file,range}[], total_count, returned_count, truncated}` — hash-anchored spans for files under the session root, unanchored entries for files outside. Bounded per the isolate-heap discipline. Fails closed when the server is unavailable (RX-V3)."
+        "Goto-declaration at a span (rust-analyzer for Rust, JDTLS for Java; warms on first use). Returns `{locations: {span: Span, anchored: true}[], unanchored: {file,range}[], total_count, returned_count, truncated}` — hash-anchored spans for files under the session root, unanchored entries for files outside. Bounded per the isolate-heap discipline. Fails closed when the server is unavailable (RX-V3)."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -901,7 +954,7 @@ impl Tool for LspDefinition {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Max locations to return. Defaults to 4096; truncation is reported."
+                    "description": "Max locations to return. Default and maximum 4096; truncation is reported."
                 }
             },
             "required": ["span"]
@@ -934,18 +987,10 @@ impl Tool for LspDefinition {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.definition: {e}")),
         };
-        let bytes = match tokio::fs::read(&abs).await {
-            Ok(b) => b,
+        let (source, sha) = match read_span_source(&abs, &span).await {
+            Ok(value) => value,
             Err(e) => return err(format!("lsp.definition: {}: {e}", span.file)),
         };
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        if sha != span.content_sha256 {
-            return err(format!(
-                "lsp.definition: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
-                span.file, span.content_sha256
-            ));
-        }
-        let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
             .ensure_current(&cx.root, &abs, language, &source, &sha)
@@ -973,13 +1018,19 @@ impl Tool for LspDefinition {
             ToolResult::Json(v) => v.as_u64().map(|b| b as usize).unwrap_or(span.byte_start),
             _ => span.byte_start,
         };
-        let position = byte_to_position(&source, aim_byte);
+        let position = match byte_to_position(&source, aim_byte) {
+            Ok(position) => position,
+            Err(e) => return err(format!("lsp.definition: {e}")),
+        };
         let wait_ready = wait_ready_duration(params.wait_ready_ms);
         let locations = match self.0.definition(&doc, position, wait_ready).await {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.definition: {e}")),
         };
-        let limit = params.limit.unwrap_or(4096);
+        let limit = params.limit.unwrap_or(4096).min(4096);
+        if limit == 0 {
+            return err("lsp.definition: limit must be >= 1");
+        }
         let total_count = locations.len();
         let truncated = total_count > limit;
         let mut truncated_locations = locations;
@@ -1020,8 +1071,8 @@ impl Tool for LspDefinition {
             let (sha, source_text) = match per_file_cache.get(&file_path) {
                 Some((s, t, _)) => (s.clone(), t.clone()),
                 None => {
-                    let bytes = match tokio::fs::read(&file_path).await {
-                        Ok(b) => b,
+                    let (source_text, sha) = match read_lsp_source(&file_path).await {
+                        Ok(value) => value,
                         Err(e) => {
                             unanchored.push(json!({
                                 "file": rel,
@@ -1033,8 +1084,6 @@ impl Tool for LspDefinition {
                             continue;
                         }
                     };
-                    let sha = bbox_refactor::sha256_hex(&bytes);
-                    let source_text = String::from_utf8_lossy(&bytes).to_string();
                     per_file_cache.insert(
                         file_path.clone(),
                         (sha.clone(), source_text.clone(), rel.clone()),
@@ -1068,6 +1117,13 @@ impl Tool for LspDefinition {
                     continue;
                 }
             };
+            if byte_start > byte_end {
+                unanchored.push(
+                    json!({"file": rel, "uri": loc.uri.to_string(), "range": loc.range,
+                    "anchored": false, "error": "inverted server range"}),
+                );
+                continue;
+            }
             anchored.push(json!({
                 "span": Span {
                     file: rel,
@@ -1145,7 +1201,7 @@ impl Tool for LspReferences {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum number of locations to return. Defaults to 5000 (isolate-heap cap); truncation is reported when the cap binds."
+                    "description": "Maximum number of locations to return. Default and hard maximum 5000; truncation is reported when the cap binds."
                 }
             },
             "required": ["span"]
@@ -1169,7 +1225,10 @@ impl Tool for LspReferences {
                 ));
             }
         };
-        let limit = params.limit.unwrap_or(MAX_REFERENCE_LOCATIONS);
+        let limit = params
+            .limit
+            .unwrap_or(MAX_REFERENCE_LOCATIONS)
+            .min(MAX_REFERENCE_LOCATIONS);
         if limit == 0 {
             return err("lsp.references: limit must be >= 1");
         }
@@ -1183,18 +1242,10 @@ impl Tool for LspReferences {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.references: {e}")),
         };
-        let bytes = match tokio::fs::read(&abs).await {
-            Ok(b) => b,
+        let (source, sha) = match read_span_source(&abs, &span).await {
+            Ok(value) => value,
             Err(e) => return err(format!("lsp.references: {}: {e}", span.file)),
         };
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        if sha != span.content_sha256 {
-            return err(format!(
-                "lsp.references: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
-                span.file, span.content_sha256
-            ));
-        }
-        let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
             .ensure_current(&cx.root, &abs, language, &source, &sha)
@@ -1224,7 +1275,10 @@ impl Tool for LspReferences {
             ToolResult::Json(v) => v.as_u64().map(|b| b as usize).unwrap_or(span.byte_start),
             _ => span.byte_start,
         };
-        let position = byte_to_position(&source, aim_byte);
+        let position = match byte_to_position(&source, aim_byte) {
+            Ok(position) => position,
+            Err(e) => return err(format!("lsp.references: {e}")),
+        };
         let wait_ready = wait_ready_duration(params.wait_ready_ms);
         let locations = match self
             .0
@@ -1284,8 +1338,8 @@ impl Tool for LspReferences {
             let (sha, source_text) = match per_file_cache.get(&file_path) {
                 Some((s, t, _)) => (s.clone(), t.clone()),
                 None => {
-                    let bytes = match tokio::fs::read(&file_path).await {
-                        Ok(b) => b,
+                    let (source_text, sha) = match read_lsp_source(&file_path).await {
+                        Ok(value) => value,
                         Err(e) => {
                             unanchored.push(json!({
                                 "file": rel,
@@ -1297,8 +1351,6 @@ impl Tool for LspReferences {
                             continue;
                         }
                     };
-                    let sha = bbox_refactor::sha256_hex(&bytes);
-                    let source_text = String::from_utf8_lossy(&bytes).to_string();
                     per_file_cache.insert(
                         file_path.clone(),
                         (sha.clone(), source_text.clone(), rel.clone()),
@@ -1332,6 +1384,13 @@ impl Tool for LspReferences {
                     continue;
                 }
             };
+            if byte_start > byte_end {
+                unanchored.push(
+                    json!({"file": rel, "uri": loc.uri.to_string(), "range": loc.range,
+                    "anchored": false, "error": "inverted server range"}),
+                );
+                continue;
+            }
             anchored.push(json!({
                 "span": Span {
                     file: rel,
@@ -1501,7 +1560,7 @@ impl Tool for LspAssist {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Max actions to return in the list. Defaults to 64 (isolate-heap cap); truncation is reported."
+                    "description": "Max actions to return in the list. Default and hard maximum 64; truncation is reported. Does not restrict an explicit select index."
                 }
             },
             "required": ["span"]
@@ -1534,18 +1593,10 @@ impl Tool for LspAssist {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.assist: {e}")),
         };
-        let bytes = match tokio::fs::read(&abs).await {
-            Ok(b) => b,
+        let (source, sha) = match read_span_source(&abs, &span).await {
+            Ok(value) => value,
             Err(e) => return err(format!("lsp.assist: {}: {e}", span.file)),
         };
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        if sha != span.content_sha256 {
-            return err(format!(
-                "lsp.assist: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
-                span.file, span.content_sha256
-            ));
-        }
-        let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
             .ensure_current(&cx.root, &abs, language, &source, &sha)
@@ -1556,9 +1607,12 @@ impl Tool for LspAssist {
         };
         let wait_ready = wait_ready_duration(params.wait_ready_ms);
         // Convert span byte range to LSP range.
-        let range = lsp_types::Range {
-            start: byte_to_position(&source, span.byte_start),
-            end: byte_to_position(&source, span.byte_end),
+        let range = match (
+            byte_to_position(&source, span.byte_start),
+            byte_to_position(&source, span.byte_end),
+        ) {
+            (Ok(start), Ok(end)) => lsp_types::Range { start, end },
+            (Err(e), _) | (_, Err(e)) => return err(format!("lsp.assist: {e}")),
         };
         // Fetch code actions from the server.
         let raw_actions = match self.0.code_action(&doc, range, wait_ready).await {
@@ -1594,13 +1648,16 @@ impl Tool for LspAssist {
                 indexed.retain(|(_, ca)| ca.title.to_lowercase().contains(&filter_lower));
             }
         }
-        let limit = params.limit.unwrap_or(MAX_ASSIST_ACTIONS);
+        let limit = params
+            .limit
+            .unwrap_or(MAX_ASSIST_ACTIONS)
+            .min(MAX_ASSIST_ACTIONS);
         if limit == 0 {
             return err("lsp.assist: limit must be >= 1");
         }
         let is_list_mode = params.select.is_none();
         let truncated = indexed.len() > limit;
-        if truncated {
+        if is_list_mode && truncated {
             indexed.truncate(limit);
         }
         // Bare call: return the menu.
@@ -1613,6 +1670,7 @@ impl Tool for LspAssist {
                         "title": ca.title,
                         "kind": ca.kind.as_ref().map(|k| k.as_str()),
                         "is_preferred": ca.is_preferred.unwrap_or(false),
+                        "disabled_reason": ca.disabled.as_ref().map(|disabled| &disabled.reason),
                     })
                 })
                 .collect();
@@ -1632,6 +1690,12 @@ impl Tool for LspAssist {
             ));
         }
         let (_orig_idx, action) = indexed.swap_remove(select_idx);
+        if let Some(disabled) = &action.disabled {
+            return err(format!(
+                "lsp.assist: selected action is disabled: {}",
+                disabled.reason
+            ));
+        }
         // Resolve the action via codeAction/resolve.
         let resolved = match self.0.code_action_resolve(&cx.root, language, action).await {
             Ok(r) => r,
@@ -1910,18 +1974,10 @@ impl Tool for LspHover {
             Ok(l) => l,
             Err(e) => return err(format!("lsp.hover: {e}")),
         };
-        let bytes = match tokio::fs::read(&abs).await {
-            Ok(b) => b,
+        let (source, sha) = match read_span_source(&abs, &span).await {
+            Ok(value) => value,
             Err(e) => return err(format!("lsp.hover: {}: {e}", span.file)),
         };
-        let sha = bbox_refactor::sha256_hex(&bytes);
-        if sha != span.content_sha256 {
-            return err(format!(
-                "lsp.hover: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
-                span.file, span.content_sha256
-            ));
-        }
-        let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
             .ensure_current(&cx.root, &abs, language, &source, &sha)
@@ -1950,7 +2006,10 @@ impl Tool for LspHover {
                 _ => span.byte_start,
             }
         };
-        let position = byte_to_position(&source, aim_byte);
+        let position = match byte_to_position(&source, aim_byte) {
+            Ok(position) => position,
+            Err(e) => return err(format!("lsp.hover: {e}")),
+        };
         let wait_ready = wait_ready_duration(params.wait_ready_ms);
         let hover = match self.0.pool.hover(&doc, position, wait_ready).await {
             Ok(h) => h,
@@ -1969,7 +2028,7 @@ impl Tool for LspHover {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "lsp".to_string(),
-        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable or still indexing after the bounded ready wait. Verbs: `lsp.status` (non-spawning readiness check), `lsp.rename` (rust + java), `lsp.references` (authoritative project-wide find-usages, rust + java; bounded result list with hash-anchored Spans under the session root and unanchored {file, range} entries outside), `lsp.definition` (goto-declaration at a span, same shape as references), `lsp.willRenameFiles` (standard file move/rename preflight edits), `lsp.executeCommand` (server-specific command seam), `lsp.hover` (rust + java), and `lsp.assist` (list-then-apply code actions at a span; lsp_verified provenance). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })`, `await edits.merge({ es, changes: r.changes })`, `await edits.apply({ es })`. THE REFERENCES RECIPE: aim a Span at a symbol, then `const refs = await lsp.references({ span })`; result is `{ locations: Span[], unanchored: {file, range}[], total_count, returned_count, truncated }`. Server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE JAVA MOVE SEAM: use `java.moveClass` / `java.movePackage`; those tools call JDTLS `java/getMoveDestinations` and `java/move` directly instead of the standard file-operation preflight when JDTLS does not supply edits there. THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively. JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Position requests wait up to 120000 ms by default; pass `wait_ready_ms: 0` only when intentionally bypassing readiness."
+        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable or still indexing after the bounded ready wait. Verbs: `lsp.status` (non-spawning readiness check), `lsp.rename` (rust + java), `lsp.references` (authoritative project-wide find-usages, rust + java; bounded result list with hash-anchored Spans under the session root and unanchored {file, range} entries outside), `lsp.definition` (goto-declaration at a span, same shape as references), `lsp.willRenameFiles` (standard file move/rename preflight edits), `lsp.executeCommand` (server-specific command seam), `lsp.hover` (rust + java), and `lsp.assist` (list-then-apply code actions at a span; lsp_verified provenance). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })`, `await edits.merge({ es, changes: r.changes })`, `await edits.apply({ es })`. THE REFERENCES RECIPE: aim a Span at a symbol, then `const refs = await lsp.references({ span })`; result is `{ locations: {span: Span, anchored: true}[], unanchored: {file, range}[], total_count, returned_count, truncated }`. Server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE JAVA MOVE SEAM: use `java.moveClass` / `java.movePackage`; those tools call JDTLS `java/getMoveDestinations` and `java/move` directly instead of the standard file-operation preflight when JDTLS does not supply edits there. THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively. JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Position requests wait up to 120000 ms by default; pass `wait_ready_ms: 0` only when intentionally bypassing readiness."
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
 	type HoverResult = { contents: string | null; language: string; position: { line: number; character: number } };
@@ -1994,6 +2053,8 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
 	  executeCommand(args: { command: string; arguments?: unknown[]; language?: "java" | "rust" }): Promise<{ command: string; language: string; result: unknown }>;
 	  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). Whole-item spans are fine, snaps to the item's name identifier like lsp.rename. THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type. Cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the ready server has no info there. Read-only (no provenance ledger). Waits for server readiness by default (120000 ms; pass wait_ready_ms: 0 to bypass). Fails closed if the server is unavailable or still not ready; stale_span on content drift. */
 	  hover(args: { span: Span; wait_ready_ms?: number; waitReadyMs?: number }): Promise<HoverResult>;
+	  /** List code actions or resolve a selected original index. limit only bounds the list. Returned changes are applied explicitly through edits.merge/apply. */
+	  assist(args: { span: Span; select?: number; kind_prefix?: string; kindPrefix?: string; title_filter?: string; titleFilter?: string; limit?: number; wait_ready_ms?: number; waitReadyMs?: number }): Promise<unknown>;
 	};"#
             .to_string(),
     }
@@ -2010,7 +2071,7 @@ mod tests {
     fn byte_position_round_trips_with_multibyte() {
         let source = "fn a() {}\n// caf\u{e9} \u{1f980} note\nfn b() {}\n";
         for (byte, _) in source.char_indices() {
-            let pos = byte_to_position(source, byte);
+            let pos = byte_to_position(source, byte).unwrap();
             assert_eq!(
                 position_to_byte(source, pos).unwrap(),
                 byte,
@@ -2023,9 +2084,108 @@ mod tests {
     fn byte_to_position_counts_utf16_units() {
         // '🦀' is 4 bytes / 2 UTF-16 units.
         let source = "\u{1f980}x";
-        let pos = byte_to_position(source, 4);
+        let pos = byte_to_position(source, 4).unwrap();
         assert_eq!(pos.line, 0);
         assert_eq!(pos.character, 2);
+    }
+
+    #[test]
+    fn coordinates_reject_split_codepoints_and_surrogates() {
+        let source = "a😀b\r\nnext";
+        assert!(
+            byte_to_position(source, 2)
+                .unwrap_err()
+                .contains("invalid_span")
+        );
+        assert!(byte_to_position(source, source.len() + 1).is_err());
+        assert!(
+            position_to_byte(source, lsp_types::Position::new(0, 2))
+                .unwrap_err()
+                .contains("surrogate")
+        );
+        assert_eq!(
+            position_to_byte(source, lsp_types::Position::new(0, 4)).unwrap(),
+            6
+        );
+        assert!(position_to_byte(source, lsp_types::Position::new(0, 5)).is_err());
+        assert_eq!(
+            position_to_byte(source, lsp_types::Position::new(1, 0)).unwrap(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn all_span_tools_reject_invalid_ranges_before_server_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = "pub fn sample() { let label = \"😀\"; }\n";
+        tokio::fs::write(root.join("sample.rs"), source)
+            .await
+            .unwrap();
+        let cx = cx_in(&root);
+        let state = unavailable_lsp_state();
+        let all = tools(state.clone(), Arc::new(ProvenanceLedger::default()));
+        let middle = source.find('😀').unwrap() + 1;
+        for tool in all.iter().filter(|tool| {
+            matches!(
+                tool.name(),
+                "lsp.rename" | "lsp.hover" | "lsp.definition" | "lsp.references" | "lsp.assist"
+            )
+        }) {
+            for (start, end) in [
+                (middle, middle),
+                (source.len() + 1, source.len() + 1),
+                (3, 1),
+            ] {
+                let result = tool.call(json!({"span":{"file":"sample.rs","byte_start":start,"byte_end":end,"content_sha256":bbox_refactor::sha256_hex(source.as_bytes())},"newName":"renamed"}), &cx).await;
+                assert!(
+                    matches!(result, ToolResult::Error(ref message) if message.contains("invalid_span")),
+                    "{}: {result:?}",
+                    tool.name()
+                );
+            }
+        }
+        let status = state.status(&root, Language::Rust).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["state"],
+            "not_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_edits_refuse_lossy_sources_and_surrogate_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("sample.rs");
+        let uri = lsp_types::Url::from_file_path(&path).unwrap();
+        tokio::fs::write(&path, b"a\xffb").await.unwrap();
+        let edit = lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 1),
+                lsp_types::Position::new(0, 2),
+            ),
+            new_text: "replacement".into(),
+        };
+        assert!(
+            text_edits_to_changes(&root, "test", vec![(uri.clone(), vec![edit.clone()])])
+                .await
+                .unwrap_err()
+                .contains("invalid_utf8")
+        );
+        tokio::fs::write(&path, "a😀b").await.unwrap();
+        assert!(
+            text_edits_to_changes(&root, "test", vec![(uri, vec![edit])])
+                .await
+                .unwrap_err()
+                .contains("surrogate")
+        );
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "a😀b");
+        assert!(
+            read_lsp_source(&root)
+                .await
+                .unwrap_err()
+                .contains("regular file")
+        );
     }
 
     fn cx_in(dir: &std::path::Path) -> ToolCx {

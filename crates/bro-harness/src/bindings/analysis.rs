@@ -26,6 +26,19 @@ use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const MAX_ANALYSIS_RESULT_BYTES: usize = 1024 * 1024;
+
+fn analysis_result(value: Value) -> ToolResult {
+    match serde_json::to_vec(&value) {
+        Ok(bytes) if bytes.len() <= MAX_ANALYSIS_RESULT_BYTES => ToolResult::Json(value),
+        Ok(bytes) => err(format!(
+            "analysis result is {} bytes, exceeding the {MAX_ANALYSIS_RESULT_BYTES} byte limit; narrow files, symbols, fields or statement regions before retrying; no partial result returned",
+            bytes.len()
+        )),
+        Err(e) => err(format!("analysis result serialization failed: {e}")),
+    }
+}
+
 fn err(msg: impl std::fmt::Display) -> ToolResult {
     ToolResult::Error(msg.to_string())
 }
@@ -135,7 +148,7 @@ impl Tool for AnalysisCohesionClusters {
         "analysis.cohesionClusters"
     }
     fn description(&self) -> &str {
-        "Partition the first class in a Java file into cohesive method clusters — the candidate seams for splitting a god class. Runs the field-co-touch + call-graph analysis Rust-side and returns a small cluster graph: each cluster has {name_hint, item_names, move_fields, score, expected_wiring} and the cross-cluster calls between them. Pick a high-score cluster and feed item_names/move_fields/expected_wiring straight into java.extractClass. Pure; syntax_only; never writes. Use this instead of reconstructing cohesion from code.query captures."
+        "Partition the first class in a Java file into cohesive method clusters — the candidate seams for splitting a god class. Runs the field-co-touch + call-graph analysis Rust-side and returns a small cluster graph: each cluster has {name_hint, item_names, move_fields, score, expected_wiring} and the cross-cluster calls between them. Pick a high-score cluster and feed item_names/move_fields into java.extractClass. expected_wiring describes coupling topology, not the extraction wiring argument. Pure; syntax_only; never writes. Use this instead of reconstructing cohesion from code.query captures."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -200,7 +213,7 @@ impl Tool for AnalysisCohesionClusters {
                 let rel = workspace_relative(&root, sp);
                 class["source_path"] = json!(rel);
             }
-            ToolResult::Json(json!({
+            analysis_result(json!({
                 "file": params.file,
                 "class": class,
                 "cluster_count": cluster_count,
@@ -314,8 +327,11 @@ impl Tool for AnalysisReferences {
                 ));
             }
         };
-        if params.symbols.is_empty() {
-            return err("analysis.references: `symbols` must be non-empty");
+        if params.symbols.is_empty()
+            || params.symbols.len() > 256
+            || params.symbols.iter().any(|name| name.trim().is_empty())
+        {
+            return err("analysis.references: `symbols` must contain 1..=256 non-empty names");
         }
         let is_rust = params
             .language
@@ -331,8 +347,16 @@ impl Tool for AnalysisReferences {
                     &root,
                     &requested_symbols,
                 ) {
-                    Ok(summary) => {
-                        ToolResult::Json(json!({
+                    Ok(mut summary) => {
+                        for paths in summary.files_by_symbol.values_mut() {
+                            for path in paths { *path = workspace_relative(&root, path); }
+                        }
+                        for examples in summary.examples_by_symbol.values_mut() {
+                            for example in examples { example.path = workspace_relative(&root, &example.path); }
+                        }
+                        analysis_result(json!({
+                            "language": "rust",
+                            "counting_scope": "syntactic name occurrences including declarations; test classification uses file paths, not cfg(test) modules; unparseable files are skipped",
                             "symbols": summary.symbols,
                             "total_usages": summary.total_usages,
                             "unique_files": summary.unique_files,
@@ -374,7 +398,7 @@ impl Tool for AnalysisReferences {
                     Err(e) => return err(format!("analysis.references: decode: {e}")),
                 };
                 relativize_reference_paths(&root, &mut v);
-                ToolResult::Json(json!({
+                analysis_result(json!({
                     "symbols": requested_symbols,
                     "total_usages": v.get("total_usages").cloned().unwrap_or(json!(0)),
                     "unique_files": v.get("unique_call_files").cloned().unwrap_or(json!(0)),
@@ -504,7 +528,13 @@ impl Tool for AnalysisFieldClassification {
                 fields.as_deref(),
                 class_name.as_deref(),
             ) {
-                Ok(found) => ToolResult::Json(field_classification_payload(&file, &found)),
+                Ok(found) => {
+                    if let Some(requested) = fields.as_ref() {
+                        let missing: Vec<_> = requested.iter().filter(|name| !found.fields.iter().any(|field| &field.name == *name)).collect();
+                        if !missing.is_empty() { return err(format!("analysis.fieldClassification: fields not found in selected class: {missing:?}; inspect code.fields before retrying")); }
+                    }
+                    analysis_result(field_classification_payload(&file, &found))
+                },
                 Err(e) => err(format!("analysis.fieldClassification: {e:#}")),
             },
         )
@@ -606,7 +636,7 @@ impl Tool for AnalysisMethodRegions {
                 Ok(found) => {
                     let mut value = serde_json::to_value(found).unwrap_or_else(|_| json!({}));
                     value["file"] = json!(file);
-                    ToolResult::Json(value)
+                    analysis_result(value)
                 }
                 Err(e) => err(format!("analysis.methodRegions: {e:#}")),
             }
@@ -667,17 +697,40 @@ impl Tool for AnalysisFieldInitializerClosure {
                 ));
             }
         };
-        let root = cx.root.clone();
+        if params.fields.is_empty() {
+            return err("analysis.fieldInitializerClosure: fields must be non-empty");
+        }
+        let path = match bro_tools::workspace::resolve_in_root(&cx.root, &params.file) {
+            Ok(path) => path,
+            Err(e) => return err(format!("analysis.fieldInitializerClosure: {e}")),
+        };
         bro_tools::tool::call_blocking(move || {
+            let found = match bbox_refactor::facts::java_fields(&path, params.class_name.as_deref()) {
+                Ok(found) => found,
+                Err(e) => return err(format!("analysis.fieldInitializerClosure: {e:#}")),
+            };
+            let missing: Vec<_> = params.fields.iter().filter(|name| !found.fields.iter().any(|field| &field.name == *name)).collect();
+            if !missing.is_empty() {
+                return err(format!("analysis.fieldInitializerClosure: fields not found in selected class: {missing:?}; inspect code.fields before retrying"));
+            }
+            let owners: std::collections::BTreeSet<_> = found.fields.iter()
+                .filter(|field| params.fields.contains(&field.name))
+                .filter_map(|field| field.owner_class.as_deref()).collect();
+            if owners.len() > 1 {
+                return err("analysis.fieldInitializerClosure: selected fields have multiple owner classes; pass className and analyze one class at a time");
+            }
+            let selected_class = params.class_name.as_deref().or_else(|| owners.first().copied());
+            let skipped_non_constants: Vec<_> = found.fields.iter().filter(|field| params.fields.contains(&field.name) && !(field.is_static && field.is_final)).map(|field| field.name.clone()).collect();
             match bbox_refactor::facts::java_field_initializer_closure(
-                &root.join(&params.file),
+                &path,
                 &params.fields,
-                params.class_name.as_deref(),
+                selected_class,
             ) {
-                Ok(closure) => ToolResult::Json(json!({
+                Ok(closure) => analysis_result(json!({
                     "file": params.file,
                     "fields": params.fields,
                     "closure": closure,
+                    "skipped_non_constants": skipped_non_constants,
                     "provenance": "syntax_only",
                 })),
                 Err(e) => err(format!("analysis.fieldInitializerClosure: {e:#}")),
@@ -753,7 +806,7 @@ impl Tool for AnalysisImplPartition {
                 }
             };
             match bbox_refactor::rust_partition::analyze_impl(&source_path, &impl_name) {
-                Ok(graph) => ToolResult::Json(json!({
+                Ok(graph) => analysis_result(json!({
                     "file": params.file,
                     // relativize impl_name back to user's input form
                     "impl_name": impl_name,
@@ -797,7 +850,7 @@ impl Tool for AnalysisTopLevelDeps {
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Path to a .rs file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
-                "projectDir": { "type": "string", "description": "Optional project directory for external reference scanning. Defaults to the file's parent directory." },
+                "projectDir": { "type": "string", "description": "Optional project directory for external reference scanning. Relative paths resolve against the session root. Defaults to the file's parent directory." },
                 "itemNames": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -838,7 +891,16 @@ impl Tool for AnalysisTopLevelDeps {
                     return err(format!("analysis.topLevelDeps: {}: {e}", params.file));
                 }
             };
-            let project_dir = params.project_dir.as_deref();
+            let project_dir = match params.project_dir.as_deref() {
+                Some(project) => match bro_tools::workspace::resolve_in_root(&root, project) {
+                    Ok(path) if path.is_dir() => Some(path),
+                    Ok(_) => return err("analysis.topLevelDeps: projectDir must name a directory"),
+                    Err(e) => return err(format!("analysis.topLevelDeps: projectDir: {e}")),
+                },
+                None => None,
+            };
+            let project_dir_text = project_dir.as_ref().map(|path| path.to_string_lossy());
+            let project_dir = project_dir_text.as_deref();
             let item_names = params.item_names.as_deref();
             let item_kinds = params.item_kinds.as_deref();
             match bbox_refactor::rust_top_level_deps::analyze_top_level(
@@ -861,7 +923,7 @@ impl Tool for AnalysisTopLevelDeps {
                             })
                         })
                         .collect();
-                    ToolResult::Json(json!({
+                    analysis_result(json!({
                         "file": params.file,
                         "items": graph.items,
                         "edges": graph.edges,
@@ -941,6 +1003,13 @@ RECIPE (god-class decomposition)
   // java.removeUnusedConstructorParams({ file }) → edits.merge/apply to drop
   // them and fully move the injection point (run it AFTER the extract apply)."#;
 
+const RUST_REFERENCES_CONTRACT: &str = r#"analysis.references (rust): syntactic name occurrence counts across Rust files.
+PARAMS { symbols: string[], language: "rust" }. symbols must contain 1..=256 non-empty names.
+Java-only kinds and declaringClass are ignored. Counts include declarations, imports and expression occurrences, not resolved semantic references. Test classification uses file paths and does not recognize inline cfg(test) modules. Unparseable files are skipped.
+RETURNS { language, counting_scope, symbols, total_usages, unique_files, production_sites, test_sites, counts_by_symbol, files_by_symbol, examples_by_symbol, truncated, provenance }.
+Paths are relative to the session root. Up to five examples per symbol; the scanner stops at 500 files or 5000 occurrences and reports truncated. The serialized result is limited to 1 MiB; oversize results fail with a narrowing hint. Use lsp.references for resolved symbol identity and hash-anchored edit addresses.
+"#;
+
 const REFERENCES_CONTRACT: &str = r#"analysis.references — count Java symbol references across the workspace without returning full capture payloads.
 
 WHAT IT DOES
@@ -998,7 +1067,8 @@ WHAT IT DOES
 PARAMS
   file: string        workspace-relative .java file
   fields?: string[]   optional field names to classify; omit for all fields
-  className?: string  optional owner class restriction
+  className?: string  optional owner class restriction; otherwise inferred from selected fields
+                      (ambiguous cross-class selections are rejected)
 
 RETURNS { file, language, content_sha256, source_len, fields, provenance }
   fields[]:
@@ -1036,7 +1106,8 @@ WHAT IT DOES
 PARAMS
   file: string        workspace-relative .java file
   method: string      method or constructor name
-  className?: string  optional owner class restriction
+  className?: string  optional owner class restriction; otherwise inferred from selected fields
+                      (ambiguous cross-class selections are rejected)
   includeStatementRegions?: boolean  default true; set false for gate-only calls
   includeNestedStatementRegions?: boolean default false; when true,
                             statement_regions inventories nested statements,
@@ -1129,9 +1200,12 @@ WHAT IT DOES
 PARAMS
   file: string        workspace-relative .java file
   fields: string[]    field names to check (typically seam.move_fields)
-  className?: string  optional owner class restriction
+  className?: string  optional owner class restriction; otherwise inferred from selected fields
+                      (ambiguous cross-class selections are rejected)
 
-RETURNS { file, fields, closure, provenance }
+RETURNS { file, fields, closure, skipped_non_constants, provenance }
+  skipped_non_constants: requested non-static-final fields, which this analysis does not cover.
+  Unknown requested fields are rejected instead of reported as an empty closure.
   closure: { [field_name]: string[] }  only present for fields with deps;
           values are sorted alphabetically
 
@@ -1169,7 +1243,7 @@ PARAMS
 RETURNS { file, impl_name, methods, fields, edges, provenance }
   methods[]: each has name, reads[], writes[], calls[],
              unresolved_callbacks[], attrs[], router
-  fields[]:  { name, type, shared_by }
+  fields[]:  { name, ty, shared_by }
   edges[]:   { from: method_name, to: method_name, kind }
 
 RECIPE (god-impl split survey)
@@ -1257,38 +1331,40 @@ impl Tool for AnalysisDescribe {
                 if language == Some("rust") {
                     return err("analysis.cohesionClusters is Java-only");
                 }
-                ToolResult::Json(json!({ "contract": COHESION_CONTRACT }))
+                analysis_result(json!({ "contract": COHESION_CONTRACT }))
             }
-            "references" => ToolResult::Json(json!({ "contract": REFERENCES_CONTRACT })),
+            "references" => analysis_result(
+                json!({ "contract": if language == Some("rust") { RUST_REFERENCES_CONTRACT } else { REFERENCES_CONTRACT } }),
+            ),
             "fieldClassification" => {
                 if language == Some("rust") {
                     return err("analysis.fieldClassification is Java-only");
                 }
-                ToolResult::Json(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
+                analysis_result(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
             }
             "methodRegions" => {
                 if language == Some("rust") {
                     return err("analysis.methodRegions is Java-only");
                 }
-                ToolResult::Json(json!({ "contract": METHOD_REGIONS_CONTRACT }))
+                analysis_result(json!({ "contract": METHOD_REGIONS_CONTRACT }))
             }
             "fieldInitializerClosure" => {
                 if language == Some("rust") {
                     return err("analysis.fieldInitializerClosure is Java-only");
                 }
-                ToolResult::Json(json!({ "contract": FIELD_INIT_CLOSURE_CONTRACT }))
+                analysis_result(json!({ "contract": FIELD_INIT_CLOSURE_CONTRACT }))
             }
             "implPartition" => {
                 if language == Some("java") {
                     return err("analysis.implPartition is Rust-only");
                 }
-                ToolResult::Json(json!({ "contract": IMPL_PARTITION_CONTRACT }))
+                analysis_result(json!({ "contract": IMPL_PARTITION_CONTRACT }))
             }
             "topLevelDeps" => {
                 if language == Some("java") {
                     return err("analysis.topLevelDeps is Rust-only");
                 }
-                ToolResult::Json(json!({ "contract": TOP_LEVEL_DEPS_CONTRACT }))
+                analysis_result(json!({ "contract": TOP_LEVEL_DEPS_CONTRACT }))
             }
             other => err(format!(
                 "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure, implPartition, topLevelDeps)"
@@ -1321,7 +1397,7 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
             .to_string(),
         declarations: r#"type CohesionCluster = { id: string; name_hint: string; item_names: string[]; move_fields: string[]; score: number; internal_field_touches: number; internal_calls: number; inbound_calls: number; outbound_calls: number; expected_wiring: "delegate" | "callback" | "source_instance" };
 type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method: string; to_method: string };
-type ReferenceExample = { path: string; line: number; column: number; byte_start: number; byte_end: number; context: string; is_test_site: boolean; usage_kind: "type_reference" | "method_invocation" | "field_access" | "method_reference" | "import"; matched_name: string };
+type ReferenceExample = { path: string; line: number; column: number; byte_start?: number; byte_end?: number; context: string; is_test_site: boolean; usage_kind: "type_reference" | "method_invocation" | "field_access" | "method_reference" | "import" | "call" | "type_ref" | "path_ref" | "macro_use"; matched_name: string };
 type FieldAccess = { method?: string; kind: "read" | "write"; line: number; column: number; context: string };
 type FieldClassification = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static_final: boolean; is_mutable_instance: boolean; is_injected: boolean; injection_style?: "field_annotation" | "constructor_param"; is_provider: boolean; reads: number; writes: number; read_by: string[]; written_by: string[]; accesses: FieldAccess[] };
 type ComponentTreeConsumption = { kind: "component_tree_argument" | "component_tree_receiver" | string; method: string; line: number; column: number };
@@ -1338,16 +1414,16 @@ type RustTopLevelCluster = { id: string; items: string[]; reason: string; intern
 declare const analysis: {
   /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. Pass language ("java"|"rust") to filter. */
   describe(args: { analysis: string; language?: "java" | "rust" }): Promise<{ contract: string }>;
-  /** Partition the first Java class's methods into cohesive clusters — the decomposition seams. Pick a high-score cluster and feed item_names/move_fields/expected_wiring into java.extractClass. The Rust-side answer to "what are the real seams"; do not rebuild it from code.query. */
+  /** Partition the first Java class's methods into cohesive clusters — the decomposition seams. Pick a high-score cluster and feed item_names/move_fields into java.extractClass; expected_wiring describes coupling topology, not the extraction wiring argument. The Rust-side answer to "what are the real seams"; do not rebuild it from code.query. */
   cohesionClusters(args: { file: string }): Promise<{ file: string; class: Record<string, unknown>; cluster_count: number; clusters: CohesionCluster[]; cross_cluster_calls: CrossClusterCall[]; provenance: "syntax_only" }>;
   /** Count symbol references across the workspace without returning full capture payloads. Default Java; Rust mode with language:"rust" (usage kinds: call, type_ref, path_ref, macro_use). Use before extraction to decide wrappers:true, distinguish forwarded fields, or estimate production/test blast radius. */
-  references(args: { symbols: string[]; language?: "java" | "rust"; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
+  references(args: { symbols: string[]; language?: "java" | "rust"; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ language?: "rust"; counting_scope?: string; truncated?: boolean; symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
   /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
   /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
   methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; includeNestedStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
   /** Compute transitive field/constant dependency closure for moved fields. For each static final field, finds constants referenced in its initializer and follows the chain transitively. Use before java.extractClass. */
-  fieldInitializerClosure(args: { file: string; fields: string[]; className?: string }): Promise<{ file: string; fields: string[]; closure: Record<string, string[]>; provenance: "syntax_only" }>;
+  fieldInitializerClosure(args: { file: string; fields: string[]; className?: string }): Promise<{ file: string; fields: string[]; closure: Record<string, string[]>; skipped_non_constants: string[]; provenance: "syntax_only" }>;
   /** (rust) Analyze one or more Rust impl blocks, returning a partition graph with per-method field reads/writes/calls, shared fields, and inferred edges. Feed into rust.extractImplMethods. */
   implPartition(args: { file: string; implName?: string; moduleName?: string }): Promise<{ file: string; impl_name: string; methods: RustMethodNode[]; fields: RustFieldNode[]; edges: RustPartitionEdge[]; provenance: "syntax_only" }>;
   /** (rust) Analyze top-level Rust items: dependency graph, external reference hints, and suggested clusters. The pre-extract survey before rust.extractItems. */
@@ -1390,6 +1466,154 @@ mod tests {
             ToolResult::Json(v) => v,
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_project_dir_uses_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("audit_scan")).unwrap();
+        std::fs::write(root.join("audit_scan/source.rs"), "pub fn invoice() {}\n").unwrap();
+        std::fs::write(
+            root.join("audit_scan/caller.rs"),
+            "fn render() { crate::invoice(); }\n",
+        )
+        .unwrap();
+        let result = json_of(
+            AnalysisTopLevelDeps
+                .call(
+                    json!({"file":"audit_scan/source.rs", "projectDir":"audit_scan"}),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        assert!(
+            result["external_references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"] == "audit_scan/caller.rs" && entry["item"] == "invoice"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_references_contract_and_paths_match_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn invoice() {} fn caller() { invoice(); }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+        let result = json_of(
+            AnalysisReferences
+                .call(json!({"symbols":["invoice"],"language":"rust"}), &cx)
+                .await,
+        );
+        assert_eq!(result["files_by_symbol"]["invoice"], json!(["lib.rs"]));
+        assert_eq!(result["examples_by_symbol"]["invoice"][0]["path"], "lib.rs");
+        assert_eq!(result["counts_by_symbol"]["invoice"], 2);
+        assert!(
+            result["counting_scope"]
+                .as_str()
+                .unwrap()
+                .contains("including declarations")
+        );
+        let described = json_of(
+            AnalysisDescribe
+                .call(json!({"analysis":"references","language":"rust"}), &cx)
+                .await,
+        );
+        assert!(
+            described["contract"]
+                .as_str()
+                .unwrap()
+                .contains("Counts include declarations")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_selected_fields_are_not_reported_as_empty_safe_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("Ledger.java"), "class Ledger { static final int BASE=2; static final int TOTAL=BASE+1; final int count=TOTAL; }").unwrap();
+        let cx = cx_in(&root);
+        for tool in [
+            Arc::new(AnalysisFieldInitializerClosure) as Arc<dyn Tool>,
+            Arc::new(AnalysisFieldClassification),
+        ] {
+            let result = tool
+                .call(json!({"file":"Ledger.java","fields":["absent"]}), &cx)
+                .await;
+            assert!(
+                matches!(result, ToolResult::Error(ref message) if message.contains("fields not found")),
+                "{result:?}"
+            );
+        }
+        let result = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({"file":"Ledger.java","fields":["TOTAL","count"]}),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["closure"]["TOTAL"], json!(["BASE"]));
+        assert_eq!(result["skipped_non_constants"], json!(["count"]));
+    }
+
+    #[tokio::test]
+    async fn initializer_closure_does_not_merge_names_across_owner_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("Owners.java"), "class Second { static final int OTHER=2; static final int BASE=OTHER; } class First { static final int BASE=1; static final int VALUE=BASE; }").unwrap();
+        let cx = cx_in(&root);
+        let result = json_of(
+            AnalysisFieldInitializerClosure
+                .call(json!({"file":"Owners.java","fields":["VALUE"]}), &cx)
+                .await,
+        );
+        assert_eq!(result["closure"]["VALUE"], json!(["BASE"]));
+        let ambiguous = AnalysisFieldInitializerClosure
+            .call(json!({"file":"Owners.java","fields":["BASE"]}), &cx)
+            .await;
+        assert!(
+            matches!(ambiguous, ToolResult::Error(ref message) if message.contains("className"))
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_method_reduction_refuses_then_narrowing_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let statements = (0..3000)
+            .map(|index| format!("int value{index} = {index};\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("Ledger.java"),
+            format!("class Ledger {{ void render() {{ {statements} }} }}"),
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+        let result = AnalysisMethodRegions
+            .call(json!({"file":"Ledger.java","method":"render"}), &cx)
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref message) if message.contains("byte limit")),
+            "oversized reduction must fail: {result:?}"
+        );
+        let result = json_of(
+            AnalysisMethodRegions
+                .call(
+                    json!({"file":"Ledger.java","method":"render","statementLimit":1}),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["statement_region_summary"]["returned_count"], 1);
+        assert_eq!(result["statement_region_summary"]["omitted_count"], 2999);
     }
 
     // Two clean concerns sharing no fields → two clusters: a pricing concern
