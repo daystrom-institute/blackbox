@@ -3528,6 +3528,7 @@ struct JavaPullUpPreviewParams {
 
 #[derive(Clone)]
 struct PullUpCandidate {
+    annotations: Vec<String>,
     ref_id: String,
     name: String,
     visibility: Option<String>,
@@ -4509,7 +4510,10 @@ struct JavaPushDownMembersParams {
 
 fn strip_signature_annotations(signature: &str, annotations: &[String]) -> String {
     let mut text = signature.to_owned();
-    let mut annotations = annotations.iter().map(|annotation| annotation.trim()).collect::<Vec<_>>();
+    let mut annotations = annotations
+        .iter()
+        .map(|annotation| annotation.trim())
+        .collect::<Vec<_>>();
     annotations.sort_by_key(|annotation| std::cmp::Reverse(annotation.len()));
     for annotation in annotations {
         if let Some(start) = text.find(annotation) {
@@ -4808,6 +4812,13 @@ fn pullup_candidates_from_preview(value: &Value) -> Vec<PullUpCandidate> {
                 candidate["comment_trivia_span"]["byte_start"].as_u64()? as usize;
             let signature_byte_start = candidate["signature_span"]["byte_start"].as_u64()? as usize;
             Some(PullUpCandidate {
+                annotations: candidate["annotations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
                 ref_id,
                 name,
                 visibility,
@@ -7905,10 +7916,6 @@ fn strip_field_injection_annotations(field: &FieldInjectCandidate, make_final: b
     text
 }
 
-fn line_start(source: &str, pos: usize) -> usize {
-    source[..pos].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
-}
-
 fn field_has_elsewhere_assignment(source: &str, field: &FieldInjectCandidate) -> bool {
     let needles = [
         format!("this.{} =", field.name),
@@ -10893,6 +10900,9 @@ fn move_method_preview_value(
     root: &Path,
     params: &JavaMoveMemberPreviewParams,
 ) -> Result<Value, String> {
+    if params.keep_copy == Some(true) || params.visibility.is_some() || params.target_prelude.is_some() {
+        return Err("java.moveMemberPreview: method moves do not support keepCopy, visibility, or targetPrelude; omit these options for a move preserving visibility, or use explicit edits for a copy".into());
+    }
     if params.member_names.is_empty() {
         return Err("java.moveMemberPreview: memberNames must not be empty".to_string());
     }
@@ -11133,6 +11143,21 @@ impl Tool for JavaMoveMember {
             }
         };
         if normalize_move_member_kind(params.member_kind.as_deref()) == Ok("method") {
+            let preview = JavaMoveMemberPreview.call(json!({
+                "file": params.file, "target": params.target,
+                "memberNames": params.member_names, "memberKind": "method",
+                "keepCopy": params.keep_copy, "visibility": params.visibility,
+                "targetPrelude": params.target_prelude, "targetClassName": params.target_class_name,
+            }), cx).await;
+            let allowed = match preview {
+                ToolResult::Json(value) => value["members"].as_array().into_iter().flatten()
+                    .filter_map(|member| member["ref"].as_str()).map(str::to_owned).collect::<BTreeSet<_>>(),
+                ToolResult::Error(error) => return err(error.replace("java.moveMemberPreview", "java.moveMember")),
+                other => return other,
+            };
+            if params.member_refs.is_empty() || params.member_refs.iter().any(|reference| !allowed.contains(reference)) {
+                return err("java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview with the same memberNames");
+            }
             let push_args = json!({
                 "file": params.file,
                 "target": params.target,
@@ -11159,6 +11184,8 @@ impl Tool for JavaMoveMember {
                     value["title"] = json!("move Java method member");
                     ToolResult::Json(value)
                 }
+                ToolResult::Error(error) => err(error.replace("java.pushDownMembersPreview", "java.moveMemberPreview")
+                    .replace("java.pushDownMembers", "java.moveMember")),
                 other => other,
             };
         }
@@ -11881,7 +11908,8 @@ IMPORTANT LIMITS
   - memberKind:"constant" handles static final constants and can create target.
   - memberKind:"method" handles concrete methods and requires an existing target.
   - remaining source accessors/references are blockers unless acknowledged.
-  - method moves copy imports conservatively; run java.hygiene afterward.
+  - method moves preserve visibility and copy imports conservatively; run java.hygiene afterward.
+  - method moves refuse keepCopy:true, visibility and targetPrelude instead of ignoring them; use explicit edits for those operations.
 
 PARAMS
   file: string
