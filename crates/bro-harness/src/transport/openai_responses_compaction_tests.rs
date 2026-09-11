@@ -240,3 +240,100 @@ async fn remote_compaction_failure_keeps_outputs_removed_from_request_copy() {
     assert_eq!(sent["input"][1], before["input"][1]);
     assert_eq!(sent["input"][3], before["input"][3]);
 }
+
+#[test]
+fn inline_fitting_bounds_tool_outputs_and_honors_summary_output_reservation() {
+    let original = oversized_input();
+    let prefix = original["input"].as_array().unwrap();
+    let params = CompactionParams {
+        tool_render_cap: 100_000,
+        ..params()
+    };
+    let body = inline_request(prefix, params, "preserve constraints", &opts(), Some(1000)).unwrap();
+    let text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("preserve the current request exactly"));
+    assert!(text.contains(OMITTED_OUTPUT));
+    assert!(text.contains("preserve constraints"));
+    assert!(serde_json::to_vec(&body).unwrap().len() <= (1000 - 256) * 4);
+    assert_eq!(original, oversized_input());
+    assert!(
+        inline_request(
+            prefix,
+            CompactionParams {
+                summary_max_tokens: 1000,
+                ..params
+            },
+            "summarize",
+            &opts(),
+            Some(1000)
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn oversized_inline_user_context_is_rejected_before_http_without_mutation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut tx = transport(
+        format!("http://{}/responses", listener.local_addr().unwrap()),
+        false,
+    );
+    tx.state.input[0]["content"][0]["text"] = json!("protected user context ".repeat(120_000));
+    let before = tx.snapshot();
+    let options = opts();
+    tokio::select! {
+        result = tx.compact(params(), "summarize", &[], &options) => {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("estimated context budget"), "{error:#}");
+        }
+        _ = listener.accept() => panic!("oversized protected summary input reached HTTP"),
+    }
+    assert_eq!(tx.snapshot(), before);
+}
+
+#[tokio::test]
+async fn inline_fitted_request_preserves_tail_and_rolls_back_failed_summary() {
+    for success in [false, true] {
+        let mut body = event(
+            json!({"type":"response.output_text.delta", "delta":"<summary>durable</summary>"}),
+        );
+        if success {
+            body.push_str(&event(
+                json!({"type":"response.completed", "response":{"status":"completed"}}),
+            ));
+        }
+        let (url, request) = server(body, "text/event-stream").await;
+        let mut tx = transport(url, false);
+        tx.state.input[2] =
+            json!({"type":"function_call", "call_id":"large", "name":"read", "arguments":"{}"});
+        tx.state.input[3] = json!({"type":"function_call_output", "call_id":"large", "output":"large tool output ".repeat(120_000)});
+        let before = tx.snapshot();
+        let result = tx
+            .compact(
+                CompactionParams {
+                    tool_render_cap: 4_000_000,
+                    ..params()
+                },
+                "summarize",
+                &[],
+                &opts(),
+            )
+            .await;
+        if success {
+            assert_eq!(result.unwrap().as_deref(), Some("durable"));
+            assert_eq!(
+                tx.state.input.last(),
+                before["input"].as_array().unwrap().last()
+            );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(tx.snapshot(), before);
+        }
+        let sent = request.await.unwrap();
+        let text = sent["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(OMITTED_OUTPUT));
+        assert!(text.contains("turn 0"));
+        assert!(!text.contains("large tool output large tool output"));
+        assert!(serde_json::to_vec(&sent).unwrap().len() < 10_000);
+    }
+}

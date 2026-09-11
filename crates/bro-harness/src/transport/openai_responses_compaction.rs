@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::transport::{CompactionParams, TurnOpts};
 
 pub(super) async fn collect_summary(response: reqwest::Response) -> Result<String> {
     let mut stream = response.bytes_stream();
@@ -100,6 +102,72 @@ pub(super) fn validate_output(response: Value) -> Result<(Vec<Value>, String)> {
     Ok((output.clone(), summary))
 }
 
+const SUMMARY_SYSTEM: &str = "You summarize coding-agent conversations precisely and completely.";
+
+/// Fit the API-key summarizer before any HTTP request. First honor the existing
+/// per-output rendering cap. If the rendered request still exceeds the window,
+/// fit a structured copy so only tool outputs can be replaced. A final check
+/// includes the exact rendered transcript, directive and output reservation.
+pub(super) fn inline_request(
+    input: &[Value],
+    params: CompactionParams,
+    instruction: &str,
+    opts: &TurnOpts,
+    window: Option<u64>,
+) -> Result<Value> {
+    let render = |input: &[Value]| {
+        let transcript =
+            super::responses_common::render_responses_transcript(input, params.tool_render_cap);
+        json!({
+            "model": opts.model,
+            "input": [{"type":"message", "role":"user", "content":[{
+                "type":"input_text", "text":format!("{transcript}\n\n---\n{instruction}")
+            }]}],
+            "instructions": SUMMARY_SYSTEM,
+            "max_output_tokens": params.summary_max_tokens,
+            "stream": true,
+            "store": false,
+        })
+    };
+    let body = render(input);
+    if let Ok(fitted) = fit_input(body, window) {
+        return Ok(fitted);
+    }
+    let mut prefix = input.to_vec();
+    for item in &mut prefix {
+        if matches!(
+            item["type"].as_str(),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) {
+            // Match the plaintext renderer exactly, including its treatment of
+            // non-text outputs, without modifying the persisted native items.
+            item["output"] = Value::String(super::super::truncate(
+                item["output"].as_str().unwrap_or(""),
+                params.tool_render_cap,
+            ));
+        }
+    }
+    let fitted = fit_input(
+        json!({
+            "model": opts.model,
+            "input": prefix,
+            "instructions": format!("{SUMMARY_SYSTEM}\n\n---\n{instruction}"),
+            "max_output_tokens": params.summary_max_tokens,
+            "stream": true,
+            "store": false,
+        }),
+        window,
+    )?;
+    fit_input(
+        render(
+            fitted["input"]
+                .as_array()
+                .context("fitted prefix missing input")?,
+        ),
+        window,
+    )
+}
+
 const OMITTED_OUTPUT: &str = "[Tool output omitted to fit the compaction request context window. The original output remains in the session transcript.]";
 
 /// Match the harness's approximate four-bytes-per-token accounting, including
@@ -110,7 +178,8 @@ pub(super) fn fit_input(mut body: Value, window: Option<u64>) -> Result<Value> {
     let Some(window) = window else {
         return Ok(body);
     };
-    let budget = window.saturating_sub(8192.min(window / 4));
+    let output_reservation = body["max_output_tokens"].as_u64().unwrap_or_default();
+    let budget = window.saturating_sub(8192.min(window / 4).max(output_reservation));
     let mut bytes = serde_json::to_vec(&body)?.len() as u64;
     let byte_budget = budget.saturating_mul(4);
     if bytes <= byte_budget {
