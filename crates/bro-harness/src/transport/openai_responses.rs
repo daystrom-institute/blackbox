@@ -278,25 +278,8 @@ impl OpenAiResponsesTransport {
         }
     }
 
-    /// One-shot summarization over `transcript` for compaction (always HTTP).
-    async fn summarize_text(
-        &self,
-        transcript: &str,
-        instruction: &str,
-        max_tokens: u32,
-        opts: &TurnOpts,
-    ) -> Result<String> {
-        let body = json!({
-            "model": opts.model,
-            "input": [{
-                "type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": format!("{transcript}\n\n---\n{instruction}")}],
-            }],
-            "instructions": "You summarize coding-agent conversations precisely and completely.",
-            "max_output_tokens": max_tokens,
-            "stream": true,
-            "store": false,
-        });
+    /// One-shot summarization using an already fitted request (always HTTP).
+    async fn summarize_text(&self, body: Value) -> Result<String> {
         let resp = super::http::send_with_retry("openai-responses/compact", || {
             self.apply_headers(self.http.post(&self.http_endpoint))
                 .json(&body)
@@ -501,13 +484,15 @@ impl Transport for OpenAiResponsesTransport {
         let Some(split) = responses_common::responses_split(&self.state.input, limit) else {
             return Ok(None);
         };
-        let transcript = responses_common::render_responses_transcript(
+        let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
+        let body = compaction::inline_request(
             &self.state.input[..split],
-            params.tool_render_cap,
-        );
-        let summary = self
-            .summarize_text(&transcript, instruction, params.summary_max_tokens, opts)
-            .await?;
+            params,
+            instruction,
+            opts,
+            window,
+        )?;
+        let summary = self.summarize_text(body).await?;
         let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
         rebuilt.push(json!({
             "type": "message",
