@@ -15,7 +15,8 @@ history, and invalidate context delivery after compaction. At the reviewed basel
 did not apply those contracts consistently across startup, resume, manual
 compaction, model changes and the three transports. The highest priority is
 history integrity and reliable request accounting, followed by context placement
-and modern Responses features.
+and modern Responses features. The [repair follow-up](#repair-follow-up) records
+subsequent implementation and validation.
 
 This review follows the earlier [loop audit](model-facing-audit/loop.md) and
 [repair plan](model-facing-tools-repair-plan.md). It checks the current code after
@@ -358,6 +359,21 @@ historical source anchors or claim parity with every newer Codex feature.
 
 Implementation roots in this table are relative to `crates/bro-harness/src/`.
 Tracked repairs: `gap-6bc48000`, `gap-edc4bc5e`, `gap-75da1a30`.
+
+Validation uses source revision `5c4ae748` in the warm Linux lane. The final
+`cargo nextest run --workspace --profile full -j 8 --no-fail-fast --retries 1`
+passes 7,009 tests with no retries required (19 ignored/skipped), in 245.6 seconds.
+The focused loop/lifecycle suite passes 103 tests. Two unrelated migration-lock
+tests exceeded their three-second deadlines in a default-concurrency rerun;
+both pass in isolation and in this final full run. The final gate saved its log
+and exit status inside the lane to survive intermittent exec-connection loss.
+Workspace formatting,
+`cargo clippy --workspace`, and concurrency lint pass (108 handlers checked).
+The expanded `--all-targets` Clippy check remains blocked by pre-existing test
+lints in unchanged files: disallowed synchronous filesystem calls in
+`crates/fleetd/src/workspace.rs`, and ignored socket-read counts in the Anthropic
+and Chat Completions transport fixtures. These are separate from the required
+workspace Clippy gate.
 
 Request projection and compaction fitting use an approximate UTF-8 byte model,
 with measured input as a separate floor. They are not tokenizer-exact capacity

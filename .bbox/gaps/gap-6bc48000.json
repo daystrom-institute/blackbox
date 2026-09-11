@@ -14,8 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/context-delivery-role-and-clear",
   "notes": "Source audit at 7a20a8f8 against Codex 242c5ce0. Startup uses the typed instruction ledger while older placement tests populate user_instructions manually. Explicit --dispatch-context '{}' clears emitted baselines but keeps restored provider history. See design/bro-harness/agent-loop-context-audit-2026-09-11.md. No runtime reproduction or fixes claimed.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-11T15:49:54Z",
-  "updated_at": "2026-09-11T15:49:54Z"
+  "updated_at": "2026-09-11T16:29:16Z",
+  "resolved_at": "2026-09-11T16:29:16Z",
+  "resolution_note": "Addressed in the agent-loop repair campaign through 5c4ae748. Typed instruction delivery precedes tasks and follows the provider strategy; explicit dispatch clearing retains baselines until revocations are emitted; AGENTS.override precedence and dynamic replacement are implemented. Startup, resume, compaction, removal and immutable-generation regressions pass in the lane. See design/bro-harness/agent-loop-context-audit-2026-09-11.md repair follow-up."
 }

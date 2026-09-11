@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/context-budget-and-reasoning-replay",
   "notes": "Manual compaction leaves old counters; resume initializes both to zero. The gpt-5* 400k default conflicts with the pinned Codex gpt-5.5 272k catalog entry. Responses include reasoning.encrypted_content is conditional on --effort, and effort is absent from saved session fields. See design/bro-harness/agent-loop-context-audit-2026-09-11.md; catalog comparison is not a live backend capacity measurement.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-11T15:49:54Z",
-  "updated_at": "2026-09-11T15:49:54Z"
+  "updated_at": "2026-09-11T16:29:16Z",
+  "resolved_at": "2026-09-11T16:29:16Z",
+  "resolution_note": "Addressed in the agent-loop repair campaign through 5c4ae748. Complete request projection includes retained output, native history, current instructions/schemas, ambient additions and user hooks. History-aligned budget checkpoints survive actual save/build/reopen, legacy history is estimated, and successful compaction resets accounting. Fresh tasks/steers remain staged across proactive compaction. Explicit known-model windows replace the broad GPT-5 default; encrypted reasoning retrieval is unconditional and effort persists with CLI override support. Focused lifecycle and request-shape regressions pass; token estimates are not exact tokenizer guarantees."
 }
