@@ -28,6 +28,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness context follows provider placement before tasks, preserves explicit
+  scope and pin removals, and honors project AGENTS override precedence. Request
+  budgeting includes retained output and current instructions/tools, survives
+  resume, and resets after compaction. Responses compaction validates completion
+  and fits disposable input; model downshifts compact with the previous model.
+  Known model windows and persisted reasoning effort follow the current catalog.
+
 - Responses completion accepts metadata-only terminal events with empty output
   after completed streamed items. Unfinished calls and contradictory nonempty
   terminal snapshots still fail before dispatch.

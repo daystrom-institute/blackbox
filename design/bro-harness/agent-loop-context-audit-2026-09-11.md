@@ -1,7 +1,7 @@
 ---
 title: "Agent loop context and compaction audit against current Codex"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic: [bro-harness, agent-loop, context-management, compaction, audit]
 brief: "Source-grounded review of initial context, ambient updates, compaction and context efficiency at Blackbox 7a20a8f8 versus Codex 242c5ce0. Identifies repair contracts, regression scenarios and reference mechanisms worth adopting."
@@ -11,8 +11,8 @@ brief: "Source-grounded review of initial context, ambient updates, compaction a
 
 The broad architecture is sound: separate stable instructions from conversation,
 deliver changed context rather than repeating everything, preserve native tool
-history, and invalidate context delivery after compaction. The implementation
-does not yet apply those contracts consistently across startup, resume, manual
+history, and invalidate context delivery after compaction. At the reviewed baseline, the implementation
+did not apply those contracts consistently across startup, resume, manual
 compaction, model changes and the three transports. The highest priority is
 history integrity and reliable request accounting, followed by context placement
 and modern Responses features.
@@ -32,8 +32,8 @@ Reviewed on 2026-09-11:
 
 All numbered findings are confirmed control-flow or request-shape observations
 from these snapshots. Backend-dependent consequences are identified explicitly.
-Existing tests were inspected, not rerun. No builds, live model requests, service
-changes or runtime repairs were performed. Reproduction cases below are proposed
+During the original audit, existing tests were inspected, not rerun. No builds,
+live model requests, service changes or runtime repairs were performed. Reproduction cases below are proposed
 regression tests, not claims of executed probes. Compaction/efficiency paths were
 reviewed separately; initial-context and explicit-clear findings received an
 independent source cross-check.
@@ -340,6 +340,33 @@ is the desired contract, then implement candidate selection in startup and
 dynamic discovery together. Test both files present, override only, nested
 overrides, and removal between requests. Preserve explicit alternate-doc
 configuration as an intentional feature.
+
+## Repair follow-up
+
+The numbered findings above remain evidence about the pinned baseline. The
+follow-up implementation addresses F1 through F11; it does not change those
+historical source anchors or claim parity with every newer Codex feature.
+
+| Findings | Implemented contract | Regression evidence |
+| --- | --- | --- |
+| F1, F2 | Responses replacement commits only after terminal success and validated summary structure; failures preserve native history. | `transport/openai_responses_compaction_tests.rs`: truncated, failed, incomplete and malformed SSE; invalid unary summaries; successful aliases; rollback. |
+| F3, F4, F11 | Typed instructions use provider-specific placement before tasks; explicit clear emits revocations; project discovery selects override before AGENTS and reselects on refresh. | `agent_loop.rs`, `context/dispatch.rs`, `project_doc.rs`: startup, updates, removal, resume, compaction and generation isolation. |
+| F5, F6 | Request projection includes retained output, native history, fresh instructions, activated schemas, ambient additions and hook directives. Occupancy checkpoints persist with history; compaction resets them. | `context/budget.rs`, `agent_loop/tests/budget.rs`, `session_startup_tests.rs`: request ordering, schema/document growth, manual reset and actual save/build/reopen. |
+| F7, F8 | Explicit known model windows replace the broad GPT-5 assumption. Encrypted reasoning retrieval is independent of explicit effort; effort survives resume and CLI override. | `compaction.rs`, `transport/responses_common.rs`, `session_startup_tests.rs`. |
+| F9 | Both Responses compaction paths fit disposable input, preserve protected history and validate the rendered request before sending. | `transport/openai_responses_compaction_tests.rs`: paired tool-output fitting, protected-content refusal before HTTP and failed-summary rollback. |
+| F10 | Live and resumed downshifts refresh context, compact using the previous model, check destination occupancy and checkpoint rejection under the retained model. | `agent_loop/tests/budget.rs`, `session_startup_tests.rs`: previous-model ordering, instruction growth and successful/failed transitions. |
+
+Implementation roots in this table are relative to `crates/bro-harness/src/`.
+Tracked repairs: `gap-6bc48000`, `gap-edc4bc5e`, `gap-75da1a30`.
+
+Request projection and compaction fitting use an approximate UTF-8 byte model,
+with measured input as a separate floor. They are not tokenizer-exact capacity
+guarantees, particularly for images and opaque reasoning. Ordinary inference
+keeps a bounded proactive attempt and one reactive overflow recovery. Protected
+instructions or schemas can still exceed capacity, and unknown model capacities
+remain provider-validated. No live provider capacity or deployed-binary claim is
+made. Codex V2 compaction, compatibility hashes and native discovery remain
+separate adoption work described below.
 
 ## Codex mechanisms worth adopting
 

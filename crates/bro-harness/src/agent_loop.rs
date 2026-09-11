@@ -1341,6 +1341,8 @@ impl Session {
             && previous_window > window
         {
             self.reg.validate_resume_tool_schemas()?;
+            self.deliver_instruction_context().await?;
+            self.prepare_context_for_user_turn();
             let tools = self.reg.wire_specs();
             let opts = TurnOpts {
                 system: compose_system(
@@ -1350,6 +1352,8 @@ impl Session {
                 ),
                 ..self.base_opts.clone()
             };
+            let added = self.tx.prepare_request_context(&opts);
+            self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
             let projected = self.projected_request_tokens(&tools, &opts);
             let limit = next_threshold
                 .unwrap_or(window)
@@ -1504,6 +1508,7 @@ impl Session {
         self.reg.validate_resume_tool_schemas()?;
         self.cx.cancellation = tokio_util::sync::CancellationToken::new();
         let mut pending_prompt = Some(prompt);
+        self.observe_user_turn(prompt);
         let prompt_estimate = est_tokens(prompt);
         let mut request_overhead_tokens = self.last_request_overhead_tokens;
 
@@ -1547,6 +1552,7 @@ impl Session {
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
             let mut proactive_checked = false;
+            let mut proactive_compacted = false;
             let out = 'attempt: loop {
                 self.deliver_instruction_context().await?;
                 if pending_prompt.is_some() || self.reference_context_item.is_none() {
@@ -1629,6 +1635,7 @@ impl Session {
                             Ok(Some(summary)) => {
                                 self.emitter
                                     .compact_boundary("auto", projected, summary.len());
+                                proactive_compacted = true;
                                 self.reset_compaction_context();
                                 continue 'attempt;
                             }
@@ -1648,13 +1655,16 @@ impl Session {
                             "content": [{"type": "text", "text": prompt}],
                         },
                     }));
-                    self.push_user_text_raw(prompt);
+                    self.append_user_text_raw(prompt);
                 }
                 self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
                     .await?;
                 // A queued manual compaction invalidates the context/options
                 // assembled above. Restore current instructions before sampling.
-                if self.reference_context_item.is_none() {
+                if self.reference_context_item.is_none() || self.tail_nudge.is_some() {
+                    // Queued inputs can fire hooks after initial task insertion.
+                    // Capture and budget those directives before this request.
+                    proactive_checked = proactive_compacted;
                     continue 'attempt;
                 }
                 self.tx.normalize_for_prompt();
@@ -2101,7 +2111,7 @@ impl Session {
                 "message":{"role":"user", "content":[{"type":"text", "text":prompt}]},
             }));
             self.prepare_context_for_user_turn();
-            self.push_user_text_raw(prompt);
+            self.append_user_text_raw(prompt);
         }
 
         // An interrupted turn (cancelled model call, or cancelled tool dispatch)
@@ -2264,10 +2274,18 @@ impl Session {
     }
 
     fn push_user_text_raw(&mut self, prompt: &str) {
+        self.append_user_text_raw(prompt);
+        self.observe_user_turn(prompt);
+    }
+
+    fn append_user_text_raw(&mut self, prompt: &str) {
         self.tx.push_user_text(prompt);
         self.pending_input_estimate = self
             .pending_input_estimate
             .saturating_add(est_tokens(prompt));
+    }
+
+    fn observe_user_turn(&mut self, prompt: &str) {
         for n in self.hooks.on_user_turn(prompt) {
             if n.delivery == Delivery::SystemTail {
                 self.tail_nudge = Some(n.message);
@@ -3059,7 +3077,7 @@ fn env_u64(key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    include!("agent_loop_budget_tests.rs");
+    mod budget;
     use super::*;
 
     #[test]

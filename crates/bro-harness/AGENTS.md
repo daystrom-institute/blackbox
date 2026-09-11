@@ -63,6 +63,16 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
 
 ## Session + loop model
 
+- Next-request budgeting is separate from measured input telemetry. Persist the
+  measured input, retained-output/appended estimate and request-overhead baseline
+  atomically with native history; legacy snapshots require a history estimate.
+  Refresh typed context and user hooks before estimating. Responses ambient
+  additions are history, so a changed equal-size manifest still costs tokens.
+  A successful compaction invalidates both accounting and delivery baselines.
+- A smaller model is selected only after current context is accounted for and
+  any required compaction succeeds using the previous model. Rejected controls
+  still checkpoint cancellation outcomes and retain the previous selection.
+
 - One `user_turn` = one model conversation turn, possibly many model steps
   (tool loop). Mid-turn operator inputs queue and are injected at the next
   model-call boundary inside the same turn; leftovers become new pending
