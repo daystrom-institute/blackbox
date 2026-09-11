@@ -3059,6 +3059,7 @@ fn env_u64(key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    include!("agent_loop_budget_tests.rs");
     use super::*;
 
     #[test]
