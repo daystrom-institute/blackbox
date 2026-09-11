@@ -1,11 +1,12 @@
-//! Codex-equivalent AGENTS.md overlay discovery.
+//! Scoped filesystem instruction discovery and delivery receipts.
 //!
-//! When the harness is launched WITHOUT a `--system-prompt` override — the flag
-//! is *absent*, not the empty-string suppress sentinel — it builds its base
-//! system prompt the same way Codex assembles project docs: a global
+//! An absent `--system-prompt` enables startup discovery. Provider composition
+//! decides whether those instructions enter user context or the leading system
+//! section. Discovery assembles a global
 //! `$CODEX_HOME/AGENTS.md` (+ `AGENTS.override.md`) followed by the repo's
 //! project instruction docs walked from the git root down to the cwd. The
-//! default project instruction doc is `AGENTS.md`; sandbox/beta sessions can set
+//! default project candidates are `AGENTS.override.md`, then `AGENTS.md`, with
+//! one selected file per directory. Sandbox/beta sessions can set
 //! `BRO_HARNESS_PROJECT_DOC_FILES=AGENTS_BETA.md` to load a different repo doc
 //! without changing global Codex instructions.
 //!
@@ -43,7 +44,26 @@ fn project_doc_files() -> Vec<String> {
         .as_deref()
         .map(parse_project_doc_files)
         .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| vec![AGENTS_FILE.to_string()])
+        .unwrap_or_else(default_project_doc_files)
+}
+
+fn default_project_doc_files() -> Vec<String> {
+    vec![AGENTS_OVERRIDE_FILE.to_string(), AGENTS_FILE.to_string()]
+}
+
+// Called during startup or on the instruction ledger's blocking executor.
+#[allow(clippy::disallowed_methods)]
+fn selected_project_doc(directory: &Path, names: &[String]) -> std::io::Result<Option<PathBuf>> {
+    for name in names {
+        let candidate = directory.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 fn parse_project_doc_files(raw: &str) -> Vec<String> {
@@ -101,11 +121,8 @@ fn project_agents_paths(cwd: &Path, names: &[String]) -> Vec<PathBuf> {
     };
     let mut chain: Vec<PathBuf> = Vec::new();
     for dir in dirs {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                chain.push(candidate);
-            }
+        if let Ok(Some(candidate)) = selected_project_doc(&dir, names) {
+            chain.push(candidate);
         }
     }
     chain
@@ -457,11 +474,23 @@ pub(crate) struct ScopedProjectDocs {
 
 impl Default for ScopedProjectDocs {
     fn default() -> Self {
-        Self::with_names(PathBuf::from("/"), None, vec![AGENTS_FILE.into()])
+        Self::with_names(PathBuf::from("/"), None, default_project_doc_files())
     }
 }
 
 impl ScopedProjectDocs {
+    /// Apply the same startup discovery/suppression contract to every session.
+    pub(crate) fn for_session(root: PathBuf, system_prompt: Option<&str>) -> Self {
+        let startup = system_prompt.is_none().then(|| discover(&root)).flatten();
+        let docs = Self::new(root, startup.as_ref());
+        if system_prompt.is_some() {
+            docs.suppress_startup_discovery();
+        } else {
+            docs.enroll_global_candidates();
+        }
+        docs
+    }
+
     pub(crate) fn new(root: PathBuf, startup: Option<&ProjectDocOverlay>) -> Self {
         Self::with_names(root, startup, project_doc_files())
     }
@@ -520,6 +549,27 @@ impl ScopedProjectDocs {
             documents,
             occurrences: pending.iter().map(|active| active.occurrence).collect(),
         })
+    }
+
+    /// A replacement system section needs all current versions, including
+    /// explicit revocations, rather than only the newly changed documents.
+    pub(crate) fn snapshot_batch(&self, generation: u64) -> InstructionBatch {
+        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let documents: Vec<_> = ledger
+            .active
+            .iter()
+            .map(|active| active.document.clone())
+            .collect();
+        InstructionBatch {
+            generation,
+            text: render_instruction_documents(&documents),
+            documents,
+            occurrences: ledger
+                .active
+                .iter()
+                .map(|active| active.occurrence)
+                .collect(),
+        }
     }
 
     pub(crate) fn acknowledge(&self, batch: &InstructionBatch) {
@@ -631,19 +681,41 @@ impl ScopedProjectDocs {
     fn refresh_blocking(&self, ledger: &mut InstructionLedger) -> Result<(), String> {
         let root = canonical_existing_ancestor(&self.root)?;
         let mut origins = ledger.explicit_origins.clone();
+        let mut directories = std::collections::BTreeSet::new();
         for path in &ledger.observed_paths {
             let canonical = canonical_existing_ancestor(path)?;
             for touched in [path, &canonical] {
-                for directory in instruction_ancestry(&root, touched) {
-                    for name in &self.names {
-                        origins.insert((directory.join(name), directory.clone()));
+                directories.extend(instruction_ancestry(&root, touched));
+            }
+        }
+        // Restored origins preserve previously visited scopes, but project
+        // candidates must be selected again: an override can appear or vanish.
+        for active in &ledger.active {
+            for origin in &active.origins {
+                if ledger
+                    .explicit_origins
+                    .contains(&(origin.clone(), active.document.scope.clone()))
+                {
+                    continue;
+                }
+                if origin
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| self.names.iter().any(|candidate| candidate == name))
+                {
+                    if let Some(directory) = origin.parent() {
+                        directories.insert(directory.to_path_buf());
                     }
+                } else {
+                    origins.insert((origin.clone(), active.document.scope.clone()));
                 }
             }
         }
-        for active in &ledger.active {
-            for origin in &active.origins {
-                origins.insert((origin.clone(), active.document.scope.clone()));
+        for directory in directories {
+            if let Some(candidate) = selected_project_doc(&directory, &self.names)
+                .map_err(|error| format!("{}: {error}", directory.display()))?
+            {
+                origins.insert((candidate, directory));
             }
         }
         let mut documents = Vec::new();
@@ -757,7 +829,7 @@ fn render_instruction_documents(documents: &[InstructionDocument]) -> String {
         if document.revoked { "This document no longer applies to this scope; revoke its previously delivered instructions." } else { &document.body }
     )).collect::<Vec<_>>().join("\n\n");
     format!(
-        "{RIDER_OPEN}\nHost-discovered instructions apply to the named scopes. These exact document versions are authoritative user context.\n\n{sections}\n{RIDER_CLOSE}"
+        "{RIDER_OPEN}\nHost-discovered instructions apply to the named scopes. These exact document versions are authoritative instructions.\n\n{sections}\n{RIDER_CLOSE}"
     )
 }
 
@@ -897,7 +969,7 @@ mod tests {
     }
 
     fn default_docs() -> Vec<String> {
-        vec![AGENTS_FILE.to_string()]
+        default_project_doc_files()
     }
 
     fn assemble_default(
@@ -1039,6 +1111,159 @@ mod tests {
         assert!(out.contains("BETA-DOC"));
         assert!(!out.contains("NORMAL-DOC"));
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn startup_selects_one_project_candidate_per_directory_and_keeps_global_additive() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let home = root.join("home");
+        write(&project.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&project.join("AGENTS.md"), "SHADOWED_ROOT");
+        write(&project.join("AGENTS.override.md"), "ROOT_OVERRIDE");
+        write(&project.join("child/AGENTS.override.md"), "CHILD_OVERRIDE");
+        write(&home.join("AGENTS.md"), "GLOBAL_BASE");
+        write(&home.join("AGENTS.override.md"), "GLOBAL_ADDITION");
+        let overlay = assemble(
+            &project.join("child"),
+            Some(&home),
+            &default_docs(),
+            usize::MAX,
+        )
+        .unwrap();
+        let bodies: Vec<_> = overlay
+            .documents
+            .iter()
+            .map(|document| document.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "GLOBAL_BASE",
+                "GLOBAL_ADDITION",
+                "ROOT_OVERRIDE",
+                "CHILD_OVERRIDE"
+            ]
+        );
+
+        // Explicit alternate filenames replace the default candidate list.
+        write(&project.join("RULES_PRIMARY.md"), "PRIMARY");
+        write(&project.join("RULES_FALLBACK.md"), "FALLBACK");
+        let names = vec!["RULES_PRIMARY.md".into(), "RULES_FALLBACK.md".into()];
+        let overlay = assemble(&project, None, &names, usize::MAX).unwrap();
+        assert_eq!(overlay.documents.len(), 1);
+        assert_eq!(overlay.documents[0].body, "PRIMARY");
+    }
+
+    #[tokio::test]
+    async fn override_appearance_and_removal_revoke_prior_candidates_and_gate_effects() {
+        use bro_tools::{InstructionAccess, InstructionPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&root.join("AGENTS.md"), "BASE_RULE");
+        write(&root.join("child/AGENTS.md"), "CHILD_BASE_RULE");
+        let startup = assemble(&root.join("child"), None, &default_docs(), usize::MAX).unwrap();
+        let ledger =
+            ScopedProjectDocs::with_names(root.join("child"), Some(&startup), default_docs());
+        ledger.refresh().await.unwrap();
+        let initial = ledger.pending_batch(1).unwrap();
+        assert_eq!(initial.documents.len(), 2);
+        ledger.acknowledge(&initial);
+        let target = root.join("child/value.txt");
+        ledger
+            .check(request(target.clone(), InstructionAccess::Mutate), 1)
+            .await
+            .unwrap();
+
+        write(&root.join("AGENTS.override.md"), "OVERRIDE_RULE");
+        assert!(
+            ledger
+                .check(request(target.clone(), InstructionAccess::Mutate), 1)
+                .await
+                .is_err()
+        );
+        let replacement = ledger.pending_batch(2).unwrap();
+        assert!(
+            replacement
+                .documents
+                .iter()
+                .any(|doc| doc.path == root.join("AGENTS.md") && doc.revoked)
+        );
+        assert!(
+            replacement
+                .documents
+                .iter()
+                .any(|doc| doc.body == "OVERRIDE_RULE" && !doc.revoked)
+        );
+        assert!(
+            !replacement
+                .documents
+                .iter()
+                .any(|doc| doc.body == "CHILD_BASE_RULE")
+        );
+        ledger.acknowledge(&replacement);
+        ledger
+            .check(request(target.clone(), InstructionAccess::Mutate), 2)
+            .await
+            .unwrap();
+        ledger.refresh().await.unwrap();
+        assert!(
+            ledger.pending_batch(3).is_none(),
+            "old origin must not revive the shadowed candidate"
+        );
+
+        fs::remove_file(root.join("AGENTS.override.md")).unwrap();
+        assert!(
+            ledger
+                .check(request(target.clone(), InstructionAccess::Mutate), 2)
+                .await
+                .is_err()
+        );
+        let fallback = ledger.pending_batch(3).unwrap();
+        assert!(
+            fallback
+                .documents
+                .iter()
+                .any(|doc| doc.path == root.join("AGENTS.override.md") && doc.revoked)
+        );
+        assert!(
+            fallback
+                .documents
+                .iter()
+                .any(|doc| doc.body == "BASE_RULE" && !doc.revoked)
+        );
+        ledger.acknowledge(&fallback);
+        ledger
+            .check(request(target, InstructionAccess::Mutate), 3)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshing_global_override_preserves_additive_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let home = root.join("home");
+        fs::create_dir(&project).unwrap();
+        write(&home.join("AGENTS.md"), "GLOBAL_BASE");
+        write(&home.join("AGENTS.override.md"), "GLOBAL_ADDITION");
+        let startup = assemble(&project, Some(&home), &default_docs(), usize::MAX).unwrap();
+        let ledger = ScopedProjectDocs::with_names(project.clone(), Some(&startup), default_docs());
+        ledger.enroll_global_candidates_at(&home);
+        ledger.refresh().await.unwrap();
+        let batch = ledger.pending_batch(1).unwrap();
+        assert_eq!(batch.documents.len(), 2);
+        assert!(
+            batch
+                .documents
+                .iter()
+                .all(|doc| doc.scope == project && !doc.revoked)
+        );
+        assert!(batch.text.contains("GLOBAL_BASE"));
+        assert!(batch.text.contains("GLOBAL_ADDITION"));
     }
 
     #[test]
