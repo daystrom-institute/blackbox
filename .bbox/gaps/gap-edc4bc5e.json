@@ -1,0 +1,21 @@
+{
+  "id": "gap-edc4bc5e",
+  "title": "Compaction replacement lacks complete-result validation and overflow fit guarantees",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Commit replacement history only after validated successful summary completion, fit compaction input to the active model, and compact with the previous model before a context-window downshift when necessary.",
+  "evidence": [
+    "crates/bro-harness/src/transport/openai_responses.rs:309",
+    "crates/bro-harness/src/transport/openai_responses.rs:415",
+    "crates/bro-harness/src/transport/openai_responses.rs:539",
+    "crates/bro-harness/src/agent_loop.rs:1273"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/compaction-transaction-and-fit",
+  "notes": "API-key summary parser accepts accumulated text after clean EOF or an ignored failure event. OAuth remote path accepts arbitrary nonempty output without requiring a summary. Oversized history is sent unchanged to remote compaction. Source-confirmed branches, not live backend failures. See design/bro-harness/agent-loop-context-audit-2026-09-11.md.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-11T15:49:54Z",
+  "updated_at": "2026-09-11T15:49:54Z"
+}
