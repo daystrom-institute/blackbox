@@ -12,6 +12,7 @@ struct Boundary {
 struct BudgetTransport {
     history: Vec<Value>,
     usage: VecDeque<Usage>,
+    first_call: Option<transport::ToolCall>,
     boundaries: Arc<Mutex<Vec<Boundary>>>,
     fail_compaction: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -65,12 +66,21 @@ impl Transport for BudgetTransport {
             self.history.push(json!({"type":"reasoning", "encrypted_content":"x".repeat(usage.output_tokens as usize * 4)}));
         }
         self.history.push(json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}));
+        let tool_calls: Vec<_> = self.first_call.take().into_iter().collect();
+        for call in &tool_calls {
+            self.history.push(json!({"type":"function_call", "call_id":call.id, "name":call.name, "arguments":call.args.to_string()}));
+        }
+        let stop = if tool_calls.is_empty() {
+            StopReason::Done
+        } else {
+            StopReason::ToolCalls
+        };
         Ok(transport::TurnOutput {
             observation_content: None,
             text: "done".into(),
             thinking: String::new(),
-            tool_calls: vec![],
-            stop: StopReason::Done,
+            tool_calls,
+            stop,
             end_turn: None,
             usage,
         })
@@ -114,6 +124,7 @@ fn probe(
     session.tx = Box::new(BudgetTransport {
         history: vec![],
         usage: usage.into(),
+        first_call: None,
         boundaries: boundaries.clone(),
         fail_compaction: fail.clone(),
     });
@@ -408,6 +419,13 @@ async fn task_and_queued_steer_hooks_are_budgeted_in_the_first_request() {
                 .unwrap()
                 .contains("HOOK_DIRECTIVE")
         );
+        let final_history = events[1].history.to_string();
+        assert!(final_history.contains("trigger"));
+        assert!(!events[0].history.to_string().contains("trigger"));
+        if queued {
+            assert!(final_history.contains("first task"));
+            assert!(!events[0].history.to_string().contains("first task"));
+        }
     }
 }
 
@@ -469,4 +487,75 @@ async fn downshift_rejects_oversized_post_compaction_context_and_checkpoints_old
     assert_eq!(saved["model"], "fixture-large-window");
     assert!(saved["snapshot"].to_string().contains("Prior work summary"));
     assert_eq!(saved["side"]["pending_user_inputs"][0], "pending task");
+}
+
+#[tokio::test]
+async fn steer_arriving_during_tool_execution_survives_compaction_before_sampling() {
+    struct Enqueue(Arc<Mutex<VecDeque<String>>>);
+    #[async_trait]
+    impl Tool for Enqueue {
+        fn name(&self) -> &str {
+            "enqueue"
+        }
+        fn description(&self) -> &str {
+            "Queue a steer at the tool execution boundary"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, _: &ToolCx) -> bro_tools::ToolResult {
+            self.0
+                .lock()
+                .unwrap()
+                .push_back("FRESH_TOOL_TIME_STEER".into());
+            bro_tools::ToolResult::Json(json!({"ok":true}))
+        }
+    }
+    let inputs = Arc::new(Mutex::new(VecDeque::new()));
+    let (mut session, boundaries, fail) = probe(vec![]);
+    session.tx = Box::new(BudgetTransport {
+        history: vec![],
+        usage: VecDeque::from([Usage {
+            input_tokens: 195_000,
+            output_tokens: 20_000,
+            ..Usage::default()
+        }]),
+        first_call: Some(transport::ToolCall {
+            id: "enqueue-1".into(),
+            name: "enqueue".into(),
+            args: json!({}),
+        }),
+        boundaries: boundaries.clone(),
+        fail_compaction: fail,
+    });
+    session.reg = Registry::new(
+        vec![Arc::new(Enqueue(inputs.clone()))],
+        vec![],
+        &PinPolicy::from_env(),
+        &mcp::ToolFilter::default(),
+    )
+    .unwrap();
+    session.compact_threshold = Some(200_000);
+    let (_sender, cancel) = watch::channel(false);
+    session
+        .user_turn("initial task", cancel, inputs)
+        .await
+        .unwrap();
+    let events = boundaries.lock().unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        vec!["request", "compact", "request"]
+    );
+    assert!(
+        !events[1]
+            .history
+            .to_string()
+            .contains("FRESH_TOOL_TIME_STEER")
+    );
+    assert!(
+        events[2]
+            .history
+            .to_string()
+            .contains("FRESH_TOOL_TIME_STEER")
+    );
 }

@@ -783,6 +783,39 @@ fn web_search_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Keep fresh steers outside history until compaction and request preparation
+/// finish. An error or cancellation returns unconsumed inputs to the owner queue.
+struct StagedUserInputs {
+    inputs: VecDeque<String>,
+    source: Arc<StdMutex<VecDeque<String>>>,
+}
+
+impl StagedUserInputs {
+    fn capture(&mut self) -> Result<Vec<String>> {
+        let captured = std::mem::take(
+            &mut *self
+                .source
+                .lock()
+                .map_err(|_| anyhow::anyhow!("input queue poisoned"))?,
+        );
+        let new_inputs = captured.iter().cloned().collect();
+        self.inputs.extend(captured);
+        Ok(new_inputs)
+    }
+}
+
+impl Drop for StagedUserInputs {
+    fn drop(&mut self) {
+        let mut source = self
+            .source
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while let Some(input) = self.inputs.pop_back() {
+            source.push_front(input);
+        }
+    }
+}
+
 /// External resources for session construction. Embedders may supply a transport
 /// and explicit durable paths without changing process environment or host state.
 struct SessionBuildRuntime {
@@ -1508,6 +1541,10 @@ impl Session {
         self.reg.validate_resume_tool_schemas()?;
         self.cx.cancellation = tokio_util::sync::CancellationToken::new();
         let mut pending_prompt = Some(prompt);
+        let mut staged_inputs = StagedUserInputs {
+            inputs: VecDeque::new(),
+            source: mid_turn_user_inputs.clone(),
+        };
         self.observe_user_turn(prompt);
         let prompt_estimate = est_tokens(prompt);
         let mut request_overhead_tokens = self.last_request_overhead_tokens;
@@ -1552,11 +1589,27 @@ impl Session {
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
             let mut proactive_checked = false;
-            let mut proactive_compacted = false;
             let out = 'attempt: loop {
                 self.deliver_instruction_context().await?;
                 if pending_prompt.is_some() || self.reference_context_item.is_none() {
                     self.prepare_context_for_user_turn();
+                }
+                for input in staged_inputs.capture()? {
+                    if input.trim() == "/compact" {
+                        self.event_log.append_event(&json!({
+                            "type":"user", "session_id":self.session_id(),
+                            "message":{"role":"user", "content":[{"type":"text", "text":input}]},
+                        }));
+                        self.compact_manual().await?;
+                        staged_inputs
+                            .inputs
+                            .retain(|input| input.trim() != "/compact");
+                    } else {
+                        self.observe_user_turn(&input);
+                    }
+                }
+                if self.reference_context_item.is_none() {
+                    continue 'attempt;
                 }
                 if let Some(nudge) = self.tail_nudge.take() {
                     tail_nudge = Some(nudge);
@@ -1597,9 +1650,8 @@ impl Session {
                     &tool_specs,
                     &opts,
                 );
-                let queued_estimate = mid_turn_user_inputs
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                let queued_estimate = staged_inputs
+                    .inputs
                     .iter()
                     .map(|prompt| est_tokens(prompt))
                     .fold(0u64, u64::saturating_add);
@@ -1635,7 +1687,6 @@ impl Session {
                             Ok(Some(summary)) => {
                                 self.emitter
                                     .compact_boundary("auto", projected, summary.len());
-                                proactive_compacted = true;
                                 self.reset_compaction_context();
                                 continue 'attempt;
                             }
@@ -1657,15 +1708,12 @@ impl Session {
                     }));
                     self.append_user_text_raw(prompt);
                 }
-                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
-                    .await?;
-                // A queued manual compaction invalidates the context/options
-                // assembled above. Restore current instructions before sampling.
-                if self.reference_context_item.is_none() || self.tail_nudge.is_some() {
-                    // Queued inputs can fire hooks after initial task insertion.
-                    // Capture and budget those directives before this request.
-                    proactive_checked = proactive_compacted;
-                    continue 'attempt;
+                while let Some(input) = staged_inputs.inputs.pop_front() {
+                    self.event_log.append_event(&json!({
+                        "type":"user", "session_id":self.session_id(),
+                        "message":{"role":"user", "content":[{"type":"text", "text":input}]},
+                    }));
+                    self.append_user_text_raw(&input);
                 }
                 self.tx.normalize_for_prompt();
                 request_overhead_tokens = estimate.overhead_tokens;
@@ -1863,8 +1911,6 @@ impl Session {
                     );
                 }
                 tool_batch_correction_reason = Some(reason);
-                self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
-                    .await?;
                 continue;
             }
 
@@ -2098,8 +2144,6 @@ impl Session {
             if interrupted {
                 break "interrupted_dispatch";
             }
-            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs)
-                .await?;
             self.hooks.tick();
         };
 
@@ -2424,32 +2468,6 @@ impl Session {
         // emits no model-visible delta, but the in-memory side-state baseline
         // still reflects the current turn environment.
         self.reference_context_item = Some(env.to_turn_context_item());
-    }
-
-    async fn drain_mid_turn_user_inputs(
-        &mut self,
-        inputs: &Arc<StdMutex<VecDeque<String>>>,
-    ) -> Result<()> {
-        // Take one input at a time. Unconsumed inputs survive an error and no
-        // std mutex is held across a compaction request.
-        loop {
-            let prompt = inputs
-                .lock()
-                .map_err(|_| anyhow::anyhow!("input queue poisoned"))?
-                .pop_front();
-            let Some(prompt) = prompt else {
-                return Ok(());
-            };
-            self.event_log.append_event(&json!({
-                "type": "user", "session_id": self.session_id(),
-                "message": {"role": "user", "content": [{"type":"text", "text":prompt}]},
-            }));
-            if prompt.trim() == "/compact" {
-                self.compact_manual().await?;
-            } else {
-                self.push_user_text_raw(&prompt);
-            }
-        }
     }
 
     fn deliver_tool_observations(&mut self) {
