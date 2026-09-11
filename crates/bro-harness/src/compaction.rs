@@ -202,8 +202,7 @@ fn default_entries() -> BTreeMap<String, Entry> {
     // Windows track the model's actual capacity; compaction is an overflow
     // guard, not a tuning knob (thread-9dfe1da5: compacting 1M-class models at
     // a stale 128K/200K default caused premature compaction and a
-    // false-memory summary). gpt-5* = 400K per the codex-rs reference
-    // (`protocol/src/openai_models.rs`); deepseek-v4*, MiniMax-M*, and Kimi
+    // false-memory summary). DeepSeek-v4*, MiniMax-M*, and Kimi
     // k3 are 1M-class; older deepseek ids stay 128K, kimi-k2* is 256K-class
     // (262144 per vendor docs; rounded to house style).
     // MiniMax-M* compact_at is 0.45 (450K threshold) per the official
@@ -221,8 +220,15 @@ fn default_entries() -> BTreeMap<String, Entry> {
         ("k3*", 1_000_000, None),
         ("kimi-k3*", 1_000_000, None),
         ("kimi-k2*", 256_000, None),
-        ("gpt-5*", 400_000, None),
-        // Codex model catalog default window; extended context is opt-in.
+        // Selected default windows from the Codex model catalog, not the
+        // larger maximum selectable windows. Extended windows require an
+        // explicit compaction-config override matching the inference setup.
+        // Keep exact IDs: unknown generations must not inherit a guessed size.
+        ("gpt-5.4", 272_000, None),
+        ("gpt-5.5", 272_000, None),
+        ("gpt-5.6-sol", 272_000, None),
+        ("gpt-5.6-terra", 272_000, None),
+        ("gpt-5.6-luna", 272_000, None),
         ("gpt-6-astra", 272_000, None),
     ] {
         m.insert(
@@ -313,13 +319,47 @@ mod tests {
         assert_eq!(p.resolve("k3").0, 1_000_000);
         assert_eq!(p.resolve("kimi-k3").0, 1_000_000);
         assert_eq!(p.resolve("kimi-k2.7-code").0, 256_000);
-        // codex-rs reference: gpt-5 family is 400K.
-        assert_eq!(p.resolve("gpt-5.5").0, 400_000);
-        assert_eq!(p.resolve("gpt-5.1-codex-max").0, 400_000);
+        assert_eq!(p.resolve("gpt-5.5").0, 272_000);
         assert_eq!(p.threshold("gpt-6-astra"), Some(204_000));
         // older deepseek ids keep the 128K window.
         assert_eq!(p.resolve("deepseek-reasoner").0, 128_000);
         assert_eq!(p.resolve("claude-sonnet-4-6").0, 200_000);
+    }
+
+    #[test]
+    fn selected_openai_windows_compact_before_capacity_and_allow_explicit_overrides() {
+        let mut p = policy(&[]);
+        p.entries = default_entries();
+        for model in [
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+        ] {
+            let window = p.context_window(model).unwrap();
+            assert_eq!(window, 272_000);
+            assert_eq!(p.threshold(model), Some(204_000));
+            assert!(p.threshold(model).unwrap() < window);
+        }
+        for model in ["gpt-5-unknown", "gpt-5.1-codex-max", "gpt-6-unknown"] {
+            assert_eq!(p.context_window(model), None);
+            assert_eq!(p.threshold(model), Some(150_000));
+        }
+
+        // The configured selected window can differ from the catalog default.
+        // The model's maximum is never selected implicitly.
+        p.entries.insert(
+            "gpt-5.6-sol".into(),
+            Entry {
+                context_window: Some(872_000),
+                compact_at: None,
+            },
+        );
+        assert_eq!(p.context_window("gpt-5.6-sol"), Some(872_000));
+        assert_eq!(p.threshold("gpt-5.6-sol"), Some(654_000));
+        assert_eq!(p.context_window("gpt-5.6-terra"), Some(272_000));
     }
 
     #[test]
@@ -485,7 +525,11 @@ mod tests {
             ("deepseek-v4-plus", 1_000_000),
             ("MiniMax-M2", 1_000_000),
             ("kimi-k2-turbo", 256_000),
-            ("gpt-5-codex", 400_000),
+            ("gpt-5.4", 272_000),
+            ("gpt-5.5", 272_000),
+            ("gpt-5.6-sol", 272_000),
+            ("gpt-5.6-terra", 272_000),
+            ("gpt-5.6-luna", 272_000),
             ("gpt-6-astra", 272_000),
         ] {
             assert_eq!(

@@ -295,24 +295,22 @@ pub(super) fn build_body(
     if let Some(tier) = service_tier_for_request(opts.service_tier.as_deref()) {
         body["service_tier"] = json!(tier);
     }
-    // Reasoning: only for reasoning-capable models, and only when an effort
-    // was requested. Bundle the summary (codex default `auto`) and request
-    // encrypted reasoning so reasoning items can be replayed across turns
-    // under `store:false` (see `parse_sse`).
-    if let Some(e) = &opts.effort {
-        if model_supports_reasoning(&opts.model) {
+    // Stateless replay needs encrypted reasoning even when the provider chooses
+    // the effort default. Explicit effort controls generation, not continuity.
+    if model_supports_reasoning(&opts.model) {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        if let Some(e) = &opts.effort {
             let mut reasoning = json!({ "effort": normalize_effort(e) });
             if let Some(summary) = reasoning_summary() {
                 reasoning["summary"] = json!(summary);
             }
             body["reasoning"] = reasoning;
-            body["include"] = json!(["reasoning.encrypted_content"]);
-        } else {
-            tracing::warn!(
-                model = %opts.model,
-                "effort requested but model is not reasoning-capable; omitting reasoning"
-            );
         }
+    } else if opts.effort.is_some() {
+        tracing::warn!(
+            model = %opts.model,
+            "effort requested but model is not reasoning-capable; omitting reasoning"
+        );
     }
     body
 }
@@ -1648,6 +1646,38 @@ mod tests {
         assert_eq!(body["service_tier"], SERVICE_TIER_PRIORITY);
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn default_effort_requests_encrypted_reasoning_and_preserves_it_for_next_request() {
+        let o = opts(SystemPrompt {
+            stable: Some("BASE".into()),
+            ambient: None,
+            volatile: None,
+        });
+        assert!(o.effort.is_none());
+        let mut s = state();
+        let initial = s.build_body(&[], &o);
+        assert_eq!(initial["include"], json!(["reasoning.encrypted_content"]));
+        assert!(initial.get("reasoning").is_none());
+        s.parse_sse(concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"ENC\",\"summary\":[]}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        )).unwrap();
+        // The same authoritative snapshot feeds HTTP replay after a resume or
+        // WebSocket fallback, independently of the request's effort selection.
+        let mut restored = state();
+        restored.restore(s.snapshot());
+        restored.push_user_text("continue");
+        let next = restored.build_body(&[], &o);
+        assert!(
+            next["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning" && item["encrypted_content"] == "ENC")
+        );
+        assert_eq!(next["include"], initial["include"]);
     }
 
     #[test]
