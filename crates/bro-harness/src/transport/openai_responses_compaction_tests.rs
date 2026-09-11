@@ -105,6 +105,10 @@ async fn failed_inline_summaries_leave_source_history_and_ambient_unchanged() {
         event(json!({"type":"error", "message":"failed"})),
         event(json!({"type":"response.incomplete", "response":{"status":"incomplete"}})),
         event(json!({"type":"response.completed", "response":{"status":"incomplete"}})),
+        event(json!({"type":"response.completed"})),
+        event(json!({"type":"response.completed", "response":null})),
+        event(json!({"type":"response.completed", "response":"malformed"})),
+        event(json!({"type":"response.completed", "response":[]})),
     ];
     for ending in endings {
         let (url, request) = server(format!("{partial}{ending}"), "text/event-stream").await;

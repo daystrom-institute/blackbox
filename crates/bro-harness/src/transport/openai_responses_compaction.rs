@@ -41,6 +41,10 @@ pub(super) async fn collect_summary(response: reqwest::Response) -> Result<Strin
                 }
                 "response.completed" => {
                     ensure!(
+                        event["response"].is_object(),
+                        "compaction completion missing response object"
+                    );
+                    ensure!(
                         event["response"]["status"].is_null()
                             || event["response"]["status"] == "completed",
                         "compaction completion has unsuccessful status"
