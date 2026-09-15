@@ -297,3 +297,95 @@ async fn production_startup_compacts_with_previous_model_before_persisting_downs
     assert_eq!(reopened.tx.snapshot(), compacted_history);
     assert_eq!(*compaction_models.lock().unwrap(), vec!["MiniMax-M3"]);
 }
+
+#[tokio::test]
+async fn production_resume_recovers_an_uncheckpointed_tail_and_briefs_the_model() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut initial = build(&cli(&root, None, false), &root).await;
+    initial.tx.push_user_text("checkpointed task");
+    let checkpointed = initial.tx.snapshot();
+    initial.persist().await.unwrap();
+    drop(initial);
+
+    // The previous process kept working after its checkpoint and was killed
+    // mid-write: a tool_search activation of a tool this catalog does not
+    // carry, a file write, and a torn final record. The activation receipt
+    // lies beyond the checkpoint, so it must not become a resume requirement.
+    let log = root.join("startup.events.jsonl");
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    let receipt = json!({"loaded":["mcp__fixture__gone"]}).to_string();
+    for event in [
+        json!({"type":"assistant","seq":48,"message":{"content":[
+            {"type":"tool_use","id":"s1","name":"tool_search","input":{}}
+        ]}}),
+        json!({"type":"user","seq":49,"message":{"content":[
+            {"type":"tool_result","tool_use_id":"s1","content":receipt}
+        ]}}),
+        json!({"type":"assistant","seq":50,"message":{"content":[
+            {"type":"tool_use","id":"c1","name":"file_write","input":{"file_path":"notes.md"}}
+        ]}}),
+        json!({"type":"user","seq":51,"message":{"content":[
+            {"type":"tool_result","tool_use_id":"c1","content":"ok"}
+        ]}}),
+    ] {
+        writeln!(
+            file,
+            "{}",
+            json!({"ts":"2026-01-01T00:00:00Z","event":event})
+        )
+        .unwrap();
+    }
+    write!(
+        file,
+        "{{\"ts\":\"2026-01-01T00:00:01Z\",\"event\":{{\"type\":\"assis"
+    )
+    .unwrap();
+    drop(file);
+
+    let mut resumed = build(&cli(&root, None, true), &root).await;
+    assert_eq!(
+        resumed.tx.snapshot(),
+        checkpointed,
+        "the snapshot stays authoritative for model history"
+    );
+    assert!(
+        resumed.seq_counter.load(Ordering::SeqCst) >= 51,
+        "seqs recorded after the checkpoint must not be reused"
+    );
+    resumed.deliver_instruction_context().await.unwrap();
+    let history = resumed.tx.snapshot().to_string();
+    for expected in [
+        "[Checkpoint gap recovered]",
+        "tool_search",
+        "file_write",
+        "notes.md",
+        "torn final log record",
+    ] {
+        assert!(history.contains(expected), "{expected}: {history}");
+    }
+    // Recovery is on the durable log, the torn bytes are gone, and the next
+    // checkpoint covers everything so a further resume is clean. The persist
+    // drains the log writer before the file is read.
+    resumed.persist().await.unwrap();
+    drop(resumed);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("\"subtype\":\"checkpoint_gap_recovered\""),
+        "{text}"
+    );
+    assert!(text.ends_with('\n'));
+    assert!(!text.contains("assis\n"));
+    let reopened = build(&cli(&root, None, true), &root).await;
+    assert!(reopened.resume_gap_notice.is_none());
+    assert_eq!(
+        reopened
+            .tx
+            .snapshot()
+            .to_string()
+            .matches("[Checkpoint gap recovered]")
+            .count(),
+        1
+    );
+}

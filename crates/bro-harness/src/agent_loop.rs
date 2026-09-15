@@ -201,13 +201,21 @@ async fn run_with_emitter(
 
     let prompt = resolve_prompt(&cli)?;
     let mut session = Session::build(&cli, callback, mcp_config, None, None).await?;
+    session.termination = termination_signal();
     session.emitter.system_init();
     let mut pending = std::mem::take(&mut session.pending_user_inputs);
     pending.push_back(prompt);
     // A resumed redirect precedes the newly supplied prompt. Every completed
     // turn checkpoints the remaining queue before proceeding to the next input.
+    let term = session.termination.clone();
     while let Some(prompt) = pending.pop_front() {
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        if *term.borrow() {
+            pending.push_front(prompt);
+            break;
+        }
+        // SIGTERM/SIGINT cancel the turn the way an interrupt does; the
+        // checkpoint below then captures the interrupted turn before exit.
+        let cancel_rx = term.clone();
         let turn_result = if prompt.trim() == "/compact" {
             session.drain_cancelled_work().await;
             let result = session.compact_manual().await;
@@ -237,6 +245,56 @@ async fn run_with_emitter(
         }
     }
     Ok(())
+}
+
+/// Process termination requests (SIGTERM from the daemon's cancel or fleetd's
+/// WorkerKill, SIGINT from an interactive operator) as a watch that flips to
+/// true once. Installed lazily, once per process. The receiver doubles as the
+/// turn cancel signal, so a terminated turn ends exactly like an interrupted
+/// one: interrupted result, drained work, persisted checkpoint, then exit. The
+/// daemon and fleetd both wait on the child after signalling, so that final
+/// checkpoint is always observed.
+fn termination_signal() -> watch::Receiver<bool> {
+    static SIGNAL: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
+    SIGNAL
+        .get_or_init(|| {
+            let (tx, _rx) = watch::channel(false);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let notify = tx.clone();
+                tokio::spawn(async move {
+                    let mut term = signal(SignalKind::terminate()).ok();
+                    let mut int = signal(SignalKind::interrupt()).ok();
+                    let name = tokio::select! {
+                        Some(()) = async {
+                            match term.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await }
+                        } => "SIGTERM",
+                        Some(()) = async {
+                            match int.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await }
+                        } => "SIGINT",
+                        else => return,
+                    };
+                    tracing::warn!(signal = name, "termination signal; interrupting the turn and checkpointing");
+                    let _ = notify.send(true);
+                });
+            }
+            tx
+        })
+        .subscribe()
+}
+
+/// A termination watch that never fires: the constructor default, kept by
+/// embedded sessions whose host owns process signals.
+fn never_terminates() -> watch::Receiver<bool> {
+    static SIGNAL: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
+    SIGNAL.get_or_init(|| watch::channel(false).0).subscribe()
+}
+
+/// Human-readable signal label for the termination event, from the watch
+/// alone (the watch does not carry which signal fired).
+fn termination_label() -> &'static str {
+    "SIGTERM/SIGINT"
 }
 
 /// Builds an `Emitter` for `session_id`, wiring in the sidecar event log and
@@ -274,6 +332,7 @@ async fn run_session(
     let exit_when_idle = cli.exit_when_idle;
     let mut session =
         Session::build(&cli, callback.clone(), mcp_config, additional_context, None).await?;
+    session.termination = termination_signal();
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
@@ -502,23 +561,36 @@ async fn session_loop(
     ctrl_emitter: &Emitter,
     mut pending: VecDeque<String>,
 ) -> Result<()> {
+    let mut term = session.termination.clone();
     loop {
+        if *term.borrow() {
+            break;
+        }
         let prompt = match pending.pop_front() {
             Some(prompt) => prompt,
-            None => match input_rx.recv().await {
-                Some(Input::User(prompt)) => prompt,
-                Some(Input::Control {
-                    subtype,
-                    req_id,
-                    raw,
-                }) => {
-                    if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
-                        apply_pending_control(session, control, ctrl_emitter, &mut pending).await?;
+            None => {
+                let received = tokio::select! {
+                    biased;
+                    _ = term.changed() => break,
+                    received = input_rx.recv() => received,
+                };
+                match received {
+                    Some(Input::User(prompt)) => prompt,
+                    Some(Input::Control {
+                        subtype,
+                        req_id,
+                        raw,
+                    }) => {
+                        if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter)
+                        {
+                            apply_pending_control(session, control, ctrl_emitter, &mut pending)
+                                .await?;
+                        }
+                        continue;
                     }
-                    continue;
+                    None => break,
                 }
-                None => break,
-            },
+            }
         };
         run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
             .await?;
@@ -533,7 +605,11 @@ async fn session_loop_until_idle(
     ctrl_emitter: &Emitter,
     mut pending: VecDeque<String>,
 ) -> Result<()> {
+    let term = session.termination.clone();
     loop {
+        if *term.borrow() {
+            break;
+        }
         let prompt = match pending.pop_front() {
             Some(prompt) => prompt,
             None => match input_rx.try_recv() {
@@ -565,8 +641,17 @@ async fn await_first_controlled_input(
     ctrl_emitter: &Emitter,
     pending: &mut VecDeque<String>,
 ) -> Result<()> {
+    let mut term = session.termination.clone();
     while pending.is_empty() {
-        match input_rx.recv().await {
+        if *term.borrow() {
+            break;
+        }
+        let received = tokio::select! {
+            biased;
+            _ = term.changed() => break,
+            received = input_rx.recv() => received,
+        };
+        match received {
             Some(Input::User(prompt)) => pending.push_back(prompt),
             Some(Input::Control {
                 subtype,
@@ -598,6 +683,11 @@ async fn run_prompt_with_controls(
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut deferred = Vec::new();
     let mut stdin_closed = false;
+    let mut term = session.termination.clone();
+    let mut terminating = *term.borrow();
+    if terminating {
+        let _ = cancel_tx.send(true);
+    }
     let mid_turn_user_inputs = Arc::new(StdMutex::new(VecDeque::new()));
     let turn_result = {
         let operation = async {
@@ -614,6 +704,15 @@ async fn run_prompt_with_controls(
             tokio::select! {
                 biased;
                 result = &mut operation => break result,
+                _ = term.changed(), if !terminating => {
+                    // Same path as an explicit interrupt: the turn ends with an
+                    // interrupted result and the checkpoint below persists it.
+                    // Admission stops; nothing further is read from stdin.
+                    terminating = true;
+                    ctrl_emitter.termination_signal(termination_label());
+                    let _ = cancel_tx.send(true);
+                    stdin_closed = true;
+                }
                 maybe = input_rx.recv(), if !stdin_closed => match maybe {
                     Some(Input::Control { subtype, req_id, raw }) => {
                         if let Some(control) = receive_control(&subtype, &raw, req_id, ctrl_emitter) {
@@ -704,6 +803,12 @@ struct Session {
     hooks: HookEngine,
     scoped_project_docs: Arc<crate::project_doc::ScopedProjectDocs>,
     resume_runtime_reset: bool,
+    /// Model-facing notice for a checkpoint gap or lost runtime work found at
+    /// resume, delivered once with the next instruction context.
+    resume_gap_notice: Option<String>,
+    /// Flips to true on SIGTERM/SIGINT (`termination_signal`). Loops stop
+    /// admitting input and the in-flight turn is interrupted and checkpointed.
+    termination: watch::Receiver<bool>,
     emitter: Emitter,
     base_opts: TurnOpts,
     /// Explicit caller-supplied system text.
@@ -1215,11 +1320,16 @@ impl Session {
             // Receipts are independent evidence, even when an explicit saved
             // activation list is empty. Neither source can erase the other.
             let path = event_log.path().to_path_buf();
-            let snapshot = store.restored.as_ref().unwrap().snapshot.clone();
+            let restored = store.restored.as_ref().unwrap();
+            let snapshot = restored.snapshot.clone();
+            // Receipts beyond the checkpoint belong to a conversation the
+            // snapshot does not contain; they are disclosed via the checkpoint
+            // gap, not promised to the resumed model.
+            let checkpoint_offset = restored.event_log_offset;
             let receipts = tokio::task::spawn_blocking(move || {
                 let mut names = std::collections::BTreeSet::new();
                 for source in [
-                    EventLog::tool_search_activations(&path),
+                    EventLog::tool_search_activations_within(&path, checkpoint_offset),
                     EventLog::snapshot_tool_search_activations(&snapshot),
                 ] {
                     names.extend(
@@ -1289,6 +1399,34 @@ impl Session {
                 "provider": transport::session_var("BRO_HARNESS_PROVIDER"),
             }),
         );
+        // A resumed snapshot behind its event log (the previous process was
+        // cancelled, killed, or crashed before its next checkpoint) is not a
+        // refusal: resume from the snapshot, record what the log has beyond
+        // it, and tell the model so it re-verifies rather than repeats.
+        let resume_gap_notice = store.restored.as_ref().and_then(|restored| {
+            match (&restored.checkpoint_gap, restored.runtime_work_outstanding) {
+                (Some(gap), outstanding) => {
+                    emitter.checkpoint_gap_recovered(
+                        &gap.to_json(),
+                        outstanding,
+                        restored.event_log_offset,
+                    );
+                    Some(gap.model_notice(outstanding))
+                }
+                (None, true) => {
+                    emitter.checkpoint_gap_recovered(&Value::Null, true, None);
+                    Some(
+                        "[Checkpoint gap recovered] The previous process for this session \
+                         checkpointed while JavaScript cells or shell sessions were still \
+                         running; their remaining output was never delivered and cannot be \
+                         recovered. Re-check the durable effects they were producing before \
+                         repeating them."
+                            .to_owned(),
+                    )
+                }
+                (None, false) => None,
+            }
+        });
 
         let mut session = Self {
             tx,
@@ -1303,6 +1441,11 @@ impl Session {
             hooks,
             scoped_project_docs,
             resume_runtime_reset: restored_snapshot,
+            resume_gap_notice,
+            // Only the standalone binary owns process signals; embedded hosts
+            // (the fleet cockpit) keep their own handling. `run_with_emitter`
+            // and `run_session` install `termination_signal()` after build.
+            termination: never_terminates(),
             emitter,
             base_opts,
             explicit_system,
@@ -1573,6 +1716,16 @@ impl Session {
             }
             if *cancel.borrow() {
                 break "cancelled";
+            }
+            if turn_steps > 0 {
+                // Checkpoint every completed step. A SIGKILL, crash, or power
+                // loss before the turn boundary then costs at most the step in
+                // flight, and resume recovers the rest from the snapshot with a
+                // correspondingly small checkpoint gap. The turn-boundary
+                // persist stays authoritative; this one only warns.
+                if let Err(error) = self.persist().await {
+                    tracing::warn!("mid-turn checkpoint failed: {error:#}");
+                }
             }
 
             let tool_specs = self.reg.wire_specs();
@@ -2495,6 +2648,13 @@ impl Session {
             self.pending_input_estimate = self
                 .pending_input_estimate
                 .saturating_add(est_tokens(reset));
+        }
+        if let Some(notice) = self.resume_gap_notice.take() {
+            self.tx.push_user_text(&notice);
+            self.emitter.tool_result_context(&notice);
+            self.pending_input_estimate = self
+                .pending_input_estimate
+                .saturating_add(est_tokens(&notice));
         }
         self.scoped_project_docs
             .refresh()
@@ -3966,6 +4126,8 @@ mod tests {
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
             scoped_project_docs: Arc::new(crate::project_doc::ScopedProjectDocs::default()),
             resume_runtime_reset: false,
+            resume_gap_notice: None,
+            termination: never_terminates(),
             strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
             dispatch: crate::context::dispatch::DispatchState::default(),
             emitter: Emitter::new("test".into()),
@@ -7061,6 +7223,156 @@ mod tests {
                 json!([MARKER])
             );
         }
+    }
+
+    #[tokio::test]
+    async fn termination_signal_interrupts_the_turn_checkpoints_and_stops_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, shared) = mk_session_with_store(
+            vec![MockTurn::Block],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        session.cx.root = root.clone();
+        let (term_tx, term_rx) = watch::channel(false);
+        session.termination = term_rx;
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        let callback: crate::emit::EventCallback =
+            Arc::new(move |event| sink.lock().unwrap().push(event));
+        let log = Arc::new(EventLog::at_path(root.join("session.events.jsonl")));
+        session.event_log = log.clone();
+        session.emitter = make_emitter(
+            "fixture".into(),
+            Some(callback.clone()),
+            Some(log.clone()),
+            session.seq_counter(),
+        );
+        let ctrl = make_emitter(
+            "fixture".into(),
+            Some(callback),
+            Some(log),
+            session.seq_counter(),
+        );
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Input>();
+        let run = tokio::spawn(async move {
+            let mut pending = VecDeque::new();
+            run_prompt_with_controls(
+                &mut session,
+                &mut input_rx,
+                &ctrl,
+                &mut pending,
+                "long task".into(),
+            )
+            .await
+            .unwrap();
+            // Admission is closed: the loop returns without waiting on the
+            // still-open input channel.
+            session_loop(&mut session, input_rx, &ctrl, pending)
+                .await
+                .unwrap();
+            session
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while shared.started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        term_tx.send(true).unwrap();
+        let session = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("a terminated session must exit promptly")
+            .unwrap();
+        drop(input_tx);
+        {
+            let events = events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["subtype"] == "termination_signal"),
+                "{events:?}"
+            );
+            let result = events
+                .iter()
+                .find(|event| event["type"] == "result")
+                .unwrap();
+            assert_eq!(result["subtype"], "interrupted");
+        }
+        drop(session);
+        // The checkpoint covers the whole log, so the next resume has no gap.
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["event_log_offset"].as_u64().unwrap(),
+            std::fs::metadata(root.join("session.events.jsonl"))
+                .unwrap()
+                .len()
+        );
+        assert!(
+            crate::session::inspect_event_checkpoint(
+                &root.join("session.events.jsonl"),
+                saved["event_log_offset"].as_u64(),
+                saved["last_event_seq"].as_u64().unwrap(),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_steps_checkpoint_before_the_turn_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut session, _shared) = mk_session_with_store(
+            vec![
+                MockTurn::ToolCalls(vec![dispatch_call("first", "dispatch_read", json!({}))]),
+                MockTurn::ToolCalls(vec![dispatch_call(
+                    "pending",
+                    "dispatch_read",
+                    json!({"block": true}),
+                )]),
+            ],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        session.cx.root = root.clone();
+        let pending_read = install_dispatch_probes(&mut session);
+        let log = Arc::new(EventLog::at_path(root.join("session.events.jsonl")));
+        session.event_log = log.clone();
+        session.emitter = make_emitter(
+            "fixture".into(),
+            Some(Arc::new(|_| {})),
+            Some(log),
+            session.seq_counter(),
+        );
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let turn = session.user_turn(
+            "read twice",
+            cancel_rx,
+            Arc::new(StdMutex::new(VecDeque::new())),
+        );
+        let observe = async {
+            pending_read.notified().await;
+            // Step one completed and the loop checkpointed it before requesting
+            // step two, so a hard kill now loses only the step in flight.
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join("session.json")).unwrap())
+                    .unwrap();
+            let offset = saved["event_log_offset"].as_u64().unwrap() as usize;
+            assert!(offset > 0);
+            let log_text = std::fs::read_to_string(root.join("session.events.jsonl")).unwrap();
+            let covered = &log_text[..offset];
+            assert!(covered.contains("\"tool_use_id\":\"first\""), "{covered}");
+            cancel_tx.send(true).unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(turn, observe);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }
 

@@ -151,17 +151,53 @@ impl EventLog {
         reason = "legacy session migration runs on the blocking pool"
     )]
     pub fn tool_search_activations(path: &Path) -> Value {
-        use std::io::BufRead;
+        Self::tool_search_activations_within(path, None)
+    }
+
+    /// Receipts that belong to the resumed conversation only. The scan stops
+    /// at `checkpoint_offset` (`None` scans the whole log, for legacy
+    /// checkpoints) and skips every recorded checkpoint gap: a
+    /// `checkpoint_gap_recovered` event marks the records from its
+    /// `gap_start_offset` up to itself as work a cancelled or killed previous
+    /// process did after its checkpoint (see `session::CheckpointGap`). Those
+    /// records promised nothing to the model's history and must not become
+    /// resume requirements, on this resume or any later one.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy session migration runs on the blocking pool"
+    )]
+    pub fn tool_search_activations_within(path: &Path, checkpoint_offset: Option<u64>) -> Value {
+        use std::io::{BufRead, Read};
 
         let Ok(file) = std::fs::File::open(path) else {
             return json!([]);
         };
+        let limit = checkpoint_offset.unwrap_or(u64::MAX);
+        let mut rows: Vec<(u64, Value)> = Vec::new();
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
+        let mut position = 0u64;
+        for line in std::io::BufReader::new(file.take(limit))
+            .lines()
+            .map_while(Result::ok)
+        {
+            let start = position;
+            position += line.len() as u64 + 1;
+            let Ok(row) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let event = row["event"].clone();
+            if event["type"] == "system"
+                && event["subtype"] == "checkpoint_gap_recovered"
+                && let Some(from) = event["gap_start_offset"].as_u64()
+            {
+                gaps.push((from, start));
+            }
+            rows.push((start, event));
+        }
         activations_from_events(
-            std::io::BufReader::new(file)
-                .lines()
-                .map_while(Result::ok)
-                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-                .map(|row| row["event"].clone()),
+            rows.into_iter()
+                .filter(|(offset, _)| !gaps.iter().any(|(from, to)| offset >= from && offset < to))
+                .map(|(_, event)| event),
         )
     }
 

@@ -78,9 +78,24 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   model-call boundary inside the same turn; leftovers become new pending
   turns. Interrupt-with-redirect cancels the step and front-queues the
   redirect.
-- Sessions persist after every turn (a bidi session is routinely SIGTERMed);
-  resume reconstructs from the session file. Anything that must survive a
-  resume belongs in persisted session state, not loop locals.
+- Sessions checkpoint after every completed model step and at every turn and
+  control boundary; resume reconstructs from the session file. Anything that
+  must survive a resume belongs in persisted session state, not loop locals.
+- SIGTERM/SIGINT are cooperative in the standalone binary: the in-flight turn
+  ends as an interrupt (interrupted result, drained work), the session
+  checkpoints, and the process exits. The daemon and fleetd wait on the child
+  after signalling, so that final checkpoint is always observed. Embedded
+  hosts keep their own signal handling (`Session.termination` stays inert).
+- Resume never refuses a snapshot for being behind its event log. The snapshot
+  is the authority for model history; anything the log recorded after it
+  (a cancelled or killed previous process) becomes a `CheckpointGap`: a
+  `checkpoint_gap_recovered` system event for the caller and a model-facing
+  notice listing the uncheckpointed steps, tool calls, user messages and
+  results so the model re-verifies rather than repeats. A torn final record is
+  dropped and counted. Outstanding cells/shell sessions at checkpoint time are
+  disclosed the same way. Only checkpoint corruption (log shorter than its
+  offset, offset off a record boundary, unparsable complete record) fails
+  closed.
 
 ## Deferred tool surface
 

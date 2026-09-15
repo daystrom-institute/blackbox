@@ -11,6 +11,17 @@ out explicitly under `Changed` or `Removed`.
 - Session browsing now enumerates retained transcript history without producer
   filesystem access, with source/account filters and bounded recency pages.
   Session-name filters report unavailable indexed metadata explicitly.
+- bro-harness sessions survive cancellation and hard kills. SIGTERM and SIGINT
+  now end the in-flight turn as an interrupt, checkpoint the session, and exit,
+  so `bro_cancel` (and fleetd's WorkerKill) leave a resumable session. Every
+  completed model step checkpoints, so a SIGKILL or crash loses at most the
+  step in flight. Resume no longer refuses a snapshot whose event log records
+  later work: it resumes from the snapshot, emits a `checkpoint_gap_recovered`
+  system event with a digest of the uncheckpointed tail (steps, tool calls,
+  user messages, results), briefs the model with the same digest so it
+  re-verifies instead of repeating, drops a torn final log record, and refuses
+  only genuine checkpoint corruption. A checkpoint taken while cells or shell
+  sessions were outstanding is likewise disclosed rather than refused.
 
 
 ### Removed

@@ -129,6 +129,42 @@ impl Emitter {
         }));
     }
 
+    /// `system/checkpoint_gap_recovered`: this resumed process found
+    /// conversation or actions in the event log beyond the snapshot it
+    /// restored (the previous process ended before its next checkpoint). The
+    /// digest names what the model's history does not contain; the same
+    /// notice is delivered to the model as tool-result context.
+    /// `gap_start_offset` is the byte offset of the restored checkpoint: log
+    /// records from there up to this event are the gap, and resume-time
+    /// scans (activation receipts) skip that range on every later resume.
+    pub fn checkpoint_gap_recovered(
+        &self,
+        gap: &Value,
+        runtime_work_outstanding: bool,
+        gap_start_offset: Option<u64>,
+    ) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "checkpoint_gap_recovered",
+            "session_id": self.session_id,
+            "gap": gap,
+            "runtime_work_outstanding": runtime_work_outstanding,
+            "gap_start_offset": gap_start_offset,
+        }));
+    }
+
+    /// `system/termination_signal`: the process received SIGTERM/SIGINT. The
+    /// in-flight turn ends as an interrupt and the session checkpoints before
+    /// exit, so the daemon sees why the turn stopped.
+    pub fn termination_signal(&self, signal: &str) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "termination_signal",
+            "session_id": self.session_id,
+            "signal": signal,
+        }));
+    }
+
     /// `system/init` for bidirectional mode, advertising the in-stream slash
     /// commands the harness accepts (currently `/compact`) so a driver knows the
     /// control surface (NDJSON_FORMAT.md §system/init `slash_commands`).

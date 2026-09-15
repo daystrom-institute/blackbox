@@ -1,0 +1,25 @@
+{
+  "id": "gap-0d758408",
+  "title": "bro_cancel kills the harness mid-turn without a checkpoint, leaving the session permanently unresumable with no recovery primitive",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Two linked capabilities. (1) Cancellation that preserves resumability: bro_cancel should deliver a cooperative interrupt (the harness already has an interrupt control that breaks the turn, emits an interrupted result, and persists) with a SIGTERM/SIGKILL escalation only after a grace period, or the harness should install a SIGTERM handler that runs the same persist path before exiting. Today cancel_task fires SIGTERM at once (local pid or fleetd WorkerKill), bro-harness installs no signal handler, and persist() only runs at prompt/control/loop-exit boundaries, so every step since the last turn boundary is durable in the event log but absent from the snapshot. (2) An explicit recovery primitive for the refusal the resume validator then emits (\"session event log contains conversation or actions after the saved snapshot; explicit recovery required\"). The validator names explicit recovery but nothing in bro-harness, bro-cli, blackbox admin, or bro_resume provides it. Wanted: a harness flag or bro_resume option that either (a) rebuilds the transport snapshot by replaying the meaningful event-log tail into the provider history, or (b) accepts a documented discard of the tail (archive it, re-anchor event_log_offset at the current log length) with the loss surfaced to the caller.",
+  "missing_primitive": "graceful cancel (interrupt-then-persist-then-exit) and a resume recovery action for a snapshot that is behind its event log",
+  "fallback_used": "Manual repair only: the saved event_log_offset sits on a verified record boundary, so the operator can archive the post-offset tail of the events.jsonl and truncate the log to that offset (the daemon already captured the cancelled turn's final assistant text as the task result), after which the validator admits the resume with the cancelled turn absent from model context. Otherwise start a fresh session.",
+  "evidence": [
+    "crates/bro-harness/src/session.rs:543-549 (refusal when any meaningful record follows event_log_offset)",
+    "crates/bro-harness/src/agent_loop.rs:228,474,484,527,558,656,1344 (all persist() sites are turn, control, or exit boundaries; none per model step)",
+    "src/orchestration/mod.rs:4771-4800 cancel_task and src/orchestration/executor.rs:118-142 (immediate SIGTERM or fleetd Kill, no grace)",
+    "crates/fleetd/src/server.rs:426 (WorkerKill = SIGTERM)",
+    "no tokio::signal / SIGTERM handler anywhere in crates/bro-harness",
+    "task 278bdd01-e3dd-4a27-ae5f-03e05df58c15 (brodex, cancelled at 6m21s mid-turn, 162 records / ~800KB appended after offset 386088, no result event, no persist) then task 1cb0ed47-3c1a-45b8-bc1d-8125d91ee8c2 (resume refused, exit 1)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/cancel-mid-turn-loses-checkpoint-no-recovery",
+  "notes": "Secondary observation from the same session, unverified from stderr: six auto compaction_start milestones fired within 40 seconds at ~224k-230k projected tokens on the ChatGPT-backed Responses transport and none was followed by a compact_boundary, so remote_compact returned None or an error each time (errors are only tracing::warn) while context kept growing toward the 204k threshold. Worth a separate look; it is not what broke the resume.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-15T02:14:43Z",
+  "updated_at": "2026-09-15T02:14:43Z"
+}

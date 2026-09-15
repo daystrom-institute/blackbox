@@ -1,8 +1,15 @@
 //! Versioned transport snapshots and exclusive session-writer ownership.
 //!
-//! Explicit resume requires a valid snapshot. The event log is evidence, not a
-//! recovery source: conversation or actions beyond its saved checkpoint require
-//! explicit recovery rather than silently starting from older model history.
+//! Explicit resume requires a valid snapshot. The snapshot is authoritative for
+//! model history; the event log is durable evidence. When the log records
+//! conversation or actions beyond the saved checkpoint (the previous process
+//! was cancelled, killed, or crashed before its next checkpoint), resume
+//! proceeds from the snapshot and carries a [`CheckpointGap`] digest of the
+//! uncheckpointed tail, so the resumed model and the caller are told exactly
+//! what happened after the checkpoint instead of the session being refused.
+//! Structural corruption of the checkpoint itself (a log shorter than its
+//! offset, an offset that is not a record boundary, an unparsable complete
+//! record) still fails closed.
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -38,6 +45,234 @@ pub struct Restored {
     pub side: Value,
     pub last_event_seq: u64,
     pub event_log_offset: Option<u64>,
+    /// The previous process checkpointed while JavaScript cells or shell
+    /// sessions were still outstanding. Process-local handles cannot be
+    /// restored; resume discloses this to the model instead of refusing.
+    pub runtime_work_outstanding: bool,
+    /// Conversation or actions the event log recorded after the checkpoint.
+    /// `None` when the log and snapshot agree.
+    pub checkpoint_gap: Option<CheckpointGap>,
+}
+
+/// Digest of the event-log tail a snapshot does not cover. Built at resume,
+/// appended to the log as a `checkpoint_gap_recovered` milestone, and rendered
+/// into a model-facing notice so uncheckpointed effects can be re-verified.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CheckpointGap {
+    pub records: u64,
+    pub meaningful_records: u64,
+    pub assistant_steps: u64,
+    pub user_messages: u64,
+    pub tool_results: u64,
+    /// `name arguments` in log order, bounded by [`Self::MAX_TOOL_CALLS`].
+    pub tool_calls: Vec<String>,
+    pub omitted_tool_calls: u64,
+    /// User prompts and steers received after the checkpoint, bounded.
+    pub user_texts: Vec<String>,
+    pub omitted_user_texts: u64,
+    pub last_assistant_text: Option<String>,
+    /// `result` subtypes seen after the checkpoint.
+    pub results: Vec<String>,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+    /// Bytes of a torn final record (no trailing newline) removed from the log
+    /// so later appends stay parseable.
+    pub discarded_partial_bytes: u64,
+}
+
+impl CheckpointGap {
+    pub const MAX_TOOL_CALLS: usize = 60;
+    pub const MAX_USER_TEXTS: usize = 4;
+    const ARG_CHARS: usize = 160;
+    const TEXT_CHARS: usize = 400;
+
+    fn observe(&mut self, record: &Value, meaningful: bool) {
+        self.records += 1;
+        if let Some(ts) = record.get("ts").and_then(Value::as_str) {
+            if self.first_ts.is_none() {
+                self.first_ts = Some(ts.to_owned());
+            }
+            self.last_ts = Some(ts.to_owned());
+        }
+        if !meaningful {
+            return;
+        }
+        self.meaningful_records += 1;
+        let event = &record["event"];
+        match event["type"].as_str() {
+            Some("assistant") => {
+                self.assistant_steps += 1;
+                for block in event["message"]["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("tool_use") => {
+                            if self.tool_calls.len() < Self::MAX_TOOL_CALLS {
+                                let name = block["name"].as_str().unwrap_or("?");
+                                let args =
+                                    block.get("input").map(Value::to_string).unwrap_or_default();
+                                self.tool_calls.push(format!(
+                                    "{name} {}",
+                                    truncate_chars(&args, Self::ARG_CHARS)
+                                ));
+                            } else {
+                                self.omitted_tool_calls += 1;
+                            }
+                        }
+                        Some("text") => {
+                            if let Some(text) = block["text"].as_str()
+                                && !text.trim().is_empty()
+                            {
+                                self.last_assistant_text =
+                                    Some(truncate_chars(text.trim(), Self::TEXT_CHARS));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("user") if event.get("subtype").is_none() => {
+                let content = &event["message"]["content"];
+                let tool_results = content
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|block| block["type"] == "tool_result")
+                            .count() as u64
+                    })
+                    .unwrap_or(0);
+                if tool_results > 0 {
+                    self.tool_results += tool_results;
+                } else {
+                    self.user_messages += 1;
+                    let text = match content {
+                        Value::String(text) => text.clone(),
+                        Value::Array(blocks) => blocks
+                            .iter()
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        _ => String::new(),
+                    };
+                    if !text.trim().is_empty() {
+                        if self.user_texts.len() < Self::MAX_USER_TEXTS {
+                            self.user_texts
+                                .push(truncate_chars(text.trim(), Self::TEXT_CHARS));
+                        } else {
+                            self.omitted_user_texts += 1;
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                let subtype = event["subtype"].as_str().unwrap_or("unknown");
+                if let Some(text) = event["result"].as_str()
+                    && !text.trim().is_empty()
+                {
+                    self.last_assistant_text = Some(truncate_chars(text.trim(), Self::TEXT_CHARS));
+                }
+                self.results.push(subtype.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.meaningful_records == 0 && self.discarded_partial_bytes == 0
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "records": self.records,
+            "meaningful_records": self.meaningful_records,
+            "assistant_steps": self.assistant_steps,
+            "user_messages": self.user_messages,
+            "tool_results": self.tool_results,
+            "tool_calls": self.tool_calls,
+            "omitted_tool_calls": self.omitted_tool_calls,
+            "user_texts": self.user_texts,
+            "omitted_user_texts": self.omitted_user_texts,
+            "last_assistant_text": self.last_assistant_text,
+            "results": self.results,
+            "first_ts": self.first_ts,
+            "last_ts": self.last_ts,
+            "discarded_partial_bytes": self.discarded_partial_bytes,
+        })
+    }
+
+    /// Model-facing notice. `runtime_work_outstanding` adds the process-local
+    /// handle disclosure when the checkpoint itself carried that marker.
+    pub fn model_notice(&self, runtime_work_outstanding: bool) -> String {
+        let mut out = String::from(
+            "[Checkpoint gap recovered] The previous process for this session ended before \
+             saving its next checkpoint (for example it was cancelled or killed mid-turn). \
+             Everything up to the checkpoint is in your history. The following happened AFTER \
+             the checkpoint and is NOT in your history, although the durable session log \
+             recorded it:",
+        );
+        out.push_str(&format!(
+            "\n- {} model steps, {} tool results, {} user messages",
+            self.assistant_steps, self.tool_results, self.user_messages
+        ));
+        if let (Some(first), Some(last)) = (&self.first_ts, &self.last_ts) {
+            out.push_str(&format!(" between {first} and {last}"));
+        }
+        out.push('.');
+        if !self.user_texts.is_empty() {
+            out.push_str("\n- User messages received after the checkpoint:");
+            for text in &self.user_texts {
+                out.push_str(&format!("\n    - {text:?}"));
+            }
+            if self.omitted_user_texts > 0 {
+                out.push_str(&format!("\n    - (+{} more)", self.omitted_user_texts));
+            }
+        }
+        if !self.tool_calls.is_empty() {
+            out.push_str("\n- Tool calls made after the checkpoint, in order:");
+            for call in &self.tool_calls {
+                out.push_str(&format!("\n    - {call}"));
+            }
+            if self.omitted_tool_calls > 0 {
+                out.push_str(&format!("\n    - (+{} more)", self.omitted_tool_calls));
+            }
+        }
+        if let Some(text) = &self.last_assistant_text {
+            out.push_str(&format!(
+                "\n- Last assistant text after the checkpoint: {text:?}"
+            ));
+        }
+        if !self.results.is_empty() {
+            out.push_str(&format!(
+                "\n- Turn results recorded after the checkpoint: {}.",
+                self.results.join(", ")
+            ));
+        }
+        if self.discarded_partial_bytes > 0 {
+            out.push_str(&format!(
+                "\n- {} bytes of a torn final log record were discarded.",
+                self.discarded_partial_bytes
+            ));
+        }
+        if runtime_work_outstanding {
+            out.push_str(
+                "\n- The previous process also had unfinished JavaScript cells or shell sessions \
+                 whose output was never delivered.",
+            );
+        }
+        out.push_str(
+            "\nFiles, commits, and other durable effects of those actions are real. Re-read files \
+             and re-check state before repeating any of them; do not assume a listed action still \
+             needs doing, and do not assume it succeeded.",
+        );
+        out
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.char_indices();
+    match chars.nth(max_chars) {
+        Some((index, _)) => format!("{}…(+{} chars)", &text[..index], text.len() - index),
+        None => text.to_owned(),
+    }
 }
 
 pub struct SaveState<'a> {
@@ -224,17 +459,24 @@ impl SessionStore {
                     .with_context(|| format!("read resumed session {}", path.display()));
             }
         };
-        let restored = parse_restored(&body)
+        let mut restored = parse_restored(&body)
             .with_context(|| format!("invalid resumed session {}", source_path.display()))?;
-        validate_event_checkpoint(
+        restored.checkpoint_gap = inspect_event_checkpoint(
             &event_log_path(&source_path),
             restored.event_log_offset,
             restored.last_event_seq,
         )?;
         // A destination log with no destination snapshot cannot be merged with
         // a legacy source: it may describe a different, unsaved conversation.
-        if source_path != path {
-            validate_event_checkpoint(&event_log_path(&path), Some(0), restored.last_event_seq)?;
+        if source_path != path
+            && let Some(gap) =
+                inspect_event_checkpoint(&event_log_path(&path), Some(0), restored.last_event_seq)?
+        {
+            anyhow::bail!(
+                "destination event log {} already records {} events without a snapshot; it may describe a different conversation",
+                event_log_path(&path).display(),
+                gap.records
+            );
         }
         Ok(Self {
             id,
@@ -360,15 +602,15 @@ fn parse_restored(body: &str) -> Result<Restored> {
             "session has unresolved remote tool outcomes; reconcile external effects before starting a fresh session, because replaying or retrying may duplicate them"
         );
     }
-    if let Some(outstanding) = side.get("runtime_work_outstanding") {
-        let outstanding = outstanding
+    // Outstanding cells or shell sessions are process-local and cannot be
+    // restored. Resume proceeds and discloses the loss to the model (see
+    // `CheckpointGap::model_notice`) instead of refusing the session.
+    let runtime_work_outstanding = match side.get("runtime_work_outstanding") {
+        None => false,
+        Some(outstanding) => outstanding
             .as_bool()
-            .context("runtime_work_outstanding must be a boolean")?;
-        anyhow::ensure!(
-            !outstanding,
-            "session checkpoint contains outstanding runtime work or unconsumed cell/shell output; explicit recovery required before resume. Inspect durable effects and recover the recorded outcomes; process-local handles cannot be restored."
-        );
-    }
+            .context("runtime_work_outstanding must be a boolean")?,
+    };
     let last_event_seq = match object.get("last_event_seq") {
         None if version == 0 => 0,
         Some(value) => value
@@ -403,6 +645,8 @@ fn parse_restored(body: &str) -> Result<Restored> {
         side,
         last_event_seq,
         event_log_offset,
+        runtime_work_outstanding,
+        checkpoint_gap: None,
     })
 }
 
@@ -439,7 +683,13 @@ fn harmless_trailing_event(event: &Value) -> bool {
             Some("session_start" | "session_resume" | "compaction_start")
         ),
         Some("system") => match event["subtype"].as_str() {
-            Some("init" | "context_pressure" | "mcp_readiness") => true,
+            Some(
+                "init"
+                | "context_pressure"
+                | "mcp_readiness"
+                | "checkpoint_gap_recovered"
+                | "termination_signal",
+            ) => true,
             Some("turn_end_diagnostics") => {
                 event.get("turn_end").is_some_and(harmless_turn_diagnostics)
             }
@@ -463,28 +713,38 @@ fn harmless_turn_diagnostics(value: &Value) -> bool {
             })
 }
 
+/// Inspect the event log against the snapshot's checkpoint. Returns the digest
+/// of any conversation or actions recorded beyond the checkpoint (the caller
+/// resumes from the snapshot and discloses the digest), or `None` when the log
+/// and snapshot agree. A torn final record (a crash mid-write leaves no trailing
+/// newline) is removed so later appends stay parseable; its byte count is
+/// reported in the digest. Checkpoint corruption still fails closed: a log
+/// shorter than its offset, an offset that is not a record boundary, or an
+/// unparsable complete record.
 #[allow(clippy::disallowed_methods)]
-fn validate_event_checkpoint(
+pub(crate) fn inspect_event_checkpoint(
     path: &Path,
     event_log_offset: Option<u64>,
     last_event_seq: u64,
-) -> Result<()> {
+) -> Result<Option<CheckpointGap>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && event_log_offset.unwrap_or(0) == 0 =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("read resumed event log {}", path.display()));
         }
     };
+    let log_len = file.metadata()?.len();
+    let mut consumed = 0u64;
     if let Some(offset) = event_log_offset {
         anyhow::ensure!(
-            file.metadata()?.len() >= offset,
+            log_len >= offset,
             "session event log is shorter than its saved checkpoint: {}",
             path.display()
         );
@@ -498,8 +758,13 @@ fn validate_event_checkpoint(
             );
         }
         file.seek(SeekFrom::Start(offset))?;
+        consumed = offset;
     }
-    let mut unsequenced_meaningful = false;
+    let mut gap = CheckpointGap::default();
+    // Legacy sequence checkpoints: unsequenced records are covered only when a
+    // later sequenced record is itself covered by the snapshot.
+    let mut pending_unsequenced: Vec<(Value, bool)> = Vec::new();
+    let mut partial_trailing_bytes = 0u64;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut line_number = 0;
@@ -513,11 +778,11 @@ fn validate_event_checkpoint(
             break;
         }
         line_number += 1;
-        anyhow::ensure!(
-            line.ends_with('\n'),
-            "event log contains an incomplete final record: {}",
-            path.display()
-        );
+        if !line.ends_with('\n') {
+            partial_trailing_bytes = line.len() as u64;
+            break;
+        }
+        consumed += line.len() as u64;
         if line.trim().is_empty() {
             continue;
         }
@@ -542,31 +807,35 @@ fn validate_event_checkpoint(
             })
             .transpose()?;
         if event_log_offset.is_some() {
-            anyhow::ensure!(
-                !meaningful,
-                "session event log contains conversation or actions after the saved snapshot; explicit recovery required: {}",
-                path.display()
-            );
+            gap.observe(&record, meaningful);
         } else if let Some(seq) = seq {
             if seq <= last_event_seq {
-                unsequenced_meaningful = false;
+                pending_unsequenced.clear();
             } else {
-                anyhow::ensure!(
-                    !meaningful && !unsequenced_meaningful,
-                    "session event log is ahead of its saved snapshot; explicit recovery required: {}",
-                    path.display()
-                );
+                for (pending, pending_meaningful) in pending_unsequenced.drain(..) {
+                    gap.observe(&pending, pending_meaningful);
+                }
+                gap.observe(&record, meaningful);
             }
         } else {
-            unsequenced_meaningful |= meaningful;
+            pending_unsequenced.push((record, meaningful));
         }
     }
-    anyhow::ensure!(
-        event_log_offset.is_some() || !unsequenced_meaningful,
-        "session event log has uncheckpointed conversation or actions; explicit recovery required: {}",
-        path.display()
-    );
-    Ok(())
+    for (pending, pending_meaningful) in pending_unsequenced {
+        gap.observe(&pending, pending_meaningful);
+    }
+    drop(reader);
+    if partial_trailing_bytes > 0 {
+        // The torn bytes are not a record; dropping them keeps the next append
+        // from fusing with them into one unparsable line.
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_len(consumed))
+            .with_context(|| format!("drop torn final record from {}", path.display()))?;
+        gap.discarded_partial_bytes = partial_trailing_bytes;
+    }
+    Ok((!gap.is_empty()).then_some(gap))
 }
 
 #[cfg(test)]
@@ -654,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_runtime_checkpoint_refuses_resume_and_id_reuse() {
+    fn outstanding_runtime_checkpoint_resumes_with_disclosure_and_refuses_id_reuse() {
         let (_dir, root) = root();
         let store = SessionStore::open_in(&root, None, Some("outstanding"), None).unwrap();
         let mut snapshot = state();
@@ -663,9 +932,14 @@ mod tests {
         let path = store.store_path().clone();
         let before = std::fs::read(&path).unwrap();
         drop(store);
-        let error = format!("{:#}", resume(&root, "outstanding").unwrap_err());
-        assert!(error.contains("outstanding runtime work"), "{error}");
-        assert!(error.contains("explicit recovery required"), "{error}");
+        // Process-local handles cannot come back; resume proceeds and the
+        // constructor discloses the loss to the model instead of refusing.
+        let resumed = resume(&root, "outstanding").unwrap();
+        let restored = resumed.restored.as_ref().unwrap();
+        assert!(restored.runtime_work_outstanding);
+        assert!(restored.checkpoint_gap.is_none());
+        assert_eq!(restored.snapshot, state().snapshot);
+        drop(resumed);
         assert!(SessionStore::open_in(&root, None, Some("outstanding"), None).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
@@ -924,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_event_log_tail_refuses_stale_resume_even_without_sequence() {
+    fn meaningful_event_log_tail_is_recovered_as_a_checkpoint_gap_even_without_sequence() {
         let (_dir, root) = root();
         let events = [
             json!({"type":"user","message":{"content":"new unsaved turn"}}),
@@ -944,9 +1218,116 @@ mod tests {
             let id = format!("stale-{index}");
             let path = create_saved(&root, &id);
             append_events(&event_log_path(&path), &[event]);
-            let error = resume(&root, &id).unwrap_err();
-            assert!(format!("{error:#}").contains("explicit recovery"));
+            let store = resume(&root, &id).unwrap_or_else(|error| panic!("{id}: {error:#}"));
+            let restored = store.restored.as_ref().unwrap();
+            let gap = restored
+                .checkpoint_gap
+                .clone()
+                .unwrap_or_else(|| panic!("{id}: expected a checkpoint gap"));
+            assert_eq!(gap.records, 1, "{id}");
+            assert_eq!(gap.meaningful_records, 1, "{id}");
+            // The snapshot is still the authority for model history.
+            assert_eq!(restored.snapshot, state().snapshot, "{id}");
+            assert_eq!(restored.last_event_seq, 7, "{id}");
         }
+    }
+
+    #[test]
+    fn uncheckpointed_tail_is_digested_for_recovery() {
+        let (_dir, root) = root();
+        let path = create_saved(&root, "tail");
+        append_events(
+            &event_log_path(&path),
+            &[
+                json!({"type":"user","message":{"content":[{"type":"text","text":"continue the migration"}]}}),
+                json!({"type":"assistant","seq":8,"message":{"content":[
+                    {"type":"text","text":"Reading the plan."},
+                    {"type":"tool_use","id":"c1","name":"file_read","input":{"file_path":"PLAN.md"}}
+                ]}}),
+                json!({"type":"user","seq":9,"message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":"plan body"}]}}),
+                json!({"type":"assistant","seq":10,"message":{"content":[
+                    {"type":"tool_use","id":"c2","name":"shell_run","input":{"command":"cargo check"}}
+                ]}}),
+                json!({"type":"system","subtype":"context_pressure","seq":11}),
+            ],
+        );
+        let store = resume(&root, "tail").unwrap();
+        let restored = store.restored.as_ref().unwrap();
+        let gap = restored.checkpoint_gap.clone().unwrap();
+        assert_eq!(gap.records, 5);
+        assert_eq!(gap.meaningful_records, 4);
+        assert_eq!(gap.assistant_steps, 2);
+        assert_eq!(gap.user_messages, 1);
+        assert_eq!(gap.tool_results, 1);
+        assert_eq!(gap.user_texts, vec!["continue the migration"]);
+        assert_eq!(
+            gap.tool_calls,
+            vec![
+                r#"file_read {"file_path":"PLAN.md"}"#,
+                r#"shell_run {"command":"cargo check"}"#
+            ]
+        );
+        assert_eq!(
+            gap.last_assistant_text.as_deref(),
+            Some("Reading the plan.")
+        );
+        assert_eq!(gap.first_ts.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(gap.discarded_partial_bytes, 0);
+        let notice = gap.model_notice(false);
+        for expected in [
+            "[Checkpoint gap recovered]",
+            "continue the migration",
+            "file_read",
+            "cargo check",
+            "NOT in your history",
+            "Reading the plan.",
+        ] {
+            assert!(notice.contains(expected), "{expected}: {notice}");
+        }
+        assert!(!notice.contains("shell sessions"));
+        assert!(gap.model_notice(true).contains("shell sessions"));
+        assert_eq!(gap.to_json()["assistant_steps"], 2);
+        assert_eq!(gap.to_json()["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(restored.snapshot, state().snapshot);
+        assert_eq!(restored.last_event_seq, 7);
+    }
+
+    #[test]
+    fn legacy_sequence_checkpoint_ahead_of_snapshot_is_recovered_not_refused() {
+        let (_dir, root) = root();
+        let path = root.join("legacy.json");
+        write_atomic(
+            &path,
+            &json!({
+                "transport":"anthropic",
+                "model":"m",
+                "snapshot":[{"role":"user","content":[{"type":"text","text":"legacy task"}]}],
+                "last_event_seq": 7,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        append_events(
+            &event_log_path(&path),
+            &[
+                json!({"type":"assistant","seq":7}),
+                json!({"type":"user","message":{"content":"steer after checkpoint"}}),
+                json!({"type":"assistant","seq":8,"message":{"content":[
+                    {"type":"tool_use","id":"x","name":"file_write","input":{"file_path":"a.txt"}}
+                ]}}),
+            ],
+        );
+        let store = resume(&root, "legacy").unwrap();
+        let gap = store
+            .restored
+            .as_ref()
+            .unwrap()
+            .checkpoint_gap
+            .clone()
+            .unwrap();
+        assert_eq!(gap.meaningful_records, 2);
+        assert_eq!(gap.user_texts, vec!["steer after checkpoint"]);
+        assert_eq!(gap.tool_calls, vec![r#"file_write {"file_path":"a.txt"}"#]);
     }
 
     #[test]
@@ -981,17 +1362,51 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tail_and_invalid_byte_checkpoints_fail_closed() {
+    fn torn_tails_recover_and_invalid_byte_checkpoints_fail_closed() {
         let (_dir, root) = root();
+        // A torn final record (crash mid-write, no trailing newline) is dropped
+        // and reported, never refused: the bytes are not a record.
         let path = create_saved(&root, "torn");
         std::fs::write(event_log_path(&path), "{torn").unwrap();
-        assert!(resume(&root, "torn").is_err());
+        let store = resume(&root, "torn").unwrap();
+        let gap = store
+            .restored
+            .as_ref()
+            .unwrap()
+            .checkpoint_gap
+            .clone()
+            .unwrap();
+        assert_eq!(gap.discarded_partial_bytes, 5);
+        assert_eq!(gap.meaningful_records, 0);
+        assert!(gap.model_notice(false).contains("torn final log record"));
+        assert_eq!(std::fs::read(event_log_path(&path)).unwrap(), b"");
+        drop(store);
+        // A complete record without its newline is torn too, and dropping it
+        // keeps the next append parseable.
         std::fs::write(
             event_log_path(&path),
             json!({"event":{"type":"result"}}).to_string(),
         )
         .unwrap();
+        let store = resume(&root, "torn").unwrap();
+        assert!(
+            store
+                .restored
+                .as_ref()
+                .unwrap()
+                .checkpoint_gap
+                .as_ref()
+                .unwrap()
+                .discarded_partial_bytes
+                > 0
+        );
+        assert_eq!(std::fs::metadata(event_log_path(&path)).unwrap().len(), 0);
+        drop(store);
+        // A complete but unparsable record is corruption, not a torn write.
+        std::fs::write(event_log_path(&path), "{torn\n").unwrap();
         assert!(resume(&root, "torn").is_err());
+        std::fs::remove_file(event_log_path(&path)).unwrap();
+        // Checkpoint corruption still fails closed.
         let path = create_saved(&root, "boundary");
         let log = event_log_path(&path);
         append_events(&log, &[json!({"type":"result"})]);
@@ -1008,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sequence_checkpoint_rejects_new_actions_and_unsequenced_turns() {
+    fn legacy_sequence_checkpoint_recovers_new_actions_and_unsequenced_turns() {
         let (_dir, root) = root();
         let path = create_saved(&root, "legacy-seq");
         write_atomic(
@@ -1021,15 +1436,39 @@ mod tests {
             &log,
             &[json!({"type":"user"}), json!({"type":"assistant","seq":7})],
         );
-        drop(resume(&root, "legacy-seq").unwrap());
+        // Everything up to the covered sequence is the snapshot's: no gap.
+        let covered = resume(&root, "legacy-seq").unwrap();
+        assert!(covered.restored.as_ref().unwrap().checkpoint_gap.is_none());
+        drop(covered);
+        // An unsequenced user turn after the covered sequence is a gap.
         append_events(
             &log,
             &[json!({"type":"user","message":{"content":"unsaved"}})],
         );
-        assert!(resume(&root, "legacy-seq").is_err());
+        let store = resume(&root, "legacy-seq").unwrap();
+        let gap = store
+            .restored
+            .as_ref()
+            .unwrap()
+            .checkpoint_gap
+            .clone()
+            .unwrap();
+        assert_eq!(gap.meaningful_records, 1);
+        assert_eq!(gap.user_texts, vec!["unsaved"]);
+        drop(store);
+        // So is a sequenced action beyond the checkpoint.
         std::fs::write(&log, "").unwrap();
         append_events(&log, &[json!({"type":"assistant","seq":8})]);
-        assert!(resume(&root, "legacy-seq").is_err());
+        let store = resume(&root, "legacy-seq").unwrap();
+        let gap = store
+            .restored
+            .as_ref()
+            .unwrap()
+            .checkpoint_gap
+            .clone()
+            .unwrap();
+        assert_eq!(gap.meaningful_records, 1);
+        assert_eq!(gap.assistant_steps, 1);
     }
 
     #[test]
