@@ -1,22 +1,23 @@
 {
   "id": "gap-a7d80bb2",
-  "title": "Git-history activation replaces the whole commit lane on overlay-only drift",
+  "title": "Typed history publication republishes the whole consolidated commit lane",
   "gap_kind": "refactor_primitive",
   "domain": "history-activation",
-  "wanted_capability": "An overlay-selector-only update path in activate_source: when the committed journal's source generation and P3 generation are unchanged and only the code selector / overlay eligibility drifted, swap the overlay selectors without clearing overlays and re-running the full activation (which replaces the entire (repo_id, commit) tantivy lane). Under active development the current behavior re-commits the same generation every ~2 minutes: prod showed rh_5f9fcb37 (transcript-search, 3,303 commits) re-committing continuously, oscillating the corpus doc count 604,168 to 607,693, keeping edge sidecars churning so the EdgeIndex watcher rebuilt a 1.5M-edge graph near-continuously (rebuilds up to 375s), re-enqueueing a constant 3,591-doc embed residue every 5-minute sweep, and growing the daemon heap to its 48Gi limit (4 OOMKills in 3 days).",
-  "missing_primitive": "overlay-selector swap without whole-lane republication when source+P3 identity is unchanged",
-  "fallback_used": "Reduced upstream churn instead: code-source pre-upload currency probe (commit a3dbeb11) stops unchanged-tree code generations, so overlay eligibility flaps only when the tree genuinely changes.",
+  "wanted_capability": "Incremental typed-history publication in which ordinary HEAD advances publish commit-document deltas derived corpus-side from verified predecessor and successor manifests. Force-pushes and ancestry changes must select an explicit full-replacement recovery path. Overlay and code-selector revisions must evolve independently from a committed activation journal so selector-only drift does not republish commit documents. The governing proposal is design/daemon-runtime/incremental-history-publication.md.",
+  "missing_primitive": "Corpus-derived commit-lane delta publication with explicit full-replacement recovery, an overlay-revision ledger for committed activations, and rooted vector tombstoning across overlapping generation inventories.",
+  "fallback_used": "No-op currency checks prevent unchanged source trees from repeatedly activating, and operators can pause high-volume history publication and embedding. Genuine HEAD advances still pay the whole-lane publication cost.",
   "evidence": [
-    "src/server/history_activation.rs:277 (clear_transport_overlays_for_repo before full re-activation)",
-    "src/server/history_activation.rs:236-276 (no-op path whose committed_metadata_current check fails on code-selector drift)",
-    "prod blackboxd logs 2026-08-23: repeated 'typed Git-history activation committed' same ghs/p3, overlays toggling 0/1 every ~2min"
+    "crates/bbox-indexing/src/index/writer_actor.rs::run_history_generation_publication",
+    "crates/bbox-git-source-store/src/lib.rs::save_activation_journal",
+    "crates/bbox-indexing/src/index/history_gc.rs::tombstone_generation_vectors",
+    "design/daemon-runtime/incremental-history-publication.md"
   ],
-  "impact": "high",
-  "blocking_level": "workaround_available",
+  "impact": "critical",
+  "blocking_level": "blocks_class_of_work",
   "dedupe_key": "refactor_primitive/history-activation/overlay-only-drift-full-lane-replacement",
-  "notes": "Escalation (2026-08-23 01:36): a single tree change (gap-file commit) from a 42.5GiB plateau re-seeded the residue and OOMKilled the daemon (5th kill). The residue re-seeds to EXACTLY 51,593 docs on every boot and fully re-drains each time, then any next cycle parks the daemon at the 48Gi cap: that cohort's embed coverage never durably lands across restarts (likely the lane-replacement identity re-mint, possibly a separate coverage-persistence defect; each drain may also be real embedding-API spend, ~51k docs per cycle - check Voyage usage). Overnight mitigation: BLACKBOX_EMBED_SWEEP_INTERVAL_SECS=0 set directly on the cage deployment (kubectl set env, NOT in Pulumi, so the next converge drops it deliberately); post-rollout boot sits at 24.5GiB with the sweeper disabled. Morning: fix the currency coupling AND find why the 51,593 cohort's coverage does not persist, then re-enable the sweeper.",
+  "notes": "The proposed design preserves complete producer snapshots and derives deltas only after corpus-side verification. Its implementation gates include force-push recovery, crash-safe overlay revisions, rooted vector retention, sustained-cadence soak testing, and cross-restart coverage persistence. Earlier currency fixes removed no-op self-amplification but did not change the per-commit worst case.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:16Z",
-  "updated_at": "2026-08-23T08:03:04Z"
+  "updated_at": "2026-09-15T06:37:17Z"
 }

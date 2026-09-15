@@ -26,7 +26,7 @@ worst case every time.
 
 Production evidence (2026-08-08 through 2026-08-23):
 
-- `rh_5f9fcb37` (transcript-search, 3,303 commits) re-committed activation
+- One history-enabled repository with 3,303 commits re-committed activation
   continuously under active development; corpus doc count oscillated between
   604,168 and 607,693 as the lane was deleted and re-emitted.
 - Every lane replacement re-enqueued a ~3,591-doc embed residue per 5-minute
@@ -41,7 +41,7 @@ The 2026-08 patches (snapshot vector reuse `e8e37c68`, outcome-level overlay
 currency, code-source pre-upload currency probe `a3dbeb11`) removed the
 SELF-AMPLIFICATION: no-op re-activation loops and runaway provider spend on
 unchanged content. They did not touch the per-commit worst case. That cost is
-why the transcript-search and pg-flare history lanes are paused and the embed
+why two high-volume history lanes are paused and the embed
 sweeper is off (thread-78d7563a); this design is the gate for turning them
 back on.
 
@@ -583,7 +583,7 @@ Decision Ledger entry whose number is assigned at implementation time.
 4. Sweeper re-enable (remove `BLACKBOX_EMBED_SWEEP_INTERVAL_SECS=0` from
    bbox-cage index.ts, converge); first sweep is the one-time family
    migration.
-5. Unpause transcript-search and pg-flare `git_history`/`provenance`
+5. Unpause the affected high-volume `git_history`/`provenance`
    collector lanes; verify two passes with no re-activation churn and
    delta-sized publications.
 6. Prune the orphaned voyage-code-3 partition once nothing maps to it.
