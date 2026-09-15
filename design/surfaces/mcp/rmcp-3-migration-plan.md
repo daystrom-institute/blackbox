@@ -22,10 +22,24 @@ mechanics, and per-phase validation.
   `bro-harness`).
 - To: rmcp 3.x implementing MCP 2026-07-28. The title names the 3.0
   breaking-change migration, not an upper bound on the minor version.
-  Evaluate 3.2.0 as the concrete candidate: Codex now pins it in both its
-  manifest and lockfile (2026-09-10 source snapshot below). The existing
-  exemplar findings are from 3.1; rerun them against the selected version
-  before treating any SDK limitation as fixed or unchanged.
+  Evaluate 3.4.0 as the concrete candidate: crates.io reached 3.4.0 on
+  2026-09-15 (3.3.0 on 2026-09-10) while Codex still pins `=3.2.0`
+  (2026-09-15 source snapshot below). Relevant to this plan: 3.3.0 adds
+  `ServerHandler::negotiate_initialize` (#1247, reuse the SDK's version
+  negotiation from an `initialize` override) and enterprise refresh-token
+  and ID-JAG OAuth exchanges (#1234); 3.4.0 adds `ServerConfig` /
+  `ClientConfig` (#1266), formally deprecates the `ServerInfo` /
+  `ClientInfo` aliases (#1156, spike friction item 6), dispatches a
+  pre-init first request through the service loop so notifications sent
+  from that handler no longer deadlock (#1263), maps handler-generated
+  `HeaderMismatch` to HTTP 400 on the modern path (#1259), adds opt-in
+  strict Origin validation with 403 for malformed Origins (#1192, default
+  unchanged; absent Origin still passes), and stops treating malformed
+  JSON 200 responses as Accepted on the client (#1208). None of the 3.3
+  or 3.4 notes touch tasks, listen, `SubscriptionFilter`, MRTR, cache
+  hints, or MSRV. The existing exemplar findings are from 3.1; rerun them
+  against the selected version before treating any SDK limitation as
+  fixed or unchanged.
 - We skip the entire 2.x line. Most 2.x deprecations are removals in 3.0,
   and we already use the modern names (`CallToolRequestParams`, `ErrorData`,
   `*RequestParams`), so the skip is net favorable.
@@ -446,7 +460,72 @@ Probe history:
     unsupported-tasks server finding above is historical, not a current
     probe target. App-server APIs are separate from this deleted command.
   Source links and current behavior matrix live in the companion
-  [Codex section](mcp-2026-07-28-target-surface.md#codex-openai-as-second-data-point-source-rechecked-2026-09-10).
+  Codex section of the target-surface doc.
+
+- 2026-09-15, codex-rs HEAD eeded5ba1a1db09c627e9e7caa80c66cd7d3291d
+  (clean local source after fetch/pull; 190 commits after 242c5ce01c) plus
+  a LIVE WIRE CAPTURE of installed codex-cli 0.154.0 (npm package; sanitized
+  record in [codex-0.154.0-mcp-audit.json](codex-0.154.0-mcp-audit.json)):
+  - Source posture unchanged on every tripwire anchor. `rmcp = "=3.2.0"`
+    in manifest and lockfile (crates.io is at 3.4.0; see Scope).
+    `mcp_2026_07_28` and `codex_apps_mcp_2026_07_28` both still
+    UnderDevelopment, default false. `protocol_mode.rs`,
+    `client_capabilities.rs`, `tool_input.rs`,
+    `event_notification_transport.rs`, the MRTR test suite, and
+    `mcp-types` have no diff since 242c5ce01c. The literal tasks/listen
+    search still finds only backend REST task-list routes.
+  - New MCP-adjacent source work: per-connection advertised server
+    capabilities are now retained after `initialize` and exposed in
+    `codex mcp` status and the app-server `McpServerStatus` (#44826);
+    tool-call request `_meta` gains `sessionId` and `windowId` beside
+    `threadId`/`itemId` (#45409, post-0.154.0); enterprise-managed
+    registrations and an `ema_auth` server auth mode behind a new
+    `use_xaa` feature (default false), which `make_rmcp_client` currently
+    refuses (#44832, #45459); MCP OAuth manual callback input and OIDC
+    recovery from 503 metadata discovery (#44629, #44636); analytics
+    classification of elicitation and approval outcomes (#45649, #45716);
+    tool output schemas shared by `Arc` with the MCP envelope built lazily
+    (#45439). Guardian work moved into its extension and now routes review
+    requests through `/responses`; it does not touch the MCP client.
+    Still no tasks-extension consumer, no `subscriptions/listen`, and the
+    host extension allowlist is unchanged.
+  - Wire matrix (unmodified `/opt/homebrew/bin/codex exec`, cwd a
+    temporary directory, loopback logging sinks, real model inference with
+    the operator's login; per-invocation `-c` overrides, no config or
+    shared service mutated):
+    - Default mode against a legacy sink: pure legacy, byte-for-byte the
+      0.149.1 shape. `initialize` at `2025-06-18`, `Mcp-Session-Id` echo,
+      `notifications/initialized`, GET stream attempt (405 accepted),
+      `tools/list` with only `progressToken` in `_meta`, DELETE teardown.
+      No `server/discover`. The whole handshake ran twice per `exec`.
+    - `features.mcp_2026_07_28=true`, discover rejected with `-32601`:
+      leads with `server/discover` (`Mcp-Method` and
+      `mcp-protocol-version: 2026-07-28` headers, SEP-2575 `_meta`
+      self-description), then falls back cleanly to the legacy sequence
+      above. `ClientLifecycleMode::Auto` still works as designed.
+    - Flag on, discover answered (`supportedVersions`, `ttlMs`,
+      `cacheScope`, `tools.listChanged`): fully stateless. No initialize,
+      no session id, no GET, no DELETE. `tools/list` and `tools/call`
+      each carry the `Mcp-Method` header and the SEP-2575 `_meta` triple.
+      The `tools/call` `_meta` additionally carries Codex-owned keys:
+      `callId`, `threadId`, `itemId`, and an `x-codex-turn-metadata`
+      object (session/thread/turn ids, sandbox mode, model, reasoning
+      effort, `codex_version`). `sessionId`/`windowId` are absent at
+      0.154.0. No `Origin` and no `Authorization` header in any mode.
+    - Declared client capabilities in all modes: `elicitation: {form, url}`
+      only. No tasks, no listen. Codex advertised tool result handling
+      accepted the `resultType: complete` envelope.
+  - Exec-mode approval gate (new since 0.149.1): with the default exec
+    approval policy the first Probe C run stopped at "MCP tool call
+    requires approval, but approval policy is never" before any
+    `tools/call` was sent. `mcp_permission_prompt_is_auto_approved` only
+    auto-approves under `AskForApproval::Never` when the permission profile
+    has full disk write; `-s danger-full-access` made the call go through.
+    Any future `tools/call` wire probe in exec mode needs that selector or
+    an interactive approval.
+  - Verdict unchanged: modern stateless HTTP works by explicit opt-in;
+    default remains legacy; no tasks or listen. The 3.4.0 SDK is available
+    to evaluate but is not what Codex ships against.
 
 - 2026-09-10, Claude Code 2.1.267 (installed macOS arm64 binary; static
   audit plus isolated live HTTP matrix). Full provenance and sanitized
@@ -478,9 +557,54 @@ Probe history:
     inference or shared-service mutation. Task execution, per-resource
     subscriptions and MRTR interaction were not exercised.
 
+- 2026-09-15, Claude Code 2.1.272 (installed macOS arm64 binary, built
+  2026-09-14; static audit plus the same isolated live HTTP matrix, five
+  releases after 2.1.267). Full provenance and sanitized observations:
+  [audit record](claude-2.1.272-mcp-audit.json).
+  - Posture unchanged. Default and v2-only cases initialize at 2025-11-25
+    with a session id and GET stream. `MCP_SDK_GENERATION=v2
+    MCP_PROTOCOL_NEGOTIATION=auto` leads with `server/discover`, opens
+    `subscriptions/listen` for the three catalog list-change classes,
+    lists statelessly with `Mcp-Method` headers, refetches `tools/list` on
+    `tools/list_changed`, and after a dropped stream refetches, attempts one
+    GET, reopens listen (attempt 1) with a synthesized tools refetch, and
+    honors the next notification. Discover rejected with `-32601` falls back
+    to legacy. Declared capabilities are still only `roots` and
+    `elicitation`.
+  - Tasks stay DISABLED: the gate is now `ZD()` (renamed from `LI()`), still
+    literally `return!1`, gating both the legacy tasks declaration and the
+    extension-key insertion. Vocabulary is the legacy quadruple; no
+    `tasks/update`, no bare `notifications/tasks`.
+  - New in the decode: a claude.ai connector projection path sends base64
+    client capabilities and discover protocol headers under
+    `tengu_mcp_stateless_skip_init` (default true) and
+    `tengu_mcp_discover_projection_prior` (default off). It is specific to
+    the hosted connector path and was not exercised; it is present in
+    2.1.269 onward among installed builds.
+  - Connect-time listen budget observed: when the fixture's acknowledgement
+    was unmatched, the client waited about 25 s, sent
+    `notifications/cancelled` for the listen id, and connected without a
+    stream. Our listen implementation must echo the listen request id as the
+    subscription id in the ack `_meta`, ack first, and stream chunked.
+  - Upstream changelog items relevant to this plan: 2.1.269 stops
+    reconnecting when only the order of the server URL query parameters
+    changed (our `?surface=&project=` scope channel); 2.1.271 debounces
+    repeated tool-list requests when a server sends `list_changed` in a tight
+    loop and fixes resumed `-p` sessions whose tools are all MCP-provided.
+  - Live checks used the checked-in fixtures under `fixtures/`, the same
+    isolation as 2.1.267, and a Messages stub holding its first response so
+    list-change delivery was observable. No real inference or shared-service
+    mutation. Task execution, per-resource subscriptions and MRTR were not
+    exercised.
+
 ### Claude live tripwire
 
-For this build, a modern HTTP repro needs both implementation selectors:
+Reproduce the recorded matrix with the checked-in tooling
+(`fixtures/claude-audit-matrix.sh`, run under bash with `CLAUDE_BIN`
+pointing at the exact binary); it drives the five cases against
+`fixtures/claude-mcp-fixture.py` and `fixtures/claude-messages-stub.py`
+and prints per-case wire timelines. For a manual repro, a modern HTTP
+session needs both implementation selectors:
 
 ```bash
 MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude
@@ -509,7 +633,14 @@ rg -n 'io\.modelcontextprotocol/tasks|subscriptions/listen|notifications/tasks|t
 ```
 
 The final search currently finds only unrelated backend REST task-list
-routes, not MCP tasks. Inspect result handling (`rmcp-client/src/tool_input.rs`),
+routes, not MCP tasks. For the live matrix, the two loopback sinks used on
+2026-09-15 are checked in beside this doc
+(`fixtures/codex-mcp-sink-legacy.py` rejects discover and answers
+`initialize`; `fixtures/codex-mcp-sink-modern.py` answers discover,
+`tools/list`, and `tools/call`); run `codex exec --skip-git-repo-check -c
+'mcp_servers.sink.url="http://127.0.0.1:<port>/mcp"'` from a temporary cwd,
+add `-c features.mcp_2026_07_28=true` for the modern cases, and add `-s
+danger-full-access` when the prompt must reach `tools/call` in exec mode. Inspect result handling (`rmcp-client/src/tool_input.rs`),
 host extension selection (`codex-mcp/src/client_capabilities.rs`), and
 per-server mode selection (`codex-mcp/src/connection_manager.rs`) as well:
 absence of a literal is not sufficient evidence on its own. No-hit `rg`
@@ -526,17 +657,19 @@ fixture. Hosted Apps and modern stdio require their separate selectors.
 ### Flip criteria
 
 - **Core modern path (stateless lifecycle and discover)**: Claude Code
-  2.1.267 has the opt-in live matrix above; Codex has the 2026-08-24 live
-  capture plus the 2026-09-10 source check. The Q2 gate can flip once
+  2.1.272 has the opt-in live matrix above (unchanged from 2.1.267); Codex
+  0.154.0 has the 2026-09-15 live matrix (stateless discover, `tools/list`,
+  `tools/call`) plus the same-day source check. The Q2 gate can flip once
   Phase 1 lands and a live round-trip validates the intended client/endpoint.
-- **Catalog listen**: Claude Code 2.1.267 is a verified opt-in consumer for
-  list-change subscription, tool refetch and listen reopening. Codex is not.
+- **Catalog listen**: Claude Code 2.1.272 (and 2.1.267) is a verified
+  opt-in consumer for list-change subscription, tool refetch and listen
+  reopening. Codex is not.
   This does not establish task notifications or per-resource subscriptions.
   Validate MRTR and cache behavior separately when relying on them.
 - **Tasks extension**: flip only when an actual capability capture shows
   `io.modelcontextprotocol/tasks` declared and the consumer handles task
-  results. The 2.1.267 matrix declares neither legacy nor extension tasks,
-  consistent with its disabled gate. The 2.1.243 bundled-key finding is
+  results. The 2.1.267 and 2.1.272 matrices declare neither legacy nor
+  extension tasks, consistent with the disabled gate in both builds. The 2.1.243 bundled-key finding is
   historical and insufficient. A legacy top-level `tasks` declaration must
   still get plain JSON; only the extension declaration can select the
   modern task-result shape.
@@ -570,7 +703,9 @@ Friction items the spike surfaced (full writeup in the spike README):
    (our `progress.rs` pattern) is unaffected, but harness client code must
    not assume it controls the token value.
 6. `ServerInfo`/`ClientInfo` are non-exhaustive aliases: constructors and
-   fluent setters, no struct literals (mechanical, Phase 0 tail).
+   fluent setters, no struct literals (mechanical, Phase 0 tail). rmcp
+   3.4.0 deprecates the aliases outright (#1156); target the underlying
+   types when selecting 3.4.0.
 7. Modern lifecycle metadata validation is strict: a client advertising
    2026-07-28 without the required request `_meta` gets `-32602`. Matters
    for hand-rolled clients and for our harness client's modern path.

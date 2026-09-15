@@ -1,0 +1,106 @@
+{
+  "audit_date": "2026-09-15",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "package": "@openai/codex 0.154.0 (npm, Homebrew node)",
+    "version": "codex-cli 0.154.0",
+    "platform": "macos-arm64",
+    "native_path": "node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+    "size_bytes": 222655232,
+    "sha256": "4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc",
+    "installed_at": "2026-09-10"
+  },
+  "source_snapshot": {
+    "repo": "openai/codex",
+    "head": "eeded5ba1a1db09c627e9e7caa80c66cd7d3291d",
+    "previous_audited_head": "242c5ce01cd3388f7d23a87b68615b2042a04bfc",
+    "commits_since_previous": 190,
+    "rmcp_pin": "=3.2.0",
+    "crates_io_rmcp_latest": "3.4.0 (2026-09-15)",
+    "feature_gates": {
+      "mcp_2026_07_28": "UnderDevelopment, default_enabled=false",
+      "codex_apps_mcp_2026_07_28": "UnderDevelopment, default_enabled=false",
+      "use_xaa": "UnderDevelopment, default_enabled=false (new; enterprise refresh-token auth)"
+    },
+    "unchanged_anchors": [
+      "codex-rs/rmcp-client/src/protocol_mode.rs",
+      "codex-rs/codex-mcp/src/client_capabilities.rs",
+      "codex-rs/rmcp-client/src/tool_input.rs",
+      "codex-rs/rmcp-client/src/event_notification_transport.rs",
+      "codex-rs/rmcp-client/tests/mcp_2026_mrtr/",
+      "codex-rs/mcp-types/"
+    ],
+    "tasks_listen_literals": "none outside backend REST task-list routes",
+    "note": "The 0.154.0 binary predates #45409 (sessionId/windowId request metadata); rust-v0.154.0 is not tagged in the local checkout so the exact source cut is not pinned here."
+  },
+  "methodology": {
+    "live": "Unmodified /opt/homebrew/bin/codex exec --skip-git-repo-check from a temporary cwd. Per-invocation -c overrides only (mcp_servers.sink.url, features.mcp_2026_07_28); no config file, credential, or shared service mutated. Real model inference with the operator's login, narrow prompts. Fixtures listened on 127.0.0.1 only.",
+    "fixtures": "fixtures/codex-mcp-sink-legacy.py answers initialize at the requested version with Mcp-Session-Id and -32601 for every other request. fixtures/codex-mcp-sink-modern.py answers server/discover (supportedVersions 2026-07-28 and 2025-06-18, tools.listChanged, ttlMs, cacheScope), tools/list (one sink_echo tool), and tools/call with resultType complete envelopes.",
+    "sanitization": "Thread, session, turn, call, and item identifiers, and the model name from x-codex-turn-metadata, are replaced with <redacted>. Header and body shapes are otherwise verbatim.",
+    "limits": [
+      "No stdio probe; the CODEX_MCP_PROTOCOL_VERSION stdio recipe was not exercised.",
+      "No Hosted Apps probe; codex_apps_mcp_2026_07_28 was not exercised.",
+      "No elicitation, MRTR input_required, listen, or task result was presented to the client.",
+      "The legacy fixture returns 405 to the GET stream; long-lived SSE behavior was not observed.",
+      "Exec mode only; the interactive TUI approval path was not exercised."
+    ]
+  },
+  "cases": [
+    {
+      "id": "A-default-legacy-sink",
+      "config": {
+        "features.mcp_2026_07_28": "unset (default false)"
+      },
+      "fixture": "legacy",
+      "observed_sequence": [
+        "POST initialize protocolVersion=2025-06-18 capabilities={elicitation:{form:{},url:{}}} clientInfo=codex-mcp-client/0.154.0 (no mcp-protocol-version header)",
+        "POST notifications/initialized with mcp-session-id: sink-session-1 and mcp-protocol-version: 2025-06-18",
+        "GET /mcp with mcp-session-id (fixture answered 405)",
+        "POST tools/list params._meta={progressToken:0}",
+        "DELETE /mcp with mcp-session-id"
+      ],
+      "notes": [
+        "The full initialize..DELETE sequence ran twice within one codex exec invocation.",
+        "No server/discover, no Mcp-Method header, no Origin or Authorization header."
+      ],
+      "verdict": "pure legacy; identical shape to the 2026-08-24 capture of 0.149.1"
+    },
+    {
+      "id": "B-flag-on-discover-rejected",
+      "config": {
+        "features.mcp_2026_07_28": true
+      },
+      "fixture": "legacy (server/discover answered -32601)",
+      "observed_sequence": [
+        "POST server/discover with headers mcp-method: server/discover, mcp-protocol-version: 2026-07-28; params._meta carries io.modelcontextprotocol/protocolVersion=2026-07-28, io.modelcontextprotocol/clientInfo, io.modelcontextprotocol/clientCapabilities={elicitation:{form:{},url:{}}}",
+        "POST initialize protocolVersion=2025-06-18 (clean fallback)",
+        "POST notifications/initialized, GET /mcp, POST tools/list, DELETE /mcp exactly as case A"
+      ],
+      "notes": [
+        "Sequence ran twice per invocation, as in case A."
+      ],
+      "verdict": "ClientLifecycleMode::Auto fallback works; legacy path unchanged"
+    },
+    {
+      "id": "C-flag-on-discover-answered",
+      "config": {
+        "features.mcp_2026_07_28": true,
+        "sandbox": "danger-full-access (required for exec-mode MCP auto-approval)"
+      },
+      "fixture": "modern",
+      "observed_sequence": [
+        "POST server/discover (headers and _meta as case B)",
+        "POST tools/list with mcp-method: tools/list, mcp-protocol-version: 2026-07-28; params._meta = SEP-2575 triple plus progressToken:0",
+        "POST tools/call name=sink_echo arguments={text:hello} with mcp-method: tools/call; params._meta = {callId:<redacted>, x-codex-turn-metadata:{session_id:<redacted>, thread_id:<redacted>, turn_started_at_unix_ms:<redacted>, turn_id:<redacted>, node_repl_disabled:false, thread_source:user, sandbox:none, sandbox_mode:danger-full-access, auto_review_enabled:false, node_repl_auto_review_required:true, model:<redacted>, codex_version:0.154.0, reasoning_effort:<redacted>}, threadId:<redacted>, itemId:<redacted>, io.modelcontextprotocol/protocolVersion:2026-07-28, io.modelcontextprotocol/clientInfo, io.modelcontextprotocol/clientCapabilities, progressToken:1}",
+        "codex reported mcp: sink/sink_echo (completed) and answered done"
+      ],
+      "notes": [
+        "No initialize, no Mcp-Session-Id, no GET, no DELETE: fully stateless after discover.",
+        "First attempt without -s danger-full-access stopped before any tools/call with: MCP tool call requires approval, but approval policy is never.",
+        "sessionId and windowId (#45409) are absent in this binary.",
+        "Declared client capabilities: elicitation form and url only; no tasks or listen."
+      ],
+      "verdict": "modern stateless HTTP path including tools/call works by explicit opt-in"
+    }
+  ]
+}

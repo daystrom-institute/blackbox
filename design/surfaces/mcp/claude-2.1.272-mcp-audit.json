@@ -1,0 +1,322 @@
+{
+  "audit_date": "2026-09-15",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "version": "2.1.272",
+    "platform": "macos-arm64",
+    "path": "~/.local/share/claude/versions/2.1.272",
+    "size_bytes": 210702192,
+    "sha256": "195e24e8e1f9bf46f1eaee72d434a33e18f9f5796f29a6348a00d16c5f8aee75",
+    "embedded_build_time": "2026-09-14T22:54:44Z",
+    "embedded_git_sha": "013cad548b76e5d315ae72da82dce47cd7c99678"
+  },
+  "previous_audit": {
+    "version": "2.1.267",
+    "record": "claude-2.1.267-mcp-audit.json"
+  },
+  "methodology": {
+    "static": "Exact-byte vocabulary counts and bounded inspection of the embedded JavaScript (one bundled chunk is readable source; the runtime selector code is Bun bytecode and was decoded from its string table plus --debug-file log lines). Literal presence is distinct from reachable behavior. Medium confidence for minified call-graph readings.",
+    "live": "Unmodified installed binary, --bare -p, --tools '' (empty built-in tool set), --setting-sources '', --strict-mcp-config, explicit loopback-only MCP fixture, --debug-file. Each case used a fresh temporary cwd and CLAUDE_CONFIG_DIR under env -i. ANTHROPIC_API_KEY was a dummy value and ANTHROPIC_BASE_URL pointed to a local deterministic Messages stub holding its first response for 8 s so list-change delivery was observable. No real model inference or shared-service mutation. Fixtures: fixtures/claude-mcp-fixture.py, fixtures/claude-messages-stub.py, fixtures/claude-audit-matrix.sh.",
+    "fixture": "Discover advertised 2026-07-28 and 2025-11-25, all three catalog listChanged capabilities, resources.subscribe and the io.modelcontextprotocol/tasks extension. Listen answered as chunked SSE with the acknowledgement first, its subscription id equal to the listen request id, then tools/resources/prompts list_changed after the initial catalog lists. The legacy fixture rejected discover with -32601 and answered initialize at the requested version with Mcp-Session-Id and legacy tasks advertised, holding the GET stream. The drop fixture closed the first listen stream right after the notifications with no terminal JSON-RPC result.",
+    "fixture_lessons": [
+      "The acknowledgement is matched by _meta['io.modelcontextprotocol/subscriptionId'] EQUAL TO the listen request's JSON-RPC id; a server-minted id is ignored, the client waits ~25 s at connect time, sends notifications/cancelled for the listen id, and proceeds without a stream.",
+      "Selectors must reach the process as separate env assignments; a zsh loop passed both in one token and Claude logged the pair as invalid and stayed on the v1 arm.",
+      "The Messages stub must terminate its SSE body (chunked or Connection: close), or the client waits on the stream forever."
+    ],
+    "limits": [
+      "Account-specific remote rollout flags were not inspected; isolated defaults are not a universal rollout verdict.",
+      "Prompt/resource catalogs were empty; only tool refetches were observed after list_changed notifications.",
+      "No task result was returned to a client that did not declare support. Task execution and task notifications were not tested.",
+      "No per-URI resource subscription, MRTR elicitation interaction, or prolonged reconnect/parking behavior was live-tested.",
+      "The claude.ai connector projection headers were decoded statically only; no claude.ai connector was contacted."
+    ]
+  },
+  "static_findings": {
+    "task_methods": [
+      "tasks/cancel",
+      "tasks/get",
+      "tasks/list",
+      "tasks/result"
+    ],
+    "tasks_extension_literal_present": true,
+    "tasks_update_present": false,
+    "bare_tasks_notification_present": false,
+    "legacy_task_status_notification_present": true,
+    "task_gate": {
+      "byte_offset": 173831250,
+      "symbol": "ZD",
+      "body": "return!1",
+      "effect": "Client capabilities are {roots:{listChanged:true},elicitation:{}} plus tasks only when this gate is true; the v2 extension insertion of io.modelcontextprotocol/tasks is also conditional on it. Renamed from LI in 2.1.267; still literally false."
+    },
+    "runtime_selector": {
+      "env": "MCP_SDK_GENERATION",
+      "values": [
+        "v1",
+        "v2"
+      ],
+      "rollout_flag": "tengu_brindle_causeway",
+      "fallback": "v1",
+      "debug_line": "mcp runtime arm: v2 (source: env)"
+    },
+    "negotiation_selector": {
+      "env": "MCP_PROTOCOL_NEGOTIATION",
+      "values": [
+        "legacy",
+        "auto"
+      ],
+      "http_rollout_flag": "tengu_mcp_protocol_negotiation_http",
+      "server_denylist_flag": "tengu_mcp_negotiation_server_denylist",
+      "fallback": "legacy"
+    },
+    "listen_reopen": {
+      "filter": [
+        "toolsListChanged",
+        "promptsListChanged",
+        "resourcesListChanged"
+      ],
+      "listen_denylist_flag": "tengu_mcp_listen_server_denylist",
+      "debug_lines": [
+        "subscriptions/listen stream dropped (remote); attempting to re-listen",
+        "Re-opened subscriptions/listen stream (attempt 1)",
+        "Synthesized tools refetch after listen-stream reopen (no notification received)",
+        "Received tools/list_changed notification, refreshing tools"
+      ],
+      "connect_time_ack_budget_ms_observed": 25000
+    },
+    "claudeai_connector_projection": {
+      "flags": {
+        "tengu_mcp_stateless_skip_init": "default true",
+        "tengu_mcp_discover_projection_prior": "default off; legacy_only|all"
+      },
+      "headers": [
+        "anthropic-mcp-client-capabilities (base64 client capabilities, 6144-byte cap)",
+        "MCP-Protocol-Version",
+        "anthropic-mcp-discover-protocol-version"
+      ],
+      "scope": "claude.ai-hosted connector path only; not observed on the generic HTTP fixture",
+      "present_in_installed_builds": [
+        "2.1.269",
+        "2.1.270",
+        "2.1.272"
+      ]
+    },
+    "vocabulary_counts": {
+      "server/discover": 13,
+      "subscriptions/listen": 14,
+      "2026-07-28": 9,
+      "2025-11-25": 7,
+      "Mcp-Session-Id": 7,
+      "Last-Event-ID": 5,
+      "resources/subscribe": 7,
+      "tasks/update": 0,
+      "io.modelcontextprotocol/tasks": 3,
+      "inputResponses": 2,
+      "requestState": 4,
+      "input_required": 14,
+      "resultType": 17,
+      "ttlMs": 8,
+      "cacheScope": 10,
+      "mcp_task": 19,
+      "allowTask": 8,
+      "taskSupport": 5
+    }
+  },
+  "cases": [
+    {
+      "name": "isolated-default",
+      "environment_selectors": {},
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "note": "The modern-mode fixture answers initialize without offering Mcp-Session-Id, so no echo could occur here; session-id echo on the legacy path is verified by v2-auto-discover-rejected. The 2.1.267 record's fixture offered a session id in these cases."
+    },
+    {
+      "name": "v2-only",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "note": "The modern-mode fixture answers initialize without offering Mcp-Session-Id, so no echo could occur here; session-id echo on the legacy path is verified by v2-auto-discover-rejected. The 2.1.267 record's fixture offered a session id in these cases."
+    },
+    {
+      "name": "v2-auto-discover-success",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-auto-discover-rejected",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1
+    },
+    {
+      "name": "v2-auto-listen-stream-dropped",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capabilities": {
+        "roots": {
+          "listChanged": true
+        },
+        "elicitation": {}
+      },
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "drop_first_listen_stream",
+        "tools/list",
+        "GET",
+        "subscriptions/listen",
+        "tools/list",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 4,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "note": "The single GET after the dropped stream was answered 405 by the fixture; the client then reopened subscriptions/listen (listen:1) and synthesized a tools refetch before the next notification burst."
+    }
+  ]
+}
