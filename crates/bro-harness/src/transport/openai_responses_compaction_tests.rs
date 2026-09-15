@@ -144,39 +144,57 @@ async fn completed_inline_summary_replaces_prefix_and_preserves_tail() {
     request.await.unwrap();
 }
 
+fn stream(items: &[Value]) -> String {
+    let mut body = String::new();
+    for (index, item) in items.iter().enumerate() {
+        body += &event(json!({
+            "type":"response.output_item.done", "output_index":index, "item":item
+        }));
+    }
+    body + &event(json!({
+        "type":"response.completed", "response":{"status":"completed", "output":[]}
+    }))
+}
+
 #[tokio::test]
-async fn malformed_unary_outputs_leave_snapshot_unchanged() {
+async fn malformed_remote_compaction_streams_leave_snapshot_unchanged() {
     let good = json!({"type":"compaction_summary", "encrypted_content":"encrypted"});
-    for output in [
-        json!(null),
-        json!([]),
-        json!([{"type":"message", "role":"assistant", "content":[]}]),
-        json!([{"type":"compaction_summary"}]),
-        json!([{"type":"compaction_summary", "encrypted_content":" "}]),
-        json!([good.clone(), good.clone()]),
-        json!([good.clone(), 7]),
-        json!([good, {"type":"function_call_output", "call_id":"orphan", "output":"lost call"}]),
-    ] {
-        let (url, request) = server(json!({"output":output}).to_string(), "application/json").await;
+    let bodies = [
+        stream(&[]),
+        stream(&[json!({"type":"message", "role":"assistant", "content":[]})]),
+        stream(&[json!({"type":"compaction_summary"})]),
+        stream(&[json!({"type":"compaction_summary", "encrypted_content":" "})]),
+        stream(&[good.clone(), good.clone()]),
+        stream(&[good.clone(), json!(7)]),
+        event(json!({"type":"response.failed", "response":{"error":{"message":"failed"}}})),
+        event(json!({"type":"response.incomplete", "response":{"status":"incomplete"}})),
+        event(json!({"type":"response.output_item.done", "output_index":0, "item":good.clone()})),
+        String::new(),
+        // The retired unary route's JSON body is not a stream.
+        json!({"output":[good]}).to_string(),
+    ];
+    for body in bodies {
+        let (url, request) = server(body.clone(), "text/event-stream").await;
         let mut tx = transport(url, true);
         let before = tx.snapshot();
         assert!(
             tx.compact(params(), "summarize", &[], &opts())
                 .await
                 .is_err(),
-            "{output}"
+            "{body}"
         );
-        assert_eq!(tx.snapshot(), before);
+        assert_eq!(tx.snapshot(), before, "{body}");
         request.await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn unary_summary_aliases_round_trip_verbatim() {
+async fn remote_compaction_sends_trigger_and_rebuilds_retained_history() {
     for kind in ["compaction_summary", "compaction"] {
-        let output = json!([history()[0], {"type":kind, "encrypted_content":"encrypted", "id":"summary-id"}]);
-        let (url, request) = server(json!({"output":output}).to_string(), "application/json").await;
+        let summary = json!({"type":kind, "encrypted_content":"encrypted", "id":"summary-id"});
+        let (url, request) = server(stream(&[summary.clone()]), "text/event-stream").await;
         let mut tx = transport(url, true);
+        let before = tx.state.input.clone();
         assert_eq!(
             tx.compact(params(), "summarize", &[], &opts())
                 .await
@@ -184,10 +202,43 @@ async fn unary_summary_aliases_round_trip_verbatim() {
                 .as_deref(),
             Some("encrypted")
         );
-        assert_eq!(json!(tx.state.input), output);
+        // Retained: every user message in order, then the verbatim summary item.
+        let mut expected: Vec<Value> = before
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .cloned()
+            .collect();
+        expected.push(summary);
+        assert_eq!(json!(tx.state.input), json!(expected));
         assert_eq!(tx.state.ambient_hash, None);
-        request.await.unwrap();
+        let sent = request.await.unwrap();
+        let input = sent["input"].as_array().unwrap();
+        assert_eq!(input.last().unwrap(), &json!({"type":"compaction_trigger"}));
+        assert_eq!(&input[..input.len() - 1], &before[..]);
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
+        assert_eq!(sent["model"], "gpt-5.5");
+        assert!(
+            sent["instructions"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
     }
+}
+
+#[test]
+fn v2_retention_keeps_newest_user_messages_within_budget() {
+    let input = history();
+    let all = retain_for_v2(&input, RETAINED_MESSAGE_TOKEN_BUDGET);
+    assert_eq!(all.len(), 5);
+    assert!(all.iter().all(|item| item["role"] == "user"));
+    assert_eq!(all.last(), Some(&input[8]));
+    let one = crate::context::budget::text_tokens(&input[8].to_string());
+    assert_eq!(retain_for_v2(&input, one), vec![input[8].clone()]);
+    assert!(retain_for_v2(&input, 0).is_empty());
+    // Easy-input user messages without an explicit type are retained too.
+    let easy = vec![json!({"role":"user", "content":"plain"})];
+    assert_eq!(retain_for_v2(&easy, RETAINED_MESSAGE_TOKEN_BUDGET), easy);
 }
 
 fn oversized_input() -> Value {
@@ -222,7 +273,7 @@ fn fit_refuses_oversized_protected_content_and_keeps_unknown_models_compatible()
 
 #[tokio::test]
 async fn remote_compaction_failure_keeps_outputs_removed_from_request_copy() {
-    let (url, request) = server(json!({"output":[]}).to_string(), "application/json").await;
+    let (url, request) = server(stream(&[]), "text/event-stream").await;
     let mut tx = transport(url, true);
     let mut input = oversized_input()["input"].as_array().unwrap().clone();
     input[2]["output"] = json!("large output ".repeat(200_000));
@@ -239,6 +290,7 @@ async fn remote_compaction_failure_keeps_outputs_removed_from_request_copy() {
     assert_eq!(sent["input"][2]["output"], OMITTED_OUTPUT);
     assert_eq!(sent["input"][1], before["input"][1]);
     assert_eq!(sent["input"][3], before["input"][3]);
+    assert_eq!(sent["input"][5], json!({"type":"compaction_trigger"}));
 }
 
 #[test]

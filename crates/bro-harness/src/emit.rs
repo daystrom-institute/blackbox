@@ -153,6 +153,31 @@ impl Emitter {
         }));
     }
 
+    /// `system/compaction_failed`: an automatic or overflow compaction attempt
+    /// failed. The turn continues on the uncompacted history and the proactive
+    /// trigger backs off `retry_after_steps` model steps before trying again,
+    /// so a refusing backend is visible to the daemon instead of a silent
+    /// per-step retry.
+    pub fn compaction_failed(
+        &self,
+        trigger: &str,
+        error: &str,
+        consecutive_failures: u32,
+        retry_after_steps: u64,
+    ) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "compaction_failed",
+            "session_id": self.session_id,
+            "compact_metadata": {
+                "trigger": trigger,
+                "error": error,
+                "consecutive_failures": consecutive_failures,
+                "retry_after_steps": retry_after_steps,
+            },
+        }));
+    }
+
     /// `system/termination_signal`: the process received SIGTERM/SIGINT. The
     /// in-flight turn ends as an interrupt and the session checkpoints before
     /// exit, so the daemon sees why the turn stopped.

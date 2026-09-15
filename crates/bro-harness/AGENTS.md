@@ -86,6 +86,13 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   checkpoints, and the process exits. The daemon and fleetd wait on the child
   after signalling, so that final checkpoint is always observed. Embedded
   hosts keep their own signal handling (`Session.termination` stays inert).
+- Brodex compaction is server-side over the normal Responses stream (Codex
+  `compact_remote_v2`): history plus a trailing `compaction_trigger` item,
+  exactly one encrypted `compaction` item back, history rebuilt as the newest
+  user messages within the retained-token budget plus that item. There is no
+  unary compact endpoint any more; do not reintroduce one. A failed compaction
+  emits `compaction_failed` and the proactive trigger backs off exponentially;
+  it never fails the turn and never retries on every step.
 - Resume never refuses a snapshot for being behind its event log. The snapshot
   is the authority for model history; anything the log recorded after it
   (a cancelled or killed previous process) becomes a `CheckpointGap`: a

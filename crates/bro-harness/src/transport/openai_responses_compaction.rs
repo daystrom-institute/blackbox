@@ -66,16 +66,14 @@ pub(super) async fn collect_summary(response: reqwest::Response) -> Result<Strin
     }
 }
 
-pub(super) fn validate_output(response: Value) -> Result<(Vec<Value>, String)> {
-    let output = response
-        .get("output")
-        .and_then(Value::as_array)
-        .context("compaction response requires output array")?;
-    ensure!(!output.is_empty(), "compaction response output is empty");
-    // These aliases are both accepted by the native snapshot protocol. Do not
-    // normalize the returned type: encrypted items must round-trip verbatim.
-    super::super::snapshot::validate_snapshot("openai-responses", &Value::Array(output.clone()))?;
-    let summaries: Vec<_> = output
+/// Codex's `RETAINED_MESSAGE_TOKEN_BUDGET`: how much verbatim user context
+/// survives a server-side compaction, newest first.
+pub(super) const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 64_000;
+
+/// Exactly one encrypted compaction item from a v2 compaction stream. Both
+/// native aliases are accepted; the item is spliced verbatim, never rewritten.
+pub(super) fn validate_v2_output(output: &[Value]) -> Result<(Value, String)> {
+    let summaries: Vec<&Value> = output
         .iter()
         .filter(|item| {
             matches!(
@@ -86,20 +84,42 @@ pub(super) fn validate_output(response: Value) -> Result<(Vec<Value>, String)> {
         .collect();
     ensure!(
         summaries.len() == 1,
-        "compaction response requires exactly one encrypted summary"
+        "remote compaction expected exactly one compaction output item, got {} from {} output items",
+        summaries.len(),
+        output.len()
     );
-    let summary = summaries[0]["encrypted_content"]
+    let item = summaries[0];
+    let summary = item["encrypted_content"]
         .as_str()
         .filter(|text| !text.trim().is_empty())
         .context("compaction summary encrypted_content must be nonempty")?
         .to_owned();
-    let mut normalized = output.clone();
-    super::responses_common::normalize_responses_input(&mut normalized);
-    ensure!(
-        &normalized == output,
-        "compaction response contains incomplete tool pairs"
-    );
-    Ok((output.clone(), summary))
+    Ok((item.clone(), summary))
+}
+
+/// Codex's v2 retention shape: only user messages survive verbatim, newest
+/// first within `budget_tokens`; a boundary message that does not fit is
+/// dropped rather than split. Assistant turns and tool traffic are covered by
+/// the encrypted summary, and the ambient developer manifest is re-injected by
+/// the next turn. Order is preserved.
+pub(super) fn retain_for_v2(input: &[Value], budget_tokens: u64) -> Vec<Value> {
+    let mut remaining = budget_tokens;
+    let mut kept = Vec::new();
+    for item in input.iter().rev() {
+        let is_user_message =
+            item["role"] == "user" && item["type"].as_str().is_none_or(|kind| kind == "message");
+        if !is_user_message {
+            continue;
+        }
+        let tokens = crate::context::budget::text_tokens(&item.to_string()).max(1);
+        if tokens > remaining {
+            break;
+        }
+        remaining -= tokens;
+        kept.push(item.clone());
+    }
+    kept.reverse();
+    kept
 }
 
 const SUMMARY_SYSTEM: &str = "You summarize coding-agent conversations precisely and completely.";

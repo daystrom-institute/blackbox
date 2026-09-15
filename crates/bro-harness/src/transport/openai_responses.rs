@@ -302,31 +302,19 @@ impl OpenAiResponsesTransport {
         Ok(summary)
     }
 
-    /// Headers for the unary `responses/compact` request: like `apply_headers`
-    /// but `accept: application/json` (the compact endpoint returns a single JSON
-    /// object, not an SSE stream). Carries the same identity/auth + sticky
-    /// `x-codex-turn-state` so it routes to the same backend as turns.
-    fn apply_compact_headers(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut rb = rb
-            .header("content-type", "application/json")
-            .header("accept", "application/json")
-            .timeout(super::http::request_timeout());
-        for (name, value) in self.state.identity_auth_headers() {
-            rb = rb.header(name, value);
-        }
-        if let Some(ts) = &self.ws_turn_state {
-            rb = rb.header("x-codex-turn-state", ts.clone());
-        }
-        rb
-    }
-
-    /// Unary compaction uses structured history and opaque encrypted summaries.
-    /// Fit only tool-output payloads when the model window is known; preserve all
-    /// source history until a valid replacement arrives. The endpoint owns
-    /// retention and summarization. Both native encrypted-summary aliases are
-    /// accepted without rewriting their wire representation.
-    /// Returns the encrypted blob for the boundary size signal, or `None` when
-    /// there is nothing to compact. Invalid output is an error.
+    /// Server-side compaction over the normal Responses stream, as codex's
+    /// `compact_remote_v2`: the current history plus a trailing
+    /// `compaction_trigger` item is sent with the same request shape as a
+    /// turn, and the stream returns exactly one encrypted `compaction` item.
+    /// (The unary `responses/compact` route this replaced no longer exists on
+    /// the backend; it answers 404.) History is rebuilt client-side the way
+    /// codex does it: user messages retained verbatim, newest first within a
+    /// token budget, then the compaction item. Assistant turns and tool
+    /// traffic are covered by the summary; the ambient manifest is re-injected
+    /// on the next turn. The request is a fitted copy, so source history is
+    /// untouched until a valid replacement exists. Returns the encrypted blob
+    /// for the boundary size signal, or `None` when there is nothing to
+    /// compact.
     async fn remote_compact(
         &mut self,
         tools: &[super::ToolSpec],
@@ -336,48 +324,32 @@ impl OpenAiResponsesTransport {
         if self.state.input.len() < 2 {
             return Ok(None);
         }
-        let url = format!("{}/compact", self.http_endpoint);
-        let body = responses_common::build_compaction_input(&self.state.input, tools, opts);
+        let mut body = self.state.build_body(tools, opts);
+        body["input"]
+            .as_array_mut()
+            .context("compaction request requires input array")?
+            .push(json!({"type": "compaction_trigger"}));
         // Fit a copy: neither rejected requests nor invalid summaries may consume
         // the source history. Unknown model windows remain provider-validated.
         let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
         let body = compaction::fit_input(body, window)?;
-
-        let mut resp = super::http::send_with_retry("openai-responses/compact", || {
-            self.apply_compact_headers(self.http.post(&url))
-                .json(&body)
-                .send()
-        })
-        .await
-        .context("responses compact request")?;
-        // Single 401 recovery, mirroring `send_with_auth_recovery`.
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            && matches!(self.state.auth, Auth::ChatGpt { .. })
-        {
-            tracing::warn!("responses/compact 401; refreshing codex token and retrying once");
-            let fresh = super::codex_auth::force_refresh(&self.http)
-                .await
-                .context("responses/compact 401; codex token refresh failed")?;
-            self.state.auth = Auth::ChatGpt {
-                access_token: fresh.access_token,
-                account_id: fresh.account_id,
-            };
-            resp = super::http::send_with_retry("openai-responses/compact", || {
-                self.apply_compact_headers(self.http.post(&url))
-                    .json(&body)
-                    .send()
-            })
-            .await
-            .context("responses compact retry")?;
-        }
+        let resp = self
+            .send_with_auth_recovery("openai-responses/compact", &body)
+            .await?;
         let status = resp.status();
-        let text = resp.text().await.context("read compact body")?;
+        let text = resp.text().await.context("read compaction stream")?;
         if !status.is_success() {
-            anyhow::bail!("openai responses compact {status}: {text}");
+            anyhow::bail!(responses_common::classify_http_error(status, &text));
         }
-        let v: Value = serde_json::from_str(&text).context("parse compact response")?;
-        let (output, summary) = compaction::validate_output(v)?;
-        self.state.input = output;
+        let output = responses_common::parse_sse_output_items(&text)
+            .map_err(|error| responses_common::responses_failure(error, &text))?;
+        let (summary_item, summary) = compaction::validate_v2_output(&output)?;
+        let mut rebuilt =
+            compaction::retain_for_v2(&self.state.input, compaction::RETAINED_MESSAGE_TOKEN_BUDGET);
+        rebuilt.push(summary_item);
+        super::snapshot::validate_snapshot("openai-responses", &Value::Array(rebuilt.clone()))?;
+        self.state.input = rebuilt;
+        self.state.normalize_for_prompt();
         // The rebuilt buffer no longer carries the persisted ambient manifest;
         // reset the hash so the next turn re-injects it.
         self.state.ambient_hash = None;
@@ -532,8 +504,9 @@ mod tests {
     use serde_json::json;
 
     /// LIVE e2e (ignored, double-gated): drives the real `compact()` →
-    /// `remote_compact()` path — `build_compaction_input` + POST
-    /// `/responses/compact` + splice — against the ChatGPT backend. Needs codex
+    /// `remote_compact()` path — history + `compaction_trigger` through the
+    /// Responses stream, then the retained-history rebuild — against the
+    /// ChatGPT backend. Needs codex
     /// OAuth (no `OPENAI_API_KEY`). Run with:
     ///   `BRO_HARNESS_LIVE_PROBE=1 [BRO_HARNESS_PROBE_MODEL=gpt-5.5]
     ///    cargo test -p bro-harness --bins probe_remote_compact_e2e -- --ignored --nocapture`
@@ -597,11 +570,11 @@ mod tests {
         );
         assert!(summary.is_some(), "remote_compact should return a summary");
         assert!(
-            tx.state
-                .input
-                .iter()
-                .any(|i| i["type"] == "compaction_summary"),
-            "compacted history must contain a compaction_summary item"
+            tx.state.input.iter().any(|i| matches!(
+                i["type"].as_str(),
+                Some("compaction" | "compaction_summary")
+            )),
+            "compacted history must contain an encrypted compaction item"
         );
         assert!(
             tx.state
@@ -609,6 +582,24 @@ mod tests {
                 .iter()
                 .any(|i| i["type"] == "message" && i["role"] == "user"),
             "compacted history should retain user messages"
+        );
+
+        // The rebuilt history (retained user messages + the encrypted
+        // compaction item) must be accepted as replay on the next turn.
+        struct NoSink;
+        impl super::super::TurnSink for NoSink {
+            fn stream_event(&self, _: Value) {}
+        }
+        tx.push_user_text("Reply with only the magic token you were asked to remember.");
+        let out = tx
+            .run_turn(&[], &opts, &NoSink)
+            .await
+            .expect("turn after compaction must be accepted by the backend");
+        eprintln!("[e2e] post-compaction reply: {:?}", out.text);
+        assert!(
+            out.text.contains("KIWI-9"),
+            "model should recall the retained token after compaction: {:?}",
+            out.text
         );
     }
 }

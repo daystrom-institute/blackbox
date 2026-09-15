@@ -22,6 +22,16 @@ out explicitly under `Changed` or `Removed`.
   re-verifies instead of repeating, drops a torn final log record, and refuses
   only genuine checkpoint corruption. A checkpoint taken while cells or shell
   sessions were outstanding is likewise disclosed rather than refused.
+- Brodex (OpenAI Responses over ChatGPT OAuth) compaction works again. The
+  backend retired the unary `responses/compact` route (it answers 404), so
+  every automatic compaction had been failing silently on every model step.
+  The harness now compacts the way Codex does: the history plus a trailing
+  `compaction_trigger` item goes through the normal Responses stream, the
+  single encrypted `compaction` item comes back, and history is rebuilt as
+  the newest user messages within a 64k-token budget plus that item. A failed
+  compaction now emits a `compaction_failed` system event with the error and
+  backs the proactive trigger off exponentially instead of retrying on every
+  step.
 
 
 ### Removed

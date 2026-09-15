@@ -806,6 +806,10 @@ struct Session {
     /// Model-facing notice for a checkpoint gap or lost runtime work found at
     /// resume, delivered once with the next instruction context.
     resume_gap_notice: Option<String>,
+    /// Consecutive failed compaction attempts; cleared by a successful one.
+    compaction_failures: u32,
+    /// The proactive trigger stays quiet until `turns` reaches this step.
+    compaction_retry_after_turn: u64,
     /// Flips to true on SIGTERM/SIGINT (`termination_signal`). Loops stop
     /// admitting input and the in-flight turn is interrupted and checkpointed.
     termination: watch::Receiver<bool>,
@@ -1442,6 +1446,8 @@ impl Session {
             scoped_project_docs,
             resume_runtime_reset: restored_snapshot,
             resume_gap_notice,
+            compaction_failures: 0,
+            compaction_retry_after_turn: 0,
             // Only the standalone binary owns process signals; embedded hosts
             // (the fleet cockpit) keep their own handling. `run_with_emitter`
             // and `run_session` install `termination_signal()` after build.
@@ -1600,7 +1606,31 @@ impl Session {
         )
     }
 
+    /// A failed compaction is loud and rate-limited: the daemon sees a
+    /// `compaction_failed` system event, and the proactive trigger backs off
+    /// exponentially (2, 4, ... 32 model steps) instead of re-sending the whole
+    /// history on every step to a backend that keeps refusing.
+    fn note_compaction_failure(&mut self, trigger: &str, error: &anyhow::Error) {
+        self.compaction_failures = self.compaction_failures.saturating_add(1);
+        let backoff_steps = 1u64 << self.compaction_failures.min(5);
+        self.compaction_retry_after_turn = self.turns.saturating_add(backoff_steps);
+        tracing::warn!(
+            trigger,
+            failures = self.compaction_failures,
+            backoff_steps,
+            "compaction failed: {error:#}"
+        );
+        self.emitter.compaction_failed(
+            trigger,
+            &format!("{error:#}"),
+            self.compaction_failures,
+            backoff_steps,
+        );
+    }
+
     fn reset_compaction_context(&mut self) {
+        self.compaction_failures = 0;
+        self.compaction_retry_after_turn = 0;
         self.last_prompt_tokens = 0;
         self.pending_input_estimate = 0;
         self.last_request_overhead_tokens = 0;
@@ -1822,29 +1852,36 @@ impl Session {
                         .compact_threshold
                         .is_some_and(|threshold| projected > threshold)
                     {
-                        self.event_log.append_milestone(
-                            "compaction_start",
-                            self.emitter.session_id(),
-                            json!({"reason":"auto", "projected_tokens":projected}),
-                        );
-                        match self
-                            .tx
-                            .compact(
-                                self.compaction.params(),
-                                crate::compaction::COMPACTION_INSTRUCTION,
-                                &tool_specs,
-                                &opts,
-                            )
-                            .await
-                        {
-                            Ok(Some(summary)) => {
-                                self.emitter
-                                    .compact_boundary("auto", projected, summary.len());
-                                self.reset_compaction_context();
-                                continue 'attempt;
+                        if self.turns < self.compaction_retry_after_turn {
+                            tracing::debug!(
+                                retry_after_turn = self.compaction_retry_after_turn,
+                                "auto compaction backing off after failure"
+                            );
+                        } else {
+                            self.event_log.append_milestone(
+                                "compaction_start",
+                                self.emitter.session_id(),
+                                json!({"reason":"auto", "projected_tokens":projected}),
+                            );
+                            match self
+                                .tx
+                                .compact(
+                                    self.compaction.params(),
+                                    crate::compaction::COMPACTION_INSTRUCTION,
+                                    &tool_specs,
+                                    &opts,
+                                )
+                                .await
+                            {
+                                Ok(Some(summary)) => {
+                                    self.emitter
+                                        .compact_boundary("auto", projected, summary.len());
+                                    self.reset_compaction_context();
+                                    continue 'attempt;
+                                }
+                                Ok(None) => {}
+                                Err(error) => self.note_compaction_failure("auto", &error),
                             }
-                            Ok(None) => {}
-                            Err(error) => tracing::warn!("compaction failed: {error:#}"),
                         }
                     }
                 }
@@ -1915,7 +1952,7 @@ impl Session {
                             // original error.
                             Ok(None) => return Err(e),
                             Err(ce) => {
-                                tracing::warn!("overflow compaction failed: {ce:#}");
+                                self.note_compaction_failure("overflow", &ce);
                                 return Err(e);
                             }
                         }
@@ -4127,6 +4164,8 @@ mod tests {
             scoped_project_docs: Arc::new(crate::project_doc::ScopedProjectDocs::default()),
             resume_runtime_reset: false,
             resume_gap_notice: None,
+            compaction_failures: 0,
+            compaction_retry_after_turn: 0,
             termination: never_terminates(),
             strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
             dispatch: crate::context::dispatch::DispatchState::default(),
@@ -7320,6 +7359,47 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn failed_auto_compaction_is_reported_and_backs_off() {
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::HighUsageFollowUp,
+            MockTurn::HighUsageFollowUp,
+            MockTurn::HighUsageFollowUp,
+            MockTurn::Text("done".into()),
+        ]);
+        shared.compact_fail.store(true, Ordering::SeqCst);
+        session.compact_threshold = Some(1);
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        session.emitter = Emitter::with_callback(
+            "fixture".into(),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
+        );
+        run_user_turn(&mut session, "keep going").await;
+        assert_eq!(shared.started.load(Ordering::SeqCst), 4);
+        // Steps one and three attempt; the failure at step one backs the
+        // trigger off two steps, the one at step three backs it off four.
+        assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 2);
+        let events = events.lock().unwrap();
+        let failures: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["subtype"] == "compaction_failed")
+            .collect();
+        assert_eq!(failures.len(), 2, "{events:?}");
+        assert_eq!(failures[0]["compact_metadata"]["trigger"], "auto");
+        assert_eq!(failures[0]["compact_metadata"]["consecutive_failures"], 1);
+        assert_eq!(failures[0]["compact_metadata"]["retry_after_steps"], 2);
+        assert_eq!(failures[1]["compact_metadata"]["consecutive_failures"], 2);
+        assert_eq!(failures[1]["compact_metadata"]["retry_after_steps"], 4);
+        assert!(
+            failures[0]["compact_metadata"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic compaction failure")
+        );
+        assert!(events.iter().any(|event| event["type"] == "result"));
     }
 
     #[tokio::test]

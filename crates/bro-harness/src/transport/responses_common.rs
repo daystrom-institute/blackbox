@@ -315,28 +315,6 @@ pub(super) fn build_body(
     body
 }
 
-/// Build the unary `responses/compact` request body (`CompactionInput`). The
-/// backend applies retention server-side and returns the replacement `input[]`
-/// (retained user/developer/system messages + one encrypted `compaction_summary`
-/// item), so this is just the current history + tools + instructions — no
-/// streaming, no `store`, no plaintext rendering. Codex-faithful minimal shape,
-/// validated live (design/bro-harness/brodex-compaction.md §5).
-pub(super) fn build_compaction_input(
-    input: &[Value],
-    tools: &[ToolSpec],
-    opts: &TurnOpts,
-) -> Value {
-    let tool_defs: Vec<Value> = tools.iter().map(responses_tool_definition).collect();
-    let instructions = response_instructions(opts);
-    json!({
-        "model": opts.model,
-        "input": input,
-        "instructions": instructions,
-        "tools": tool_defs,
-        "parallel_tool_calls": false,
-    })
-}
-
 fn responses_tool_definition(t: &ToolSpec) -> Value {
     if let Some(grammar) = &t.grammar {
         json!({
@@ -390,6 +368,81 @@ pub(super) fn parse_sse(
 ) -> Result<TurnOutput> {
     parse_sse_validated(input, custom_tool_call_ids, sse)
         .map_err(|error| responses_failure(error, sse))
+}
+
+/// Output items of one completed Responses stream, without touching history.
+/// Server-side compaction uses this: its only output is the encrypted
+/// compaction item, which the caller splices into a rebuilt history itself.
+/// A failed, incomplete, or unterminated stream is an error.
+pub(super) fn parse_sse_output_items(sse: &str) -> Result<Vec<Value>> {
+    let mut output_items: Vec<Value> = Vec::new();
+    let mut final_output = None;
+    let mut terminal = false;
+    for line in sse.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let ev: Value = serde_json::from_str(data).context("invalid Responses SSE JSON")?;
+        anyhow::ensure!(!terminal, "Responses event after terminal response");
+        match ev["type"].as_str().unwrap_or("") {
+            "response.output_item.done" => {
+                let item = ev
+                    .get("item")
+                    .context("completed output item missing payload")?;
+                anyhow::ensure!(
+                    item.is_object() && item["type"].as_str().is_some_and(|kind| !kind.is_empty()),
+                    "invalid Responses output item"
+                );
+                output_items.push(item.clone());
+            }
+            "response.completed" | "response.incomplete" => {
+                terminal = true;
+                let r = &ev["response"];
+                anyhow::ensure!(r.is_object(), "Responses terminal missing response object");
+                anyhow::ensure!(
+                    ev["type"] == "response.completed"
+                        && r["status"]
+                            .as_str()
+                            .is_none_or(|status| status == "completed"),
+                    "Responses stream did not complete"
+                );
+                if let Some(output) = r.get("output").and_then(Value::as_array)
+                    && !output.is_empty()
+                {
+                    final_output = Some(output.clone());
+                }
+            }
+            "response.failed" | "error" => {
+                let err = if ev["type"] == "response.failed" {
+                    &ev["response"]["error"]
+                } else {
+                    &ev["error"]
+                };
+                let code = err["code"]
+                    .as_str()
+                    .or_else(|| ev["code"].as_str())
+                    .unwrap_or("");
+                let message = err["message"]
+                    .as_str()
+                    .or_else(|| ev["message"].as_str())
+                    .unwrap_or(data);
+                if matches!(code, "context_length_exceeded" | "context_window_exceeded") {
+                    return Err(anyhow::Error::new(super::ContextWindowExceeded(
+                        classify_stream_error(code, message),
+                    )));
+                }
+                anyhow::bail!(classify_stream_error(code, message));
+            }
+            _ => {}
+        }
+    }
+    anyhow::ensure!(terminal, "Responses stream closed before terminal response");
+    Ok(final_output.unwrap_or(output_items))
 }
 
 pub(super) fn responses_failure(error: anyhow::Error, sse: &str) -> anyhow::Error {
@@ -1821,40 +1874,6 @@ mod tests {
         );
         assert!(classify_stream_error("server_is_overloaded", "busy").contains("overloaded"));
         assert!(classify_stream_error("", "boom").contains("boom"));
-    }
-
-    #[test]
-    fn build_compaction_input_is_codex_faithful() {
-        let input = vec![json!({
-            "type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "hi"}]
-        })];
-        let tools = vec![ToolSpec {
-            name: "do_thing".into(),
-            description: "does a thing".into(),
-            schema: json!({"type": "object"}),
-            grammar: None,
-        }];
-        let body = build_compaction_input(
-            &input,
-            &tools,
-            &opts(SystemPrompt {
-                stable: Some("BASE".into()),
-                ambient: None,
-                volatile: Some("VOL".into()),
-            }),
-        );
-        assert_eq!(body["model"], "gpt-5-codex");
-        // Stable instructions only; the volatile developer item is NOT appended
-        // (unlike a normal turn) — the server compacts the literal history.
-        assert_eq!(body["instructions"], "BASE");
-        assert_eq!(body["input"].as_array().unwrap().len(), 1);
-        assert_eq!(body["parallel_tool_calls"], false);
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "do_thing");
-        // Unary endpoint: no stream / store fields.
-        assert!(body.get("stream").is_none());
-        assert!(body.get("store").is_none());
     }
 
     #[test]

@@ -688,6 +688,7 @@ fn harmless_trailing_event(event: &Value) -> bool {
                 | "context_pressure"
                 | "mcp_readiness"
                 | "checkpoint_gap_recovered"
+                | "compaction_failed"
                 | "termination_signal",
             ) => true,
             Some("turn_end_diagnostics") => {
