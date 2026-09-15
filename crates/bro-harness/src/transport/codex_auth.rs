@@ -29,7 +29,7 @@ pub struct ChatGptAuth {
     pub account_id: String,
 }
 
-fn codex_home() -> PathBuf {
+pub(super) fn codex_home() -> PathBuf {
     super::session_var("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))

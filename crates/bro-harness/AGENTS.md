@@ -52,6 +52,17 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   as a utilization denominator manufactures false ceiling alarms on model
   families the table has not learned yet. Unknown means `None`, all the way
   out to the consumer.
+- Windows for ChatGPT-backed models come from the backend catalog
+  (`transport/model_catalog.rs`, codex's `models` endpoint via its fresh cache
+  or a fetch), not the built-in table: `context_window` is the target the loop
+  manages to, the compaction limit is 90 percent of it, and
+  `max_context_window` is the hard ceiling the backend actually enforces. The
+  two differ by 3x on current models, so occupancy above 1.0 of the target is
+  not a rejection. The table is the fallback; `BRO_HARNESS_COMPACTION_CONFIG`
+  overrides both.
+- The request-size estimate discounts encrypted reasoning and compaction
+  payloads (decoded bytes less a fixed envelope, per codex); never count
+  base64 as tokens.
 - The per-step `context_pressure` system event carries occupancy
   (cache-inclusive `last_turn_input_tokens`) plus the window and threshold.
   It fires every model step so observers can follow request occupancy while

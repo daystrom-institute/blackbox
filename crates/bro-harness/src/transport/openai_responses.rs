@@ -38,6 +38,9 @@ pub struct OpenAiResponsesTransport {
     /// requests after a WS→HTTP fallback so they stay sticky to the same backend
     /// (routing/cache-warmth hint). `None` until a fallback occurs.
     ws_turn_state: Option<String>,
+    /// Backend model catalog (ChatGPT-OAuth only): the provider's own window
+    /// and compaction limits per model. Empty when unavailable.
+    catalog: Vec<super::ModelLimits>,
 }
 
 impl OpenAiResponsesTransport {
@@ -52,12 +55,27 @@ impl OpenAiResponsesTransport {
         } else {
             None
         };
+        let state = ResponsesState::new(auth);
+        // The backend publishes each model's window and compaction limit; the
+        // loop manages to those numbers instead of a hardcoded table.
+        let catalog = if matches!(state.auth, Auth::ChatGpt { .. }) {
+            super::model_catalog::load(
+                &http,
+                &http_endpoint,
+                state.identity_auth_headers(),
+                &super::codex_auth::codex_home(),
+            )
+            .await
+        } else {
+            Vec::new()
+        };
         Ok(Self {
-            state: ResponsesState::new(auth),
+            state,
             http,
             http_endpoint,
             ws,
             ws_turn_state: None,
+            catalog,
         })
     }
 
@@ -384,6 +402,13 @@ impl Transport for OpenAiResponsesTransport {
         self.state.session_id = id;
     }
 
+    fn model_limits(&self, model: &str) -> Option<super::ModelLimits> {
+        self.catalog
+            .iter()
+            .find(|limits| limits.slug == model)
+            .cloned()
+    }
+
     fn push_user_text(&mut self, text: &str) {
         self.state.push_user_text(text);
     }
@@ -596,6 +621,14 @@ mod tests {
             .await
             .expect("turn after compaction must be accepted by the backend");
         eprintln!("[e2e] post-compaction reply: {:?}", out.text);
+        let limits = tx.model_limits(&opts.model);
+        eprintln!("[e2e] catalog limits for {}: {limits:?}", opts.model);
+        assert!(
+            limits
+                .as_ref()
+                .is_some_and(|limits| limits.target_window().is_some()),
+            "the backend catalog should publish a window for the probe model"
+        );
         assert!(
             out.text.contains("KIWI-9"),
             "model should recall the retained token after compaction: {:?}",
@@ -616,6 +649,7 @@ mod budget_tests {
             http_endpoint: "http://127.0.0.1:1".into(),
             ws: None,
             ws_turn_state: None,
+            catalog: Vec::new(),
         };
         let mut opts = TurnOpts {
             model: "gpt-5.5".into(),

@@ -466,6 +466,7 @@ impl Emitter {
         last_turn_input_tokens: u64,
         context_window: Option<u64>,
         compaction_threshold: Option<u64>,
+        max_context_window: Option<u64>,
     ) {
         let mut context = json!({
             "last_turn_input_tokens": last_turn_input_tokens,
@@ -475,6 +476,12 @@ impl Emitter {
         }
         if let Some(t) = compaction_threshold {
             context["compaction_threshold"] = json!(t);
+        }
+        // The backend's hard ceiling, when the catalog publishes one. It
+        // differs from `context_window` (the target the loop manages to), so
+        // occupancy above 1.0 of the target is not a rejection.
+        if let Some(m) = max_context_window {
+            context["max_context_window"] = json!(m);
         }
         self.write_line(json!({
             "type": "system",
@@ -965,7 +972,7 @@ mod tests {
         };
         let emitter = Emitter::with_callback("session-pressure".into(), sink);
 
-        emitter.context_pressure(164_000, Some(200_000), Some(150_000));
+        emitter.context_pressure(164_000, Some(200_000), Some(150_000), Some(872_000));
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -975,6 +982,7 @@ mod tests {
         assert_eq!(events[0]["context"]["last_turn_input_tokens"], 164_000);
         assert_eq!(events[0]["context"]["context_window"], 200_000);
         assert_eq!(events[0]["context"]["compaction_threshold"], 150_000);
+        assert_eq!(events[0]["context"]["max_context_window"], 872_000);
     }
 
     #[test]
@@ -988,7 +996,7 @@ mod tests {
         };
         let emitter = Emitter::with_callback("session-unknown".into(), sink);
 
-        emitter.context_pressure(9_000, None, None);
+        emitter.context_pressure(9_000, None, None, None);
 
         let events = captured.lock().unwrap();
         let context = &events[0]["context"];

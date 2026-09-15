@@ -78,6 +78,7 @@ fn transport(endpoint: String, oauth: bool) -> OpenAiResponsesTransport {
         http_endpoint: endpoint,
         ws: None,
         ws_turn_state: None,
+        catalog: Vec::new(),
     }
 }
 

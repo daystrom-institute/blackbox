@@ -146,6 +146,11 @@ impl CompactionPolicy {
 
     /// Token count above which the prefix should be compacted, or `None` when
     /// compaction is disabled or the window is unknown/zero.
+    /// Whether automatic compaction is enabled at all (`BRO_HARNESS_COMPACTION`).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn threshold(&self, model: &str) -> Option<u64> {
         if !self.enabled {
             return None;

@@ -32,6 +32,17 @@ out explicitly under `Changed` or `Removed`.
   compaction now emits a `compaction_failed` system event with the error and
   backs the proactive trigger off exponentially instead of retrying on every
   step.
+- Brodex context windows come from the backend's model catalog, as in Codex.
+  The harness reads codex's fresh `models_cache.json` or fetches the `models`
+  endpoint at session start and manages each model to its published
+  `context_window` with the compaction limit at 90 percent of it, publishing
+  the catalog's `max_context_window` (the backend's hard ceiling, 872k for
+  gpt-6-astra against a 272k target) as `max_context_window` on
+  `context_pressure`. The built-in table remains the fallback, and an explicit
+  `BRO_HARNESS_COMPACTION_CONFIG` still wins. The request-size estimate now
+  discounts encrypted reasoning payloads the way Codex does instead of
+  counting their base64 as tokens, which had inflated long sessions' projected
+  occupancy by 20 to 30 percent.
 
 
 ### Removed

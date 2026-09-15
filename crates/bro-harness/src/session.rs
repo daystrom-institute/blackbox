@@ -1342,7 +1342,7 @@ mod tests {
                 .with_seq_counter(std::sync::Arc::new(AtomicU64::new(7)));
         emitter.system_init_session();
         emitter.control_response_success(Some("synthetic-request"));
-        emitter.context_pressure(10, Some(100), Some(75));
+        emitter.context_pressure(10, Some(100), Some(75), None);
         emitter.turn_end_diagnostics(
             json!({"last_tool_results":[],"outstanding_shell_sessions":{"count":0,"ids":[]}}),
         );

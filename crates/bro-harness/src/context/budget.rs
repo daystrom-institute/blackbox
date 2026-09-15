@@ -44,7 +44,7 @@ impl RequestEstimate {
     /// string; the four-byte heuristic is approximate, not a tokenizer promise.
     pub(crate) fn new(snapshot: &Value, tools: &[ToolSpec], opts: &TurnOpts) -> Self {
         let history = snapshot.get("input").unwrap_or(snapshot);
-        let history_tokens = json_tokens(history);
+        let history_tokens = history_tokens(history);
         let mut overhead_tokens = 64u64;
         for text in [
             opts.base_instructions.as_ref().and_then(|base| base.text()),
@@ -97,6 +97,42 @@ pub(crate) fn text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4)
 }
 
+/// History tokens with codex's discount for encrypted payloads: reasoning and
+/// compaction items carry base64 whose model-visible cost is roughly the
+/// decoded bytes less a fixed envelope, not the raw JSON length. Counting the
+/// raw bytes made long brodex sessions look 20 to 30 percent larger than the
+/// provider measured them.
+fn history_tokens(history: &Value) -> u64 {
+    let Some(items) = history.as_array() else {
+        return json_tokens(history);
+    };
+    items
+        .iter()
+        .map(item_tokens)
+        .fold(0u64, u64::saturating_add)
+}
+
+fn item_tokens(item: &Value) -> u64 {
+    let encrypted = match item["type"].as_str() {
+        Some("reasoning" | "compaction" | "compaction_summary") => {
+            item["encrypted_content"].as_str()
+        }
+        _ => None,
+    };
+    match encrypted {
+        Some(content) => encrypted_payload_tokens(content.len()),
+        None => json_tokens(item),
+    }
+}
+
+/// codex `estimate_reasoning_length`: base64 decodes to 3/4 of its length,
+/// minus a 650-byte envelope, then the four-bytes-per-token heuristic.
+fn encrypted_payload_tokens(encoded_len: usize) -> u64 {
+    ((encoded_len as u64).saturating_mul(3) / 4)
+        .saturating_sub(650)
+        .div_ceil(4)
+}
+
 fn json_tokens(value: &Value) -> u64 {
     struct ByteCount(u64);
     impl std::io::Write for ByteCount {
@@ -130,6 +166,24 @@ mod tests {
             web_search: false,
             service_tier: None,
         }
+    }
+
+    #[test]
+    fn encrypted_reasoning_is_discounted_like_codex() {
+        let encoded = "A".repeat(4_000);
+        let reasoning = json!({"type":"reasoning","id":"rs_1","encrypted_content":encoded});
+        let message = json!({"type":"message","role":"user","content":[{"type":"input_text","text":"x".repeat(4_000)}]});
+        // 4000 base64 chars decode to 3000 bytes, less the 650-byte envelope:
+        // 2350 bytes, so 588 tokens instead of the ~1000 the raw JSON implies.
+        assert_eq!(item_tokens(&reasoning), 588);
+        assert!(json_tokens(&reasoning) > 1_000);
+        assert_eq!(item_tokens(&message), json_tokens(&message));
+        assert_eq!(encrypted_payload_tokens(100), 0);
+        let history = json!([reasoning, message]);
+        assert_eq!(
+            history_tokens(&history),
+            item_tokens(&history[0]) + item_tokens(&history[1])
+        );
     }
 
     #[test]

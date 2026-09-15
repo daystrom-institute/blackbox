@@ -787,6 +787,44 @@ async fn run_prompt_with_controls(
     Ok(())
 }
 
+/// The window and compaction limit the loop manages a model to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedWindow {
+    context_window: Option<u64>,
+    compact_threshold: Option<u64>,
+    max_context_window: Option<u64>,
+}
+
+/// The transport's backend catalog wins when it knows the model: codex's own
+/// numbers, `context_window` as the target, 90% of it as the compaction
+/// limit, `max_context_window` as the hard ceiling. An operator compaction
+/// config file, a transport without a catalog, or an unknown model falls back
+/// to the built-in table.
+fn resolve_window(
+    tx: &dyn Transport,
+    policy: &crate::compaction::CompactionPolicy,
+    model: &str,
+) -> ResolvedWindow {
+    if transport::session_var("BRO_HARNESS_COMPACTION_CONFIG").is_none()
+        && let Some(limits) = tx.model_limits(model)
+        && let Some(window) = limits.target_window()
+    {
+        return ResolvedWindow {
+            context_window: Some(window),
+            compact_threshold: policy
+                .enabled()
+                .then(|| limits.auto_compact_limit())
+                .flatten(),
+            max_context_window: limits.max_context_window,
+        };
+    }
+    ResolvedWindow {
+        context_window: policy.context_window(model),
+        compact_threshold: policy.threshold(model),
+        max_context_window: None,
+    }
+}
+
 /// Persistent per-dispatch state, shared by both entry modes.
 struct Session {
     tx: Box<dyn Transport>,
@@ -838,6 +876,9 @@ struct Session {
     /// it. `None` for a model the table does not recognize; consumers then
     /// report occupancy with no utilization rather than guessing.
     context_window: Option<u64>,
+    /// The backend's hard ceiling for the current model, when its catalog
+    /// publishes one; `context_window` is the target the loop manages to.
+    max_context_window: Option<u64>,
     /// Ordinary tool-result output limit in bytes (0 disables the limit).
     tool_result_cap: usize,
     store: SessionStore,
@@ -1382,8 +1423,10 @@ impl Session {
             return Err(error);
         }
         let compaction = crate::compaction::CompactionPolicy::from_env();
-        let compact_threshold = compaction.threshold(&base_opts.model);
-        let context_window = compaction.context_window(&base_opts.model);
+        let window = resolve_window(tx.as_ref(), &compaction, &base_opts.model);
+        let compact_threshold = window.compact_threshold;
+        let context_window = window.context_window;
+        let max_context_window = window.max_context_window;
 
         // Timestamp the session boundary in the sidecar log. Daemon-launched
         // workers receive the dispatch provider through
@@ -1460,6 +1503,7 @@ impl Session {
             compaction,
             compact_threshold,
             context_window,
+            max_context_window,
             tool_result_cap,
             strategy,
             dispatch,
@@ -1485,8 +1529,14 @@ impl Session {
         {
             let requested_model = session.base_opts.model.clone();
             session.base_opts.model = previous_model;
-            session.context_window = session.compaction.context_window(&session.base_opts.model);
-            session.compact_threshold = session.compaction.threshold(&session.base_opts.model);
+            let window = resolve_window(
+                session.tx.as_ref(),
+                &session.compaction,
+                &session.base_opts.model,
+            );
+            session.context_window = window.context_window;
+            session.compact_threshold = window.compact_threshold;
+            session.max_context_window = window.max_context_window;
             let transition = session.apply_control(&requested_model).await;
             // Startup compaction and cancellation observations must share the
             // checkpoint even if changing models is rejected.
@@ -1516,8 +1566,9 @@ impl Session {
 
     /// Fit history with the previous model before committing a smaller model.
     async fn apply_control(&mut self, model: &str) -> Result<()> {
-        let next_window = self.compaction.context_window(model);
-        let next_threshold = self.compaction.threshold(model);
+        let next = resolve_window(self.tx.as_ref(), &self.compaction, model);
+        let next_window = next.context_window;
+        let next_threshold = next.compact_threshold;
         if model != self.base_opts.model
             && let (Some(previous_window), Some(window)) = (self.context_window, next_window)
             && previous_window > window
@@ -1589,6 +1640,7 @@ impl Session {
         self.base_opts.model = model.to_owned();
         self.compact_threshold = next_threshold;
         self.context_window = next_window;
+        self.max_context_window = next.max_context_window;
         tracing::info!(model, "set_model");
         Ok(())
     }
@@ -1973,6 +2025,7 @@ impl Session {
                 self.last_prompt_tokens,
                 self.context_window,
                 self.compact_threshold,
+                self.max_context_window,
             );
             // The response is retained history for the next request. Provider
             // output usage includes reasoning, which visible text alone misses.
@@ -3422,6 +3475,7 @@ mod tests {
         compact_block: Arc<std::sync::atomic::AtomicBool>,
         compact_gate: Arc<Notify>,
         compact_fail: Arc<std::sync::atomic::AtomicBool>,
+        model_limits: Arc<Mutex<Option<transport::ModelLimits>>>,
         model_gate: Arc<Notify>,
         tool_started: Arc<AtomicUsize>,
         tool_gate: Arc<Notify>,
@@ -3632,6 +3686,14 @@ mod tests {
         }
         fn restore(&mut self, snapshot: Value) {
             *self.shared.pushed_users.lock().unwrap() = serde_json::from_value(snapshot).unwrap();
+        }
+        fn model_limits(&self, model: &str) -> Option<transport::ModelLimits> {
+            self.shared
+                .model_limits
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|limits| limits.slug == model)
         }
         async fn compact(
             &mut self,
@@ -4185,6 +4247,7 @@ mod tests {
             compaction: crate::compaction::CompactionPolicy::from_env(),
             compact_threshold: None,
             context_window: None,
+            max_context_window: None,
             tool_result_cap: 0,
             store: store.unwrap_or_else(SessionStore::temporary_for_test),
             event_log: Arc::new(EventLog::disabled()),
@@ -7359,6 +7422,29 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn catalog_limits_win_over_the_built_in_window_table() {
+        let (session, shared) = mk_session(vec![]);
+        let table = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-6-astra");
+        assert_eq!(table.context_window, Some(272_000));
+        assert_eq!(table.compact_threshold, Some(204_000));
+        assert_eq!(table.max_context_window, None);
+        *shared.model_limits.lock().unwrap() = Some(transport::ModelLimits {
+            slug: "gpt-6-astra".into(),
+            context_window: Some(272_000),
+            max_context_window: Some(872_000),
+            auto_compact_token_limit: None,
+            effective_context_window_percent: 95,
+        });
+        let catalog = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-6-astra");
+        assert_eq!(catalog.context_window, Some(272_000));
+        assert_eq!(catalog.compact_threshold, Some(244_800));
+        assert_eq!(catalog.max_context_window, Some(872_000));
+        // A model the catalog does not name still resolves from the table.
+        let other = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-5.5");
+        assert_eq!(other, table);
     }
 
     #[tokio::test]

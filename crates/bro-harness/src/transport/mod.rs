@@ -19,6 +19,8 @@
 
 pub mod anthropic;
 mod catalog_prompt;
+pub mod model_catalog;
+pub use model_catalog::ModelLimits;
 pub mod codex_auth;
 pub mod http;
 pub mod openai_chat;
@@ -455,6 +457,13 @@ pub trait Transport: Send {
     /// construction with the harness session id. Default: no-op (transports that
     /// don't carry a session identity on the wire).
     fn set_session_id(&mut self, _id: String) {}
+
+    /// Provider-published limits for `model` (target window, hard maximum,
+    /// auto-compaction limit) when the transport learned them from its
+    /// backend catalog. `None` falls back to the harness's built-in table.
+    fn model_limits(&self, _model: &str) -> Option<ModelLimits> {
+        None
+    }
 
     /// Append the user's turn to the (transport-native) conversation.
     fn push_user_text(&mut self, text: &str);
