@@ -8,6 +8,16 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Project indexing passes are substantially faster on large projects. Three
+  hot spots in the per-project index pass were fixed: the code-edge derivation
+  compiled two regexes for every chunk, the chunker recounted newlines from
+  byte zero for every symbol's line numbers (quadratic in file size, and
+  struct fields and impl blocks are symbols), and the Git history overlay
+  spawned one `git diff-tree` per commit so every pass scaled with history
+  depth. Touched files now come from the same single `git log` call that reads
+  the commits, with rename detection disabled so the result matches the
+  plumbing output exactly. The test that indexes the live checkout is now an
+  opt-in benchmark; the gate test runs against a synthetic fixture.
 - Session browsing now enumerates retained transcript history without producer
   filesystem access, with source/account filters and bounded recency pages.
   Session-name filters report unavailable indexed metadata explicitly.

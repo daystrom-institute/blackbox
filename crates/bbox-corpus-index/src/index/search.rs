@@ -2828,25 +2828,80 @@ mod agentic_project_file_tests {
         record
     }
 
+    /// A small git-backed project carrying the three document shapes the
+    /// searchability test anchors on: a design note under `design/`, a Rust
+    /// trait, and a Rust `Display` impl. The paths mirror the live repo's
+    /// so the ignored live-checkout variant below shares the assertions.
+    fn markdown_and_rust_fixture(root: &Path) {
+        std::fs::create_dir_all(root.join("design/corpus/agentic-corpus")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("design/corpus/agentic-corpus/agentic-corpus.md"),
+            "# Agentic corpus\n\nThe agentic-corpus design covers typed entities and edges.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/store_persister.rs"),
+            "/// Snapshot contract for persisted stores.\npub trait StoreSnapshot {\n    fn snapshot_bytes(&self) -> Vec<u8>;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/entity_ref.rs"),
+            "use std::fmt::{self, Display};\n\npub struct EntityRef {\n    pub id: String,\n}\n\nimpl Display for EntityRef {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"entity:{}\", self.id)\n    }\n}\n",
+        )
+        .unwrap();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        run_git(root, &["config", "user.email", "test@example.test"]);
+        run_git(root, &["add", "."]);
+        run_git(
+            root,
+            &["commit", "-m", "fixture: design note and rust sources"],
+        );
+    }
+
     #[test]
     fn registered_project_markdown_and_rust_source_are_searchable() {
         let dir = tempfile::tempdir().unwrap();
-        let projects_path = dir.path().join("projects.json");
-        // This test indexes the live repo (design/ + src/). The engine crate
-        // lives at <repo>/crates/bbox-corpus-index, so re-root two levels up.
+        let work = dir.path().canonicalize().unwrap();
+        let repo_root = work.join("repo");
+        std::fs::create_dir(&repo_root).unwrap();
+        markdown_and_rust_fixture(&repo_root);
+        assert_markdown_and_rust_project_searchable(&work, &repo_root);
+    }
+
+    /// The same assertions against the live checkout (design/ plus every
+    /// crate) and its full Git history. Ignored: its cost grows with the
+    /// repository every month and it depends on whatever sits in the
+    /// checkout, so it is an opt-in indexing benchmark against real data,
+    /// not a gate. Run it from the workspace root with
+    /// `cargo nextest run --workspace --run-ignored all -E
+    /// 'test(=index::search::agentic_project_file_tests::live_checkout_markdown_and_rust_source_are_searchable)'`.
+    #[test]
+    #[ignore = "indexes the live checkout: opt-in benchmark, not a gate"]
+    fn live_checkout_markdown_and_rust_source_are_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().canonicalize().unwrap();
+        // The engine crate lives at <repo>/crates/bbox-corpus-index, so
+        // re-root two levels up.
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap();
+        assert_markdown_and_rust_project_searchable(&work, repo_root);
+    }
+
+    fn assert_markdown_and_rust_project_searchable(work: &Path, repo_root: &Path) {
+        let projects_path = work.join("projects.json");
         let project = register_test_project(&projects_path, repo_root);
 
         let mut index = TranscriptIndex::open_or_create_with_records(
-            &dir.path().join("index"),
+            &work.join("index"),
             Vec::new(),
             None,
             projects_path,
-            dir.path().join("knowledge.json"),
-            dir.path().join("threads.json"),
+            work.join("knowledge.json"),
+            work.join("threads.json"),
             std::sync::Arc::new(
                 crate::index::StaticProjectRecordsProvider::from_bridge_records(
                     vec![project.clone()],
@@ -2886,12 +2941,11 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(design_hits.contains("design/corpus/agentic-corpus/agentic-corpus.md"));
+        assert!(
+            design_hits.contains("design/corpus/agentic-corpus/agentic-corpus.md"),
+            "{design_hits}"
+        );
 
-        // Anchor on a trait that lives in the root package's src/ today.
-        // (The original anchor, SourceFormatChunker in src/chunker/, was
-        // refactored away when the chunker moved to the bbox-chunker crate —
-        // this test indexes the live repo, so anchors must track it.)
         let trait_hits = index
             .search(&SearchParams {
                 query: "trait StoreSnapshot".into(),
@@ -2907,7 +2961,10 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(trait_hits.contains("src/store_persister.rs"));
+        assert!(
+            trait_hits.contains("src/store_persister.rs"),
+            "{trait_hits}"
+        );
 
         let display_hits = index
             .search(&SearchParams {
@@ -2924,12 +2981,12 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(display_hits.contains("src/entity_ref.rs"));
+        assert!(display_hits.contains("src/entity_ref.rs"), "{display_hits}");
 
         let rerun = index
             .build_index_with_project_access(false, &[access])
             .unwrap();
-        assert!(rerun.contains("skipped"));
+        assert!(rerun.contains("skipped"), "{rerun}");
     }
 
     #[test]

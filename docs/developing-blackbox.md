@@ -43,8 +43,11 @@ Measured timing story (M-series laptop, 14 threads, warm `target/`,
 | `cargo nextest run --workspace --profile full` (3,702 tests) | ~85s |
 | `cargo test --lib` (legacy fallback, root package only) | ~610s |
 
-The fold gate's wall-clock is pinned by the single 80s index/search agentic
-test; the mid-cycle gate's by ~5s artifact-install tests. Cold worktree builds
+The fold gate's wall-clock is pinned by the extended catalog migration fault
+matrix (~68s alone on a warm Mac); the mid-cycle gate's by ~5s artifact-install
+tests. The test that indexes the live checkout is an `#[ignore]`d opt-in
+benchmark (`live_checkout_markdown_and_rust_source_are_searchable`), not part
+of either gate. Cold worktree builds
 are solved separately by `project_dispatch.seed_dirs` CoW target seeding (see
 below), not by the test profiles.
 

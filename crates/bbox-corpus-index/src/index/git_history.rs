@@ -128,7 +128,9 @@ pub fn index_git_history_for_project(
     } else {
         git_meta.last_ingested_sha.as_deref()
     };
-    let commits = bbox_corpus_core::git::commit_log(root, since)?;
+    // One git child for the whole range, touched files included. A
+    // per-commit `git diff-tree` here made every pass scale with history.
+    let commits = bbox_corpus_core::git::commit_log_with_changed_files(root, since)?;
     if commits.is_empty() {
         anyhow::bail!(
             "git history read returned no commits for project {} at HEAD {}; refusing to publish an empty replacement",
@@ -139,7 +141,11 @@ pub fn index_git_history_for_project(
 
     let mut edges = Vec::new();
     let mut stats = GitIndexStats::default();
-    for commit in commits {
+    for bbox_corpus_core::git::GitCommitWithFiles {
+        commit,
+        changed_files,
+    } in commits
+    {
         let entity_id = commit_entity_id(repo_id, &commit.sha);
         ctx.writer
             .delete_term(Term::from_field_text(ctx.f.entity_id, &entity_id));
@@ -156,7 +162,12 @@ pub fn index_git_history_for_project(
             &commit.message,
         );
         stats.indexed_commits += 1;
-        edges.extend(commit_edges(root, repo_id, &commit, project_chunks)?);
+        edges.extend(commit_edges(
+            repo_id,
+            &commit,
+            &changed_files,
+            project_chunks,
+        ));
     }
     stats.emitted_edges = edges.len() as u64;
     // Stage the managed Git sidecar and ingest cursor together. The daemon
@@ -328,11 +339,11 @@ pub fn commit_touched_file_edges(
 }
 
 fn commit_edges(
-    root: &Path,
     repo_id: &str,
     commit: &GitCommit,
+    changed_files: &[String],
     project_chunks: &HashMap<String, EntityRef>,
-) -> Result<Vec<Edge>> {
+) -> Vec<Edge> {
     let source = EntityRef::Commit {
         repo_id: repo_id.to_string(),
         sha: commit.sha.clone(),
@@ -349,8 +360,8 @@ fn commit_edges(
             EdgeConfidence::Exact,
         ));
     }
-    for file in bbox_corpus_core::git::changed_files_for_commit(root, &commit.sha)? {
-        if let Some(target) = project_chunks.get(&file) {
+    for file in changed_files {
+        if let Some(target) = project_chunks.get(file) {
             edges.push(edge(
                 source.clone(),
                 "COMMIT_TOUCHED_FILE",
@@ -359,7 +370,7 @@ fn commit_edges(
             ));
         }
     }
-    Ok(edges)
+    edges
 }
 
 fn edge(source: EntityRef, kind: &str, target: EntityRef, confidence: EdgeConfidence) -> Edge {

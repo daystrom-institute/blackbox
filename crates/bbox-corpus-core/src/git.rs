@@ -2905,10 +2905,51 @@ pub fn linked_worktree_base(worktree_top: &Path) -> Option<PathBuf> {
 }
 
 pub fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitCommit>> {
+    let output = run_commit_log(root, since_exclusive, false)?;
+    parse_commit_log(&output)
+}
+
+/// One commit plus the repository-relative paths it touched, as
+/// `git diff-tree --root --no-commit-id --name-only -r <sha>` would list
+/// them (renames appear as their old and new paths, merge commits list
+/// nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommitWithFiles {
+    pub commit: GitCommit,
+    pub changed_files: Vec<String>,
+}
+
+/// [`commit_log`] with each commit's touched files, in ONE git child.
+///
+/// The touched files are the same set [`changed_files_for_commit`]
+/// returns, but a full-history ingest that called it per commit spawned
+/// one git process per commit, which made every reindex pass scale with
+/// history depth. `--no-renames` keeps the plumbing semantics: `git log`
+/// enables rename detection by default and would then list only the new
+/// path of a renamed file.
+pub fn commit_log_with_changed_files(
+    root: &Path,
+    since_exclusive: Option<&str>,
+) -> Result<Vec<GitCommitWithFiles>> {
+    let output = run_commit_log(root, since_exclusive, true)?;
+    parse_commit_log_with_changed_files(&output)
+}
+
+fn run_commit_log(root: &Path, since_exclusive: Option<&str>, with_files: bool) -> Result<Vec<u8>> {
     let mut args = vec![
         "log".to_string(),
         "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%B%x1e".to_string(),
     ];
+    if with_files {
+        // `--root` and `--no-renames` pin the plumbing semantics of
+        // `git diff-tree --root --no-commit-id --name-only -r` against host
+        // git config: `log.showRoot=false` would otherwise drop the root
+        // commit's paths, and `diff.renames` (on by default for `git log`)
+        // would list only the new path of a renamed file.
+        args.push("--name-only".to_string());
+        args.push("--root".to_string());
+        args.push("--no-renames".to_string());
+    }
     if let Some(since) = since_exclusive.filter(|since| is_ancestor_of_head(root, since)) {
         args.push(format!("{since}..HEAD"));
     }
@@ -2921,7 +2962,7 @@ pub fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitC
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_commit_log(&output.stdout)
+    Ok(output.stdout)
 }
 
 fn is_ancestor_of_head(root: &Path, since: &str) -> bool {
@@ -3345,41 +3386,67 @@ pub fn dirty_fingerprint(root: &Path) -> Option<String> {
 
 pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
     let raw = String::from_utf8(stdout.to_vec())?;
-    let mut commits = Vec::new();
-    for record in raw.split('\x1e') {
-        let record = record.trim_matches('\n');
-        if record.trim().is_empty() {
-            continue;
+    Ok(raw.split('\x1e').filter_map(parse_commit_record).collect())
+}
+
+/// Parse `git log --format=<record>%x1e --name-only` output.
+///
+/// With `--name-only`, git prints a commit's file list AFTER the record
+/// separator, so on splitting at `\x1e` each chunk starts with the
+/// previous commit's paths (one per line, none containing `\x1f`) and
+/// continues with the next record, which is the first line holding a
+/// `\x1f`. The final chunk carries only the last commit's paths.
+pub fn parse_commit_log_with_changed_files(stdout: &[u8]) -> Result<Vec<GitCommitWithFiles>> {
+    let raw = String::from_utf8(stdout.to_vec())?;
+    let mut commits: Vec<GitCommitWithFiles> = Vec::new();
+    for chunk in raw.split('\x1e') {
+        let record_start = chunk
+            .split_inclusive('\n')
+            .take_while(|line| !line.contains('\x1f'))
+            .map(str::len)
+            .sum::<usize>();
+        let (paths, record) = chunk.split_at(record_start);
+        if let Some(previous) = commits.last_mut() {
+            previous.changed_files.extend(
+                paths
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string),
+            );
         }
-        let mut parts = record.splitn(5, '\x1f');
-        let Some(sha) = parts.next() else {
-            continue;
-        };
-        let Some(parents) = parts.next() else {
-            continue;
-        };
-        let Some(author_name) = parts.next() else {
-            continue;
-        };
-        let Some(author_email) = parts.next() else {
-            continue;
-        };
-        let Some(message) = parts.next() else {
-            continue;
-        };
-        commits.push(GitCommit {
-            sha: sha.trim().to_string(),
-            parent_shas: parents
-                .split_whitespace()
-                .filter(|parent| !parent.is_empty())
-                .map(str::to_string)
-                .collect(),
-            author_name: author_name.trim().to_string(),
-            author_email: author_email.trim().to_string(),
-            message: message.trim().to_string(),
-        });
+        if let Some(commit) = parse_commit_record(record) {
+            commits.push(GitCommitWithFiles {
+                commit,
+                changed_files: Vec::new(),
+            });
+        }
     }
     Ok(commits)
+}
+
+fn parse_commit_record(record: &str) -> Option<GitCommit> {
+    let record = record.trim_matches('\n');
+    if record.trim().is_empty() {
+        return None;
+    }
+    let mut parts = record.splitn(5, '\x1f');
+    let sha = parts.next()?;
+    let parents = parts.next()?;
+    let author_name = parts.next()?;
+    let author_email = parts.next()?;
+    let message = parts.next()?;
+    Some(GitCommit {
+        sha: sha.trim().to_string(),
+        parent_shas: parents
+            .split_whitespace()
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_string)
+            .collect(),
+        author_name: author_name.trim().to_string(),
+        author_email: author_email.trim().to_string(),
+        message: message.trim().to_string(),
+    })
 }
 
 /// Hard ceiling on any git child spawned through this module's output
@@ -4007,6 +4074,89 @@ mod tests {
             blame.author_time.as_deref(),
             Some("2023-11-14T22:13:20+00:00")
         );
+    }
+
+    #[test]
+    fn parse_commit_log_with_changed_files_assigns_paths_to_the_preceding_commit() {
+        // Two commits, newest first, as git prints them: the newest touched
+        // one path, the root commit touched two. The path block follows the
+        // record separator of the commit it belongs to.
+        let raw = b"new\x1froot\x1fAlice\x1fa@example.test\x1fsecond\x1e\n\nsrc/lib.rs\n\nroot\x1f\x1fAlice\x1fa@example.test\x1ffirst\x1e\n\nREADME.md\nsrc/lib.rs\n";
+        let commits = parse_commit_log_with_changed_files(raw).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].commit.sha, "new");
+        assert_eq!(commits[0].commit.message, "second");
+        assert_eq!(commits[0].changed_files, vec!["src/lib.rs"]);
+        assert_eq!(commits[1].commit.sha, "root");
+        assert_eq!(commits[1].changed_files, vec!["README.md", "src/lib.rs"]);
+
+        // A merge commit lists no paths; the following record must not
+        // inherit anything.
+        let raw = b"m\x1fa b\x1fAlice\x1fa@example.test\x1fmerge\x1e\na\x1froot\x1fAlice\x1fa@example.test\x1fchange\x1e\n\nsrc/a.rs\n";
+        let commits = parse_commit_log_with_changed_files(raw).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert!(commits[0].changed_files.is_empty());
+        assert_eq!(commits[1].changed_files, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn commit_log_with_changed_files_matches_per_commit_diff_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.name", "Test User"]);
+        run_git(repo.path(), &["config", "user.email", "test@example.test"]);
+        // Host config that changes `git log` output but not `git diff-tree`:
+        // the single-pass reader must override both.
+        run_git(repo.path(), &["config", "log.showRoot", "false"]);
+        run_git(repo.path(), &["config", "diff.renames", "true"]);
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("README.md"), "one\n").unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "root"]);
+        // A rename: plumbing lists both the old and the new path.
+        run_git(repo.path(), &["mv", "README.md", "GUIDE.md"]);
+        run_git(repo.path(), &["commit", "-m", "rename"]);
+        // A merge commit: plumbing lists nothing for it.
+        run_git(repo.path(), &["checkout", "-b", "side"]);
+        std::fs::write(repo.path().join("src/side.rs"), "pub fn s() {}\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "side"]);
+        run_git(repo.path(), &["checkout", "-"]);
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "main"]);
+        run_git(
+            repo.path(),
+            &["merge", "--no-ff", "-m", "merge side", "side"],
+        );
+
+        let commits = commit_log_with_changed_files(repo.path(), None).unwrap();
+        assert_eq!(commits.len(), 5);
+        let plain = commit_log(repo.path(), None).unwrap();
+        for (with_files, commit) in commits.iter().zip(&plain) {
+            assert_eq!(&with_files.commit, commit);
+            let mut expected = changed_files_for_commit(repo.path(), &commit.sha).unwrap();
+            expected.sort();
+            let mut actual = with_files.changed_files.clone();
+            actual.sort();
+            assert_eq!(actual, expected, "{}", commit.message);
+        }
+        let by_message = |message: &str| {
+            commits
+                .iter()
+                .find(|entry| entry.commit.message == message)
+                .unwrap()
+                .changed_files
+                .clone()
+        };
+        assert_eq!(by_message("root"), vec!["README.md", "src/lib.rs"]);
+        assert_eq!(by_message("rename"), vec!["GUIDE.md", "README.md"]);
+        assert!(by_message("merge side").is_empty());
     }
 
     #[test]

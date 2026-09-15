@@ -563,8 +563,8 @@ pub fn probe_project_store_mode(
         }
         return Ok(ProjectStoreProbe::AbsentBridge);
     }
-    let Some(raw) =
-        RealCatalogStoreIo.read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
+    let Some(raw) = RealCatalogStoreIo::durable()
+        .read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
     else {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_snapshot",
@@ -708,8 +708,8 @@ pub fn plan_catalog_gc_exclusions(
     // The origin, read WITHOUT the marker binding check. A partial probe
     // rather than a full snapshot decode: this needs one field, and a full
     // decode would couple sweep planning to every future catalog field.
-    let Some(raw) =
-        RealCatalogStoreIo.read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
+    let Some(raw) = RealCatalogStoreIo::durable()
+        .read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
     else {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_snapshot",
@@ -734,8 +734,8 @@ pub fn plan_catalog_gc_exclusions(
     let incomplete = |detail: &str| {
         ProjectCatalogStoreError::new("error.project_catalog_migration_incomplete", detail)
     };
-    let Some(marker_bytes) =
-        RealCatalogStoreIo.read_regular_nofollow(&paths.migration_marker, MAX_MARKER_BYTES)?
+    let Some(marker_bytes) = RealCatalogStoreIo::durable()
+        .read_regular_nofollow(&paths.migration_marker, MAX_MARKER_BYTES)?
     else {
         return Err(incomplete(
             "migrated catalog has no committed migration marker; refusing to sweep rather \
@@ -816,7 +816,10 @@ impl ProjectCatalogStore {
     ///
     /// Two missing snapshots are not interpreted as an empty store here.
     pub fn open_existing(projects_path: impl Into<PathBuf>) -> ProjectCatalogStoreResult<Self> {
-        Self::open_existing_with_io(projects_path.into(), Arc::new(RealCatalogStoreIo))
+        Self::open_existing_with_io(
+            projects_path.into(),
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
     }
 
     /// Initialize an explicitly new store at epoch one.
@@ -826,7 +829,7 @@ impl ProjectCatalogStore {
     pub fn initialize_empty(projects_path: impl Into<PathBuf>) -> ProjectCatalogStoreResult<Self> {
         Self::initialize_empty_with_io(
             projects_path.into(),
-            Arc::new(RealCatalogStoreIo),
+            Arc::new(RealCatalogStoreIo::durable()),
             InitializationPreStateV1::StrictlyAbsent,
         )
     }
@@ -857,7 +860,7 @@ impl ProjectCatalogStore {
     ) -> ProjectCatalogStoreResult<Self> {
         Self::initialize_empty_with_io(
             projects_path.into(),
-            Arc::new(RealCatalogStoreIo),
+            Arc::new(RealCatalogStoreIo::durable()),
             InitializationPreStateV1::EmptyLegacyV1Admitted,
         )
     }
@@ -1194,7 +1197,7 @@ impl ProjectCatalogStore {
         Self::open_existing_after_migration_classified_with_io(
             projects_path,
             ParticipantRegistry::Migration(Arc::new(registry)),
-            Arc::new(RealCatalogStoreIo),
+            Arc::new(RealCatalogStoreIo::durable()),
         )
     }
 
@@ -1910,7 +1913,10 @@ impl MigrationParticipantRegistry {
 pub(crate) fn begin_migration_checkout_registry_bootstrap(
     projects_path: &Path,
 ) -> Result<MigrationCheckoutRegistryBootstrapV1, MigrationBootstrapFailureV1> {
-    begin_migration_checkout_registry_bootstrap_with_io(projects_path, Arc::new(RealCatalogStoreIo))
+    begin_migration_checkout_registry_bootstrap_with_io(
+        projects_path,
+        Arc::new(RealCatalogStoreIo::durable()),
+    )
 }
 
 fn begin_migration_checkout_registry_bootstrap_with_io(
@@ -4719,15 +4725,23 @@ pub(crate) fn transact_migration(
     projects_path: &Path,
     plan: ValidatedMigrationPlanV1,
 ) -> ProjectCatalogStoreResult<ProjectCatalogCommit> {
-    transact_migration_classified_with_io(projects_path, plan, Arc::new(RealCatalogStoreIo))
-        .map_err(|failure| failure.error)
+    transact_migration_classified_with_io(
+        projects_path,
+        plan,
+        Arc::new(RealCatalogStoreIo::durable()),
+    )
+    .map_err(|failure| failure.error)
 }
 
 pub(crate) fn transact_migration_classified(
     projects_path: &Path,
     plan: ValidatedMigrationPlanV1,
 ) -> Result<ProjectCatalogCommit, MigrationTransactionFailureV1> {
-    transact_migration_classified_with_io(projects_path, plan, Arc::new(RealCatalogStoreIo))
+    transact_migration_classified_with_io(
+        projects_path,
+        plan,
+        Arc::new(RealCatalogStoreIo::durable()),
+    )
 }
 
 fn transact_migration_classified_with_io(
@@ -9627,10 +9641,46 @@ trait CatalogStoreIo: Send + Sync {
     }
 }
 
+/// Whether writes are flushed to stable storage. Production always
+/// flushes. Fault-injection tests that assert on-disk STATE, never on
+/// durability, skip the flush: every `sync_all` is a full disk flush on
+/// macOS, and the migration fault matrices run thousands of them.
+#[derive(Clone, Copy, Debug)]
+enum WriteSync {
+    Durable,
+    #[cfg(test)]
+    Skipped,
+}
+
+impl WriteSync {
+    fn apply(self, file: &File) -> std::io::Result<()> {
+        match self {
+            Self::Durable => file.sync_all(),
+            #[cfg(test)]
+            Self::Skipped => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug)]
-struct RealCatalogStoreIo;
+struct RealCatalogStoreIo {
+    sync: WriteSync,
+}
 
 impl RealCatalogStoreIo {
+    const fn durable() -> Self {
+        Self {
+            sync: WriteSync::Durable,
+        }
+    }
+
+    #[cfg(test)]
+    const fn unsynced() -> Self {
+        Self {
+            sync: WriteSync::Skipped,
+        }
+    }
+
     fn read_file(path: &Path, max_bytes: usize) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
         #[cfg(unix)]
         {
@@ -9702,7 +9752,10 @@ impl RealCatalogStoreIo {
     }
 
     #[cfg(unix)]
-    fn open_directory_unix(path: &Path, create_missing: bool) -> ProjectCatalogStoreResult<File> {
+    fn open_directory_unix(
+        path: &Path,
+        create_missing: Option<WriteSync>,
+    ) -> ProjectCatalogStoreResult<File> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
@@ -9735,7 +9788,7 @@ impl RealCatalogStoreIo {
             let mut descriptor =
                 unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
             if descriptor < 0
-                && create_missing
+                && let Some(sync) = create_missing
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
             {
                 let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -9745,8 +9798,7 @@ impl RealCatalogStoreIo {
                         return Err(io_error("create directory component for", path, error));
                     }
                 }
-                directory
-                    .sync_all()
+                sync.apply(&directory)
                     .map_err(|error| io_error("fsync created directory parent for", path, error))?;
                 descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
             }
@@ -9787,7 +9839,7 @@ impl RealCatalogStoreIo {
                 "filename contains a NUL byte",
             )
         })?;
-        Ok((Self::open_directory_unix(parent, false)?, filename))
+        Ok((Self::open_directory_unix(parent, None)?, filename))
     }
 
     #[cfg(unix)]
@@ -9847,7 +9899,11 @@ impl RealCatalogStoreIo {
     }
 
     #[cfg(unix)]
-    fn write_new_file_unix(path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+    fn write_new_file_unix(
+        path: &Path,
+        bytes: &[u8],
+        sync: WriteSync,
+    ) -> ProjectCatalogStoreResult<()> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -9875,7 +9931,7 @@ impl RealCatalogStoreIo {
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         if let Err(error) = file
             .write_all(bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync.apply(&file))
             .map_err(|error| io_error("write and fsync no-replace image for", path, error))
         {
             drop(file);
@@ -9912,7 +9968,11 @@ impl RealCatalogStoreIo {
     }
 
     #[cfg(unix)]
-    fn atomic_replace_unix(path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+    fn atomic_replace_unix(
+        path: &Path,
+        bytes: &[u8],
+        sync: WriteSync,
+    ) -> ProjectCatalogStoreResult<()> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -9940,7 +10000,7 @@ impl RealCatalogStoreIo {
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         if let Err(error) = file
             .write_all(bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync.apply(&file))
             .map_err(|error| io_error("write and fsync temporary file for", path, error))
         {
             unsafe {
@@ -9964,8 +10024,7 @@ impl RealCatalogStoreIo {
             }
             return Err(error);
         }
-        parent
-            .sync_all()
+        sync.apply(&parent)
             .map_err(|error| io_error("fsync directory for", path, error))
     }
 }
@@ -9990,7 +10049,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
     fn create_private_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
         #[cfg(unix)]
         {
-            Self::open_directory_unix(path, true)?;
+            Self::open_directory_unix(path, Some(self.sync))?;
             return Ok(());
         }
         #[cfg(not(unix))]
@@ -10047,7 +10106,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
     fn write_new_nofollow(&self, path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
         #[cfg(unix)]
         {
-            return Self::write_new_file_unix(path, bytes);
+            return Self::write_new_file_unix(path, bytes, self.sync);
         }
         #[cfg(not(unix))]
         {
@@ -10055,7 +10114,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
             let mut file = Self::create_new_file(&temp)?;
             if let Err(error) = file
                 .write_all(bytes)
-                .and_then(|()| file.sync_all())
+                .and_then(|()| self.sync.apply(&file))
                 .map_err(|error| io_error("write and fsync no-replace image for", path, error))
             {
                 drop(file);
@@ -10110,8 +10169,9 @@ impl CatalogStoreIo for RealCatalogStoreIo {
                     format!("{} is not a regular file", path.display()),
                 ));
             }
-            return file
-                .sync_all()
+            return self
+                .sync
+                .apply(&file)
                 .map_err(|error| io_error("fsync", path, error));
         }
         #[cfg(not(unix))]
@@ -10132,7 +10192,8 @@ impl CatalogStoreIo for RealCatalogStoreIo {
                     format!("{} is not a regular file", path.display()),
                 ));
             }
-            file.sync_all()
+            self.sync
+                .apply(&file)
                 .map_err(|error| io_error("fsync", path, error))
         }
     }
@@ -10144,7 +10205,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
     ) -> ProjectCatalogStoreResult<()> {
         #[cfg(unix)]
         {
-            return Self::atomic_replace_unix(path, bytes);
+            return Self::atomic_replace_unix(path, bytes, self.sync);
         }
         #[cfg(not(unix))]
         {
@@ -10152,7 +10213,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
             let mut file = Self::create_new_file(&temp)?;
             if let Err(error) = file
                 .write_all(bytes)
-                .and_then(|()| file.sync_all())
+                .and_then(|()| self.sync.apply(&file))
                 .map_err(|error| io_error("write and fsync", &temp, error))
             {
                 let _ = fs::remove_file(&temp);
@@ -10259,8 +10320,9 @@ impl CatalogStoreIo for RealCatalogStoreIo {
                     std::io::Error::last_os_error(),
                 ));
             }
-            return parent
-                .sync_all()
+            return self
+                .sync
+                .apply(&parent)
                 .map_err(|error| io_error("fsync directory for", path, error));
         }
         #[cfg(not(unix))]
@@ -10304,8 +10366,9 @@ impl CatalogStoreIo for RealCatalogStoreIo {
                 }
                 return Err(io_error("remove empty directory", path, error));
             }
-            return parent
-                .sync_all()
+            return self
+                .sync
+                .apply(&parent)
                 .map_err(|error| io_error("fsync directory for", path, error));
         }
         #[cfg(not(unix))]
@@ -10323,8 +10386,9 @@ impl CatalogStoreIo for RealCatalogStoreIo {
     fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
         #[cfg(unix)]
         {
-            return Self::open_directory_unix(path, false)?
-                .sync_all()
+            return self
+                .sync
+                .apply(&Self::open_directory_unix(path, None)?)
                 .map_err(|error| io_error("fsync directory", path, error));
         }
         #[cfg(not(unix))]
@@ -10345,8 +10409,8 @@ impl CatalogStoreIo for RealCatalogStoreIo {
                     format!("{} is not a directory", path.display()),
                 ));
             }
-            directory
-                .sync_all()
+            self.sync
+                .apply(&directory)
                 .map_err(|error| io_error("fsync directory", path, error))
         }
     }
@@ -10498,7 +10562,7 @@ mod tests {
     impl TracingIo {
         fn recording() -> Self {
             Self {
-                real: RealCatalogStoreIo,
+                real: RealCatalogStoreIo::unsynced(),
                 fail_at: None,
                 fail_points: BTreeSet::new(),
                 fail_read_paths: BTreeSet::new(),
@@ -10510,7 +10574,7 @@ mod tests {
 
         fn failing_at(index: usize) -> Self {
             Self {
-                real: RealCatalogStoreIo,
+                real: RealCatalogStoreIo::unsynced(),
                 fail_at: Some(index),
                 fail_points: BTreeSet::new(),
                 fail_read_paths: BTreeSet::new(),
@@ -10522,7 +10586,7 @@ mod tests {
 
         fn failing_points(points: impl IntoIterator<Item = FaultPoint>) -> Self {
             Self {
-                real: RealCatalogStoreIo,
+                real: RealCatalogStoreIo::unsynced(),
                 fail_at: None,
                 fail_points: points.into_iter().collect(),
                 fail_read_paths: BTreeSet::new(),
@@ -10537,7 +10601,7 @@ mod tests {
             points: impl IntoIterator<Item = FaultPoint>,
         ) -> Self {
             Self {
-                real: RealCatalogStoreIo,
+                real: RealCatalogStoreIo::unsynced(),
                 fail_at: Some(index),
                 fail_points: points.into_iter().collect(),
                 fail_read_paths: BTreeSet::new(),
@@ -10549,7 +10613,7 @@ mod tests {
 
         fn failing_reads(paths: impl IntoIterator<Item = PathBuf>) -> Self {
             Self {
-                real: RealCatalogStoreIo,
+                real: RealCatalogStoreIo::unsynced(),
                 fail_at: None,
                 fail_points: BTreeSet::new(),
                 fail_read_paths: paths.into_iter().collect(),
@@ -12481,7 +12545,7 @@ mod tests {
         let parent = root.join("not-a-directory");
         fs::write(&parent, b"file").unwrap();
 
-        let error = RealCatalogStoreIo
+        let error = RealCatalogStoreIo::durable()
             .read_regular_nofollow(&parent.join("child"), 128)
             .unwrap_err();
 
@@ -12496,7 +12560,7 @@ mod tests {
         fs::create_dir(&evidence).unwrap();
         fs::write(evidence.join("retained.json"), b"retained").unwrap();
 
-        RealCatalogStoreIo
+        RealCatalogStoreIo::durable()
             .remove_empty_dir_nofollow(&evidence)
             .unwrap();
 
@@ -13514,7 +13578,12 @@ mod tests {
                 .collision_retirement_pending(&project_id)
                 .exists()
         );
-        recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(
+            &path,
+            registry.clone(),
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap();
 
         let lifecycle_path = registry
             .code_source_paths
@@ -13563,7 +13632,12 @@ mod tests {
             .collision_retirement_pending(&project_id);
         assert!(!lifecycle_path.exists());
 
-        recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(
+            &path,
+            registry.clone(),
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap();
         let lifecycle =
             decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
                 .unwrap();
@@ -13643,8 +13717,12 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
-                .unwrap();
+            recover_migration_with_io(
+                &path,
+                registry.clone(),
+                Arc::new(RealCatalogStoreIo::durable()),
+            )
+            .unwrap();
             let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
                 &fs::read(&paths.journal).unwrap(),
                 MAX_JOURNAL_BYTES,
@@ -13707,7 +13785,12 @@ mod tests {
             unprotected_scope.clone(),
         );
 
-        recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(
+            &path,
+            registry.clone(),
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap();
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
         let rolled_back: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(&paths.journal).unwrap(),
@@ -14016,7 +14099,8 @@ mod tests {
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_injected_fault");
         fs::remove_file(&manifest_target).unwrap();
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
             MAX_JOURNAL_BYTES,
@@ -14031,7 +14115,8 @@ mod tests {
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_injected_fault");
         fs::write(&manifest_target, b"corrupt manifest").unwrap();
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
             MAX_JOURNAL_BYTES,
@@ -14237,7 +14322,12 @@ mod tests {
         for entry in fs::read_dir(&stage_dir).unwrap() {
             fs::remove_file(entry.unwrap().path()).unwrap();
         }
-        recover_migration_with_io(&path, recovery_registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(
+            &path,
+            recovery_registry,
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap();
         let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
             MAX_JOURNAL_BYTES,
@@ -14287,7 +14377,8 @@ mod tests {
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
         assert!(paths.journal.exists());
         assert!(local.exists());
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         // Installed markers carry the runtime producer's bare shape, the
         // same bytes ensure_checkout_id writes.
         assert_eq!(
@@ -14690,7 +14781,8 @@ mod tests {
             FaultPoint::RecoveryParticipantRestore,
         ]));
         assert!(recover_migration_with_io(&path, registry.clone(), second_crash).is_err());
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert!(!paths.attachments.exists());
@@ -14732,7 +14824,8 @@ mod tests {
             .unwrap();
         fs::remove_file(attachment_stage).unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_absent_pair(&path);
         let rolled_back: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(&paths.journal).unwrap(),
@@ -14763,7 +14856,8 @@ mod tests {
         assert!(transact_migration_with_io(&path, plan, initial).is_err());
         fs::remove_file(pinned_target).unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
 
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
         let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
@@ -14785,14 +14879,20 @@ mod tests {
         fs::write(&path, b"unexplained catalog bytes").unwrap();
 
         for _ in 0..2 {
-            let error =
-                recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
-                    .unwrap_err();
+            let error = recover_migration_with_io(
+                &path,
+                registry.clone(),
+                Arc::new(RealCatalogStoreIo::durable()),
+            )
+            .unwrap_err();
             assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
         }
-        let failure =
-            transact_migration_classified_with_io(&path, retry, Arc::new(RealCatalogStoreIo))
-                .unwrap_err();
+        let failure = transact_migration_classified_with_io(
+            &path,
+            retry,
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap_err();
         assert_eq!(
             failure.disposition,
             MigrationMutationDispositionV1::RetryExactPlanRequired
@@ -15158,7 +15258,8 @@ mod tests {
         )
         .unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), legacy);
         assert!(!paths.attachments.exists());
         let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
@@ -15291,7 +15392,7 @@ mod tests {
         let owner = ProjectCatalogTransactionOwner {
             paths: paths.clone(),
             registry: ParticipantRegistry::Migration(Arc::new(registry)),
-            io: Arc::new(RealCatalogStoreIo),
+            io: Arc::new(RealCatalogStoreIo::durable()),
         };
         fs::create_dir_all(&paths.stage_dir).unwrap();
 
@@ -15566,9 +15667,12 @@ mod tests {
         );
         fs::write(&publisher_source, b"new publisher source").unwrap();
 
-        let failure =
-            transact_migration_classified_with_io(&path, retry, Arc::new(RealCatalogStoreIo))
-                .unwrap_err();
+        let failure = transact_migration_classified_with_io(
+            &path,
+            retry,
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap_err();
         assert_eq!(
             failure.disposition,
             MigrationMutationDispositionV1::RecoveredToOldState
@@ -15658,7 +15762,7 @@ mod tests {
         let opened = ProjectCatalogStore::open_existing_after_migration_classified_with_io(
             path,
             ParticipantRegistry::Migration(Arc::new(registry)),
-            Arc::new(RealCatalogStoreIo),
+            Arc::new(RealCatalogStoreIo::durable()),
         )
         .unwrap();
 
@@ -15700,7 +15804,7 @@ mod tests {
         let failure = ProjectCatalogStore::open_existing_after_migration_classified_with_io(
             path.clone(),
             ParticipantRegistry::Migration(Arc::new(registry)),
-            Arc::new(RealCatalogStoreIo),
+            Arc::new(RealCatalogStoreIo::durable()),
         )
         .unwrap_err();
 
@@ -15779,9 +15883,12 @@ mod tests {
             .is_err()
         );
         fs::write(&publisher_source, b"new publisher source").unwrap();
-        let failure =
-            transact_migration_classified_with_io(&path, retry, Arc::new(RealCatalogStoreIo))
-                .unwrap_err();
+        let failure = transact_migration_classified_with_io(
+            &path,
+            retry,
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap_err();
         assert_eq!(
             failure.disposition,
             MigrationMutationDispositionV1::RecoveredToOldState
@@ -15984,7 +16091,8 @@ mod tests {
         );
         fs::write(&publisher_source, b"new publisher source").unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert_eq!(fs::read(publisher_source).unwrap(), b"new publisher source");
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
@@ -16034,7 +16142,8 @@ mod tests {
         );
         fs::write(&publisher_source, b"changed publisher source").unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert_eq!(
             fs::read(publisher_source).unwrap(),
@@ -16069,7 +16178,12 @@ mod tests {
         );
         write_unprotected_legacy_generation(&registry.code_source_paths);
 
-        recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(
+            &path,
+            registry.clone(),
+            Arc::new(RealCatalogStoreIo::durable()),
+        )
+        .unwrap();
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         let inventory = {
             let guard = registry
@@ -16114,7 +16228,8 @@ mod tests {
         if code_source_root.exists() {
             fs::remove_dir_all(&code_source_root).unwrap();
         }
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         let expected_effective =
             bbox_code_source_store::encode_migration_effective_source_manifest_v1(
                 &MigrationEffectiveSourceManifestV1 {
@@ -16155,7 +16270,8 @@ mod tests {
         fs::create_dir_all(checkout_id.parent().unwrap()).unwrap();
         fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert_eq!(
             fs::read(&checkout_id).unwrap(),
@@ -16235,7 +16351,8 @@ mod tests {
                 fs::write(checkout_local.join("checkout-id"), b"malformed\n").unwrap();
             }
 
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+                .unwrap();
             assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
             let paths = ProjectCatalogPaths::derive(&path).unwrap();
             assert!(!paths.attachments.exists());
@@ -16260,7 +16377,8 @@ mod tests {
             .join("checkout/.bbox/local/checkout-id");
         fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
 
-        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+            .unwrap();
         assert_eq!(
             fs::read(checkout_id).unwrap(),
             b"99999999999999999999999999999999\n"
@@ -16313,7 +16431,8 @@ mod tests {
         let catalog_before_recovery = fs::read(&path).unwrap();
 
         let error =
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::durable()))
+                .unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
         assert_eq!(fs::read(&path).unwrap(), catalog_before_recovery);
         assert!(!paths.attachments.exists());
@@ -16350,7 +16469,8 @@ mod tests {
             let registry = plan.registry.clone();
             let failing = Arc::new(TracingIo::failing_at(index));
             let _ = transact_migration_with_io(&path, plan, failing);
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::unsynced()))
+                .unwrap();
             let paths = ProjectCatalogPaths::derive(&path).unwrap();
             let catalog_bytes = fs::read(&paths.catalog).unwrap();
             if decode_legacy_project_store(&catalog_bytes).is_ok() {
@@ -16425,7 +16545,8 @@ mod tests {
             let accepted_paths = registry.accepted_publication_paths.clone();
             let failing = Arc::new(TracingIo::failing_at(index));
             let _ = transact_migration_with_io(&path, plan, failing);
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo::unsynced()))
+                .unwrap();
             assert_eq!(fs::read(&manifest_target).unwrap(), manifest_bytes);
             let catalog_bytes = fs::read(&path).unwrap();
             if decode_legacy_project_store(&catalog_bytes).is_ok() {
@@ -16457,8 +16578,12 @@ mod tests {
             let registry = plan.registry.clone();
             let failing = Arc::new(TracingIo::failing_at(index));
             let _ = transact_migration_with_io(&path, plan, failing);
-            recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
-                .unwrap();
+            recover_migration_with_io(
+                &path,
+                registry.clone(),
+                Arc::new(RealCatalogStoreIo::unsynced()),
+            )
+            .unwrap();
             let activation = fs::read(
                 registry
                     .participant_target(&activation_role)
@@ -16518,8 +16643,12 @@ mod tests {
             assert!(transact_migration_with_io(&path, plan, initial).is_err());
             let recovery_failure = Arc::new(TracingIo::failing_at(index));
             let _ = recover_migration_with_io(&path, registry.clone(), recovery_failure);
-            recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
-                .unwrap();
+            recover_migration_with_io(
+                &path,
+                registry.clone(),
+                Arc::new(RealCatalogStoreIo::unsynced()),
+            )
+            .unwrap();
             assert_known_migration_state_or_absent(
                 &path,
                 registry,

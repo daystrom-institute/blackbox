@@ -3060,9 +3060,18 @@ fn derive_impl_trait_edges(
     )]
 }
 
+// Compiled once per process: these run once per chunk, and a large project
+// has tens of thousands of chunks per pass. Compiling a regex per call
+// dominated the code-edge derivation of every project index.
+static CALL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("static call pattern")
+});
+static TYPE_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").expect("static type pattern")
+});
+
 fn call_names(content: &str) -> Vec<String> {
-    let call_pattern = regex::Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap();
-    call_pattern
+    CALL_PATTERN
         .captures_iter(content)
         .filter_map(|capture| capture.get(1).map(|name| name.as_str()))
         .filter(|name| !CALL_KEYWORDS.contains(name))
@@ -3071,8 +3080,7 @@ fn call_names(content: &str) -> Vec<String> {
 }
 
 fn type_names(content: &str) -> Vec<String> {
-    let type_pattern = regex::Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").unwrap();
-    type_pattern
+    TYPE_PATTERN
         .captures_iter(content)
         .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()))
         .collect()

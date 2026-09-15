@@ -187,6 +187,7 @@ fn chunks_from_symbols(
         .filter(|spec| seen.insert((spec.qualified_name.clone(), spec.byte_start, spec.byte_end)))
         .collect();
     specs.sort_by_key(|spec| (spec.byte_start, spec.byte_end));
+    let lines = LineIndex::new(source);
     specs
         .into_iter()
         .enumerate()
@@ -204,21 +205,53 @@ fn chunks_from_symbols(
             chunk.symbol_exact = Some(spec.bare_name);
             chunk.symbol_kind = Some(spec.kind);
             chunk.parent_kind = spec.parent_kind;
-            chunk.line_start = Some(byte_to_line_1based(source, spec.byte_start));
-            chunk.line_end = Some(byte_to_line_1based(source, spec.byte_end));
+            chunk.line_start = Some(lines.line_1based(spec.byte_start));
+            chunk.line_end = Some(lines.line_1based(spec.byte_end));
             chunk
         })
         .collect()
 }
 
-/// Convert a byte offset in `source` to a 1-based line number.
-/// `byte` is clamped to `source.len()`. Used by `chunks_from_symbols`
-/// so indexed records can return line ranges without re-opening the
-/// source file at read time.
+/// Byte offset to 1-based line number, built once per source file.
+///
+/// Every symbol (struct fields, impl blocks, modules and the whole file
+/// included) asks for two line numbers, so a large file asks thousands
+/// of times. Rescanning from byte zero per call made line numbering
+/// quadratic in file size; one newline scan plus a binary search keeps
+/// it linear. Indexed records get their line ranges from here without
+/// re-opening the source file at read time.
+struct LineIndex {
+    /// Byte offset of the first byte of every line after the first.
+    line_starts: Vec<usize>,
+    len: usize,
+}
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        let line_starts = source
+            .bytes()
+            .enumerate()
+            .filter(|(_, byte)| *byte == b'\n')
+            .map(|(offset, _)| offset + 1)
+            .collect();
+        Self {
+            line_starts,
+            len: source.len(),
+        }
+    }
+
+    /// `byte` is clamped to the source length; a byte past the end
+    /// reports the last line.
+    fn line_1based(&self, byte: usize) -> u32 {
+        let clamped = byte.min(self.len);
+        let lines_before = self.line_starts.partition_point(|start| *start <= clamped);
+        (lines_before as u32) + 1
+    }
+}
+
+#[cfg(test)]
 fn byte_to_line_1based(source: &str, byte: usize) -> u32 {
-    let clamped = byte.min(source.len());
-    let lines_before = source[..clamped].bytes().filter(|b| *b == b'\n').count();
-    (lines_before as u32) + 1
+    LineIndex::new(source).line_1based(byte)
 }
 
 fn chunk_from_language_pack(
@@ -589,6 +622,21 @@ mod tests {
         assert_eq!(byte_to_line_1based(source, 11), 3); // gamma
         // Past EOF clamps to line 3.
         assert_eq!(byte_to_line_1based(source, 999), 3);
+    }
+
+    /// The line index must agree with a byte-by-byte newline count at
+    /// every offset, including offsets on the newline itself, at the end
+    /// of the source, and on a trailing newline.
+    #[test]
+    fn line_index_matches_newline_count_at_every_offset() {
+        for source in ["", "no newline", "a\n", "alpha\nbeta\n\ngamma\n", "\n\n\n"] {
+            let index = LineIndex::new(source);
+            for byte in 0..=source.len() + 2 {
+                let clamped = byte.min(source.len());
+                let expected = source[..clamped].bytes().filter(|b| *b == b'\n').count() as u32 + 1;
+                assert_eq!(index.line_1based(byte), expected, "{source:?} @ {byte}");
+            }
+        }
     }
 
     #[test]

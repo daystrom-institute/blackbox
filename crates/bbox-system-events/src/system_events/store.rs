@@ -552,14 +552,26 @@ mod tests {
     #[test]
     fn compact_caps_at_ten_thousand_keeping_newest() {
         let dir = tempdir().unwrap();
-        let store = EventStore::new_at(dir.path().to_path_buf());
+        let root = dir.path().to_path_buf();
+        // Lay the journal down directly instead of appending 10,005 events
+        // through `append`: each append is a durable write (a full disk
+        // flush on macOS), which made building this fixture the slowest
+        // step in the whole suite. The journal format is one envelope per
+        // line, exactly what `append` writes, and the reopen below reads
+        // it the same way a daemon restart would.
+        let mut journal = Vec::new();
         // All within window — only the count cap applies.
         for i in 0..(EVENT_RETENTION_MAX + 5) {
             let occurred = format!("2026-05-12T00:00:{:02}Z", i % 60);
             let mut ev = event_at(&format!("p-{i}"), &occurred);
             ev.id = format!("evt-fixed-{i:05}");
-            store.append(&JournalEnvelope::wrap(ev)).unwrap();
+            serde_json::to_writer(&mut journal, &JournalEnvelope::wrap(ev)).unwrap();
+            journal.push(b'\n');
         }
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("current.jsonl"), journal).unwrap();
+        let store = EventStore::new_at(root);
+        assert_eq!(store.load_all().unwrap().len(), EVENT_RETENTION_MAX + 5);
 
         let report = store.compact_with_now("2026-05-12T01:00:00Z").unwrap();
         assert_eq!(report.before, EVENT_RETENTION_MAX + 5);
