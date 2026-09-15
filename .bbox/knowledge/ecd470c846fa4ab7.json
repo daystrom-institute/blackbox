@@ -1,0 +1,21 @@
+{
+  "id": "ecd470c846fa4ab7",
+  "title": "stablesign errSecInternalComponent means locked keychain: pause and ask the operator to unlock",
+  "content": "When `stablesign` (b1-stablesign.sh) fails with errSecInternalComponent while re-signing a redeployed binary (blackboxd, bro-harness), the cause is a locked login keychain, not a sandbox or session problem. Do not retry with sandbox tricks, launchctl asuser, or osascript, and do not leave the ad-hoc-signed binary deployed as the outcome. Pause, tell the operator the keychain is locked, ask them to unlock it, then re-run `stablesign <path>` and verify `codesign -dvv` shows Authority=PlanGlobal Stable Codesign before reporting the redeploy done.",
+  "cluster": "macOS redeploy",
+  "variants": {},
+  "category": "tool",
+  "scope": "project",
+  "project_id": "89bd722f",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-09-15T03:18:11Z",
+  "updated_at": "2026-09-15T03:18:11Z",
+  "recall_count": 0
+}
