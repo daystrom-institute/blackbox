@@ -18,8 +18,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/cancel-mid-turn-loses-checkpoint-no-recovery",
   "notes": "Secondary observation from the same session, unverified from stderr: six auto compaction_start milestones fired within 40 seconds at ~224k-230k projected tokens on the ChatGPT-backed Responses transport and none was followed by a compact_boundary, so remote_compact returned None or an error each time (errors are only tracing::warn) while context kept growing toward the 204k threshold. Worth a separate look; it is not what broke the resume.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-15T02:14:43Z",
-  "updated_at": "2026-09-15T02:14:43Z"
+  "updated_at": "2026-09-15T02:55:30Z",
+  "resolved_at": "2026-09-15T02:55:30Z",
+  "resolution_note": "Addressed in commit 9a1a7383 (beta/blackbox-v2): bro-harness handles SIGTERM/SIGINT cooperatively (interrupt, checkpoint, exit), checkpoints after every completed model step, and resume recovers a snapshot behind its event log via a CheckpointGap digest (system event + model notice, gap byte range skipped by receipt scans) instead of refusing. Verified against the original cancelled session on a scratch copy: 162 tail records digested, snapshot re-anchored, exit 0. Deployed to ~/.local/bin/bro-harness (ad-hoc signature; operator re-sign with stablesign pending)."
 }
