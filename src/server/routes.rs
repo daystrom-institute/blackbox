@@ -1624,7 +1624,7 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                         match await_edge_watcher_wake(nudge_rx.as_ref(), interval, debounce) {
                             EdgeWatcherWake::Nudged => true,
                             EdgeWatcherWake::Interval => false,
-                            // All senders dropped — SharedState is gone; exit.
+                            // All senders dropped: SharedState is gone; exit.
                             EdgeWatcherWake::Disconnected => return,
                         };
                 }
