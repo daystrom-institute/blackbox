@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::ErrorResponse;
 use bbox_git_source::{
@@ -315,6 +315,10 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
         .route(
             "/internal/code-source/v1/provenance/imports/{upload_id}/finalize",
             post(finalize_provenance_import).layer(DefaultBodyLimit::max(1)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}",
+            delete(abort_provenance_import),
         )
         .route(
             "/internal/code-source/v1/provenance/generations/{generation}/status",
@@ -664,6 +668,18 @@ async fn finalize_provenance_import(
         .git_sources
         .enqueue_provenance_import(response.import_generation_id.clone());
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn abort_provenance_import(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(upload_id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let producer_id = grant.producer_id;
+    blocking(move || store.abort_provenance_import(&producer_id, &upload_id)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn provenance_import_generation_status(
@@ -1670,6 +1686,167 @@ mod tests {
             status.state,
             bbox_git_source::ProvenanceImportStateV1::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn provenance_import_abort_route_removes_open_upload_and_refuses_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, token, scope) = enabled_state(directory.path());
+        let app = router(state.clone()).with_state(state);
+        let commit = "1".repeat(40);
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "commit": commit,
+            "produced_by": {},
+            "tool_calls": [],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let hash = hex::encode(Sha256::digest(document.as_bytes()));
+        let manifest = vec![ProvenanceImportManifestEntryV1 {
+            note_commit: commit.clone(),
+            document_ordinal: 0,
+            encoded_bytes: document.len() as u64,
+            document_sha256: hash.clone(),
+        }];
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope,
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: 1,
+            logical_bytes: document.len() as u64,
+        };
+        let begun = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/code-source/v1/provenance/imports",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvenanceImportRequestV1 {
+                        descriptor: descriptor.clone(),
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(begun.status(), StatusCode::CREATED);
+        let begun: BeginProvenanceImportResponseV1 =
+            serde_json::from_slice(&to_bytes(begun.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            begun.state,
+            bbox_git_source::ProvenanceImportStateV1::ReceivingManifest
+        );
+        assert_eq!(begun.next_page, 0);
+        let abort_url = format!(
+            "/internal/code-source/v1/provenance/imports/{}",
+            begun.upload_id
+        );
+        let denied = app
+            .clone()
+            .oneshot(request("DELETE", &abort_url, None, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let aborted = app
+            .clone()
+            .oneshot(request("DELETE", &abort_url, Some(&token), Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(aborted.status(), StatusCode::NO_CONTENT);
+        let missing = app
+            .clone()
+            .oneshot(request("DELETE", &abort_url, Some(&token), Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let restarted = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/code-source/v1/provenance/imports",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvenanceImportRequestV1 { descriptor }).unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restarted.status(), StatusCode::CREATED);
+        let restarted: BeginProvenanceImportResponseV1 =
+            serde_json::from_slice(&to_bytes(restarted.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_ne!(restarted.upload_id, begun.upload_id);
+        let upload = |segment: &str| {
+            format!(
+                "/internal/code-source/v1/provenance/imports/{}/{}",
+                restarted.upload_id, segment
+            )
+        };
+        let page = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                &upload("manifest/0"),
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&ProvenanceImportManifestPageV1 { entries: manifest })
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::NO_CONTENT);
+        let complete = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &upload("manifest/complete"),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let document_upload = Request::builder()
+            .method("PUT")
+            .uri(upload(&format!("documents/{hash}")))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_LENGTH, document.len())
+            .body(Body::from(document))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(document_upload).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        let finalized = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &upload("finalize"),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finalized.status(), StatusCode::ACCEPTED);
+        let refused = app
+            .oneshot(request(
+                "DELETE",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}",
+                    restarted.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

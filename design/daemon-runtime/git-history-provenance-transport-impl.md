@@ -429,13 +429,14 @@ ProvenanceNoteGenerationV1 {
 ```
 Routes:
 ```text
-POST /internal/code-source/v1/provenance/imports
-PUT  /internal/code-source/v1/provenance/imports/{id}/manifest/{page}
-POST /internal/code-source/v1/provenance/imports/{id}/manifest/complete
-GET  /internal/code-source/v1/provenance/imports/{id}/missing?cursor=...
-PUT  /internal/code-source/v1/provenance/imports/{id}/documents/{sha256}
-POST /internal/code-source/v1/provenance/imports/{id}/finalize
-GET  /internal/code-source/v1/provenance/generations/{generation}/status
+POST   /internal/code-source/v1/provenance/imports
+PUT    /internal/code-source/v1/provenance/imports/{id}/manifest/{page}
+POST   /internal/code-source/v1/provenance/imports/{id}/manifest/complete
+GET    /internal/code-source/v1/provenance/imports/{id}/missing?cursor=...
+PUT    /internal/code-source/v1/provenance/imports/{id}/documents/{sha256}
+POST   /internal/code-source/v1/provenance/imports/{id}/finalize
+DELETE /internal/code-source/v1/provenance/imports/{id}
+GET    /internal/code-source/v1/provenance/generations/{generation}/status
 ```
 `note_commit` is the Git object carrying the note and must equal `GitProvenanceNote.commit`; it is distinct from `NoteToolCall.target_ref`, which names the project-file entity targeted by an imported edge.
 Collector captures one stable listing through `StableGitRepository::snapshot_notes_generation_bounded`, resolving the moving notes ref once and preserving that immutable tip, note commit, and exact document bytes.

@@ -236,6 +236,16 @@ Authenticated provenance imports live under
 `<state_dir>/git-sources/provenance-imports/`. Their document bytes are
 content-addressed, while a durable per-project acceptance sequence and ready
 pointer prevent an older queued note snapshot from replacing a newer one.
+`POST .../provenance/imports` resumes an existing open or terminally failed
+session for the same descriptor and reports its durable `state`, `next_page`,
+and failure `diagnostic`. Manifest page replay with the identical digest is a
+no-op in any session state, and a verifier rejection that is deterministic in
+the uploaded content settles the session as terminally `failed` while the
+finalize call still returns the contract error. An open or failed session that
+will not be completed can be dropped with
+`DELETE .../provenance/imports/{upload_id}`, authenticated like the other
+provenance routes; it returns 204 and refuses a finalized upload. Sessions
+that are neither aborted nor completed expire after the same 24 idle hours.
 Edge preparation is capped at 64 MiB; a larger or semantically invalid import
 is quarantined before sidecar publication. The projected active-sidecar size
 is checked before the project lane is read, and the lane size is checked again
