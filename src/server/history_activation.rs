@@ -281,10 +281,17 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
                 )?;
                 clear_transport_health(state, &grant);
                 super::code_source::republish_code_read_view(state)?;
+                // Terminal for this revalidation flow: the republish lowered
+                // the readiness fence, so wake the watcher now.
+                state.nudge_edge_index_rebuild();
             }
             return Ok(());
         }
         clear_transport_overlays_for_repo(state, &existing.repo_history_id)?;
+        // Terminal for this branch: the clear republished (and lowered the
+        // fence); mid-transaction callers of the same helper rely on their
+        // own transaction-end nudge instead.
+        state.nudge_edge_index_rebuild();
     }
     if let Some(existing) = source_store.read_activation_journal(&grant.repo_history_id)?
         && existing.source_generation_id == source_generation_id
@@ -693,6 +700,9 @@ fn finish_activation(
         &journal.source_generation_id,
     )?;
     super::code_source::republish_code_read_view(state)?;
+    // Transaction end: the republish lowered the readiness fence, so the
+    // watcher must rebuild from the freshly committed overlays now.
+    state.nudge_edge_index_rebuild();
     tracing::info!(
         repo_history = %journal.repo_history_id,
         source_generation = %journal.source_generation_id,

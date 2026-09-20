@@ -2812,7 +2812,9 @@ pub(super) fn resolve_code_project_identity(
 
 /// Republish the pinned code read view after a post-activation overlay
 /// landed. The active selector map is already correct (the activation set
-/// it); only the edge index and searcher move.
+/// it); only the edge index and searcher move. Does NOT nudge: the caller
+/// owns the nudge for its transaction (firing it here made one activation
+/// transaction nudge once per republishing branch).
 pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
         &state.idx.read().reindex_config().projects_path,
@@ -2842,7 +2844,6 @@ pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
             &state.code_sources,
         ),
     });
-    state.nudge_edge_index_rebuild();
     Ok(())
 }
 
@@ -6157,7 +6158,10 @@ fn activate_desired_loop(
                 Ok(())
             },
         )?;
-        state.nudge_edge_index_rebuild();
+        // No nudge here: the activation transaction is still mid-flight (the
+        // previous generation's retirement and the Git overlay selector are
+        // both still to land), and a rebuild started now races those manifest
+        // writes. The single transaction-end nudge below covers this publish.
         tracing::info!(
             project_id,
             generation = %desired_generation_id,
@@ -6195,6 +6199,12 @@ fn activate_desired_loop(
             &desired_generation_id,
             &overlay_chunk_targets,
         );
+        // Single transaction-end nudge: activation, previous-generation
+        // retirement scheduling, and the overlay-selector attempt have all
+        // landed (or degraded to recorded health) by this point, so one
+        // rebuild sees the whole transaction instead of racing its trailing
+        // manifest writes.
+        state.nudge_edge_index_rebuild();
         return Ok(());
     }
 }
@@ -8480,6 +8490,146 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!store.retirement_pending(&collected_selector).unwrap());
+    }
+
+    /// The activation transaction (activate + previous-generation retirement
+    /// scheduling + the Git overlay attempt) must ask for exactly one
+    /// edge-index rebuild. A nudge fired at the first manifest write makes
+    /// the watcher parse while the transaction's trailing writes are still
+    /// landing, which is the stale-publication race; retirement must not add
+    /// nudges of its own either, or the same race reopens from the other
+    /// side.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_transaction_nudges_the_edge_rebuild_watcher_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        let home = root.join("home");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Blackbox Test"]);
+        fs::write(repo.join("src/lib.rs"), "pub fn gen_one() {}\n").unwrap();
+        git(&repo, &["add", "src/lib.rs"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        let recorded = crate::config::ensure_recorded_repo_id(&repo).unwrap();
+        git(&repo, &["add", ".bbox"]);
+        git(&repo, &["commit", "-q", "-m", "record repository identity"]);
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("HOME", &home);
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+
+        let state = transition_test_state(&state_dir);
+        // Selector retirement deletes vector rows; without a global vector
+        // store it retries on VectorStoreWarming forever.
+        let _vector_store = bbox_vectors::install_test_global(state.vector_store.clone());
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&repo)
+            .unwrap();
+        state.persist_projects_durable().await.unwrap();
+        let scope = PublishedScope::try_new(recorded.repo_id, ".").unwrap();
+        let producer_id = "nudge-once-producer";
+        install_test_assignment(&state, producer_id, &scope, &project.project_id);
+
+        let upload_generation = |head: &str, source: &str| {
+            let store = state.code_sources.store();
+            let entries = vec![ManifestEntry {
+                relative_path: "src/lib.rs".into(),
+                content_sha256: hex::encode(Sha256::digest(source)),
+                size: source.len() as u64,
+            }];
+            let descriptor = GenerationDescriptor {
+                schema_version: SCHEMA_VERSION,
+                walker_policy_version: WALKER_POLICY_VERSION.into(),
+                scope: scope.clone(),
+                head_commit: head.to_string(),
+                dirty_fingerprint: dirty_fingerprint(head, &entries),
+                manifest_sha256: manifest_sha256(&entries),
+                file_count: entries.len() as u64,
+                logical_bytes: source.len() as u64,
+            };
+            let upload = store.begin_upload(producer_id, descriptor).unwrap();
+            store
+                .put_manifest_page(producer_id, &upload.upload_id, 0, &entries)
+                .unwrap();
+            store
+                .complete_manifest(producer_id, &upload.upload_id)
+                .unwrap();
+            store
+                .install_blob(
+                    producer_id,
+                    &upload.upload_id,
+                    &entries[0].content_sha256,
+                    entries[0].size,
+                    std::io::Cursor::new(source.as_bytes()),
+                )
+                .unwrap();
+            store
+                .finalize_upload(producer_id, &upload.upload_id)
+                .unwrap()
+        };
+
+        // First activation (no previous generation: no retirement; the
+        // overlay attempt runs and degrades in bridge mode): one nudge.
+        let before_first = state.edge_rebuild_nudge_attempt_count();
+        let first = upload_generation(&"a".repeat(40), "pub fn gen_one() {}\n");
+        activate_desired_loop(&state, &scope, &project.project_id).unwrap();
+        state.index_writer.flush_blocking().unwrap();
+        assert_eq!(
+            state.edge_rebuild_nudge_attempt_count(),
+            before_first + 1,
+            "the first activation must fire exactly one transaction-end nudge"
+        );
+
+        // Second activation over the live previous generation: activate +
+        // retire + overlay attempt must still be exactly one nudge.
+        let before_second = state.edge_rebuild_nudge_attempt_count();
+        upload_generation(&"c".repeat(40), "pub fn gen_two() {}\n");
+        activate_desired_loop(&state, &scope, &project.project_id).unwrap();
+        state.index_writer.flush_blocking().unwrap();
+        assert_eq!(
+            state.edge_rebuild_nudge_attempt_count(),
+            before_second + 1,
+            "activate + retire + overlay must coalesce into one nudge"
+        );
+        // The fence the activation lowered comes back up only via the nudged
+        // watcher (not running in this test), proving the nudge carries the
+        // recovery rather than a timer.
+        assert!(state.complete_code_read_view().is_err());
+
+        // Retirement completes on its own coordinator thread; it must not
+        // add nudges (its inputs, if loader-visible at all, are covered by
+        // the transaction-end rebuild or the interval signature compare).
+        let retired_selector = crate::index::project_files::collected_materialization_selector(
+            &project.project_id,
+            &first.generation_id,
+        );
+        let store = state.code_sources.store();
+        for _ in 0..500 {
+            if !store.retirement_pending(&retired_selector).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !store.retirement_pending(&retired_selector).unwrap(),
+            "retirement must complete for this assertion to be meaningful"
+        );
+        assert_eq!(
+            state.edge_rebuild_nudge_attempt_count(),
+            before_second + 1,
+            "retirement must not nudge separately"
+        );
     }
 
     /// A collected generation stays activated when Git is entirely

@@ -1439,6 +1439,72 @@ fn edge_watcher_tick(
     inputs.last_seen = current;
 }
 
+/// Outcome of one watcher park: woken by a nudge, by the interval, or the
+/// nudge channel is gone (SharedState dropped; the watcher exits).
+enum EdgeWatcherWake {
+    Nudged,
+    Interval,
+    Disconnected,
+}
+
+const DEFAULT_EDGE_INDEX_NUDGE_DEBOUNCE_MS: u64 = 500;
+
+fn edge_index_nudge_debounce() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BLACKBOX_EDGE_INDEX_NUDGE_DEBOUNCE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_EDGE_INDEX_NUDGE_DEBOUNCE_MS),
+    )
+}
+
+/// Collapse a burst of nudges into one rebuild: hold off for the debounce
+/// window, then drain every nudge queued meanwhile. The 1-slot channel
+/// already coalesces while a nudge sits queued; this extends that
+/// coalescing to the window before the rebuild starts, so the trailing
+/// mutations of one transaction join the same rebuild instead of starting
+/// a second one. Nudges arriving after the window still wake the watcher:
+/// every selector change keeps its eventual rebuild.
+fn collapse_edge_nudge_burst(
+    nudge_rx: &std::sync::mpsc::Receiver<()>,
+    debounce: std::time::Duration,
+) {
+    if !debounce.is_zero() {
+        std::thread::sleep(debounce);
+    }
+    while let Ok(()) = nudge_rx.try_recv() {}
+}
+
+/// Park the watcher until a nudge arrives or the interval elapses, collapsing
+/// any nudge burst inside the debounce window into a single wake.
+fn await_edge_watcher_wake(
+    nudge_rx: Option<&std::sync::mpsc::Receiver<()>>,
+    interval: std::time::Duration,
+    debounce: std::time::Duration,
+) -> EdgeWatcherWake {
+    let nudged = match nudge_rx {
+        Some(rx) => match rx.recv_timeout(interval) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return EdgeWatcherWake::Disconnected;
+            }
+        },
+        None => {
+            std::thread::sleep(interval);
+            false
+        }
+    };
+    if nudged && let Some(rx) = nudge_rx {
+        collapse_edge_nudge_burst(rx, debounce);
+    }
+    if nudged {
+        EdgeWatcherWake::Nudged
+    } else {
+        EdgeWatcherWake::Interval
+    }
+}
+
 /// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
 /// The auto-reindex thread writes new docs + edge sidecars every interval,
 /// but it can't trigger a rebuild itself (it spawns before SharedState exists).
@@ -1465,20 +1531,16 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                 std::thread::sleep(std::time::Duration::from_secs(20));
             }
             let mut inputs = EdgeWatcherInputs::capture(&state);
+            let debounce = edge_index_nudge_debounce();
             loop {
                 if !pending_nudge {
-                    pending_nudge = match &nudge_rx {
-                        Some(rx) => match rx.recv_timeout(interval) {
-                            Ok(()) => true,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    pending_nudge =
+                        match await_edge_watcher_wake(nudge_rx.as_ref(), interval, debounce) {
+                            EdgeWatcherWake::Nudged => true,
+                            EdgeWatcherWake::Interval => false,
                             // All senders dropped — SharedState is gone; exit.
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                        },
-                        None => {
-                            std::thread::sleep(interval);
-                            false
-                        }
-                    };
+                            EdgeWatcherWake::Disconnected => return,
+                        };
                 }
                 edge_watcher_tick(&state, &mut inputs, &mut pending_nudge, interval);
             }
@@ -2793,6 +2855,34 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "non-stale failures return without retry pauses"
         );
+    }
+
+    #[test]
+    fn edge_watcher_nudge_burst_inside_debounce_collapses_into_one_wake() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(()).unwrap();
+        // A second mutation surface fires inside the debounce window, as the
+        // trailing writes of one activation transaction would.
+        let trailing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = tx.try_send(());
+        });
+        let started = std::time::Instant::now();
+        let wake = await_edge_watcher_wake(
+            Some(&rx),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(80),
+        );
+        assert!(matches!(wake, EdgeWatcherWake::Nudged));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "the wake must hold off for the debounce window"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the burst must be drained: one wake is one rebuild"
+        );
+        trailing.join().unwrap();
     }
 
     #[test]

@@ -1006,6 +1006,7 @@ pub(super) fn open_shared_state(
         )),
         edge_rebuild_nudge_tx,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
+        edge_rebuild_nudge_attempts: std::sync::atomic::AtomicU64::new(0),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
