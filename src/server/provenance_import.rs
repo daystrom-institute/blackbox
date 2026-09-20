@@ -268,7 +268,8 @@ fn publish_edge_index_and_verify(state: &SharedState, edge_keys: &[String]) -> R
         .try_begin_edge_index_rebuild()
         .ok_or_else(|| anyhow!("edge-index publication is busy"))?;
     let edges_dir = super::edge_sidecar_dir(state);
-    super::rebuild_edge_index_from_shared_at(state, false, &edges_dir)
+    super::rebuild_edge_index_from_shared_at(state, false, &edges_dir, None)
+        .map(|_| ())
         .context("publishing authenticated provenance edges into the read view")?;
     if !published_edge_index_contains(state, edge_keys) {
         let view = state.code_read_view.read();
@@ -874,7 +875,7 @@ mod tests {
 
         activate_import(&state, &source.import_generation_id).unwrap();
         activate_import(&state, &source.import_generation_id).unwrap();
-        crate::server::rebuild_edge_index_from_shared(&state, false).unwrap();
+        let _ = crate::server::rebuild_edge_index_from_shared(&state, false, None).unwrap();
         assert!(
             published_edge_index_contains(&state, &edge_keys),
             "an ordinary graph rebuild must retain authenticated provenance edges"

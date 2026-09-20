@@ -2262,7 +2262,7 @@ mod tests {
 
         // Simulate the watcher consuming the nudge, then prove both durable
         // facts become queryable after the bounded rebuild.
-        rebuild_edge_index_from_shared(&server.state, false).unwrap();
+        let _ = rebuild_edge_index_from_shared(&server.state, false, None).unwrap();
         let published = server.state.code_read_view.read().clone();
         let edges = published
             .edge_index
