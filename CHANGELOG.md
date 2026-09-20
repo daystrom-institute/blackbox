@@ -16,7 +16,8 @@ out explicitly under `Changed` or `Removed`.
   documents, treats a failed upload or a finalize `invalid_git_source_input`
   as terminal for that descriptor (logged once at WARN, skipped quietly on
   later passes, never re-sent until the notes tip or manifest changes), and
-  aborts superseded or rejected uploads through a new delete route.
+  aborts superseded open uploads through a new delete route while a rejected
+  upload stays on the server as the durable diagnostic.
   Provenance import capture also assigns manifest ordinals after per-project
   filtering and keeps fragmented note documents atomic, so a filtered document
   no longer produces an out-of-order manifest or an unassemblable part group.
