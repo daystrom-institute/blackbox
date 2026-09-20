@@ -49,6 +49,14 @@ pub const HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE: &str = "history_unavailable_no_
 /// not prescribe restoring an attachment for a transport-owned fault.
 pub const HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE: &str = "history_transport_activation_failed";
 
+/// Durable health code for a typed producer activation the background worker
+/// has dead-lettered: the failure class needs catalog or grant-table action
+/// before any automatic retry can converge, so the row is keyed by the repo
+/// history id even when no catalog project binds it. Doctor surfaces it with
+/// the operator remedy rather than the automatic-retry text above.
+pub const HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE: &str =
+    "history_transport_activation_deadletter";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HistoryHealthStateV1 {
     /// A validated attachment exists and the recorded cursor matches the

@@ -169,13 +169,15 @@ pub(crate) fn spawn_worker(state: &Arc<SharedState>) -> Result<()> {
     std::thread::Builder::new()
         .name("blackbox-git-history-activation".to_string())
         .spawn(move || {
-            let mut pending = BTreeSet::new();
+            let mut worker = ActivationWorkerState::default();
             loop {
-                match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+                match receiver
+                    .recv_timeout(std::time::Duration::from_secs(ACTIVATION_WORKER_TICK_SECS))
+                {
                     Ok(source) => {
-                        pending.insert(source);
+                        worker.pending.insert(source);
                         while let Ok(source) = receiver.try_recv() {
-                            pending.insert(source);
+                            worker.pending.insert(source);
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -184,35 +186,281 @@ pub(crate) fn spawn_worker(state: &Arc<SharedState>) -> Result<()> {
                 let Some(state) = weak.upgrade() else {
                     break;
                 };
-                let store = state.git_sources.store();
-                match store.current_ready_source_ids() {
-                    Ok(ids) => pending.extend(ids),
-                    Err(error) => tracing::warn!(%error, "enumerating ready Git-history sources failed"),
-                }
-                match store.list_activation_journals() {
-                    Ok(journals) => pending.extend(
-                        journals
-                            .into_iter()
-                            .filter(|journal| !journal.stage.terminal())
-                            .map(|journal| journal.source_generation_id),
-                    ),
-                    Err(error) => tracing::warn!(%error, "enumerating Git-history activation journals failed"),
-                }
-                let batch = std::mem::take(&mut pending);
-                for source in batch {
-                    if let Err(error) = activate_source(&state, &source) {
-                        record_activation_failure(&state, &source, &error);
-                        tracing::warn!(
-                            source_generation = %source,
-                            error = %error,
-                            "typed Git-history activation did not converge; background redrive will retry"
-                        );
-                    }
-                }
+                run_activation_tick(&state, &mut worker);
             }
         })
         .context("spawning Git-history activation worker")?;
     Ok(())
+}
+
+/// How long the activation worker waits between redrive ticks. Also the base
+/// interval for per-source retryable backoff.
+const ACTIVATION_WORKER_TICK_SECS: u64 = 30;
+
+/// Retryable activation failures back off exponentially from the tick
+/// interval up to this ceiling, so a persistently failing source stops
+/// consuming a full activation attempt every tick.
+const ACTIVATION_BACKOFF_CAP_SECS: u64 = 60 * 60;
+
+/// In-memory redrive state owned by the activation worker thread. Only the
+/// retryable backoff lives here; dead letters are durable store records so
+/// an operator (and a restarted daemon) sees the same stop condition.
+#[derive(Default)]
+struct ActivationWorkerState {
+    pending: BTreeSet<String>,
+    retryable: BTreeMap<String, RetryableActivationFailure>,
+}
+
+struct RetryableActivationFailure {
+    error_summary: String,
+    attempts: u64,
+    next_attempt_at: std::time::Instant,
+}
+
+impl RetryableActivationFailure {
+    fn backoff_after(attempts: u64) -> std::time::Duration {
+        let exponent = attempts.saturating_sub(1).min(16) as u32;
+        let delay_secs = ACTIVATION_WORKER_TICK_SECS
+            .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+            .min(ACTIVATION_BACKOFF_CAP_SECS);
+        std::time::Duration::from_secs(delay_secs)
+    }
+}
+
+/// Activation failure classes that no amount of background retrying can
+/// clear: they describe catalog or producer-grant state only an operator
+/// changes. `repo_history_not_found` means no published catalog project
+/// binds the repo history; `repo_history_scope_split` means the repo's
+/// members are assigned to more than one producer; `scope_forbidden` would
+/// mean the recorded producer lost the grant outright. All three surface
+/// from the transport-grant derivation before any journal is written.
+fn operator_required_activation_code(error: &anyhow::Error) -> Option<&'static str> {
+    const CODES: [&str; 3] = [
+        "repo_history_not_found",
+        "repo_history_scope_split",
+        "scope_forbidden",
+    ];
+    CODES.into_iter().find(|code| {
+        error
+            .chain()
+            .any(|cause| cause.to_string().as_str() == *code)
+    })
+}
+
+fn activation_error_summary(error: &anyhow::Error) -> String {
+    error.to_string().chars().take(160).collect()
+}
+
+/// One worker tick: re-seed the work set from durable store state, then
+/// redrive every pending source that is neither dead-lettered for its
+/// current generation nor inside its retryable backoff window.
+fn run_activation_tick(state: &Arc<SharedState>, worker: &mut ActivationWorkerState) {
+    let store = state.git_sources.store();
+    match store.current_ready_source_ids() {
+        Ok(ids) => worker.pending.extend(ids),
+        Err(error) => tracing::warn!(%error, "enumerating ready Git-history sources failed"),
+    }
+    match store.list_activation_journals() {
+        Ok(journals) => worker.pending.extend(
+            journals
+                .into_iter()
+                .filter(|journal| !journal.stage.terminal())
+                .map(|journal| journal.source_generation_id),
+        ),
+        Err(error) => tracing::warn!(%error, "enumerating Git-history activation journals failed"),
+    }
+    let deadletters = match store.list_activation_deadletters() {
+        Ok(deadletters) => deadletters
+            .into_iter()
+            .map(|deadletter| (deadletter.repo_history_id.clone(), deadletter))
+            .collect::<BTreeMap<_, _>>(),
+        Err(error) => {
+            tracing::warn!(%error, "enumerating Git-history activation dead letters failed");
+            BTreeMap::new()
+        }
+    };
+    let batch = std::mem::take(&mut worker.pending);
+    for source in batch {
+        // The store owns the binding from generation id to repo history;
+        // without it there is nothing to classify or dead-letter yet.
+        let authority = match store.generation_authority_for_any_producer(&source) {
+            Ok(authority) => authority,
+            Err(error) => {
+                record_retryable_failure(worker, &source, &error);
+                continue;
+            }
+        };
+        // A dead letter for exactly this generation is the durable stop
+        // condition: the worker re-evaluates only once the ready pointer
+        // moves to a different generation or an operator drops the record.
+        if deadletters
+            .get(&authority.repo_history_id)
+            .is_some_and(|deadletter| deadletter.source_generation_id == source)
+        {
+            worker.retryable.remove(&source);
+            tracing::debug!(
+                repo_history = %authority.repo_history_id,
+                source_generation = %source,
+                "Git-history activation is dead-lettered; skipping redrive"
+            );
+            worker.pending.insert(source);
+            continue;
+        }
+        if let Some(retry) = worker.retryable.get(&source)
+            && std::time::Instant::now() < retry.next_attempt_at
+        {
+            tracing::debug!(
+                source_generation = %source,
+                attempts = retry.attempts,
+                next_attempt_at_secs = retry
+                    .next_attempt_at
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs(),
+                "Git-history activation backoff defers this redrive"
+            );
+            worker.pending.insert(source);
+            continue;
+        }
+        match activate_source(state, &source) {
+            Ok(()) => {
+                let recovered = worker.retryable.remove(&source);
+                if recovered.is_some() {
+                    tracing::info!(
+                        source_generation = %source,
+                        repo_history = %authority.repo_history_id,
+                        "typed Git-history activation recovered after retryable failures"
+                    );
+                }
+                let _ = store.drop_activation_deadletter(&authority.repo_history_id);
+                let _ = state.code_sources.store().clear_health_failure(
+                    authority.repo_history_id.as_str(),
+                    bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE,
+                );
+            }
+            Err(error) => match operator_required_activation_code(&error) {
+                Some(code) => {
+                    record_deadletter_failure(state, worker, &source, &authority, code, &error);
+                }
+                None => record_retryable_failure(worker, &source, &error),
+            },
+        }
+    }
+}
+
+fn record_deadletter_failure(
+    state: &Arc<SharedState>,
+    worker: &mut ActivationWorkerState,
+    source: &str,
+    authority: &bbox_git_source_store::StoredHistorySourceAuthorityV1,
+    code: &'static str,
+    error: &anyhow::Error,
+) {
+    worker.retryable.remove(source);
+    let store = state.git_sources.store();
+    let prior = store
+        .read_activation_deadletter(&authority.repo_history_id)
+        .ok()
+        .flatten();
+    let already_recorded =
+        prior.is_some_and(|prior| prior.source_generation_id == source && prior.error_code == code);
+    match store.record_activation_deadletter(
+        &authority.repo_history_id,
+        &authority.producer_id,
+        source,
+        code,
+        Some(error.to_string()),
+    ) {
+        Ok(deadletter) => {
+            record_activation_failure(state, source, error);
+            let diagnostic = format!(
+                "activation dead-lettered after {code}: {}; attempts {}; remedy: rebind a \
+                 catalog project to this repository history or drop the dead letter",
+                error.to_string().chars().take(320).collect::<String>(),
+                deadletter.attempts
+            );
+            let _ = state.code_sources.store().record_health_failure(
+                authority.repo_history_id.as_str(),
+                bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE,
+                &diagnostic,
+            );
+            if already_recorded {
+                tracing::debug!(
+                    repo_history = %authority.repo_history_id,
+                    source_generation = %source,
+                    error_code = code,
+                    attempts = deadletter.attempts,
+                    "Git-history activation remains dead-lettered; operator action required"
+                );
+            } else {
+                tracing::warn!(
+                    repo_history = %authority.repo_history_id,
+                    source_generation = %source,
+                    error_code = code,
+                    error = %error,
+                    "typed Git-history activation cannot converge without operator action; \
+                     redrive stopped until the dead letter is dropped or a newer source is \
+                     accepted"
+                );
+            }
+        }
+        Err(record_error) => tracing::warn!(
+            repo_history = %authority.repo_history_id,
+            source_generation = %source,
+            error_code = code,
+            error = %record_error,
+            "recording the Git-history activation dead letter failed"
+        ),
+    }
+    // Keep the source in the pending set: the skip path consults the durable
+    // dead letter rather than this map, so a dropped record restores retry on
+    // the very next tick.
+    worker.pending.insert(source.to_string());
+}
+
+fn record_retryable_failure(
+    worker: &mut ActivationWorkerState,
+    source: &str,
+    error: &anyhow::Error,
+) {
+    let summary = activation_error_summary(error);
+    let (attempts, class_changed) = match worker.retryable.get(source) {
+        Some(prior) => (
+            prior.attempts.saturating_add(1),
+            prior.error_summary != summary,
+        ),
+        None => (1, true),
+    };
+    let next_attempt_at =
+        std::time::Instant::now() + RetryableActivationFailure::backoff_after(attempts);
+    worker.retryable.insert(
+        source.to_string(),
+        RetryableActivationFailure {
+            error_summary: summary.clone(),
+            attempts,
+            next_attempt_at,
+        },
+    );
+    worker.pending.insert(source.to_string());
+    let next_attempt_in = next_attempt_at
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
+    if class_changed {
+        tracing::warn!(
+            source_generation = %source,
+            error = %error,
+            attempts,
+            next_attempt_at_secs = next_attempt_in,
+            "typed Git-history activation did not converge; background redrive will retry"
+        );
+    } else {
+        tracing::debug!(
+            source_generation = %source,
+            error = %error,
+            attempts,
+            next_attempt_at_secs = next_attempt_in,
+            "typed Git-history activation did not converge; background redrive will retry"
+        );
+    }
 }
 
 pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &str) -> Result<()> {
@@ -722,16 +970,29 @@ fn record_activation_failure(
         return;
     };
     let diagnostic = error.to_string().chars().take(512).collect::<String>();
+    let mut bound_projects = 0_u64;
     for project in catalog
         .catalog()
         .projects
         .values()
         .filter(|project| project.repo_history.as_ref() == Some(&authority.repo_history_id))
     {
+        bound_projects = bound_projects.saturating_add(1);
         let _ = state.code_sources.store().record_health_failure(
             project.project_id.as_str(),
             bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
             &diagnostic,
+        );
+    }
+    if bound_projects == 0 {
+        // An orphaned repo history has no project row to carry the failure,
+        // which is exactly how weeks of redrive WARNs stayed invisible to
+        // doctor. Record the health row keyed by the repo history id so the
+        // finding exists even when nothing binds it.
+        let _ = state.code_sources.store().record_health_failure(
+            authority.repo_history_id.as_str(),
+            bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
+            &format!("no catalog project binds this repository history: {diagnostic}"),
         );
     }
 }
@@ -1956,5 +2217,293 @@ mod tests {
                 }),
             "a retained older source must not reactivate after current-ready advanced"
         );
+    }
+
+    fn orphaned_history_fixture() -> (CatalogFixture, Arc<SharedState>, RepoHistoryId) {
+        // Production shape of the redrive loop: a published project with an
+        // authenticated producer, a repo-history record, and an accepted
+        // source whose repo history NO catalog project binds because the
+        // binding was unregistered after the transport cutover.
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_orphan_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_0000000000000000000000000000000d").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        let token = bro_rpc::ServiceToken::parse("d".repeat(64)).unwrap();
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        let state = fixture.server().state;
+        (fixture, state, history)
+    }
+
+    #[test]
+    fn worker_deadletters_operator_required_activation_and_skips_later_ticks() {
+        let (_fixture, state, history) = orphaned_history_fixture();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let root_scope = CatalogFixture::scope(".");
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, "p_orphan_root", root_scope.clone(), &head);
+        let source = install_history_source(&state, &history, &namespace, root_scope, &head);
+
+        let mut worker = ActivationWorkerState::default();
+        run_activation_tick(&state, &mut worker);
+        let store = state.git_sources.store();
+        let deadletter = store.read_activation_deadletter(&history).unwrap().unwrap();
+        assert_eq!(deadletter.error_code, "repo_history_not_found");
+        assert_eq!(deadletter.source_generation_id, source);
+        assert_eq!(deadletter.attempts, 1);
+
+        // Doctor visibility for an orphan history is keyed by the repo
+        // history id: one dead-letter row plus one orphan-failure row.
+        let codes = store_health_codes(&state, history.as_str());
+        assert!(
+            codes.contains(
+                &bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE
+                    .to_string()
+            )
+        );
+        assert!(
+            codes.contains(
+                &bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE
+                    .to_string()
+            )
+        );
+
+        // Later ticks must not re-attempt (and so not re-log) the same
+        // generation: the dead letter is the durable stop condition.
+        run_activation_tick(&state, &mut worker);
+        let unchanged = store.read_activation_deadletter(&history).unwrap().unwrap();
+        assert_eq!(unchanged.attempts, 1);
+        assert_eq!(
+            unchanged.last_seen_unix_secs,
+            deadletter.last_seen_unix_secs
+        );
+
+        // An operator dropping the record restores retry on the next tick:
+        // the failure recurs and a FRESH dead letter (new first_seen,
+        // attempts restart) proves the redrive actually ran again.
+        assert!(store.drop_activation_deadletter(&history).unwrap());
+        run_activation_tick(&state, &mut worker);
+        let revived = store.read_activation_deadletter(&history).unwrap().unwrap();
+        assert_eq!(revived.attempts, 1);
+        assert!(revived.first_seen_unix_secs >= deadletter.last_seen_unix_secs);
+    }
+
+    #[test]
+    fn worker_reevaluates_a_deadlettered_repo_when_the_ready_pointer_advances() {
+        let (_fixture, state, history) = orphaned_history_fixture();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let root_scope = CatalogFixture::scope(".");
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, "p_orphan_root", root_scope.clone(), &head);
+        let first = install_history_source(&state, &history, &namespace, root_scope.clone(), &head);
+
+        let mut worker = ActivationWorkerState::default();
+        run_activation_tick(&state, &mut worker);
+        let store = state.git_sources.store();
+        assert_eq!(
+            store
+                .read_activation_deadletter(&history)
+                .unwrap()
+                .unwrap()
+                .source_generation_id,
+            first
+        );
+
+        // A newer accepted generation moves the ready pointer: the dead
+        // letter no longer names the current source, so the worker must
+        // re-evaluate (and re-classify) the new generation.
+        let head_two = "2".repeat(40);
+        let second = install_history_source(&state, &history, &namespace, root_scope, &head_two);
+        assert_ne!(first, second);
+        run_activation_tick(&state, &mut worker);
+        let advanced = store.read_activation_deadletter(&history).unwrap().unwrap();
+        assert_eq!(advanced.source_generation_id, second);
+        assert_eq!(
+            advanced.attempts, 2,
+            "the new generation is a fresh attempt"
+        );
+    }
+
+    #[test]
+    fn worker_backoff_defers_retryable_failures_until_due() {
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_backoff_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_0000000000000000000000000000000e").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        let token = bro_rpc::ServiceToken::parse("e".repeat(64)).unwrap();
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head);
+        let source = install_history_source(&state, &history, &namespace, root_scope, &head);
+
+        // First tick fails mid-pipeline (retryable): the journal reaches
+        // Prepared and the worker records one failure with tick-interval
+        // backoff.
+        set_activation_failure_point("prepared");
+        let mut worker = ActivationWorkerState::default();
+        run_activation_tick(&state, &mut worker);
+        let store = state.git_sources.store();
+        let retry = worker
+            .retryable
+            .get(&source)
+            .expect("retryable failure recorded");
+        assert_eq!(retry.attempts, 1);
+        let backoff_secs = retry
+            .next_attempt_at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        assert!(
+            backoff_secs <= ACTIVATION_WORKER_TICK_SECS
+                && backoff_secs >= ACTIVATION_WORKER_TICK_SECS - 1,
+            "first retryable failure backs off one tick interval, got {backoff_secs}s"
+        );
+        assert_eq!(
+            store
+                .read_activation_journal(&history)
+                .unwrap()
+                .unwrap()
+                .stage,
+            HistoryActivationStageV1::Prepared
+        );
+        assert!(
+            store
+                .read_activation_deadletter(&history)
+                .unwrap()
+                .is_none(),
+            "a retryable pipeline failure must not dead-letter"
+        );
+
+        // The failpoint is spent, so a second attempt would commit; backoff
+        // must defer it and leave the journal exactly where it was.
+        run_activation_tick(&state, &mut worker);
+        assert_eq!(
+            store
+                .read_activation_journal(&history)
+                .unwrap()
+                .unwrap()
+                .stage,
+            HistoryActivationStageV1::Prepared
+        );
+        assert_eq!(worker.retryable.get(&source).unwrap().attempts, 1);
+
+        // Once the backoff window expires, the next tick converges and the
+        // worker drops its retry state.
+        worker.retryable.get_mut(&source).unwrap().next_attempt_at = std::time::Instant::now();
+        run_activation_tick(&state, &mut worker);
+        assert_eq!(
+            store
+                .read_activation_journal(&history)
+                .unwrap()
+                .unwrap()
+                .stage,
+            HistoryActivationStageV1::Committed
+        );
+        assert!(worker.retryable.get(&source).is_none());
+    }
+
+    #[test]
+    fn operator_required_codes_are_recognized_through_error_context() {
+        for code in [
+            "repo_history_not_found",
+            "repo_history_scope_split",
+            "scope_forbidden",
+        ] {
+            let direct = anyhow::Error::msg(code);
+            assert_eq!(operator_required_activation_code(&direct), Some(code));
+            let wrapped = anyhow::Error::msg(code).context("resolving transport grant");
+            assert_eq!(
+                operator_required_activation_code(&wrapped),
+                Some(code),
+                "context wrapping must not hide the class"
+            );
+        }
+        let retryable = anyhow::Error::msg("repo-history group vanished before activation");
+        assert_eq!(operator_required_activation_code(&retryable), None);
+    }
+
+    fn store_health_codes(state: &Arc<SharedState>, key: &str) -> Vec<String> {
+        state
+            .code_sources
+            .store()
+            .health_records()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.project_id == key)
+            .map(|record| record.code)
+            .collect()
     }
 }
