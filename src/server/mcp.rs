@@ -35,6 +35,48 @@ pub(super) fn build_http_app(
             server_config,
         );
 
+    // Operator admin plane. The loopback-or-service-bearer gate rides as a
+    // `route_layer` over exactly these routes (see `super::admin_auth`); it
+    // must never cover `/mcp`, `/internal/*`, `/control/*`, `/healthz`, or
+    // `/readyz`.
+    let admin_routes = axum::Router::new()
+        .route(
+            "/admin/artifact/install",
+            axum::routing::post(admin_artifact_install),
+        )
+        .route(
+            "/admin/artifact/list",
+            axum::routing::get(admin_artifact_list),
+        )
+        .route(
+            "/admin/runtime-metrics",
+            axum::routing::get(admin_runtime_metrics),
+        )
+        .route(
+            "/admin/orchestration-activity",
+            axum::routing::get(admin_orchestration_activity),
+        )
+        .route(
+            "/admin/drain",
+            axum::routing::get(admin_drain_status).post(admin_drain_set),
+        )
+        .route(
+            "/admin/artifact/supersede",
+            axum::routing::post(admin_artifact_supersede),
+        )
+        .route(
+            "/admin/artifact/remove",
+            axum::routing::post(admin_artifact_remove),
+        )
+        .route(
+            "/admin/brofile/upsert",
+            axum::routing::post(admin_brofile_upsert),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            super::admin_auth::AdminAuth::from_config(&cfg.daemon),
+            super::admin_auth::authenticate_admin_request,
+        ));
+
     axum::Router::new()
         // The HTTP router is constructed only after durable state has opened,
         // so a reachable route proves startup completed as well as liveness.
@@ -83,38 +125,7 @@ pub(super) fn build_http_app(
             "/control/cancel",
             axum::routing::post(control_cancel_handler),
         )
-        .route(
-            "/admin/artifact/install",
-            axum::routing::post(admin_artifact_install),
-        )
-        .route(
-            "/admin/artifact/list",
-            axum::routing::get(admin_artifact_list),
-        )
-        .route(
-            "/admin/runtime-metrics",
-            axum::routing::get(admin_runtime_metrics),
-        )
-        .route(
-            "/admin/orchestration-activity",
-            axum::routing::get(admin_orchestration_activity),
-        )
-        .route(
-            "/admin/drain",
-            axum::routing::get(admin_drain_status).post(admin_drain_set),
-        )
-        .route(
-            "/admin/artifact/supersede",
-            axum::routing::post(admin_artifact_supersede),
-        )
-        .route(
-            "/admin/artifact/remove",
-            axum::routing::post(admin_artifact_remove),
-        )
-        .route(
-            "/admin/brofile/upsert",
-            axum::routing::post(admin_brofile_upsert),
-        )
+        .merge(admin_routes)
         .merge(super::code_source::router(shared.clone()))
         .merge(super::file_source::router(shared.clone()))
         .merge(super::conversation_source::router(shared.clone()))

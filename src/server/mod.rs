@@ -1,3 +1,4 @@
+pub(crate) mod admin_auth;
 mod background;
 mod bridge_parity;
 mod built_from;
