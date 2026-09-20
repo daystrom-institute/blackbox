@@ -15,7 +15,7 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{CommitNamespace, RepoHistoryId};
 use bbox_git_source::{
-    BeginGitHistoryUploadResponseV1, BeginProvenanceImportResponseV1,
+    BeginGitHistoryUploadResponseV1, BeginProvenanceImportResponseV1, ContractError,
     FinalizeGitHistoryUploadResponseV1, FinalizeProvenanceImportResponseV1, GitHistoryDescriptorV1,
     GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitHistorySourceStateV1,
     GitHistorySourceStatusV1, GitSourceLimits, HistorySourceVerifier,
@@ -119,6 +119,8 @@ struct ProvenanceUploadRecordV1 {
     page_digests: BTreeMap<u32, String>,
     import_generation_id: String,
     updated_unix_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -829,9 +831,10 @@ impl GitSourceStore {
                     record.state,
                     ProvenanceImportStateV1::ReceivingManifest
                         | ProvenanceImportStateV1::MissingDocuments
+                        | ProvenanceImportStateV1::Failed
                 )
             {
-                return Ok(begin_provenance_response(record.upload_id));
+                return Ok(begin_provenance_response(&record));
             }
             if matches!(
                 record.state,
@@ -848,23 +851,21 @@ impl GitSourceStore {
         let upload_path = producer_dir.join(&upload_id);
         let upload_dir = NofollowDirectory::open_or_create(&upload_path)?;
         NofollowDirectory::open_or_create(&upload_path.join("pages"))?;
-        write_json(
-            &upload_dir,
-            "upload.json",
-            &ProvenanceUploadRecordV1 {
-                version: STORE_VERSION,
-                upload_id: upload_id.clone(),
-                producer_id: producer_id.to_string(),
-                project_id: project_id.to_string(),
-                descriptor,
-                state: ProvenanceImportStateV1::ReceivingManifest,
-                next_page: 0,
-                page_digests: BTreeMap::new(),
-                import_generation_id,
-                updated_unix_secs: now_unix_secs(),
-            },
-        )?;
-        Ok(begin_provenance_response(upload_id))
+        let record = ProvenanceUploadRecordV1 {
+            version: STORE_VERSION,
+            upload_id,
+            producer_id: producer_id.to_string(),
+            project_id: project_id.to_string(),
+            descriptor,
+            state: ProvenanceImportStateV1::ReceivingManifest,
+            next_page: 0,
+            page_digests: BTreeMap::new(),
+            import_generation_id,
+            updated_unix_secs: now_unix_secs(),
+            diagnostic: None,
+        };
+        write_json(&upload_dir, "upload.json", &record)?;
+        Ok(begin_provenance_response(&record))
     }
 
     pub fn put_provenance_manifest_page(
@@ -885,13 +886,16 @@ impl GitSourceStore {
         let _guard = self.lock_mutation()?;
         let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
         let mut record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        // A replayed page with its exact recorded digest is a no-op in any
+        // state, so reattachment after a lost response can resume even when
+        // the session has already moved past manifest intake.
+        if record.page_digests.get(&page) == Some(&digest) {
+            return Ok(());
+        }
         if record.state != ProvenanceImportStateV1::ReceivingManifest {
             bail!(StoreRequestError::InvalidState);
         }
         if page < record.next_page {
-            if record.page_digests.get(&page) == Some(&digest) {
-                return Ok(());
-            }
             bail!(StoreRequestError::InvalidInput);
         }
         if page != record.next_page {
@@ -1056,11 +1060,21 @@ impl GitSourceStore {
             bail!(StoreRequestError::InvalidState);
         }
         let manifest = self.load_provenance_manifest(&upload_path)?;
-        let mut verifier = ProvenanceSourceVerifier::new(
+        // A ContractError from the verifier is deterministic given the
+        // immutable manifest and content-addressed documents, so the session
+        // is terminally failed with a durable diagnostic instead of staying
+        // retryable forever. IO and state errors stay non-terminal.
+        let mut verifier = match ProvenanceSourceVerifier::new(
             &upload.descriptor,
             &manifest,
             self.current_limits()?.contract,
-        )?;
+        ) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                mark_provenance_upload_failed(&mut upload, &upload_directory, &error)?;
+                return Err(error.into());
+            }
+        };
         for entry in &manifest {
             let bytes = self
                 .read_provenance_document_bytes(
@@ -1069,9 +1083,15 @@ impl GitSourceStore {
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
             let document = String::from_utf8(bytes).map_err(|_| StoreRequestError::InvalidInput)?;
-            verifier.push(&document)?;
+            if let Err(error) = verifier.push(&document) {
+                mark_provenance_upload_failed(&mut upload, &upload_directory, &error)?;
+                return Err(error.into());
+            }
         }
-        verifier.finish()?;
+        if let Err(error) = verifier.finish() {
+            mark_provenance_upload_failed(&mut upload, &upload_directory, &error)?;
+            return Err(error.into());
+        }
         let generation_path = self.provenance_generation_dir(&upload.import_generation_id)?;
         let existing = read_json::<StoredProvenanceImportV1>(
             &generation_path,
@@ -3577,12 +3597,15 @@ fn begin_response(upload_id: String) -> BeginGitHistoryUploadResponseV1 {
     }
 }
 
-fn begin_provenance_response(upload_id: String) -> BeginProvenanceImportResponseV1 {
+fn begin_provenance_response(record: &ProvenanceUploadRecordV1) -> BeginProvenanceImportResponseV1 {
     BeginProvenanceImportResponseV1 {
-        upload_id,
+        upload_id: record.upload_id.clone(),
         max_page_entries: MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES,
         max_page_bytes: MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
         max_document_bytes: MAX_PROVENANCE_DOCUMENT_BYTES,
+        state: record.state,
+        next_page: record.next_page as u64,
+        diagnostic: record.diagnostic.clone(),
     }
 }
 
@@ -3639,6 +3662,17 @@ fn validate_stored_provenance_receipt(
     validate_receipt_authority(&stored.producer_id, &stored.project_id)?;
     stored.receipt.validate(limits)?;
     Ok(())
+}
+
+fn mark_provenance_upload_failed(
+    upload: &mut ProvenanceUploadRecordV1,
+    upload_directory: &NofollowDirectory,
+    error: &ContractError,
+) -> Result<()> {
+    upload.state = ProvenanceImportStateV1::Failed;
+    upload.diagnostic = Some(format!("{error}").chars().take(512).collect());
+    upload.updated_unix_secs = now_unix_secs();
+    write_json(upload_directory, "upload.json", upload)
 }
 
 fn finalize_response(source_generation_id: String) -> FinalizeGitHistoryUploadResponseV1 {
@@ -4135,6 +4169,241 @@ mod tests {
         assert!(
             store
                 .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &conflicting,)
+                .is_err()
+        );
+    }
+
+    fn provenance_fixture_with_documents(
+        documents: &[String],
+    ) -> (
+        ProvenanceImportDescriptorV1,
+        Vec<ProvenanceImportManifestEntryV1>,
+    ) {
+        let manifest = documents
+            .iter()
+            .map(|document| ProvenanceImportManifestEntryV1 {
+                note_commit: "1".repeat(40),
+                document_ordinal: 0,
+                encoded_bytes: document.len() as u64,
+                document_sha256: sha256(document.as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: PublishedScope::try_new("repo-a", ".").unwrap(),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "3".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: manifest.len() as u64,
+            logical_bytes: documents.iter().map(|document| document.len() as u64).sum(),
+        };
+        (descriptor, manifest)
+    }
+
+    fn upload_failed_provenance_import(
+        store: &GitSourceStore,
+        documents: &[String],
+    ) -> BeginProvenanceImportResponseV1 {
+        let (descriptor, manifest) = provenance_fixture_with_documents(documents);
+        let begin = store
+            .begin_provenance_import(
+                "producer-a",
+                "p_00000000000000000000000000000001",
+                descriptor,
+            )
+            .unwrap();
+        store
+            .put_provenance_manifest_page(
+                "producer-a",
+                &begin.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        for (entry, document) in manifest.iter().zip(documents) {
+            store
+                .install_provenance_document(
+                    "producer-a",
+                    &begin.upload_id,
+                    &entry.document_sha256,
+                    entry.encoded_bytes,
+                    document.as_bytes(),
+                )
+                .unwrap();
+        }
+        let error = store
+            .finalize_provenance_import("producer-a", &begin.upload_id)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ContractError>(),
+            Some(&ContractError::ProvenanceDocumentInvalid)
+        );
+        begin
+    }
+
+    #[test]
+    fn provenance_begin_reattach_reports_missing_documents_state_and_next_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let (descriptor, manifest, _) = provenance_fixture();
+        let begin = store
+            .begin_provenance_import("producer-a", project_id, descriptor.clone())
+            .unwrap();
+        assert_eq!(begin.state, ProvenanceImportStateV1::ReceivingManifest);
+        assert_eq!(begin.next_page, 0);
+        assert!(begin.diagnostic.is_none());
+        store
+            .put_provenance_manifest_page(
+                "producer-a",
+                &begin.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 { entries: manifest },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        let reattached = store
+            .begin_provenance_import("producer-a", project_id, descriptor)
+            .unwrap();
+        assert_eq!(reattached.upload_id, begin.upload_id);
+        assert_eq!(reattached.state, ProvenanceImportStateV1::MissingDocuments);
+        assert_eq!(reattached.next_page, 1);
+        assert!(reattached.diagnostic.is_none());
+    }
+
+    #[test]
+    fn provenance_manifest_page_replay_in_missing_documents_is_a_no_op() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let (descriptor, manifest, _) = provenance_fixture();
+        let begin = store
+            .begin_provenance_import(
+                "producer-a",
+                "p_00000000000000000000000000000001",
+                descriptor,
+            )
+            .unwrap();
+        let page = ProvenanceImportManifestPageV1 {
+            entries: manifest.clone(),
+        };
+        store
+            .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &page)
+            .unwrap();
+        store
+            .complete_provenance_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        store
+            .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &page)
+            .unwrap();
+        let conflicting = ProvenanceImportManifestPageV1 {
+            entries: manifest[1..2].to_vec(),
+        };
+        let error = store
+            .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &conflicting)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::InvalidState)
+        );
+        store
+            .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &page)
+            .unwrap();
+    }
+
+    #[test]
+    fn provenance_finalize_contract_failure_is_terminal_and_not_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                max_open_uploads_per_producer: 1,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let documents = vec!["not a note document".to_string()];
+        let (descriptor, _) = provenance_fixture_with_documents(&documents);
+        let begin = upload_failed_provenance_import(&store, &documents);
+
+        let failed = store
+            .begin_provenance_import("producer-a", project_id, descriptor.clone())
+            .unwrap();
+        assert_eq!(failed.upload_id, begin.upload_id);
+        assert_eq!(failed.state, ProvenanceImportStateV1::Failed);
+        assert_eq!(
+            failed.diagnostic.as_deref(),
+            Some("provenance document is invalid")
+        );
+        assert_eq!(failed.next_page, 1);
+        let error = store
+            .finalize_provenance_import("producer-a", &begin.upload_id)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::InvalidState)
+        );
+
+        let mut moved = descriptor;
+        moved.notes_tip = "4".repeat(40);
+        let fresh = store
+            .begin_provenance_import("producer-a", project_id, moved.clone())
+            .unwrap();
+        assert_ne!(fresh.upload_id, begin.upload_id);
+        let mut blocked = moved;
+        blocked.notes_tip = "5".repeat(40);
+        let error = store
+            .begin_provenance_import("producer-a", project_id, blocked)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::TooManyOpenUploads)
+        );
+    }
+
+    #[test]
+    fn provenance_failed_uploads_expire_after_idle_ttl() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                unreferenced_record_grace_secs: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let documents = vec!["not a note document".to_string()];
+        let begin = upload_failed_provenance_import(&store, &documents);
+        let upload_path = store
+            .provenance_upload_dir("producer-a", &begin.upload_id)
+            .unwrap();
+        let mut upload = store
+            .load_provenance_upload(&upload_path, "producer-a", &begin.upload_id)
+            .unwrap();
+        assert_eq!(upload.state, ProvenanceImportStateV1::Failed);
+        assert!(upload.diagnostic.is_some());
+        upload.updated_unix_secs = 0;
+        let upload_directory = NofollowDirectory::open_existing(&upload_path)
+            .unwrap()
+            .unwrap();
+        write_json(&upload_directory, "upload.json", &upload).unwrap();
+
+        let report = store.maintain(&BTreeSet::new()).unwrap();
+        assert_eq!(report.expired_uploads, 1);
+        assert!(
+            store
+                .provenance_upload_dir("producer-a", &begin.upload_id)
                 .is_err()
         );
     }
