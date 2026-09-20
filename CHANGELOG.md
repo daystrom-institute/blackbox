@@ -8,6 +8,35 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The daemon's `/admin/*` HTTP plane now requires a loopback peer or
+  `Authorization: Bearer <token>` matching the owner-readable 64-hex token
+  file configured via `daemon.admin_token_file`
+  (`BLACKBOX_ADMIN_TOKEN_FILE`); unauthenticated non-loopback requests get
+  401, and with no token configured the plane stays loopback-only as
+  before. The gate covers only the admin routes, never `/mcp`,
+  `/internal/*`, `/control/*`, or the health probes, and token comparison
+  is constant-time.
+- The code collector's provenance import no longer wedges on a deterministic
+  server-side verifier rejection. Begin now reports the persisted upload state
+  (`state`, `next_page`, `diagnostic` on the begin response; a terminal
+  `failed` import state), and the collector resumes manifest pages from the
+  reported page, skips the manifest entirely for an upload already waiting on
+  documents, treats a failed upload or a finalize `invalid_git_source_input`
+  as terminal for that descriptor (logged once at WARN, skipped quietly on
+  later passes, never re-sent until the notes tip or manifest changes), and
+  aborts superseded open uploads through a new delete route while a rejected
+  upload stays on the server as the durable diagnostic.
+  Provenance import capture also assigns manifest ordinals after per-project
+  filtering and keeps fragmented note documents atomic, so a filtered document
+  no longer produces an out-of-order manifest or an unassemblable part group.
+- The code collector's log volume drops sharply on idle hosts. Idle-pass
+  already-current lines and zero-write terminal receipts log at debug, and
+  repeated identical per-project lane errors are change-gated: ERROR once and
+  on change, debug on repeats, with a WARN roll-up every six passes. The
+  per-pass failure tally only warns when the failure set changed. A new
+  optional `log_dir` config key sends collector logs to daily-rotated
+  non-blocking files without ANSI codes; stdout remains the default sink,
+  now colorizing only when it is a terminal or `log_ansi` is set explicitly.
 - Breaking: knowledge, gap, project-graph, hybrid-search, inspect, and render
   reads are published-only. The `own` and `all` provisional views are
   removed: `bbox_knowledge`, `bbox_render`, `bbox_gaps`,

@@ -135,6 +135,11 @@ See `docs/index-embedding-internals.md` (Visual routes) for details.
 Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
 `BBOX_PORT` environment variable.
 
+The `/admin/*` HTTP plane requires a loopback peer or
+`Authorization: Bearer <token>` matching the owner-readable 64-hex token
+file configured via `daemon.admin_token_file` (`BLACKBOX_ADMIN_TOKEN_FILE`);
+with no token configured it is loopback-only.
+
 ### Checkout authority
 
 A daemon that holds no project checkout (the containerized corpus daemon,
