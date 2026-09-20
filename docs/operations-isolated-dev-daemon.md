@@ -273,10 +273,10 @@ once and nothing is stored. The binding lives 24 hours, and minting again for
 the same checkout replaces the previous one.
 
 Behind the CLI is `POST /admin/workspace-binding/mint`. It is **operator
-authority**: like every other `/admin/*` route its only gate is the daemon's
-loopback bind, and it is deliberately absent from the MCP tool catalog, so no
-agent can mint itself a binding. Do not expose the listener beyond loopback
-while relying on that.
+authority**: like every other `/admin/*` route its gate is a loopback peer
+or the daemon service bearer (`daemon.admin_token_file`), and it is
+deliberately absent from the MCP tool catalog, so no agent can mint itself
+a binding.
 
 What the daemon proves before minting, from catalog state alone (it neither
 reads nor writes the checkout, and never resolves the path you declare):

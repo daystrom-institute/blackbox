@@ -43,8 +43,8 @@ pub(crate) fn is_loopback_bind(bind_host: &str) -> bool {
 // ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
 //
 // These wrap the same operations the MCP tools expose so install
-// scripts can use plain `curl`. They're loopback-only via the listener
-// binding.
+// scripts can use plain `curl`. They sit behind the loopback-or-bearer
+// gate (`super::admin_auth`).
 
 pub(crate) async fn admin_runtime_metrics() -> impl axum::response::IntoResponse {
     axum::Json(json!({

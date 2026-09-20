@@ -159,6 +159,11 @@ Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
 `BBOX_PORT` environment variable. Port `7263` is retired (old `bro.service`)
 - avoid it.
 
+The `/admin/*` HTTP plane requires a loopback peer or
+`Authorization: Bearer <token>` matching the owner-readable 64-hex token
+file configured via `daemon.admin_token_file` (`BLACKBOX_ADMIN_TOKEN_FILE`);
+with no token configured it is loopback-only.
+
 ### Daemon variants
 
 Prod and dev intentionally run from separate installed binary paths so

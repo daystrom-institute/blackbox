@@ -1,11 +1,12 @@
 //! Operator-only Git-history activation administration.
 //!
 //! Thin HTTP mirror of the offline `blackbox git-history activations` CLI:
-//! the same store reads and drops, exposed on the loopback admin surface so
-//! an operator can inspect and clear a dead-lettered activation without
-//! shell access to the state dir. Like every other `/admin/*` route this is
-//! operator authority, never an MCP tool, and store I/O runs on the blocking
-//! pool.
+//! the same store reads and drops, exposed on the authenticated admin
+//! surface so an operator can inspect and clear a dead-lettered activation
+//! without shell access to the state dir. Like every other `/admin/*` route
+//! this is operator authority behind the loopback-or-bearer gate
+//! (`super::admin_auth`), never an MCP tool, and store I/O runs on the
+//! blocking pool.
 
 use axum::Json;
 use axum::extract::State;

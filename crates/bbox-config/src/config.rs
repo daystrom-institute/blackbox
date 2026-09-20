@@ -345,6 +345,12 @@ struct RawDaemonConfig {
     /// off-host daemon's state root.
     #[serde(default)]
     pub fleetd_worker_bro_home: Option<PathBuf>,
+    /// Owner-readable file holding the bearer token that authorizes
+    /// non-loopback access to the daemon's `/admin/*` HTTP plane. The file
+    /// must contain a 64-lowercase-hex token (`bro_rpc::ServiceToken` shape).
+    /// When absent, the admin plane stays loopback-only.
+    #[serde(default)]
+    pub admin_token_file: Option<PathBuf>,
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -619,6 +625,7 @@ pub struct DaemonConfig {
     pub fleetd_token_file: Option<PathBuf>,
     pub fleetd_worker_home: Option<PathBuf>,
     pub fleetd_worker_bro_home: Option<PathBuf>,
+    pub admin_token_file: Option<PathBuf>,
 }
 
 /// Index configuration
@@ -1050,6 +1057,7 @@ impl Config {
                 fleetd_token_file: None,
                 fleetd_worker_home: None,
                 fleetd_worker_bro_home: None,
+                admin_token_file: None,
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -1185,6 +1193,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !path.trim().is_empty()
     {
         raw.daemon.fleetd_worker_bro_home = Some(PathBuf::from(path));
+    }
+
+    if let Ok(path) = std::env::var("BLACKBOX_ADMIN_TOKEN_FILE")
+        && !path.trim().is_empty()
+    {
+        raw.daemon.admin_token_file = Some(PathBuf::from(path));
     }
 
     // poller_min_interval_secs
@@ -1425,6 +1439,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             fleetd_token_file,
             fleetd_worker_home,
             fleetd_worker_bro_home,
+            admin_token_file: raw.daemon.admin_token_file,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,

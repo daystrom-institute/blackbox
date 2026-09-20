@@ -142,7 +142,14 @@ async fn serve_with_grace_period(
 ) -> anyhow::Result<()> {
     let shutdown_grace = std::time::Duration::from_secs(shutdown_grace_secs);
     let graceful_ct = ct.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    // `into_make_service_with_connect_info` publishes the accepted peer
+    // address as a request extension; the `/admin/*` gate reads it to admit
+    // loopback peers (`super::admin_auth`).
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         graceful_ct.cancelled().await;
     });
     tokio::select! {
