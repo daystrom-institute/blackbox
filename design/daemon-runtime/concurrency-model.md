@@ -120,6 +120,12 @@ tasks.json; this doc generalizes it.
   per knowledge write.
 - Edge-index rebuild takes **six store read guards simultaneously** across a
   multi-GB sidecar scan (src/server/routes.rs:1800-1826).
+- Edge-rebuild nudges fire once per mutation transaction (the activation
+  path nudges only after retirement scheduling and the overlay attempt have
+  landed), and the watcher collapses bursts inside a short debounce window
+  into one rebuild. A rebuild whose sidecar inputs change mid-parse fails
+  coordination with a typed stale-publication error and retries immediately
+  under a bounded attempt budget, never a full watcher interval.
 
 ### 1.4 Dispatch/harness hot path (per stream event)
 
