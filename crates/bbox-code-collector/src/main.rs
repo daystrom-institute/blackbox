@@ -1646,37 +1646,14 @@ fn capture_provenance_import(
             |note| {
                 let body = std::str::from_utf8(&note.bytes)
                     .context("provenance note blob is not UTF-8")?;
-                for (ordinal, document) in bbox_provenance::split_note_documents(body)
-                    .into_iter()
-                    .enumerate()
-                {
-                    if !provenance_document_belongs_to_project(document, project_id)? {
-                        continue;
-                    }
-                    let document = document.as_bytes();
-                    if document.len() as u64 > MAX_PROVENANCE_DOCUMENT_BYTES {
-                        bail!("provenance note document exceeds the transport limit");
-                    }
-                    let hash = hex::encode(Sha256::digest(document));
-                    let path = documents.path().join(&hash);
-                    if path.exists() {
-                        if fs::read(&path)? != document {
-                            bail!("captured provenance document hash collision");
-                        }
-                    } else {
-                        fs::write(&path, document)?;
-                    }
-                    logical_bytes = logical_bytes
-                        .checked_add(document.len() as u64)
-                        .ok_or_else(|| anyhow!("provenance import size overflow"))?;
-                    entries.push(ProvenanceImportManifestEntryV1 {
-                        note_commit: note.target_oid.clone(),
-                        document_ordinal: u32::try_from(ordinal)
-                            .map_err(|_| anyhow!("one provenance note has too many documents"))?,
-                        encoded_bytes: document.len() as u64,
-                        document_sha256: hash,
-                    });
-                }
+                append_owned_note_documents(
+                    body,
+                    project_id,
+                    &note.target_oid,
+                    documents.path(),
+                    &mut entries,
+                    &mut logical_bytes,
+                )?;
                 Ok(())
             },
         )?
@@ -1738,6 +1715,92 @@ fn provenance_document_belongs_to_project(document: &str, project_id: &str) -> R
         bail!("one provenance document mixes target projects");
     }
     Ok(!foreign_target)
+}
+
+/// Append one note blob's import documents for `project_id`. Fragmented V2
+/// documents are decided per logical document, not per part: the server-side
+/// verifier can only reassemble complete part groups, so a document whose
+/// parts disagree on ownership is kept whole. Manifest ordinals are assigned
+/// after filtering so they stay contiguous per note commit, matching
+/// `validate_provenance_manifest`.
+fn append_owned_note_documents(
+    body: &str,
+    project_id: &str,
+    note_commit: &str,
+    documents: &Path,
+    entries: &mut Vec<ProvenanceImportManifestEntryV1>,
+    logical_bytes: &mut u64,
+) -> Result<()> {
+    let split = bbox_provenance::split_note_documents(body);
+    let mut group_document_ids = Vec::new();
+    let mut group_keeps = Vec::new();
+    for document in &split {
+        let Ok(parsed) = bbox_provenance::parse_note_document(document) else {
+            continue;
+        };
+        if parsed.schema_version < bbox_provenance::SCHEMA_VERSION_V2 {
+            continue;
+        }
+        let Some(part) = parsed.part.as_ref() else {
+            continue;
+        };
+        let owned = provenance_document_belongs_to_project(document, project_id)?;
+        match group_document_ids
+            .iter()
+            .position(|document_id| document_id == &part.document_id)
+        {
+            Some(index) => group_keeps[index] = group_keeps[index] || owned,
+            None => {
+                group_document_ids.push(part.document_id.clone());
+                group_keeps.push(owned);
+            }
+        }
+    }
+    let mut ordinal = 0_u32;
+    for document in split {
+        let keep = match bbox_provenance::parse_note_document(document) {
+            // Preserve malformed local evidence for the authenticated
+            // server-side verifier to quarantine with a durable diagnostic.
+            Err(_) => true,
+            Ok(parsed) => match parsed.part.as_ref() {
+                None => provenance_document_belongs_to_project(document, project_id)?,
+                Some(part) => group_document_ids
+                    .iter()
+                    .zip(&group_keeps)
+                    .find(|(document_id, _)| **document_id == part.document_id)
+                    .is_some_and(|(_, keep)| *keep),
+            },
+        };
+        if !keep {
+            continue;
+        }
+        let document = document.as_bytes();
+        if document.len() as u64 > MAX_PROVENANCE_DOCUMENT_BYTES {
+            bail!("provenance note document exceeds the transport limit");
+        }
+        let hash = hex::encode(Sha256::digest(document));
+        let path = documents.join(&hash);
+        if path.exists() {
+            if fs::read(&path)? != document {
+                bail!("captured provenance document hash collision");
+            }
+        } else {
+            fs::write(&path, document)?;
+        }
+        *logical_bytes = logical_bytes
+            .checked_add(document.len() as u64)
+            .ok_or_else(|| anyhow!("provenance import size overflow"))?;
+        entries.push(ProvenanceImportManifestEntryV1 {
+            note_commit: note_commit.to_string(),
+            document_ordinal: ordinal,
+            encoded_bytes: document.len() as u64,
+            document_sha256: hash,
+        });
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("one provenance note has too many documents"))?;
+    }
+    Ok(())
 }
 
 async fn publish_provenance_import(
@@ -1962,6 +2025,7 @@ async fn abort_remembered_provenance_upload(
     tracing::debug!(
         root = %root.display(),
         upload_id = %open.upload_id,
+        notes_tip = %open.descriptor.notes_tip,
         "aborting the open provenance import upload for a superseded descriptor"
     );
     abort_provenance_import_best_effort(runtime, &open.upload_id).await;
@@ -3895,7 +3959,6 @@ mod tests {
         missing_hashes: Vec<String>,
         finalize_rejection: Option<(&'static str, String)>,
         export_response: Option<ProvenanceExportPageResponseV1>,
-        export_receipts: Vec<ProvenanceExportReceiptV1>,
     }
 
     fn import_fixture(scope: &PublishedScope, documents: &[&str]) -> CapturedProvenanceImport {
@@ -4074,7 +4137,7 @@ mod tests {
             .route(
                 "/internal/code-source/v1/provenance/generations/{generation}/status",
                 get(move || {
-                    status_state.lock().unwrap();
+                    drop(status_state.lock().unwrap());
                     async move {
                         Json(ProvenanceImportStatusV1 {
                             import_generation_id: "gen-1".to_string(),
@@ -4374,6 +4437,181 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn provenance_capture_ordinals_are_contiguous_and_part_groups_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.name", "Provenance Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "provenance@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-ordinals\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "fixture"]);
+        let head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let scope = PublishedScope::try_new("repo-ordinals", ".").unwrap();
+        let notes_ref = "refs/notes/bb/provenance";
+
+        let document = |letter: &str, part_index: u32, part_count: u32, target: &str| {
+            serde_json::json!({
+                "schema_version": 2,
+                "commit": head,
+                "part": {
+                    "document_id": format!("{letter}").repeat(64),
+                    "part_index": part_index,
+                    "part_count": part_count
+                },
+                "produced_by": {},
+                "tool_calls": [{
+                    "tool": "Read",
+                    "source_ref": "transcript:test:session:1:0",
+                    "target_ref": format!(
+                        "project_file_v2:{target}:snapshot:path:{}:0",
+                        "1".repeat(64)
+                    ),
+                    "file": "src/lib.rs"
+                }],
+                "knowledge_writes": []
+            })
+            .to_string()
+        };
+        // Write the note blob directly: the authenticated export channel
+        // would refuse foreign-target documents, but shared checkouts do
+        // accumulate them locally and capture must filter them.
+        bbox_corpus_core::git::ensure_notes_merge_strategy_union(&root).unwrap();
+        for raw in [
+            document("a", 0, 1, "project-a"),
+            document("b", 0, 1, "project-b"),
+            document("c", 0, 1, "project-a"),
+            document("d", 0, 2, "project-b"),
+            document("d", 1, 2, "project-b"),
+            document("e", 0, 2, "project-a"),
+            document("e", 1, 2, "project-b"),
+        ] {
+            bbox_corpus_core::git::write_note(&root, notes_ref, &head, &format!("{raw}\n"))
+                .unwrap();
+        }
+
+        let captured = capture_provenance_import(&root, &scope, "project-a", notes_ref).unwrap();
+        assert_eq!(captured.entries.len(), 4, "b and both d parts are filtered");
+        let expected_order = [
+            document("a", 0, 1, "project-a"),
+            document("c", 0, 1, "project-a"),
+            document("e", 0, 2, "project-a"),
+            document("e", 1, 2, "project-b"),
+        ];
+        for (ordinal, (entry, expected)) in captured.entries.iter().zip(expected_order).enumerate()
+        {
+            assert_eq!(
+                entry.document_sha256,
+                bbox_provenance::document_sha256(&expected),
+                "kept document {ordinal}"
+            );
+            // Ordinals are assigned after filtering: contiguous per note, no
+            // gap where the filtered middle document and foreign parts sit.
+            assert_eq!(entry.document_ordinal, ordinal as u32);
+        }
+        // The surviving manifest validates and the kept documents stream
+        // through the complete verifier, including the atomic e part group.
+        bbox_git_source::validate_provenance_manifest(
+            &captured.descriptor,
+            &captured.entries,
+            bbox_git_source::GitSourceLimits::default(),
+        )
+        .unwrap();
+        let kept_documents = captured
+            .entries
+            .iter()
+            .map(|entry| {
+                fs::read_to_string(captured.documents.path().join(&entry.document_sha256)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        bbox_git_source::validate_provenance_documents(
+            &captured.descriptor,
+            &captured.entries,
+            &kept_documents,
+            bbox_git_source::GitSourceLimits::default(),
+        )
+        .unwrap();
+
+        // A second note commit restarts ordinals at zero after filtering.
+        fs::write(root.join("second.md"), "second\n").unwrap();
+        git(&root, &["add", "second.md"]);
+        git(&root, &["commit", "--quiet", "-m", "second"]);
+        let second_head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let foreign_second = serde_json::json!({
+            "schema_version": 2,
+            "commit": second_head,
+            "part": {
+                "document_id": "g".repeat(64),
+                "part_index": 0,
+                "part_count": 1
+            },
+            "produced_by": {},
+            "tool_calls": [{
+                "tool": "Read",
+                "source_ref": "transcript:test:session:1:0",
+                "target_ref": format!(
+                    "project_file_v2:project-b:snapshot:path:{}:0",
+                    "1".repeat(64)
+                ),
+                "file": "src/lib.rs"
+            }],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let owned_second = serde_json::json!({
+            "schema_version": 2,
+            "commit": second_head,
+            "part": {
+                "document_id": "h".repeat(64),
+                "part_index": 0,
+                "part_count": 1
+            },
+            "produced_by": {},
+            "tool_calls": [{
+                "tool": "Read",
+                "source_ref": "transcript:test:session:1:0",
+                "target_ref": format!(
+                    "project_file_v2:project-a:snapshot:path:{}:0",
+                    "1".repeat(64)
+                ),
+                "file": "src/lib.rs"
+            }],
+            "knowledge_writes": []
+        })
+        .to_string();
+        for raw in [foreign_second, owned_second] {
+            bbox_corpus_core::git::write_note(&root, notes_ref, &second_head, &format!("{raw}\n"))
+                .unwrap();
+        }
+
+        let captured = capture_provenance_import(&root, &scope, "project-a", notes_ref).unwrap();
+        assert_eq!(captured.entries.len(), 5);
+        let second: Vec<&ProvenanceImportManifestEntryV1> = captured
+            .entries
+            .iter()
+            .filter(|entry| entry.note_commit == second_head)
+            .collect();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].document_ordinal, 0);
+        assert_eq!(captured.descriptor.document_count, 5);
+        bbox_git_source::validate_provenance_manifest(
+            &captured.descriptor,
+            &captured.entries,
+            bbox_git_source::GitSourceLimits::default(),
+        )
+        .unwrap();
     }
 
     #[test]
