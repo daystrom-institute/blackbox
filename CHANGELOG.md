@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The code collector's provenance import no longer wedges on a deterministic
+  server-side verifier rejection. Begin now reports the persisted upload state
+  (`state`, `next_page`, `diagnostic` on the begin response; a terminal
+  `failed` import state), and the collector resumes manifest pages from the
+  reported page, skips the manifest entirely for an upload already waiting on
+  documents, treats a failed upload or a finalize `invalid_git_source_input`
+  as terminal for that descriptor (logged once at WARN, skipped quietly on
+  later passes, never re-sent until the notes tip or manifest changes), and
+  aborts superseded or rejected uploads through a new delete route.
+  Provenance import capture also assigns manifest ordinals after per-project
+  filtering and keeps fragmented note documents atomic, so a filtered document
+  no longer produces an out-of-order manifest or an unassemblable part group.
+- The code collector's log volume drops sharply on idle hosts. Idle-pass
+  already-current lines and zero-write terminal receipts log at debug, and
+  repeated identical per-project lane errors are change-gated: ERROR once and
+  on change, debug on repeats, with a WARN roll-up every six passes. The
+  per-pass failure tally only warns when the failure set changed. A new
+  optional `log_dir` config key sends collector logs to daily-rotated
+  non-blocking files without ANSI codes; stdout remains the default sink,
+  now colorizing only when it is a terminal or `log_ansi` is set explicitly.
 - Project indexing passes are substantially faster on large projects. Three
   hot spots in the per-project index pass were fixed: the code-edge derivation
   compiled two regexes for every chunk, the chunker recounted newlines from

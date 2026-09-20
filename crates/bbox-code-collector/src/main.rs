@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +86,14 @@ struct CollectorConfig {
     mutation_interval_secs: u64,
     #[serde(default = "default_status_timeout_secs")]
     status_timeout_secs: u64,
+    /// Optional directory for daily-rotated collector log files. When unset,
+    /// logging goes to stdout (typically captured by the service manager).
+    #[serde(default)]
+    log_dir: Option<PathBuf>,
+    /// Explicit ANSI override for stdout logging; defaults to whether stdout
+    /// is a terminal. File logging never emits ANSI codes.
+    #[serde(default)]
+    log_ansi: Option<bool>,
     projects: Vec<ProjectConfig>,
 }
 
@@ -286,14 +294,9 @@ fn default_status_timeout_secs() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "bbox_code_collector=info".into()),
-        )
-        .init();
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+    let _log_guard = init_tracing(&config);
     if let Command::Init { path } = &cli.command {
         return init_project_scaffolding(path);
     }
@@ -302,6 +305,35 @@ async fn main() -> Result<()> {
         Command::Once => publish_all(&runtime, &config).await,
         Command::Run => run_loop(&runtime, &config).await,
         Command::Init { .. } => unreachable!("init returns above"),
+    }
+}
+
+/// Install the process-wide tracing subscriber. With `log_dir` configured,
+/// logs go to daily-rotated, non-blocking files without ANSI codes; without
+/// it, stdout is used as before, with ANSI colors only for an explicit
+/// `log_ansi = true` or an interactive terminal. The returned guard flushes
+/// the background writer and must stay alive for the process lifetime.
+fn init_tracing(config: &CollectorConfig) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "bbox_code_collector=info".into());
+    if let Some(log_dir) = &config.log_dir {
+        let appender = tracing_appender::rolling::daily(log_dir, "bbox-code-collector.log");
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .with_ansi(false)
+            .init();
+        Some(guard)
+    } else {
+        let ansi = config
+            .log_ansi
+            .unwrap_or_else(|| std::io::stdout().is_terminal());
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(ansi)
+            .init();
+        None
     }
 }
 
@@ -3354,6 +3386,8 @@ mod tests {
             interval_secs: 1,
             mutation_interval_secs: 1,
             status_timeout_secs: 1,
+            log_dir: None,
+            log_ansi: None,
             projects: vec![ProjectConfig {
                 root: root.to_path_buf(),
                 scope,
@@ -3718,6 +3752,18 @@ mod tests {
         .unwrap();
         assert!(!config.projects[0].git_history);
         assert!(!config.projects[0].provenance);
+        assert_eq!(config.log_dir, None);
+        assert_eq!(config.log_ansi, None);
+
+        let config = toml::from_str::<CollectorConfig>(
+            "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\nlog_dir = \"/var/log/collector\"\nlog_ansi = true\nprojects = []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.log_dir.as_deref(),
+            Some(Path::new("/var/log/collector"))
+        );
+        assert_eq!(config.log_ansi, Some(true));
     }
 
     #[test]
@@ -4996,5 +5042,34 @@ mod tests {
             "lanes are independent"
         );
         assert!(!gate.tally_changed("git-history", &changed));
+    }
+
+    #[test]
+    fn file_logging_rotates_daily_without_ansi() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut config = mutation_config(&root, PublishedScope::try_new("repo-logs", ".").unwrap());
+        // log_ansi must be ignored by the file sink.
+        config.log_dir = Some(root.join("logs"));
+        config.log_ansi = Some(true);
+        let guard = init_tracing(&config).expect("log_dir installs the rotating file writer");
+        tracing::warn!("rotation target marker");
+        drop(guard);
+        let logs_dir = root.join("logs");
+        let rotated: Vec<String> = fs::read_dir(&logs_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rotated.len(), 1, "exactly one dated log file: {rotated:?}");
+        assert!(
+            rotated[0].starts_with("bbox-code-collector.log."),
+            "daily rotation names the file with a date suffix: {rotated:?}"
+        );
+        let content = fs::read_to_string(logs_dir.join(&rotated[0])).unwrap();
+        assert!(content.contains("rotation target marker"), "{content}");
+        assert!(
+            !content.contains('\u{1b}'),
+            "the file sink never emits ANSI escapes: {content:?}"
+        );
     }
 }
