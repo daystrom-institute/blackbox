@@ -1164,6 +1164,25 @@ impl GitSourceStore {
         Ok(finalize_provenance_response(upload.import_generation_id))
     }
 
+    /// Remove one producer-owned provenance import upload session that has
+    /// not published a ready generation. Sessions still receiving their
+    /// manifest, waiting for documents, or terminally failed are removable;
+    /// a finalized upload is durable generation evidence and refuses.
+    pub fn abort_provenance_import(&self, producer_id: &str, upload_id: &str) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if !matches!(
+            record.state,
+            ProvenanceImportStateV1::ReceivingManifest
+                | ProvenanceImportStateV1::MissingDocuments
+                | ProvenanceImportStateV1::Failed
+        ) {
+            bail!(StoreRequestError::InvalidState);
+        }
+        remove_upload_directory(&upload_path)
+    }
+
     pub fn provenance_import_status(
         &self,
         producer_id: &str,
@@ -4479,6 +4498,85 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn provenance_abort_removes_open_uploads_and_refuses_ready_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let producer_id = "producer-a";
+        let (descriptor, manifest, documents) = provenance_fixture();
+        let begin = store
+            .begin_provenance_import(producer_id, project_id, descriptor.clone())
+            .unwrap();
+        store
+            .put_provenance_manifest_page(
+                producer_id,
+                &begin.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest(producer_id, &begin.upload_id)
+            .unwrap();
+        store
+            .abort_provenance_import(producer_id, &begin.upload_id)
+            .unwrap();
+        assert!(
+            store
+                .provenance_upload_dir(producer_id, &begin.upload_id)
+                .is_err()
+        );
+        let error = store
+            .abort_provenance_import(producer_id, &begin.upload_id)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::NotFound)
+        );
+        let restarted = store
+            .begin_provenance_import(producer_id, project_id, descriptor)
+            .unwrap();
+        assert_ne!(restarted.upload_id, begin.upload_id);
+        store
+            .put_provenance_manifest_page(
+                producer_id,
+                &restarted.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest(producer_id, &restarted.upload_id)
+            .unwrap();
+        for (entry, document) in manifest.iter().zip(&documents) {
+            store
+                .install_provenance_document(
+                    producer_id,
+                    &restarted.upload_id,
+                    &entry.document_sha256,
+                    entry.encoded_bytes,
+                    document.as_bytes(),
+                )
+                .unwrap();
+        }
+        store
+            .finalize_provenance_import(producer_id, &restarted.upload_id)
+            .unwrap();
+        let error = store
+            .abort_provenance_import(producer_id, &restarted.upload_id)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::InvalidState)
+        );
     }
 
     #[test]
