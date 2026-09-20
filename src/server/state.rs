@@ -81,6 +81,16 @@ impl ProjectAuthority {
     }
 }
 
+/// One project's last knowledge discovery-lease denial, kept only to gate
+/// reconciler logging: WARN on the first denial or a changed denial, debug
+/// while the same denial persists, INFO when the lease recovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KnowledgeDiscoveryDenial {
+    pub(crate) denial: String,
+    pub(crate) first_seen_unix_secs: u64,
+    pub(crate) last_seen_unix_secs: u64,
+}
+
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
     /// Handle to the daemon's single tantivy writer actor. All production
@@ -138,6 +148,11 @@ pub(crate) struct SharedState {
     /// proves the remote result matched its overlap reference.
     pub(crate) knowledge_transport_observations:
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
+    /// Last discovery-lease denial key per project, for transition-gated
+    /// logging in the knowledge checkout reconciler: a steady-state denial
+    /// (an uncovered project whose checkout root is gone) logs WARN once and
+    /// drops to debug until the outcome changes.
+    pub(crate) knowledge_discovery_denials: Mutex<BTreeMap<String, KnowledgeDiscoveryDenial>>,
     /// Durable positive-use and shadow-parity evidence for checkout-local
     /// blame execution. Contains identity and response checksums only.
     pub(crate) blame_locality_observations:
@@ -806,6 +821,7 @@ impl SharedState {
             checkout_access,
             knowledge_transport_observations:
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
+            knowledge_discovery_denials: Mutex::new(BTreeMap::new()),
             blame_locality_observations:
                 bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::in_memory(),
             render_locality_observations:
