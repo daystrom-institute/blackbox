@@ -891,9 +891,9 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
     if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
         let current = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
         if current != authority {
-            anyhow::bail!(
-                "edge-index rebuild input changed while it was being parsed; refusing stale publication"
-            );
+            // Typed so the watcher can distinguish "restart now from a fresh
+            // capture" from every other failure class.
+            return Err(anyhow::Error::new(EdgeRebuildInputChanged));
         }
         *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
             active_selectors: selectors,
@@ -925,6 +925,84 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
         .store()
         .clear_health_failure("_edge_index", "rebuild_failed")?;
     Ok(())
+}
+
+/// The sidecar inputs a rebuild parsed changed before its publication could
+/// be coordinated. This is a retry-now condition, not a reportable failure:
+/// a manifest write landed mid-parse (for example a trailing mutation of an
+/// activation transaction), so the rebuild must restart from a fresh capture
+/// instead of publishing a graph built from mixed inputs.
+#[derive(Debug)]
+struct EdgeRebuildInputChanged;
+
+impl std::fmt::Display for EdgeRebuildInputChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "edge-index rebuild input changed while it was being parsed; refusing stale publication",
+        )
+    }
+}
+
+impl std::error::Error for EdgeRebuildInputChanged {}
+
+fn edge_rebuild_input_changed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EdgeRebuildInputChanged>().is_some())
+}
+
+const DEFAULT_EDGE_INDEX_STALE_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_EDGE_INDEX_STALE_RETRY_PAUSE_MS: u64 = 250;
+
+fn edge_index_stale_retry_attempts() -> u32 {
+    std::env::var("BLACKBOX_EDGE_INDEX_STALE_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_EDGE_INDEX_STALE_RETRY_ATTEMPTS)
+}
+
+fn edge_index_stale_retry_pause() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BLACKBOX_EDGE_INDEX_STALE_RETRY_PAUSE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_EDGE_INDEX_STALE_RETRY_PAUSE_MS),
+    )
+}
+
+/// Run one edge-index rebuild, retrying immediately (bounded, with a short
+/// pause between attempts) while the coordinator refuses publication because
+/// the parsed inputs changed mid-parse. Any other failure, or a stale race
+/// that persists past the attempt budget, returns to the caller's ordinary
+/// failure handling unchanged.
+fn rebuild_edge_index_with_stale_retry(
+    state: &SharedState,
+    include_tantivy_projection: bool,
+) -> anyhow::Result<()> {
+    let attempts = edge_index_stale_retry_attempts();
+    let pause = edge_index_stale_retry_pause();
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match rebuild_edge_index_from_shared(state, include_tantivy_projection) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt < attempts && edge_rebuild_input_changed(&error) {
+                    tracing::debug!(
+                        attempt,
+                        attempts,
+                        pause_ms = pause.as_millis(),
+                        "edge-index rebuild inputs changed mid-parse; retrying immediately"
+                    );
+                    std::thread::sleep(pause);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
 }
 
 fn build_edge_index_from_shared_at_authority(
@@ -1291,7 +1369,7 @@ fn edge_watcher_tick(
             sidecars_changed,
             "edge-index watcher rebuild started"
         );
-        match rebuild_edge_index_from_shared(&state, false) {
+        match rebuild_edge_index_with_stale_retry(&state, false) {
             Ok(()) => {
                 tracing::info!(
                     prev_docs = inputs.last_seen,
@@ -2567,6 +2645,153 @@ mod tests {
         assert!(
             error.to_string().contains("active sidecar input"),
             "unexpected refusal: {error:#}"
+        );
+    }
+
+    /// Hold the process-wide manifest coordinator until `release` fires, so a
+    /// rebuild under test parks at its publication gate exactly where a
+    /// mid-parse manifest write would land. The receive is bounded so a
+    /// broken test still exits on the nextest per-test timeout.
+    fn hold_manifest_coordinator_until(
+        held: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+            held.send(()).unwrap();
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn explicit_lane_edge(kind: &str) -> edge_index::Edge {
+        edge_index::Edge {
+            provenance: chunker::EdgeProvenance::Explicit,
+            ..signature_test_edge(kind)
+        }
+    }
+
+    #[test]
+    fn stale_edge_rebuild_race_retries_immediately_and_publishes() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_EDGE_INDEX_STALE_RETRY_PAUSE_MS", "5");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Park the rebuild's first attempt at its publication gate.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || hold_manifest_coordinator_until(held_tx, release_rx));
+        held_rx.recv().unwrap();
+
+        let rebuild_state = state.clone();
+        let rebuild =
+            std::thread::spawn(move || rebuild_edge_index_with_stale_retry(&rebuild_state, false));
+        // No early break: the settle observes the parked steady state, not
+        // the pre-acquisition race.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !rebuild.is_finished(),
+            "precondition: the rebuild should be parked at the coordinator"
+        );
+
+        // The mid-parse input change: append one edge to the ACTIVE snapshot
+        // member the manifest selects. This is exactly the shape of a
+        // manifest-coordinated write landing while the rebuild parses (raw
+        // bytes here so it can happen under the test's coordinator hold).
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        let active_snapshot = manifest.workspaces["p"]
+            .active_snapshot
+            .clone()
+            .expect("fixture published an active snapshot");
+        let member = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join(&active_snapshot)
+            .join("project.jsonl");
+        let mut member_bytes = std::fs::read(&member).unwrap();
+        member_bytes.extend_from_slice(
+            format!(
+                "{}\n",
+                serde_json::to_string(&explicit_lane_edge("MID_PARSE")).unwrap()
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&member, member_bytes).unwrap();
+
+        let finished = std::time::Instant::now();
+        release_tx.send(()).unwrap();
+        gate.join().unwrap();
+        rebuild
+            .join()
+            .unwrap()
+            .expect("the stale race must publish on the second attempt");
+        assert!(
+            finished.elapsed() < std::time::Duration::from_secs(5),
+            "stale-publication races retry immediately, not on the watcher interval; took {:?}",
+            finished.elapsed()
+        );
+        // The second attempt parsed the mutated inputs: the mid-parse edge
+        // is part of the published graph, not just the sidecar directory.
+        let view = state.complete_code_read_view().unwrap();
+        let published = view
+            .edge_index
+            .forward_edges(&entity_ref::EntityRef::Knowledge {
+                id: "source".into(),
+            });
+        assert!(
+            published.iter().any(|edge| edge.kind == "MID_PARSE"),
+            "the retried rebuild must publish the changed sidecar input"
+        );
+    }
+
+    #[test]
+    fn non_stale_edge_rebuild_failure_does_not_retry() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root.join("bro"));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // The oversized-input refusal is not the stale-publication class:
+        // the bounded retry loop must return it on the first attempt.
+        let started = std::time::Instant::now();
+        let error = rebuild_edge_index_with_stale_retry(&state, false).unwrap_err();
+        assert!(
+            error.to_string().contains("active sidecar input"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            !edge_rebuild_input_changed(&error),
+            "the oversized-input refusal is not the stale-publication class"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "non-stale failures return without retry pauses"
         );
     }
 
