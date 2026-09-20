@@ -1202,6 +1202,12 @@ impl HttpError {
                 "unsupported_contract",
                 "Git-source contract version is unsupported",
             ),
+            // The stable invalid_git_source_input code drives the collector's
+            // terminal-failure detection; the message carries the group
+            // identity so the finalize 422 names the damaged document.
+            ContractError::ProvenancePartGroupIncomplete { .. } => {
+                Self::unprocessable("invalid_git_source_input", error.to_string())
+            }
             _ => Self::unprocessable(
                 "invalid_git_source_input",
                 "Git-source input violates the transport contract",
@@ -1686,6 +1692,133 @@ mod tests {
             status.state,
             bbox_git_source::ProvenanceImportStateV1::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn provenance_finalize_incomplete_part_group_names_the_group_in_the_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, token, scope) = enabled_state(directory.path());
+        let app = router(state.clone()).with_state(state);
+        let commit = "1".repeat(40);
+        let document_id = "d".repeat(64);
+        // Only part 0 of 4 landed on the note: the manifest is consistent and
+        // the document is individually valid, so finalize rejects at the
+        // verifier's group check and the 422 must name the damaged group.
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "commit": commit,
+            "part": {
+                "document_id": document_id,
+                "part_index": 0,
+                "part_count": 4
+            },
+            "produced_by": {},
+            "tool_calls": [],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let hash = hex::encode(Sha256::digest(document.as_bytes()));
+        let manifest = vec![ProvenanceImportManifestEntryV1 {
+            note_commit: commit.clone(),
+            document_ordinal: 0,
+            encoded_bytes: document.len() as u64,
+            document_sha256: hash.clone(),
+        }];
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope,
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: 1,
+            logical_bytes: document.len() as u64,
+        };
+        let begun = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/code-source/v1/provenance/imports",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvenanceImportRequestV1 { descriptor }).unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(begun.status(), StatusCode::CREATED);
+        let begun: BeginProvenanceImportResponseV1 =
+            serde_json::from_slice(&to_bytes(begun.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let page = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/manifest/0",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&ProvenanceImportManifestPageV1 { entries: manifest })
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::NO_CONTENT);
+        let complete = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/manifest/complete",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let upload = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/internal/code-source/v1/provenance/imports/{}/documents/{hash}",
+                begun.upload_id
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_LENGTH, document.len())
+            .body(Body::from(document))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(upload).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        let finalized = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/finalize",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finalized.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let rejection: ErrorResponse =
+            serde_json::from_slice(&to_bytes(finalized.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        // The code stays stable so producers keep treating the rejection as
+        // terminal for the descriptor; the message carries the identity.
+        assert_eq!(rejection.code, "invalid_git_source_input");
+        assert!(
+            rejection.message.contains(&document_id),
+            "{}",
+            rejection.message
+        );
+        assert!(rejection.message.contains("of 4"), "{}", rejection.message);
     }
 
     #[tokio::test]
