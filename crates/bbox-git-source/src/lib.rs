@@ -708,6 +708,16 @@ pub struct BeginProvenanceImportResponseV1 {
     pub max_page_entries: usize,
     pub max_page_bytes: usize,
     pub max_document_bytes: u64,
+    /// Resumed uploads report the durable session state so a reattached
+    /// producer learns whether intake already progressed past the manifest.
+    #[serde(default)]
+    pub state: ProvenanceImportStateV1,
+    /// The next manifest page index the session expects.
+    #[serde(default)]
+    pub next_page: u64,
+    /// Durable diagnostic for terminal `failed` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -734,6 +744,13 @@ pub enum ProvenanceImportStateV1 {
     Active,
     Superseded,
     Quarantined,
+    Failed,
+}
+
+impl Default for ProvenanceImportStateV1 {
+    fn default() -> Self {
+        Self::ReceivingManifest
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1113,6 +1130,37 @@ mod tests {
 
     fn scope() -> PublishedScope {
         PublishedScope::try_new("repo-a", ".").unwrap()
+    }
+
+    #[test]
+    fn begin_provenance_import_response_defaults_for_older_peers() {
+        let legacy = serde_json::json!({
+            "upload_id": "upload",
+            "max_page_entries": 1,
+            "max_page_bytes": 2,
+            "max_document_bytes": 3
+        });
+        let parsed: BeginProvenanceImportResponseV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.state, ProvenanceImportStateV1::ReceivingManifest);
+        assert_eq!(parsed.next_page, 0);
+        assert!(parsed.diagnostic.is_none());
+
+        let resumed = serde_json::to_value(BeginProvenanceImportResponseV1 {
+            upload_id: "upload".into(),
+            max_page_entries: 1,
+            max_page_bytes: 2,
+            max_document_bytes: 3,
+            state: ProvenanceImportStateV1::Failed,
+            next_page: 2,
+            diagnostic: Some("provenance document is invalid".into()),
+        })
+        .unwrap();
+        assert_eq!(resumed["state"], serde_json::json!("failed"));
+        assert_eq!(resumed["next_page"], serde_json::json!(2));
+        assert_eq!(
+            resumed["diagnostic"],
+            serde_json::json!("provenance document is invalid")
+        );
     }
 
     fn fragment(oid: &str, parents: Vec<String>, paths: Vec<String>) -> GitHistoryCommitFragmentV1 {
