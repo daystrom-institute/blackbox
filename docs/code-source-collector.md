@@ -122,6 +122,16 @@ Delivery errors back off to at most 60 seconds, or the configured mutation
 interval when larger. Delivery changes the checkout; publication still waits
 for the configured committed ref and its publication cycle.
 
+`log_dir` optionally sends collector logging into daily-rotated files
+(`bbox-code-collector.log.YYYY-MM-DD`) written by a non-blocking background
+worker with ANSI codes disabled. When it is unset, logging goes to stdout as
+before, which the service manager captures and rotates itself; stdout colors
+then default to whether stdout is a terminal and can be forced either way
+with `log_ansi` (`true` or `false`). Repeated identical per-project failures
+are change-gated (logged once at ERROR, quiet repeats, a WARN roll-up every
+six passes), so a stable misconfiguration no longer produces one ERROR line
+per project per interval.
+
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
 submodules, special files, `.bbox`, build output, and unsupported or oversized
