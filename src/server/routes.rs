@@ -841,22 +841,72 @@ pub(crate) fn edge_sidecar_dir(state: &SharedState) -> std::path::PathBuf {
     )
 }
 
+/// Phase accounting for one edge-index rebuild. The four durations sum to
+/// (approximately) the rebuild call's wall clock: authority captures
+/// (pre-publication plus the coordinator's verification capture), time
+/// parked waiting on the manifest coordinator, the overlay-map read for the
+/// published view, and everything that builds the replacement graph (store
+/// projections, sidecar parse, selector/searcher refresh, view swap).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EdgeRebuildTimings {
+    pub(crate) capture: std::time::Duration,
+    pub(crate) coordinator_wait: std::time::Duration,
+    pub(crate) overlay_read: std::time::Duration,
+    pub(crate) build: std::time::Duration,
+}
+
+/// What a successful rebuild reports back to its caller: the sidecar
+/// signature the coordinator validated (identical, by construction, to the
+/// post-publication inputs), the phase timings, and how many attempts the
+/// stale-retry loop needed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EdgeRebuildReport {
+    pub(crate) signature: EdgeSidecarSignature,
+    pub(crate) timings: EdgeRebuildTimings,
+    pub(crate) attempts: u32,
+}
+
+/// A sidecar authority the watcher captured immediately before deciding to
+/// rebuild, plus how long that capture took. Reusing it skips the rebuild's
+/// own duplicate capture; the coordinator's fresh verification capture
+/// remains the correctness anchor, so a stale pre-capture can only cost a
+/// typed retry, never a stale publication.
+pub(crate) struct EdgeRebuildPreCaptured {
+    pub(crate) authority: EdgeRebuildAuthority,
+    pub(crate) capture: std::time::Duration,
+}
+
 pub(crate) fn rebuild_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
-) -> anyhow::Result<()> {
+    pre_captured: Option<EdgeRebuildPreCaptured>,
+) -> anyhow::Result<EdgeRebuildReport> {
     let edges_dir = edge_sidecar_dir(state);
-    rebuild_edge_index_from_shared_at(state, include_tantivy_projection, &edges_dir)
+    rebuild_edge_index_from_shared_at(state, include_tantivy_projection, &edges_dir, pre_captured)
 }
 
 pub(crate) fn rebuild_edge_index_from_shared_at(
     state: &SharedState,
     include_tantivy_projection: bool,
     edges_dir: &std::path::Path,
-) -> anyhow::Result<()> {
+    pre_captured: Option<EdgeRebuildPreCaptured>,
+) -> anyhow::Result<EdgeRebuildReport> {
     let registered_project_ids = state.corpus_registered_project_ids();
+    let mut timings = EdgeRebuildTimings::default();
     let prepared = (|| -> anyhow::Result<_> {
-        let authority = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
+        let authority = match pre_captured {
+            Some(pre_captured) => {
+                timings.capture += pre_captured.capture;
+                pre_captured.authority
+            }
+            None => {
+                let capture_started = std::time::Instant::now();
+                let authority =
+                    capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
+                timings.capture += capture_started.elapsed();
+                authority
+            }
+        };
         let max_bytes = edge_index_rebuild_max_input_bytes();
         if authority.signature.bytes > max_bytes {
             anyhow::bail!(
@@ -865,6 +915,7 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
                 max_bytes
             );
         }
+        let build_started = std::time::Instant::now();
         let rebuilt = build_edge_index_from_shared_at_authority(
             state,
             include_tantivy_projection,
@@ -875,6 +926,7 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
             let index = state.idx.read();
             (index.refresh_active_code_selectors()?, index.searcher())
         };
+        timings.build += build_started.elapsed();
         Ok((authority, rebuilt, selectors, searcher))
     })();
     let (authority, rebuilt, selectors, searcher) = match prepared {
@@ -888,43 +940,141 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
             return Err(error);
         }
     };
-    if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+    let published = bbox_edge_sidecar::snapshot::with_manifest_coordinator_reporting_wait(|| {
+        let verify_started = std::time::Instant::now();
         let current = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
+        timings.capture += verify_started.elapsed();
         if current != authority {
-            anyhow::bail!(
-                "edge-index rebuild input changed while it was being parsed; refusing stale publication"
-            );
+            // Typed so the watcher can distinguish "restart now from a fresh
+            // capture" from every other failure class.
+            return Err(anyhow::Error::new(EdgeRebuildInputChanged));
         }
+        let overlay_started = std::time::Instant::now();
+        let git_overlays = super::state::read_git_overlays_for_view(
+            &state.project_authority,
+            edges_dir,
+            &state.git_transport_cutover,
+            &state.code_sources,
+        );
+        timings.overlay_read += overlay_started.elapsed();
         *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
             active_selectors: selectors,
             searcher,
             edge_index: std::sync::Arc::new(rebuilt),
             catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
-            git_overlays: super::state::read_git_overlays_for_view(
-                &state.project_authority,
-                &edges_dir,
-                &state.git_transport_cutover,
-                &state.code_sources,
-            ),
+            git_overlays,
         });
         state
             .edge_index_ready
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
-    }) {
-        let _ = state.code_sources.store().record_health_failure(
-            "_edge_index",
-            "rebuild_failed",
-            &error.to_string(),
-        );
-        tracing::error!(%error, "edge-index rebuild manifest coordination failed");
-        return Err(error);
-    }
+    });
+    let coordinator_wait = match published {
+        Ok(((), coordinator_wait)) => coordinator_wait,
+        Err(error) => {
+            let _ = state.code_sources.store().record_health_failure(
+                "_edge_index",
+                "rebuild_failed",
+                &error.to_string(),
+            );
+            tracing::error!(%error, "edge-index rebuild manifest coordination failed");
+            return Err(error);
+        }
+    };
+    timings.coordinator_wait = coordinator_wait;
     state
         .code_sources
         .store()
         .clear_health_failure("_edge_index", "rebuild_failed")?;
-    Ok(())
+    Ok(EdgeRebuildReport {
+        signature: authority.signature,
+        timings,
+        attempts: 1,
+    })
+}
+
+/// The sidecar inputs a rebuild parsed changed before its publication could
+/// be coordinated. This is a retry-now condition, not a reportable failure:
+/// a manifest write landed mid-parse (for example a trailing mutation of an
+/// activation transaction), so the rebuild must restart from a fresh capture
+/// instead of publishing a graph built from mixed inputs.
+#[derive(Debug)]
+struct EdgeRebuildInputChanged;
+
+impl std::fmt::Display for EdgeRebuildInputChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "edge-index rebuild input changed while it was being parsed; refusing stale publication",
+        )
+    }
+}
+
+impl std::error::Error for EdgeRebuildInputChanged {}
+
+fn edge_rebuild_input_changed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EdgeRebuildInputChanged>().is_some())
+}
+
+const DEFAULT_EDGE_INDEX_STALE_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_EDGE_INDEX_STALE_RETRY_PAUSE_MS: u64 = 250;
+
+fn edge_index_stale_retry_attempts() -> u32 {
+    std::env::var("BLACKBOX_EDGE_INDEX_STALE_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_EDGE_INDEX_STALE_RETRY_ATTEMPTS)
+}
+
+fn edge_index_stale_retry_pause() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BLACKBOX_EDGE_INDEX_STALE_RETRY_PAUSE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_EDGE_INDEX_STALE_RETRY_PAUSE_MS),
+    )
+}
+
+/// Run one edge-index rebuild, retrying immediately (bounded, with a short
+/// pause between attempts) while the coordinator refuses publication because
+/// the parsed inputs changed mid-parse. Any other failure, or a stale race
+/// that persists past the attempt budget, returns to the caller's ordinary
+/// failure handling unchanged. Only the first attempt may reuse a
+/// pre-captured authority: a stale race means those inputs are outdated.
+fn rebuild_edge_index_with_stale_retry(
+    state: &SharedState,
+    include_tantivy_projection: bool,
+    mut pre_captured: Option<EdgeRebuildPreCaptured>,
+) -> anyhow::Result<EdgeRebuildReport> {
+    let attempts = edge_index_stale_retry_attempts();
+    let pause = edge_index_stale_retry_pause();
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match rebuild_edge_index_from_shared(state, include_tantivy_projection, pre_captured.take())
+        {
+            Ok(mut report) => {
+                report.attempts = attempt;
+                return Ok(report);
+            }
+            Err(error) => {
+                if attempt < attempts && edge_rebuild_input_changed(&error) {
+                    tracing::debug!(
+                        attempt,
+                        attempts,
+                        pause_ms = pause.as_millis(),
+                        "edge-index rebuild inputs changed mid-parse; retrying immediately"
+                    );
+                    std::thread::sleep(pause);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
 }
 
 fn build_edge_index_from_shared_at_authority(
@@ -1204,6 +1354,243 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> anyhow::Result<EdgeSid
     capture_edge_rebuild_authority(edges_dir, None).map(|authority| authority.signature)
 }
 
+/// Watcher state carried across iterations: the sidecar directory under
+/// observation, the last observed corpus doc count, and the last published
+/// sidecar signature (what a rebuild's inputs are compared against).
+struct EdgeWatcherInputs {
+    edges_dir: std::path::PathBuf,
+    last_seen: u64,
+    last_signature: Option<EdgeSidecarSignature>,
+}
+
+impl EdgeWatcherInputs {
+    fn capture(state: &SharedState) -> Self {
+        let last_seen = state.idx.read().num_docs();
+        let edges_dir = edge_sidecar_dir(state);
+        let last_signature = capture_edge_rebuild_authority(
+            &edges_dir,
+            Some(&state.corpus_registered_project_ids()),
+        )
+        .ok()
+        .map(|authority| authority.signature);
+        Self {
+            edges_dir,
+            last_seen,
+            last_signature,
+        }
+    }
+}
+
+/// One watcher iteration after a wake (nudge or interval tick). Decides
+/// whether the published graph must be rebuilt, rebuilds it, or refreshes
+/// only the pinned searcher. `pending_nudge` is consumed only once the
+/// iteration is committed to run; failure paths may re-arm it so the next
+/// wake is immediate instead of interval-length.
+fn edge_watcher_tick(
+    state: &SharedState,
+    inputs: &mut EdgeWatcherInputs,
+    pending_nudge: &mut bool,
+    interval: std::time::Duration,
+) {
+    let Some(publication_guard) = state.index_writer.try_begin_edge_index_rebuild() else {
+        tracing::debug!(
+            pending_nudge,
+            "edge-index watcher deferred while a reindex publication is active"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        return;
+    };
+    let nudged = std::mem::take(pending_nudge);
+    let current = state.idx.read().num_docs();
+    let registered_project_ids = state.corpus_registered_project_ids();
+    let capture_started = std::time::Instant::now();
+    let authority =
+        match capture_edge_rebuild_authority(&inputs.edges_dir, Some(&registered_project_ids)) {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    nudged,
+                    "edge-index watcher authority capture failed; keeping the last published graph"
+                );
+                if !state
+                    .edge_index_ready
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    *pending_nudge = true;
+                    drop(publication_guard);
+                    std::thread::sleep(interval);
+                }
+                inputs.last_seen = current;
+                return;
+            }
+        };
+    let capture_elapsed = capture_started.elapsed();
+    let signature = authority.signature;
+    let sidecars_changed = Some(signature) != inputs.last_signature;
+    let published_edge_count = state.code_read_view.read().edge_index.edge_count();
+    if should_rebuild_edge_index(
+        nudged,
+        sidecars_changed,
+        published_edge_count,
+        edge_index_nudge_max_current_edges(),
+    ) {
+        let started = std::time::Instant::now();
+        tracing::info!(
+            current_docs = current,
+            sidecar_files = signature.files,
+            sidecar_bytes = signature.bytes,
+            nudged,
+            sidecars_changed,
+            "edge-index watcher rebuild started"
+        );
+        // Reuse this iteration's capture: the coordinator's verification
+        // remains the correctness anchor, so a stale capture costs a typed
+        // immediate retry, never a stale publication.
+        let pre_captured = EdgeRebuildPreCaptured {
+            authority,
+            capture: capture_elapsed,
+        };
+        match rebuild_edge_index_with_stale_retry(&state, false, Some(pre_captured)) {
+            Ok(report) => {
+                tracing::info!(
+                    prev_docs = inputs.last_seen,
+                    new_docs = current,
+                    sidecar_files = signature.files,
+                    sidecar_bytes = signature.bytes,
+                    nudged,
+                    sidecars_changed,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    capture_ms = report.timings.capture.as_millis(),
+                    coordinator_wait_ms = report.timings.coordinator_wait.as_millis(),
+                    overlay_ms = report.timings.overlay_read.as_millis(),
+                    build_ms = report.timings.build.as_millis(),
+                    attempts = report.attempts,
+                    "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
+                );
+                // The coordinator verified the published inputs equal the
+                // authority this rebuild parsed, so its signature IS the
+                // post-publication signature. A write landing after the
+                // verification must stay visible to the next comparison
+                // (triggering a rebuild) instead of being absorbed here.
+                inputs.last_signature = Some(report.signature);
+                let _ = state
+                    .code_sources
+                    .store()
+                    .clear_health_failure("_edge_index", "store_refresh_deferred");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    nudged,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "edge-index watcher rebuild failed; retaining prior signature for retry"
+                );
+                if !state
+                    .edge_index_ready
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    *pending_nudge = true;
+                    drop(publication_guard);
+                    std::thread::sleep(interval);
+                }
+            }
+        }
+    } else if nudged {
+        let detail = format!(
+            "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
+            edge_index_nudge_max_current_edges()
+        );
+        let _ = state.code_sources.store().record_health_failure(
+            "_edge_index",
+            "store_refresh_deferred",
+            &detail,
+        );
+        tracing::warn!(
+            published_edge_count,
+            limit = edge_index_nudge_max_current_edges(),
+            "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
+        );
+    } else if current != inputs.last_seen {
+        let searcher = { state.idx.read().searcher() };
+        state.publish_code_read_searcher(searcher);
+        tracing::debug!(
+            prev_docs = inputs.last_seen,
+            new_docs = current,
+            sidecar_files = signature.files,
+            sidecar_bytes = signature.bytes,
+            "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
+        );
+    }
+    inputs.last_seen = current;
+}
+
+/// Outcome of one watcher park: woken by a nudge, by the interval, or the
+/// nudge channel is gone (SharedState dropped; the watcher exits).
+enum EdgeWatcherWake {
+    Nudged,
+    Interval,
+    Disconnected,
+}
+
+const DEFAULT_EDGE_INDEX_NUDGE_DEBOUNCE_MS: u64 = 500;
+
+fn edge_index_nudge_debounce() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BLACKBOX_EDGE_INDEX_NUDGE_DEBOUNCE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_EDGE_INDEX_NUDGE_DEBOUNCE_MS),
+    )
+}
+
+/// Collapse a burst of nudges into one rebuild: hold off for the debounce
+/// window, then drain every nudge queued meanwhile. The 1-slot channel
+/// already coalesces while a nudge sits queued; this extends that
+/// coalescing to the window before the rebuild starts, so the trailing
+/// mutations of one transaction join the same rebuild instead of starting
+/// a second one. Nudges arriving after the window still wake the watcher:
+/// every selector change keeps its eventual rebuild.
+fn collapse_edge_nudge_burst(
+    nudge_rx: &std::sync::mpsc::Receiver<()>,
+    debounce: std::time::Duration,
+) {
+    if !debounce.is_zero() {
+        std::thread::sleep(debounce);
+    }
+    while let Ok(()) = nudge_rx.try_recv() {}
+}
+
+/// Park the watcher until a nudge arrives or the interval elapses, collapsing
+/// any nudge burst inside the debounce window into a single wake.
+fn await_edge_watcher_wake(
+    nudge_rx: Option<&std::sync::mpsc::Receiver<()>>,
+    interval: std::time::Duration,
+    debounce: std::time::Duration,
+) -> EdgeWatcherWake {
+    let nudged = match nudge_rx {
+        Some(rx) => match rx.recv_timeout(interval) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return EdgeWatcherWake::Disconnected;
+            }
+        },
+        None => {
+            std::thread::sleep(interval);
+            false
+        }
+    };
+    if nudged && let Some(rx) = nudge_rx {
+        collapse_edge_nudge_burst(rx, debounce);
+    }
+    if nudged {
+        EdgeWatcherWake::Nudged
+    } else {
+        EdgeWatcherWake::Interval
+    }
+}
+
 /// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
 /// The auto-reindex thread writes new docs + edge sidecars every interval,
 /// but it can't trigger a rebuild itself (it spawns before SharedState exists).
@@ -1229,154 +1616,19 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             if !pending_nudge {
                 std::thread::sleep(std::time::Duration::from_secs(20));
             }
-            let mut last_seen: u64 = state.idx.read().num_docs();
-            let edges_dir = edge_sidecar_dir(&state);
-            let mut last_signature = capture_edge_rebuild_authority(
-                &edges_dir,
-                Some(&state.corpus_registered_project_ids()),
-            )
-            .ok()
-            .map(|authority| authority.signature);
+            let mut inputs = EdgeWatcherInputs::capture(&state);
+            let debounce = edge_index_nudge_debounce();
             loop {
                 if !pending_nudge {
-                    pending_nudge = match &nudge_rx {
-                    Some(rx) => match rx.recv_timeout(interval) {
-                        Ok(()) => true,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-                        // All senders dropped — SharedState is gone; exit.
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                    },
-                    None => {
-                        std::thread::sleep(interval);
-                        false
-                    }
-                    };
+                    pending_nudge =
+                        match await_edge_watcher_wake(nudge_rx.as_ref(), interval, debounce) {
+                            EdgeWatcherWake::Nudged => true,
+                            EdgeWatcherWake::Interval => false,
+                            // All senders dropped — SharedState is gone; exit.
+                            EdgeWatcherWake::Disconnected => return,
+                        };
                 }
-                let Some(publication_guard) =
-                    state.index_writer.try_begin_edge_index_rebuild()
-                else {
-                    tracing::debug!(
-                        pending_nudge,
-                        "edge-index watcher deferred while a reindex publication is active"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                };
-                let nudged = std::mem::take(&mut pending_nudge);
-                let current = state.idx.read().num_docs();
-                let registered_project_ids = state.corpus_registered_project_ids();
-                let signature = match capture_edge_rebuild_authority(
-                    &edges_dir,
-                    Some(&registered_project_ids),
-                ) {
-                    Ok(authority) => authority.signature,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            nudged,
-                            "edge-index watcher authority capture failed; keeping the last published graph"
-                        );
-                        if !state
-                            .edge_index_ready
-                            .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            pending_nudge = true;
-                            drop(publication_guard);
-                            std::thread::sleep(interval);
-                        }
-                        last_seen = current;
-                        continue;
-                    }
-                };
-                let sidecars_changed = Some(signature) != last_signature;
-                let published_edge_count = state
-                    .code_read_view
-                    .read()
-                    .edge_index
-                    .edge_count();
-                if should_rebuild_edge_index(
-                    nudged,
-                    sidecars_changed,
-                    published_edge_count,
-                    edge_index_nudge_max_current_edges(),
-                ) {
-                    let started = std::time::Instant::now();
-                    tracing::info!(
-                        current_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        nudged,
-                        sidecars_changed,
-                        "edge-index watcher rebuild started"
-                    );
-                    match rebuild_edge_index_from_shared(&state, false) {
-                        Ok(()) => {
-                            tracing::info!(
-                                prev_docs = last_seen,
-                                new_docs = current,
-                                sidecar_files = signature.files,
-                                sidecar_bytes = signature.bytes,
-                                nudged,
-                                sidecars_changed,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
-                            );
-                            last_signature = capture_edge_rebuild_authority(
-                                &edges_dir,
-                                Some(&state.corpus_registered_project_ids()),
-                            )
-                            .ok()
-                            .map(|authority| authority.signature)
-                            .or(Some(signature));
-                            let _ = state.code_sources.store().clear_health_failure(
-                                "_edge_index",
-                                "store_refresh_deferred",
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                nudged,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher rebuild failed; retaining prior signature for retry"
-                            );
-                            if !state
-                                .edge_index_ready
-                                .load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                pending_nudge = true;
-                                drop(publication_guard);
-                                std::thread::sleep(interval);
-                            }
-                        }
-                    }
-                } else if nudged {
-                    let detail = format!(
-                        "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
-                        edge_index_nudge_max_current_edges()
-                    );
-                    let _ = state.code_sources.store().record_health_failure(
-                        "_edge_index",
-                        "store_refresh_deferred",
-                        &detail,
-                    );
-                    tracing::warn!(
-                        published_edge_count,
-                        limit = edge_index_nudge_max_current_edges(),
-                        "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
-                    );
-                } else if current != last_seen {
-                    let searcher = { state.idx.read().searcher() };
-                    state.publish_code_read_searcher(searcher);
-                    tracing::debug!(
-                        prev_docs = last_seen,
-                        new_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
-                    );
-                }
-                last_seen = current;
+                edge_watcher_tick(&state, &mut inputs, &mut pending_nudge, interval);
             }
         })
         .expect("failed to spawn edge index rebuild watcher");
@@ -2306,7 +2558,7 @@ mod tests {
 
         let st = state.clone();
         let handle = std::thread::spawn(move || {
-            rebuild_edge_index_from_shared(&st, false).unwrap();
+            let _ = rebuild_edge_index_from_shared(&st, false, None).unwrap();
         });
 
         // Let the rebuild acquire its store read-locks, finish computing
@@ -2537,10 +2789,251 @@ mod tests {
         )
         .unwrap();
         env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
-        let error = rebuild_edge_index_from_shared(&state, false).unwrap_err();
+        let error = rebuild_edge_index_from_shared(&state, false, None).unwrap_err();
         assert!(
             error.to_string().contains("active sidecar input"),
             "unexpected refusal: {error:#}"
+        );
+    }
+
+    /// Hold the process-wide manifest coordinator until `release` fires, so a
+    /// rebuild under test parks at its publication gate exactly where a
+    /// mid-parse manifest write would land. The receive is bounded so a
+    /// broken test still exits on the nextest per-test timeout.
+    fn hold_manifest_coordinator_until(
+        held: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+            held.send(()).unwrap();
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn explicit_lane_edge(kind: &str) -> edge_index::Edge {
+        edge_index::Edge {
+            provenance: chunker::EdgeProvenance::Explicit,
+            ..signature_test_edge(kind)
+        }
+    }
+
+    #[test]
+    fn stale_edge_rebuild_race_retries_immediately_and_publishes() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_EDGE_INDEX_STALE_RETRY_PAUSE_MS", "5");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Park the rebuild's first attempt at its publication gate.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || hold_manifest_coordinator_until(held_tx, release_rx));
+        held_rx.recv().unwrap();
+
+        let rebuild_state = state.clone();
+        let rebuild = std::thread::spawn(move || {
+            rebuild_edge_index_with_stale_retry(&rebuild_state, false, None)
+        });
+        // No early break: the settle observes the parked steady state, not
+        // the pre-acquisition race.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !rebuild.is_finished(),
+            "precondition: the rebuild should be parked at the coordinator"
+        );
+
+        // The mid-parse input change: append one edge to the ACTIVE snapshot
+        // member the manifest selects. This is exactly the shape of a
+        // manifest-coordinated write landing while the rebuild parses (raw
+        // bytes here so it can happen under the test's coordinator hold).
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        let active_snapshot = manifest.workspaces["p"]
+            .active_snapshot
+            .clone()
+            .expect("fixture published an active snapshot");
+        let member = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join(&active_snapshot)
+            .join("project.jsonl");
+        let mut member_bytes = std::fs::read(&member).unwrap();
+        member_bytes.extend_from_slice(
+            format!(
+                "{}\n",
+                serde_json::to_string(&explicit_lane_edge("MID_PARSE")).unwrap()
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&member, member_bytes).unwrap();
+
+        let finished = std::time::Instant::now();
+        release_tx.send(()).unwrap();
+        gate.join().unwrap();
+        rebuild
+            .join()
+            .unwrap()
+            .expect("the stale race must publish on the second attempt");
+        assert!(
+            finished.elapsed() < std::time::Duration::from_secs(5),
+            "stale-publication races retry immediately, not on the watcher interval; took {:?}",
+            finished.elapsed()
+        );
+        // The second attempt parsed the mutated inputs: the mid-parse edge
+        // is part of the published graph, not just the sidecar directory.
+        let view = state.complete_code_read_view().unwrap();
+        let published = view
+            .edge_index
+            .forward_edges(&entity_ref::EntityRef::Knowledge {
+                id: "source".into(),
+            });
+        assert!(
+            published.iter().any(|edge| edge.kind == "MID_PARSE"),
+            "the retried rebuild must publish the changed sidecar input"
+        );
+    }
+
+    #[test]
+    fn non_stale_edge_rebuild_failure_does_not_retry() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root.join("bro"));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // The oversized-input refusal is not the stale-publication class:
+        // the bounded retry loop must return it on the first attempt.
+        let started = std::time::Instant::now();
+        let error = rebuild_edge_index_with_stale_retry(&state, false, None).unwrap_err();
+        assert!(
+            error.to_string().contains("active sidecar input"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            !edge_rebuild_input_changed(&error),
+            "the oversized-input refusal is not the stale-publication class"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "non-stale failures return without retry pauses"
+        );
+    }
+
+    #[test]
+    fn edge_watcher_nudge_burst_inside_debounce_collapses_into_one_wake() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(()).unwrap();
+        // A second mutation surface fires inside the debounce window, as the
+        // trailing writes of one activation transaction would.
+        let trailing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = tx.try_send(());
+        });
+        let started = std::time::Instant::now();
+        let wake = await_edge_watcher_wake(
+            Some(&rx),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(80),
+        );
+        assert!(matches!(wake, EdgeWatcherWake::Nudged));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "the wake must hold off for the debounce window"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the burst must be drained: one wake is one rebuild"
+        );
+        trailing.join().unwrap();
+    }
+
+    #[test]
+    fn edge_rebuild_phase_timers_are_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Hold the coordinator so the rebuild parks at its publication gate
+        // for a measurable interval before publishing.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || hold_manifest_coordinator_until(held_tx, release_rx));
+        held_rx.recv().unwrap();
+
+        let rebuild_state = state.clone();
+        let wall_started = std::time::Instant::now();
+        let rebuild = std::thread::spawn(move || {
+            rebuild_edge_index_with_stale_retry(&rebuild_state, false, None)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert!(
+            !rebuild.is_finished(),
+            "precondition: the rebuild should be parked at the coordinator"
+        );
+        release_tx.send(()).unwrap();
+        gate.join().unwrap();
+        let report = rebuild.join().unwrap().expect("rebuild must publish");
+        let wall = wall_started.elapsed();
+
+        assert_eq!(report.attempts, 1);
+        assert!(
+            report.timings.coordinator_wait >= std::time::Duration::from_millis(100),
+            "the coordinator wait phase must be observable; got {:?}",
+            report.timings.coordinator_wait
+        );
+        assert!(
+            report.timings.capture > std::time::Duration::ZERO,
+            "the capture phase must account the authority captures"
+        );
+        let phases = report.timings.capture
+            + report.timings.coordinator_wait
+            + report.timings.overlay_read
+            + report.timings.build;
+        assert!(
+            phases <= wall,
+            "the phase split must fit inside the rebuild's wall clock"
+        );
+        assert_eq!(
+            report.signature,
+            edge_sidecar_signature(&edges_dir).unwrap()
         );
     }
 

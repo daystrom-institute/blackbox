@@ -102,6 +102,9 @@ fn install_config_reload(
             "SIGHUP cutover authority republish failed after auth reload"
         );
     }
+    // The republish lowered the edge readiness fence; wake the watcher so
+    // the reload does not wait out a watcher interval.
+    shared.nudge_edge_index_rebuild();
     Some(transitions)
 }
 

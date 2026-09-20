@@ -282,6 +282,11 @@ pub(crate) struct SharedState {
     pub(crate) edge_rebuild_nudge_tx: std::sync::mpsc::SyncSender<()>,
     /// Receiver half, taken once by `spawn_edge_index_rebuild_watcher`.
     pub(crate) edge_rebuild_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Total nudge attempts (queued or coalesced away). Observability for
+    /// the watcher's burst collapse: one queued nudge can absorb several
+    /// attempts, so the queue alone cannot answer "how many mutation
+    /// surfaces asked for a rebuild".
+    pub(crate) edge_rebuild_nudge_attempts: std::sync::atomic::AtomicU64,
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
@@ -606,7 +611,15 @@ impl SharedState {
     /// nudge is already pending — the queued rebuild will see this caller's
     /// store mutation too, so dropping the second nudge is correct.
     pub(crate) fn nudge_edge_index_rebuild(&self) {
+        self.edge_rebuild_nudge_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.edge_rebuild_nudge_tx.try_send(());
+    }
+
+    /// Nudge attempts so far (see [`Self::edge_rebuild_nudge_attempts`]).
+    pub(crate) fn edge_rebuild_nudge_attempt_count(&self) -> u64 {
+        self.edge_rebuild_nudge_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Clone one internally coherent code read view and reject the deferred
@@ -887,6 +900,7 @@ impl SharedState {
             )),
             edge_rebuild_nudge_tx,
             edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
+            edge_rebuild_nudge_attempts: std::sync::atomic::AtomicU64::new(0),
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,

@@ -46,6 +46,19 @@ pub fn with_manifest_coordinator<T>(operation: impl FnOnce() -> Result<T>) -> Re
     operation()
 }
 
+/// Like [`with_manifest_coordinator`], additionally reporting how long the
+/// caller waited on the coordinator lock before the operation ran. Phase
+/// accounting for the edge-index rebuild, whose publication step parks here
+/// behind concurrent manifest writers.
+pub fn with_manifest_coordinator_reporting_wait<T>(
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, std::time::Duration)> {
+    let waited = std::time::Instant::now();
+    let _coordinator = lock_manifest_coordinator()?;
+    let coordinator_wait = waited.elapsed();
+    operation().map(|value| (value, coordinator_wait))
+}
+
 /// Physically deduplicate the selected project-edge members of an active
 /// materialization without changing its logical snapshot identity. Receipt-
 /// managed snapshots are skipped because their member bytes are committed by

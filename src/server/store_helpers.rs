@@ -165,7 +165,7 @@ impl BlackboxServer {
         // Store mutations only affect structured edges. Re-projecting all
         // Tantivy docs here is a multi-GB path and can stack under concurrent
         // thread updates.
-        rebuild_edge_index_from_shared(&self.state, false)
+        rebuild_edge_index_from_shared(&self.state, false, None).map(|_| ())
     }
 
     /// Soft-nag classifier for `bbox_learn`: apply the latest

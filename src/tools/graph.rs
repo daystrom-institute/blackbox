@@ -1626,7 +1626,7 @@ impl BlackboxServer {
             let mut receipt = json!({"status":"ok", "stats":stats,
                 "compaction_completed":true, "edge_index_rebuilt":false});
             if edge_index_rebuilt {
-                match crate::server::rebuild_edge_index_from_shared(&server.state, false) {
+                match crate::server::rebuild_edge_index_from_shared(&server.state, false, None).map(|_| ()) {
                     Ok(()) => receipt["edge_index_rebuilt"] = json!(true),
                     Err(_) => {
                         receipt["status"] = json!("partial");
