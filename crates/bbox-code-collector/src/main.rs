@@ -154,6 +154,115 @@ struct CapturedProvenanceImport {
     documents: tempfile::TempDir,
 }
 
+/// Per-project verdict of one provenance pass. A descriptor the server's
+/// verifier terminally rejected is a deliberate skip, not a success and not
+/// a failure: the lane keeps its cadence and stops re-sending the same
+/// bytes until the local notes tip moves.
+#[derive(Debug, PartialEq, Eq)]
+enum ProvenancePass {
+    Imported,
+    SkippedTerminal,
+}
+
+/// In-memory, per-lane provenance coordination state. Terminal failures are
+/// keyed by project root plus descriptor identity so an unchanged descriptor
+/// logs once at WARN and only debug afterwards; open uploads are remembered
+/// so a superseded upload can be aborted instead of holding a server slot.
+#[derive(Debug, Default)]
+struct ProvenanceLaneState {
+    terminal: HashMap<PathBuf, TerminalProvenanceImport>,
+    open_uploads: HashMap<PathBuf, OpenProvenanceUpload>,
+}
+
+#[derive(Debug)]
+struct TerminalProvenanceImport {
+    descriptor: ProvenanceImportDescriptorV1,
+    diagnostic: String,
+}
+
+#[derive(Debug)]
+struct OpenProvenanceUpload {
+    descriptor: ProvenanceImportDescriptorV1,
+    upload_id: String,
+}
+
+impl ProvenanceLaneState {
+    fn terminal_for(&self, root: &Path, descriptor: &ProvenanceImportDescriptorV1) -> bool {
+        self.terminal
+            .get(root)
+            .is_some_and(|entry| entry.descriptor == *descriptor)
+    }
+
+    fn note_terminal(
+        &mut self,
+        root: &Path,
+        descriptor: ProvenanceImportDescriptorV1,
+        diagnostic: String,
+    ) {
+        self.terminal.insert(
+            root.to_path_buf(),
+            TerminalProvenanceImport {
+                descriptor,
+                diagnostic,
+            },
+        );
+    }
+
+    fn diagnostic_for(&self, root: &Path) -> Option<&str> {
+        self.terminal
+            .get(root)
+            .map(|entry| entry.diagnostic.as_str())
+    }
+
+    fn remember_open_upload(
+        &mut self,
+        root: &Path,
+        descriptor: ProvenanceImportDescriptorV1,
+        upload_id: String,
+    ) {
+        self.open_uploads.insert(
+            root.to_path_buf(),
+            OpenProvenanceUpload {
+                descriptor,
+                upload_id,
+            },
+        );
+    }
+
+    fn take_open_upload(&mut self, root: &Path) -> Option<OpenProvenanceUpload> {
+        self.open_uploads.remove(root)
+    }
+}
+
+/// A server-side terminal rejection of one provenance descriptor. The
+/// verifier decision is content-borne and deterministic for this descriptor,
+/// so retrying identical bytes can never succeed; the lane records the
+/// project as skipped-terminal instead of failing the pass.
+#[derive(Debug)]
+struct TerminalProvenanceFailure {
+    diagnostic: String,
+}
+
+impl std::fmt::Display for TerminalProvenanceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "server terminally rejected this provenance descriptor: {}",
+            self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for TerminalProvenanceFailure {}
+
+fn terminal_provenance_diagnostic(error: &anyhow::Error) -> Option<&str> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalProvenanceFailure>()
+            .map(|failure| failure.diagnostic.as_str())
+    })
+}
+
 struct CapturedPublicationCandidate {
     descriptor: PublicationCandidateDescriptorV1,
     knowledge_entries: Vec<SourceFileManifestEntryV1>,
@@ -621,8 +730,9 @@ async fn run_published_knowledge_lane(runtime: &Runtime, config: &CollectorConfi
 async fn run_provenance_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
+    let mut lane_state = ProvenanceLaneState::default();
     loop {
-        match publish_provenance_projects(runtime, config).await {
+        match publish_provenance_projects(runtime, config, &mut lane_state).await {
             Ok(()) => backoff = interval,
             Err(error) => {
                 tracing::error!(error = %error, "provenance synchronization failed");
@@ -667,10 +777,12 @@ async fn run_history_lane(runtime: &Runtime, config: &CollectorConfig) {
 /// project and must not let one unadoptable repo (no committed `.bbox`
 /// identity, a vanished root, a scope mismatch) starve the rest: each project
 /// is attempted, each failure is logged with its root, and the pass reports
-/// the tally.
+/// the tally. A project whose provenance descriptor was terminally rejected
+/// counts as skipped-terminal, which is neither a success nor a failure.
 #[derive(Debug, Default)]
 struct LanePassOutcome {
     succeeded: usize,
+    skipped_terminal: usize,
     failures: Vec<String>,
 }
 
@@ -688,6 +800,18 @@ impl LanePassOutcome {
                 self.failures.push(format!("{}: {error:#}", root.display()));
             }
         }
+    }
+
+    /// Record a project deliberately skipped this pass (terminally rejected
+    /// provenance descriptor). Not a success, not a failure: the lane keeps
+    /// its cadence and the skip is visible in the tally.
+    fn record_skipped(&mut self, lane: &str, root: &Path) {
+        tracing::debug!(
+            lane,
+            root = %root.display(),
+            "project skipped this pass: terminally rejected provenance descriptor"
+        );
+        self.skipped_terminal += 1;
     }
 
     /// Continuous-lane verdict. A pass where at least one project published
@@ -737,7 +861,8 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     let history = publish_history_repositories_pass(runtime, config)
         .await
         .into_strict_result();
-    let provenance = publish_provenance_projects_pass(runtime, config)
+    let mut provenance_lane_state = ProvenanceLaneState::default();
+    let provenance = publish_provenance_projects_pass(runtime, config, &mut provenance_lane_state)
         .await
         .into_strict_result();
     let mutations = apply_checkout_mutations(runtime, config).await;
@@ -1223,8 +1348,12 @@ async fn publish_publication_candidate(
 const MAX_PROVENANCE_STALE_RESTARTS: usize = 3;
 const MAX_PROVENANCE_PAGE_RESPONSE_BYTES: usize = 128 * 1024;
 
-async fn publish_provenance_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
-    publish_provenance_projects_pass(runtime, config)
+async fn publish_provenance_projects(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    lane_state: &mut ProvenanceLaneState,
+) -> Result<()> {
+    publish_provenance_projects_pass(runtime, config, lane_state)
         .await
         .into_lane_result("provenance")
 }
@@ -1232,6 +1361,7 @@ async fn publish_provenance_projects(runtime: &Runtime, config: &CollectorConfig
 async fn publish_provenance_projects_pass(
     runtime: &Runtime,
     config: &CollectorConfig,
+    lane_state: &mut ProvenanceLaneState,
 ) -> LanePassOutcome {
     let mut outcome = LanePassOutcome::default();
     for project in config.projects.iter().filter(|project| project.provenance) {
@@ -1239,9 +1369,20 @@ async fn publish_provenance_projects_pass(
             runtime,
             project,
             Duration::from_secs(config.status_timeout_secs),
+            lane_state,
         )
         .await;
-        outcome.record("provenance", &project.root, result);
+        match result {
+            Ok(ProvenancePass::Imported) => {
+                outcome.record("provenance", &project.root, Ok(()));
+            }
+            Ok(ProvenancePass::SkippedTerminal) => {
+                outcome.record_skipped("provenance", &project.root);
+            }
+            Err(error) => {
+                outcome.record("provenance", &project.root, Err(error));
+            }
+        }
     }
     outcome
 }
@@ -1250,7 +1391,8 @@ async fn publish_project_provenance(
     runtime: &Runtime,
     project: &ProjectConfig,
     status_timeout: Duration,
-) -> Result<()> {
+    lane_state: &mut ProvenanceLaneState,
+) -> Result<ProvenancePass> {
     let root = project.root.canonicalize().with_context(|| {
         format!(
             "canonicalizing provenance project root {}",
@@ -1279,13 +1421,44 @@ async fn publish_project_provenance(
                     restart = restart + 1,
                     "provenance inventory changed; restarting export from page one"
                 );
+                // The server just declared this checkout's notes inventory
+                // moved, so any upload remembered from an earlier pass was
+                // begun against a superseded snapshot: abort it rather than
+                // letting it hold an open-upload slot until expiry.
+                abort_remembered_provenance_upload(runtime, lane_state, &root).await;
             }
             Err(error) => return Err(error),
         }
     }
     let (project_id, notes_ref) = resolved_export.context("provenance export did not converge")?;
     let captured = capture_provenance_import(&root, &project.scope, &project_id, &notes_ref)?;
-    publish_provenance_import(runtime, captured, status_timeout).await
+    if lane_state.terminal_for(&root, &captured.descriptor) {
+        tracing::debug!(
+            root = %root.display(),
+            notes_tip = %captured.descriptor.notes_tip,
+            diagnostic = lane_state.diagnostic_for(&root).unwrap_or("none"),
+            "provenance descriptor was terminally rejected and the notes tip is unchanged; skipping import"
+        );
+        return Ok(ProvenancePass::SkippedTerminal);
+    }
+    let descriptor = captured.descriptor.clone();
+    match publish_provenance_import(runtime, captured, status_timeout, &root, lane_state).await {
+        Ok(()) => Ok(ProvenancePass::Imported),
+        Err(error) if terminal_provenance_diagnostic(&error).is_some() => {
+            let diagnostic = terminal_provenance_diagnostic(&error)
+                .unwrap_or_default()
+                .to_string();
+            tracing::warn!(
+                root = %root.display(),
+                notes_tip = %descriptor.notes_tip,
+                diagnostic = %diagnostic,
+                "provenance descriptor terminally rejected; skipping until the notes tip or manifest changes"
+            );
+            lane_state.note_terminal(&root, descriptor, diagnostic);
+            Ok(ProvenancePass::SkippedTerminal)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn publish_project_provenance_attempt(
@@ -1571,6 +1744,8 @@ async fn publish_provenance_import(
     runtime: &Runtime,
     captured: CapturedProvenanceImport,
     status_timeout: Duration,
+    root: &Path,
+    lane_state: &mut ProvenanceLaneState,
 ) -> Result<()> {
     let begin: BeginProvenanceImportResponseV1 = send_json(
         runtime
@@ -1583,33 +1758,82 @@ async fn publish_provenance_import(
             }),
     )
     .await?;
-    let pages = pack_provenance_manifest_pages(
-        &captured.entries,
-        begin
-            .max_page_entries
-            .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES),
-        begin
-            .max_page_bytes
-            .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_BYTES),
-    )?;
-    for (page, page_body) in pages.into_iter().enumerate() {
-        let url = runtime.endpoint(&format!(
-            "internal/code-source/v1/provenance/imports/{}/manifest/{page}",
-            begin.upload_id
-        ))?;
-        send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
+    match begin.state {
+        ProvenanceImportStateV1::ReceivingManifest | ProvenanceImportStateV1::MissingDocuments => {}
+        ProvenanceImportStateV1::Ready
+        | ProvenanceImportStateV1::Active
+        | ProvenanceImportStateV1::Superseded => {
+            tracing::debug!(
+                upload_id = %begin.upload_id,
+                state = ?begin.state,
+                "provenance import is already terminal on the server; nothing to send"
+            );
+            return Ok(());
+        }
+        ProvenanceImportStateV1::Failed => {
+            return Err(anyhow!(TerminalProvenanceFailure {
+                diagnostic: begin
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "server reported no diagnostic".to_string()),
+            }));
+        }
+        ProvenanceImportStateV1::Importing | ProvenanceImportStateV1::Quarantined => {
+            bail!(
+                "server returned unexpected provenance import state from begin: {:?}",
+                begin.state
+            );
+        }
     }
-    let complete_url = runtime.endpoint(&format!(
-        "internal/code-source/v1/provenance/imports/{}/manifest/complete",
-        begin.upload_id
-    ))?;
-    let mut missing: bbox_git_source::MissingProvenanceDocumentsPageV1 =
-        send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
+    lane_state.remember_open_upload(root, captured.descriptor.clone(), begin.upload_id.clone());
     let entries_by_hash = captured
         .entries
         .iter()
         .map(|entry| (entry.document_sha256.as_str(), entry))
         .collect::<HashMap<_, _>>();
+    let mut missing: bbox_git_source::MissingProvenanceDocumentsPageV1 = match begin.state {
+        // Resume exactly where the server says it is: pages below next_page
+        // have already landed, and a mid-upload state change (for example
+        // invalid_upload_state) is only ever retried by re-beginning on a
+        // later pass, never by blindly resending from page zero.
+        ProvenanceImportStateV1::ReceivingManifest => {
+            let pages = pack_provenance_manifest_pages(
+                &captured.entries,
+                begin
+                    .max_page_entries
+                    .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES),
+                begin
+                    .max_page_bytes
+                    .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_BYTES),
+            )?;
+            for (page, page_body) in pages
+                .into_iter()
+                .enumerate()
+                .skip(usize::try_from(begin.next_page).unwrap_or(usize::MAX))
+            {
+                let url = runtime.endpoint(&format!(
+                    "internal/code-source/v1/provenance/imports/{}/manifest/{page}",
+                    begin.upload_id
+                ))?;
+                send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
+            }
+            let complete_url = runtime.endpoint(&format!(
+                "internal/code-source/v1/provenance/imports/{}/manifest/complete",
+                begin.upload_id
+            ))?;
+            send_json(runtime.request(reqwest::Method::POST, complete_url)).await?
+        }
+        // The server already has the complete manifest; go straight to the
+        // missing-document list and finish the upload.
+        ProvenanceImportStateV1::MissingDocuments => {
+            let missing_url = runtime.endpoint(&format!(
+                "internal/code-source/v1/provenance/imports/{}/missing",
+                begin.upload_id
+            ))?;
+            send_json(runtime.request(reqwest::Method::GET, missing_url)).await?
+        }
+        _ => unreachable!("state was matched above"),
+    };
     loop {
         for hash in &missing.hashes {
             let entry = entries_by_hash
@@ -1649,7 +1873,19 @@ async fn publish_provenance_import(
         begin.upload_id
     ))?;
     let finalized: FinalizeProvenanceImportResponseV1 =
-        send_json(runtime.request(reqwest::Method::POST, finalize_url)).await?;
+        match send_json(runtime.request(reqwest::Method::POST, finalize_url)).await {
+            Ok(finalized) => finalized,
+            // A deterministic verifier rejection is content-borne: re-sending the
+            // same descriptor can never succeed. Abort the upload so it stops
+            // holding a slot, then surface the terminal classification.
+            Err(error) if has_remote_error_code(&error, "invalid_git_source_input") => {
+                abort_provenance_import_best_effort(runtime, &begin.upload_id).await;
+                return Err(anyhow!(TerminalProvenanceFailure {
+                    diagnostic: format!("{error:#}"),
+                }));
+            }
+            Err(error) => return Err(error),
+        };
     let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
     with_status_timeout(status_timeout, async {
         loop {
@@ -1657,13 +1893,22 @@ async fn publish_provenance_import(
                 send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
             match status.state {
                 ProvenanceImportStateV1::Active | ProvenanceImportStateV1::Superseded => {
-                    tracing::info!(
-                        import_generation = %status.import_generation_id,
-                        documents = status.document_count,
-                        bytes = status.logical_bytes,
-                        edges = status.edges_imported,
-                        "provenance import reached durable terminal success"
-                    );
+                    if status.document_count > 0 {
+                        tracing::info!(
+                            import_generation = %status.import_generation_id,
+                            documents = status.document_count,
+                            bytes = status.logical_bytes,
+                            edges = status.edges_imported,
+                            "provenance import reached durable terminal success"
+                        );
+                    } else {
+                        tracing::debug!(
+                            import_generation = %status.import_generation_id,
+                            documents = status.document_count,
+                            bytes = status.logical_bytes,
+                            "provenance import is already current"
+                        );
+                    }
                     return Ok(());
                 }
                 ProvenanceImportStateV1::Quarantined => {
@@ -1677,7 +1922,49 @@ async fn publish_provenance_import(
             }
         }
     })
-    .await
+    .await?;
+    lane_state.take_open_upload(root);
+    Ok(())
+}
+
+/// Abort one provenance import upload through the authenticated delete
+/// route. The server discards the open or failed upload and frees its slot.
+async fn abort_provenance_import(runtime: &Runtime, upload_id: &str) -> Result<()> {
+    let url = runtime.endpoint(&format!(
+        "internal/code-source/v1/provenance/imports/{upload_id}"
+    ))?;
+    send_empty(runtime.request(reqwest::Method::DELETE, url)).await
+}
+
+/// Best-effort abort: servers without the route (or an already-expired
+/// upload) answer 404/405, which is logged at debug and never fails the
+/// surrounding pass.
+async fn abort_provenance_import_best_effort(runtime: &Runtime, upload_id: &str) {
+    if let Err(error) = abort_provenance_import(runtime, upload_id).await {
+        tracing::debug!(
+            upload_id = %upload_id,
+            error = %error,
+            "aborting the provenance import upload was not possible; the server will expire it"
+        );
+    }
+}
+
+/// Abort and forget the upload this lane remembered for `root`. Called when
+/// the collector knows the remembered descriptor is stale locally.
+async fn abort_remembered_provenance_upload(
+    runtime: &Runtime,
+    lane_state: &mut ProvenanceLaneState,
+    root: &Path,
+) {
+    let Some(open) = lane_state.take_open_upload(root) else {
+        return;
+    };
+    tracing::debug!(
+        root = %root.display(),
+        upload_id = %open.upload_id,
+        "aborting the open provenance import upload for a superseded descriptor"
+    );
+    abort_provenance_import_best_effort(runtime, &open.upload_id).await;
 }
 
 fn pack_provenance_manifest_pages(
@@ -3590,6 +3877,464 @@ mod tests {
         assert!(!receipts[0].local_notes_tip.is_empty());
     }
 
+    /// Shared mock for the provenance import endpoints: every handler records
+    /// what the collector sent so tests can assert the resume/terminal
+    /// behavior instead of trusting the return value alone.
+    #[derive(Debug, Default)]
+    struct ImportServerState {
+        begin_calls: usize,
+        manifest_pages: Vec<u32>,
+        complete_calls: usize,
+        missing_calls: usize,
+        uploaded_documents: Vec<String>,
+        finalize_calls: usize,
+        abort_calls: usize,
+        begin_state: Option<ProvenanceImportStateV1>,
+        begin_next_page: u64,
+        begin_diagnostic: Option<String>,
+        missing_hashes: Vec<String>,
+        finalize_rejection: Option<(&'static str, String)>,
+        export_response: Option<ProvenanceExportPageResponseV1>,
+        export_receipts: Vec<ProvenanceExportReceiptV1>,
+    }
+
+    fn import_fixture(scope: &PublishedScope, documents: &[&str]) -> CapturedProvenanceImport {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = Vec::new();
+        let mut logical_bytes = 0_u64;
+        for (ordinal, document) in documents.iter().enumerate() {
+            let hash = hex::encode(Sha256::digest(document.as_bytes()));
+            fs::write(directory.path().join(&hash), document).unwrap();
+            logical_bytes += document.len() as u64;
+            entries.push(ProvenanceImportManifestEntryV1 {
+                note_commit: "a".repeat(40),
+                document_ordinal: ordinal as u32,
+                encoded_bytes: document.len() as u64,
+                document_sha256: hash,
+            });
+        }
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: GIT_SOURCE_SCHEMA_VERSION,
+            scope: scope.clone(),
+            notes_ref: "refs/notes/bb/provenance".to_string(),
+            notes_tip: "1".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&entries),
+            document_count: entries.len() as u64,
+            logical_bytes,
+        };
+        CapturedProvenanceImport {
+            descriptor,
+            entries,
+            documents: directory,
+        }
+    }
+
+    async fn spawn_import_server(
+        server_state: Arc<std::sync::Mutex<ImportServerState>>,
+    ) -> (Runtime, tokio::task::JoinHandle<()>) {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::Path as AxumPath;
+        use axum::http::StatusCode as AxumStatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{delete, get, post, put};
+
+        let begin_state = server_state.clone();
+        let manifest_state = server_state.clone();
+        let complete_state = server_state.clone();
+        let missing_state = server_state.clone();
+        let document_state = server_state.clone();
+        let finalize_state = server_state.clone();
+        let abort_state = server_state.clone();
+        let status_state = server_state.clone();
+        let export_state = server_state.clone();
+        let export_receipts = Arc::new(std::sync::Mutex::new(
+            Vec::<ProvenanceExportReceiptV1>::new(),
+        ));
+        let app = Router::new()
+            .route(
+                "/internal/code-source/v1/provenance/export/page",
+                post(move || {
+                    let response = export_state
+                        .lock()
+                        .unwrap()
+                        .export_response
+                        .clone()
+                        .expect("test configured no provenance export response");
+                    async move { Json(response) }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/export/receipt",
+                post(move |Json(receipt): Json<ProvenanceExportReceiptV1>| {
+                    export_receipts.lock().unwrap().push(receipt);
+                    async move { AxumStatusCode::NO_CONTENT }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports",
+                post(move || {
+                    let mut state = begin_state.lock().unwrap();
+                    state.begin_calls += 1;
+                    let response = BeginProvenanceImportResponseV1 {
+                        upload_id: "upload-1".to_string(),
+                        max_page_entries: 1,
+                        max_page_bytes: bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
+                        max_document_bytes: MAX_PROVENANCE_DOCUMENT_BYTES,
+                        state: state.begin_state.unwrap_or_default(),
+                        next_page: state.begin_next_page,
+                        diagnostic: state.begin_diagnostic.clone(),
+                    };
+                    drop(state);
+                    async move { Json(response) }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}/manifest/{page}",
+                put(
+                    move |AxumPath((_upload_id, page)): AxumPath<(String, u32)>| {
+                        manifest_state.lock().unwrap().manifest_pages.push(page);
+                        async move { AxumStatusCode::NO_CONTENT }
+                    },
+                ),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}/manifest/complete",
+                post(move || {
+                    let mut state = complete_state.lock().unwrap();
+                    state.complete_calls += 1;
+                    let hashes = state.missing_hashes.clone();
+                    drop(state);
+                    async move {
+                        Json(bbox_git_source::MissingProvenanceDocumentsPageV1 {
+                            import_generation_id: "gen-1".to_string(),
+                            hashes,
+                            next_cursor: None,
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}/missing",
+                get(move || {
+                    missing_state.lock().unwrap().missing_calls += 1;
+                    async move {
+                        Json(bbox_git_source::MissingProvenanceDocumentsPageV1 {
+                            import_generation_id: "gen-1".to_string(),
+                            hashes: Vec::new(),
+                            next_cursor: None,
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}/documents/{hash}",
+                put(
+                    move |AxumPath((_upload_id, hash)): AxumPath<(String, String)>| {
+                        document_state.lock().unwrap().uploaded_documents.push(hash);
+                        async move { AxumStatusCode::NO_CONTENT }
+                    },
+                ),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}/finalize",
+                post(move || {
+                    let mut state = finalize_state.lock().unwrap();
+                    state.finalize_calls += 1;
+                    let rejection = state.finalize_rejection.clone();
+                    drop(state);
+                    async move {
+                        if let Some((code, message)) = rejection {
+                            return (
+                                AxumStatusCode::UNPROCESSABLE_ENTITY,
+                                Json(ErrorResponse {
+                                    code: code.to_string(),
+                                    message,
+                                }),
+                            )
+                                .into_response();
+                        }
+                        Json(FinalizeProvenanceImportResponseV1 {
+                            import_generation_id: "gen-1".to_string(),
+                            status_url:
+                                "/internal/code-source/v1/provenance/generations/gen-1/status"
+                                    .to_string(),
+                        })
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/imports/{upload_id}",
+                delete(move |AxumPath(_upload_id): AxumPath<String>| {
+                    abort_state.lock().unwrap().abort_calls += 1;
+                    async move { AxumStatusCode::NO_CONTENT }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/generations/{generation}/status",
+                get(move || {
+                    status_state.lock().unwrap();
+                    async move {
+                        Json(ProvenanceImportStatusV1 {
+                            import_generation_id: "gen-1".to_string(),
+                            state: ProvenanceImportStateV1::Active,
+                            document_count: 1,
+                            logical_bytes: 1,
+                            edges_imported: 0,
+                            diagnostic: None,
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Runtime {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            token: ServiceToken::parse("9".repeat(64)).unwrap(),
+            client: Client::builder().build().unwrap(),
+        };
+        (runtime, server)
+    }
+
+    fn import_server_state() -> Arc<std::sync::Mutex<ImportServerState>> {
+        Arc::new(std::sync::Mutex::new(ImportServerState::default()))
+    }
+
+    #[tokio::test]
+    async fn provenance_import_resumes_from_the_reported_next_page() {
+        let scope = PublishedScope::try_new("repo-imports", ".").unwrap();
+        let captured = import_fixture(&scope, &["one", "two", "three"]);
+        let first_hash = captured.entries[0].document_sha256.clone();
+        let server_state = import_server_state();
+        {
+            let mut state = server_state.lock().unwrap();
+            state.begin_state = Some(ProvenanceImportStateV1::ReceivingManifest);
+            state.begin_next_page = 1;
+            state.missing_hashes = vec![first_hash];
+        }
+        let (runtime, server) = spawn_import_server(server_state.clone()).await;
+        let mut lane_state = ProvenanceLaneState::default();
+        publish_provenance_import(
+            &runtime,
+            captured,
+            Duration::from_secs(2),
+            Path::new("/repos/imports"),
+            &mut lane_state,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let state = server_state.lock().unwrap();
+        assert_eq!(state.begin_calls, 1);
+        // Page 0 already landed server-side: only pages 1 and 2 are sent.
+        assert_eq!(state.manifest_pages, vec![1, 2]);
+        assert_eq!(state.complete_calls, 1);
+        assert_eq!(state.uploaded_documents.len(), 1);
+        assert_eq!(state.finalize_calls, 1);
+        assert!(
+            lane_state.open_uploads.is_empty(),
+            "success clears the remembered upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_import_missing_documents_skips_manifest_and_completes() {
+        let scope = PublishedScope::try_new("repo-imports", ".").unwrap();
+        let captured = import_fixture(&scope, &["one"]);
+        let server_state = import_server_state();
+        server_state.lock().unwrap().begin_state = Some(ProvenanceImportStateV1::MissingDocuments);
+        let (runtime, server) = spawn_import_server(server_state.clone()).await;
+        let mut lane_state = ProvenanceLaneState::default();
+        publish_provenance_import(
+            &runtime,
+            captured,
+            Duration::from_secs(2),
+            Path::new("/repos/imports"),
+            &mut lane_state,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let state = server_state.lock().unwrap();
+        assert_eq!(state.begin_calls, 1);
+        assert!(
+            state.manifest_pages.is_empty(),
+            "manifest pages are not resent"
+        );
+        assert_eq!(
+            state.complete_calls, 0,
+            "complete is skipped for a re-attached upload"
+        );
+        assert_eq!(
+            state.missing_calls, 1,
+            "the missing list is fetched directly"
+        );
+        assert_eq!(state.finalize_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn provenance_import_ready_state_is_a_noop() {
+        let scope = PublishedScope::try_new("repo-imports", ".").unwrap();
+        let captured = import_fixture(&scope, &["one"]);
+        let server_state = import_server_state();
+        server_state.lock().unwrap().begin_state = Some(ProvenanceImportStateV1::Ready);
+        let (runtime, server) = spawn_import_server(server_state.clone()).await;
+        let mut lane_state = ProvenanceLaneState::default();
+        publish_provenance_import(
+            &runtime,
+            captured,
+            Duration::from_secs(2),
+            Path::new("/repos/imports"),
+            &mut lane_state,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let state = server_state.lock().unwrap();
+        assert_eq!(state.begin_calls, 1);
+        assert!(state.manifest_pages.is_empty());
+        assert_eq!(state.complete_calls, 0);
+        assert_eq!(state.missing_calls, 0);
+        assert_eq!(state.finalize_calls, 0);
+        assert!(lane_state.open_uploads.is_empty());
+    }
+
+    /// Full `publish_project_provenance` passes against the mock: a real
+    /// fixture repository with one applied note, plus configurable import
+    /// behavior, driven across two lane passes sharing one lane state.
+    async fn provenance_pass_fixture(
+        server_state: &Arc<std::sync::Mutex<ImportServerState>>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        ProjectConfig,
+        Runtime,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.name", "Provenance Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "provenance@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-terminal\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "fixture"]);
+        let head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let scope = PublishedScope::try_new("repo-terminal", ".").unwrap();
+        let note = bbox_provenance::GitProvenanceNote::new_v2(
+            &head,
+            bbox_provenance::ProducedBy::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let part = bbox_provenance::fragment_note(&note, bbox_provenance::MAX_NOTE_DOCUMENT_BYTES)
+            .unwrap()
+            .remove(0);
+        let document = bbox_provenance::ProvenanceExportDocument::from_note(&part).unwrap();
+        let notes_ref = "refs/notes/bb/provenance";
+        let plan = bbox_provenance::ProvenanceExportPlan::new(
+            scope.clone(),
+            "project",
+            notes_ref,
+            vec![document],
+        )
+        .unwrap();
+        let page = plan.page(plan.documents.clone(), None);
+        bbox_provenance::apply_export_page(&root, &page).unwrap();
+        server_state.lock().unwrap().export_response = Some(ProvenanceExportPageResponseV1 {
+            schema_version: GIT_SOURCE_SCHEMA_VERSION,
+            page,
+            document_count: plan.document_count(),
+            logical_bytes: plan
+                .documents
+                .iter()
+                .map(|document| document.document.len() as u64)
+                .sum(),
+            ordered_document_commitment: plan.ordered_document_commitment().unwrap(),
+        });
+        let project = ProjectConfig {
+            root: root.clone(),
+            scope,
+            git_history: false,
+            provenance: true,
+            published_knowledge: None,
+        };
+        let (runtime, server) = spawn_import_server(server_state.clone()).await;
+        (directory, root, project, runtime, server)
+    }
+
+    #[tokio::test]
+    async fn provenance_failed_state_is_terminal_across_passes() {
+        let server_state = import_server_state();
+        {
+            let mut state = server_state.lock().unwrap();
+            state.begin_state = Some(ProvenanceImportStateV1::Failed);
+            state.begin_diagnostic = Some("verifier rejected the manifest".to_string());
+        }
+        let (_directory, _root, project, runtime, server) =
+            provenance_pass_fixture(&server_state).await;
+        let mut lane_state = ProvenanceLaneState::default();
+        let first =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await
+                .unwrap();
+        assert_eq!(first, ProvenancePass::SkippedTerminal);
+        // A later pass with the same descriptor skips before contacting the
+        // import endpoints: begin is not called again.
+        let second =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await
+                .unwrap();
+        assert_eq!(second, ProvenancePass::SkippedTerminal);
+        server.abort();
+        let state = server_state.lock().unwrap();
+        assert_eq!(state.begin_calls, 1);
+        assert!(state.manifest_pages.is_empty());
+        assert_eq!(state.finalize_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn provenance_finalize_rejection_is_terminal_and_aborts_the_upload() {
+        let server_state = import_server_state();
+        server_state.lock().unwrap().finalize_rejection = Some((
+            "invalid_git_source_input",
+            "Git-source input violates the transport contract".to_string(),
+        ));
+        let (_directory, _root, project, runtime, server) =
+            provenance_pass_fixture(&server_state).await;
+        let mut lane_state = ProvenanceLaneState::default();
+        let first =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await
+                .unwrap();
+        assert_eq!(first, ProvenancePass::SkippedTerminal);
+        let second =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await
+                .unwrap();
+        assert_eq!(second, ProvenancePass::SkippedTerminal);
+        server.abort();
+        let state = server_state.lock().unwrap();
+        // The descriptor was attempted exactly once: the rejection is
+        // terminal, the upload was aborted, and later passes skip it.
+        assert_eq!(state.begin_calls, 1);
+        assert_eq!(state.finalize_calls, 1);
+        assert_eq!(state.abort_calls, 1, "the rejected upload is aborted once");
+        assert_eq!(state.missing_calls, 0);
+        assert_eq!(state.complete_calls, 1);
+    }
+
     #[test]
     fn v2_provenance_capture_filters_foreign_projects_and_refuses_mixed_documents() {
         let document = |targets: &[&str]| {
@@ -3735,6 +4480,7 @@ mod tests {
         assert!(partial.failures[0].starts_with("/repos/no-committed-bbox: "));
         let strict = LanePassOutcome {
             succeeded: partial.succeeded,
+            skipped_terminal: 0,
             failures: partial.failures.clone(),
         };
         partial
