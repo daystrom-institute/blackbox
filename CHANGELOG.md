@@ -8,6 +8,14 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The daemon's `/admin/*` HTTP plane now requires a loopback peer or
+  `Authorization: Bearer <token>` matching the owner-readable 64-hex token
+  file configured via `daemon.admin_token_file`
+  (`BLACKBOX_ADMIN_TOKEN_FILE`); unauthenticated non-loopback requests get
+  401, and with no token configured the plane stays loopback-only as
+  before. The gate covers only the admin routes, never `/mcp`,
+  `/internal/*`, `/control/*`, or the health probes, and token comparison
+  is constant-time.
 - The code collector's provenance import no longer wedges on a deterministic
   server-side verifier rejection. Begin now reports the persisted upload state
   (`state`, `next_page`, `diagnostic` on the begin response; a terminal
