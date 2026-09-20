@@ -136,6 +136,14 @@ pub(super) fn build_http_app(
             "/admin/workspace-binding/mint",
             axum::routing::post(super::workspace_binding_mint::admin_workspace_binding_mint),
         )
+        // Operator-only mirror of `blackbox git-history activations`: the
+        // same dead-letter listing and drop the offline CLI performs, on the
+        // loopback admin surface. Never an MCP tool.
+        .route(
+            "/admin/git-history/activations",
+            axum::routing::get(super::git_history_admin::admin_git_history_activations)
+                .delete(super::git_history_admin::admin_git_history_activations_drop),
+        )
         .merge(super::code_source::router(shared.clone()))
         .merge(super::file_source::router(shared.clone()))
         .merge(super::conversation_source::router(shared.clone()))

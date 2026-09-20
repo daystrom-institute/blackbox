@@ -14,6 +14,7 @@ pub(crate) mod conversation_source;
 pub(crate) mod file_source;
 pub(crate) mod file_source_activation;
 mod gap_view;
+pub(crate) mod git_history_admin;
 pub(crate) mod git_source;
 pub mod handler;
 pub(crate) mod history_activation;
