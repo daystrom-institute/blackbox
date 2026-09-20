@@ -569,6 +569,54 @@ impl HistoryActivationJournalV1 {
     }
 }
 
+/// Durable operator-facing dead letter for one Git-history activation that
+/// cannot converge without catalog or grant-table action. Keyed by repo
+/// history id under `activation-deadletter/`; the background worker stops
+/// redriving the recorded source generation until an operator drops the
+/// record or a newer ready pointer supersedes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationDeadletterV1 {
+    pub version: u32,
+    pub repo_history_id: RepoHistoryId,
+    pub producer_id: String,
+    pub source_generation_id: String,
+    pub error_code: String,
+    pub first_seen_unix_secs: u64,
+    pub last_seen_unix_secs: u64,
+    pub attempts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+impl ActivationDeadletterV1 {
+    fn validate(&self) -> Result<()> {
+        if self.version != STORE_VERSION
+            || self.error_code.is_empty()
+            || self.error_code.len() > 128
+            || self.attempts == 0
+            || self.last_seen_unix_secs < self.first_seen_unix_secs
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        validate_producer_authority(&self.producer_id)?;
+        validate_generation_id(&self.source_generation_id)?;
+        Ok(())
+    }
+}
+
+/// One repository's durable ready pointer, as the offline CLI and admin
+/// surfaces observe it. Pure listing view: retirement revalidates the
+/// pointer against its generation under the mutation lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyPointerViewV1 {
+    pub repo_history_id: RepoHistoryId,
+    pub source_generation_id: String,
+    pub producer_id: String,
+    pub repo_head: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct GenerationIndexV1 {
@@ -633,6 +681,7 @@ impl GitSourceStore {
             "repos",
             "generation-index",
             "activations",
+            "activation-deadletter",
             "provenance-receipts",
             "provenance-imports",
             "provenance-imports/uploads",
@@ -654,7 +703,10 @@ impl GitSourceStore {
 
     /// Open an already initialized store without creating any directory.
     /// Offline cutover preflight is observational and must not make an empty
-    /// transport estate look initialized merely by inspecting it.
+    /// transport estate look initialized merely by inspecting it. The
+    /// activation dead-letter area is deliberately absent from the required
+    /// member list: stores written before it existed lack the directory, and
+    /// dead-letter reads treat a missing area as empty rather than refusing.
     pub fn open_existing(root: impl Into<PathBuf>, limits: StoreLimits) -> Result<Self> {
         validate_store_limits(limits)?;
         let root = root.into();
@@ -2439,6 +2491,206 @@ impl GitSourceStore {
         Ok(Some(pointer.source_generation_id))
     }
 
+    /// Every repository's ready pointer as a listing view. Retirement and
+    /// activation revalidate the pointer against its generation under the
+    /// mutation lock; this read does not.
+    pub fn current_ready_pointers(&self) -> Result<Vec<ReadyPointerViewV1>> {
+        let mut pointers = Vec::new();
+        for repo_dir in read_directories(&self.root.join("repos"))? {
+            let Some(repo_history_id) = repo_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|raw| RepoHistoryId::parse(raw).ok())
+            else {
+                continue;
+            };
+            let history_dir = repo_dir.join("history");
+            if NofollowDirectory::open_existing(&history_dir)?.is_none() {
+                continue;
+            }
+            if let Some(pointer) = read_json::<ReadyPointerV1>(
+                &history_dir,
+                "current-ready.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "Git-history ready pointer",
+            )? {
+                validate_generation_id(&pointer.source_generation_id)?;
+                pointers.push(ReadyPointerViewV1 {
+                    repo_history_id,
+                    source_generation_id: pointer.source_generation_id,
+                    producer_id: pointer.producer_id,
+                    repo_head: pointer.repo_head,
+                });
+            }
+        }
+        pointers.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        Ok(pointers)
+    }
+
+    /// Retire one repository's ready pointer under the same lock and
+    /// protection discipline as maintenance: the pointer must still name an
+    /// installed generation it agrees with, the pointed generation is marked
+    /// `Superseded` so its state stops claiming readiness, and the pointer
+    /// file itself is removed as a durable regular file. Returns the retired
+    /// source generation id, or `None` when no pointer existed.
+    pub fn retire_current_ready_pointer(
+        &self,
+        repo_history_id: &RepoHistoryId,
+    ) -> Result<Option<String>> {
+        let _guard = self.lock_mutation()?;
+        let history_dir = self.repo_history_root(repo_history_id)?;
+        let Some(pointer) = read_json::<ReadyPointerV1>(
+            &history_dir,
+            "current-ready.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history ready pointer",
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_generation_id(&pointer.source_generation_id)?;
+        let source = self.load_generation(repo_history_id, &pointer.source_generation_id)?;
+        if source.producer_id != pointer.producer_id
+            || source.descriptor.repo_head != pointer.repo_head
+        {
+            bail!("Git-history ready pointer disagrees with its generation");
+        }
+        remove_regular_file_if_present(&history_dir.join("current-ready.json"))?;
+        if source.state != GitHistorySourceStateV1::Superseded {
+            self.set_history_source_state_locked(
+                &pointer.producer_id,
+                &pointer.source_generation_id,
+                GitHistorySourceStateV1::Superseded,
+                Some(
+                    "ready pointer retired by operator alongside its activation dead letter"
+                        .to_string(),
+                ),
+            )?;
+        }
+        Ok(Some(pointer.source_generation_id))
+    }
+
+    pub fn read_activation_deadletter(
+        &self,
+        repo_history_id: &RepoHistoryId,
+    ) -> Result<Option<ActivationDeadletterV1>> {
+        let deadletter = read_json::<ActivationDeadletterV1>(
+            &self.root.join("activation-deadletter"),
+            &format!("{}.json", repo_history_id.as_str()),
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history activation dead letter",
+        )?;
+        if let Some(deadletter) = deadletter.as_ref() {
+            deadletter.validate()?;
+            if &deadletter.repo_history_id != repo_history_id {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        Ok(deadletter)
+    }
+
+    pub fn list_activation_deadletters(&self) -> Result<Vec<ActivationDeadletterV1>> {
+        let root = self.root.join("activation-deadletter");
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+            _ => bail!("refusing non-directory Git-source dead-letter area"),
+        }
+        let mut deadletters = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Some(deadletter) = read_json::<ActivationDeadletterV1>(
+                &root,
+                &name,
+                MAX_GENERATION_RECORD_BYTES,
+                "Git-history activation dead letter",
+            )?
+            else {
+                continue;
+            };
+            deadletter.validate()?;
+            if name != format!("{}.json", deadletter.repo_history_id.as_str()) {
+                bail!(StoreRequestError::InvalidState);
+            }
+            deadletters.push(deadletter);
+        }
+        deadletters.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        Ok(deadletters)
+    }
+
+    /// Record or refresh one repository's activation dead letter. The record
+    /// is keyed by repo history id: a repeat failure of the same source
+    /// accumulates attempts and preserves `first_seen`, while a newer source
+    /// generation replaces the recorded target. The worker consults the
+    /// record before every redrive.
+    pub fn record_activation_deadletter(
+        &self,
+        repo_history_id: &RepoHistoryId,
+        producer_id: &str,
+        source_generation_id: &str,
+        error_code: &str,
+        diagnostic: Option<String>,
+    ) -> Result<ActivationDeadletterV1> {
+        let _guard = self.lock_mutation()?;
+        let diagnostic = diagnostic.map(|value| value.chars().take(512).collect::<String>());
+        let now = now_unix_secs();
+        let deadletter = match self.read_activation_deadletter(repo_history_id)? {
+            Some(mut prior) => {
+                prior.producer_id = producer_id.to_string();
+                prior.source_generation_id = source_generation_id.to_string();
+                prior.error_code = error_code.to_string();
+                prior.last_seen_unix_secs = now;
+                prior.attempts = prior.attempts.saturating_add(1);
+                prior.diagnostic = diagnostic;
+                prior
+            }
+            None => ActivationDeadletterV1 {
+                version: STORE_VERSION,
+                repo_history_id: repo_history_id.clone(),
+                producer_id: producer_id.to_string(),
+                source_generation_id: source_generation_id.to_string(),
+                error_code: error_code.to_string(),
+                first_seen_unix_secs: now,
+                last_seen_unix_secs: now,
+                attempts: 1,
+                diagnostic,
+            },
+        };
+        deadletter.validate()?;
+        let area = NofollowDirectory::open_or_create(&self.root.join("activation-deadletter"))?;
+        write_json(
+            &area,
+            &format!("{}.json", repo_history_id.as_str()),
+            &deadletter,
+        )?;
+        Ok(deadletter)
+    }
+
+    /// Remove one repository's activation dead letter. Returns whether a
+    /// record existed; the worker redrives the repository's current source on
+    /// its next tick once the record is gone.
+    pub fn drop_activation_deadletter(&self, repo_history_id: &RepoHistoryId) -> Result<bool> {
+        let _guard = self.lock_mutation()?;
+        let path = self
+            .root
+            .join("activation-deadletter")
+            .join(format!("{}.json", repo_history_id.as_str()));
+        let existed = matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.is_file());
+        remove_regular_file_if_present(&path)?;
+        Ok(existed)
+    }
+
     pub fn set_history_source_state(
         &self,
         producer_id: &str,
@@ -2447,6 +2699,16 @@ impl GitSourceStore {
         diagnostic: Option<String>,
     ) -> Result<StoredHistorySourceV1> {
         let _guard = self.lock_mutation()?;
+        self.set_history_source_state_locked(producer_id, source_generation_id, next, diagnostic)
+    }
+
+    fn set_history_source_state_locked(
+        &self,
+        producer_id: &str,
+        source_generation_id: &str,
+        next: GitHistorySourceStateV1,
+        diagnostic: Option<String>,
+    ) -> Result<StoredHistorySourceV1> {
         let authority = self.generation_authority(producer_id, source_generation_id)?;
         let mut source = self.load_generation(&authority.repo_history_id, source_generation_id)?;
         let allowed = source.state == next
@@ -4821,5 +5083,132 @@ mod tests {
                 .history_status("producer-a", &generation_four)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn activation_deadletter_records_accumulate_and_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000007").unwrap();
+        let (_, generation) = ingest_fixture(
+            &store,
+            &history,
+            &CommitNamespace::parse("repo-a").unwrap(),
+            fixture_for('1', '2'),
+        );
+
+        let first = store
+            .record_activation_deadletter(
+                &history,
+                "producer-a",
+                &generation,
+                "repo_history_not_found",
+                Some("no published project binds this repo history".to_string()),
+            )
+            .unwrap();
+        assert_eq!(first.attempts, 1);
+        assert_eq!(first.first_seen_unix_secs, first.last_seen_unix_secs);
+
+        let second = store
+            .record_activation_deadletter(
+                &history,
+                "producer-a",
+                &generation,
+                "repo_history_not_found",
+                Some("no published project binds this repo history".to_string()),
+            )
+            .unwrap();
+        assert_eq!(second.attempts, 2);
+        assert_eq!(second.first_seen_unix_secs, first.first_seen_unix_secs);
+        assert!(second.last_seen_unix_secs >= first.last_seen_unix_secs);
+
+        let listed = store.list_activation_deadletters().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], second);
+        assert_eq!(
+            store.read_activation_deadletter(&history).unwrap(),
+            Some(second)
+        );
+
+        assert!(store.drop_activation_deadletter(&history).unwrap());
+        assert!(!store.drop_activation_deadletter(&history).unwrap());
+        assert!(store.list_activation_deadletters().unwrap().is_empty());
+        assert!(
+            store
+                .read_activation_deadletter(&history)
+                .unwrap()
+                .is_none()
+        );
+
+        // A dropped record starts fresh rather than resurrecting history.
+        let revived = store
+            .record_activation_deadletter(
+                &history,
+                "producer-a",
+                &generation,
+                "repo_history_not_found",
+                None,
+            )
+            .unwrap();
+        assert_eq!(revived.attempts, 1);
+    }
+
+    #[test]
+    fn deadletter_area_is_optional_for_existing_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        drop(store);
+        // A store written before the dead-letter area existed has no such
+        // directory; observational opens and reads must treat it as empty.
+        std::fs::remove_dir(root.join("activation-deadletter")).unwrap();
+        let reopened = GitSourceStore::open_existing(&root, StoreLimits::default()).unwrap();
+        assert!(reopened.list_activation_deadletters().unwrap().is_empty());
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000008").unwrap();
+        assert!(
+            reopened
+                .read_activation_deadletter(&history)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retire_current_ready_pointer_supersedes_the_pointed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000009").unwrap();
+        let namespace = CommitNamespace::parse("repo-a").unwrap();
+        let (_, generation) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+
+        let pointers = store.current_ready_pointers().unwrap();
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(pointers[0].repo_history_id, history);
+        assert_eq!(pointers[0].source_generation_id, generation);
+        assert_eq!(pointers[0].producer_id, "producer-a");
+
+        let retired = store.retire_current_ready_pointer(&history).unwrap();
+        assert_eq!(retired.as_deref(), Some(generation.as_str()));
+        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert!(store.current_ready_source_ids().unwrap().is_empty());
+        assert_eq!(
+            store
+                .history_status("producer-a", &generation)
+                .unwrap()
+                .state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert!(
+            store
+                .history_status("producer-a", &generation)
+                .unwrap()
+                .diagnostic
+                .is_some()
+        );
+
+        // Retiring again is an idempotent no-op.
+        assert_eq!(store.retire_current_ready_pointer(&history).unwrap(), None);
     }
 }
