@@ -1014,12 +1014,39 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                         )
                     }
                     bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE => {
+                        // Rows keyed by a repo history id are the orphan
+                        // fallback the activation worker writes when no
+                        // catalog project binds the repository; their remedy
+                        // must not promise an automatic retry that stopped.
+                        if bbox_corpus_core::project_catalog::RepoHistoryId::parse(
+                            &record.project_id,
+                        )
+                        .is_ok()
+                        {
+                            Finding::action(
+                                format!(
+                                    "repository history `{}` typed activation has not converged and no catalog project binds it: {}",
+                                    record.project_id, record.diagnostic
+                                ),
+                                "rebind a catalog project to this repository history, or drop its activation dead letter",
+                            )
+                        } else {
+                            Finding::action(
+                                format!(
+                                    "project `{}` typed repository-history activation has not converged: {}",
+                                    record.project_id, record.diagnostic
+                                ),
+                                "repair the reported producer source, catalog grant, or publication receipt; the background activation lane retries automatically",
+                            )
+                        }
+                    }
+                    bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE => {
                         Finding::action(
                             format!(
-                                "project `{}` typed repository-history activation has not converged: {}",
+                                "repository history `{}` typed activation is dead-lettered; background redrive stopped: {}",
                                 record.project_id, record.diagnostic
                             ),
-                            "repair the reported producer source, catalog grant, or publication receipt; the background activation lane retries automatically",
+                            "blackbox git-history activations drop --repo-history <id>, adding --retire-ready-pointer when the ready pointer is orphaned, or rebind a catalog project to this repository history",
                         )
                     }
                     "git_history_unavailable" => Finding::warn(format!(
@@ -2560,5 +2587,74 @@ mod catalog_health_tests {
                 "bridge mode must not render {name}"
             );
         }
+    }
+
+    #[test]
+    fn deadlettered_activation_surfaces_with_operator_remedy() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
+        let repo_history = "rh_00000000000000000000000000000042";
+        state
+            .code_sources
+            .store()
+            .record_health_failure(
+                repo_history,
+                bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_DEADLETTER_CODE,
+                "activation dead-lettered after repo_history_not_found: no published project binds this repo history; attempts 6",
+            )
+            .unwrap();
+
+        let section = code_sources_section(&state);
+        let finding = section
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.message.contains(repo_history) && finding.message.contains("dead-lettered")
+            })
+            .expect("the dead-lettered activation must surface as a finding");
+        assert_eq!(finding.level, FindingLevel::Action);
+        let next = finding.next.as_deref().unwrap_or_default();
+        assert!(
+            next.contains("git-history activations drop")
+                && next.contains("--retire-ready-pointer"),
+            "remedy must name the drop command and its retire flag: {next}"
+        );
+    }
+
+    #[test]
+    fn orphan_activation_failure_row_does_not_promise_automatic_retry() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
+        let repo_history = "rh_00000000000000000000000000000043";
+        state
+            .code_sources
+            .store()
+            .record_health_failure(
+                repo_history,
+                bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
+                "no catalog project binds this repository history: repo_history_not_found",
+            )
+            .unwrap();
+
+        let section = code_sources_section(&state);
+        let finding = section
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.message.contains(repo_history)
+                    && finding.message.contains("has not converged")
+            })
+            .expect("the orphan activation failure must surface as a finding");
+        assert_eq!(finding.level, FindingLevel::Action);
+        let next = finding.next.as_deref().unwrap_or_default();
+        assert!(
+            !next.contains("retries automatically"),
+            "an orphan history has no bound project; the remedy must not promise automatic retry: {next}"
+        );
+        assert!(next.contains("rebind"), "{next}");
     }
 }
