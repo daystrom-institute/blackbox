@@ -78,6 +78,51 @@ struct Cli {
 enum TopLevelCommand {
     /// Inspect or rehearse the durable project-catalog migration.
     ProjectCatalog(ProjectCatalogArgs),
+    /// Inspect and clear typed Git-history activation state offline.
+    GitHistory(GitHistoryArgs),
+}
+
+#[derive(Debug, Args)]
+struct GitHistoryArgs {
+    #[command(subcommand)]
+    command: GitHistoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum GitHistoryCommand {
+    /// List ready pointers, activation journals, and dead letters with ages.
+    ActivationsList(ActivationsListArgs),
+    /// Drop one activation dead letter, optionally retiring its ready pointer.
+    ActivationsDrop(ActivationsDropArgs),
+}
+
+#[derive(Debug, Args)]
+struct ActivationsListArgs {
+    /// Shared configuration file; its state dir locates the git-source store.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Exact git-source store root to administer (default
+    /// `<state-dir>/git-sources`).
+    #[arg(long, value_name = "PATH")]
+    store: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ActivationsDropArgs {
+    /// Shared configuration file; its state dir locates the git-source store.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Exact git-source store root to administer (default
+    /// `<state-dir>/git-sources`).
+    #[arg(long, value_name = "PATH")]
+    store: Option<PathBuf>,
+    /// Repository history whose dead letter is dropped.
+    #[arg(long, value_name = "REPO_HISTORY")]
+    repo_history: String,
+    /// Also retire the repository's orphaned ready pointer (marks the
+    /// pointed generation superseded and removes `current-ready.json`).
+    #[arg(long)]
+    retire_ready_pointer: bool,
 }
 
 #[derive(Debug, Args)]
@@ -957,6 +1002,12 @@ fn command_name(cli: &Cli) -> &'static str {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::RetirementJournal(_),
         }) => "project_catalog_retirement_journal",
+        TopLevelCommand::GitHistory(GitHistoryArgs {
+            command: GitHistoryCommand::ActivationsList(_),
+        }) => "git_history_activations_list",
+        TopLevelCommand::GitHistory(GitHistoryArgs {
+            command: GitHistoryCommand::ActivationsDrop(_),
+        }) => "git_history_activations_drop",
     }
 }
 
@@ -1022,6 +1073,12 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::RetirementJournal(args),
         }) => execute_retirement_journal(args),
+        TopLevelCommand::GitHistory(GitHistoryArgs {
+            command: GitHistoryCommand::ActivationsList(args),
+        }) => execute_git_history_activations_list(args),
+        TopLevelCommand::GitHistory(GitHistoryArgs {
+            command: GitHistoryCommand::ActivationsDrop(args),
+        }) => execute_git_history_activations_drop(args),
     }
 }
 
@@ -2189,6 +2246,187 @@ fn serialize_result(value: &impl Serialize) -> Result<serde_json::Value, Command
     })
 }
 
+#[derive(Serialize)]
+struct GitHistoryActivationsListResult {
+    ready_pointers: Vec<GitHistoryReadyPointerRow>,
+    journals: Vec<GitHistoryActivationJournalRow>,
+    deadletters: Vec<GitHistoryDeadletterRow>,
+}
+
+#[derive(Serialize)]
+struct GitHistoryReadyPointerRow {
+    repo_history_id: String,
+    source_generation_id: String,
+    producer_id: String,
+    repo_head: String,
+}
+
+#[derive(Serialize)]
+struct GitHistoryActivationJournalRow {
+    repo_history_id: String,
+    source_generation_id: String,
+    stage: &'static str,
+    terminal: bool,
+}
+
+#[derive(Serialize)]
+struct GitHistoryDeadletterRow {
+    repo_history_id: String,
+    source_generation_id: String,
+    producer_id: String,
+    error_code: String,
+    attempts: u64,
+    first_seen_unix_secs: u64,
+    first_seen_age_secs: u64,
+    last_seen_unix_secs: u64,
+    last_seen_age_secs: u64,
+    diagnostic: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GitHistoryActivationsDropResult {
+    repo_history_id: String,
+    dropped: bool,
+    retired_ready_pointer: Option<String>,
+}
+
+fn open_git_history_store(
+    config: Option<PathBuf>,
+    store: Option<PathBuf>,
+) -> Result<bbox_git_source_store::GitSourceStore, CommandFailure> {
+    let root = match store {
+        Some(path) => path,
+        None => load_config(config)?.paths.state_dir.join("git-sources"),
+    };
+    // Listing and dropping run no intake path; store limits are validated
+    // at open and never consulted.
+    bbox_git_source_store::GitSourceStore::open_existing(
+        &root,
+        bbox_git_source_store::StoreLimits::default(),
+    )
+    .map_err(|error| {
+        CommandFailure::new(
+            "error.git_history_cli_store",
+            format!(
+                "git-source store {} could not be opened: {error}",
+                root.display()
+            ),
+        )
+    })
+}
+
+fn parse_repo_history_id(
+    raw: &str,
+) -> Result<bbox_corpus_core::project_catalog::RepoHistoryId, CommandFailure> {
+    bbox_corpus_core::project_catalog::RepoHistoryId::parse(raw).map_err(|_| {
+        CommandFailure::new(
+            "error.git_history_cli_arguments",
+            format!("{raw} is not a repo history id"),
+        )
+    })
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn execute_git_history_activations_list(
+    args: ActivationsListArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let store = open_git_history_store(args.config, args.store)?;
+    let now = unix_now_secs();
+    let result = GitHistoryActivationsListResult {
+        ready_pointers: store
+            .current_ready_pointers()
+            .map_err(git_history_cli_store_failure)?
+            .into_iter()
+            .map(|pointer| GitHistoryReadyPointerRow {
+                repo_history_id: pointer.repo_history_id.as_str().to_string(),
+                source_generation_id: pointer.source_generation_id,
+                producer_id: pointer.producer_id,
+                repo_head: pointer.repo_head,
+            })
+            .collect(),
+        journals: store
+            .list_activation_journals()
+            .map_err(git_history_cli_store_failure)?
+            .into_iter()
+            .map(|journal| GitHistoryActivationJournalRow {
+                repo_history_id: journal.repo_history_id.as_str().to_string(),
+                source_generation_id: journal.source_generation_id,
+                stage: activation_stage_label(journal.stage),
+                terminal: journal.stage.terminal(),
+            })
+            .collect(),
+        deadletters: store
+            .list_activation_deadletters()
+            .map_err(git_history_cli_store_failure)?
+            .into_iter()
+            .map(|deadletter| GitHistoryDeadletterRow {
+                repo_history_id: deadletter.repo_history_id.as_str().to_string(),
+                source_generation_id: deadletter.source_generation_id,
+                producer_id: deadletter.producer_id,
+                error_code: deadletter.error_code,
+                attempts: deadletter.attempts,
+                first_seen_unix_secs: deadletter.first_seen_unix_secs,
+                first_seen_age_secs: now.saturating_sub(deadletter.first_seen_unix_secs),
+                last_seen_unix_secs: deadletter.last_seen_unix_secs,
+                last_seen_age_secs: now.saturating_sub(deadletter.last_seen_unix_secs),
+                diagnostic: deadletter.diagnostic,
+            })
+            .collect(),
+    };
+    serialize_result(&result)
+}
+
+fn execute_git_history_activations_drop(
+    args: ActivationsDropArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let repo_history = parse_repo_history_id(&args.repo_history)?;
+    let store = open_git_history_store(args.config, args.store)?;
+    // Retire the pointer BEFORE dropping the letter: a crash between the
+    // two steps then leaves the dead letter in place, so the worker stays
+    // stopped instead of resuming a redrive the operator just retired.
+    let retired_ready_pointer = if args.retire_ready_pointer {
+        store
+            .retire_current_ready_pointer(&repo_history)
+            .map_err(git_history_cli_store_failure)?
+    } else {
+        None
+    };
+    let dropped = store
+        .drop_activation_deadletter(&repo_history)
+        .map_err(git_history_cli_store_failure)?;
+    serialize_result(&GitHistoryActivationsDropResult {
+        repo_history_id: repo_history.as_str().to_string(),
+        dropped,
+        retired_ready_pointer,
+    })
+}
+
+fn git_history_cli_store_failure(error: anyhow::Error) -> CommandFailure {
+    CommandFailure::new(
+        "error.git_history_cli_store",
+        format!("git-source store operation failed: {error:#}"),
+    )
+}
+
+fn activation_stage_label(stage: bbox_git_source_store::HistoryActivationStageV1) -> &'static str {
+    use bbox_git_source_store::HistoryActivationStageV1 as Stage;
+    match stage {
+        Stage::Prepared => "prepared",
+        Stage::GenerationVerified => "generation_verified",
+        Stage::MaterializationAdvanced => "materialization_advanced",
+        Stage::CommitViewPublished => "commit_view_published",
+        Stage::OverlaysPublished => "overlays_published",
+        Stage::Committed => "committed",
+        Stage::Superseded => "superseded",
+    }
+}
+
 fn write_json(value: &impl Serialize) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     let stdout = std::io::stdout();
@@ -2960,6 +3198,201 @@ mod tests {
             selection.target_selection,
             ProjectCatalogTargetSelectionV1::Rehearsal
         );
+    }
+
+    fn install_cli_history_source(
+        store: &bbox_git_source_store::GitSourceStore,
+        history: &bbox_corpus_core::project_catalog::RepoHistoryId,
+        namespace: &bbox_corpus_core::project_catalog::CommitNamespace,
+        head: &str,
+    ) -> String {
+        use bbox_git_source::{
+            GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitHistoryDescriptorV1,
+            GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitObjectFormatV1, SCHEMA_VERSION,
+            encode_history_fragment, history_manifest_sha256,
+        };
+        use sha2::Digest;
+        let scope = bbox_corpus_core::identity::PublishedScope::try_new("repo-cli", ".").unwrap();
+        let fragment = GitHistoryCommitFragmentV1 {
+            commit_oid: head.to_string(),
+            fragment_index: 0,
+            fragment_count: 1,
+            header: Some(GitHistoryCommitHeaderV1 {
+                parent_oids: Vec::new(),
+                author_name: "A".into(),
+                author_email: "a@example.invalid".into(),
+                message: "cli fixture".into(),
+            }),
+            changed_paths: vec!["README.md".into()],
+        };
+        let bytes = encode_history_fragment(&fragment);
+        let manifest = vec![GitHistoryManifestEntryV1 {
+            commit_oid: head.to_string(),
+            fragment_index: 0,
+            encoded_bytes: bytes.len() as u64,
+            content_sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+        }];
+        let descriptor = GitHistoryDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope,
+            repo_head: head.to_string(),
+            object_format: GitObjectFormatV1::Sha1,
+            manifest_sha256: history_manifest_sha256(&manifest),
+            commit_count: 1,
+            fragment_count: 1,
+            logical_bytes: bytes.len() as u64,
+        };
+        let begin = store
+            .begin_history_upload("producer-a", history, namespace, descriptor)
+            .unwrap();
+        store
+            .put_history_manifest_page(
+                "producer-a",
+                &begin.upload_id,
+                0,
+                &GitHistoryManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_history_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        store
+            .install_history_record(
+                "producer-a",
+                &begin.upload_id,
+                &manifest[0].content_sha256,
+                manifest[0].encoded_bytes,
+                std::io::Cursor::new(bytes),
+            )
+            .unwrap();
+        store
+            .finalize_history_upload("producer-a", &begin.upload_id)
+            .unwrap()
+            .source_generation_id
+    }
+
+    #[test]
+    fn git_history_activations_list_and_drop_operate_on_a_tempdir_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("git-sources");
+        let store = bbox_git_source_store::GitSourceStore::open(
+            &root,
+            bbox_git_source_store::StoreLimits::default(),
+        )
+        .unwrap();
+        let history = parse_repo_history_id("rh_00000000000000000000000000000051").unwrap();
+        let namespace =
+            bbox_corpus_core::project_catalog::CommitNamespace::parse("repo-cli").unwrap();
+        let head = "1".repeat(40);
+        let generation = install_cli_history_source(&store, &history, &namespace, &head);
+        store
+            .record_activation_deadletter(
+                &history,
+                "producer-a",
+                &generation,
+                "repo_history_not_found",
+                Some("no published project binds this repo history".to_string()),
+            )
+            .unwrap();
+        drop(store);
+
+        let listed = execute_git_history_activations_list(ActivationsListArgs {
+            config: None,
+            store: Some(root.clone()),
+        })
+        .unwrap();
+        let ready = listed
+            .get("ready_pointers")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .clone();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].get("repo_history_id").unwrap().as_str().unwrap(),
+            history.as_str()
+        );
+        let deadletters = listed
+            .get("deadletters")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .clone();
+        assert_eq!(deadletters.len(), 1);
+        assert_eq!(
+            deadletters[0].get("error_code").unwrap().as_str().unwrap(),
+            "repo_history_not_found"
+        );
+        assert_eq!(deadletters[0].get("attempts").unwrap().as_u64().unwrap(), 1);
+        assert!(
+            deadletters[0]
+                .get("first_seen_age_secs")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            listed
+                .get("journals")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+
+        let dropped = execute_git_history_activations_drop(ActivationsDropArgs {
+            config: None,
+            store: Some(root.clone()),
+            repo_history: history.as_str().to_string(),
+            retire_ready_pointer: true,
+        })
+        .unwrap();
+        assert_eq!(dropped.get("dropped").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            dropped
+                .get("retired_ready_pointer")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            generation
+        );
+
+        let after = execute_git_history_activations_list(ActivationsListArgs {
+            config: None,
+            store: Some(root),
+        })
+        .unwrap();
+        assert!(
+            after
+                .get("ready_pointers")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            after
+                .get("deadletters")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn git_history_activations_drop_refuses_a_malformed_repo_history_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("git-sources");
+        bbox_git_source_store::GitSourceStore::open(
+            &root,
+            bbox_git_source_store::StoreLimits::default(),
+        )
+        .unwrap();
+        let failure = execute_git_history_activations_drop(ActivationsDropArgs {
+            config: None,
+            store: Some(root),
+            repo_history: "not-a-repo-history".to_string(),
+            retire_ready_pointer: false,
+        })
+        .expect_err("a malformed id must be refused before any store access");
+        assert_eq!(failure.code, "error.git_history_cli_arguments");
     }
 }
 

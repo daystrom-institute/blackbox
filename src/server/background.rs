@@ -33,8 +33,13 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_scheduler_latency_probe(runtime_handle.clone());
     // Inventory and checkout reconciliation may probe registered paths on
     // stalled mounts. Keep the initial pass off the listener startup path just
-    // like subsequent periodic passes.
-    tokio::spawn(run_knowledge_lifecycle_pass(shared.clone()));
+    // like subsequent periodic passes. It owns its own log gating: the first
+    // pass has no predecessor, so its census always logs at INFO.
+    let startup_pass = shared.clone();
+    tokio::spawn(async move {
+        let mut log_gating = KnowledgeLifecycleLogGating::default();
+        run_knowledge_lifecycle_pass(startup_pass, &mut log_gating).await;
+    });
     // Reconcile the published knowledge index from durable accepted
     // content. A process that died between a pointer swap and its index
     // commit leaves accepted reads on the new generation and search on the
@@ -72,7 +77,10 @@ async fn run_published_index_convergence_pass(shared: Arc<SharedState>) {
     }
 }
 
-async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
+async fn run_knowledge_lifecycle_pass(
+    shared: Arc<SharedState>,
+    log_gating: &mut KnowledgeLifecycleLogGating,
+) {
     let result = tokio::task::spawn_blocking(move || {
         let server = crate::server::BlackboxServer::new(shared);
         // Recovery is nonblocking even during startup. A live writer or
@@ -99,12 +107,31 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
                 tracing::info!(recovered, "knowledge transaction recovery completed");
             }
             match inventory {
-                Ok(inventory) => tracing::info!(
-                    resolved = inventory.inventory.resolved.len(),
-                    quarantined = inventory.inventory.quarantined.len(),
-                    marked_scopes = inventory.marked_scopes.len(),
-                    "knowledge schema epoch inventoried"
-                ),
+                Ok(inventory) => {
+                    let counts = (
+                        inventory.inventory.resolved.len(),
+                        inventory.inventory.quarantined.len(),
+                        inventory.marked_scopes.len(),
+                    );
+                    // A steady daemon re-inventories the same corpus every
+                    // tick; only a CHANGED census is worth an INFO line.
+                    if lifecycle_counts_changed(log_gating.inventory_counts, counts) {
+                        tracing::info!(
+                            resolved = counts.0,
+                            quarantined = counts.1,
+                            marked_scopes = counts.2,
+                            "knowledge schema epoch inventoried"
+                        );
+                    } else {
+                        tracing::debug!(
+                            resolved = counts.0,
+                            quarantined = counts.1,
+                            marked_scopes = counts.2,
+                            "knowledge schema epoch inventoried (unchanged)"
+                        );
+                    }
+                    log_gating.inventory_counts = Some(counts);
+                }
                 Err(err) => tracing::warn!(error = %err, "knowledge schema inventory failed"),
             }
             if let Some(path_fallback) = path_fallback {
@@ -128,12 +155,29 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
                 }
             }
             match reconciliation {
-                Ok(reconciliation) => tracing::info!(
-                    discovered = reconciliation.discovered,
-                    dropped = reconciliation.dropped,
-                    refreshed = reconciliation.refreshed,
-                    "knowledge checkout lifecycle reconciled"
-                ),
+                Ok(reconciliation) => {
+                    let counts = (
+                        reconciliation.discovered,
+                        reconciliation.dropped,
+                        reconciliation.refreshed,
+                    );
+                    if lifecycle_counts_changed(log_gating.reconcile_counts, counts) {
+                        tracing::info!(
+                            discovered = counts.0,
+                            dropped = counts.1,
+                            refreshed = counts.2,
+                            "knowledge checkout lifecycle reconciled"
+                        );
+                    } else {
+                        tracing::debug!(
+                            discovered = counts.0,
+                            dropped = counts.1,
+                            refreshed = counts.2,
+                            "knowledge checkout lifecycle reconciled (unchanged)"
+                        );
+                    }
+                    log_gating.reconcile_counts = Some(counts);
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "knowledge checkout reconciliation failed")
                 }
@@ -141,6 +185,42 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
         }
         Err(err) => tracing::warn!(error = %err, "knowledge lifecycle task failed"),
     }
+}
+
+/// Change gate for the lifecycle INFO lines: the first pass (no
+/// predecessor) and any changed census log at INFO, an identical repeat
+/// logs at debug.
+fn lifecycle_counts_changed(
+    previous: Option<(usize, usize, usize)>,
+    current: (usize, usize, usize),
+) -> bool {
+    previous != Some(current)
+}
+
+#[cfg(test)]
+mod lifecycle_log_gating_tests {
+    use super::lifecycle_counts_changed;
+
+    #[test]
+    fn first_pass_and_changed_censuses_log_while_repeats_stay_quiet() {
+        // First pass: no predecessor, so the census is news.
+        assert!(lifecycle_counts_changed(None, (0, 32, 0)));
+        // Identical repeat: the exact spam this gate removes.
+        assert!(!lifecycle_counts_changed(Some((0, 32, 0)), (0, 32, 0)));
+        // Any movement in any counter is news again.
+        assert!(lifecycle_counts_changed(Some((0, 32, 0)), (1, 32, 0)));
+        assert!(lifecycle_counts_changed(Some((0, 32, 0)), (0, 31, 0)));
+        assert!(lifecycle_counts_changed(Some((0, 32, 0)), (0, 32, 3)));
+    }
+}
+
+/// Per-daemon previous counts for the knowledge lifecycle pass's change
+/// gating: identical consecutive censuses log at debug, changed ones at
+/// INFO. The first pass has no predecessor and always logs at INFO.
+#[derive(Default)]
+struct KnowledgeLifecycleLogGating {
+    inventory_counts: Option<(usize, usize, usize)>,
+    reconcile_counts: Option<(usize, usize, usize)>,
 }
 
 fn spawn_knowledge_lifecycle_reconciler(shared: Arc<SharedState>) {
@@ -154,9 +234,10 @@ fn spawn_knowledge_lifecycle_reconciler(shared: Arc<SharedState>) {
     }
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(interval_secs);
+        let mut log_gating = KnowledgeLifecycleLogGating::default();
         loop {
             tokio::time::sleep(interval).await;
-            run_knowledge_lifecycle_pass(shared.clone()).await;
+            run_knowledge_lifecycle_pass(shared.clone(), &mut log_gating).await;
         }
     });
 }

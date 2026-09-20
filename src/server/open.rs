@@ -964,6 +964,7 @@ pub(super) fn open_shared_state(
         ),
         checkout_access,
         knowledge_transport_observations,
+        knowledge_discovery_denials: parking_lot::Mutex::new(Default::default()),
         blame_locality_observations,
         render_locality_observations,
         // Publisher refs define authority and cannot be reconstructed from

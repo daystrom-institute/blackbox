@@ -36,6 +36,142 @@ pub(crate) struct ExistingKnowledgeMutation {
 
 const PUBLISHER_AUTHORIZATION_CACHE_TTL: Duration = Duration::from_millis(250);
 
+/// Whether one project can contribute a knowledge discovery lease, decided
+/// from the catalog alone. `Ineligible` mirrors the exact gates the lease
+/// path applies (the Selected attachment ladder, the `repo_knowledge` and
+/// `artifact_watching` capabilities, a validated published scope) without
+/// touching the filesystem; `Unknown` keeps the lease attempt for every
+/// shape the catalog cannot decide (bridge mode, unreadable snapshot,
+/// off-catalog project).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryEligibility {
+    Eligible,
+    Unknown,
+    Ineligible { reason: &'static str },
+}
+
+fn discovery_lease_eligibility(
+    catalog_state: &bbox_indexing::project_catalog_store::ProjectCatalogState,
+    project_id: &str,
+) -> DiscoveryEligibility {
+    use bbox_corpus_core::project_catalog::{AttachmentKind, AttachmentStatus};
+    let Ok(parsed) = bbox_corpus_core::project_catalog::ProjectId::parse(project_id) else {
+        return DiscoveryEligibility::Unknown;
+    };
+    if !catalog_state.catalog().projects.contains_key(&parsed) {
+        return DiscoveryEligibility::Unknown;
+    }
+    let attachments = catalog_state
+        .attachments()
+        .attachments
+        .values()
+        .filter(|row| row.status == AttachmentStatus::Attached && row.project_id == parsed)
+        .collect::<Vec<_>>();
+    if attachments.is_empty() {
+        return DiscoveryEligibility::Ineligible {
+            reason: "no active attachment",
+        };
+    }
+    // The Selected ladder the v2 authority applies: operator default, then
+    // a single active attachment, then the unique active Base attachment.
+    let default = catalog_state
+        .attachments()
+        .default_attachments
+        .get(&parsed)
+        .and_then(|selected| {
+            attachments
+                .iter()
+                .find(|row| row.attachment_id == *selected)
+                .copied()
+        });
+    let single = (attachments.len() == 1).then_some(attachments[0]);
+    let unique_base = || {
+        let mut bases = attachments
+            .iter()
+            .filter(|row| row.kind == AttachmentKind::Base);
+        match (bases.next(), bases.next()) {
+            (Some(base), None) => Some(*base),
+            _ => None,
+        }
+    };
+    let Some(attachment) = default.or(single).or_else(unique_base) else {
+        return DiscoveryEligibility::Ineligible {
+            reason: "no selectable attachment",
+        };
+    };
+    if !attachment.capabilities.repo_knowledge {
+        return DiscoveryEligibility::Ineligible {
+            reason: "attachment lacks repo_knowledge",
+        };
+    }
+    if !attachment.capabilities.artifact_watching {
+        return DiscoveryEligibility::Ineligible {
+            reason: "attachment lacks artifact_watching",
+        };
+    }
+    if attachment.validated_scope.is_none() {
+        // A lease without a published scope makes discovery `continue`
+        // anyway; skip it before the canonicalization the lease would pay.
+        return DiscoveryEligibility::Ineligible {
+            reason: "attachment has no published scope",
+        };
+    }
+    DiscoveryEligibility::Eligible
+}
+
+/// Stable key for one denial so a repeated identical failure reads as
+/// steady state while any change (new code, new diagnostic) re-WARNs.
+fn discovery_denial_key(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
+        .map(|error| error.code.as_str().to_string())
+        .unwrap_or_else(|| error.to_string().chars().take(160).collect())
+}
+
+#[derive(Debug)]
+enum DiscoveryDenialTransition {
+    FirstDenial,
+    ChangedDenial,
+    SteadyDenial,
+}
+
+fn gate_discovery_denial(
+    denials: &mut BTreeMap<String, super::state::KnowledgeDiscoveryDenial>,
+    project_id: &str,
+    denial: String,
+) -> DiscoveryDenialTransition {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    match denials.get_mut(project_id) {
+        Some(prior) if prior.denial == denial => {
+            prior.last_seen_unix_secs = now;
+            DiscoveryDenialTransition::SteadyDenial
+        }
+        Some(prior) => {
+            let first_seen_unix_secs = prior.first_seen_unix_secs;
+            *prior = super::state::KnowledgeDiscoveryDenial {
+                denial,
+                first_seen_unix_secs,
+                last_seen_unix_secs: now,
+            };
+            DiscoveryDenialTransition::ChangedDenial
+        }
+        None => {
+            denials.insert(
+                project_id.to_string(),
+                super::state::KnowledgeDiscoveryDenial {
+                    denial,
+                    first_seen_unix_secs: now,
+                    last_seen_unix_secs: now,
+                },
+            );
+            DiscoveryDenialTransition::FirstDenial
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthorizedPublisher {
     pub(crate) project_id: String,
@@ -780,6 +916,17 @@ impl BlackboxServer {
             .map(registry_key)
             .collect::<BTreeSet<_>>();
         let mut discovery = Vec::new();
+        // One catalog snapshot decides which projects can contribute a
+        // discovery lease at all. Projects that cannot (no selectable
+        // attachment, missing capability, no published scope) are skipped
+        // BEFORE any lease: a lease canonicalizes the attachment's checkout
+        // root, which for an uncovered project with a host-local root that
+        // is gone fails every pass and used to WARN every pass.
+        let eligibility = self
+            .state
+            .project_authority
+            .catalog_store()
+            .map(|store| store.snapshot());
         for project in projects.iter() {
             if self
                 .state
@@ -788,18 +935,58 @@ impl BlackboxServer {
             {
                 continue;
             }
+            if let Some(Ok(catalog_state)) = eligibility.as_ref()
+                && let DiscoveryEligibility::Ineligible { reason } =
+                    discovery_lease_eligibility(catalog_state, &project.project_id)
+            {
+                tracing::debug!(
+                    project = %project.project_id,
+                    reason,
+                    "knowledge checkout discovery skipped a project that cannot contribute"
+                );
+                continue;
+            }
             match super::checkout_access::acquire_selected_project_access(
                 &self.state.checkout_access,
                 &project.project_id,
                 bbox_indexing::checkout_access::CheckoutAccessKind::ArtifactWatchDiscovery,
                 bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
             ) {
-                Ok(lease) => discovery.push((project, lease)),
-                Err(error) => tracing::warn!(
-                    project = %project.project_id,
-                    error = %error,
-                    "checkout reconciliation skipped unavailable discovery authority"
-                ),
+                Ok(lease) => {
+                    if self
+                        .state
+                        .knowledge_discovery_denials
+                        .lock()
+                        .remove(&project.project_id)
+                        .is_some()
+                    {
+                        tracing::info!(
+                            project = %project.project_id,
+                            "knowledge checkout discovery authority recovered"
+                        );
+                    }
+                    discovery.push((project, lease));
+                }
+                Err(error) => {
+                    let denial = discovery_denial_key(&error);
+                    match gate_discovery_denial(
+                        &mut self.state.knowledge_discovery_denials.lock(),
+                        &project.project_id,
+                        denial,
+                    ) {
+                        DiscoveryDenialTransition::FirstDenial
+                        | DiscoveryDenialTransition::ChangedDenial => tracing::warn!(
+                            project = %project.project_id,
+                            error = %error,
+                            "checkout reconciliation skipped unavailable discovery authority"
+                        ),
+                        DiscoveryDenialTransition::SteadyDenial => tracing::debug!(
+                            project = %project.project_id,
+                            error = %error,
+                            "checkout reconciliation skipped unavailable discovery authority (unchanged denial)"
+                        ),
+                    }
+                }
             }
         }
         let discovery_access = discovery
@@ -2645,6 +2832,285 @@ mod tests {
                 .any(|blocker| blocker.contains("vacuous path-fallback cut")),
             "{:?}",
             report.blockers
+        );
+    }
+
+    fn discovery_watch_grants_and_denials(state: &SharedState) -> (u64, u64) {
+        use bbox_indexing::checkout_access::{CheckoutAccessKind, CheckoutAccessOutcome};
+        let health = state.checkout_access_observations.health();
+        let watch_grants = health
+            .counters
+            .iter()
+            .filter(|counter| {
+                counter.kind == CheckoutAccessKind::ArtifactWatchDiscovery
+                    && counter.outcome == CheckoutAccessOutcome::Granted
+            })
+            .map(|counter| counter.count)
+            .sum();
+        // The discovery helper first takes a PublisherConfigTreeRead lease
+        // to bind the scope, so a denied project records its denial under
+        // EITHER kind; count all denials.
+        let denials = health
+            .counters
+            .iter()
+            .filter(|counter| counter.outcome == CheckoutAccessOutcome::Denied)
+            .map(|counter| counter.count)
+            .sum();
+        (watch_grants, denials)
+    }
+
+    #[test]
+    fn discovery_skips_ineligible_projects_before_taking_any_lease() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project = "p_discovery_ineligible";
+        fixture.add_published_project(project, &scope);
+        // One real checkout with repo_knowledge but no artifact_watching:
+        // the project appears in the records projection, is not covered by
+        // the knowledge transport cutover, and can never hold the
+        // ArtifactWatchDiscovery lease the loop wants.
+        let checkout = fixture.root().join("checkout");
+        fixture.attach_overlay_checkout(
+            project,
+            &scope,
+            &checkout,
+            "att_2222222222222222222222222222aa01",
+            "ccccccccccccccccccccccccccccaa01",
+            true,
+        );
+        let server = fixture.server();
+        // Preconditions, so the skip assertion cannot pass vacuously: the
+        // project must be in the records projection (exactly one active
+        // Base attachment) and must not be covered by the cutover.
+        assert!(
+            server
+                .state
+                .records_provider
+                .records_snapshot()
+                .records
+                .iter()
+                .any(|record| record.project_id == project),
+            "fixture setup must make the project visible to the reconciler"
+        );
+        assert!(
+            !server
+                .state
+                .knowledge_transport_cutover
+                .covers_project_str(project)
+        );
+
+        let report = server.reconcile_dark_knowledge_checkouts().unwrap();
+        assert_eq!(report.discovered, 0);
+        let (granted, denials) = discovery_watch_grants_and_denials(&server.state);
+        assert_eq!(granted, 0, "an ineligible project must not be leased");
+        assert_eq!(
+            denials, 0,
+            "an ineligible project must not even be denied: it is skipped before the lease"
+        );
+        assert!(
+            server.state.knowledge_discovery_denials.lock().is_empty(),
+            "skipping is not a denial and must not seed the log-gating map"
+        );
+    }
+
+    #[test]
+    fn steady_state_discovery_denial_is_recorded_once_and_stays_steady() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project = "p_discovery_denied";
+        fixture.add_published_project(project, &scope);
+        // A watching-capable base attachment whose checkout root does not
+        // exist on this host: the production shape of the repeated denial.
+        let gone = fixture.root().join("gone");
+        let attachment = "att_3333333333333333333333333333bb02";
+        let checkout_id = "ddddddddddddddddddddddddddddbb02";
+        let parsed_project = bbox_corpus_core::project_catalog::ProjectId::parse(project).unwrap();
+        let parsed_attachment =
+            bbox_corpus_core::project_catalog::AttachmentId::parse(attachment).unwrap();
+        let scope_clone = scope.clone();
+        let gone_str = gone.to_string_lossy().into_owned();
+        let epoch = fixture.store().snapshot().unwrap().epoch();
+        fixture
+            .store()
+            .transact(epoch, |_catalog, attachments| {
+                attachments.attachments.insert(
+                    parsed_attachment.clone(),
+                    bbox_corpus_core::project_catalog::CheckoutAttachment {
+                        attachment_id: parsed_attachment,
+                        project_id: parsed_project,
+                        checkout_id: checkout_id.into(),
+                        checkout_dir: gone_str.clone(),
+                        checkout_project_dir: gone_str,
+                        project_root_relpath: scope_clone.bbox_root_relpath().to_string(),
+                        kind: bbox_corpus_core::project_catalog::AttachmentKind::Base,
+                        validated_scope: Some(scope_clone),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                            repo_knowledge: true,
+                            artifact_watching: true,
+                            ..Default::default()
+                        },
+                        status: bbox_corpus_core::project_catalog::AttachmentStatus::Attached,
+                        attached_at: "2026-08-03T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let server = fixture.server();
+        // Precondition: the project is visible to the reconciler and the
+        // catalog admits a discovery lease (all capability and scope gates
+        // pass), so the only failure left is the filesystem root.
+        assert!(
+            server
+                .state
+                .records_provider
+                .records_snapshot()
+                .records
+                .iter()
+                .any(|record| record.project_id == project),
+            "fixture setup must make the project visible to the reconciler"
+        );
+        let catalog_state = server
+            .state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            discovery_lease_eligibility(&catalog_state, project),
+            DiscoveryEligibility::Eligible
+        );
+
+        let first = server.reconcile_dark_knowledge_checkouts().unwrap();
+        assert_eq!(first.discovered, 0);
+        let (granted, denials) = discovery_watch_grants_and_denials(&server.state);
+        assert_eq!(granted, 0);
+        assert_eq!(denials, 1, "the first pass attempts the lease once");
+        let denials_after_first = server
+            .state
+            .knowledge_discovery_denials
+            .lock()
+            .get(project)
+            .cloned()
+            .expect("the first denial is recorded for transition gating");
+
+        // The second pass is steady state: the lease is attempted again
+        // (nothing else would notice recovery) but the recorded denial is
+        // UNCHANGED, which is exactly the debug-instead-of-WARN transition.
+        let second = server.reconcile_dark_knowledge_checkouts().unwrap();
+        assert_eq!(second.discovered, 0);
+        let (_granted, denials) = discovery_watch_grants_and_denials(&server.state);
+        assert_eq!(
+            denials, 2,
+            "steady state still probes; only logging is gated"
+        );
+        let steady = server
+            .state
+            .knowledge_discovery_denials
+            .lock()
+            .get(project)
+            .cloned()
+            .expect("the denial entry persists");
+        assert_eq!(steady.denial, denials_after_first.denial);
+        assert!(steady.last_seen_unix_secs >= denials_after_first.last_seen_unix_secs);
+        assert_eq!(
+            steady.first_seen_unix_secs, denials_after_first.first_seen_unix_secs,
+            "a steady denial must not look like a fresh one"
+        );
+    }
+
+    #[test]
+    fn discovery_denial_gating_transitions_are_exact() {
+        let mut denials = BTreeMap::new();
+        match gate_discovery_denial(&mut denials, "p_one", "attachment_inactive".into()) {
+            DiscoveryDenialTransition::FirstDenial => {}
+            other => panic!("first denial must be FirstDenial, got {other:?}"),
+        }
+        match gate_discovery_denial(&mut denials, "p_one", "attachment_inactive".into()) {
+            DiscoveryDenialTransition::SteadyDenial => {}
+            other => panic!("identical denial must be SteadyDenial, got {other:?}"),
+        }
+        match gate_discovery_denial(&mut denials, "p_one", "capability_denied".into()) {
+            DiscoveryDenialTransition::ChangedDenial => {}
+            other => panic!("a changed denial must re-WARN, got {other:?}"),
+        }
+        // Recovery is the successful-lease branch removing the entry, so a
+        // later denial is FirstDenial again and re-WARNs.
+        denials.remove("p_one");
+        match gate_discovery_denial(&mut denials, "p_one", "attachment_inactive".into()) {
+            DiscoveryDenialTransition::FirstDenial => {}
+            other => panic!("denial after recovery must be FirstDenial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ineligible_discovery_reasons_follow_the_attachment_ladder() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project = "p_discovery_ladder";
+        fixture.add_published_project(project, &scope);
+
+        // Each phase opens a FRESH server: a store instance serves its own
+        // cached snapshot, so fixture-side transactions are only visible to
+        // servers created after them.
+        let no_attachment = fixture.server();
+        let catalog_state = no_attachment
+            .state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            discovery_lease_eligibility(&catalog_state, project),
+            DiscoveryEligibility::Ineligible {
+                reason: "no active attachment"
+            }
+        );
+
+        // A checkout with repo_knowledge but no artifact_watching: the
+        // ladder selects it, and discovery stays ineligible for the missing
+        // capability.
+        let checkout = fixture.root().join("ladder");
+        fixture.attach_overlay_checkout(
+            project,
+            &scope,
+            &checkout,
+            "att_4444444444444444444444444444cc03",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeecc03",
+            true,
+        );
+        let without_watching = fixture.server();
+        let catalog_state = without_watching
+            .state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            discovery_lease_eligibility(&catalog_state, project),
+            DiscoveryEligibility::Ineligible {
+                reason: "attachment lacks artifact_watching"
+            }
+        );
+
+        // Off-catalog ids stay Unknown so the lease attempt (and its
+        // transition-gated logging) decides.
+        assert_eq!(
+            discovery_lease_eligibility(&catalog_state, "p_not_in_catalog"),
+            DiscoveryEligibility::Unknown
+        );
+        assert_eq!(
+            discovery_lease_eligibility(&catalog_state, "not-a-project-id"),
+            DiscoveryEligibility::Unknown
         );
     }
 }
