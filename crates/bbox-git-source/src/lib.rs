@@ -81,6 +81,16 @@ pub enum ContractError {
     ProvenanceDocumentInvalid,
     #[error("provenance count does not match its descriptor")]
     ProvenanceCountMismatch,
+    #[error(
+        "provenance part group is incomplete: note commit {note_commit} document \
+         {document_id} has parts {present_part_indices:?} of {expected_part_count}"
+    )]
+    ProvenancePartGroupIncomplete {
+        note_commit: String,
+        document_id: String,
+        present_part_indices: Vec<u32>,
+        expected_part_count: u32,
+    },
     #[error("provenance commitment does not match its descriptor")]
     ProvenanceCommitmentMismatch,
     #[error("provenance source exceeds an enforced limit")]
@@ -927,12 +937,20 @@ impl<'a> ProvenanceSourceVerifier<'a> {
     }
 
     pub fn finish(self) -> Result<(), ContractError> {
-        if self.next != self.manifest.len()
-            || self.parts.values().any(|(part_count, indices)| {
-                indices.len() as u32 != *part_count || indices.iter().copied().ne(0..*part_count)
-            })
-        {
+        if self.next != self.manifest.len() {
             return Err(ContractError::ProvenanceCountMismatch);
+        }
+        for ((note_commit, document_id), (expected_part_count, indices)) in self.parts {
+            if indices.len() as u32 != expected_part_count
+                || indices.iter().copied().ne(0..expected_part_count)
+            {
+                return Err(ContractError::ProvenancePartGroupIncomplete {
+                    note_commit,
+                    document_id,
+                    present_part_indices: indices.into_iter().collect(),
+                    expected_part_count,
+                });
+            }
         }
         Ok(())
     }
@@ -1440,6 +1458,63 @@ mod tests {
             ),
             Err(ContractError::ProvenanceDocumentMismatch)
         );
+    }
+
+    #[test]
+    fn provenance_finish_names_the_incomplete_part_group() {
+        // A damaged note whose later parts never landed: the manifest is
+        // self-consistent and every present document is individually valid,
+        // so only finish() can detect the gap. Its error must name the group.
+        let commit = "1".repeat(40);
+        let document_id = "d".repeat(64);
+        let document = bbox_provenance::serialize_note(&GitProvenanceNote {
+            schema_version: bbox_provenance::SCHEMA_VERSION_V2,
+            commit: commit.clone(),
+            part: Some(bbox_provenance::GitProvenanceNotePart {
+                document_id: document_id.clone(),
+                part_index: 0,
+                part_count: 4,
+            }),
+            produced_by: ProducedBy::default(),
+            tool_calls: Vec::new(),
+            knowledge_writes: Vec::new(),
+        })
+        .unwrap();
+        let manifest = vec![ProvenanceImportManifestEntryV1 {
+            note_commit: commit.clone(),
+            document_ordinal: 0,
+            encoded_bytes: document.len() as u64,
+            document_sha256: bbox_provenance::document_sha256(&document),
+        }];
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: scope(),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: 1,
+            logical_bytes: document.len() as u64,
+        };
+        let error = validate_provenance_documents(
+            &descriptor,
+            &manifest,
+            std::slice::from_ref(&document),
+            GitSourceLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ContractError::ProvenancePartGroupIncomplete {
+                note_commit: commit.clone(),
+                document_id: document_id.clone(),
+                present_part_indices: vec![0],
+                expected_part_count: 4,
+            }
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains(&document_id), "{rendered}");
+        assert!(rendered.contains(&commit), "{rendered}");
+        assert!(rendered.contains("of 4"), "{rendered}");
     }
 
     #[test]
