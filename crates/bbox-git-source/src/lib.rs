@@ -734,9 +734,10 @@ pub struct FinalizeProvenanceImportResponseV1 {
     pub status_url: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceImportStateV1 {
+    #[default]
     ReceivingManifest,
     MissingDocuments,
     Ready,
@@ -745,12 +746,6 @@ pub enum ProvenanceImportStateV1 {
     Superseded,
     Quarantined,
     Failed,
-}
-
-impl Default for ProvenanceImportStateV1 {
-    fn default() -> Self {
-        Self::ReceivingManifest
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
