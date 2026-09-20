@@ -4653,6 +4653,80 @@ mod tests {
     }
 
     #[test]
+    fn provenance_finalize_incomplete_part_group_diagnostic_names_the_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let commit = "1".repeat(40);
+        let document_id = "d".repeat(64);
+        // A damaged note: only part 0 of 4 landed, so every uploaded document
+        // is individually valid and only finish() detects the gap.
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "commit": commit,
+            "part": {
+                "document_id": document_id,
+                "part_index": 0,
+                "part_count": 4
+            },
+            "produced_by": {},
+            "tool_calls": [],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let (descriptor, manifest) = provenance_fixture_with_documents(&[document.clone()]);
+        let begin = store
+            .begin_provenance_import(
+                "producer-a",
+                "p_00000000000000000000000000000001",
+                descriptor,
+            )
+            .unwrap();
+        store
+            .put_provenance_manifest_page(
+                "producer-a",
+                &begin.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        for (entry, document) in manifest.iter().zip([&document]) {
+            store
+                .install_provenance_document(
+                    "producer-a",
+                    &begin.upload_id,
+                    &entry.document_sha256,
+                    entry.encoded_bytes,
+                    document.as_bytes(),
+                )
+                .unwrap();
+        }
+        let error = store
+            .finalize_provenance_import("producer-a", &begin.upload_id)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ContractError>(),
+            Some(ContractError::ProvenancePartGroupIncomplete { .. })
+        ));
+        let upload_path = store
+            .provenance_upload_dir("producer-a", &begin.upload_id)
+            .unwrap();
+        let upload = store
+            .load_provenance_upload(&upload_path, "producer-a", &begin.upload_id)
+            .unwrap();
+        assert_eq!(upload.state, ProvenanceImportStateV1::Failed);
+        let diagnostic = upload.diagnostic.as_deref().unwrap_or_default();
+        assert!(diagnostic.contains(&document_id), "{diagnostic}");
+        assert!(diagnostic.contains(&commit), "{diagnostic}");
+        assert!(diagnostic.contains("of 4"), "{diagnostic}");
+    }
+
+    #[test]
     fn provenance_failed_uploads_expire_after_idle_ttl() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
