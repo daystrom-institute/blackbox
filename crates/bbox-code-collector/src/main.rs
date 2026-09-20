@@ -240,6 +240,21 @@ impl ProvenanceLaneState {
     fn take_open_upload(&mut self, root: &Path) -> Option<OpenProvenanceUpload> {
         self.open_uploads.remove(root)
     }
+
+    /// Whether the remembered open upload for `root` was begun against a
+    /// different descriptor than the one about to be published. A notes-tip
+    /// advance after a mid-upload failure leaves exactly this situation; the
+    /// remembered upload can never complete and must be aborted so it stops
+    /// holding a producer slot until idle expiry.
+    fn open_upload_conflicts(
+        &self,
+        root: &Path,
+        descriptor: &ProvenanceImportDescriptorV1,
+    ) -> bool {
+        self.open_uploads
+            .get(root)
+            .is_some_and(|open| open.descriptor != *descriptor)
+    }
 }
 
 /// A server-side terminal rejection of one provenance descriptor. The
@@ -1616,6 +1631,13 @@ async fn publish_project_provenance(
     }
     let (project_id, notes_ref) = resolved_export.context("provenance export did not converge")?;
     let captured = capture_provenance_import(&root, &project.scope, &project_id, &notes_ref)?;
+    if lane_state.open_upload_conflicts(&root, &captured.descriptor) {
+        // The notes tip advanced since an earlier pass failed mid-upload: the
+        // remembered upload was begun against a superseded descriptor, can
+        // never complete, and would hold an open-upload slot until idle
+        // expiry. Abort it before beginning the new one.
+        abort_remembered_provenance_upload(runtime, lane_state, &root).await;
+    }
     if lane_state.terminal_for(&root, &captured.descriptor) {
         tracing::debug!(
             root = %root.display(),
@@ -1638,6 +1660,10 @@ async fn publish_project_provenance(
                 diagnostic = %diagnostic,
                 "provenance descriptor terminally rejected; skipping until the notes tip or manifest changes"
             );
+            // The server-side failed upload is the durable terminal marker
+            // for this descriptor; forget it locally so a later descriptor
+            // change never tries to abort (and delete) the failed record.
+            lane_state.take_open_upload(&root);
             lane_state.note_terminal(&root, descriptor, diagnostic);
             Ok(ProvenancePass::SkippedTerminal)
         }
@@ -2133,10 +2159,13 @@ async fn publish_provenance_import(
         match send_json(runtime.request(reqwest::Method::POST, finalize_url)).await {
             Ok(finalized) => finalized,
             // A deterministic verifier rejection is content-borne: re-sending the
-            // same descriptor can never succeed. Abort the upload so it stops
-            // holding a slot, then surface the terminal classification.
+            // same descriptor can never succeed. The server persists this
+            // upload as terminally failed with a durable diagnostic and returns
+            // it (state=failed) on the next begin with the same descriptor, so
+            // it must NOT be aborted: deleting it would also delete the
+            // diagnostic, and a collector restart without the in-memory
+            // terminal map would re-upload and re-fail on every pass.
             Err(error) if has_remote_error_code(&error, "invalid_git_source_input") => {
-                abort_provenance_import_best_effort(runtime, &begin.upload_id).await;
                 return Err(anyhow!(TerminalProvenanceFailure {
                     diagnostic: format!("{error:#}"),
                 }));
@@ -4171,11 +4200,16 @@ mod tests {
         uploaded_documents: Vec<String>,
         finalize_calls: usize,
         abort_calls: usize,
+        /// Ordered endpoint events ("begin:<id>", "manifest:<page>",
+        /// "complete", "document:<hash>", "finalize", "abort:<id>") so tests
+        /// can assert request ordering, not just counts.
+        events: Vec<String>,
         begin_state: Option<ProvenanceImportStateV1>,
         begin_next_page: u64,
         begin_diagnostic: Option<String>,
         missing_hashes: Vec<String>,
         finalize_rejection: Option<(&'static str, String)>,
+        document_rejection: Option<(&'static str, String)>,
         export_response: Option<ProvenanceExportPageResponseV1>,
     }
 
@@ -4257,8 +4291,10 @@ mod tests {
                 post(move || {
                     let mut state = begin_state.lock().unwrap();
                     state.begin_calls += 1;
+                    let upload_id = format!("upload-{}", state.begin_calls);
+                    state.events.push(format!("begin:{upload_id}"));
                     let response = BeginProvenanceImportResponseV1 {
-                        upload_id: "upload-1".to_string(),
+                        upload_id,
                         max_page_entries: 1,
                         max_page_bytes: bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
                         max_document_bytes: MAX_PROVENANCE_DOCUMENT_BYTES,
@@ -4274,7 +4310,10 @@ mod tests {
                 "/internal/code-source/v1/provenance/imports/{upload_id}/manifest/{page}",
                 put(
                     move |AxumPath((_upload_id, page)): AxumPath<(String, u32)>| {
-                        manifest_state.lock().unwrap().manifest_pages.push(page);
+                        let mut state = manifest_state.lock().unwrap();
+                        state.manifest_pages.push(page);
+                        state.events.push(format!("manifest:{page}"));
+                        drop(state);
                         async move { AxumStatusCode::NO_CONTENT }
                     },
                 ),
@@ -4285,6 +4324,7 @@ mod tests {
                     let mut state = complete_state.lock().unwrap();
                     state.complete_calls += 1;
                     let hashes = state.missing_hashes.clone();
+                    state.events.push("complete".to_string());
                     drop(state);
                     async move {
                         Json(bbox_git_source::MissingProvenanceDocumentsPageV1 {
@@ -4312,8 +4352,24 @@ mod tests {
                 "/internal/code-source/v1/provenance/imports/{upload_id}/documents/{hash}",
                 put(
                     move |AxumPath((_upload_id, hash)): AxumPath<(String, String)>| {
-                        document_state.lock().unwrap().uploaded_documents.push(hash);
-                        async move { AxumStatusCode::NO_CONTENT }
+                        let mut state = document_state.lock().unwrap();
+                        let rejection = state.document_rejection.clone();
+                        state.uploaded_documents.push(hash.clone());
+                        state.events.push(format!("document:{hash}"));
+                        drop(state);
+                        async move {
+                            if let Some((code, message)) = rejection {
+                                return (
+                                    AxumStatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(ErrorResponse {
+                                        code: code.to_string(),
+                                        message,
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                            AxumStatusCode::NO_CONTENT.into_response()
+                        }
                     },
                 ),
             )
@@ -4323,6 +4379,7 @@ mod tests {
                     let mut state = finalize_state.lock().unwrap();
                     state.finalize_calls += 1;
                     let rejection = state.finalize_rejection.clone();
+                    state.events.push("finalize".to_string());
                     drop(state);
                     async move {
                         if let Some((code, message)) = rejection {
@@ -4347,8 +4404,11 @@ mod tests {
             )
             .route(
                 "/internal/code-source/v1/provenance/imports/{upload_id}",
-                delete(move |AxumPath(_upload_id): AxumPath<String>| {
-                    abort_state.lock().unwrap().abort_calls += 1;
+                delete(move |AxumPath(upload_id): AxumPath<String>| {
+                    let mut state = abort_state.lock().unwrap();
+                    state.abort_calls += 1;
+                    state.events.push(format!("abort:{upload_id}"));
+                    drop(state);
                     async move { AxumStatusCode::NO_CONTENT }
                 }),
             )
@@ -4493,6 +4553,7 @@ mod tests {
         ProjectConfig,
         Runtime,
         tokio::task::JoinHandle<()>,
+        String,
     ) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -4551,8 +4612,9 @@ mod tests {
             provenance: true,
             published_knowledge: None,
         };
+        let document_sha = plan.documents[0].document_sha256.clone();
         let (runtime, server) = spawn_import_server(server_state.clone()).await;
-        (directory, root, project, runtime, server)
+        (directory, root, project, runtime, server, document_sha)
     }
 
     #[tokio::test]
@@ -4563,7 +4625,7 @@ mod tests {
             state.begin_state = Some(ProvenanceImportStateV1::Failed);
             state.begin_diagnostic = Some("verifier rejected the manifest".to_string());
         }
-        let (_directory, _root, project, runtime, server) =
+        let (_directory, _root, project, runtime, server, _document_sha) =
             provenance_pass_fixture(&server_state).await;
         let mut lane_state = ProvenanceLaneState::default();
         let first =
@@ -4586,13 +4648,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provenance_finalize_rejection_is_terminal_and_aborts_the_upload() {
+    async fn provenance_finalize_rejection_is_terminal_and_keeps_the_failed_record() {
         let server_state = import_server_state();
         server_state.lock().unwrap().finalize_rejection = Some((
             "invalid_git_source_input",
             "Git-source input violates the transport contract".to_string(),
         ));
-        let (_directory, _root, project, runtime, server) =
+        let (_directory, _root, project, runtime, server, _document_sha) =
             provenance_pass_fixture(&server_state).await;
         let mut lane_state = ProvenanceLaneState::default();
         let first =
@@ -4600,20 +4662,134 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(first, ProvenancePass::SkippedTerminal);
-        let second =
-            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
-                .await
-                .unwrap();
+        // The server-side failed upload is the durable terminal marker; the
+        // collector must not abort (and delete) it. The remembered upload is
+        // dropped so a later descriptor change never aborts the failed record.
+        assert!(lane_state.open_uploads.is_empty());
+        // A collector restart loses the in-memory terminal map. The server
+        // answers the next begin for the same descriptor with state=failed,
+        // which is terminal again without re-sending anything.
+        {
+            let mut state = server_state.lock().unwrap();
+            state.begin_state = Some(ProvenanceImportStateV1::Failed);
+            state.begin_diagnostic =
+                Some("Git-source input violates the transport contract".to_string());
+        }
+        let mut restarted_state = ProvenanceLaneState::default();
+        let second = publish_project_provenance(
+            &runtime,
+            &project,
+            Duration::from_secs(2),
+            &mut restarted_state,
+        )
+        .await
+        .unwrap();
         assert_eq!(second, ProvenancePass::SkippedTerminal);
         server.abort();
         let state = server_state.lock().unwrap();
         // The descriptor was attempted exactly once: the rejection is
-        // terminal, the upload was aborted, and later passes skip it.
-        assert_eq!(state.begin_calls, 1);
+        // terminal, nothing was aborted, and the post-restart pass reached
+        // only begin.
+        assert_eq!(state.begin_calls, 2);
+        assert_eq!(
+            state.manifest_pages,
+            vec![0],
+            "the manifest page is sent exactly once, never re-sent after the rejection or restart"
+        );
+        assert!(state.uploaded_documents.is_empty());
         assert_eq!(state.finalize_calls, 1);
-        assert_eq!(state.abort_calls, 1, "the rejected upload is aborted once");
-        assert_eq!(state.missing_calls, 0);
+        assert_eq!(state.abort_calls, 0, "the failed record is never aborted");
         assert_eq!(state.complete_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn provenance_descriptor_change_aborts_the_superseded_open_upload() {
+        let server_state = import_server_state();
+        server_state.lock().unwrap().document_rejection = Some((
+            "storage_unavailable",
+            "Git-source storage is unavailable".to_string(),
+        ));
+        let (_directory, root, project, runtime, server, document_sha) =
+            provenance_pass_fixture(&server_state).await;
+        server_state.lock().unwrap().missing_hashes = vec![document_sha];
+        // Pass one fails mid-upload: begin and the manifest land, the document
+        // PUT errors, and the lane remembers the open upload for the old
+        // descriptor.
+        let mut lane_state = ProvenanceLaneState::default();
+        let first =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await;
+        assert!(
+            first.is_err(),
+            "the mid-upload document failure errors the pass"
+        );
+        assert_eq!(lane_state.open_uploads.len(), 1);
+
+        // Pass two captures a new descriptor: advance the notes tip with a
+        // second commit and serve its export page, and let documents succeed.
+        fs::write(root.join("second.md"), "second\n").unwrap();
+        git(&root, &["add", "second.md"]);
+        git(&root, &["commit", "--quiet", "-m", "second note"]);
+        let second_head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let note = bbox_provenance::GitProvenanceNote::new_v2(
+            &second_head,
+            bbox_provenance::ProducedBy::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let part = bbox_provenance::fragment_note(&note, bbox_provenance::MAX_NOTE_DOCUMENT_BYTES)
+            .unwrap()
+            .remove(0);
+        let document = bbox_provenance::ProvenanceExportDocument::from_note(&part).unwrap();
+        let notes_ref = "refs/notes/bb/provenance";
+        let plan = bbox_provenance::ProvenanceExportPlan::new(
+            project.scope.clone(),
+            "project",
+            notes_ref,
+            vec![document],
+        )
+        .unwrap();
+        let page = plan.page(plan.documents.clone(), None);
+        {
+            let mut state = server_state.lock().unwrap();
+            state.export_response = Some(ProvenanceExportPageResponseV1 {
+                schema_version: GIT_SOURCE_SCHEMA_VERSION,
+                page,
+                document_count: plan.document_count(),
+                logical_bytes: plan
+                    .documents
+                    .iter()
+                    .map(|document| document.document.len() as u64)
+                    .sum(),
+                ordered_document_commitment: plan.ordered_document_commitment().unwrap(),
+            });
+            state.document_rejection = None;
+        }
+        let second =
+            publish_project_provenance(&runtime, &project, Duration::from_secs(2), &mut lane_state)
+                .await
+                .unwrap();
+        assert_eq!(second, ProvenancePass::Imported);
+        server.abort();
+        let state = server_state.lock().unwrap();
+        // The superseded upload is aborted exactly once, before the new
+        // descriptor's begin.
+        assert_eq!(state.abort_calls, 1);
+        let aborted_at = state
+            .events
+            .iter()
+            .position(|event| event == "abort:upload-1")
+            .expect("the old upload id is aborted");
+        let rebiased_at = state
+            .events
+            .iter()
+            .position(|event| event == "begin:upload-2")
+            .expect("the new descriptor begins a fresh upload");
+        assert!(
+            aborted_at < rebiased_at,
+            "abort must precede the new begin: {:?}",
+            state.events
+        );
     }
 
     #[test]
