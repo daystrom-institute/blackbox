@@ -708,6 +708,19 @@ pub struct BeginProvenanceImportResponseV1 {
     pub max_page_entries: usize,
     pub max_page_bytes: usize,
     pub max_document_bytes: u64,
+    /// Current state of the returned upload. A re-attached upload reports its
+    /// persisted state so the producer resumes instead of resending. Missing
+    /// on older servers; deserializes as `receiving_manifest`.
+    #[serde(default)]
+    pub state: ProvenanceImportStateV1,
+    /// First manifest page the server still expects, relative to this upload.
+    /// Pages below it have already landed. Missing on older servers;
+    /// deserializes as 0.
+    #[serde(default)]
+    pub next_page: u64,
+    /// Server-side diagnostic accompanying a terminally failed upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,9 +737,10 @@ pub struct FinalizeProvenanceImportResponseV1 {
     pub status_url: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceImportStateV1 {
+    #[default]
     ReceivingManifest,
     MissingDocuments,
     Ready,
@@ -734,6 +748,10 @@ pub enum ProvenanceImportStateV1 {
     Active,
     Superseded,
     Quarantined,
+    /// Terminally rejected by the server-side verifier. The upload persists
+    /// with a diagnostic and does not count as open; a later begin with the
+    /// same descriptor returns the failed upload unchanged.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1180,6 +1198,39 @@ mod tests {
             let encoded = encode_history_fragment(&fragment);
             assert_eq!(decode_history_fragment(&encoded).unwrap(), fragment);
         }
+    }
+
+    #[test]
+    fn provenance_begin_response_defaults_and_failed_state_round_trip() {
+        // An older server omits state/next_page entirely: the producer must
+        // read that as a fresh receiving_manifest upload resumable from page 0.
+        let legacy: BeginProvenanceImportResponseV1 = serde_json::from_str(
+            r#"{"upload_id":"u1","max_page_entries":32,"max_page_bytes":4096,"max_document_bytes":262144}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.state, ProvenanceImportStateV1::ReceivingManifest);
+        assert_eq!(legacy.next_page, 0);
+        assert_eq!(legacy.diagnostic, None);
+
+        let failed: BeginProvenanceImportResponseV1 = serde_json::from_str(
+            r#"{"upload_id":"u2","max_page_entries":32,"max_page_bytes":4096,"max_document_bytes":262144,
+                "state":"failed","next_page":3,"diagnostic":"verifier rejected the manifest"}"#,
+        )
+        .unwrap();
+        assert_eq!(failed.state, ProvenanceImportStateV1::Failed);
+        assert_eq!(failed.next_page, 3);
+        assert_eq!(
+            failed.diagnostic.as_deref(),
+            Some("verifier rejected the manifest")
+        );
+        assert_eq!(
+            serde_json::to_value(ProvenanceImportStateV1::Failed).unwrap(),
+            serde_json::json!("failed")
+        );
+        assert_eq!(
+            ProvenanceImportStateV1::default(),
+            ProvenanceImportStateV1::ReceivingManifest
+        );
     }
 
     #[test]

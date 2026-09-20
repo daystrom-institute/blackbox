@@ -3583,6 +3583,9 @@ fn begin_provenance_response(upload_id: String) -> BeginProvenanceImportResponse
         max_page_entries: MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES,
         max_page_bytes: MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
         max_document_bytes: MAX_PROVENANCE_DOCUMENT_BYTES,
+        state: ProvenanceImportStateV1::ReceivingManifest,
+        next_page: 0,
+        diagnostic: None,
     }
 }
 
