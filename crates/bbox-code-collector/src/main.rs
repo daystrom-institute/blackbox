@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Read};
@@ -160,6 +160,9 @@ struct CapturedProvenanceImport {
     descriptor: ProvenanceImportDescriptorV1,
     entries: Vec<ProvenanceImportManifestEntryV1>,
     documents: tempfile::TempDir,
+    /// Owned V2 part groups dropped whole at capture because their present
+    /// parts were not exactly 0..part_count (damaged local note data).
+    dropped_incomplete_groups: u64,
 }
 
 /// Per-project verdict of one provenance pass. A descriptor the server's
@@ -1631,6 +1634,15 @@ async fn publish_project_provenance(
     }
     let (project_id, notes_ref) = resolved_export.context("provenance export did not converge")?;
     let captured = capture_provenance_import(&root, &project.scope, &project_id, &notes_ref)?;
+    if captured.dropped_incomplete_groups > 0 {
+        tracing::warn!(
+            root = %root.display(),
+            notes_tip = %captured.descriptor.notes_tip,
+            dropped_incomplete_groups = captured.dropped_incomplete_groups,
+            documents = captured.descriptor.document_count,
+            "provenance capture skipped incomplete fragmented note document groups"
+        );
+    }
     if lane_state.open_upload_conflicts(&root, &captured.descriptor) {
         // The notes tip advanced since an earlier pass failed mid-upload: the
         // remembered upload was begun against a superseded descriptor, can
@@ -1858,6 +1870,7 @@ fn capture_provenance_import(
     let documents = tempfile::tempdir()?;
     let mut entries = Vec::new();
     let mut logical_bytes = 0_u64;
+    let mut dropped_incomplete_groups = 0_u64;
     let notes_tip = repository
         .visit_notes_generation_bounded(
             notes_ref,
@@ -1873,6 +1886,7 @@ fn capture_provenance_import(
                     documents.path(),
                     &mut entries,
                     &mut logical_bytes,
+                    &mut dropped_incomplete_groups,
                 )?;
                 Ok(())
             },
@@ -1897,6 +1911,7 @@ fn capture_provenance_import(
         descriptor,
         entries,
         documents,
+        dropped_incomplete_groups,
     })
 }
 
@@ -1940,8 +1955,11 @@ fn provenance_document_belongs_to_project(document: &str, project_id: &str) -> R
 /// Append one note blob's import documents for `project_id`. Fragmented V2
 /// documents are decided per logical document, not per part: the server-side
 /// verifier can only reassemble complete part groups, so a document whose
-/// parts disagree on ownership is kept whole. Manifest ordinals are assigned
-/// after filtering so they stay contiguous per note commit, matching
+/// parts disagree on ownership is kept whole, and an owned group whose
+/// present parts are not exactly 0..part_count (or whose parts disagree on
+/// part_count) is damaged local note data and is dropped whole rather than
+/// uploaded as a partial group. Manifest ordinals are assigned after
+/// filtering so they stay contiguous per note commit, matching
 /// `validate_provenance_manifest`.
 fn append_owned_note_documents(
     body: &str,
@@ -1950,10 +1968,13 @@ fn append_owned_note_documents(
     documents: &Path,
     entries: &mut Vec<ProvenanceImportManifestEntryV1>,
     logical_bytes: &mut u64,
+    dropped_incomplete_groups: &mut u64,
 ) -> Result<()> {
     let split = bbox_provenance::split_note_documents(body);
     let mut group_document_ids = Vec::new();
     let mut group_keeps = Vec::new();
+    let mut group_part_counts: Vec<BTreeSet<u32>> = Vec::new();
+    let mut group_part_indices: Vec<BTreeSet<u32>> = Vec::new();
     for document in &split {
         let Ok(parsed) = bbox_provenance::parse_note_document(document) else {
             continue;
@@ -1969,12 +1990,54 @@ fn append_owned_note_documents(
             .iter()
             .position(|document_id| document_id == &part.document_id)
         {
-            Some(index) => group_keeps[index] = group_keeps[index] || owned,
+            Some(index) => {
+                group_keeps[index] = group_keeps[index] || owned;
+                group_part_counts[index].insert(part.part_count);
+                group_part_indices[index].insert(part.part_index);
+            }
             None => {
                 group_document_ids.push(part.document_id.clone());
                 group_keeps.push(owned);
+                group_part_counts.push(BTreeSet::from([part.part_count]));
+                group_part_indices.push(BTreeSet::from([part.part_index]));
             }
         }
+    }
+    for (index, document_id) in group_document_ids.iter().enumerate() {
+        // A group the project does not own was already filtered by ownership;
+        // only an owned group can be newly dropped for damage here.
+        if !group_keeps[index] {
+            continue;
+        }
+        let declared_counts = &group_part_counts[index];
+        let present_indices = &group_part_indices[index];
+        let complete = match declared_counts.iter().copied().next() {
+            Some(part_count) if declared_counts.len() == 1 => {
+                present_indices.len() as u32 == part_count
+                    && present_indices.iter().copied().eq(0..part_count)
+            }
+            _ => false,
+        };
+        if complete {
+            continue;
+        }
+        let present_part_indices = present_indices.iter().copied().collect::<Vec<_>>();
+        let expected_part_count = declared_counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        tracing::warn!(
+            note_commit = %note_commit,
+            document_id = %document_id,
+            present_part_indices = ?present_part_indices,
+            expected_part_count = %expected_part_count,
+            "dropping an incomplete fragmented provenance document at capture; its note is damaged"
+        );
+        *dropped_incomplete_groups = dropped_incomplete_groups
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("dropped incomplete provenance group count overflow"))?;
+        group_keeps[index] = false;
     }
     let mut ordinal = 0_u32;
     for document in split {
@@ -4241,6 +4304,7 @@ mod tests {
             descriptor,
             entries,
             documents: directory,
+            dropped_incomplete_groups: 0,
         }
     }
 
@@ -5003,6 +5067,115 @@ mod tests {
         bbox_git_source::validate_provenance_manifest(
             &captured.descriptor,
             &captured.entries,
+            bbox_git_source::GitSourceLimits::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn provenance_capture_drops_incomplete_part_groups_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.name", "Provenance Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "provenance@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-incomplete\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "fixture"]);
+        let head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let scope = PublishedScope::try_new("repo-incomplete", ".").unwrap();
+        let notes_ref = "refs/notes/bb/provenance";
+
+        let document = |letter: &str, part_index: u32, part_count: u32| {
+            serde_json::json!({
+                "schema_version": 2,
+                "commit": head,
+                "part": {
+                    "document_id": format!("{letter}").repeat(64),
+                    "part_index": part_index,
+                    "part_count": part_count
+                },
+                "produced_by": {},
+                "tool_calls": [{
+                    "tool": "Read",
+                    "source_ref": "transcript:test:session:1:0",
+                    "target_ref": format!(
+                        "project_file_v2:project-a:snapshot:path:{}:0",
+                        "1".repeat(64)
+                    ),
+                    "file": "src/lib.rs"
+                }],
+                "knowledge_writes": []
+            })
+            .to_string()
+        };
+        // A damaged note: one complete 2-part group interleaved with a group
+        // that lost parts 1..=3 and a group whose two parts disagree on
+        // part_count. Both bad groups must vanish whole, never upload a
+        // partial group, and the surviving manifest must verify end to end.
+        bbox_corpus_core::git::ensure_notes_merge_strategy_union(&root).unwrap();
+        for raw in [
+            document("a", 0, 2),
+            document("b", 0, 4),
+            document("c", 0, 2),
+            document("a", 1, 2),
+            document("c", 1, 3),
+        ] {
+            bbox_corpus_core::git::write_note(&root, notes_ref, &head, &format!("{raw}\n"))
+                .unwrap();
+        }
+
+        let captured = capture_provenance_import(&root, &scope, "project-a", notes_ref).unwrap();
+        assert_eq!(
+            captured.entries.len(),
+            2,
+            "only the complete group survives"
+        );
+        assert_eq!(captured.dropped_incomplete_groups, 2);
+        let expected = [document("a", 0, 2), document("a", 1, 2)];
+        for (ordinal, (entry, expected)) in captured.entries.iter().zip(expected).enumerate() {
+            assert_eq!(
+                entry.document_sha256,
+                bbox_provenance::document_sha256(&expected),
+                "kept document {ordinal}"
+            );
+            assert_eq!(entry.document_ordinal, ordinal as u32);
+        }
+        assert_eq!(captured.descriptor.document_count, 2);
+        assert_eq!(
+            captured.descriptor.logical_bytes,
+            captured
+                .entries
+                .iter()
+                .map(|entry| entry.encoded_bytes)
+                .sum::<u64>()
+        );
+        bbox_git_source::validate_provenance_manifest(
+            &captured.descriptor,
+            &captured.entries,
+            bbox_git_source::GitSourceLimits::default(),
+        )
+        .unwrap();
+        let kept_documents = captured
+            .entries
+            .iter()
+            .map(|entry| {
+                fs::read_to_string(captured.documents.path().join(&entry.document_sha256)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        bbox_git_source::validate_provenance_documents(
+            &captured.descriptor,
+            &captured.entries,
+            &kept_documents,
             bbox_git_source::GitSourceLimits::default(),
         )
         .unwrap();
