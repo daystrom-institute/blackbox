@@ -1204,6 +1204,163 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> anyhow::Result<EdgeSid
     capture_edge_rebuild_authority(edges_dir, None).map(|authority| authority.signature)
 }
 
+/// Watcher state carried across iterations: the sidecar directory under
+/// observation, the last observed corpus doc count, and the last published
+/// sidecar signature (what a rebuild's inputs are compared against).
+struct EdgeWatcherInputs {
+    edges_dir: std::path::PathBuf,
+    last_seen: u64,
+    last_signature: Option<EdgeSidecarSignature>,
+}
+
+impl EdgeWatcherInputs {
+    fn capture(state: &SharedState) -> Self {
+        let last_seen = state.idx.read().num_docs();
+        let edges_dir = edge_sidecar_dir(state);
+        let last_signature = capture_edge_rebuild_authority(
+            &edges_dir,
+            Some(&state.corpus_registered_project_ids()),
+        )
+        .ok()
+        .map(|authority| authority.signature);
+        Self {
+            edges_dir,
+            last_seen,
+            last_signature,
+        }
+    }
+}
+
+/// One watcher iteration after a wake (nudge or interval tick). Decides
+/// whether the published graph must be rebuilt, rebuilds it, or refreshes
+/// only the pinned searcher. `pending_nudge` is consumed only once the
+/// iteration is committed to run; failure paths may re-arm it so the next
+/// wake is immediate instead of interval-length.
+fn edge_watcher_tick(
+    state: &SharedState,
+    inputs: &mut EdgeWatcherInputs,
+    pending_nudge: &mut bool,
+    interval: std::time::Duration,
+) {
+    let Some(publication_guard) = state.index_writer.try_begin_edge_index_rebuild() else {
+        tracing::debug!(
+            pending_nudge,
+            "edge-index watcher deferred while a reindex publication is active"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        return;
+    };
+    let nudged = std::mem::take(pending_nudge);
+    let current = state.idx.read().num_docs();
+    let registered_project_ids = state.corpus_registered_project_ids();
+    let signature =
+        match capture_edge_rebuild_authority(&inputs.edges_dir, Some(&registered_project_ids)) {
+            Ok(authority) => authority.signature,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    nudged,
+                    "edge-index watcher authority capture failed; keeping the last published graph"
+                );
+                if !state
+                    .edge_index_ready
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    *pending_nudge = true;
+                    drop(publication_guard);
+                    std::thread::sleep(interval);
+                }
+                inputs.last_seen = current;
+                return;
+            }
+        };
+    let sidecars_changed = Some(signature) != inputs.last_signature;
+    let published_edge_count = state.code_read_view.read().edge_index.edge_count();
+    if should_rebuild_edge_index(
+        nudged,
+        sidecars_changed,
+        published_edge_count,
+        edge_index_nudge_max_current_edges(),
+    ) {
+        let started = std::time::Instant::now();
+        tracing::info!(
+            current_docs = current,
+            sidecar_files = signature.files,
+            sidecar_bytes = signature.bytes,
+            nudged,
+            sidecars_changed,
+            "edge-index watcher rebuild started"
+        );
+        match rebuild_edge_index_from_shared(&state, false) {
+            Ok(()) => {
+                tracing::info!(
+                    prev_docs = inputs.last_seen,
+                    new_docs = current,
+                    sidecar_files = signature.files,
+                    sidecar_bytes = signature.bytes,
+                    nudged,
+                    sidecars_changed,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
+                );
+                inputs.last_signature = capture_edge_rebuild_authority(
+                    &inputs.edges_dir,
+                    Some(&state.corpus_registered_project_ids()),
+                )
+                .ok()
+                .map(|authority| authority.signature)
+                .or(Some(signature));
+                let _ = state
+                    .code_sources
+                    .store()
+                    .clear_health_failure("_edge_index", "store_refresh_deferred");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    nudged,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "edge-index watcher rebuild failed; retaining prior signature for retry"
+                );
+                if !state
+                    .edge_index_ready
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    *pending_nudge = true;
+                    drop(publication_guard);
+                    std::thread::sleep(interval);
+                }
+            }
+        }
+    } else if nudged {
+        let detail = format!(
+            "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
+            edge_index_nudge_max_current_edges()
+        );
+        let _ = state.code_sources.store().record_health_failure(
+            "_edge_index",
+            "store_refresh_deferred",
+            &detail,
+        );
+        tracing::warn!(
+            published_edge_count,
+            limit = edge_index_nudge_max_current_edges(),
+            "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
+        );
+    } else if current != inputs.last_seen {
+        let searcher = { state.idx.read().searcher() };
+        state.publish_code_read_searcher(searcher);
+        tracing::debug!(
+            prev_docs = inputs.last_seen,
+            new_docs = current,
+            sidecar_files = signature.files,
+            sidecar_bytes = signature.bytes,
+            "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
+        );
+    }
+    inputs.last_seen = current;
+}
+
 /// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
 /// The auto-reindex thread writes new docs + edge sidecars every interval,
 /// but it can't trigger a rebuild itself (it spawns before SharedState exists).
@@ -1229,154 +1386,23 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             if !pending_nudge {
                 std::thread::sleep(std::time::Duration::from_secs(20));
             }
-            let mut last_seen: u64 = state.idx.read().num_docs();
-            let edges_dir = edge_sidecar_dir(&state);
-            let mut last_signature = capture_edge_rebuild_authority(
-                &edges_dir,
-                Some(&state.corpus_registered_project_ids()),
-            )
-            .ok()
-            .map(|authority| authority.signature);
+            let mut inputs = EdgeWatcherInputs::capture(&state);
             loop {
                 if !pending_nudge {
                     pending_nudge = match &nudge_rx {
-                    Some(rx) => match rx.recv_timeout(interval) {
-                        Ok(()) => true,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-                        // All senders dropped — SharedState is gone; exit.
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                    },
-                    None => {
-                        std::thread::sleep(interval);
-                        false
-                    }
+                        Some(rx) => match rx.recv_timeout(interval) {
+                            Ok(()) => true,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                            // All senders dropped — SharedState is gone; exit.
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        },
+                        None => {
+                            std::thread::sleep(interval);
+                            false
+                        }
                     };
                 }
-                let Some(publication_guard) =
-                    state.index_writer.try_begin_edge_index_rebuild()
-                else {
-                    tracing::debug!(
-                        pending_nudge,
-                        "edge-index watcher deferred while a reindex publication is active"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                };
-                let nudged = std::mem::take(&mut pending_nudge);
-                let current = state.idx.read().num_docs();
-                let registered_project_ids = state.corpus_registered_project_ids();
-                let signature = match capture_edge_rebuild_authority(
-                    &edges_dir,
-                    Some(&registered_project_ids),
-                ) {
-                    Ok(authority) => authority.signature,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            nudged,
-                            "edge-index watcher authority capture failed; keeping the last published graph"
-                        );
-                        if !state
-                            .edge_index_ready
-                            .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            pending_nudge = true;
-                            drop(publication_guard);
-                            std::thread::sleep(interval);
-                        }
-                        last_seen = current;
-                        continue;
-                    }
-                };
-                let sidecars_changed = Some(signature) != last_signature;
-                let published_edge_count = state
-                    .code_read_view
-                    .read()
-                    .edge_index
-                    .edge_count();
-                if should_rebuild_edge_index(
-                    nudged,
-                    sidecars_changed,
-                    published_edge_count,
-                    edge_index_nudge_max_current_edges(),
-                ) {
-                    let started = std::time::Instant::now();
-                    tracing::info!(
-                        current_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        nudged,
-                        sidecars_changed,
-                        "edge-index watcher rebuild started"
-                    );
-                    match rebuild_edge_index_from_shared(&state, false) {
-                        Ok(()) => {
-                            tracing::info!(
-                                prev_docs = last_seen,
-                                new_docs = current,
-                                sidecar_files = signature.files,
-                                sidecar_bytes = signature.bytes,
-                                nudged,
-                                sidecars_changed,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
-                            );
-                            last_signature = capture_edge_rebuild_authority(
-                                &edges_dir,
-                                Some(&state.corpus_registered_project_ids()),
-                            )
-                            .ok()
-                            .map(|authority| authority.signature)
-                            .or(Some(signature));
-                            let _ = state.code_sources.store().clear_health_failure(
-                                "_edge_index",
-                                "store_refresh_deferred",
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                nudged,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher rebuild failed; retaining prior signature for retry"
-                            );
-                            if !state
-                                .edge_index_ready
-                                .load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                pending_nudge = true;
-                                drop(publication_guard);
-                                std::thread::sleep(interval);
-                            }
-                        }
-                    }
-                } else if nudged {
-                    let detail = format!(
-                        "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
-                        edge_index_nudge_max_current_edges()
-                    );
-                    let _ = state.code_sources.store().record_health_failure(
-                        "_edge_index",
-                        "store_refresh_deferred",
-                        &detail,
-                    );
-                    tracing::warn!(
-                        published_edge_count,
-                        limit = edge_index_nudge_max_current_edges(),
-                        "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
-                    );
-                } else if current != last_seen {
-                    let searcher = { state.idx.read().searcher() };
-                    state.publish_code_read_searcher(searcher);
-                    tracing::debug!(
-                        prev_docs = last_seen,
-                        new_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
-                    );
-                }
-                last_seen = current;
+                edge_watcher_tick(&state, &mut inputs, &mut pending_nudge, interval);
             }
         })
         .expect("failed to spawn edge index rebuild watcher");
