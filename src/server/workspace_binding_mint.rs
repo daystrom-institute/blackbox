@@ -17,9 +17,10 @@
 //! on the daemon's admin plane and is deliberately absent from the MCP tool
 //! catalog, matching the onboarding non-goal in
 //! `design/daemon-runtime/remote-project-onboarding.md` (no agent self-service
-//! registration, no MCP-triggered checkout authority). Its auth posture is the
-//! same as every other `/admin/*` route: the daemon's loopback bind is the
-//! trust boundary, so exposing the listener beyond loopback exposes this mint.
+//! registration, no MCP-triggered checkout authority). Its auth posture is
+//! the same as every other `/admin/*` route: a loopback peer or the daemon
+//! service bearer (`super::admin_auth`), so exposing the listener beyond
+//! loopback does not by itself expose this mint.
 //!
 //! # What the daemon can and cannot verify about the presented checkout
 //!
@@ -427,12 +428,18 @@ mod tests {
         state: &Arc<SharedState>,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        // The mint sits behind the admin gate (`super::admin_auth`): a
+        // loopback `ConnectInfo` extension mirrors the real serving path.
         let response = app_for(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/workspace-binding/mint")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    )))
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -877,7 +884,16 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let serving = tokio::spawn({
             let app = app_for(&state);
-            async move { axum::serve(listener, app).await.unwrap() }
+            // Mirrors the daemon's serving path so the admin gate can see the
+            // loopback peer address (`super::admin_auth`).
+            async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap()
+            }
         });
 
         LiveCapture {

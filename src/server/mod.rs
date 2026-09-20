@@ -1,3 +1,4 @@
+pub(crate) mod admin_auth;
 mod background;
 pub(crate) mod blame_authority;
 mod bridge_parity;
