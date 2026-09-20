@@ -8,6 +8,19 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The code collector skips incomplete fragmented provenance note documents at
+  capture. A V2 part group whose present parts are not exactly
+  `0..part_count`, or whose parts disagree on `part_count`, is damaged local
+  note data; the group is dropped whole (never uploaded as a partial group)
+  with one WARN per dropped group naming the note commit, document id,
+  present part indices, and expected part count, plus a per-pass
+  `dropped_incomplete_groups` tally. One damaged note no longer terminally
+  fails the whole project's provenance import at finalize.
+- The server-side provenance verifier's rejection for an incomplete part
+  group now names the group. The failed upload's stored diagnostic and the
+  finalize 422 body carry the note commit, document id, present part indices,
+  and expected part count, while the stable `invalid_git_source_input` error
+  code is unchanged so producers keep treating the rejection as terminal.
 - The code collector's provenance import no longer wedges on a deterministic
   server-side verifier rejection. Begin now reports the persisted upload state
   (`state`, `next_page`, `diagnostic` on the begin response; a terminal

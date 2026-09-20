@@ -158,6 +158,15 @@ page one; already-written documents are counted as unchanged. Import status is
 polled to `active`/`superseded`, while invalid typed targets are quarantined
 with a durable diagnostic.
 
+Incomplete fragmented note documents are skipped at capture. A V2 part group
+whose present parts are not exactly `0..part_count`, or whose parts disagree on
+`part_count`, is damaged local note data (a rewrite or merge that lost
+fragments); the collector drops the group whole rather than uploading a
+partial group, logs one WARN naming the note commit, document id, present part
+indices, and expected part count, and reports the per-pass
+`dropped_incomplete_groups` tally. The rest of the project's documents import
+normally instead of failing finalize for the whole descriptor.
+
 `published_knowledge` is also independently opt-in. It names one full
 `refs/heads/*` branch ref. The collector pins that ref, reads both committed
 `.bbox/knowledge` and `.bbox/gaps` through the stable no-follow Git authority,
