@@ -1,0 +1,23 @@
+{
+  "id": "gap-5cd017cc",
+  "title": "Agent-provenance edges in explicit/agents.jsonl trigger edge rebuilds but are never loaded into the published manifest-mode graph",
+  "gap_kind": "ontology",
+  "domain": "edge-index",
+  "wanted_capability": "The explicit/agents.jsonl sidecar lane should be either a full participant of the published graph (loaded by the manifest-mode explicit/observed union with the same registration exemption the signature fold grants the \"agents\" stem) or excluded from the rebuild signature entirely. Today routes.rs's signature fold admits the \"agents\" stem on every lane, so persist_agent_provenance_edges appends and nudges trigger rebuilds, but EdgeIndex::load_legacy_explicit_edges filters through sidecar_project_id_is_registered, which has no agents special-case (only the path-based sidecar_project_is_registered does), so the published graph may never contain those edges.",
+  "missing_primitive": "a single registration/admission predicate shared by the rebuild signature fold and the manifest-mode explicit-lane loader",
+  "evidence": [
+    "src/server/routes.rs edge sidecar signature fold admits the agents stem",
+    "crates/bbox-edge-index EdgeIndex::load_legacy_explicit_edges filters via sidecar_project_id_is_registered",
+    "persist_agent_provenance_edges appends to explicit/agents.jsonl and nudges",
+    "note-8af005bb",
+    "thread-f51d2132"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "ontology/edge-index/agents-explicit-lane-input-not-loaded",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-f51d2132",
+  "created_at": "2026-09-20T04:13:53Z",
+  "updated_at": "2026-09-20T04:13:53Z"
+}
