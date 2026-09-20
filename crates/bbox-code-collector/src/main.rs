@@ -554,11 +554,12 @@ fn apply_checkout_mutation(
 async fn run_onboard_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
+    let mut error_gate = LaneErrorGate::default();
     loop {
-        match onboard_projects(runtime, config).await {
+        match onboard_projects(runtime, config, &mut error_gate).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "catalog onboarding failed");
+                log_gated_lane_error(&mut error_gate, "onboard", &error);
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
@@ -566,11 +567,16 @@ async fn run_onboard_lane(runtime: &Runtime, config: &CollectorConfig) {
     }
 }
 
-async fn onboard_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+async fn onboard_projects(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
+) -> Result<()> {
     let mut failures = Vec::new();
     for project in &config.projects {
         match onboard_project(runtime, project).await {
             Ok(receipt) => {
+                error_gate.note_project_success("onboard", &project.root);
                 if receipt.created_project {
                     tracing::info!(
                         project_id = %receipt.project_id,
@@ -586,12 +592,9 @@ async fn onboard_projects(runtime: &Runtime, config: &CollectorConfig) -> Result
                 }
             }
             Err(error) => {
-                tracing::error!(
-                    root = %project.root.display(),
-                    error = %error,
-                    "catalog onboarding failed for project"
-                );
-                failures.push(format!("{}: {error:#}", project.root.display()));
+                let message = format!("{error:#}");
+                log_gated_error(error_gate, "onboard", &project.root, &message);
+                failures.push(format!("{}: {message}", project.root.display()));
             }
         }
     }
@@ -715,11 +718,12 @@ fn probe_onboard_request(
 async fn run_published_knowledge_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
+    let mut error_gate = LaneErrorGate::default();
     loop {
-        match publish_knowledge_projects(runtime, config).await {
+        match publish_knowledge_projects(runtime, config, &mut error_gate).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "published knowledge synchronization failed");
+                log_gated_lane_error(&mut error_gate, "published-knowledge", &error);
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
@@ -731,11 +735,12 @@ async fn run_provenance_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
     let mut lane_state = ProvenanceLaneState::default();
+    let mut error_gate = LaneErrorGate::default();
     loop {
-        match publish_provenance_projects(runtime, config, &mut lane_state).await {
+        match publish_provenance_projects(runtime, config, &mut lane_state, &mut error_gate).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "provenance synchronization failed");
+                log_gated_lane_error(&mut error_gate, "provenance", &error);
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
@@ -746,11 +751,12 @@ async fn run_provenance_lane(runtime: &Runtime, config: &CollectorConfig) {
 async fn run_code_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
+    let mut error_gate = LaneErrorGate::default();
     loop {
-        match publish_code_projects(runtime, config).await {
+        match publish_code_projects(runtime, config, &mut error_gate).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "code-source publication failed");
+                log_gated_lane_error(&mut error_gate, "code-source", &error);
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
@@ -761,16 +767,137 @@ async fn run_code_lane(runtime: &Runtime, config: &CollectorConfig) {
 async fn run_history_lane(runtime: &Runtime, config: &CollectorConfig) {
     let interval = Duration::from_secs(config.interval_secs.max(1));
     let mut backoff = interval;
+    let mut error_gate = LaneErrorGate::default();
     loop {
-        match publish_history_repositories(runtime, config).await {
+        match publish_history_repositories(runtime, config, &mut error_gate).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "Git-history publication failed");
+                log_gated_lane_error(&mut error_gate, "git-history", &error);
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
         tokio::time::sleep(jittered(backoff)).await;
     }
+}
+
+/// How one repeated per-project error should be logged this pass. The first
+/// occurrence of a message (and any later change of message) logs at ERROR;
+/// identical repeats log at debug, with one WARN roll-up every
+/// `ERROR_ROLLUP_PASSES` passes so a persistently failing project stays
+/// visible without re-logging its full error every cycle.
+const ERROR_ROLLUP_PASSES: u32 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatedErrorDecision {
+    FirstOccurrence,
+    Repeat { consecutive: u32 },
+    Rollup { consecutive: u32 },
+}
+
+#[derive(Debug)]
+struct GatedProjectError {
+    message: String,
+    consecutive: u32,
+}
+
+/// Change-gated error logging shared by the continuous lanes. State lives for
+/// the lifetime of the lane loop, so a stable failure (for example a
+/// configured root that no longer exists) is loud once and quiet afterwards,
+/// and the per-pass failure tally only WARNs when the failure set changed.
+#[derive(Debug, Default)]
+struct LaneErrorGate {
+    projects: HashMap<(String, String), GatedProjectError>,
+    lane_tallies: HashMap<String, Vec<String>>,
+}
+
+impl LaneErrorGate {
+    fn classify_project_error(
+        &mut self,
+        lane: &str,
+        root: &Path,
+        message: &str,
+    ) -> GatedErrorDecision {
+        let key = (lane.to_string(), root.display().to_string());
+        let Some(state) = self.projects.get_mut(&key) else {
+            self.projects.insert(
+                key,
+                GatedProjectError {
+                    message: message.to_string(),
+                    consecutive: 1,
+                },
+            );
+            return GatedErrorDecision::FirstOccurrence;
+        };
+        if state.message != message {
+            *state = GatedProjectError {
+                message: message.to_string(),
+                consecutive: 1,
+            };
+            return GatedErrorDecision::FirstOccurrence;
+        }
+        state.consecutive += 1;
+        if state.consecutive % ERROR_ROLLUP_PASSES == 0 {
+            GatedErrorDecision::Rollup {
+                consecutive: state.consecutive,
+            }
+        } else {
+            GatedErrorDecision::Repeat {
+                consecutive: state.consecutive,
+            }
+        }
+    }
+
+    fn note_project_success(&mut self, lane: &str, root: &Path) {
+        self.projects
+            .remove(&(lane.to_string(), root.display().to_string()));
+    }
+
+    /// Whether the per-pass failure tally changed since the previous pass.
+    fn tally_changed(&mut self, lane: &str, failures: &[String]) -> bool {
+        match self.lane_tallies.get_mut(lane) {
+            Some(previous) if previous.as_slice() == failures => false,
+            Some(previous) => {
+                *previous = failures.to_vec();
+                true
+            }
+            None => {
+                self.lane_tallies
+                    .insert(lane.to_string(), failures.to_vec());
+                true
+            }
+        }
+    }
+}
+
+fn log_gated_error(gate: &mut LaneErrorGate, lane: &str, root: &Path, message: &str) {
+    match gate.classify_project_error(lane, root, message) {
+        GatedErrorDecision::FirstOccurrence => tracing::error!(
+            lane,
+            root = %root.display(),
+            error = %message,
+            "lane pass failed for project; continuing with the rest"
+        ),
+        GatedErrorDecision::Repeat { consecutive } => tracing::debug!(
+            lane,
+            root = %root.display(),
+            consecutive,
+            error = %message,
+            "project failure repeats unchanged; suppressed until it changes or rolls up"
+        ),
+        GatedErrorDecision::Rollup { consecutive } => tracing::warn!(
+            lane,
+            root = %root.display(),
+            consecutive,
+            error = %message,
+            "project is still failing on this lane"
+        ),
+    }
+}
+
+/// Gate a whole-lane error (every project failed) the same way, keyed by the
+/// lane name alone.
+fn log_gated_lane_error(gate: &mut LaneErrorGate, lane: &str, error: &anyhow::Error) {
+    log_gated_error(gate, lane, Path::new(""), &format!("{error:#}"));
 }
 
 /// Per-project outcome of one lane pass. Lanes iterate every configured
@@ -787,17 +914,16 @@ struct LanePassOutcome {
 }
 
 impl LanePassOutcome {
-    fn record(&mut self, lane: &str, root: &Path, result: Result<()>) {
+    fn record(&mut self, lane: &str, root: &Path, result: Result<()>, gate: &mut LaneErrorGate) {
         match result {
-            Ok(()) => self.succeeded += 1,
+            Ok(()) => {
+                gate.note_project_success(lane, root);
+                self.succeeded += 1;
+            }
             Err(error) => {
-                tracing::error!(
-                    lane,
-                    root = %root.display(),
-                    error = %format!("{error:#}"),
-                    "lane pass failed for project; continuing with the rest"
-                );
-                self.failures.push(format!("{}: {error:#}", root.display()));
+                let message = format!("{error:#}");
+                log_gated_error(gate, lane, root, &message);
+                self.failures.push(format!("{}: {message}", root.display()));
             }
         }
     }
@@ -815,20 +941,33 @@ impl LanePassOutcome {
     }
 
     /// Continuous-lane verdict. A pass where at least one project published
-    /// keeps the lane on its normal cadence (the failures were already
-    /// reported per project); only a pass where every attempted project
-    /// failed is a lane error, which drives the backoff.
-    fn into_lane_result(self, lane: &str) -> Result<()> {
+    /// (or was deliberately skipped) keeps the lane on its normal cadence (the
+    /// failures were already reported per project); only a pass where every
+    /// attempted project failed is a lane error, which drives the backoff.
+    /// The per-pass tally WARNs only when the failure set changed since the
+    /// previous pass.
+    fn into_lane_result(self, lane: &str, gate: &mut LaneErrorGate) -> Result<()> {
         if self.failures.is_empty() {
             return Ok(());
         }
-        if self.succeeded > 0 {
-            tracing::warn!(
-                lane,
-                succeeded = self.succeeded,
-                failed = self.failures.len(),
-                "lane pass completed with per-project failures"
-            );
+        if self.succeeded > 0 || self.skipped_terminal > 0 {
+            if gate.tally_changed(lane, &self.failures) {
+                tracing::warn!(
+                    lane,
+                    succeeded = self.succeeded,
+                    skipped_terminal = self.skipped_terminal,
+                    failed = self.failures.len(),
+                    "lane pass completed with per-project failures"
+                );
+            } else {
+                tracing::debug!(
+                    lane,
+                    succeeded = self.succeeded,
+                    skipped_terminal = self.skipped_terminal,
+                    failed = self.failures.len(),
+                    "lane pass completed with the same per-project failures as the previous pass"
+                );
+            }
             return Ok(());
         }
         bail!(
@@ -855,21 +994,27 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     if config.status_timeout_secs == 0 {
         bail!("collector status_timeout_secs must be greater than zero");
     }
-    let code = publish_code_projects_pass(runtime, config)
+    let mut error_gate = LaneErrorGate::default();
+    let code = publish_code_projects_pass(runtime, config, &mut error_gate)
         .await
         .into_strict_result();
-    let history = publish_history_repositories_pass(runtime, config)
+    let history = publish_history_repositories_pass(runtime, config, &mut error_gate)
         .await
         .into_strict_result();
     let mut provenance_lane_state = ProvenanceLaneState::default();
-    let provenance = publish_provenance_projects_pass(runtime, config, &mut provenance_lane_state)
-        .await
-        .into_strict_result();
+    let provenance = publish_provenance_projects_pass(
+        runtime,
+        config,
+        &mut provenance_lane_state,
+        &mut error_gate,
+    )
+    .await
+    .into_strict_result();
     let mutations = apply_checkout_mutations(runtime, config).await;
-    let published_knowledge = publish_knowledge_projects_pass(runtime, config)
+    let published_knowledge = publish_knowledge_projects_pass(runtime, config, &mut error_gate)
         .await
         .into_strict_result();
-    let onboard = onboard_projects(runtime, config).await;
+    let onboard = onboard_projects(runtime, config, &mut error_gate).await;
     let mut failures = Vec::new();
     if let Err(error) = code {
         failures.push(format!("code-source lane failed: {error:#}"));
@@ -896,15 +1041,20 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     }
 }
 
-async fn publish_knowledge_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
-    publish_knowledge_projects_pass(runtime, config)
+async fn publish_knowledge_projects(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
+) -> Result<()> {
+    publish_knowledge_projects_pass(runtime, config, error_gate)
         .await
-        .into_lane_result("published-knowledge")
+        .into_lane_result("published-knowledge", error_gate)
 }
 
 async fn publish_knowledge_projects_pass(
     runtime: &Runtime,
     config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
 ) -> LanePassOutcome {
     let mut outcome = LanePassOutcome::default();
     for project in config
@@ -922,7 +1072,7 @@ async fn publish_knowledge_projects_pass(
             .await
         }
         .await;
-        outcome.record("published-knowledge", &project.root, result);
+        outcome.record("published-knowledge", &project.root, result, error_gate);
     }
     outcome
 }
@@ -1192,7 +1342,7 @@ async fn publish_publication_candidate(
     )
     .await?;
     if let Some(current) = probe.current {
-        tracing::info!(
+        tracing::debug!(
             source_generation = %current.source_generation_id,
             knowledge_files = current.knowledge_files,
             gap_files = current.gap_files,
@@ -1352,16 +1502,18 @@ async fn publish_provenance_projects(
     runtime: &Runtime,
     config: &CollectorConfig,
     lane_state: &mut ProvenanceLaneState,
+    error_gate: &mut LaneErrorGate,
 ) -> Result<()> {
-    publish_provenance_projects_pass(runtime, config, lane_state)
+    publish_provenance_projects_pass(runtime, config, lane_state, error_gate)
         .await
-        .into_lane_result("provenance")
+        .into_lane_result("provenance", error_gate)
 }
 
 async fn publish_provenance_projects_pass(
     runtime: &Runtime,
     config: &CollectorConfig,
     lane_state: &mut ProvenanceLaneState,
+    error_gate: &mut LaneErrorGate,
 ) -> LanePassOutcome {
     let mut outcome = LanePassOutcome::default();
     for project in config.projects.iter().filter(|project| project.provenance) {
@@ -1374,13 +1526,13 @@ async fn publish_provenance_projects_pass(
         .await;
         match result {
             Ok(ProvenancePass::Imported) => {
-                outcome.record("provenance", &project.root, Ok(()));
+                outcome.record("provenance", &project.root, Ok(()), error_gate);
             }
             Ok(ProvenancePass::SkippedTerminal) => {
                 outcome.record_skipped("provenance", &project.root);
             }
             Err(error) => {
-                outcome.record("provenance", &project.root, Err(error));
+                outcome.record("provenance", &project.root, Err(error), error_gate);
             }
         }
     }
@@ -1595,13 +1747,23 @@ async fn publish_project_provenance_attempt(
             .json(&receipt),
     )
     .await?;
-    tracing::info!(
-        generation = %receipt.generation,
-        documents = receipt.document_count,
-        written = receipt.written,
-        unchanged = receipt.unchanged,
-        "provenance export reached durable terminal success"
-    );
+    if receipt.written > 0 {
+        tracing::info!(
+            generation = %receipt.generation,
+            documents = receipt.document_count,
+            written = receipt.written,
+            unchanged = receipt.unchanged,
+            "provenance export reached durable terminal success"
+        );
+    } else {
+        tracing::debug!(
+            generation = %receipt.generation,
+            documents = receipt.document_count,
+            written = receipt.written,
+            unchanged = receipt.unchanged,
+            "provenance export is already current"
+        );
+    }
     Ok((
         project_id.context("provenance export returned no project id")?,
         receipt.notes_ref,
@@ -2074,15 +2236,20 @@ fn pack_provenance_manifest_pages(
     Ok(pages)
 }
 
-async fn publish_code_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
-    publish_code_projects_pass(runtime, config)
+async fn publish_code_projects(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
+) -> Result<()> {
+    publish_code_projects_pass(runtime, config, error_gate)
         .await
-        .into_lane_result("code-source")
+        .into_lane_result("code-source", error_gate)
 }
 
 async fn publish_code_projects_pass(
     runtime: &Runtime,
     config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
 ) -> LanePassOutcome {
     let mut outcome = LanePassOutcome::default();
     for project in &config.projects {
@@ -2096,20 +2263,25 @@ async fn publish_code_projects_pass(
             .await
         }
         .await;
-        outcome.record("code-source", &project.root, result);
+        outcome.record("code-source", &project.root, result, error_gate);
     }
     outcome
 }
 
-async fn publish_history_repositories(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
-    publish_history_repositories_pass(runtime, config)
+async fn publish_history_repositories(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
+) -> Result<()> {
+    publish_history_repositories_pass(runtime, config, error_gate)
         .await
-        .into_lane_result("git-history")
+        .into_lane_result("git-history", error_gate)
 }
 
 async fn publish_history_repositories_pass(
     runtime: &Runtime,
     config: &CollectorConfig,
+    error_gate: &mut LaneErrorGate,
 ) -> LanePassOutcome {
     let mut outcome = LanePassOutcome::default();
     let mut published_history_repositories = HashSet::new();
@@ -2134,7 +2306,7 @@ async fn publish_history_repositories_pass(
             .await
         }
         .await;
-        outcome.record("git-history", &project.root, result);
+        outcome.record("git-history", &project.root, result, error_gate);
     }
     outcome
 }
@@ -2158,7 +2330,7 @@ async fn publish_git_history(
     )
     .await?;
     if let Some(current) = probe.current {
-        tracing::info!(
+        tracing::debug!(
             source_generation = %current.source_generation_id,
             commits = current.commit_count,
             bytes = current.logical_bytes,
@@ -2290,7 +2462,7 @@ async fn publish_project(
     )
     .await?;
     if let Some(current) = probe.current {
-        tracing::info!(
+        tracing::debug!(
             generation = %current.generation_id,
             files = current.file_count,
             bytes = current.logical_bytes,
@@ -4704,39 +4876,125 @@ mod tests {
         let healthy = Path::new("/repos/healthy");
         let broken = Path::new("/repos/no-committed-bbox");
 
+        let mut error_gate = LaneErrorGate::default();
         let mut partial = LanePassOutcome::default();
-        partial.record("code-source", healthy, Ok(()));
+        partial.record("code-source", healthy, Ok(()), &mut error_gate);
         partial.record(
             "code-source",
             broken,
             Err(anyhow!(
                 "committed project config has no recorded repo authority"
             )),
+            &mut error_gate,
         );
         assert_eq!(partial.succeeded, 1);
         assert_eq!(partial.failures.len(), 1);
         assert!(partial.failures[0].starts_with("/repos/no-committed-bbox: "));
         let strict = LanePassOutcome {
             succeeded: partial.succeeded,
-            skipped_terminal: 0,
+            skipped_terminal: partial.skipped_terminal,
             failures: partial.failures.clone(),
         };
         partial
-            .into_lane_result("code-source")
+            .into_lane_result("code-source", &mut error_gate)
             .expect("a partial pass keeps the lane on cadence");
         let error = strict.into_strict_result().unwrap_err();
         assert!(error.to_string().contains("no-committed-bbox"), "{error}");
 
         let mut all_failed = LanePassOutcome::default();
-        all_failed.record("code-source", broken, Err(anyhow!("boom")));
-        let error = all_failed.into_lane_result("code-source").unwrap_err();
+        all_failed.record("code-source", broken, Err(anyhow!("boom")), &mut error_gate);
+        let error = all_failed
+            .into_lane_result("code-source", &mut error_gate)
+            .unwrap_err();
         assert!(
             error.to_string().starts_with("every project failed (1)"),
             "{error}"
         );
 
+        // A pass whose only outcome is a terminal skip is not a lane error
+        // and does not report a success either.
+        let mut skipped = LanePassOutcome::default();
+        skipped.record_skipped("provenance", broken);
+        assert_eq!(skipped.skipped_terminal, 1);
+        assert_eq!(skipped.succeeded, 0);
+        skipped
+            .into_lane_result("provenance", &mut LaneErrorGate::default())
+            .expect("a skipped-only pass keeps the lane on cadence");
+
         LanePassOutcome::default()
-            .into_lane_result("code-source")
+            .into_lane_result("code-source", &mut LaneErrorGate::default())
             .expect("an empty pass is not an error");
+    }
+
+    /// Repeated identical errors (a vanished configured root, a stable
+    /// per-project failure) log once, stay quiet, roll up periodically, and
+    /// become loud again when the message changes or the project recovers.
+    #[test]
+    fn lane_error_gate_logs_first_change_and_periodic_rollups() {
+        let stale_root = Path::new("/repos/vanished");
+        let mut gate = LaneErrorGate::default();
+        let message = "canonicalizing provenance project root /repos/vanished\n\n\
+                      Caused by:\n    No such file or directory (os error 2)";
+
+        assert_eq!(
+            gate.classify_project_error("provenance", stale_root, message),
+            GatedErrorDecision::FirstOccurrence
+        );
+        for consecutive in 2..ERROR_ROLLUP_PASSES {
+            assert_eq!(
+                gate.classify_project_error("provenance", stale_root, message),
+                GatedErrorDecision::Repeat { consecutive }
+            );
+        }
+        assert_eq!(
+            gate.classify_project_error("provenance", stale_root, message),
+            GatedErrorDecision::Rollup {
+                consecutive: ERROR_ROLLUP_PASSES
+            }
+        );
+        assert_eq!(
+            gate.classify_project_error("provenance", stale_root, message),
+            GatedErrorDecision::Repeat {
+                consecutive: ERROR_ROLLUP_PASSES + 1
+            }
+        );
+        assert_eq!(
+            gate.classify_project_error("provenance", stale_root, "a different failure"),
+            GatedErrorDecision::FirstOccurrence
+        );
+
+        // A recovered project logs at ERROR again on its next failure, and
+        // other lanes or roots are gated independently.
+        gate.note_project_success("provenance", stale_root);
+        assert_eq!(
+            gate.classify_project_error("provenance", stale_root, message),
+            GatedErrorDecision::FirstOccurrence
+        );
+        assert_eq!(
+            gate.classify_project_error("code-source", stale_root, message),
+            GatedErrorDecision::FirstOccurrence
+        );
+        assert_eq!(
+            gate.classify_project_error("provenance", Path::new("/repos/other"), message),
+            GatedErrorDecision::FirstOccurrence
+        );
+    }
+
+    #[test]
+    fn lane_error_gate_tallies_only_on_failure_set_changes() {
+        let mut gate = LaneErrorGate::default();
+        let failures = vec!["/repos/a: boom".to_string()];
+        assert!(gate.tally_changed("code-source", &failures));
+        assert!(
+            !gate.tally_changed("code-source", &failures),
+            "an identical failure set stays quiet"
+        );
+        let changed = vec!["/repos/a: boom".to_string(), "/repos/b: boom".to_string()];
+        assert!(gate.tally_changed("code-source", &changed));
+        assert!(
+            gate.tally_changed("git-history", &changed),
+            "lanes are independent"
+        );
+        assert!(!gate.tally_changed("git-history", &changed));
     }
 }
