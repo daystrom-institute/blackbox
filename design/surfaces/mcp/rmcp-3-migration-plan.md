@@ -22,9 +22,10 @@ mechanics, and per-phase validation.
   `bro-harness`).
 - To: rmcp 3.x implementing MCP 2026-07-28. The title names the 3.0
   breaking-change migration, not an upper bound on the minor version.
-  Evaluate 3.4.0 as the concrete candidate: crates.io reached 3.4.0 on
-  2026-09-15 (3.3.0 on 2026-09-10) while Codex still pins `=3.2.0`
-  (2026-09-15 source snapshot below). Relevant to this plan: 3.3.0 adds
+  Evaluate 3.4.0 as the concrete candidate: it is the latest published
+  version in the [SDK source audit](codex-0.155.1-mcp-audit.json), while
+  Codex release and upstream main still pin `=3.2.0`.
+  Relevant to this plan: 3.3.0 adds
   `ServerHandler::negotiate_initialize` (#1247, reuse the SDK's version
   negotiation from an `initialize` override) and enterprise refresh-token
   and ID-JAG OAuth exchanges (#1234); 3.4.0 adds `ServerConfig` /
@@ -201,14 +202,14 @@ into listen:
 
 ## Phase 3: subscriptions/listen
 
-External catalog consumer verified 2026-09-10: Claude Code 2.1.267 with
-`MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto` opens listen for
-advertised tools/prompts/resources list changes. An isolated wire probe
-verified tool catalog refetch on notification and after stream reopening.
-This validates a catalog-change slice independently of Phase 2; it does
-not validate task notifications. Tasks are disabled in that build, and
-Codex still does not open standard listen. See the
-[Claude audit record](claude-2.1.267-mcp-audit.json).
+Claude Code is a verified catalog consumer: its default direct HTTP path
+negotiates modern discovery and opens listen for advertised tools/prompts/
+resources list changes. The isolated matrix validates tool catalog refetch
+on notification and after stream reopening, plus explicit legacy opt-outs
+and discover fallback. Tasks remain disabled; Codex still has no standard
+listen consumer. See the [Claude audit](claude-2.1.280-mcp-audit.json) and
+[Codex audit](codex-0.155.1-mcp-audit.json). This validates a catalog-change
+slice independently of Phase 2, not task notifications.
 
 - `ServerHandler::listen` + `SubscriptionSink`; emit
   `notifications/tasks` on task transitions (thin payloads), driven off the
@@ -217,7 +218,8 @@ Codex still does not open standard listen. See the
 - `resourcesListChanged` if Phase 4 has landed.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
-- SDK gap confirmed by the spike (rmcp 3.1): `SubscriptionFilter` has no
+- SDK gap confirmed by the runtime spike (rmcp 3.1) and source inspection
+  of rmcp 3.4.0: `SubscriptionFilter` has no
   task category, `SubscriptionSink::send` rejects `notifications/tasks`,
   and the client `Subscription` rejects them too. Options: (a) custom glue
   sending task notifications on the active listen response stream, which
@@ -278,7 +280,10 @@ This plan interlocks at two points:
 ## Client-support tripwire
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
-from Claude Code, re-probe the installed binary. The probe is structural,
+from Claude Code, re-probe the installed binary. Current evidence is in the
+[Claude audit](claude-2.1.280-mcp-audit.json) and
+[Codex audit](codex-0.155.1-mcp-audit.json); the entries below are prior
+snapshots, not the current compatibility verdict. The probe is structural,
 not single-literal: it enumerates vocabulary classes rather than grepping
 one string each, because (a) a constructed/concatenated key literal would
 read as a false "still legacy" forever, (b) substring hits lie - a grep
@@ -306,7 +311,7 @@ for s in Mcp-Session-Id Last-Event-ID resources/subscribe subscriptions/listen s
 
 Verdict rules: vocabulary enumeration is a discovery aid, not an enablement
 verdict. `tasks/update` or the extension key warrants inspection, but mixed
-SDK copies may retain old methods and disabled code may contain every new
+  SDK copies may retain old methods and disabled code may contain every new
 literal. Check the app's capability builder, runtime gates and result
 consumer, then capture negotiated capabilities. In 2.1.267, bundled task
 scaffolding survives behind a false gate; only a wire audit exposes the
@@ -599,23 +604,26 @@ Probe history:
 
 ### Claude live tripwire
 
-Reproduce the recorded matrix with the checked-in tooling
-(`fixtures/claude-audit-matrix.sh`, run under bash with `CLAUDE_BIN`
-pointing at the exact binary); it drives the five cases against
-`fixtures/claude-mcp-fixture.py` and `fixtures/claude-messages-stub.py`
-and prints per-case wire timelines. For a manual repro, a modern HTTP
-session needs both implementation selectors:
+Run `fixtures/claude-audit-matrix.sh` under bash with `CLAUDE_BIN`
+pointing at the exact binary. It drives nine cases against the MCP fixture
+and deterministic Messages stub: default, SDK-only, explicit modern,
+explicit/default fallback, dropped stream, each legacy opt-out, and
+mismatched acknowledgement. It prints per-case wire timelines and checks
+capture completeness and lifecycle behavior.
+
+Direct HTTP defaults to modern discovery in the current audited client.
+Explicit selectors remain useful when testing a particular mode:
 
 ```bash
 MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude
 ```
 
-Configure a test MCP endpoint separately; this command alone creates no
-subscription. The server must negotiate 2026-07-28 and advertise catalog
-`listChanged` support. Capture `server/discover`, `subscriptions/listen`,
-its notification filter and actual list refetches. Repeat with discover
-rejected to check legacy fallback. Querying account rollout state is a
-separate exercise from the clean-environment matrix recorded here.
+Configure a separate test MCP endpoint advertising catalog `listChanged`
+support. Capture discovery, listen, notification filters and actual tool
+refetches. Keep the default case distinct from the forced-modern case;
+account rollout flags and server denylists are outside this clean-environment
+matrix. `MCP_SDK_GENERATION=v1` or `MCP_PROTOCOL_NEGOTIATION=legacy` selects
+the legacy path in the audited binary.
 
 ### Codex source tripwire
 
@@ -632,19 +640,22 @@ rg -n 'ClientLifecycleMode|CODEX_MCP_PROTOCOL_VERSION' ../codex/codex-rs/rmcp-cl
 rg -n 'io\.modelcontextprotocol/tasks|subscriptions/listen|notifications/tasks|tasks/(get|cancel|update|result|list)' ../codex/codex-rs --glob '*.rs'
 ```
 
-The final search currently finds only unrelated backend REST task-list
-routes, not MCP tasks. For the live matrix, the two loopback sinks used on
-2026-09-15 are checked in beside this doc
-(`fixtures/codex-mcp-sink-legacy.py` rejects discover and answers
-`initialize`; `fixtures/codex-mcp-sink-modern.py` answers discover,
-`tools/list`, and `tools/call`); run `codex exec --skip-git-repo-check -c
-'mcp_servers.sink.url="http://127.0.0.1:<port>/mcp"'` from a temporary cwd,
-add `-c features.mcp_2026_07_28=true` for the modern cases, and add `-s
-danger-full-access` when the prompt must reach `tools/call` in exec mode. Inspect result handling (`rmcp-client/src/tool_input.rs`),
-host extension selection (`codex-mcp/src/client_capabilities.rs`), and
-per-server mode selection (`codex-mcp/src/connection_manager.rs`) as well:
-absence of a literal is not sufficient evidence on its own. No-hit `rg`
-exit status 1 is an expected probe outcome.
+Run the live matrix with `python3 fixtures/codex-audit-matrix.py --binary
+/path/to/codex`. The runner uses the two loopback sinks and a local Responses
+stub, exercises default legacy, explicit modern with discovery rejected,
+explicit modern through tools/call, and default against a modern-capable
+server. It asserts the full modern request metadata triple, HTTP headers,
+statelessness, and tool-result consumption. The stub first performs tool
+search because MCP tools are deferred; an unsupported direct call is not a
+successful wire probe. Per-invocation configuration and ephemeral mode keep
+installed settings unchanged. Exec tool-call cases use `-s danger-full-access`.
+
+Inspect result handling (`rmcp-client/src/tool_input.rs`), host extension
+selection (`codex-mcp/src/client_capabilities.rs`), and per-server mode
+selection (`codex-mcp/src/connection_manager.rs`) too: absence of a literal
+is not sufficient evidence. No-hit `rg` exit status 1 is an expected probe
+outcome. Pin upstream source and release source separately from the binary;
+main-only metadata and auth changes are not shipped-client findings.
 
 Before changing a capability gate, repeat the HTTP wire matrix against an
 isolated dev endpoint: ordinary feature off, on with discover rejected,
@@ -656,23 +667,19 @@ fixture. Hosted Apps and modern stdio require their separate selectors.
 
 ### Flip criteria
 
-- **Core modern path (stateless lifecycle and discover)**: Claude Code
-  2.1.272 has the opt-in live matrix above (unchanged from 2.1.267); Codex
-  0.154.0 has the 2026-09-15 live matrix (stateless discover, `tools/list`,
-  `tools/call`) plus the same-day source check. The Q2 gate can flip once
-  Phase 1 lands and a live round-trip validates the intended client/endpoint.
-- **Catalog listen**: Claude Code 2.1.272 (and 2.1.267) is a verified
-  opt-in consumer for list-change subscription, tool refetch and listen
-  reopening. Codex is not.
-  This does not establish task notifications or per-resource subscriptions.
-  Validate MRTR and cache behavior separately when relying on them.
-- **Tasks extension**: flip only when an actual capability capture shows
-  `io.modelcontextprotocol/tasks` declared and the consumer handles task
-  results. The 2.1.267 and 2.1.272 matrices declare neither legacy nor
-  extension tasks, consistent with the disabled gate in both builds. The 2.1.243 bundled-key finding is
-  historical and insufficient. A legacy top-level `tasks` declaration must
-  still get plain JSON; only the extension declaration can select the
-  modern task-result shape.
+- **Core modern path (stateless lifecycle and discover)**: the current
+  Claude matrix validates the default modern lifecycle; the Codex matrix
+  validates modern opt-in through tools/list and tools/call. The Q2 gate
+  requires Phase 1 and a live round-trip against the intended endpoint.
+- **Catalog listen**: Claude validates list-change subscription, tool
+  refetch and listen reopening. Codex does not. This does not establish
+  task notifications or per-resource subscriptions. Validate MRTR and
+  cache behavior separately when relying on them.
+- **Tasks extension**: require an actual capability capture declaring
+  `io.modelcontextprotocol/tasks` and a consumer that handles task results.
+  Neither current client declares it. A legacy top-level `tasks`
+  declaration still receives plain JSON; only the extension declaration
+  selects the modern task-result shape.
 
 Strings show what is bundled, not what is negotiated. Add a bounded trace
 of client `protocolVersion` + capabilities at legacy `initialize` and

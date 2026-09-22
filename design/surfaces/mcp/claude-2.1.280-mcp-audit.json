@@ -1,0 +1,573 @@
+{
+  "audit_date": "2026-09-22",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "version": "2.1.280",
+    "platform": "macos-arm64",
+    "path": "~/.local/share/claude/versions/2.1.280",
+    "size_bytes": 217254576,
+    "sha256": "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d",
+    "embedded_build_time": "2026-09-21T20:40:17Z",
+    "embedded_git_sha": "80abbfe7d7232280011ff01a21ae3338f4c6e372"
+  },
+  "release": {
+    "latest_stable_verified": true,
+    "source": "https://api.github.com/repos/anthropics/claude-code/releases/latest",
+    "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.280",
+    "published_at": "2026-09-22T16:38:14Z",
+    "prerelease": false
+  },
+  "previous_audit": {
+    "version": "2.1.272",
+    "record": "claude-2.1.272-mcp-audit.json"
+  },
+  "delta": {
+    "direct_http_default": "CHANGED: isolated default and v2-only now use modern discover and catalog listen, without MCP_PROTOCOL_NEGOTIATION=auto. Official 2.1.274 notes document the default change for telemetry-disabled and third-party provider installs.",
+    "default_change_release": "https://github.com/anthropics/claude-code/releases/tag/v2.1.274",
+    "tasks": "UNCHANGED: no declared legacy tasks or tasks extension in any case; gF() remains literally false; only the legacy task methods and status notification are bundled.",
+    "listen": "Catalog notification refetch and dropped-stream reopen/reconciliation remain functional.",
+    "opt_out": "MCP_SDK_GENERATION=v1 or MCP_PROTOCOL_NEGOTIATION=legacy each restores initialize at 2025-11-25.",
+    "unmatched_ack": "Initial acknowledgement timeout remains about 25 s. The client now attempts a replacement listen through its reopen machinery after continuing with catalog listing; this probe does not establish successful acknowledgement on the replacement."
+  },
+  "methodology": {
+    "static": "Exact-byte counts and bounded inspection of readable embedded JavaScript. Literal vocabulary presence is not proof of reachable behavior. Counts increased with bundle layout changes and are not feature counts.",
+    "live": "Unmodified installed binary, --bare -p, --tools '' (empty built-in tool set), --setting-sources '', --strict-mcp-config, explicit loopback-only MCP fixture, --debug-file. Each case used a fresh temporary cwd and CLAUDE_CONFIG_DIR under env -i with HOME preserved; CLAUDE_CONFIG_DIR, --bare, empty setting sources and strict MCP config provide fixture isolation. ANTHROPIC_API_KEY was a dummy value and ANTHROPIC_BASE_URL pointed to a local deterministic Messages stub holding its first response for 8 s so list-change delivery was observable. No real model inference or shared-service mutation. Fixtures: fixtures/claude-mcp-fixture.py, fixtures/claude-messages-stub.py, fixtures/claude-audit-matrix.sh.",
+    "fixture": "Discover advertised 2026-07-28 and 2025-11-25, all three catalog listChanged capabilities, resources.subscribe and the io.modelcontextprotocol/tasks extension. Listen answered as chunked SSE with the acknowledgement first, its subscription id equal to the listen request id, then tools/resources/prompts list_changed after waiting up to 10 s for the first tools/list and another 1 s. Healthy cases list before emission; in the unmatched-ack case the bounded wait expires, so the first notifications precede catalog startup at about 25 s. The legacy fixture rejected discover with -32601 and answered initialize at the requested version with Mcp-Session-Id and legacy tasks advertised, holding the GET stream. The drop fixture closed the first listen stream right after the notifications with no terminal JSON-RPC result. The unmatched-ack case substitutes a server-minted subscription id. Four added cases cover default fallback, each explicit legacy opt-out, and mismatched acknowledgement.",
+    "limits": [
+      "Account-specific remote rollout flags were not inspected; isolated defaults are not a universal rollout verdict.",
+      "Prompt/resource catalogs were empty; only tool refetches were observed after list_changed notifications.",
+      "No task result was returned to a client that did not declare support. Task execution and task notifications were not tested.",
+      "No per-URI resource subscription, MRTR elicitation interaction, or prolonged reconnect/parking behavior was live-tested.",
+      "The claude.ai connector projection headers were decoded statically only; no claude.ai connector was contacted.",
+      "No tools/call was induced by the deterministic text-only model stub; this matrix verifies negotiation, catalogs and listen."
+    ],
+    "raw_evidence_directory": "/tmp/claude-2.1.280-mcp-audit-20260922-preserved-home",
+    "capture_validation": "All nine cases passed a fresh full matrix with HOME preserved and EXPECT_TASKS=absent; the saved captures also passed AUDIT_VERIFY_ONLY=1 replay. The verifier requires successful CLI exit/result, nonempty MCP traffic, model requests, protocol metadata, catalogs, explicit-selector lifecycles, notification refetches, stream reopen/reconciliation and unmatched-ack cancellation. Default lifecycle and task capabilities are observed unless explicitly pinned. Negative replays with an empty capture, missing model request, missing tool refetch or missing cancellation each exited 1; a live matrix using /usr/bin/false also exited 1."
+  },
+  "static_findings": {
+    "task_methods": [
+      "tasks/cancel",
+      "tasks/get",
+      "tasks/list",
+      "tasks/result"
+    ],
+    "tasks_extension_literal_present": true,
+    "tasks_update_present": false,
+    "bare_tasks_notification_present": false,
+    "legacy_task_status_notification_present": true,
+    "task_gate": {
+      "byte_offset": 177666054,
+      "symbol": "gF",
+      "body": "return!1",
+      "effect": "Gates both the legacy tasks capability and insertion of the tasks extension into v2 client capabilities."
+    },
+    "runtime_selector": {
+      "env": "MCP_SDK_GENERATION",
+      "values": [
+        "v1",
+        "v2"
+      ],
+      "rollout_flag": "tengu_brindle_causeway",
+      "fallback": "v2",
+      "byte_offset": 176918782,
+      "debug_line": "mcp runtime arm: v2 (source: default)"
+    },
+    "negotiation_selector": {
+      "env": "MCP_PROTOCOL_NEGOTIATION",
+      "values": [
+        "legacy",
+        "auto"
+      ],
+      "http_rollout_flag": "tengu_mcp_protocol_negotiation_http",
+      "server_denylist_flag": "tengu_mcp_negotiation_server_denylist",
+      "direct_http_fallback": "auto",
+      "other_transport_fallback": "legacy",
+      "byte_offset": 202757854
+    },
+    "claudeai_connector_projection": {
+      "flags": {
+        "tengu_mcp_stateless_skip_init": "default true",
+        "tengu_mcp_discover_projection_prior": "default off; legacy_only|all"
+      },
+      "headers": [
+        "anthropic-mcp-client-capabilities (base64 client capabilities, 6144-byte cap)",
+        "MCP-Protocol-Version",
+        "anthropic-mcp-discover-protocol-version"
+      ],
+      "scope": "claude.ai-hosted connector path only; not observed on the generic HTTP fixture"
+    },
+    "vocabulary_counts": {
+      "server/discover": 47,
+      "subscriptions/listen": 49,
+      "2026-07-28": 27,
+      "2025-11-25": 7,
+      "Mcp-Session-Id": 8,
+      "Last-Event-ID": 5,
+      "resources/subscribe": 16,
+      "tasks/update": 0,
+      "io.modelcontextprotocol/tasks": 3,
+      "inputResponses": 9,
+      "requestState": 35,
+      "input_required": 28,
+      "resultType": 50,
+      "ttlMs": 37,
+      "cacheScope": 36,
+      "mcp_task": 53,
+      "allowTask": 12,
+      "taskSupport": 5
+    },
+    "listen_reopen": {
+      "filter": [
+        "toolsListChanged",
+        "promptsListChanged",
+        "resourcesListChanged"
+      ],
+      "listen_denylist_flag": "tengu_mcp_listen_server_denylist",
+      "connect_time_ack_budget_ms_observed": 25000
+    }
+  },
+  "cases": [
+    {
+      "name": "isolated-default",
+      "environment_selectors": {},
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: default)"
+    },
+    {
+      "name": "v2-only",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: env)"
+    },
+    {
+      "name": "v2-auto-discover-success",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "tools/list",
+        "resources/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: env)"
+    },
+    {
+      "name": "v2-auto-discover-rejected",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: env)"
+    },
+    {
+      "name": "v2-auto-listen-stream-dropped",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "tools/list",
+        "resources/list",
+        "model-request",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "drop_first_listen_stream",
+        "tools/list",
+        "GET",
+        "subscriptions/listen",
+        "tools/list",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 4,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: env)",
+      "reopen_debug_lines": [
+        "subscriptions/listen stream dropped (remote); attempting to re-listen",
+        "Re-opened subscriptions/listen stream (attempt 1)",
+        "Synthesized tools refetch after listen-stream reopen (no notification received)"
+      ]
+    },
+    {
+      "name": "isolated-default-discover-rejected",
+      "environment_selectors": {},
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "listen_requests": [],
+      "event_order": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: default)"
+    },
+    {
+      "name": "explicit-v1",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v1"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": null,
+      "modern_method_header_matches": null,
+      "runtime_debug_line": "mcp runtime arm: v1 (source: env)"
+    },
+    {
+      "name": "explicit-legacy",
+      "environment_selectors": {
+        "MCP_PROTOCOL_NEGOTIATION": "legacy"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [],
+      "event_order": [
+        "initialize",
+        "notifications/initialized",
+        "GET",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "model-request"
+      ],
+      "tools_list_count": 1,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": null,
+      "modern_method_header_matches": null,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: default)"
+    },
+    {
+      "name": "v2-auto-listen-unmatched-ack",
+      "environment_selectors": {
+        "MCP_SDK_GENERATION": "v2",
+        "MCP_PROTOCOL_NEGOTIATION": "auto"
+      },
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {}
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "event_order": [
+        "server/discover",
+        "subscriptions/listen",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "notifications/cancelled",
+        "resources/list",
+        "prompts/list",
+        "tools/list",
+        "model-request",
+        "subscriptions/listen",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "tools/list"
+      ],
+      "tools_list_count": 2,
+      "prompts_list_count": 1,
+      "resources_list_count": 1,
+      "modern_request_metadata_complete": true,
+      "modern_method_header_matches": true,
+      "runtime_debug_line": "mcp runtime arm: v2 (source: env)",
+      "cancelled_requests": [
+        {
+          "params": {
+            "requestId": "listen:0",
+            "_meta": {
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "claude-code",
+                "title": "Claude Code",
+                "version": "2.1.280",
+                "description": "Anthropic's agentic coding tool",
+                "websiteUrl": "https://claude.com/claude-code"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {
+                "roots": {
+                  "listChanged": true
+                },
+                "elicitation": {}
+              }
+            }
+          },
+          "seconds_since_first_listen": 25.003
+        }
+      ],
+      "note": "The unmatched acknowledgement is ignored. The initial listen is cancelled after about 25 s, catalog listing proceeds, and the reopen machinery attempts another listen about 1 s later. A tools list-change notification arriving on that pending stream triggers refetch, but no successful acknowledgement or reopened-stream debug confirmation occurs before process exit.",
+      "reopen_debug_lines": [
+        "no auto-opened subscriptions/listen on a modern connection; running the listen open through the reopen machinery (no-op if the server advertises no listChanged capability)",
+        "subscriptions/listen re-open attempt 1 failed: Connection closed"
+      ]
+    }
+  ]
+}

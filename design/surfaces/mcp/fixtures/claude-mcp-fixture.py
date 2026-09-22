@@ -4,6 +4,7 @@
 Usage: mcp_fixture.py <logfile> <port> <mode>
   mode = modern        answer server/discover (2026-07-28), listen with SSE, emit list_changed
          modern-drop   same, but close the FIRST listen stream after the notifications (no terminal result)
+         modern-bad-ack same, but send an acknowledgement with an unmatched subscription id
          legacy        reject server/discover with -32601, answer initialize at 2025-11-25 with legacy tasks,
                        echo Mcp-Session-Id, hold the GET stream open
 Every request is appended to <logfile> as one JSON line.
@@ -113,12 +114,13 @@ class H(BaseHTTPRequestHandler):
             filt = msg.get("params", {}).get("notifications") or msg.get("params", {})
             self._sse_start()
             try:
-                # Per the SDK listen router, the subscription id IS the listen request's JSON-RPC id.
-                sub_id = rid
+                # Valid acknowledgements correlate the subscription id with the listen request id.
+                sub_id = "fixture-unmatched-subscription" if MODE == "modern-bad-ack" else rid
                 self._sse({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
                            "params": {"notifications": filt,
                                       "_meta": {"io.modelcontextprotocol/subscriptionId": sub_id}}}, 1)
-                # Mirror the 2026-09-10 fixture: emit list changes only after the initial catalog lists.
+                # Wait at most 10 s for the first tools/list, then delay another 1 s.
+                # An unmatched ack can hold catalog startup past this bounded wait.
                 for _ in range(100):
                     if STATE.get("tools_list_count", 0) >= 1: break
                     time.sleep(0.1)
