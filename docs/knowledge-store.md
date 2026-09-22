@@ -226,8 +226,8 @@ matched by their unchanged cue and filename. Project entrypoints retain their
 existing generated-file ownership check.
 
 Global render plans use wire kind `bbox.global_render_plan.v2`; project render
-transport uses version 2. Upgrade the daemon and applying client/collector
-together: older versions cannot safely interpret the satellite contract.
+transport uses version 2. Upgrade the daemon, `bro` global-render client, and
+`bro-harness` checkout renderer together: older versions cannot safely interpret the satellite contract.
 `bro render global` assembles checksum-bound pages before writing any files;
 a stale generation restarts delivery from page one, with bounded retries.
 Project receipts and drift checks cover satellites as well as entrypoints.
