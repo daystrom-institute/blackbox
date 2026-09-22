@@ -22,6 +22,9 @@ use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_corpus_core::project_selector::project_scope_matches;
 
+mod guidance;
+pub use guidance::{GuidanceTopic, RenderPlacement};
+
 // ── MCP parameter structs ─────────────────────────────────────────
 //
 // Typed inputs for the bbox_* knowledge tools. Keeping them colocated
@@ -63,6 +66,9 @@ pub struct LearnParams {
     /// Optional subsection heading within the category render block
     #[serde(default)]
     pub cluster: Option<String>,
+    /// Explicit instruction placement. Omitted updates preserve the current placement.
+    #[serde(default)]
+    pub render_placement: Option<RenderPlacement>,
     /// Update existing entry by ID
     #[serde(default)]
     pub id: Option<String>,
@@ -203,16 +209,12 @@ pub struct RenderParams {
     /// Project directory path. Required when scope includes "project".
     #[serde(default)]
     pub project: Option<String>,
-    /// Which scope to render. "global" writes the canonical shared doc to
-    /// ~/.blackbox/BLACKBOX.md and surgically patches a managed region (an
-    /// @import pointer plus global provider-specific entries) into each
-    /// provider's global-memory file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
-    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers, snapshotting
-    /// the original to ~/.local/state/blackbox/backups/ first. "project" writes
-    /// <project>/{CLAUDE,AGENTS,GEMINI}.md from the project's committed
-    /// .bbox/knowledge/ entries plus an include reference to PROJECT.md (no
-    /// global content). "both" runs both. Defaults to "both" if `project` is
-    /// given, else "global".
+    /// Scope: global, project, or both. Global renders inline rules and
+    /// conditional satellite breadcrumbs into provider managed regions, with
+    /// an optional full BLACKBOX.md reference. Project renders checkout-owned
+    /// provider files and .bbox/guidance satellites. PROJECT.md is a conditional
+    /// orientation breadcrumb. Defaults to both when project is supplied,
+    /// otherwise global. Generated files are not source authority.
     #[serde(default)]
     pub scope: Option<String>,
     /// Preview without writing (default: false)
@@ -252,9 +254,14 @@ pub struct GlobalRenderPlanRequestV1 {
     /// (`~/.blackbox/BLACKBOX.md` there). Provider bodies reference it by
     /// this exact path, so it must be the host's own resolved common target.
     pub host_common_target: String,
+    /// Request a bounded global plan page; nonzero offsets require the first page hash.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub plan_sha256: Option<String>,
 }
 
-pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 1;
+pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 2;
 pub const PROJECT_RENDER_TRANSPORT_SCOPE: &str = "project-render-transport-v1";
 const MAX_PROJECT_RENDER_ENTRIES: usize = 4_096;
 pub const MAX_PROJECT_RENDER_PLAN_BYTES: usize = 8 * 1024 * 1024;
@@ -466,7 +473,7 @@ impl ProjectRenderPlanV1 {
         project_doc_nonempty: bool,
     ) -> Result<Vec<ProjectRenderProjectionReceiptV1>> {
         let view = self.detached_knowledge();
-        validated_project_render_providers(self.provider.as_deref())?
+        let mut receipts: Vec<_> = validated_project_render_providers(self.provider.as_deref())?
             .into_iter()
             .map(|provider| {
                 let projection = view.project_projection_with_include(
@@ -492,7 +499,26 @@ impl ProjectRenderPlanV1 {
                     projection_bytes: projection.as_ref().map(String::len),
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        for provider in validated_project_render_providers(self.provider.as_deref())? {
+            for file in view.guidance_files(
+                provider,
+                ScopeFilter::Project(PROJECT_RENDER_TRANSPORT_SCOPE),
+            ) {
+                receipts.push(ProjectRenderProjectionReceiptV1 {
+                    provider: provider.into(),
+                    file_name: format!(".bbox/{}", file.path),
+                    disposition: if self.dry_run {
+                        ProjectRenderDispositionV1::DryRun
+                    } else {
+                        ProjectRenderDispositionV1::Written
+                    },
+                    projection_sha256: Some(format!("{:x}", Sha256::digest(file.body.as_bytes()))),
+                    projection_bytes: Some(file.body.len()),
+                });
+            }
+        }
+        Ok(receipts)
     }
 
     pub fn transport_bytes_and_sha256(&self) -> Result<(Vec<u8>, String)> {
@@ -674,6 +700,13 @@ impl ProjectRenderReceiptV1 {
                     expected.provider
                 );
             }
+            if expected.file_name.starts_with(".bbox/guidance/")
+                && actual.disposition != expected.disposition
+            {
+                anyhow::bail!(
+                    "project render receipt cannot publish an entrypoint with refused satellites"
+                );
+            }
             let disposition_valid = match expected.disposition {
                 ProjectRenderDispositionV1::Skipped => {
                     actual.disposition == ProjectRenderDispositionV1::Skipped
@@ -702,8 +735,9 @@ impl ProjectRenderReceiptV1 {
 }
 
 /// Execute an authorized project render inside the checkout owner's already
-/// verified root. The shared renderer never receives a daemon path and every
-/// destination is one fixed provider filename directly under `project_root`.
+/// verified root. The shared renderer never receives a daemon path. Its
+/// destinations are fixed provider filenames and content-addressed satellites
+/// derived from validated source entries within `project_root`.
 pub fn execute_project_render_plan(
     plan: &ProjectRenderPlanV1,
     project_root: &Path,
@@ -721,6 +755,9 @@ pub fn execute_project_render_plan(
     let mut projections = plan.expected_projections(project_doc_nonempty)?;
     for projection in &mut projections {
         if projection.projection_sha256.is_none() {
+            continue;
+        }
+        if projection.file_name.starts_with(".bbox/guidance/") {
             continue;
         }
         let target = canonical_root.join(&projection.file_name);
@@ -1056,6 +1093,8 @@ pub struct KnowledgeEntry {
     pub approval: Approval,
     #[serde(default = "default_true")]
     pub render: bool, // false = indexed only, never rendered into markdown
+    #[serde(default, skip_serializing_if = "RenderPlacement::is_inline")]
+    pub render_placement: RenderPlacement,
     #[serde(default = "default_true")]
     pub decay: bool, // false = invariant, never ages out or gets staleness-reviewed
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3068,6 +3107,9 @@ impl Knowledge {
                 let old_scope = format!("{:?}", entry.scope);
                 let old_project = entry.project.clone();
 
+                if let Some(placement) = p.render_placement {
+                    entry.render_placement = placement;
+                }
                 entry.content = p.content.clone();
                 entry.cluster = cluster.clone();
                 entry.title = title;
@@ -3089,6 +3131,12 @@ impl Knowledge {
                 }
 
                 let mut changes: Vec<String> = Vec::new();
+                if prior_entry.render_placement != entry.render_placement {
+                    changes.push(format!(
+                        "render placement: {:?} -> {:?}",
+                        prior_entry.render_placement, entry.render_placement
+                    ));
+                }
                 if old_title != entry.title {
                     changes.push(format!(
                         "title: {:?} → {:?}",
@@ -3182,6 +3230,7 @@ impl Knowledge {
 
         let id = Self::gen_id();
         let entry = KnowledgeEntry {
+            render_placement: p.render_placement.unwrap_or_default(),
             id: id.clone(),
             title,
             content: p.content.clone(),
@@ -3289,6 +3338,7 @@ impl Knowledge {
         let id = Self::gen_id();
 
         self.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.clone(),
             title,
             content: p.content.clone(),
@@ -3429,6 +3479,7 @@ impl Knowledge {
         let id = Self::gen_id();
 
         self.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.clone(),
             title,
             content: p.content.clone(),
@@ -3839,72 +3890,29 @@ impl Knowledge {
 
         let mut results = Vec::new();
 
-        // ── Global render: small provider files + one shared include ──
+        // Local and remote hosts apply the same complete render plan.
         if do_global {
-            let common_target = crate::render::global_common_target_path()?;
-            let common_body = self.render_global_common_body()?;
-            let common_plan = crate::render::plan_managed_patch(&common_target, &common_body)?;
-            if dry_run {
-                results.push(format!(
-                    "[DRY-RUN] {}\n--- proposed managed region ---\n{}",
-                    common_plan.summary(),
-                    common_plan.managed_block().unwrap_or("<no change>"),
-                ));
-            } else {
-                let backup = crate::render::apply_managed_patch(&common_plan, false)?;
-                let backup_str = backup
-                    .map(|p| format!(" (backup: {})", p.display()))
+            let target = crate::render::global_common_target_path()?;
+            let plan = self.global_render_plan(
+                provider,
+                &GlobalRenderPlanRequestV1 {
+                    offset: None,
+                    plan_sha256: None,
+                    host_common_target: target.display().to_string(),
+                },
+            )?;
+            for outcome in crate::render::apply_global_render_plan(&plan, dry_run)? {
+                let detail = outcome
+                    .managed_block
+                    .map(|body| format!("\n{body}"))
                     .unwrap_or_default();
-                results.push(format!("{}{}", common_plan.summary(), backup_str));
-            }
-
-            for prov in &providers {
-                let Some(target_res) = crate::render::global_target_path(prov) else {
-                    results.push(format!(
-                        "Skipped {} global (no documented global-memory file)",
-                        prov
-                    ));
-                    continue;
-                };
-                let target = target_res?;
-                let body = self.render_global_body(prov, &common_target)?;
-                let plan = crate::render::plan_managed_patch(&target, &body)?;
-
-                if dry_run {
-                    use crate::render::PatchPlan;
-                    let (before_label, after_label) = match &plan {
-                        PatchPlan::Create { .. } => (
-                            "--- no existing file ---",
-                            "--- proposed managed region ---",
-                        ),
-                        PatchPlan::Append { .. } => (
-                            "--- existing file (will be preserved, managed region appended) ---",
-                            "--- managed region to append ---",
-                        ),
-                        PatchPlan::Replace { .. } => (
-                            "--- existing managed region (will be replaced) ---",
-                            "--- proposed managed region ---",
-                        ),
-                        PatchPlan::Unchanged { .. } => (
-                            "--- existing managed region (identical, no change) ---",
-                            "--- no change ---",
-                        ),
-                    };
-                    results.push(format!(
-                        "[DRY-RUN] {}\n{}\n{}\n{}\n{}",
-                        plan.summary(),
-                        before_label,
-                        plan.before_text().unwrap_or("<none>"),
-                        after_label,
-                        plan.managed_block().unwrap_or("<no change>"),
-                    ));
-                } else {
-                    let backup = crate::render::apply_managed_patch(&plan, false)?;
-                    let backup_str = backup
-                        .map(|p| format!(" (backup: {})", p.display()))
-                        .unwrap_or_default();
-                    results.push(format!("{}{}", plan.summary(), backup_str));
-                }
+                results.push(format!(
+                    "{}{} {}{}",
+                    if dry_run { "[DRY-RUN] " } else { "" },
+                    outcome.summary,
+                    outcome.path,
+                    detail
+                ));
             }
         }
 
@@ -3915,6 +3923,23 @@ impl Knowledge {
             // worktree rendering: entries live under the registered base
             // path while the files land in the worktree checkout).
             let scope_dir = p.scope_project.as_deref().unwrap_or(dir);
+            let satellites: Vec<_> = providers
+                .iter()
+                .flat_map(|prov| self.guidance_files(prov, ScopeFilter::Project(scope_dir)))
+                .collect();
+            bbox_util::guidance::publish_files(
+                &Path::new(dir).join(".bbox"),
+                &satellites,
+                dry_run,
+            )?;
+            for file in &satellites {
+                results.push(format!(
+                    "{}SATELLITE .bbox/{} ({} bytes)",
+                    if dry_run { "[DRY-RUN] " } else { "" },
+                    file.path,
+                    file.body.len()
+                ));
+            }
             for prov in &providers {
                 let path = Path::new(dir).join(project_target_file(prov)?);
                 let Some(full) = self.project_projection(prov, dir, scope_dir)? else {
@@ -3988,8 +4013,31 @@ impl Knowledge {
                 });
             }
         }
+        let mut checked = providers.len();
+        for provider in providers {
+            for file in self.guidance_files(provider, ScopeFilter::Project(&project)) {
+                checked += 1;
+                let path = project_dir.join(".bbox").join(&file.path);
+                match fs::read_to_string(&path) {
+                    Ok(body) if body == file.body => {}
+                    Ok(_) => mismatches.push(ProjectRenderMismatch {
+                        provider: provider.into(),
+                        path: path.display().to_string(),
+                        reason: "generated satellite is stale".into(),
+                    }),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        mismatches.push(ProjectRenderMismatch {
+                            provider: provider.into(),
+                            path: path.display().to_string(),
+                            reason: "generated satellite is missing".into(),
+                        })
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
         Ok(ProjectRenderCheck {
-            checked: providers.len(),
+            checked,
             mismatches,
         })
     }
@@ -4031,25 +4079,21 @@ impl Knowledge {
         contradictions
     }
 
-    /// Body for a global provider file: provider-scoped global entries plus a
-    /// reference to the shared global include. Provider-neutral entries,
-    /// including the generated tool reference, live in BLACKBOX.md.
+    /// Inline global rules plus conditional satellite breadcrumbs. The common
+    /// reference is optional and is never imported by provider entrypoints.
     fn render_global_body(&self, provider: &str, common_path: &Path) -> Result<String> {
         let mut md = String::new();
-        self.render_steerage_filtered(provider, ScopeFilter::Global, &mut md, |e| {
-            !e.providers.is_empty()
-        });
-        if provider == "gemini" {
-            render_global_common_include(provider, common_path, &mut md);
-            self.render_memory_filtered(provider, ScopeFilter::Global, &mut md, |e| {
-                !e.providers.is_empty()
-            });
-        } else {
-            self.render_memory_filtered(provider, ScopeFilter::Global, &mut md, |e| {
-                !e.providers.is_empty()
-            });
-            render_global_common_include(provider, common_path, &mut md);
-        }
+        render_global_common_core_rules(&mut md);
+        self.render_steerage(provider, ScopeFilter::Global, &mut md);
+        self.render_memory(provider, ScopeFilter::Global, &mut md);
+        self.render_guidance_breadcrumbs(
+            provider,
+            ScopeFilter::Global,
+            common_path
+                .parent()
+                .context("common target has no parent")?,
+            &mut md,
+        );
         Ok(md)
     }
 
@@ -4074,22 +4118,31 @@ impl Knowledge {
             None => vec!["claude", "agents", "gemini"],
         };
         let mut plans = Vec::new();
+        let mut satellites = Vec::new();
         for prov in providers {
             if crate::render::global_target_path(prov).is_none() {
                 anyhow::bail!(
                     "error.bad_input: provider {prov} has no documented global-memory file"
                 );
             }
+            satellites.extend(self.guidance_files(prov, ScopeFilter::Global));
             plans.push(bbox_util::global_render::GlobalRenderProviderPlanV1 {
                 provider: prov.to_string(),
                 body: self.render_global_body(prov, host_common_target)?,
             });
         }
-        Ok(bbox_util::global_render::GlobalRenderPlanV1::new(
+        let mut plan = bbox_util::global_render::GlobalRenderPlanV1::new(
             host_common_target,
             self.render_global_common_body()?,
             plans,
-        ))
+        )
+        .with_satellites(satellites);
+        for provider in &plan.providers {
+            if provider.body.len() > 6_000 {
+                plan.diagnostics.push(format!("{} inline guidance is {} bytes (budget 6000); classify source entries explicitly, never truncate rules", provider.provider, provider.body.len()));
+            }
+        }
+        Ok(plan)
     }
 
     /// Body for the shared global include: provider-neutral global entries only.
@@ -4146,6 +4199,7 @@ impl Knowledge {
             render_project_include(provider, project_doc_nonempty, &mut body);
         }
 
+        self.render_guidance_breadcrumbs(provider, filter, Path::new(".bbox"), &mut body);
         Ok(body)
     }
 
@@ -4177,12 +4231,13 @@ impl Knowledge {
         let mut full = String::new();
         full.push_str("<!-- Generated by blackbox. Do not edit directly. -->\n");
         full.push_str("<!-- Use bbox_learn / bbox_forget to modify. -->\n\n");
-        full.push_str(&body);
+        full.push_str(body.trim_end());
+        full.push('\n');
         Ok(Some(full))
     }
 
     fn render_steerage(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
-        self.render_steerage_filtered(provider, filter, md, |_| true);
+        self.render_steerage_filtered(provider, filter, md, |e| e.render_placement.is_inline());
     }
 
     fn render_steerage_filtered<F>(
@@ -4218,7 +4273,7 @@ impl Knowledge {
     }
 
     fn render_memory(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
-        self.render_memory_filtered(provider, filter, md, |_| true);
+        self.render_memory_filtered(provider, filter, md, |e| e.render_placement.is_inline());
     }
 
     fn render_memory_filtered<F>(
@@ -4869,8 +4924,7 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
 
 fn render_global_common_core_rules(out: &mut String) {
     out.push_str("## Critical Instructions\n\n");
-    out.push_str("**Report Blackbox substrate gaps with gap notes.**\n\n");
-    out.push_str("When blackbox itself is missing a reusable capability — tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, rendered instruction, or runbook — file a gap note with `bbox_gap`, not an ad hoc TODO. First dedupe with `bbox_gaps` (filter by `dedupe_key` / `gap_kind` / `domain`) and reuse the same `dedupe_key`; an open gap with that key dedupes by default. Project-scoped gaps are repo-owned (committed under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. Close out via `bbox_gap_resolve` (with optional structured supersession). If the current client has deferred those tools, load `bbox_gap`, `bbox_gaps`, and `bbox_gap_resolve` with `tool_search` first. Use `bbox_packet_gap` only for packet AST expressiveness gaps while authoring packets. Pull `sm-gap-notes` via `bbox_knowledge` for the full envelope and lifecycle.\n\n");
+    out.push_str("Report Blackbox substrate gaps with gap notes: list with `bbox_gaps` before creating with `bbox_gap`. Read the operations guide when recording or resolving a gap.\n\n");
 }
 
 fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
@@ -4901,24 +4955,7 @@ fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut
 const PROJECT_DOC_FILE: &str = "PROJECT.md";
 
 fn project_include_instruction(_provider: &str) -> &'static str {
-    "Read @PROJECT.md fully before acting; it contains the shared project context and instructions.\n\n@PROJECT.md"
-}
-
-fn render_global_common_include(provider: &str, common_path: &Path, out: &mut String) {
-    if out.trim_end().is_empty() {
-        // no-op
-    } else {
-        out.push('\n');
-    }
-    out.push_str(global_common_include_instruction(provider, common_path).as_str());
-    out.push('\n');
-}
-
-fn global_common_include_instruction(_provider: &str, common_path: &Path) -> String {
-    let include = format!("@{}", common_path.display());
-    format!(
-        "Read {include} fully before acting; it contains the shared global blackbox instructions and tool reference.\n\n{include}"
-    )
+    "For project architecture, implementation, or operational work, read `PROJECT.md`. Skip it for unrelated tasks."
 }
 
 fn validated_project_render_providers(provider: Option<&str>) -> Result<Vec<&str>> {
@@ -5235,6 +5272,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn guidance_legacy_defaults_and_provider_variants_are_preserved() {
+        let mut common = entry("inline", "Inline", "essential rule", Scope::Global);
+        let wire = serde_json::to_value(&common).unwrap();
+        assert!(wire.get("render_placement").is_none());
+        common = serde_json::from_value(wire).unwrap();
+        assert!(common.render_placement.is_inline());
+        let mut satellite = entry("satellite", "Procedure", "shared detail", Scope::Global);
+        satellite.render_placement = RenderPlacement::Satellite {
+            topic: GuidanceTopic::Retrieval,
+        };
+        satellite
+            .variants
+            .insert("claude".into(), "claude detail".into());
+        let mut hidden = satellite.clone();
+        hidden.id = "hidden".into();
+        hidden.render = false;
+        hidden.content = "hidden detail".into();
+        hidden.variants.clear();
+        let kb = Knowledge::detached_view(vec![common, satellite, hidden], BTreeMap::new());
+        let path = Path::new("/fixture/BLACKBOX.md");
+        let body = kb.render_global_body("claude", path).unwrap();
+        assert!(body.contains("essential rule"));
+        assert!(body.contains("Retrieving code evidence"));
+        assert!(!body.contains("claude detail"));
+        assert!(!body.contains("@/fixture"));
+        let files = kb.guidance_files("claude", ScopeFilter::Global);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].body.contains("claude detail"));
+        assert!(!files[0].body.contains("hidden detail"));
+        assert!(!files[0].body.contains("shared detail"));
+        assert!(body.contains(&files[0].path));
+        let plan = kb
+            .global_render_plan(
+                None,
+                &GlobalRenderPlanRequestV1 {
+                    offset: None,
+                    plan_sha256: None,
+                    host_common_target: path.display().to_string(),
+                },
+            )
+            .unwrap();
+        plan.validate().unwrap();
+        assert_eq!(plan.satellites.len(), 3);
+        assert_eq!(
+            plan,
+            kb.global_render_plan(
+                None,
+                &GlobalRenderPlanRequestV1 {
+                    offset: None,
+                    plan_sha256: None,
+                    host_common_target: path.display().to_string()
+                }
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn project_guidance_receipts_cover_satellites_and_repeated_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut plan = project_render_plan(Some("agents"), false);
+        plan.entries[0].render_placement = RenderPlacement::Satellite {
+            topic: GuidanceTopic::Build,
+        };
+        let execution =
+            execute_project_render_plan(&plan, &root, &plan.scope, &plan.workspace_id).unwrap();
+        assert_eq!(execution.receipt.projections.len(), 2);
+        execution.receipt.validate_against(&plan).unwrap();
+        let body = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(!body.contains("PROJECT_RENDER_LOCALITY_MARKER"));
+        let satellite = &execution.receipt.projections[1];
+        assert!(body.contains(&satellite.file_name));
+        assert!(
+            fs::read_to_string(root.join(&satellite.file_name))
+                .unwrap()
+                .contains("PROJECT_RENDER_LOCALITY_MARKER")
+        );
+        let again =
+            execute_project_render_plan(&plan, &root, &plan.scope, &plan.workspace_id).unwrap();
+        assert_eq!(execution.receipt, again.receipt);
+        let mut refused = execution.receipt.clone();
+        refused.projections[1].disposition = ProjectRenderDispositionV1::Refused;
+        assert!(refused.validate_against(&plan).is_err());
+        let mut damaged = execution.receipt.clone();
+        damaged.projections.pop();
+        assert!(damaged.validate_against(&plan).is_err());
+        let mut previous = plan.clone();
+        previous.version = 1;
+        assert!(previous.validate().is_err());
+        fs::write(root.join(&satellite.file_name), "tampered").unwrap();
+        assert!(
+            execute_project_render_plan(&plan, &root, &plan.scope, &plan.workspace_id).is_err()
+        );
+        assert_eq!(body, fs::read_to_string(root.join("AGENTS.md")).unwrap());
+    }
+
     fn mk_kb() -> (tempfile::TempDir, Knowledge) {
         let dir = tempfile::tempdir().unwrap();
         let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
@@ -5253,6 +5388,7 @@ mod tests {
 
     fn push_entry(kb: &mut Knowledge, id: &str, title: &str, content: &str) {
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: title.into(),
             content: content.into(),
@@ -5290,6 +5426,7 @@ mod tests {
 
     fn entry(id: &str, title: &str, content: &str, scope: Scope) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: title.into(),
             content: content.into(),
@@ -5381,6 +5518,7 @@ mod tests {
         // unrelated carrier is unreadable.
         kb.learn(
             &LearnParams {
+                render_placement: None,
                 content: "global still writes".into(),
                 category: "convention".into(),
                 format: None,
@@ -5831,7 +5969,7 @@ mod tests {
         );
         let rendered = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
         assert!(rendered.contains("PROJECT_RENDER_LOCALITY_MARKER"));
-        assert!(rendered.contains("@PROJECT.md"));
+        assert!(rendered.contains("`PROJECT.md`"));
         assert!(execution.output.contains(root.to_str().unwrap()));
     }
 
@@ -5934,6 +6072,7 @@ mod tests {
         let result = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "use rustls, not openssl".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -5978,6 +6117,7 @@ mod tests {
         let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
         kb.set_project_roots(vec![base_root.clone()]).unwrap();
         let params = |content: &str| LearnParams {
+            render_placement: None,
             content: content.into(),
             category: "convention".into(),
             scope: Some("project".into()),
@@ -6033,6 +6173,7 @@ mod tests {
         let error = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "must not leak after a failed transaction".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6074,6 +6215,7 @@ mod tests {
         let id = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "published content".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6098,6 +6240,7 @@ mod tests {
         let error = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     id: Some(id.clone()),
                     content: "failed edit must never leak".into(),
                     category: "convention".into(),
@@ -6135,6 +6278,7 @@ mod tests {
         let id = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "initial base entry".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6161,6 +6305,7 @@ mod tests {
 
         kb.learn_result_with_checkout(
             &LearnParams {
+                render_placement: None,
                 id: Some(id.clone()),
                 content: "operator update".into(),
                 category: "convention".into(),
@@ -6201,6 +6346,7 @@ mod tests {
         let id = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "redirected survivor rule".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6249,6 +6395,7 @@ mod tests {
         let id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "legacy retained checkout bytes".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6299,6 +6446,7 @@ mod tests {
         let id = kb
             .learn_result_with_write_dir(
                 &LearnParams {
+                    render_placement: None,
                     content: "orphaned redirect rule".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -6348,6 +6496,7 @@ mod tests {
         kb.set_project_roots(vec![base_root.clone()]).unwrap();
 
         let base_params = |content: &str| LearnParams {
+            render_placement: None,
             content: content.into(),
             category: "convention".into(),
             scope: Some("project".into()),
@@ -6381,6 +6530,7 @@ mod tests {
         // survives the authoritative purge that `kept` still drives.
         kb.learn_result_with_write_dir(
             &LearnParams {
+                render_placement: None,
                 id: Some(redirected.clone()),
                 content: "edited from worktree".into(),
                 ..base_params("ignored")
@@ -6649,6 +6799,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Pre-seed the store with a global entry that won't be found in
         // the file — should get disabled.
         let mk_global_entry = |id: &str, title: &str, content: &str| KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: title.into(),
             content: content.into(),
@@ -7029,6 +7180,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         git_init_commit(&base);
         let id = "checkout-mutation";
         let mut published = KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: "checkout mutation".into(),
             content: "mutate only the checkout generation".into(),
@@ -7096,6 +7248,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         };
         kb.learn_result_with_checkout(
             &LearnParams {
+                render_placement: None,
                 content: "updated only in the checkout generation".into(),
                 category: "convention".into(),
                 format: None,
@@ -7196,6 +7349,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "always run cargo test --lib before pushing".into(),
                     category: "convention".into(),
                     format: None,
@@ -7291,6 +7445,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "prefer rustls over openssl".into(),
                     category: "convention".into(),
                     format: None,
@@ -7355,6 +7510,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let proj_id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "always run cargo test --lib before pushing".into(),
                     category: "convention".into(),
                     format: None,
@@ -7395,6 +7551,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let global_id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "prefer fd over find".into(),
                     category: "convention".into(),
                     format: None,
@@ -7439,6 +7596,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let id = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "stays in central until ejected".into(),
                     category: "convention".into(),
                     format: None,
@@ -7497,6 +7655,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let err = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "must not become path-authoritative".into(),
                     category: "convention".into(),
                     scope: Some("project".into()),
@@ -7532,6 +7691,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         fs::create_dir_all(repo_kb_dir(&repo_root)).unwrap(); // repo-owned
 
         let mut entry = KnowledgeEntry {
+            render_placement: Default::default(),
             id: "recl0001".into(),
             title: "durable title".into(),
             content: "durable body".into(),
@@ -7620,6 +7780,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         fs::create_dir_all(repo_kb_dir(&repo_root)).unwrap();
 
         let mut entry = KnowledgeEntry {
+            render_placement: Default::default(),
             id: "keep0001".into(),
             title: "t".into(),
             content: "durable".into(),
@@ -7703,6 +7864,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // A global write triggers save() while roots are unset.
         kb.learn_result(
             &LearnParams {
+                render_placement: None,
                 content: "global".into(),
                 category: "memory".into(),
                 format: None,
@@ -7921,6 +8083,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             built_from: Default::default(),
             provenance: Default::default(),
             entries: vec![KnowledgeEntry {
+                render_placement: Default::default(),
                 id: "legacy01".into(),
                 title: "old convention".into(),
                 content: "LEGACY_MARKER".into(),
@@ -7986,6 +8149,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let kb_dir = repo_root.join(".bbox").join("knowledge");
         std::fs::create_dir_all(&kb_dir).unwrap();
         let entry = KnowledgeEntry {
+            render_placement: Default::default(),
             id: "conv0001".into(),
             title: "house rule".into(),
             content: "PROJECT_CONVENTION_MARKER: always canonicalize tempdirs".into(),
@@ -8119,6 +8283,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let out = kb
             .learn(
                 &LearnParams {
+                    render_placement: None,
                     content: "brand new much longer replacement body text with extras".into(),
                     category: "convention".into(),
                     format: None,
@@ -8158,6 +8323,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let out = kb
             .learn(
                 &LearnParams {
+                    render_placement: None,
                     content: "klmnopqrst".into(),
                     category: "memory".into(),
                     format: None,
@@ -8189,6 +8355,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let out = kb
             .learn(
                 &LearnParams {
+                    render_placement: None,
                     content: "same body".into(),
                     category: "memory".into(),
                     format: None,
@@ -8214,6 +8381,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let (_t, mut kb) = mk_kb();
         let project = "/tmp/proj";
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "flat0001".into(),
             title: "Flat rule".into(),
             content: "flat body".into(),
@@ -8251,6 +8419,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             ("clust002", "Require change", "gate on actual changes", 30),
         ] {
             kb.store.entries.push(KnowledgeEntry {
+                render_placement: Default::default(),
                 id: id.into(),
                 title: title.into(),
                 content: body.into(),
@@ -8313,6 +8482,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         )
         .unwrap();
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "mem00001".into(),
             title: "Local rule".into(),
             content: "provider-specific project memory".into(),
@@ -8346,10 +8516,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .expect("render should succeed");
 
         assert!(out.contains("**Local rule**"));
-        assert!(out.contains("@PROJECT.md"));
+        assert!(out.contains("`PROJECT.md`"));
         assert!(!out.contains("shared project details"));
         let memory_idx = out.find("**Local rule**").unwrap();
-        let project_idx = out.find("@PROJECT.md").unwrap();
+        let project_idx = out.find("`PROJECT.md`").unwrap();
         assert!(
             memory_idx < project_idx,
             "claude should keep PROJECT.md include after project memory: {out}"
@@ -8362,6 +8532,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let project = project_dir.path().to_str().unwrap();
         fs::write(project_dir.path().join(PROJECT_DOC_FILE), "# Project\n").unwrap();
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "mem00002".into(),
             title: "Gemini local rule".into(),
             content: "provider-specific project memory".into(),
@@ -8394,7 +8565,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .render_project_body("gemini", project, project)
             .expect("render should succeed");
 
-        let project_idx = out.find("@PROJECT.md").unwrap();
+        let project_idx = out.find("`PROJECT.md`").unwrap();
         let memory_idx = out.find("**Gemini local rule**").unwrap();
         assert!(
             project_idx < memory_idx,
@@ -8403,9 +8574,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     }
 
     #[test]
-    fn render_global_splits_common_entries_into_shared_include() {
+    fn render_global_inlines_common_rules_without_an_eager_import() {
         let (tmp, mut kb) = mk_kb();
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "common01".into(),
             title: "Common global rule".into(),
             content: "provider-neutral global body".into(),
@@ -8434,6 +8606,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: None,
         });
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "claude01".into(),
             title: "Claude-only rule".into(),
             content: "claude-specific global body".into(),
@@ -8470,8 +8643,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(common.contains("provider-neutral global body"));
         assert!(!common.contains("Claude-only rule"));
         assert!(claude.contains("**Claude-only rule**"));
-        assert!(claude.contains(&format!("@{}", common_path.display())));
-        assert!(!claude.contains("provider-neutral global body"));
+        assert!(!claude.contains(&format!("@{}", common_path.display())));
+        assert!(claude.contains("provider-neutral global body"));
         assert!(!common.contains("bb:entry"));
         assert!(!claude.contains("bb:entry"));
     }
@@ -8483,11 +8656,9 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         assert!(common.starts_with("## Critical Instructions"));
         assert!(common.contains("Report Blackbox substrate gaps with gap notes"));
-        assert!(common.contains("file a gap note with `bbox_gap`"));
+        assert!(common.contains("creating with `bbox_gap`"));
         assert!(common.contains("bbox_gaps"));
-        assert!(common.contains("bbox_gap_resolve"));
-        assert!(common.contains("bbox_packet_gap"));
-        assert!(common.contains("sm-gap-notes"));
+        assert!(common.contains("operations guide"));
     }
 
     #[test]
@@ -8498,6 +8669,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         fs::write(project_dir.path().join("CLAUDE.md"), "hand authored\n").unwrap();
 
         kb.store.entries.push(KnowledgeEntry {
+            render_placement: Default::default(),
             id: "mem00003".into(),
             title: "Local rule".into(),
             content: "project memory".into(),
@@ -8597,6 +8769,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let out = kb
             .learn_result(
                 &LearnParams {
+                    render_placement: None,
                     content: "use rustls, not openssl".into(),
                     category: "convention".into(),
                     format: Some("json".into()),
@@ -8787,6 +8960,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
     fn entry_json(id: &str, content: &str) -> String {
         let e = KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: "t".into(),
             content: content.into(),

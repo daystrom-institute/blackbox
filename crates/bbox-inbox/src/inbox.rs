@@ -1061,6 +1061,7 @@ mod tests {
         // Agent-inferred knowledge → should appear in "Unverified"
         kb.learn(
             &LearnParams {
+                render_placement: None,
                 content: "always use bbox_note".into(),
                 category: "convention".into(),
                 format: None,

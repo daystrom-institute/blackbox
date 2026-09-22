@@ -2948,6 +2948,7 @@ pub(crate) mod fixtures {
 
     pub(crate) fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.to_string(),
             title: "Accepted publication is path-free".to_string(),
             content: content.to_string(),
@@ -3119,6 +3120,7 @@ mod tests {
 
     fn knowledge(id: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.to_string(),
             title: "Keep publication strict".to_string(),
             content: "Accepted bytes are detached from checkout paths.".to_string(),

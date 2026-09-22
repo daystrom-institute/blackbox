@@ -13,8 +13,8 @@
 
 use anyhow::Context;
 use bbox_util::global_render::{
-    GlobalRenderApplyOutcomeV1, GlobalRenderPlanV1, apply_global_render_plan,
-    global_common_target_path,
+    GlobalRenderApplyOutcomeV1, GlobalRenderAssembler, GlobalRenderPage, GlobalRenderPlanV1,
+    apply_global_render_plan, global_common_target_path,
 };
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -69,15 +69,39 @@ async fn global(args: RenderGlobalArgs) -> anyhow::Result<()> {
     let mut client = McpClient::connect_surface(&base_url, &args.surface).await?;
     let mut arguments = json!({
         "scope": "global",
-        "global_plan": { "host_common_target": host_common_target.display().to_string() },
+        "global_plan": { "host_common_target": host_common_target.display().to_string(), "offset": 0 },
     });
     if let Some(provider) = &args.provider {
         arguments["provider"] = json!(provider);
     }
-    let plan: GlobalRenderPlanV1 = client
-        .call_tool_json("bbox_render", arguments)
-        .await
-        .context("requesting the global render plan from the daemon")?;
+    let mut assembler = GlobalRenderAssembler::default();
+    let mut restarts = 0;
+    let plan = loop {
+        let response = client
+            .call_tool_json::<GlobalRenderPage>("bbox_render", arguments.clone())
+            .await;
+        let page = match response {
+            Err(error)
+                if format!("{error:#}").contains("error.global_render_plan_stale")
+                    && restarts < 2 =>
+            {
+                restarts += 1;
+                assembler = GlobalRenderAssembler::default();
+                arguments["global_plan"]["offset"] = json!(0);
+                arguments["global_plan"]
+                    .as_object_mut()
+                    .expect("request object")
+                    .remove("plan_sha256");
+                continue;
+            }
+            other => other.context("requesting a global render plan page from the daemon")?,
+        };
+        arguments["global_plan"]["offset"] = json!(page.next_offset);
+        arguments["global_plan"]["plan_sha256"] = json!(page.plan_sha256);
+        if let Some(plan) = assembler.push(page)? {
+            break plan;
+        }
+    };
     let outcomes = apply_global_render_plan(&plan, args.check)?;
     print_outcomes(&plan, &outcomes, args.check, args.json)
 }

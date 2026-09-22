@@ -629,6 +629,7 @@ mod tests {
 
     fn render_entry() -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: "render-cutover".into(),
             title: "Render cutover".into(),
             content: "render cutover positive control".into(),

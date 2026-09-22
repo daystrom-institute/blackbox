@@ -1047,6 +1047,8 @@ dependencies = [
  "anyhow",
  "bbox-knowledge",
  "bbox-util",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

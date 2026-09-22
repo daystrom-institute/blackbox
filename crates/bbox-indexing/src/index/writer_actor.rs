@@ -2959,6 +2959,7 @@ mod tests {
 
     fn test_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: "actor test entry".into(),
             content: content.into(),

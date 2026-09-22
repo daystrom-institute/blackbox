@@ -96,6 +96,7 @@ fn write_project_scoped_knowledge_entry(root: &Path) {
 
     let mut store = KnowledgeStore::new();
     store.entries.push(KnowledgeEntry {
+        render_placement: Default::default(),
         id: "k0000001".into(),
         title: "scoped row".into(),
         content: "scoped row".into(),

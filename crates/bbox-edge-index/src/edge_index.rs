@@ -1232,6 +1232,7 @@ mod tests {
         let now = "2026-01-01T00:00:00Z".to_string();
         knowledge
             .upsert_generated(KnowledgeEntry {
+                render_placement: Default::default(),
                 id: "aaaabbbb".into(),
                 title: "A".into(),
                 content: "claim A".into(),

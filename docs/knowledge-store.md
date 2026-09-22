@@ -187,3 +187,59 @@ deferred followups, and failed bro tasks. It is the round-boundary sweep.
 - Using `bbox_note(kind="learned")` for a user-stated rule. User rules belong in
   `bbox_learn` or `bbox_decide`.
 - Rendering just to influence one active dispatch. Use `bbox_pin`.
+
+## Instruction placement and satellites
+
+`render: false` remains indexed-only. Rendered entries default to inline placement;
+existing entries are never silently summarized or moved. To explicitly defer an
+entry, use `bbox_learn` with `render_placement` (or edit the repo-owned source):
+
+```json
+{"render_placement": {"placement": "satellite", "topic": "build"}}
+```
+
+`{"placement":"inline"}` restores inline placement. An omitted placement on an
+update preserves the current value. Topics are a closed, code-owned registry:
+`retrieval`, `persistence`, `orchestration`, `operations`, `build`, `architecture`,
+`refactoring`, `authoring`, and `shell`. Each has a conditional loading cue;
+entries cannot add their own unconditional loading instructions to the index.
+Provider filters, provider variants, approval markers, expiry, and render flags
+apply to satellites exactly as they do to inline entries.
+
+Global provider files contain the inline rules and plain-path breadcrumbs. They
+no longer import `BLACKBOX.md`; it remains an optional complete reference.
+Generated Blackbox tool procedures are split by topic. Local global rendering
+and host-applied `bro render global` share the same complete plan. A provider
+entrypoint over 6,000 bytes reports a diagnostic rather than truncating rules.
+
+Satellites live below `guidance/<content-hash>/` beside the global common file,
+or below `.bbox/guidance/<content-hash>/` in a project. Their source remains the
+knowledge entries and code-owned tool catalog, not the generated markdown.
+The applier validates all satellite paths and contents, writes satellites first,
+and only then publishes entrypoints. Previous generations remain available for
+rollback and in-flight readers. A conflicting immutable file or symlink refuses
+the render. Global managed regions preserve surrounding hand-authored text and
+retain the destructive-shrink guard. An explicit relocation can pass that guard
+only when every old nonempty line remains in that provider's entrypoint or a
+referenced satellite; mechanically updated content-addressed breadcrumbs are
+matched by their unchanged cue and filename. Project entrypoints retain their
+existing generated-file ownership check.
+
+Global render plans use wire kind `bbox.global_render_plan.v2`; project render
+transport uses version 2. Upgrade the daemon and applying client/collector
+together: older versions cannot safely interpret the satellite contract.
+`bro render global` assembles checksum-bound pages before writing any files;
+a stale generation restarts delivery from page one, with bounded retries.
+Project receipts and drift checks cover satellites as well as entrypoints.
+
+`PROJECT.md` is conditional project orientation, with repository-relative links
+to authored guides. It is not included automatically. To inspect or regenerate
+project guidance offline, without reading the live knowledge store:
+
+```sh
+cargo run -p bbox-tool-docs --example render_guidance -- /path/to/repo /path/to/output
+```
+
+Use a separate output directory for a preview. Using the source directory as the
+output regenerates that checkout's project projections from `.bbox/knowledge`.
+Generated project satellites are committed alongside their source entries.

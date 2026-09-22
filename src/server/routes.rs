@@ -2147,6 +2147,7 @@ mod tests {
 
     fn embedding_test_entry(content: &str) -> crate::knowledge::KnowledgeEntry {
         crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: "embed-source".into(),
             title: "embed source".into(),
             content: content.into(),

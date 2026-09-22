@@ -10,3 +10,7 @@ edition = "2024"
 anyhow = "1"
 bbox-util = { path = "../bbox-util" }
 bbox-knowledge = { path = "../bbox-knowledge" }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

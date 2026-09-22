@@ -1656,6 +1656,7 @@ mod tests {
 
     fn write_test_knowledge(root: &Path, id: &str, content: &str) {
         let entry = KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: id.into(),
             content: content.into(),
@@ -1883,6 +1884,7 @@ mod tests {
     fn global_mutations_bypass_broken_project_publisher_and_overlay() {
         let (_temp, server, base, worktree, scope) = fixture();
         let global = KnowledgeEntry {
+            render_placement: Default::default(),
             id: "global-update".into(),
             title: "global entry".into(),
             content: "global content".into(),
@@ -1963,6 +1965,7 @@ mod tests {
             .write()
             .learn_result_with_checkout(
                 &bbox_knowledge::knowledge::LearnParams {
+                    render_placement: None,
                     id: Some(update.id),
                     content: "updated global content".into(),
                     category: "memory".into(),

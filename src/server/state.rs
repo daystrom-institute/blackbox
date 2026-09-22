@@ -1909,6 +1909,7 @@ mod code_read_view_tests {
 
     fn knowledge_entry(content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
         bbox_knowledge::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: "feed1234".into(),
             title: "pinned view commit test".into(),
             content: content.into(),
@@ -3173,6 +3174,7 @@ pub(crate) mod catalog_fixture {
 
     pub(crate) fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.to_string(),
             title: format!("entry {id}"),
             content: content.to_string(),

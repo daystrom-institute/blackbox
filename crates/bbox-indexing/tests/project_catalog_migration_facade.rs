@@ -3390,6 +3390,7 @@ fn publishable_checkout(
 fn fixture_knowledge_entry(id: &str, content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
     use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
     bbox_knowledge::knowledge::KnowledgeEntry {
+        render_placement: Default::default(),
         id: id.to_string(),
         title: format!("entry {id}"),
         content: content.to_string(),

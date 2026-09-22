@@ -12,6 +12,7 @@
   "status": "active",
   "approval": "user_confirmed",
   "render": true,
+  "render_placement": {"placement": "satellite", "topic": "authoring"},
   "decay": true,
   "source": "user",
   "created_at": "2026-05-04T16:35:09Z",

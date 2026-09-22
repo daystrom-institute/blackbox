@@ -97,6 +97,7 @@ fn fixture() -> (CatalogFixture, BlackboxServer, PublishedScope) {
 
 fn learn(id: Option<&str>, content: &str) -> LearnParams {
     LearnParams {
+        render_placement: None,
         id: id.map(str::to_string),
         content: content.into(),
         category: "convention".into(),
@@ -695,6 +696,7 @@ async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_au
         .write()
         .learn_result_with_checkout(
             &LearnParams {
+                render_placement: None,
                 content: "global rule".into(),
                 category: "convention".into(),
                 scope: Some("global".into()),
@@ -970,6 +972,7 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
         .write()
         .learn_result_with_checkout(
             &LearnParams {
+                render_placement: None,
                 content: "global owner".into(),
                 category: "convention".into(),
                 scope: Some("global".into()),
@@ -1129,6 +1132,7 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
     );
     let result = server
         .bbox_learn(Parameters(LearnParams {
+            render_placement: None,
             content: "durable global".into(),
             category: "convention".into(),
             scope: Some("global".into()),
@@ -1148,6 +1152,7 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
         .clone();
     let result = server
         .bbox_learn(Parameters(LearnParams {
+            render_placement: None,
             id: Some(global.id.clone()),
             content: "updated durable global".into(),
             category: "convention".into(),

@@ -1,3 +1,6 @@
+mod pages;
+pub use pages::{GlobalRenderAssembler, GlobalRenderPage};
+
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -351,23 +354,11 @@ pub fn apply_managed_patch(
 
         PatchPlan::Replace {
             path,
-            existing_block,
+            existing_block: _,
             managed_block,
         } => {
             if !allow_destructive_shrink {
-                let new_body = managed_body_trimmed(managed_block);
-                let existing_body = managed_body_trimmed(existing_block);
-                if destructive_managed_shrink(existing_body.len(), new_body.len()) {
-                    anyhow::bail!(
-                        "error.render_destructive_shrink: refusing to replace the managed region \
-                         in {}: the candidate is {} bytes but the existing region is {} bytes. \
-                         The rendered source view may be incomplete; inspect a dry run and \
-                         restore source authority before retrying",
-                        path.display(),
-                        new_body.len(),
-                        existing_body.len(),
-                    );
-                }
+                validate_managed_shrink(plan)?;
             }
             let backup = Some(snapshot_file(path)?);
             let full = fs::read_to_string(path)?;
@@ -386,6 +377,25 @@ pub fn apply_managed_patch(
             Ok(backup)
         }
     }
+}
+
+fn validate_managed_shrink(plan: &PatchPlan) -> Result<()> {
+    if let PatchPlan::Replace {
+        path,
+        existing_block,
+        managed_block,
+    } = plan
+    {
+        let old = managed_body_trimmed(existing_block).len();
+        let new = managed_body_trimmed(managed_block).len();
+        if destructive_managed_shrink(old, new) {
+            anyhow::bail!(
+                "error.render_destructive_shrink: refusing {}: candidate is {new} bytes, existing is {old} bytes; inspect source authority and dry run",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn destructive_managed_shrink(existing_bytes: usize, candidate_bytes: usize) -> bool {
@@ -467,7 +477,7 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 // ── Global render plan (daemon computes, operator host applies) ──────
 
 /// Schema tag for [`GlobalRenderPlanV1`].
-pub const GLOBAL_RENDER_PLAN_KIND_V1: &str = "bbox.global_render_plan.v1";
+pub const GLOBAL_RENDER_PLAN_KIND_V1: &str = "bbox.global_render_plan.v2";
 
 /// A daemon-computed global render, delivered to an operator host that
 /// applies it locally.
@@ -488,6 +498,9 @@ pub struct GlobalRenderPlanV1 {
     pub host_common_target: String,
     /// Managed body for the shared include (`~/.blackbox/BLACKBOX.md`).
     pub common_body: String,
+    /// Immutable files published before any provider entrypoint.
+    #[serde(default)]
+    pub satellites: Vec<crate::guidance::GuidanceFile>,
     /// One managed body per provider global memory file.
     pub providers: Vec<GlobalRenderProviderPlanV1>,
     /// SHA-256 over every body, in order, for receipts and drift checks.
@@ -516,6 +529,7 @@ impl GlobalRenderPlanV1 {
             kind: GLOBAL_RENDER_PLAN_KIND_V1.to_string(),
             host_common_target: host_common_target.display().to_string(),
             common_body,
+            satellites: Vec::new(),
             providers,
             checksum: String::new(),
             diagnostics: Vec::new(),
@@ -524,12 +538,19 @@ impl GlobalRenderPlanV1 {
         plan
     }
 
+    pub fn with_satellites(mut self, satellites: Vec<crate::guidance::GuidanceFile>) -> Self {
+        self.satellites = satellites;
+        self.checksum = self.compute_checksum();
+        self
+    }
+
     fn compute_checksum(&self) -> String {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hasher.update(self.host_common_target.as_bytes());
         hasher.update([0]);
         hasher.update(self.common_body.as_bytes());
+        hasher.update(serde_json::to_vec(&self.satellites).expect("guidance serialization"));
         for provider in &self.providers {
             hasher.update([0]);
             hasher.update(provider.provider.as_bytes());
@@ -547,6 +568,18 @@ impl GlobalRenderPlanV1 {
                 "error.global_render_plan_kind: expected {GLOBAL_RENDER_PLAN_KIND_V1}, got {}",
                 self.kind
             );
+        }
+        crate::guidance::validate_files(&self.satellites)?;
+        let mut providers = std::collections::BTreeSet::new();
+        for provider in &self.providers {
+            let identity = if provider.provider == "codex" {
+                "agents"
+            } else {
+                &provider.provider
+            };
+            if !providers.insert(identity) {
+                anyhow::bail!("duplicate global render provider");
+            }
         }
         let expected = self.compute_checksum();
         if self.checksum != expected {
@@ -603,21 +636,118 @@ pub fn apply_global_render_plan(
             common_target.display()
         );
     }
-    let mut outcomes = Vec::new();
-    let common_plan = plan_managed_patch(&common_target, &plan.common_body)?;
-    outcomes.push(apply_one(&common_target, "common", &common_plan, dry_run)?);
+    let root = common_target
+        .parent()
+        .context("common target has no parent")?;
+    crate::guidance::preflight_files(root, &plan.satellites)?;
+    let mut patches = vec![(
+        common_target.clone(),
+        "common".to_string(),
+        plan_managed_patch(&common_target, &plan.common_body)?,
+    )];
     for provider in &plan.providers {
-        let Some(target) = global_target_path(&provider.provider) else {
-            anyhow::bail!(
-                "error.global_render_plan_provider: {} has no documented global memory file",
-                provider.provider
-            );
-        };
-        let target = target?;
+        let target = global_target_path(&provider.provider).with_context(|| {
+            format!("unsupported global render provider {}", provider.provider)
+        })??;
         let patch = plan_managed_patch(&target, &provider.body)?;
-        outcomes.push(apply_one(&target, &provider.provider, &patch, dry_run)?);
+        patches.push((target, provider.provider.clone(), patch));
+    }
+    // A source-authorized relocation may shrink an entrypoint only when its
+    // previous lines remain in that provider's entrypoint or referenced guides.
+    let mut relocations = Vec::new();
+    for (_, label, patch) in &patches {
+        let relocated = label != "common"
+            && plan
+                .providers
+                .iter()
+                .find(|p| &p.provider == label)
+                .is_some_and(|provider| {
+                    relocation_preserves_guidance(patch, provider, &plan.satellites)
+                });
+        if !relocated {
+            validate_managed_shrink(patch)?;
+        }
+        relocations.push(relocated);
+    }
+    crate::guidance::publish_files(root, &plan.satellites, dry_run)?;
+    let mut outcomes = Vec::new();
+    for file in &plan.satellites {
+        outcomes.push(GlobalRenderApplyOutcomeV1 {
+            target: "satellite".into(),
+            path: root.join(&file.path).display().to_string(),
+            summary: format!("{} ({} bytes)", file.path, file.body.len()),
+            backup: None,
+            managed_block: dry_run.then(|| file.body.clone()),
+        });
+    }
+    for ((target, label, patch), relocated) in patches.into_iter().zip(relocations) {
+        outcomes.push(apply_one(&target, &label, &patch, dry_run, relocated)?);
     }
     Ok(outcomes)
+}
+
+fn relocation_preserves_guidance(
+    patch: &PatchPlan,
+    provider: &GlobalRenderProviderPlanV1,
+    files: &[crate::guidance::GuidanceFile],
+) -> bool {
+    let PatchPlan::Replace { existing_block, .. } = patch else {
+        return false;
+    };
+    let referenced: Vec<_> = files
+        .iter()
+        .filter(|file| provider.body.contains(&file.path))
+        .collect();
+    if referenced.is_empty() {
+        return false;
+    }
+    managed_body_trimmed(existing_block)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .all(|line| {
+            provider.body.contains(line)
+                || referenced.iter().any(|file| file.body.contains(line))
+                || same_guidance_breadcrumb(line, &provider.body, &referenced)
+        })
+}
+
+/// A content-addressed route changes its generation when its body changes.
+/// Accept that mechanical path update only for the same cue and filename.
+fn same_guidance_breadcrumb(
+    line: &str,
+    body: &str,
+    files: &[&crate::guidance::GuidanceFile],
+) -> bool {
+    let Some((cue, old_path)) = line
+        .strip_prefix("- ")
+        .and_then(|s| s.strip_suffix('`'))
+        .and_then(|s| s.split_once(": `"))
+    else {
+        return false;
+    };
+    let components: Vec<_> = old_path.split('/').collect();
+    let Some(tail) = components
+        .len()
+        .checked_sub(3)
+        .map(|start| &components[start..])
+    else {
+        return false;
+    };
+    if tail[0] != "guidance"
+        || tail[1].len() != 64
+        || !tail[1].bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let prefix = format!("- {cue}: `");
+    body.lines().any(|candidate| {
+        candidate.starts_with(&prefix)
+            && files.iter().any(|file| {
+                file.path.ends_with(&format!("/{}", tail[2]))
+                    && candidate.ends_with(&format!("{}`", file.path))
+            })
+    })
 }
 
 fn apply_one(
@@ -625,11 +755,12 @@ fn apply_one(
     label: &str,
     patch: &PatchPlan,
     dry_run: bool,
+    relocated: bool,
 ) -> Result<GlobalRenderApplyOutcomeV1> {
     let backup = if dry_run {
         None
     } else {
-        apply_managed_patch(patch, false)?
+        apply_managed_patch(patch, relocated)?
     };
     Ok(GlobalRenderApplyOutcomeV1 {
         target: label.to_string(),
@@ -983,6 +1114,98 @@ mod tests {
         unsafe {
             std::env::remove_var("BLACKBOX_BACKUP_DIR");
         }
+    }
+
+    #[test]
+    fn explicit_relocation_preserves_old_rules_without_disabling_shrink_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let common = root.join("BLACKBOX.md");
+        let provider = root.join("AGENTS.md");
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", &common);
+        env.set("BLACKBOX_GLOBAL_CODEX_MD", &provider);
+        env.set("BLACKBOX_BACKUP_DIR", root.join("backups"));
+        let original = "Preserve this complete operator instruction. ".repeat(100);
+        let old_route = format!(
+            "- Build guide: `guidance/{}/agents-build.md`",
+            "a".repeat(64)
+        );
+        fs::write(
+            &provider,
+            format!("{MANAGED_START}\n{original}\n{old_route}\n{MANAGED_END}\n"),
+        )
+        .unwrap();
+        let files =
+            crate::guidance::generation_files(vec![("agents-build".into(), original.clone())]);
+        let plan = GlobalRenderPlanV1::new(
+            &common,
+            "reference".into(),
+            vec![GlobalRenderProviderPlanV1 {
+                provider: "agents".into(),
+                body: format!("- Build guide: `{}`", files[0].path),
+            }],
+        )
+        .with_satellites(files);
+        apply_global_render_plan(&plan, false).unwrap();
+        assert!(!fs::read_to_string(&provider).unwrap().contains(&original));
+        fs::write(
+            &provider,
+            format!("{MANAGED_START}\n{original} EXTRA RULE\n{MANAGED_END}\n"),
+        )
+        .unwrap();
+        assert!(apply_global_render_plan(&plan, false).is_err());
+    }
+
+    #[test]
+    fn global_satellites_publish_before_entrypoints_and_validate_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let common = root.join("BLACKBOX.md");
+        let provider = root.join("AGENTS.md");
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", &common);
+        env.set("BLACKBOX_GLOBAL_CODEX_MD", &provider);
+        env.set("BLACKBOX_BACKUP_DIR", root.join("backups"));
+        let satellites = crate::guidance::generation_files(vec![(
+            "agents-retrieval".into(),
+            "exact detail".into(),
+        )]);
+        let plan = GlobalRenderPlanV1::new(
+            &common,
+            "optional reference".into(),
+            vec![GlobalRenderProviderPlanV1 {
+                provider: "agents".into(),
+                body: format!(
+                    "Read when retrieving: `{}`",
+                    root.join(&satellites[0].path).display()
+                ),
+            }],
+        )
+        .with_satellites(satellites);
+        let preview = apply_global_render_plan(&plan, true).unwrap();
+        assert_eq!(preview.len(), 3);
+        assert!(!provider.exists());
+        assert!(!root.join("guidance").exists());
+        let mut bad = plan.clone();
+        bad.providers[0].provider = "unknown".into();
+        bad.checksum = bad.compute_checksum();
+        assert!(apply_global_render_plan(&bad, false).is_err());
+        assert!(!common.exists());
+        assert!(!root.join("guidance").exists());
+        apply_global_render_plan(&plan, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(&plan.satellites[0].path)).unwrap(),
+            "exact detail"
+        );
+        assert!(
+            fs::read_to_string(&provider)
+                .unwrap()
+                .contains("Read when retrieving")
+        );
+        let mut bad = plan.clone();
+        bad.satellites[0].body.push_str(" drift");
+        assert!(apply_global_render_plan(&bad, false).is_err());
     }
 
     #[test]

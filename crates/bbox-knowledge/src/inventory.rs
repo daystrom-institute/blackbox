@@ -769,6 +769,7 @@ mod tests {
 
     fn project_entry(id: &str, project: Option<&str>) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: "t".into(),
             content: "c".into(),

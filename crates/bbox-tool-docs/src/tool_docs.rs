@@ -3,11 +3,9 @@
 //! Every `bbox_*` / `bro_*` MCP tool registered in `main.rs` must have
 //! a matching stanza in `TOOL_DOCS`. A unit test enforces this.
 //!
-//! On daemon startup, `sync_into_knowledge` upserts a fixed-ID global
-//! knowledge entry (`bb-tool-reference`) rendered from the hot subset of
-//! `TOOL_DOCS` + `WORKFLOW_NOTES`. Deep topics stay as system memories,
-//! discoverable through `bbox_knowledge` when the agent actually needs the
-//! runbook, rather than bloating every global render.
+//! On startup, `sync_into_knowledge` publishes a compact inline bootstrap and
+//! topic-scoped satellite entries. `TOOL_DOCS` is the source for both detailed
+//! guidance and tool discovery. Deep runbooks remain available through memory.
 //!
 //! Adding or changing a tool = one edit here. No hand-curated drift.
 
@@ -15,7 +13,9 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 
-use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+use bbox_knowledge::knowledge::{
+    Approval, Category, GuidanceTopic, KnowledgeEntry, Priority, RenderPlacement, Scope, Status,
+};
 
 pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 
@@ -1117,61 +1117,20 @@ pub fn blackbox_mcp_prefix() -> String {
 
 // ── Rendering ────────────────────────────────────────────────────────
 
-/// Render the hot-path tool reference as markdown. Deep categories are
-/// rendered as on-demand system-memory pointers, not as full per-tool manuals.
+/// Assemble an optional reference. Provider entrypoints use `render_bootstrap`
+/// and the topic satellites; this reference is never an automatic import.
 pub fn render_markdown() -> String {
     let mut out = String::new();
     out.push_str(
         "Blackbox tool reference — the MCP tools this daemon exposes and when to reach for them. ",
     );
     out.push_str(
-        "This entry is generated from `src/tool_docs.rs` and refreshed on every daemon restart. ",
+        "This entry is generated from `crates/bbox-tool-docs/src/tool_docs.rs` and refreshed on every daemon restart. ",
     );
     out.push_str("Do not hand-edit.\n\n");
 
-    out.push_str("## CORE RULE: agentic opening sequence\n\n");
-    out.push_str("**For any task that touches the codebase, prior decisions, or conversational history, run this five-step sequence before falling back to filesystem search or training-prior answers:**\n\n");
-    out.push_str("```\n");
-    out.push_str("1. bbox_describe_schema           # orient — entity types + edge families\n");
-    out.push_str(
-        "2. bbox_hybrid_search(q, k=5)     # seeds — mixed-modal results with notable_edges\n",
-    );
-    out.push_str("3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call\n");
-    out.push_str("4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains (when multi-hop)\n");
-    out.push_str("5. bbox_bundle_evidence(...)      # answer — package refs + path_ids\n");
-    out.push_str("```\n\n");
-    out.push_str("Step 1 is one-time per session — cache the schema mentally. Step 4 is conditional (skip when the question is single-hop). Step 5 is the close-the-loop write that lets the user re-query your evidence.\n\n");
-    out.push_str("`bbox_blame(file, line)` is the line-level provenance escape hatch when the question is \"who/why does this line exist?\" rather than a graph walk.\n\n");
-    out.push_str("**Hard rules (break these and quality collapses):**\n\n");
-    out.push_str("1. Entity refs are canonical `<type>:<segments>` — when a tool returns `error.bad_input` with a `suggested_fix`, use the suggestion verbatim, don't guess.\n");
-    out.push_str("2. Don't restate paths from memory — pass `path_ids` from `bbox_find_paths` directly to `bbox_bundle_evidence` (the server holds the validated graph).\n");
-    out.push_str("3. Targeted inspection beats broad inspection — pass `edge_types` and `direction` once you know what you're looking for; default `direction=both` is for orientation only.\n");
-    out.push_str("4. Follow `recommended_next_hops` from `bbox_inspect_entity` — they're ordered semantic-first, structural-last.\n");
-    out.push_str("5. Trust topical hits — `bbox_hybrid_search` blends BM25 + vector + path-token boost. Top seed is the canonical entity even when wording doesn't exactly match.\n\n");
-    out.push_str("Final-answer protocol by question type and pattern recipes (where/what/who/why/how/replacement/historical/impact) live in `sm-agentic-opening-sequence`. Pull it via `bbox_knowledge(query=\"sm-agentic-opening-sequence\")` the first time you handle one of those question shapes.\n\n");
-
-    out.push_str("## CORE RULE: contextual recall fallback\n\n");
-    out.push_str("**When the opening sequence above doesn't fit (fast lookup of stored rules, no graph walk needed), query `bbox_knowledge` directly before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
-    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks (sm-* IDs), and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
-    out.push_str("Do not add a `bbox_knowledge` call just because you are doing procedural state work on an already-authoritative live surface: deduping or resolving gaps with `bbox_gaps`/`bbox_gap*`, opening or continuing threads with `bbox_thread*`, triaging notes/inbox, or committing repo-owned state files. Use the live surface directly unless a specific durable convention, decision, or runbook could materially change the operation.\n\n");
-    out.push_str("The signature failure mode: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
-    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase or escalate to `bbox_hybrid_search` (vector lane catches paraphrases). Then proceed with the opening sequence above or normal implementation work using the retrieved context.\n\n");
-    out.push_str(
-        "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
-    );
-
-    out.push_str("## CORE RULE: operator-approved persistence\n\n");
-    out.push_str("**When the user states a rule, convention, or preference that may need to bind future sessions, do not immediately call `bbox_learn`, `bbox_remember`, or `bbox_decide`.** First decide whether persistence is warranted, then present the proposed memory text, lane, and scope to the operator and wait for explicit approval. Mechanical enforcement in code/config can enforce the current edit but does not transmit intent to future sessions; persistence still requires approval unless the operator has already approved the exact memory write in the current turn.\n\n");
-    out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
-    out.push_str("Lane selection - when preparing a persistence proposal, walk the ladder and stop at the first yes:\n\n");
-    out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
-    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn` or `bbox_decide`\n");
-    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_remember`\n");
-    out.push_str("4. Otherwise - arc-bound guidance that must stay hot for one execution lane - → `bbox_pin`\n\n");
-    out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
-    out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, propose the exact storage text, lane, and scope before replying; only emit the storage call after the operator approves it.\n\n");
-
-    out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
+    render_retrieval_workflow(&mut out);
+    render_persistence_workflow(&mut out);
 
     for cat in HOT_RENDER_CATEGORIES {
         out.push_str(&format!("## {}\n\n", cat.heading()));
@@ -1207,6 +1166,29 @@ pub fn render_markdown() -> String {
     out
 }
 
+fn render_retrieval_workflow(out: &mut String) {
+    out.push_str("## Retrieval workflow\n\n");
+    out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
+    out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, `bbox_search` for conversation history, and `bbox_hybrid_search` for indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
+    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package. Use `bbox_blame` for line-level provenance.\n\n");
+    out.push_str("Use tool-returned canonical entity refs and suggested fixes. Scope edge types and direction to the question. Retrieve `sm-agentic-opening-sequence` only for a graph investigation that needs its detailed recipes.\n\n");
+}
+
+fn render_persistence_workflow(out: &mut String) {
+    out.push_str("## CORE RULE: operator-approved persistence\n\n");
+    out.push_str("**When the user states a rule, convention, or preference that may need to bind future sessions, do not immediately call `bbox_learn`, `bbox_remember`, or `bbox_decide`.** First decide whether persistence is warranted, then present the proposed memory text, lane, and scope to the operator and wait for explicit approval. Mechanical enforcement in code/config can enforce the current edit but does not transmit intent to future sessions; persistence still requires approval unless the operator has already approved the exact memory write in the current turn.\n\n");
+    out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
+    out.push_str("Lane selection - when preparing a persistence proposal, walk the ladder and stop at the first yes:\n\n");
+    out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
+    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn` or `bbox_decide`\n");
+    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_remember`\n");
+    out.push_str("4. Otherwise - arc-bound guidance that must stay hot for one execution lane - → `bbox_pin`\n\n");
+    out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
+    out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, propose the exact storage text, lane, and scope before replying; only emit the storage call after the operator approves it.\n\n");
+
+    out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
+}
+
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
     // Cap at 200 bytes — long enough for one or two informative sentences per
     // tool, short enough that the rendered tool reference stays skimmable and
@@ -1233,6 +1215,66 @@ fn hot_summary(summary: &'static str) -> Cow<'static, str> {
     Cow::Owned(format!("{} See MCP.", summary[..end].trim()))
 }
 
+/// The always-loaded contract stays independent of catalog size.
+pub fn render_bootstrap() -> String {
+    "Use Blackbox when stored context or its operations are relevant to the task. \
+     Read only the matching task guide; unrelated work needs no Blackbox opening sequence.\n\n\
+     Durable rules and decisions require operator approval of the exact text before persistence. \
+     List before creating dedupe-sensitive objects. Use returned canonical refs.\n"
+        .to_string()
+}
+
+fn topic_for_category(category: ToolCategory) -> GuidanceTopic {
+    match category {
+        ToolCategory::Transcripts | ToolCategory::Graph | ToolCategory::ProjectGraphs => {
+            GuidanceTopic::Retrieval
+        }
+        ToolCategory::Knowledge | ToolCategory::Packets => GuidanceTopic::Persistence,
+        ToolCategory::Threads
+        | ToolCategory::Notes
+        | ToolCategory::Inbox
+        | ToolCategory::Artifacts
+        | ToolCategory::Orchestration => GuidanceTopic::Orchestration,
+        _ => GuidanceTopic::Operations,
+    }
+}
+
+pub fn render_satellite(topic: GuidanceTopic) -> String {
+    let mut out = String::new();
+    match topic {
+        GuidanceTopic::Retrieval => render_retrieval_workflow(&mut out),
+        GuidanceTopic::Persistence => render_persistence_workflow(&mut out),
+        GuidanceTopic::Orchestration => out.push_str(WORKFLOW_NOTES),
+        _ => {}
+    }
+    for cat in HOT_RENDER_CATEGORIES.iter().copied().chain([
+        ToolCategory::Gaps,
+        ToolCategory::Operations,
+        ToolCategory::StorageHealth,
+        ToolCategory::ProjectCatalog,
+        ToolCategory::ProjectGraphs,
+        ToolCategory::Workspace,
+    ]) {
+        if topic_for_category(cat) != topic {
+            continue;
+        }
+        out.push_str(&format!("## {}\n\n{}\n\n", cat.heading(), cat.intro()));
+        if let Some(memory) = deferred_system_memory(cat) {
+            out.push_str(&format!(
+                "Detailed runbook: `bbox_knowledge(query=\"{memory}\")`.\n\n"
+            ));
+        }
+        for doc in TOOL_DOCS.iter().filter(|doc| doc.category == cat) {
+            out.push_str(&format!("- `{}`: {}\n", doc.name, doc.summary));
+            if let Some(example) = doc.example {
+                out.push_str(&format!("  Example: `{example}`\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ── Sync into knowledge store ────────────────────────────────────────
 
 pub struct SyncResult {
@@ -1241,21 +1283,59 @@ pub struct SyncResult {
     pub bytes: usize,
 }
 
-/// Upsert the canonical tool reference as a fixed-ID global entry.
-/// Idempotent: no-op if the content hasn't changed.
+/// Upsert the generated bootstrap and topic guides under stable IDs.
+/// Idempotent: no-op if content and placement are unchanged.
 pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Result<SyncResult> {
-    let content = render_markdown();
-    let bytes = content.len();
+    let mut result = SyncResult {
+        wrote: false,
+        bytes: 0,
+    };
+    // Publish satellite source entries first, then replace the old monolithic entry.
+    for topic in [
+        GuidanceTopic::Retrieval,
+        GuidanceTopic::Persistence,
+        GuidanceTopic::Orchestration,
+        GuidanceTopic::Operations,
+    ] {
+        let r = sync_entry(
+            kb,
+            &format!("bb-guide-{}", topic.slug()),
+            &format!("Blackbox {} guide", topic.slug()),
+            render_satellite(topic),
+            RenderPlacement::Satellite { topic },
+        )?;
+        result.wrote |= r.wrote;
+        result.bytes += r.bytes;
+    }
+    let r = sync_entry(
+        kb,
+        TOOL_DOC_ENTRY_ID,
+        "Blackbox essentials",
+        render_bootstrap(),
+        RenderPlacement::Inline,
+    )?;
+    result.wrote |= r.wrote;
+    result.bytes += r.bytes;
+    Ok(result)
+}
 
+fn sync_entry(
+    kb: &mut bbox_knowledge::knowledge::Knowledge,
+    id: &str,
+    title: &str,
+    content: String,
+    placement: RenderPlacement,
+) -> Result<SyncResult> {
+    let bytes = content.len();
     // Look for existing entry by stable ID
-    let existing = kb
-        .all_entries()
-        .iter()
-        .find(|e| e.id == TOOL_DOC_ENTRY_ID)
-        .cloned();
+    let existing = kb.all_entries().iter().find(|e| e.id == id).cloned();
 
     if let Some(ref e) = existing {
-        if e.content == content {
+        if e.content == content
+            && e.render_placement == placement
+            && e.render
+            && e.status == Status::Active
+        {
             return Ok(SyncResult {
                 wrote: false,
                 bytes,
@@ -1265,8 +1345,9 @@ pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Res
 
     let now = bbox_util::util::now_iso();
     let entry = KnowledgeEntry {
-        id: TOOL_DOC_ENTRY_ID.to_string(),
-        title: "Blackbox tool reference".to_string(),
+        render_placement: placement,
+        id: id.to_string(),
+        title: title.to_string(),
         content,
         cluster: None,
         variants: Default::default(),
@@ -1305,6 +1386,65 @@ pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_migrates_the_monolith_and_rerender_keeps_guides_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut kb =
+            bbox_knowledge::knowledge::Knowledge::open(&root.join("knowledge.json")).unwrap();
+        assert!(sync_into_knowledge(&mut kb).unwrap().wrote);
+        let mut legacy = kb
+            .all_entries()
+            .iter()
+            .find(|e| e.id == TOOL_DOC_ENTRY_ID)
+            .unwrap()
+            .clone();
+        legacy.content = render_markdown();
+        kb.upsert_generated(legacy).unwrap();
+        assert!(sync_into_knowledge(&mut kb).unwrap().wrote);
+        assert!(!sync_into_knowledge(&mut kb).unwrap().wrote);
+        let request = bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+            host_common_target: root.join("BLACKBOX.md").display().to_string(),
+            offset: None,
+            plan_sha256: None,
+        };
+        let plan = kb.global_render_plan(Some("agents"), &request).unwrap();
+        let body = &plan.providers[0].body;
+        assert!(
+            body.len() < 2_500,
+            "generated inline overhead: {} bytes",
+            body.len()
+        );
+        assert!(!body.contains("bro_exec"));
+        assert!(!body.contains("bbox_describe_schema"));
+        assert_eq!(plan.satellites.len(), 4);
+        for file in &plan.satellites {
+            assert!(body.contains(&file.path));
+        }
+        assert_eq!(
+            plan,
+            kb.global_render_plan(Some("agents"), &request).unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_bootstrap_stays_small_and_procedures_are_deferred() {
+        let bootstrap = render_bootstrap();
+        assert!(bootstrap.len() < 1_024);
+        assert!(!bootstrap.contains("bbox_describe_schema"));
+        assert!(!bootstrap.contains("bro_exec"));
+        let retrieval = render_satellite(GuidanceTopic::Retrieval);
+        assert!(retrieval.contains("bbox_hybrid_search"));
+        assert!(!retrieval.contains("bro_exec"));
+        assert!(!retrieval.contains("Cost of a wasted query"));
+        assert!(!retrieval.contains("run this five-step sequence"));
+        let operations = render_satellite(GuidanceTopic::Operations);
+        assert!(operations.contains("bbox_gap"));
+        assert!(operations.contains("sm-gap-notes"));
+        let persistence = render_satellite(GuidanceTopic::Persistence);
+        assert!(persistence.contains("operator-approved persistence"));
+    }
 
     #[test]
     fn render_contains_hot_tool_names() {

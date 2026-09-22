@@ -70,6 +70,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Rendered agent instructions now keep essential rules inline and route task-specific
+  guidance to generated, content-addressed satellite files. Local and remote render
+  plans publish satellites before entrypoints, preserve previous generations, and
+  include satellite integrity in project receipts. `PROJECT.md` is conditional
+  orientation rather than an unconditional import.
+
 - Harness context follows provider placement before tasks, preserves explicit
   scope and pin removals, and honors project AGENTS override precedence. Request
   budgeting includes retained output and current instructions/tools, survives

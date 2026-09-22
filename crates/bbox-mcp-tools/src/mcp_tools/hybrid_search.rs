@@ -1536,6 +1536,7 @@ mod tests {
 
     fn visible_knowledge_entry(id: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: "visible".into(),
             content: "visible content".into(),
@@ -2308,6 +2309,7 @@ pdf_figure = "voyage_visual"
             built_from: Default::default(),
             provenance: Default::default(),
             entries: vec![KnowledgeEntry {
+                render_placement: Default::default(),
                 id: "vector-only".into(),
                 title: "Vector only".into(),
                 content: "semantic-only content".into(),

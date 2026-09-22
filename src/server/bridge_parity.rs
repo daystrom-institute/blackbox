@@ -237,6 +237,7 @@ mod harness {
 
     fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.to_string(),
             title: format!("entry {id}"),
             content: content.to_string(),

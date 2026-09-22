@@ -876,6 +876,7 @@ impl BlackboxServer {
             );
         }
         let entry = crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: String::new(),
             title,
             content: p.content.clone(),
@@ -905,6 +906,7 @@ impl BlackboxServer {
         };
         self.mutate_queued_knowledge(project_id, scope, "bbox_learn create", |transaction| {
             let entry = crate::knowledge::KnowledgeEntry {
+                render_placement: Default::default(),
                 id: transaction.mint_id(),
                 ..entry
             };
@@ -930,6 +932,7 @@ impl BlackboxServer {
         };
         let now = bbox_util::util::now_iso();
         let entry = crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: String::new(),
             title: Self::checkout_lane_title(&p.content, &p.title),
             content: p.content.clone(),
@@ -959,6 +962,7 @@ impl BlackboxServer {
         };
         self.mutate_queued_knowledge(project_id, scope, "bbox_remember", |transaction| {
             let entry = crate::knowledge::KnowledgeEntry {
+                render_placement: Default::default(),
                 id: transaction.mint_id(),
                 ..entry
             };
@@ -990,6 +994,7 @@ impl BlackboxServer {
         let priority = Self::checkout_lane_priority(p.priority.as_deref())?;
         let now = bbox_util::util::now_iso();
         let entry = crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: String::new(),
             title: Self::checkout_lane_title(&p.content, &p.title),
             content: p.content.clone(),
@@ -1019,6 +1024,7 @@ impl BlackboxServer {
         };
         self.mutate_queued_knowledge(project_id, scope, "bbox_decide", |transaction| {
             let entry = crate::knowledge::KnowledgeEntry {
+                render_placement: Default::default(),
                 id: transaction.mint_id(),
                 ..entry
             };
@@ -3127,6 +3133,7 @@ mod tests {
 
         let learn = server
             .bbox_learn(Parameters(LearnParams {
+                render_placement: None,
                 content: "WORKTREE_KB_MARKER: prefer rustls".into(),
                 category: "convention".into(),
                 scope: Some("project".into()),
@@ -3229,6 +3236,7 @@ mod tests {
         std::fs::write(&local, "block overlay marker creation").unwrap();
         let degraded = server
             .bbox_learn(Parameters(LearnParams {
+                render_placement: None,
                 content: "WORKTREE_KB_DEGRADED_MARKER: legacy write survives".into(),
                 category: "convention".into(),
                 scope: Some("project".into()),
@@ -3254,6 +3262,7 @@ mod tests {
     ) -> crate::knowledge::KnowledgeEntry {
         use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
         crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: id.into(),
             content: content.into(),

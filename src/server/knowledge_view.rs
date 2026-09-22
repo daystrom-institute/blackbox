@@ -2505,6 +2505,7 @@ fn knowledge_entry_from_accepted(
     project_id: &ProjectId,
 ) -> KnowledgeEntry {
     KnowledgeEntry {
+        render_placement: Default::default(),
         id: record.id.as_str().to_string(),
         title: record.title.clone(),
         content: record.content.clone(),
@@ -2769,6 +2770,7 @@ mod tests {
 
     fn entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: id.into(),
             content: content.into(),

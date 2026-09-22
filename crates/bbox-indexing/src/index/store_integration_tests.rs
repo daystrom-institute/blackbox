@@ -23,6 +23,7 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
     )
     .unwrap();
     let entry = bbox_knowledge::knowledge::KnowledgeEntry {
+        render_placement: Default::default(),
         id: "abc12345".into(),
         title: "Delete fixture".into(),
         content: "tombstone searchable knowledge phrase".into(),

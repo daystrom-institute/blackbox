@@ -313,7 +313,12 @@ impl BlackboxServer {
                     // inside it rather than as trailing text.
                     let mut plan: bbox_util::global_render::GlobalRenderPlanV1 =
                         serde_json::from_str(&rendered)?;
-                    plan.diagnostics = view.diagnostics;
+                    plan.diagnostics.extend(view.diagnostics);
+                    if let Some(request) = &p.global_plan {
+                        if let Some(offset) = request.offset {
+                            return Ok(serde_json::to_string(&plan.page(offset, request.plan_sha256.as_deref())?)?);
+                        }
+                    }
                     return Ok(serde_json::to_string_pretty(&plan)?);
                 }
                 rendered
@@ -580,6 +585,7 @@ mod tests {
 
     fn knowledge_entry(id: &str, content: String) -> KnowledgeEntry {
         KnowledgeEntry {
+            render_placement: Default::default(),
             id: id.into(),
             title: id.into(),
             content,
@@ -962,6 +968,7 @@ mod catalog_render_tests {
 
     fn render_entry() -> crate::knowledge::KnowledgeEntry {
         crate::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
             id: "render-locality-entry".into(),
             title: "Project render locality".into(),
             content: "DAEMON_RENDER_LOCALITY_MARKER".into(),
@@ -1156,6 +1163,8 @@ mod catalog_render_tests {
             .bbox_render(Parameters(RenderParams {
                 scope: Some("global".into()),
                 global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                    offset: None,
+                    plan_sha256: None,
                     host_common_target: host_common.display().to_string(),
                 }),
                 ..Default::default()
@@ -1174,8 +1183,11 @@ mod catalog_render_tests {
         assert_eq!(providers, ["claude", "agents", "gemini"]);
         for provider in &plan.providers {
             assert!(
-                provider.body.contains(&host_common.display().to_string()),
-                "{} body must include the host common target: {}",
+                provider.body.contains("bbox_gap")
+                    && !provider
+                        .body
+                        .contains(&format!("@{}", host_common.display())),
+                "{} body must inline core rules without importing the common reference: {}",
                 provider.provider,
                 provider.body
             );
@@ -1185,11 +1197,31 @@ mod catalog_render_tests {
             "the daemon must not write the plan's targets itself"
         );
 
+        let paged = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("global".into()),
+                global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                    offset: Some(0),
+                    plan_sha256: None,
+                    host_common_target: host_common.display().to_string(),
+                }),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!is_error(&paged), "{paged:?}");
+        let page: bbox_util::global_render::GlobalRenderPage =
+            serde_json::from_str(&text(&paged)).unwrap();
+        let mut assembler = bbox_util::global_render::GlobalRenderAssembler::default();
+        assert_eq!(assembler.push(page).unwrap().unwrap(), plan);
+        assert!(!host_common.exists());
+
         let rejected = server
             .bbox_render(Parameters(RenderParams {
                 scope: Some("project".into()),
                 project: Some(PROJECT.into()),
                 global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                    offset: None,
+                    plan_sha256: None,
                     host_common_target: host_common.display().to_string(),
                 }),
                 ..Default::default()
