@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "blocks_task",
   "dedupe_key": "tooling/bro-harness-transport/thinking-replay-signature-openrouter",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-20T07:24:41Z",
-  "updated_at": "2026-08-20T07:24:41Z"
+  "updated_at": "2026-09-23T23:01:54Z",
+  "resolved_at": "2026-09-23T23:01:54Z",
+  "resolution_note": "obsolete: db3f0d8b makes reconstruct_segment in crates/bro-harness/src/transport/anthropic.rs always replay thinking blocks with a signature field (empty when no signature_delta streamed); covered by reconstruct_segment_emits_empty_signature_when_stream_gave_none."
 }
