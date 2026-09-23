@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/refactor-tools/code-items-aggregate-cap",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-18T23:21:45Z",
-  "updated_at": "2026-08-18T23:21:45Z"
+  "updated_at": "2026-09-23T22:32:05Z",
+  "resolved_at": "2026-09-23T22:32:05Z",
+  "resolution_note": "obsolete: code.items batch path is now paged and aggregate-capped (MAX_ITEMS_PAGE_FILES=128, MAX_FACT_RESULT_BYTES=1 MiB, next_offset/truncated/aggregate_capped/files_scanned/files_total, per-file inventory_too_large) in 76447947, crates/bro-harness/src/bindings/code_facts.rs CodeItems::call; code.query keeps MAX_AGGREGATE_QUERY_CAPTURES; code.fields is single-file only, so no uncapped multi-file collection path remains in the code bindings."
 }

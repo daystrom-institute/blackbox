@@ -3,19 +3,23 @@
   "title": "code.query authoring is blind: no tree-sitter node-kind introspection",
   "gap_kind": "tooling",
   "domain": "refactor-tools/code-facts",
-  "wanted_capability": "Query-authoring support for cells, two halves. (1) Binding half: code.nodeKinds(file|language) enumerating valid tree-sitter node type names (and ideally field names). (2) Doc half — operator direction 2026-06-12: as the query surface expands, do NOT keep growing inline declaration prose; create an sm-tree-sitter system memory holding per-language grammar guidance + example queries, and signpost it from the tool docs/declarations (\"use bbox_knowledge to read sm-tree-sitter before authoring code queries\"). Caveat for the signpost: standalone harness probes have no bbox MCP surface — daemon dispatches can follow it from cells via tools.mcp__blackbox__bbox_knowledge, standalone agents need the binding half or inline minimum. Probe-2 evidence sharpened the failure mode: a VALID query returning empty captures collapsed the agent's confidence in the whole namespace (now mitigated by an empty-vs-invalid line in the declarations, but the deep fix is grammar knowledge on demand).",
+  "wanted_capability": "Query authors can discover, on demand, the valid tree-sitter node kinds and field names for each language code.query supports, instead of guessing from examples. Two parts: (1) a code binding (for example code.nodeKinds({language}) or code.grammar) returning the named node kinds and field names of that language's grammar, read from the tree-sitter Language metadata the query path already loads; (2) per-language grammar guidance with example queries kept as retrievable guidance and signposted from the code namespace description, so query-authoring prose stops growing inline in the tool declarations. Part (1) must work in standalone harness sessions that have no Blackbox MCP surface.",
   "missing_primitive": "code.nodeKinds(language) binding + example queries in declarations",
   "fallback_used": "Abandoned semantic queries after 2 failed cells; fell back to a structural (function_item (visibility_modifier)) query plus code.read + JS string matching.",
   "evidence": [
-    "session probe-code-facts-1 (BRO_HOME=/tmp/refactor-v2-probe/brohome), cells 3-5",
-    "prompts/RETRO_ISOLATE_REFACTOR.md retro findings: query-authoring x2, errors",
-    "design/bro-harness/refactor-v2-pressure-test.md §7"
+    "crates/bro-harness/src/bindings/code_facts.rs: CodeQuery (code.query) and the code namespace description in tools(), which carries the inline query-authoring examples and empty-vs-invalid note",
+    "crates/bbox-refactor/src/facts.rs: file_query, which resolves the grammar via chunker::code::ts_language_for_name",
+    "design/bro-harness/refactor-v2-pressure-test.md section 7",
+    "prompts/RETRO_ISOLATE_REFACTOR.md (query-authoring retro findings)"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/refactor-tools/ts-query-node-kind-introspection",
-  "notes": "Inline mitigations landed (commits 27b8236, and the probe-3 round): two example queries, empty-vs-invalid semantics, node-kind provenance note. These are holding the line but are exactly the inline growth the operator wants capped — next expansion goes to sm-tree-sitter + signpost instead.",
-  "resolution": "unresolved",
+  "notes": "Traced 2026-09-23: no node-kind or grammar introspection binding exists; the code namespace lists eight methods (items, fields, files, query, read, readLines, signature, spanUnion). Inline mitigations remain in the namespace description (two example queries, empty-vs-invalid semantics). No retrievable tree-sitter guidance memory exists.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "created_at": "2026-06-12T19:27:18Z",
-  "updated_at": "2026-06-12T19:46:57Z"
+  "updated_at": "2026-09-23T22:33:22Z",
+  "resolved_at": "2026-09-23T22:33:22Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/20"
 }
