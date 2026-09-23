@@ -7266,6 +7266,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
             claim_scopes: Default::default(),
+            auto_publish: false,
         }];
         let catalog = catalog_grant_store(
             &root.join("catalog"),
@@ -8463,6 +8464,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: Vec::new(),
                 claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                auto_publish: false,
             }],
             Vec::new(),
         );
@@ -8524,6 +8526,7 @@ mod tests {
                         token_files: Vec::new(),
                         scopes: Vec::new(),
                         claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                        auto_publish: false,
                     },
                     CodeCollectionProducerConfig {
                         producer_id: "producer-b".into(),
@@ -8531,6 +8534,7 @@ mod tests {
                         token_files: Vec::new(),
                         scopes: (!claimed).then(|| scope.clone()).into_iter().collect(),
                         claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                        auto_publish: false,
                     },
                 ],
                 claimed
@@ -8578,6 +8582,7 @@ mod tests {
                     token_files: Vec::new(),
                     scopes: Vec::new(),
                     claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                    auto_publish: false,
                 },
                 CodeCollectionProducerConfig {
                     producer_id: "producer-b".into(),
@@ -8585,6 +8590,7 @@ mod tests {
                     token_files: Vec::new(),
                     scopes: vec![sibling],
                     claim_scopes: ProducerScopeClaimPolicy::None,
+                    auto_publish: false,
                 },
             ],
             Vec::new(),
@@ -8626,6 +8632,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: vec![pinned],
                 claim_scopes: ProducerScopeClaimPolicy::None,
+                auto_publish: false,
             }],
             Vec::new(),
         );
@@ -8820,6 +8827,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes,
                 claim_scopes: Default::default(),
+                auto_publish: false,
             };
 
         let broker = snapshot_broker(Vec::new());
@@ -9256,6 +9264,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
             claim_scopes: Default::default(),
+            auto_publish: false,
         }];
         config
     }
@@ -9286,6 +9295,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: Vec::new(),
             claim_scopes: ProducerScopeClaimPolicy::None,
+            auto_publish: false,
         }];
         let error = build_snapshot(
             &none,
@@ -9347,6 +9357,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: vec![scope.clone()],
                 claim_scopes: ProducerScopeClaimPolicy::None,
+                auto_publish: false,
             },
             CodeCollectionProducerConfig {
                 producer_id: "producer-b".into(),
@@ -9354,6 +9365,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: Vec::new(),
                 claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                auto_publish: false,
             },
         ];
         let claims = ProducerClaimStore {
@@ -9414,6 +9426,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: Vec::new(),
             claim_scopes: ProducerScopeClaimPolicy::None,
+            auto_publish: false,
         }];
         let claims_path = root.join("producer-claims.json");
         let claims_store = Arc::new(parking_lot::RwLock::new(
@@ -9659,6 +9672,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
             claim_scopes: Default::default(),
+            auto_publish: false,
         }];
         let claims = ProducerClaimStore {
             version: PRODUCER_CLAIM_STORE_VERSION,
@@ -9719,6 +9733,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: vec![scope.clone()],
                 claim_scopes: Default::default(),
+                auto_publish: false,
             },
             CodeCollectionProducerConfig {
                 producer_id: "dup-producer-b".into(),
@@ -9726,6 +9741,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: vec![scope.clone()],
                 claim_scopes: Default::default(),
+                auto_publish: false,
             },
         ];
 

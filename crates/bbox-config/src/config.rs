@@ -309,6 +309,8 @@ struct RawDaemonConfig {
     pub port: u16,
     #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub advertise_url: Option<String>,
     #[serde(default = "default_daemon_mcp_name")]
     pub mcp_name: String,
     #[serde(default = "default_daemon_mcp_allowed_hosts")]
@@ -608,6 +610,7 @@ pub struct ResolvedPathConfig {
 pub struct DaemonConfig {
     pub port: u16,
     pub bind: String,
+    pub advertise_url: Option<String>,
     pub mcp_name: String,
     pub mcp_allowed_hosts: Vec<String>,
     pub shutdown_grace_secs: u64,
@@ -674,6 +677,8 @@ pub struct CodeCollectionProducerConfig {
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
     #[serde(default)]
     pub claim_scopes: ProducerScopeClaimPolicy,
+    #[serde(default)]
+    pub auto_publish: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1049,6 +1054,7 @@ impl Config {
             daemon: RawDaemonConfig {
                 port: default_daemon_port(),
                 bind: default_daemon_bind(),
+                advertise_url: None,
                 mcp_name: default_daemon_mcp_name(),
                 mcp_allowed_hosts: default_daemon_mcp_allowed_hosts(),
                 shutdown_grace_secs: default_daemon_shutdown_grace_secs(),
@@ -1125,6 +1131,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !bind.trim().is_empty()
     {
         raw.daemon.bind = bind;
+    }
+
+    if let Ok(advertise_url) = std::env::var("BLACKBOX_ADVERTISE_URL")
+        && !advertise_url.trim().is_empty()
+    {
+        raw.daemon.advertise_url = Some(advertise_url);
     }
 
     if let Ok(mcp_name) = std::env::var("BLACKBOX_MCP_NAME")
@@ -1424,6 +1436,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         daemon: DaemonConfig {
             port: raw.daemon.port,
             bind: raw.daemon.bind,
+            advertise_url: raw.daemon.advertise_url,
             mcp_name: raw.daemon.mcp_name,
             mcp_allowed_hosts: raw.daemon.mcp_allowed_hosts,
             shutdown_grace_secs: raw.daemon.shutdown_grace_secs,
@@ -3390,6 +3403,7 @@ state_dir = "~"
             token_files: token_files.into_iter().map(PathBuf::from).collect(),
             scopes: Vec::new(),
             claim_scopes: ProducerScopeClaimPolicy::None,
+            auto_publish: false,
         }
     }
 
@@ -3412,6 +3426,34 @@ state_dir = "~"
             .extract()
             .unwrap();
         assert_eq!(unclaimed.claim_scopes, ProducerScopeClaimPolicy::Unclaimed);
+        assert!(!defaulted.auto_publish);
+
+        let auto_publish: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 auto_publish = true\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(auto_publish.auto_publish);
+    }
+
+    #[test]
+    fn daemon_advertise_url_is_optional_and_parses() {
+        let defaulted: RawDaemonConfig = Figment::new().extract().unwrap();
+        assert_eq!(defaulted.advertise_url, None);
+
+        let configured: RawDaemonConfig = Figment::new()
+            .merge(Toml::string(
+                "advertise_url = \"https://blackbox.example.test\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            configured.advertise_url.as_deref(),
+            Some("https://blackbox.example.test")
+        );
     }
 
     #[test]
