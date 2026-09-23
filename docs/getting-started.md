@@ -102,6 +102,10 @@ url = "http://127.0.0.1:7264/mcp?surface=interactive"
 
 ## 4. Enroll a project from its owning checkout
 
+MCP clients can read the instance-specific onboarding instructions from
+`blackbox://skills/onboard-project/SKILL.md`, use the `onboard-project` prompt,
+or discover the same skill through `skills/list`.
+
 Check `bbox_project_list()` before adding a project. For a remote corpus daemon,
 configure one producer with `claim_scopes = "unclaimed"` and configure the
 [Code Source Collector](code-source-collector.md) on the checkout host with an

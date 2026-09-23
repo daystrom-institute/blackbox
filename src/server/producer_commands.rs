@@ -193,6 +193,31 @@ impl ProducerCommandRuntime {
         Ok(winners.remove(0))
     }
 
+    pub(crate) fn fresh_presences(&self) -> Vec<KnownProducerPresence> {
+        let now = self.clock.now_secs();
+        self.state
+            .lock()
+            .presences
+            .iter()
+            .filter(|(_, record)| {
+                now.saturating_sub(record.last_seen_secs) <= PRODUCER_PRESENCE_FRESH_SECS
+            })
+            .map(|(producer_id, record)| KnownProducerPresence {
+                producer_id: producer_id.clone(),
+                presence: record.presence.clone(),
+                fresh: true,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_presence_for_test(&self, producer_id: &str, age_secs: u64) {
+        let now = self.clock.now_secs();
+        if let Some(record) = self.state.lock().presences.get_mut(producer_id) {
+            record.last_seen_secs = now.saturating_sub(age_secs);
+        }
+    }
+
     pub(crate) fn enqueue_enroll(
         &self,
         producer_id: &str,

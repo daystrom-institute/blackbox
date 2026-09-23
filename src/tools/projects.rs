@@ -480,6 +480,7 @@ impl BlackboxServer {
                     "message": "multiple checkout-host producers have equally specific enroll roots for this path",
                     "path": params.path,
                     "candidates": producer_ids,
+                    "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
                     "next_step": "Call bbox_project_register again with the producer parameter set to one candidate id."
                 }));
             }
@@ -507,6 +508,7 @@ impl BlackboxServer {
                     "message": "no fresh checkout-host producer covers this path",
                     "path": params.path,
                     "known_producers": known,
+                    "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
                 }));
             }
         };
@@ -524,7 +526,7 @@ impl BlackboxServer {
             Some(ProducerCommandResult::Applied(receipt)) => {
                 let next_step = (!receipt.identity_committed).then(|| {
                     format!(
-                        "Commit exactly [{}] on {} and push that ref, then call bbox_project_register again if publication has not started.",
+                        "Commit exactly [{}] on {}, then call bbox_project_register again if publication has not started. Do not push unless the user asks; the collector reads the local ref.",
                         receipt
                             .commit_paths
                             .iter()
@@ -815,11 +817,16 @@ impl BlackboxServer {
             }
             if !path.exists() {
                 anyhow::bail!(
-                    "error.project_init_remote: {} is not visible to this daemon. Call \
-                     bbox_project_register(path={:?}) instead; remote registration routes to \
-                     the checkout-host collector and scaffolds the project as part of enrollment.",
-                    p.path,
-                    p.path
+                    "{}",
+                    serde_json::json!({
+                        "code": "error.project_init_remote",
+                        "message": format!(
+                            "{} is not visible to this daemon. Call bbox_project_register instead; remote registration routes to the checkout-host collector and scaffolds the project as part of enrollment.",
+                            p.path
+                        ),
+                        "path": p.path,
+                        "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
+                    })
                 );
             }
             // Bootstrap exception, plan section 4.19: an UNREGISTERED absolute
@@ -1543,6 +1550,8 @@ mod tests {
         assert!(text.contains("\"status\": \"enrolled\""), "{text}");
         assert!(text.contains(".bbox/config.toml"), "{text}");
         assert!(text.contains("refs/heads/main"), "{text}");
+        assert!(!text.contains("push that ref"), "{text}");
+        assert!(text.contains("Do not push unless the user asks"), "{text}");
     }
 
     #[tokio::test]
@@ -1559,6 +1568,56 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert!(
             result_text(&result).contains("error.project_onboarding_no_producer"),
+            "{}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains(crate::server::onboarding_skill::ONBOARDING_SKILL_URI),
+            "{}",
+            result_text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_register_ambiguity_names_the_onboarding_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let root = tmp.path().canonicalize().unwrap();
+        let remote_path = root.join("remote-project");
+        record_presence(&server.state.producer_commands, "producer-a", &root);
+        record_presence(&server.state.producer_commands, "producer-b", &root);
+
+        let error = server
+            .register_remote_project_with_timeout(
+                &ProjectRegisterParams {
+                    path: remote_path.to_string_lossy().into_owned(),
+                    producer: None,
+                },
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error["code"], "error.project_onboarding_ambiguous");
+        assert_eq!(
+            error["skill_uri"],
+            crate::server::onboarding_skill::ONBOARDING_SKILL_URI
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_project_init_error_names_the_onboarding_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let missing = tmp.path().canonicalize().unwrap().join("remote-project");
+        let result = server
+            .bbox_project_init(Parameters(ProjectInitParams {
+                path: missing.to_string_lossy().into_owned(),
+                force: false,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains(crate::server::onboarding_skill::ONBOARDING_SKILL_URI),
             "{}",
             result_text(&result)
         );

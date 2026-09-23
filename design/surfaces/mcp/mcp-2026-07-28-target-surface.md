@@ -319,6 +319,7 @@ blackbox://packet/{id}
 blackbox://atom/{id}
 blackbox://task/{id}                     (live task state)
 blackbox://project/{project}/packet/{id} (explicit project encoding)
+blackbox://skills/onboard-project/SKILL.md
 ```
 
 The classification rule for resource candidacy: a durable ID plus a JSON
@@ -340,6 +341,9 @@ the five catalogs:
   with a standard mechanism any MCP client can consume.
 - **`blackbox://session/{id}`** descriptors (metadata only; message bodies
   stay tool-paginated since `resources/read` has no intra-resource cursor).
+- **`blackbox://skills/onboard-project/SKILL.md`** is the instance-specific
+  onboarding skill served through resources, prompts, and the
+  `io.modelcontextprotocol/skills` extension.
 - **`blackbox://spill/{id}`** (over-cap response payloads). See the spill
   paragraph below: with a remote daemon this stops being optional.
 
