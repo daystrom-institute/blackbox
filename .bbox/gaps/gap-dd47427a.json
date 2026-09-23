@@ -7,16 +7,21 @@
   "missing_primitive": "java.organizeImports LSP-backed mode",
   "fallback_used": "Implemented a syntax-only java.organizeImports/java.hygiene primitive that prunes/sorts obvious imports and reports provenance=\"syntax_only\".",
   "evidence": [
-    "thread-8d968b2d",
-    "crates/bro-harness/src/bindings/java_transforms.rs",
-    "crates/bbox-refactor/src/java/hygiene.rs"
+    "crates/bro-harness/src/bindings/java_transforms.rs (JavaOrganizeImports, JavaHygiene)",
+    "crates/bbox-refactor/src/java/hygiene.rs",
+    "crates/bbox-refactor/src/java/imports.rs",
+    "crates/bro-lsp/src/lib.rs (SessionPool::code_action)",
+    "crates/bro-harness/src/bindings/lsp_facts.rs (lsp.assist)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/java-refactor/lsp-backed-isolate-organize-imports",
-  "notes": "Current code-mode binding does not carry a JDTLS session handle into the isolate tool surface, so recipes can use the conservative hygiene primitive now but cannot request semantic LSP import organization from code-mode yet.",
-  "resolution": "unresolved",
+  "notes": "Traced 2026-09-23: java.organizeImports and java.hygiene (crates/bro-harness/src/bindings/java_transforms.rs, crates/bbox-refactor/src/java/hygiene.rs and imports.rs) are syntax_only with no LSP-backed mode. The harness now owns a JDTLS session pool (bro-lsp Language::Java) and exposes lsp.assist, but SessionPool::code_action sends no CodeActionContext.only filter and no Java hygiene tool routes through JDTLS source.organizeImports, so an lsp_verified import organization for touched files is still unavailable.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T00:53:07Z",
-  "updated_at": "2026-06-14T00:53:07Z"
+  "updated_at": "2026-09-23T23:33:33Z",
+  "resolved_at": "2026-09-23T23:33:33Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/23"
 }
