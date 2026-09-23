@@ -241,6 +241,11 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
         ),
         InstanceRoot::file("pin store", "BLACKBOX_PINS_PATH", paths.pins_path.clone()),
         InstanceRoot::file(
+            "producer claims store",
+            "BLACKBOX_PRODUCER_CLAIMS_PATH",
+            paths.producer_claims_path.clone(),
+        ),
+        InstanceRoot::file(
             "project store",
             "BLACKBOX_PROJECTS_PATH",
             paths.projects_path.clone(),
@@ -873,6 +878,7 @@ mod tests {
             "thread store",
             "notes store",
             "pin store",
+            "producer claims store",
             "project store",
         ] {
             assert!(labels.contains(&expected), "{expected} must be claimed");

@@ -56,6 +56,7 @@ token_file = "~/.config/blackbox/code-collectors/checkout-host-a.token"
 scopes = [
   { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." },
 ]
+claim_scopes = "none"
 ```
 
 The daemon fails closed at startup when an enabled token is unsafe, a scope is
@@ -64,6 +65,33 @@ scope can wait for authenticated onboarding; it cannot publish before admission.
 Legacy bridge mode still requires scopes to resolve to registered projects.
 On SIGHUP, an invalid replacement retains the previous complete assignment and
 authentication table.
+
+Producer fields are:
+
+- `producer_id`: the stable id named by authentication and assignment errors.
+- `token_file` or `token_files`: the mutually exclusive bearer-token forms.
+- `scopes`: operator-pinned published scopes. Pins override durable claims.
+- `claim_scopes`: `none` by default, or `unclaimed` to let this producer claim
+  an unassigned catalog scope on its first authenticated onboard request.
+
+With `claim_scopes = "unclaimed"`, `scopes` may be empty. A new claim is
+accepted only when no other producer owns that scope or any scope with the same
+repository id. Claims persist in the daemon's producer claims store and remain
+effective if the policy later returns to `none`; the policy gates new claims.
+A claimed scope without a catalog project is pending onboarding exactly like a
+pinned scope. Bridge mode ignores claims.
+
+Inspect or revoke claims offline with:
+
+```sh
+blackbox producer-claims list
+blackbox producer-claims revoke \
+  --producer checkout-host-a \
+  --scope '<recorded-repo-id>/.'
+```
+
+Both commands load the daemon configuration to resolve the producer claims
+store path. `--config <path>` selects a non-default daemon configuration.
 
 ### Rotating a producer's token without a downtime window
 

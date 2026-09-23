@@ -560,9 +560,11 @@ async fn catalog_onboard(
     // Promote the freshly cataloged scope out of `pending_onboard` so the
     // ingest routes stop refusing it.
     if receipt.created_project {
+        let _claim_guard = state.producer_claim_lock.lock().await;
         let config = state.config.read().clone();
         let projects = state.records_provider.records_snapshot().records;
-        if let Err(error) = state.code_sources.reload(&config, &projects) {
+        let claims = state.producer_claims.read().records_snapshot();
+        if let Err(error) = state.code_sources.reload(&config, &projects, &claims) {
             tracing::warn!(
                 error = %error,
                 "post-onboard connector grant reload failed; the scope is admitted on the \

@@ -29,7 +29,7 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
             let _ = sighup.recv().await;
             match config::load() {
                 Ok(new_cfg) => {
-                    if let Some(transitions) = install_config_reload(&shared, new_cfg) {
+                    if let Some(transitions) = install_config_reload(&shared, new_cfg).await {
                         super::code_source::apply_source_transitions(shared.clone(), transitions);
                     }
                 }
@@ -44,13 +44,14 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
 /// Install one validated configuration replacement and republish the pinned
 /// read view before any asynchronous source transition can begin. Producer
 /// assignment removal is cutover authority, so readers must stop seeing a
-/// covered producer overlay at this synchronous boundary rather than waiting
+/// covered producer overlay at this installation boundary rather than waiting
 /// for the cutback reconciler.
 #[cfg(any(unix, test))]
-fn install_config_reload(
+async fn install_config_reload(
     shared: &Arc<SharedState>,
     new_cfg: crate::config::Config,
 ) -> Option<super::code_source::SourceTransitions> {
+    let _claim_guard = shared.producer_claim_lock.lock().await;
     if let Err(error) = super::git_source::GitSourceRuntime::validate_config(&new_cfg) {
         tracing::warn!(
             error = %error,
@@ -66,7 +67,8 @@ fn install_config_reload(
         return None;
     }
     let projects = shared.records_provider.records_snapshot().records;
-    let transitions = match shared.code_sources.reload(&new_cfg, &projects) {
+    let claims = shared.producer_claims.read().records_snapshot();
+    let transitions = match shared.code_sources.reload(&new_cfg, &projects, &claims) {
         Ok(transitions) => transitions,
         Err(error) => {
             tracing::warn!(
@@ -237,8 +239,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn config_reload_revokes_covered_producer_overlay_before_transition_dispatch() {
+    #[tokio::test]
+    async fn config_reload_revokes_covered_producer_overlay_before_transition_dispatch() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -307,6 +309,7 @@ mod tests {
             token_file,
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
+            claim_scopes: Default::default(),
         }];
 
         let mut state = SharedState::for_test_catalog(&state_dir, &catalog_path);
@@ -320,6 +323,7 @@ mod tests {
                 Arc::new(
                     bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
                 ),
+                &state.producer_claims.read().records_snapshot(),
             )
             .unwrap(),
         );
@@ -416,6 +420,7 @@ mod tests {
         removed_cfg.code_collection.git_transport_enabled = false;
         removed_cfg.code_collection.producers.clear();
         let _pending_transitions = install_config_reload(&state, removed_cfg)
+            .await
             .expect("the validated reload must install before transition dispatch");
 
         assert!(

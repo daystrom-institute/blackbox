@@ -4,4 +4,5 @@
 
 pub mod checkout_mutations;
 pub mod pins;
+pub mod producer_claims;
 pub mod store_persister;
