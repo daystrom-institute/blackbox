@@ -1,0 +1,26 @@
+{
+  "id": "gap-c6eb8348",
+  "title": "Remote project onboarding needs a hand-edited exact-scope producer grant plus a daemon redeploy, and the redirect error omits that step",
+  "gap_kind": "workflow",
+  "domain": "project-catalog",
+  "wanted_capability": "One agent-drivable onboarding path for a new checkout on a remote-daemon estate: a producer-level auto-grant policy so the onboard route can admit a new committed scope without a daemon config edit and pod restart, a single collector-side command that scaffolds, derives the scope, enrolls the project and triggers onboarding without a service restart, and an instance-rendered onboarding skill served over MCP (skills extension, resource, and prompt) in place of the static error redirect.",
+  "missing_primitive": "Producer auto-grant policy; collector add/reload subcommand; daemon-served instance-specific onboarding skill.",
+  "fallback_used": "Agents hand-append a [[projects]] block to the collector config, run collector init, restart the launchd collector, then separately edit the daemon producer grant table and run the cage converge (pod roll), then commit .bbox/config.toml and restart the collector again. When the grant step is missed the collector returns 403 scope_forbidden silently for days.",
+  "evidence": [
+    "src/tools/projects.rs:331",
+    "src/tools/projects.rs:696",
+    "src/server/code_source.rs:1170",
+    "src/server/code_source.rs:6776",
+    "src/server/producer_auth.rs:272",
+    "crates/bbox-code-collector/src/main.rs:187",
+    "design/daemon-runtime/remote-project-onboarding.md:131",
+    "src/server/handler.rs:93"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "workflow/project-catalog/remote-onboarding-grant-and-redirect",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-23T15:51:21Z",
+  "updated_at": "2026-09-23T15:51:21Z"
+}

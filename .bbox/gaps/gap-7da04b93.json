@@ -1,0 +1,26 @@
+{
+  "id": "gap-7da04b93",
+  "title": "Edge-index publish tears down the prior complete view, so any rebuild failure or slow rebuild is a fenced outage for graph tools",
+  "gap_kind": "tooling",
+  "domain": "edge-index",
+  "wanted_capability": "A selector-changing publish should carry the prior complete EdgeIndex into the new code read view and mark it stale rather than installing an empty index and lowering the readiness fence. Read-only graph consumers (bbox_inspect_entity, bbox_bundle_evidence, transcript hops) should be able to serve the stale-but-complete prior view with an explicit staleness marker while the watcher rebuilds, and a failed rebuild should never widen the outage beyond the rebuild itself. Fail-closed remains appropriate for writers such as provenance export, but that choice belongs to the consumer, not the fence.",
+  "missing_primitive": "readiness-fence semantics that distinguish \"prior view still complete but stale\" from \"no view available\"; a code read view that retains the prior Arc<EdgeIndex> across publish",
+  "fallback_used": "Callers retry after the watcher tick. The immediate-retry and coalesced-nudge fixes dispatched from thread-f51d2132 shrink the window but keep the tear-down-first swap.",
+  "evidence": [
+    "src/server/state.rs complete_code_read_view refuses on edge_index_ready=false",
+    "src/server/code_source.rs activation and republish sites install EdgeIndex::default() in the same swap that lowers the fence",
+    "src/server/file_source_activation.rs same pattern",
+    "src/server/routes.rs manifest coordinator raises the fence only after a successful publish; a failed rebuild returns Err and the watcher sleeps the full interval",
+    "cage daemon log 2026-09-20T02:39:41Z to 02:40:49Z: rebuild aborted on stale publication, fence down 68s, two MCP calls refused with error.edge_index_warming",
+    "thread-f51d2132"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/edge-index/publish-tears-down-prior-view-no-stale-serving",
+  "notes": "Sibling of gap-71db0a11 (deferral branch leaves the fence down). This one covers the admitted-rebuild branch: the fence is down for the whole rebuild plus any retry because the prior index was discarded at publish time.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-f51d2132",
+  "created_at": "2026-09-20T03:02:31Z",
+  "updated_at": "2026-09-20T03:02:31Z"
+}
