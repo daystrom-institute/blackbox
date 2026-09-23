@@ -16,7 +16,10 @@
   "dedupe_key": "tooling/lane-mechanics/release-refill-checkout-race",
   "suggested_owner": "bbox-cage lane pool",
   "notes": "The release path couples safe cleanup of the caller's lane to synchronous pool refill. A transient checkout-mount race turns successful release into a failed closeout and leaves capacity below the configured pool size. Creation should wait for the checkout path before calling git, retry safely, and reconcile the pool independently of the release exit path.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-07-19T18:22:10Z",
-  "updated_at": "2026-07-19T18:22:10Z"
+  "updated_at": "2026-09-23T19:02:38Z",
+  "resolved_at": "2026-09-23T19:02:38Z",
+  "resolution_note": "obsolete: lane pool release now destroys only the released lane and starts refill reconciliation asynchronously with bounded create retries, off the release exit path. The lane pool tooling lives in the operator-local lane overlay, not this repo."
 }

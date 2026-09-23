@@ -17,7 +17,10 @@
   "dedupe_key": "tooling/lane-mechanics/pool-lane-project-scope-mapping",
   "suggested_owner": "bbox-cage lane pool and Blackbox project resolution",
   "notes": "The lane-pool checkout behaves like a clone rather than a linked git worktree, so project-scoped knowledge/render paths do not reuse the base repo identity. This can silently erase rendered project conventions if an agent renders from the lane, make follow-up mutation tools unable to find lane-filed gaps, and mutate or delete the base checkout's repo-owned knowledge while operating from the lane.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-07-19T17:57:18Z",
-  "updated_at": "2026-07-19T18:22:10Z"
+  "updated_at": "2026-09-23T19:05:21Z",
+  "resolved_at": "2026-09-23T19:05:21Z",
+  "resolution_note": "obsolete: pool lanes now carry the .git/blackbox-managed-checkout marker, and managed independent clones resolve to the registered base project by repo_id (cdd98205, resolve_base_project_for_scope and resolve_managed_fleet_worktree class 3). In catalog mode an unattached checkout path is refused with project_selector_unknown, and covered knowledge and gap writes queue through the checkout-owner lane into the base checkout (58cb98c3), so a lane cannot rewrite the base identity or delete base repo-owned files. Residual, not lane-specific: on a local bridge daemon without the path-fallback cut, an unmarked clone still passes through as its own project key."
 }

@@ -16,7 +16,10 @@
   "dedupe_key": "tooling/lane-mechanics/stable-rustfmt-missing",
   "suggested_owner": "bbox-cage lane image",
   "notes": "BBOX_LANE_WORK describes warm build/test offload, while project policy mandates `cargo +stable fmt`. A freshly claimed warm lane cannot satisfy that gate directly, and `rtk rustup` mutates or checks the host toolchain rather than the remote cargo execution environment. The host-cwd/remote-manifest workaround should be documented or replaced by provisioning rustfmt in the lane image.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-07-19T17:48:20Z",
-  "updated_at": "2026-07-19T18:14:37Z"
+  "updated_at": "2026-09-23T19:02:41Z",
+  "resolved_at": "2026-09-23T19:02:41Z",
+  "resolution_note": "obsolete: the format gate is now scripts/fmt.sh with a pinned rustfmt toolchain (cdd98205), not cargo +stable fmt, and it prints the lane remedy when a builder image lacks that toolchain. Lane image provisioning is outside this repo."
 }
