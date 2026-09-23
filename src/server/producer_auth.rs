@@ -65,6 +65,9 @@ pub(crate) struct ConnectorGrant {
 struct AuthEntry {
     tokens: ServiceTokenSet,
     grant: ProducerGrant,
+    /// Operator-authored permission to establish the first accepted
+    /// publication for projects in this producer's effective assignment.
+    auto_publish: bool,
     /// Slot index of the LAST successful verification against this
     /// producer's token set, this boot (`NEVER_MATCHED` before the first
     /// one). Rotation observability only: an operator watching this move
@@ -415,6 +418,7 @@ impl ProducerAuthRuntime {
             entries.push(AuthEntry {
                 tokens,
                 last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+                auto_publish: producer.auto_publish,
                 grant: ProducerGrant {
                     producer_id: producer.producer_id.clone(),
                     projects: resolved,
@@ -523,6 +527,7 @@ impl ProducerAuthRuntime {
                     tokens: ServiceTokenSet::from_tokens(tokens)
                         .expect("test entries stage at least one token"),
                     last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+                    auto_publish: false,
                     grant,
                 })
                 .collect(),
@@ -541,12 +546,22 @@ impl ProducerAuthRuntime {
         entries: Vec<(bro_rpc::ServiceToken, ProducerGrant)>,
         catalog: &CatalogSnapshotV2,
     ) -> Self {
+        Self::for_test_catalog_with_auto_publish(entries, catalog, BTreeSet::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_catalog_with_auto_publish(
+        entries: Vec<(bro_rpc::ServiceToken, ProducerGrant)>,
+        catalog: &CatalogSnapshotV2,
+        auto_publish_producers: BTreeSet<String>,
+    ) -> Self {
         let entries = entries
             .into_iter()
             .map(|(token, grant)| AuthEntry {
                 tokens: ServiceTokenSet::from_tokens(vec![token])
                     .expect("test entries stage at least one token"),
                 last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+                auto_publish: auto_publish_producers.contains(&grant.producer_id),
                 grant,
             })
             .collect::<Vec<_>>();
@@ -710,6 +725,27 @@ impl ProducerAuthRuntime {
             .iter()
             .flat_map(|entry| entry.grant.projects.values().cloned())
             .collect()
+    }
+
+    /// The effective producer assignment for one catalog project and whether
+    /// operator config pre-grants its first accepted publication.
+    ///
+    /// Effective assignment already merges config pins and durable claims, so
+    /// callers do not need a second ownership interpretation for claimed
+    /// projects.
+    pub(crate) fn project_assignment(
+        &self,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+    ) -> Option<(&str, bool)> {
+        self.entries.iter().find_map(|entry| {
+            entry
+                .grant
+                .projects
+                .get(scope)
+                .is_some_and(|assigned| assigned == project_id.as_str())
+                .then_some((entry.grant.producer_id.as_str(), entry.auto_publish))
+        })
     }
 
     #[cfg(test)]
@@ -1091,6 +1127,7 @@ mod tests {
             ])
             .unwrap(),
             last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+            auto_publish: false,
             grant: ProducerGrant {
                 producer_id: producer_id.into(),
                 projects: scopes

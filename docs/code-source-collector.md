@@ -56,6 +56,7 @@ producer_id = "checkout-host-a"
 token_file = "~/.config/blackbox/code-collectors/checkout-host-a.token"
 scopes = []
 claim_scopes = "unclaimed"
+auto_publish = true
 ```
 
 The daemon fails closed at startup when an enabled token is unsafe, a scope is
@@ -72,6 +73,13 @@ Producer fields are:
 - `scopes`: operator-pinned published scopes. Pins override durable claims.
 - `claim_scopes`: `none` by default, or `unclaimed` to let this producer claim
   an unassigned catalog scope on its first authenticated onboard request.
+- `auto_publish`: `false` by default. When `true`, this producer may establish
+  the first accepted publication for a project it currently owns, only from a
+  Ready candidate on the project's catalog scope with a non-empty full branch
+  ref. An attached repo-knowledge capable attachment must exist for that scope,
+  but its checked-out branch does not constrain publication. The establish
+  uses the normal publisher acceptance path, makes the candidate's branch ref
+  the pointer's ref, and installs the project's auto-advance grant.
 
 With `claim_scopes = "unclaimed"`, `scopes` may be empty. A new claim is
 accepted only when no other producer owns that scope or any scope with the same

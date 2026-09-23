@@ -674,6 +674,10 @@ pub struct CodeCollectionProducerConfig {
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
     #[serde(default)]
     pub claim_scopes: ProducerScopeClaimPolicy,
+    /// Operator pre-grant for establishing the first accepted publication
+    /// from this producer's current project assignment.
+    #[serde(default)]
+    pub auto_publish: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3390,6 +3394,7 @@ state_dir = "~"
             token_files: token_files.into_iter().map(PathBuf::from).collect(),
             scopes: Vec::new(),
             claim_scopes: ProducerScopeClaimPolicy::None,
+            auto_publish: false,
         }
     }
 
@@ -3412,6 +3417,27 @@ state_dir = "~"
             .extract()
             .unwrap();
         assert_eq!(unclaimed.claim_scopes, ProducerScopeClaimPolicy::Unclaimed);
+    }
+
+    #[test]
+    fn code_collection_producer_auto_publish_defaults_off_and_parses_true() {
+        let defaulted: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(!defaulted.auto_publish);
+
+        let enabled: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 auto_publish = true\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(enabled.auto_publish);
     }
 
     #[test]

@@ -195,12 +195,15 @@ which scaffolds as part of enrollment.
 A claimed or pinned project's knowledge and gaps become visible once an
 accepted publication pointer exists. Producer config gains
 `auto_publish = true`: for a project with no accepted pointer, the first
-Ready candidate from the project's owning producer on its enrolled
-published ref is established through the same acceptance path as
+Ready candidate from the project's owning producer, on a non-empty full
+branch ref and with an attached repo-knowledge capable attachment for the
+catalog scope, is established through the same acceptance path as
 `bbox_project_publisher_advance(mode="establish")`, and the project's
-auto-advance grant is installed on that pointer. Establish never happens
-for a project that already has a pointer, and rollback and scope changes
-stay manual.
+auto-advance grant is installed on that pointer. The first candidate's branch
+ref becomes the pointer's ref; later advances stay bound to it. The
+attachment's currently checked-out branch does not select or constrain the
+published ref. Establish never happens for a project that already has a
+pointer, and rollback and scope changes stay manual.
 
 ## 6. Onboarding skill over MCP
 
