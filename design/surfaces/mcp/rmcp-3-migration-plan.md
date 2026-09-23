@@ -22,8 +22,8 @@ mechanics, and per-phase validation.
   `bro-harness`).
 - To: rmcp 3.x implementing MCP 2026-07-28. The title names the 3.0
   breaking-change migration, not an upper bound on the minor version.
-  Evaluate 3.4.0 as the concrete candidate: it is the latest published
-  version in the [SDK source audit](codex-0.155.1-mcp-audit.json), while
+  Evaluate 3.4.1 as the concrete candidate: it is the latest published
+  version in the [SDK source audit](codex-0.156.1-mcp-audit.json), while
   Codex release and upstream main still pin `=3.2.0`.
   Relevant to this plan: 3.3.0 adds
   `ServerHandler::negotiate_initialize` (#1247, reuse the SDK's version
@@ -36,10 +36,13 @@ mechanics, and per-phase validation.
   `HeaderMismatch` to HTTP 400 on the modern path (#1259), adds opt-in
   strict Origin validation with 403 for malformed Origins (#1192, default
   unchanged; absent Origin still passes), and stops treating malformed
-  JSON 200 responses as Accepted on the client (#1208). None of the 3.3
-  or 3.4 notes touch tasks, listen, `SubscriptionFilter`, MRTR, cache
-  hints, or MSRV. The existing exemplar findings are from 3.1; rerun them
-  against the selected version before treating any SDK limitation as
+  JSON 200 responses as Accepted on the client (#1208). Version 3.4.1
+  preserves a sessionless discover request's ID when forwarding a JSON-RPC
+  rejection carried by HTTP 4xx (excluding 401/403), so clients receive
+  the server's error. It also supports const-path and `concat!` macro
+  descriptions. The task subscription filter and notification rejection
+  paths remain unchanged; MSRV stays 1.88. The existing exemplar findings
+  are from 3.1; rerun them against the selected version before treating any SDK limitation as
   fixed or unchanged.
 - We skip the entire 2.x line. Most 2.x deprecations are removals in 3.0,
   and we already use the modern names (`CallToolRequestParams`, `ErrorData`,
@@ -207,8 +210,8 @@ negotiates modern discovery and opens listen for advertised tools/prompts/
 resources list changes. The isolated matrix validates tool catalog refetch
 on notification and after stream reopening, plus explicit legacy opt-outs
 and discover fallback. Tasks remain disabled; Codex still has no standard
-listen consumer. See the [Claude audit](claude-2.1.280-mcp-audit.json) and
-[Codex audit](codex-0.155.1-mcp-audit.json). This validates a catalog-change
+listen consumer. See the [Claude audit](claude-2.1.281-mcp-audit.json) and
+[Codex audit](codex-0.156.1-mcp-audit.json). This validates a catalog-change
 slice independently of Phase 2, not task notifications.
 
 - `ServerHandler::listen` + `SubscriptionSink`; emit
@@ -219,7 +222,7 @@ slice independently of Phase 2, not task notifications.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
 - SDK gap confirmed by the runtime spike (rmcp 3.1) and source inspection
-  of rmcp 3.4.0: `SubscriptionFilter` has no
+  of rmcp 3.4.1: `SubscriptionFilter` has no
   task category, `SubscriptionSink::send` rejects `notifications/tasks`,
   and the client `Subscription` rejects them too. Options: (a) custom glue
   sending task notifications on the active listen response stream, which
@@ -249,9 +252,12 @@ slice independently of Phase 2, not task notifications.
   unadvertised inputs, cancellation, and auth/session loss after an input
   response. Approval continuations must not silently replay a mutation.
   Its native user-verification extension is hosted-Apps-only; use standard
-  elicitation for Blackbox interoperability. See the target-surface doc's
-  pinned MRTR source and test anchors. The inspected upstream tests are
-  evidence of intended behavior, not a completed Blackbox gate.
+  elicitation for Blackbox interoperability. The Claude audit also validates
+  a modern URL-elicitation cancellation round in headless mode, including
+  exact `requestState` echo and `inputResponses`. This does not validate
+  browser acceptance or operator approval. See the target-surface doc and
+  linked audits for pinned evidence. Inspected upstream tests are evidence
+  of intended behavior, not a completed Blackbox gate.
 
 ## Phase ordering rationale
 
@@ -281,8 +287,8 @@ This plan interlocks at two points:
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
 from Claude Code, re-probe the installed binary. Current evidence is in the
-[Claude audit](claude-2.1.280-mcp-audit.json) and
-[Codex audit](codex-0.155.1-mcp-audit.json); the entries below are prior
+[Claude audit](claude-2.1.281-mcp-audit.json) and
+[Codex audit](codex-0.156.1-mcp-audit.json); the entries below are prior
 snapshots, not the current compatibility verdict. The probe is structural,
 not single-literal: it enumerates vocabulary classes rather than grepping
 one string each, because (a) a constructed/concatenated key literal would
@@ -605,11 +611,13 @@ Probe history:
 ### Claude live tripwire
 
 Run `fixtures/claude-audit-matrix.sh` under bash with `CLAUDE_BIN`
-pointing at the exact binary. It drives nine cases against the MCP fixture
+pointing at the exact binary. It drives ten cases against the MCP fixture
 and deterministic Messages stub: default, SDK-only, explicit modern,
-explicit/default fallback, dropped stream, each legacy opt-out, and
-mismatched acknowledgement. It prints per-case wire timelines and checks
-capture completeness and lifecycle behavior.
+explicit/default fallback, dropped stream, each legacy opt-out,
+mismatched acknowledgement, and a headless URL-elicitation cancellation
+round. The cancellation case verifies `inputResponses`, exact
+`requestState` echo and final tool-result consumption. It prints per-case
+wire timelines and checks capture completeness and lifecycle behavior.
 
 Direct HTTP defaults to modern discovery in the current audited client.
 Explicit selectors remain useful when testing a particular mode:
@@ -673,7 +681,8 @@ fixture. Hosted Apps and modern stdio require their separate selectors.
   requires Phase 1 and a live round-trip against the intended endpoint.
 - **Catalog listen**: Claude validates list-change subscription, tool
   refetch and listen reopening. Codex does not. This does not establish
-  task notifications or per-resource subscriptions. Validate MRTR and
+  task notifications or per-resource subscriptions. The Claude MRTR probe
+  covers URL cancellation only; validate acceptance, other input modes and
   cache behavior separately when relying on them.
 - **Tasks extension**: require an actual capability capture declaring
   `io.modelcontextprotocol/tasks` and a consumer that handles task results.

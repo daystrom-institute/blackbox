@@ -5,6 +5,7 @@ Usage: mcp_fixture.py <logfile> <port> <mode>
   mode = modern        answer server/discover (2026-07-28), listen with SSE, emit list_changed
          modern-drop   same, but close the FIRST listen stream after the notifications (no terminal result)
          modern-bad-ack same, but send an acknowledgement with an unmatched subscription id
+         modern-url-elicitation return a URL input request on the first tools/call
          legacy        reject server/discover with -32601, answer initialize at 2025-11-25 with legacy tasks,
                        echo Mcp-Session-Id, hold the GET stream open
 Every request is appended to <logfile> as one JSON line.
@@ -152,6 +153,18 @@ class H(BaseHTTPRequestHandler):
             return self._json({"jsonrpc": "2.0", "id": rid, "result": {"resultType": "complete", key: [],
                                                                        "ttlMs": 60000, "cacheScope": "private", "_meta": META}}, sess)
         if method == "tools/call":
+            if MODE == "modern-url-elicitation" and not msg.get("params", {}).get("inputResponses"):
+                result = {"resultType": "input_required", "requestState": "fixture-url-state",
+                          "inputRequests": {"url-flow": {"method": "elicitation/create", "params": {
+                              "mode": "url", "message": "Open the local audit flow",
+                              "url": f"http://127.0.0.1:{PORT}/audit-flow"}}}, "_meta": META}
+                log({"event": "url_input_required", "result": result})
+                return self._json({"jsonrpc": "2.0", "id": rid, "result": result})
+            if MODE == "modern-url-elicitation":
+                action = msg.get("params", {}).get("inputResponses", {}).get("url-flow", {}).get("action")
+                return self._json({"jsonrpc": "2.0", "id": rid, "result": {
+                    "resultType": "complete", "content": [{"type": "text", "text": f"URL flow {action}"}],
+                    "isError": action != "accept", "_meta": META}})
             text = (msg.get("params", {}).get("arguments") or {}).get("text", "")
             return self._json({"jsonrpc": "2.0", "id": rid, "result": {"resultType": "complete",
                                "content": [{"type": "text", "text": f"echo: {text}"}], "isError": False, "_meta": META}}, sess)

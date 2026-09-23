@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Deterministic local Anthropic Messages API stub. Usage: messages_stub.py <logfile> <port>
 Answers POST /v1/messages (streaming SSE or plain JSON) with the text "ok"; logs each request's
-tool names and message count as a JSON line; 200-empties everything else."""
+tool names and message count as a JSON line; 200-empties everything else.
+STUB_TOOL_CALL=1 emits one fixture_echo tool call first and logs returned tool results."""
 import json, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG, PORT = sys.argv[1], int(sys.argv[2])
 import os
 DELAY = float(os.environ.get("STUB_DELAY", "0"))  # seconds to hold the FIRST model response
+TOOL_CALL = os.environ.get("STUB_TOOL_CALL") == "1"
 LOCK = threading.Lock()
 def log(ev):
     with LOCK, open(LOG, "a") as f:
@@ -29,6 +31,13 @@ class H(BaseHTTPRequestHandler):
             log({"event": "model-request", "path": self.path, "stream": bool(req.get("stream")),
                  "model": req.get("model"), "n_messages": len(req.get("messages", [])), "tools": tools})
             msg_id = "msg_stub_0001"
+            tool_call = TOOL_CALL and not getattr(H, "_called_tool", False)
+            if tool_call:
+                H._called_tool = True
+            elif TOOL_CALL:
+                log({"event": "tool-results", "results": [block for message in req.get("messages", [])
+                     if isinstance(message.get("content"), list) for block in message["content"]
+                     if isinstance(block, dict) and block.get("type") == "tool_result"]})
             if DELAY and not getattr(H, "_delayed", False):
                 H._delayed = True; log({"event": "model-hold", "seconds": DELAY}); time.sleep(DELAY)
             if req.get("stream"):
@@ -43,12 +52,23 @@ class H(BaseHTTPRequestHandler):
                        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
                        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 1}}),
                        ("message_stop", {"type": "message_stop"})]
+                if tool_call:
+                    evs[1] = ("content_block_start", {"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "tool_use", "id": "toolu_fixture_1",
+                                          "name": "mcp__fixture__fixture_echo", "input": {}}})
+                    evs[2] = ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": '{"text":"url-audit"}'}})
+                    evs[4][1]["delta"]["stop_reason"] = "tool_use"
                 for name, ev in evs:
                     self.wfile.write(f"event: {name}\ndata: {json.dumps(ev)}\n\n".encode()); self.wfile.flush()
                 return
             resp = {"id": msg_id, "type": "message", "role": "assistant", "model": req.get("model", "stub"),
                     "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
                     "usage": {"input_tokens": 10, "output_tokens": 1}}
+            if tool_call:
+                resp["content"] = [{"type": "tool_use", "id": "toolu_fixture_1",
+                                    "name": "mcp__fixture__fixture_echo", "input": {"text": "url-audit"}}]
+                resp["stop_reason"] = "tool_use"
             return self._send(200, "application/json", json.dumps(resp).encode())
         if "count_tokens" in self.path:
             log({"event": "count_tokens", "path": self.path})

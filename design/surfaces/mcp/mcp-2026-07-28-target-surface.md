@@ -44,8 +44,8 @@ is the largest protocol break since Streamable HTTP:
 
 ### Current client compatibility
 
-The checked-in [Claude audit](claude-2.1.280-mcp-audit.json) and
-[Codex audit](codex-0.155.1-mcp-audit.json) pin binary hashes, release
+The checked-in [Claude audit](claude-2.1.281-mcp-audit.json) and
+[Codex audit](codex-0.156.1-mcp-audit.json) pin binary hashes, release
 versions, source snapshots, selectors, ordered wire observations and limits.
 Both matrices use isolated loopback MCP servers and deterministic local
 model responses. Wire findings are direct evidence; decoded Claude gates
@@ -59,7 +59,7 @@ and inspected Codex/rmcp source are separate evidence layers.
 | Standard listen | Opens automatically for catalog `listChanged`; filter contains tools, prompts and resources list changes | No consumer in inspected source; no listen request despite advertised tools list changes | Catalog-change push has a Claude consumer |
 | Notification effect | Tools refetched after notification; dropped listen reopened with synthesized reconciliation and further refetch | Not applicable | Reconcile on reconnect; do not rely on replay |
 | Tasks | No tasks capability or tasks extension declared, even when advertised by the fixture; embedded gate is false | No declaration or consumer; modern tool driver accepts complete/input-required responses | Keep plain tool JSON unless the tasks extension is explicitly declared |
-| Tool execution | The matrix exercises catalogs/listen, not tools/call | Both default legacy and explicit modern modes reach tools/call and consume the echo result | Stateless tool calls have direct Codex evidence |
+| Tool execution | A modern URL-elicitation tool call retries with cancellation and consumes the final result in headless mode | Both default legacy and explicit modern modes reach tools/call and consume the echo result | Stateless tool calls have direct evidence from both clients |
 
 Claude's isolated direct-HTTP default uses the v2 SDK and automatic
 negotiation. Account-specific rollout flags and server denylists still
@@ -68,6 +68,13 @@ The task gate remains literally false, despite bundled task UI, extension
 keys and legacy methods. Neither the vocabulary nor catalog listen proves
 task wake-on-done.
 
+Claude advertises `elicitation: {form: {}, url: {}}` on modern requests.
+The URL-elicitation probe returns `input_required` without a legacy
+`elicitationId`; headless Claude retries the tool with an `inputResponses`
+cancellation and the exact `requestState`, then consumes the completed
+result. This proves the cancellation continuation, not browser interaction,
+acceptance, form elicitation or asynchronous completion notifications.
+
 The listen acknowledgement must be the first SSE frame on a chunked
 response and carry `_meta["io.modelcontextprotocol/subscriptionId"]`
 equal to the listen request ID. An unmatched acknowledgement causes an
@@ -75,7 +82,10 @@ initial timeout and cancellation; a subsequent reopen attempt is not proof
 of an acknowledged subscription. The dropped-stream probe also observes a
 stray GET, answered 405, before successful reopening. Empty prompt/resource
 catalogs do not establish their notification-driven refetch behavior, and
-per-URI subscriptions remain outside the matrix.
+per-URI subscriptions remain outside the matrix. Claude's model-facing
+resource catalog filters Apps UI resources identified by `ui://` or HTML
+with the `mcp-app` profile; direct URI reads remain available. The audit
+records that filtering as static evidence.
 
 Codex's ordinary-server and hosted-Apps modern flags are separate and
 remain default false in the inspected source. Modern stdio additionally
@@ -88,17 +98,18 @@ Codex's modern MRTR driver accepts complete/input-required responses,
 returns `inputResponses` with `requestState`, bounds continuation rounds,
 and rejects other result variants. Native user verification is restricted
 to the host-owned Apps service; portable Blackbox approval flows use
-standard elicitation. The fixture does not exercise MRTR input rounds.
+standard elicitation. The Codex fixture does not exercise MRTR input rounds.
 
 The stateless head must accept unknown request metadata. The audited
-release sends `callId`, `threadId`, `itemId` and `x-codex-turn-metadata`
-beside the SEP-2575 triple. Inspected upstream main also supplies
-`sessionId`/`windowId`, conditional `openai/readOnly`, and W3C trace
-metadata. These source additions are not claims about the audited binary.
-Scope remains URL-owned, never inferred from client identifiers.
+release sends `callId`, `threadId`, `sessionId`, `windowId`, `itemId`
+and `x-codex-turn-metadata` beside the SEP-2575 triple. The session/window
+keys appear in both modern and legacy tool-call captures. Conditional
+`openai/readOnly` is present in release source; request-local W3C trace
+metadata is an upstream-main source finding. Neither path is exercised by
+the matrix. Scope remains URL-owned, never inferred from client identifiers.
 
 Codex still pins rmcp 3.2.0; the published migration candidate is rmcp
-3.4.0. Source inspection of 3.4.0 confirms no task subscription filter and
+3.4.1. Source inspection of 3.4.1 confirms no task subscription filter and
 explicit rejection of task notifications by the server sink and client
 subscription. The standalone runtime exemplar still needs rerunning on the
 selected SDK version. Exact source anchors and package provenance are in
