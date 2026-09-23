@@ -103,18 +103,23 @@ url = "http://127.0.0.1:7264/mcp?surface=interactive"
 ## 4. Enroll a project from its owning checkout
 
 Check `bbox_project_list()` before adding a project. For a remote corpus daemon,
-configure the [Code Source Collector](code-source-collector.md) on the checkout
-host with an operator-authorized producer and exact published scope. Initialize
-missing project scaffolding on that host:
+configure one producer with `claim_scopes = "unclaimed"` and configure the
+[Code Source Collector](code-source-collector.md) on the checkout host with an
+`enroll_roots` entry that contains the project. These are host-level settings,
+not per-project entries. Then call:
 
-```sh
-bbox-code-collector --config /path/to/code-collector.toml init /absolute/path/to/repo
+```text
+bbox_project_register(path="/absolute/path/to/repo")
 ```
 
-Initialization writes `.bbox` locally. Commit the project identity, then run the
-configured collector's `once` or `run` command to onboard and publish the source.
-Catalog admission, source publication, and index activation are separate steps;
-use `bbox_project_list()` and `bbox_doctor()` to inspect progress.
+If the daemon cannot stat the path, it routes enrollment to the fresh
+checkout-host collector whose most specific enroll root contains it. The
+collector scaffolds `.bbox`, records the project in its enrolled-projects
+sidecar, and onboards it without a per-project config edit. When the response
+reports `identity_committed = false`, commit exactly the returned `commit_paths`
+on `published_ref`. Catalog admission, source publication, and index activation
+are separate steps; use `bbox_project_list()` and `bbox_doctor()` to inspect
+progress.
 
 `bbox_bootstrap` is retired. It does not import instructions or enroll remote
 checkouts. See [Projects And Code Indexing](projects-code-indexing.md) for local

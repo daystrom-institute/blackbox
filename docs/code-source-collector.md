@@ -32,7 +32,8 @@ openssl rand -hex 32 > ~/.config/blackbox/code-collectors/checkout-host-a.token
 chmod 600 ~/.config/blackbox/code-collectors/checkout-host-a.token
 ```
 
-Add the producer and its exact published scopes to the daemon configuration:
+Add the producer once. To let agent registration claim previously unassigned
+catalog scopes, use `claim_scopes = "unclaimed"`:
 
 ```toml
 [code_collection]
@@ -53,10 +54,8 @@ max_provenance_logical_bytes = 2147483648
 [[code_collection.producers]]
 producer_id = "checkout-host-a"
 token_file = "~/.config/blackbox/code-collectors/checkout-host-a.token"
-scopes = [
-  { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." },
-]
-claim_scopes = "none"
+scopes = []
+claim_scopes = "unclaimed"
 ```
 
 The daemon fails closed at startup when an enabled token is unsafe, a scope is
@@ -135,13 +134,8 @@ token_file = "/home/operator/.config/blackbox/code-collectors/checkout-host-a.to
 interval_secs = 120
 mutation_interval_secs = 10
 enroll_roots = ["~/repos"]
-
-[[projects]]
-root = "/home/operator/repos/project"
-scope = { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." }
-git_history = true
-provenance = true
-published_knowledge = { full_ref = "refs/heads/main" }
+host_label = "checkout-host-a"
+service_label = "code-collector"
 ```
 
 Operator-authored projects remain in the main configuration. Projects enrolled
@@ -156,6 +150,21 @@ and the collector logs a warning.
 an existing directory, and is canonicalized at load time. These roots bound
 daemon-routed enrollment requests. Host-local `add` commands do not require the
 target to be under an enroll root.
+
+`host_label` identifies the checkout host in remote-registration errors and
+defaults to the output of `hostname`, or `unknown` if that command fails.
+`service_label` is optional and can identify one collector service among several
+on the same host.
+
+On every checkout-mutation cadence, after checking for a live config reload,
+the collector polls the authenticated producer command channel. The poll sends
+the canonical config path, host and service labels, collector version, and the
+complete `enroll_roots` list, including an empty list. The daemon retains this
+presence in memory and can route `bbox_project_register(path)` to a fresh
+collector whose most specific root contains the path. Enrollment runs the same
+scaffolding, sidecar update, and catalog onboarding procedure as the host-shell
+`add` command. The response names any project files that still need to be
+committed on the returned published ref.
 
 `interval_secs` controls source collection. Queued gap and knowledge edits
 poll independently at `mutation_interval_secs` (default 10 seconds, minimum
