@@ -3,20 +3,25 @@
   "title": "Git-transport recutover has no exit path for a stale covered row",
   "gap_kind": "docs_runbook",
   "domain": "git-transport-cutover",
-  "wanted_capability": "A supported ceremony path to unwedge a CoverageStalePendingRecutover row. Once a covered repo's catalog membership_generation moves past its marker row (wampum went 1 to 13 as 12 subtree projects were promoted after the 2026-08-06 cutover), typed history activation AND provenance import refuse pending a newer cutover, the collector's continued uploads retire the last Committed journal, and readiness evidence for a new marker (Committed journal at current ready source, per-member provenance receipts, code HEAD matching typed history) becomes unbuildable: the freeze forbids exactly the publications the evidence requires. The apply path only replaces Proposed rows and carries every other predecessor row forward verbatim, so a stale row can never leave the marker; the resolution artifact only acknowledges blocked (assignment-removed) repos, and blocking wampum's grant would have severed its code-source and knowledge lanes too. 2026-08-23 remedy: retired the marker + receipt entirely (backups at /var/lib/blackbox/state/backups/pre-git-recutover-20260822/), returning all 19 repos to Uncovered-with-grant, which activates normally (pg-flare ran that mode healthily for 2 weeks). Wampum's stuck 2026-08-19 source activated within minutes. Re-establishing coverage needs per-member provenance for wampum's 13 members, then a fresh full cutover ceremony.",
-  "missing_primitive": "ceremony verb (or resolution arm) that drops or re-baselines a stale covered row without forging evidence",
-  "fallback_used": "Offline marker + receipt retirement with PVC and local backups; all repos fall back to Uncovered-with-grant which the activation gate admits.",
+  "wanted_capability": "A supported ceremony path out of CoverageStalePendingRecutover. Once a covered repo's catalog membership_generation moves past its marker row (for example after promoting subtree projects), typed history activation is superseded pending a newer cutover and provenance import refuses, so the readiness evidence a new cutover requires (Committed activation journal at the current ready source, per-member provenance receipts, code HEAD matching typed history) can never be produced: the freeze forbids exactly the publications the evidence needs. Cutover apply only replaces Proposed rows and carries every other predecessor row forward verbatim, so a stale row can never leave the marker, and the resolution artifact only acknowledges blocked, never-covered repos. Wanted: a ceremony verb or resolution arm that drops or re-baselines a stale covered row without forging evidence, or a freeze exception that admits the publications a recutover needs.",
+  "missing_primitive": "Ceremony verb or resolution arm that drops or re-baselines a stale covered row",
+  "fallback_used": "Offline retirement of the whole cutover marker and receipt with backups, returning every repo to Uncovered-with-grant, which the activation gate admits.",
   "evidence": [
-    "crates/bbox-indexing/src/git_transport_cutover.rs:1604-1620 (carried rows = predecessor minus Proposed)",
-    "crates/bbox-indexing/src/git_transport_cutover.rs:2233-2325 (readiness defects)",
-    "src/server/history_activation.rs:689-697 (transport_governed && !current refuses at finish_activation)",
-    "prod: 5 days of 422 invalid_upload_state on wampum git-history lane, ~660/day since 2026-08-19"
+    "crates/bbox-indexing/src/git_transport_cutover.rs::GitTransportRuntimeCoverageV1::classify_repo (membership_generation mismatch yields CoverageStalePendingRecutover)",
+    "crates/bbox-indexing/src/git_transport_cutover.rs::carried_forward_marker_rows and ProjectCatalogGitTransportCutoverFacadeV1::apply (non-Proposed predecessor rows carried verbatim)",
+    "crates/bbox-indexing/src/git_transport_cutover.rs::capture_granted_repo (refuses without typed history parity, matching code HEAD, overlay, provenance receipt)",
+    "crates/bbox-indexing/src/git_transport_cutover.rs::GitTransportCutoverResolutionV1, load_or_create_resolution (only blocked_repo_acknowledgements)",
+    "src/server/history_activation.rs::finish_activation (supersedes: a newer cutover must authorize publication)",
+    "src/server/provenance_import.rs (same coverage gate)",
+    "src/bin/blackbox.rs::GitTransportCutoverArgs (only --preflight, --apply, --verify)"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/git-transport-cutover/stale-covered-row-no-exit",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:44Z",
-  "updated_at": "2026-08-23T06:06:44Z"
+  "updated_at": "2026-09-23T22:04:30Z",
+  "resolved_at": "2026-09-23T22:04:30Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/18"
 }

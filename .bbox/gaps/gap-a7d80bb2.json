@@ -16,8 +16,10 @@
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "refactor_primitive/history-activation/overlay-only-drift-full-lane-replacement",
   "notes": "The proposed design preserves complete producer snapshots and derives deltas only after corpus-side verification. Its implementation gates include force-push recovery, crash-safe overlay revisions, rooted vector retention, sustained-cadence soak testing, and cross-restart coverage persistence. Earlier currency fixes removed no-op self-amplification but did not change the per-commit worst case.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:16Z",
-  "updated_at": "2026-09-15T06:37:17Z"
+  "updated_at": "2026-09-23T22:04:28Z",
+  "resolved_at": "2026-09-23T22:04:28Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/16"
 }

@@ -1,21 +1,27 @@
 {
   "id": "gap-9c91a9c0",
-  "title": "Git-history upload resume protocol wedges mid-state uploads permanently",
+  "title": "Resumed Git-history uploads replay from manifest page 0 and loop on invalid_upload_state",
   "gap_kind": "tooling",
   "domain": "git-source-transport",
-  "wanted_capability": "A resumable or abortable git-history upload protocol. begin_history_upload resumes an existing non-terminal upload record with the same descriptor (returns its upload_id), but the collector client always replays the flow from manifest-page upload, which is invalid for a record stuck in missing_records: the result is a permanent 422 invalid_upload_state loop (wampum program repo, every pass from 2026-08-19 to 2026-08-23, ~660 failures/day). Either the begin response should carry the resumed record's state so the client can continue from the right step, or the client needs an abort/restart verb. Separately, terminal ready/superseded upload staging dirs are never cleaned: 47 leftover ready records had accumulated for one producer (34 for one actively-developed repo). Remedy tonight: deleted the stuck staging dir by hand in the pod; the next collector pass re-uploaded fresh.",
-  "missing_primitive": "upload state in begin response, or an abort-upload verb, plus terminal-upload staging GC",
-  "fallback_used": "Manual rm -rf of the stuck upload staging dir in the daemon pod.",
+  "wanted_capability": "A resumable or abortable Git-history upload protocol. begin_history_upload returns the upload_id of an existing non-terminal upload with the same descriptor, but BeginGitHistoryUploadResponseV1 carries no state, and the collector's publish_git_history always restarts at manifest page 0. put_history_manifest_page rejects any record not in ReceivingManifest, so an upload left in MissingRecords fails with 422 invalid_upload_state on every pass until the 24h idle TTL (expire_stale_uploads) deletes it. Wanted: the begin response carries the resumed state and next page so the collector continues from the right step, or an abort verb the collector can use.",
+  "missing_primitive": "Upload state in the begin response, or an abort-upload route",
+  "fallback_used": "Manual removal of the stuck upload staging dir in the daemon pod.",
   "evidence": [
-    "crates/bbox-git-source-store/src/lib.rs:1640-1661 (begin resumes same-descriptor non-terminal record)",
-    "crates/bbox-code-collector/src/main.rs publish_git_history (always replays from manifest)",
-    "collector log: ~660/day 422 invalid_upload_state on wampum program since 2026-08-19"
+    "crates/bbox-git-source-store/src/lib.rs::begin_history_upload (resumes same-descriptor non-terminal record, returns begin_response(upload_id))",
+    "crates/bbox-git-source/src/lib.rs::BeginGitHistoryUploadResponseV1 (no state field)",
+    "crates/bbox-code-collector/src/main.rs::publish_git_history (always PUTs manifest from page 0)",
+    "crates/bbox-git-source-store/src/lib.rs::put_history_manifest_page (InvalidState unless ReceivingManifest)",
+    "crates/bbox-git-source-store/src/lib.rs::expire_stale_uploads, HISTORY_UPLOAD_IDLE_TTL_SECS (24h idle expiry bounds each wedge)",
+    "src/server/git_source.rs upload routes (no abort verb)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/git-source-transport/upload-resume-mid-state-wedge",
-  "resolution": "unresolved",
+  "notes": "Triage correction: terminal upload staging dirs are already reclaimed by expire_stale_uploads after 24h idle (added in 75bb4ac0), so the GC half of the original record does not hold. The multi-day wedge came from this loop combined with gap-a0acbe33 (every fresh upload failed finalize again). Paired with gap-a0acbe33 in one issue.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:14:17Z",
-  "updated_at": "2026-08-23T06:14:17Z"
+  "updated_at": "2026-09-23T22:04:29Z",
+  "resolved_at": "2026-09-23T22:04:29Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/17"
 }

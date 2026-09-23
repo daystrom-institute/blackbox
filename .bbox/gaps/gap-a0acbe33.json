@@ -1,21 +1,26 @@
 {
   "id": "gap-a0acbe33",
-  "title": "Store JSON serialization change breaks immutable-install idempotency for same-id generations",
+  "title": "Re-finalizing an already installed Git-history generation id is refused with InvalidInput",
   "gap_kind": "tooling",
   "domain": "git-source-transport",
-  "wanted_capability": "Byte-format-independent idempotency for content-addressed generation installs. install_immutable_json compares stored bytes against the new serialization; a deploy that changed store JSON from pretty-printed to compact made every previously installed generation dir refuse re-install of the SAME generation id (identical manifest_sha256, identical logical content) with StoreRequestError::InvalidInput. Because history_source_generation_id pins (producer, repo_history, namespace, repo_head, manifest_sha256), a repo whose HEAD does not move re-derives the same id forever, so finalize 422s on every attempt: this was the actual origin of the 5-day wampum git-history wedge (generation ghs_dffc1c8a installed 2026-08-19 pretty-printed, superseded by the coverage freeze; every later same-head upload refused at finalize). Fix direction: treat an existing generation dir whose manifest_sha256/descriptor match as idempotent success (semantic compare or re-derived hash compare), or pin the store serialization format as part of the on-disk contract. Remedy: deleted the superseded relic dir and the wedged upload; the next pass finalized fresh.",
-  "missing_primitive": "semantic-equality (or descriptor-hash) idempotency check in install_immutable_json callers for generation artifacts",
-  "fallback_used": "Deleted the pretty-JSON-era superseded generation dir and wedged upload record in the pod by hand.",
+  "wanted_capability": "Idempotent finalize for content-addressed Git-history generations. finalize_history_upload builds a fresh StoredHistorySourceV1 (state Ready, created_unix_secs now) and installs it with install_immutable_json, which deserializes the stored source.json and compares with PartialEq. Because the generation id pins producer, repo history, namespace, HEAD, and manifest digest, an unchanged HEAD re-derives the same id; once the generation dir exists its source.json always differs (earlier timestamp, and state possibly moved to Active or Superseded), so a second finalize fails with StoreRequestError::InvalidInput (422). Reached whenever the collector ready probe misses, for example after the generation was superseded. Wanted: treat an existing generation whose descriptor and manifest match as idempotent success, ignoring timestamp and lifecycle state. The provenance-import finalize path has the same pattern.",
+  "missing_primitive": "Descriptor and manifest based idempotency for generation finalize, excluding mutable source.json fields",
+  "fallback_used": "Manual removal of the superseded generation dir and the wedged upload record in the daemon pod.",
   "evidence": [
-    "crates/bbox-git-source-store/src/lib.rs finalize_history_upload install_immutable_json calls",
-    "crates/bbox-git-source/src/lib.rs:533-557 (generation id covers manifest_sha256, so same-head same-content re-derives the same id)",
-    "pod: ghs_dffc1c8a manifest.json pretty-printed (Aug 19, 242111 bytes) vs current upload compact (207729 bytes), identical entries"
+    "crates/bbox-git-source-store/src/lib.rs::finalize_history_upload (StoredHistorySourceV1 with created_unix_secs now, installed via install_immutable_json)",
+    "crates/bbox-git-source-store/src/lib.rs::install_immutable_json (semantic PartialEq compare since 4c4ef90a, not byte compare)",
+    "crates/bbox-git-source-store/src/lib.rs::StoredHistorySourceV1 (derives PartialEq over state and created_unix_secs)",
+    "crates/bbox-git-source/src/lib.rs::history_source_generation_id (id covers manifest_sha256, so same HEAD re-derives the same id)",
+    "A covered repo's git-history lane failed finalize on every collector pass for several days until the generation dir was removed by hand"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/git-source-transport/immutable-install-serialization-drift",
-  "resolution": "unresolved",
+  "notes": "Triage correction: the original diagnosis (pretty vs compact serialization breaking a byte compare) does not match the code; install_immutable_json has compared deserialized values since it was added. The failing field is the per-install timestamp and lifecycle state in source.json. Paired with gap-9c91a9c0 in one issue.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:49:44Z",
-  "updated_at": "2026-08-23T06:49:44Z"
+  "updated_at": "2026-09-23T22:04:29Z",
+  "resolved_at": "2026-09-23T22:04:29Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/17"
 }
