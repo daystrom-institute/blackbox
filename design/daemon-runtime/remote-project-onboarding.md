@@ -213,6 +213,23 @@ three ways:
   clients that read MCP resources;
 - a prompt, for clients that expose MCP prompts as commands.
 
+Wire shape consumed by Claude Code's skills-extension client:
+
+- The server capabilities carry both `resources` and
+  `extensions["io.modelcontextprotocol/skills"]` (an object; `directoryRead`
+  is optional and unused here).
+- `skills/list` takes `{cursor?}` and returns `{skills: [{frontmatter:
+  {name, description}, uri, digest}], nextCursor?}`.
+- `resources/read` on `uri` returns the complete `SKILL.md` (YAML
+  frontmatter plus body) as the first text content. `digest` is
+  `sha256:<hex>` of exactly that text; the client caches by digest.
+- The client names the skill `<server>:<name>` and ignores hooks and
+  allowed-tools declared by MCP-sourced skills.
+
+Because the client caches by digest, the rendered body carries no
+per-read volatile values (clock times, ages); it changes only when the
+instance facts it states change.
+
 The skill body is rendered at read time from instance facts: fresh producer
 presence (host label, enroll roots, config path, service label), claim and
 auto-publish policy, and the daemon's `advertise_url` when configured. It
