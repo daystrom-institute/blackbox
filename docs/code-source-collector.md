@@ -106,6 +106,7 @@ server_url = "https://corpus.example.invalid/"
 token_file = "/home/operator/.config/blackbox/code-collectors/checkout-host-a.token"
 interval_secs = 120
 mutation_interval_secs = 10
+enroll_roots = ["~/repos"]
 
 [[projects]]
 root = "/home/operator/repos/project"
@@ -114,6 +115,19 @@ git_history = true
 provenance = true
 published_knowledge = { full_ref = "refs/heads/main" }
 ```
+
+Operator-authored projects remain in the main configuration. Projects enrolled
+by the collector are stored in a sibling sidecar named
+`<config-stem>.enrolled.toml` by default. Set `enrolled_projects_file` to use a
+different path. The sidecar uses the same `[[projects]]` entries as the main
+configuration, and the effective project set is the union of both files. When
+the same canonical root or scope appears in both, the main configuration wins
+and the collector logs a warning.
+
+`enroll_roots` is empty by default. Each configured path expands `~`, must name
+an existing directory, and is canonicalized at load time. These roots bound
+daemon-routed enrollment requests. Host-local `add` commands do not require the
+target to be under an enroll root.
 
 `interval_secs` controls source collection. Queued gap and knowledge edits
 poll independently at `mutation_interval_secs` (default 10 seconds, minimum
@@ -155,6 +169,28 @@ uploads the atomic candidate with resumable content-addressed blobs, and then
 re-resolves the ref. Ref movement abandons the capture and retries. Working-tree
 files are never used, and a linked worktree remains ineligible.
 
+Enroll a main-worktree repository root or subtree and onboard it immediately:
+
+```sh
+bbox-code-collector --config /path/to/code-collector.toml add /path/to/project
+```
+
+`add` requires complete, non-shallow history and refuses linked worktrees. It
+scaffolds the project-owned `.bbox` files, derives the durable root or subtree
+scope, and chooses the published branch ref from `--ref`, `origin/HEAD`, or the
+current branch in that order. Git history, provenance, and published knowledge
+are enabled for the enrolled entry by default. Disable individual lanes with
+`--no-git-history`, `--no-provenance`, or `--no-published-knowledge`.
+
+The sidecar replacement is atomic. Re-adding an enrolled root does not add a
+duplicate. The command prints one JSON receipt containing the catalog ids,
+scope, published ref, sidecar path, and whether the `.bbox` identity is
+committed at that ref. An uncommitted receipt lists the exact repo-relative
+scaffolding paths to commit. If immediate onboarding is refused, the sidecar
+entry remains enrolled and the receipt includes the daemon HTTP status, error
+code, and message before the command exits nonzero. The command does not
+commit, push, or write outside `.bbox/` and the sidecar.
+
 Publish once and wait for a terminal generation state:
 
 ```sh
@@ -166,6 +202,13 @@ Run continuously with bounded retry backoff:
 ```sh
 bbox-code-collector --config /path/to/code-collector.toml run
 ```
+
+`run` checks the main configuration and enrolled-projects sidecar modification
+times on the checkout-mutation cadence. A valid replacement atomically becomes
+the shared snapshot read by every lane pass. An invalid replacement leaves the
+previous snapshot active. Changes to `server_url`, `token_file`, or
+`trusted_encrypted_network` are logged but retain their active values until the
+collector restarts.
 
 ## FreshV2 cutover rehearsal
 
