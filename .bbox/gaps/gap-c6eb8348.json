@@ -19,8 +19,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "workflow/project-catalog/remote-onboarding-grant-and-redirect",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-23T15:51:21Z",
-  "updated_at": "2026-09-23T15:51:21Z"
+  "updated_at": "2026-09-23T19:47:40Z",
+  "resolved_at": "2026-09-23T19:47:40Z",
+  "resolution_note": "Implemented on invidious9000/skills-as-mcp-resources (tip 07c03b95) and deployed to the cage: producer claim_scopes/auto_publish policies with a durable claims store, collector add + enrolled-projects sidecar + live reload, producer command channel routing bbox_project_register on remote paths to the covering collector, and the onboard-project skill served over MCP skills/list, resources, and prompts. Verified live: a throwaway repository registered with one bbox_project_register call, then one identity commit, and was searchable and auto-published on the next collector pass."
 }

@@ -1,0 +1,20 @@
+{
+  "id": "gap-6ac18d37",
+  "title": "Offline producer-claims revoke runs against a live daemon, whose in-memory claims can overwrite it",
+  "gap_kind": "tooling",
+  "domain": "project-catalog",
+  "wanted_capability": "Revoking a producer scope claim should either be an online daemon operation (operator-authenticated admin route or MCP tool that updates the in-memory store and rebuilds producer auth) or the offline CLI should take the daemon lifetime lock like project-catalog retire does. Today the offline command writes the claims file while the daemon keeps the claim in memory: the claim stays effective until restart, and the daemon's next claim persist rewrites the revoked record back.",
+  "missing_primitive": "Locked or online producer-claims revoke.",
+  "fallback_used": "Ran the offline revoke inside the pod immediately before a converge that restarted the daemon, so the restart loaded the revoked file.",
+  "evidence": [
+    "src/bin/blackbox.rs:1068",
+    "crates/bbox-stores/src/producer_claims.rs"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/producer-claims-offline-revoke-unlocked",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-23T19:52:14Z",
+  "updated_at": "2026-09-23T19:52:14Z"
+}
