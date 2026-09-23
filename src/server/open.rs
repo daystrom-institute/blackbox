@@ -968,6 +968,7 @@ pub(super) fn open_shared_state(
         producer_claims: producer_claims_store,
         producer_claims_persister,
         producer_claim_lock: tokio::sync::Mutex::new(()),
+        producer_commands: Arc::new(super::producer_commands::ProducerCommandRuntime::new()),
         project_authority,
         accepted_publications,
         records_provider,

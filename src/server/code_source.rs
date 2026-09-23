@@ -16,7 +16,8 @@ use bbox_code_source::{
     CheckoutMutationPollResponseV1, CodeSourceProbeCurrentV1, CodeSourceProbeRequestV1,
     CodeSourceProbeResponseV1, ContractError, CutbackErrorClass, CutbackReason, CutbackStateV2,
     ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus, ManifestPage,
-    MissingBlobsPage,
+    MissingBlobsPage, ProducerCommandAckRequestV1, ProducerCommandPollRequestV1,
+    ProducerCommandPollResponseV1,
 };
 use bbox_code_source_store::{
     ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
@@ -922,6 +923,14 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             "/internal/code-source/v1/checkout-mutations/ack",
             post(ack_checkout_mutation).layer(DefaultBodyLimit::max(64 * 1024)),
         )
+        .route(
+            "/internal/code-source/v1/producer-commands/poll",
+            post(poll_producer_commands).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/code-source/v1/producer-commands/ack",
+            post(ack_producer_command).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             super::producer_auth::authenticate_code_source_request,
@@ -1436,6 +1445,59 @@ async fn poll_checkout_mutations(
         mutations,
         deferred,
     }))
+}
+
+async fn poll_producer_commands(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<ProducerCommandPollRequestV1>,
+) -> Result<Json<ProducerCommandPollResponseV1>, HttpError> {
+    request.validate().map_err(|error| {
+        HttpError::unprocessable("invalid_producer_command_poll", error.to_string())
+    })?;
+    Ok(Json(
+        state.producer_commands.poll(&grant.producer_id, request),
+    ))
+}
+
+async fn ack_producer_command(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<ProducerCommandAckRequestV1>,
+) -> Result<Json<serde_json::Value>, HttpError> {
+    request.validate().map_err(|error| {
+        HttpError::unprocessable("invalid_producer_command_ack", error.to_string())
+    })?;
+    let result = match request.outcome.as_str() {
+        "applied" => super::producer_commands::ProducerCommandResult::Applied(
+            request.receipt.expect("validated applied receipt"),
+        ),
+        "failed" => super::producer_commands::ProducerCommandResult::Failed(
+            request.error.expect("validated failed error"),
+        ),
+        _ => unreachable!("producer command ack outcome was validated"),
+    };
+    let status = state
+        .producer_commands
+        .ack(&grant.producer_id, &request.command_id, result)
+        .map_err(|error| match error {
+            super::producer_commands::ProducerCommandAckError::UnknownCommand => HttpError::new(
+                StatusCode::NOT_FOUND,
+                "producer_command_not_found",
+                "producer command not found",
+            ),
+            super::producer_commands::ProducerCommandAckError::WrongProducer => HttpError::new(
+                StatusCode::FORBIDDEN,
+                "producer_command_forbidden",
+                "producer command belongs to another producer",
+            ),
+        })?;
+    Ok(Json(serde_json::json!({
+        "status": match status {
+            super::producer_commands::ProducerCommandAckStatus::Accepted => "accepted",
+            super::producer_commands::ProducerCommandAckStatus::AlreadySettled => "already_settled",
+        }
+    })))
 }
 
 /// Terminal outcome for one delivered mutation. The ack's scope must sit
@@ -7415,6 +7477,43 @@ mod tests {
         (state, token_secret)
     }
 
+    fn two_producer_http_state(root: &std::path::Path) -> (Arc<SharedState>, String, String) {
+        let state = Arc::new(SharedState::for_test(root));
+        let first_secret = "a".repeat(64);
+        let second_secret = "b".repeat(64);
+        let store = state.code_sources.store();
+        *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
+            auth: Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![
+                    (
+                        bro_rpc::ServiceToken::parse(first_secret.clone()).unwrap(),
+                        ProducerGrant {
+                            producer_id: "producer-a".into(),
+                            projects: BTreeMap::from([(
+                                PublishedScope::try_new("repo-a", ".").unwrap(),
+                                "project-a".into(),
+                            )]),
+                        },
+                    ),
+                    (
+                        bro_rpc::ServiceToken::parse(second_secret.clone()).unwrap(),
+                        ProducerGrant {
+                            producer_id: "producer-b".into(),
+                            projects: BTreeMap::from([(
+                                PublishedScope::try_new("repo-b", ".").unwrap(),
+                                "project-b".into(),
+                            )]),
+                        },
+                    ),
+                ],
+            )),
+            store,
+        });
+        (state, first_secret, second_secret)
+    }
+
     fn authenticated_request(
         method: &str,
         uri: impl AsRef<str>,
@@ -7428,6 +7527,99 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn producer_command_routes_isolate_poll_and_ack_by_authenticated_producer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, first_token, second_token) = two_producer_http_state(&root);
+        let command = state.producer_commands.enqueue_enroll(
+            "producer-a",
+            Path::new("/checkout/repos/project"),
+            None,
+        );
+        let app = router(state.clone()).with_state(state.clone());
+        let presence = |host: &str, root: &str| ProducerCommandPollRequestV1 {
+            schema_version: bbox_code_source::PRODUCER_COMMAND_SCHEMA_VERSION,
+            presence: bbox_code_source::ProducerPresenceV1 {
+                enroll_roots: vec![root.into()],
+                host_label: host.into(),
+                config_path: format!("/etc/blackbox/{host}.toml"),
+                service_label: None,
+                collector_version: "0.0.1".into(),
+            },
+        };
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/producer-commands/poll",
+                &second_token,
+                Body::from(serde_json::to_vec(&presence("host-b", "/other")).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let page: ProducerCommandPollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(page.commands.is_empty());
+
+        let wrong_ack = ProducerCommandAckRequestV1 {
+            command_id: command.command_id.clone(),
+            outcome: "failed".into(),
+            receipt: None,
+            error: Some(bbox_code_source::ProducerCommandErrorV1 {
+                code: "enroll_failed".into(),
+                message: "failed".into(),
+            }),
+        };
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/producer-commands/ack",
+                &second_token,
+                Body::from(serde_json::to_vec(&wrong_ack).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/producer-commands/poll",
+                &first_token,
+                Body::from(serde_json::to_vec(&presence("host-a", "/checkout/repos")).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let page: ProducerCommandPollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.commands, vec![command.clone()]);
+
+        let ack = ProducerCommandAckRequestV1 {
+            command_id: command.command_id,
+            outcome: "failed".into(),
+            receipt: None,
+            error: Some(bbox_code_source::ProducerCommandErrorV1 {
+                code: "enroll_failed".into(),
+                message: "failed".into(),
+            }),
+        };
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/producer-commands/ack",
+                &first_token,
+                Body::from(serde_json::to_vec(&ack).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

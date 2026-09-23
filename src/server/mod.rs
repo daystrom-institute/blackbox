@@ -32,6 +32,7 @@ pub(crate) mod knowledge_view;
 mod mcp;
 mod open;
 pub(crate) mod producer_auth;
+pub(crate) mod producer_commands;
 pub mod progress;
 pub(crate) mod provenance_authority;
 pub(crate) mod provenance_import;

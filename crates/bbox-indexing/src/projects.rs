@@ -20,6 +20,10 @@ use crate::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProjectRegisterParams {
     pub path: String,
+    /// Select one checkout-host producer when equally specific enroll roots
+    /// would otherwise make remote onboarding ambiguous.
+    #[serde(default)]
+    pub producer: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -2,6 +2,7 @@ use anyhow::Context;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::artifacts;
 use crate::config;
@@ -34,6 +35,10 @@ struct ProjectInitResult {
     skipped: Vec<String>,
     repo_id: Option<String>,
     repo_id_recorded: bool,
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[derive(Debug)]
@@ -319,23 +324,35 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
 impl BlackboxServer {
     #[tool(
         name = "bbox_project_register",
-        description = "Checkout-host administration: requires local checkout authority; remote checkout onboarding uses the checkout-host collector. Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent - returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope (or a new Published/LegacyLocal project is minted), config-declared aliases become pending nominations, and a scope disagreement returns the exact promotion or scope-migration handoff instead of a second project. Use bbox_project_catalog_list for logical projects in catalog mode, or bbox_project_list for bridge registered roots."
+        description = "Register an absolute project path and schedule background agentic-corpus indexing. A path visible to the daemon uses local checkout authority. A remote path automatically routes to the fresh checkout-host collector whose enroll_roots most specifically contain it; optional producer selects among an equal-depth tie. Collector enrollment scaffolds `.bbox` and updates its host-local sidecar, so no per-project collector or daemon config edit is needed. When the enrolled receipt reports identity_committed=false, commit exactly the returned commit_paths on published_ref. Repeating the same path reuses pending work and registration is idempotent. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope or a new Published/LegacyLocal project is minted. Use bbox_project_catalog_list for logical projects in catalog mode, or bbox_project_list for bridge registered roots."
     )]
     pub(crate) async fn bbox_project_register(
         &self,
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        if !Path::new(&p.path).exists() {
-            return Self::err_text(&format!(
-                "Error: error.project_onboarding_remote: {} is not visible to this daemon. \
-                 Onboard it through the checkout owner instead: add the project to the \
-                 checkout-host collector config, run `bbox-code-collector --config <cfg> \
-                 init {}` on that host for scaffolding, and the collector onboards it \
-                 through the producer channel on its next cycle. See \
-                 design/daemon-runtime/remote-project-onboarding.md",
-                p.path, p.path
-            ));
+        let path = Path::new(&p.path);
+        if !path.is_absolute() {
+            return Self::err_text(&format!("Error: project path must be absolute: {}", p.path));
+        }
+        if tokio::fs::metadata(path).await.is_err() {
+            let result = self.register_remote_project(&p).await;
+            return match result {
+                Ok(value) => {
+                    let text = serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                    Self::ok_text(&text)
+                }
+                Err(value) => {
+                    let text = serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %text, "err");
+                    Self::err_text(&text)
+                }
+            };
         }
         // Catalog arm (plan §9.1): the compatibility composite. Probing,
         // find-or-create, attach, and nomination ingestion run on the
@@ -432,6 +449,111 @@ impl BlackboxServer {
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
                 Self::err_text(&format!("Error: {e:#}"))
             }
+        }
+    }
+
+    async fn register_remote_project(
+        &self,
+        params: &ProjectRegisterParams,
+    ) -> Result<Value, Value> {
+        self.register_remote_project_with_timeout(params, Duration::from_secs(60))
+            .await
+    }
+
+    async fn register_remote_project_with_timeout(
+        &self,
+        params: &ProjectRegisterParams,
+        wait_timeout: Duration,
+    ) -> Result<Value, Value> {
+        use crate::server::producer_commands::{ProducerCommandResult, ProducerSelectionError};
+
+        let path = Path::new(&params.path);
+        let producer = match self
+            .state
+            .producer_commands
+            .select_producer(path, params.producer.as_deref())
+        {
+            Ok(producer) => producer,
+            Err(ProducerSelectionError::Ambiguous { producer_ids }) => {
+                return Err(json!({
+                    "code": "error.project_onboarding_ambiguous",
+                    "message": "multiple checkout-host producers have equally specific enroll roots for this path",
+                    "path": params.path,
+                    "candidates": producer_ids,
+                    "next_step": "Call bbox_project_register again with the producer parameter set to one candidate id."
+                }));
+            }
+            Err(ProducerSelectionError::NoProducer { known }) => {
+                let known = known
+                    .into_iter()
+                    .map(|producer| {
+                        let command = format!(
+                            "bbox-code-collector --config {} add {}",
+                            shell_quote(&producer.presence.config_path),
+                            shell_quote(&params.path)
+                        );
+                        json!({
+                            "producer_id": producer.producer_id,
+                            "host_label": producer.presence.host_label,
+                            "enroll_roots": producer.presence.enroll_roots,
+                            "config_path": producer.presence.config_path,
+                            "fresh": producer.fresh,
+                            "host_shell_fallback": command,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Err(json!({
+                    "code": "error.project_onboarding_no_producer",
+                    "message": "no fresh checkout-host producer covers this path",
+                    "path": params.path,
+                    "known_producers": known,
+                }));
+            }
+        };
+
+        let command =
+            self.state
+                .producer_commands
+                .enqueue_enroll(&producer.producer_id, path, None);
+        match self
+            .state
+            .producer_commands
+            .wait_for_result(&command.command_id, wait_timeout)
+            .await
+        {
+            Some(ProducerCommandResult::Applied(receipt)) => {
+                let next_step = (!receipt.identity_committed).then(|| {
+                    format!(
+                        "Commit exactly [{}] on {} and push that ref, then call bbox_project_register again if publication has not started.",
+                        receipt
+                            .commit_paths
+                            .iter()
+                            .map(|path| format!("`{path}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        receipt.published_ref
+                    )
+                });
+                Ok(json!({
+                    "status": "enrolled",
+                    "producer_id": producer.producer_id,
+                    "command_id": command.command_id,
+                    "receipt": receipt,
+                    "next_step": next_step,
+                }))
+            }
+            Some(ProducerCommandResult::Failed(error)) => Err(json!({
+                "code": error.code,
+                "message": error.message,
+                "producer_id": producer.producer_id,
+                "command_id": command.command_id,
+            })),
+            None => Ok(json!({
+                "status": "pending",
+                "producer_id": producer.producer_id,
+                "command_id": command.command_id,
+                "next_step": "Call bbox_project_register again with the same path.",
+            })),
         }
     }
 
@@ -679,7 +801,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_init",
-        description = "Checkout-host initialization, requiring local filesystem authority; remote checkouts initialize through their owning host collector. Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml."
+        description = "Initialize a locally visible project `.bbox` workspace using daemon checkout authority. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml. If the daemon cannot stat the path, call bbox_project_register instead; it routes to the checkout-host collector, scaffolds the project during enrollment, and returns the exact paths to commit."
     )]
     pub(crate) async fn bbox_project_init(
         &self,
@@ -693,12 +815,9 @@ impl BlackboxServer {
             }
             if !path.exists() {
                 anyhow::bail!(
-                    "error.project_onboarding_remote: {} is not visible to this daemon. \
-                     Onboard it through the checkout owner instead: add the project to the \
-                     checkout-host collector config, run `bbox-code-collector --config <cfg> \
-                     init {}` on that host for scaffolding, and the collector onboards it \
-                     through the producer channel on its next cycle. See \
-                     design/daemon-runtime/remote-project-onboarding.md",
+                    "error.project_init_remote: {} is not visible to this daemon. Call \
+                     bbox_project_register(path={:?}) instead; remote registration routes to \
+                     the checkout-host collector and scaffolds the project as part of enrollment.",
                     p.path,
                     p.path
                 );
@@ -1319,14 +1438,154 @@ mod tests {
     use std::sync::Arc;
 
     use crate::projects::ProjectRecord;
+    use crate::server::producer_commands::{ProducerCommandResult, ProducerCommandRuntime};
     use crate::server::state::{BlackboxServer, SharedState};
     use crate::{entity_ref, knowledge, notes, pins, threads};
+    use bbox_code_source::{
+        EnrollReceiptV1, PRODUCER_COMMAND_SCHEMA_VERSION, ProducerCommandPollRequestV1,
+        ProducerPresenceV1,
+    };
+    use bbox_corpus_core::identity::PublishedScope;
     use rmcp::handler::server::wrapper::Parameters;
     use serde_json::Value;
     use tempfile::tempdir;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn record_presence(runtime: &ProducerCommandRuntime, producer_id: &str, root: &Path) {
+        runtime.poll(
+            producer_id,
+            ProducerCommandPollRequestV1 {
+                schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+                presence: ProducerPresenceV1 {
+                    enroll_roots: vec![root.to_string_lossy().into_owned()],
+                    host_label: "checkout-host".into(),
+                    config_path: "/etc/blackbox/collector.toml".into(),
+                    service_label: Some("collector".into()),
+                    collector_version: "0.0.1".into(),
+                },
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_register_routes_to_collector_and_returns_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let root = tmp.path().canonicalize().unwrap();
+        let remote_path = root.join("remote-project");
+        record_presence(&server.state.producer_commands, "producer-a", &root);
+
+        let call_server = server.clone();
+        let call_path = remote_path.to_string_lossy().into_owned();
+        let call = tokio::spawn(async move {
+            call_server
+                .bbox_project_register(Parameters(ProjectRegisterParams {
+                    path: call_path,
+                    producer: None,
+                }))
+                .await
+        });
+
+        let command = loop {
+            let response = server.state.producer_commands.poll(
+                "producer-a",
+                ProducerCommandPollRequestV1 {
+                    schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+                    presence: ProducerPresenceV1 {
+                        enroll_roots: vec![root.to_string_lossy().into_owned()],
+                        host_label: "checkout-host".into(),
+                        config_path: "/etc/blackbox/collector.toml".into(),
+                        service_label: Some("collector".into()),
+                        collector_version: "0.0.1".into(),
+                    },
+                },
+            );
+            if let Some(command) = response.commands.into_iter().next() {
+                break command;
+            }
+            tokio::task::yield_now().await;
+        };
+        server
+            .state
+            .producer_commands
+            .ack(
+                "producer-a",
+                &command.command_id,
+                ProducerCommandResult::Applied(EnrollReceiptV1 {
+                    project_id: Some("project-1".into()),
+                    attachment_id: Some("attachment-1".into()),
+                    created_project: true,
+                    already_attached: false,
+                    scope: PublishedScope::try_new("repo-a", ".").unwrap(),
+                    published_ref: "refs/heads/main".into(),
+                    identity_committed: false,
+                    commit_paths: vec![".bbox/config.toml".into()],
+                    onboard_error: None,
+                }),
+            )
+            .unwrap();
+
+        let result = call.await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let text = result_text(&result);
+        assert!(text.contains("\"status\": \"enrolled\""), "{text}");
+        assert!(text.contains(".bbox/config.toml"), "{text}");
+        assert!(text.contains("refs/heads/main"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn remote_register_without_presence_returns_typed_no_producer_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let missing = tmp.path().canonicalize().unwrap().join("remote-project");
+        let result = server
+            .bbox_project_register(Parameters(ProjectRegisterParams {
+                path: missing.to_string_lossy().into_owned(),
+                producer: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("error.project_onboarding_no_producer"),
+            "{}",
+            result_text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_register_timeout_returns_pending_and_reuses_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let root = tmp.path().canonicalize().unwrap();
+        let remote_path = root.join("remote-project");
+        record_presence(&server.state.producer_commands, "producer-a", &root);
+        let params = ProjectRegisterParams {
+            path: remote_path.to_string_lossy().into_owned(),
+            producer: None,
+        };
+
+        let first = server
+            .register_remote_project_with_timeout(&params, Duration::from_millis(1))
+            .await
+            .unwrap();
+        let second = server
+            .register_remote_project_with_timeout(&params, Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(first["status"], "pending");
+        assert_eq!(first["command_id"], second["command_id"]);
     }
 
     #[tokio::test]
@@ -1376,6 +1635,7 @@ mod tests {
         let reg = server
             .bbox_project_register(Parameters(ProjectRegisterParams {
                 path: repo.to_string_lossy().into_owned(),
+                producer: None,
             }))
             .await;
         assert_ne!(reg.is_error, Some(true));
@@ -1621,6 +1881,7 @@ mod tests {
         let register = server
             .bbox_project_register(Parameters(ProjectRegisterParams {
                 path: project.to_string_lossy().into_owned(),
+                producer: None,
             }))
             .await;
         assert_ne!(register.is_error, Some(true));
@@ -1730,6 +1991,7 @@ mod tests {
         let register = server
             .bbox_project_register(Parameters(ProjectRegisterParams {
                 path: old_project.clone(),
+                producer: None,
             }))
             .await;
         assert_ne!(register.is_error, Some(true));

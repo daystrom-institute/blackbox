@@ -112,6 +112,7 @@ pub(crate) struct SharedState {
     /// Serializes claim mutations and every producer-auth replacement so no
     /// reload can install a snapshot built from stale claim or config state.
     pub(crate) producer_claim_lock: tokio::sync::Mutex<()>,
+    pub(crate) producer_commands: Arc<super::producer_commands::ProducerCommandRuntime>,
     /// The runtime project authority selected by the startup store-version
     /// probe (phase-2 §4.1). Consumers never match this directly outside
     /// the defined seams: record enumeration goes through
@@ -816,6 +817,9 @@ impl SharedState {
             producer_claims: producer_claims_store,
             producer_claims_persister,
             producer_claim_lock: tokio::sync::Mutex::new(()),
+            producer_commands: Arc::new(
+                super::producer_commands::ProducerCommandRuntime::new(),
+            ),
             project_authority,
             // `for_test` builds the bridge authority, which never has an
             // accepted-publication runtime.
