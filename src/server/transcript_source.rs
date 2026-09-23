@@ -238,9 +238,11 @@ async fn onboard(
         Ok(serde_json::json!({"project_id": receipt.project_id.as_str(), "created": receipt.created, "epoch": receipt.catalog_epoch, "catalog_admitted": true, "reload_pending": false}))
     }).await;
     if result.is_ok() {
+        let _claim_guard = state.producer_claim_lock.lock().await;
         let config = state.config.read().clone();
         let records = state.records_provider.records_snapshot().records;
-        if let Err(error) = state.code_sources.reload(&config, &records) {
+        let claims = state.producer_claims.read().records_snapshot();
+        if let Err(error) = state.code_sources.reload(&config, &records, &claims) {
             tracing::warn!(%error, "native transcript catalog admission succeeded but grant reload is pending");
             if let Ok(receipt) = result.as_mut() {
                 receipt["catalog_admitted"] = serde_json::Value::Bool(true);
@@ -300,6 +302,7 @@ mod tests {
                 state.project_authority.catalog_store().cloned(),
                 state.checkout_access.clone(),
                 state.code_source_locality_cutover.clone(),
+                &state.producer_claims.read().records_snapshot(),
             )
             .unwrap(),
         );
@@ -488,7 +491,11 @@ mod tests {
         state.config.write().source_connectors.enabled = false;
         let config_state = state.config.read().clone();
         let records = state.records_provider.records_snapshot().records;
-        state.code_sources.reload(&config_state, &records).unwrap();
+        let claims = state.producer_claims.read().records_snapshot();
+        state
+            .code_sources
+            .reload(&config_state, &records, &claims)
+            .unwrap();
         let refused: Result<StreamStatus> = client
             .post(
                 "status",

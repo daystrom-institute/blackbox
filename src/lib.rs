@@ -64,6 +64,7 @@ use bbox_mcp_tools::path_cache;
 use bbox_packets as packets;
 use bbox_stores::checkout_mutations;
 use bbox_stores::pins;
+use bbox_stores::producer_claims;
 /// The transcript parser lives in the shared `bro-transcript` crate (the
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.

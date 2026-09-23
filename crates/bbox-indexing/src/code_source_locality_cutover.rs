@@ -854,6 +854,8 @@ mod tests {
             token_file: root.join("producer-token"),
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
+            claim_scopes: Default::default(),
+            auto_publish: false,
         }];
         let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
             &config,

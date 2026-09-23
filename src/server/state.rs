@@ -105,6 +105,14 @@ pub(crate) struct SharedState {
     pub(crate) checkout_mutations: Arc<RwLock<crate::checkout_mutations::CheckoutMutations>>,
     pub(crate) checkout_mutations_persister:
         StorePersister<crate::checkout_mutations::CheckoutMutations>,
+    /// Durable first-onboard assignments for producers whose config policy
+    /// permits claiming otherwise unassigned published scopes.
+    pub(crate) producer_claims: Arc<RwLock<crate::producer_claims::ProducerClaims>>,
+    pub(crate) producer_claims_persister: StorePersister<crate::producer_claims::ProducerClaims>,
+    /// Serializes claim mutations and every producer-auth replacement so no
+    /// reload can install a snapshot built from stale claim or config state.
+    pub(crate) producer_claim_lock: tokio::sync::Mutex<()>,
+    pub(crate) producer_commands: Arc<super::producer_commands::ProducerCommandRuntime>,
     /// The runtime project authority selected by the startup store-version
     /// probe (phase-2 §4.1). Consumers never match this directly outside
     /// the defined seams: record enumeration goes through
@@ -576,6 +584,10 @@ impl SharedState {
         self.checkout_mutations_persister.request_durable().await
     }
 
+    pub(crate) async fn persist_producer_claims_durable(&self) -> anyhow::Result<()> {
+        self.producer_claims_persister.request_durable().await
+    }
+
     pub(crate) async fn persist_projects_durable(&self) -> anyhow::Result<()> {
         match &self.project_authority {
             ProjectAuthority::Bridge { persister, .. } => persister.request_durable().await,
@@ -766,6 +778,15 @@ impl SharedState {
             checkout_mutations_store.clone(),
             checkout_mutations_path,
         );
+        let producer_claims_path = store_dir.join("producer-claims.json");
+        let producer_claims_store = Arc::new(RwLock::new(
+            crate::producer_claims::ProducerClaims::open(&producer_claims_path).unwrap(),
+        ));
+        let producer_claims_persister = StorePersister::spawn(
+            "producer-claims-test",
+            producer_claims_store.clone(),
+            producer_claims_path,
+        );
         let projects_persister =
             StorePersister::spawn("projects-test", projects_store.clone(), projects_path);
         if projects_needs_persist {
@@ -793,6 +814,12 @@ impl SharedState {
             pins_persister,
             checkout_mutations: checkout_mutations_store,
             checkout_mutations_persister,
+            producer_claims: producer_claims_store,
+            producer_claims_persister,
+            producer_claim_lock: tokio::sync::Mutex::new(()),
+            producer_commands: Arc::new(
+                super::producer_commands::ProducerCommandRuntime::new(),
+            ),
             project_authority,
             // `for_test` builds the bridge authority, which never has an
             // accepted-publication runtime.

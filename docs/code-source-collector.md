@@ -32,7 +32,8 @@ openssl rand -hex 32 > ~/.config/blackbox/code-collectors/checkout-host-a.token
 chmod 600 ~/.config/blackbox/code-collectors/checkout-host-a.token
 ```
 
-Add the producer and its exact published scopes to the daemon configuration:
+Add the producer once. To let agent registration claim previously unassigned
+catalog scopes, use `claim_scopes = "unclaimed"`:
 
 ```toml
 [code_collection]
@@ -53,9 +54,9 @@ max_provenance_logical_bytes = 2147483648
 [[code_collection.producers]]
 producer_id = "checkout-host-a"
 token_file = "~/.config/blackbox/code-collectors/checkout-host-a.token"
-scopes = [
-  { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." },
-]
+scopes = []
+claim_scopes = "unclaimed"
+auto_publish = true
 ```
 
 The daemon fails closed at startup when an enabled token is unsafe, a scope is
@@ -64,6 +65,40 @@ scope can wait for authenticated onboarding; it cannot publish before admission.
 Legacy bridge mode still requires scopes to resolve to registered projects.
 On SIGHUP, an invalid replacement retains the previous complete assignment and
 authentication table.
+
+Producer fields are:
+
+- `producer_id`: the stable id named by authentication and assignment errors.
+- `token_file` or `token_files`: the mutually exclusive bearer-token forms.
+- `scopes`: operator-pinned published scopes. Pins override durable claims.
+- `claim_scopes`: `none` by default, or `unclaimed` to let this producer claim
+  an unassigned catalog scope on its first authenticated onboard request.
+- `auto_publish`: `false` by default. When `true`, this producer may establish
+  the first accepted publication for a project it currently owns, only from a
+  Ready candidate on the project's catalog scope with a non-empty full branch
+  ref. An attached repo-knowledge capable attachment must exist for that scope,
+  but its checked-out branch does not constrain publication. The establish
+  uses the normal publisher acceptance path, makes the candidate's branch ref
+  the pointer's ref, and installs the project's auto-advance grant.
+
+With `claim_scopes = "unclaimed"`, `scopes` may be empty. A new claim is
+accepted only when no other producer owns that scope or any scope with the same
+repository id. Claims persist in the daemon's producer claims store and remain
+effective if the policy later returns to `none`; the policy gates new claims.
+A claimed scope without a catalog project is pending onboarding exactly like a
+pinned scope. Bridge mode ignores claims.
+
+Inspect or revoke claims offline with:
+
+```sh
+blackbox producer-claims list
+blackbox producer-claims revoke \
+  --producer checkout-host-a \
+  --scope '<recorded-repo-id>/.'
+```
+
+Both commands load the daemon configuration to resolve the producer claims
+store path. `--config <path>` selects a non-default daemon configuration.
 
 ### Rotating a producer's token without a downtime window
 
@@ -106,14 +141,38 @@ server_url = "https://corpus.example.invalid/"
 token_file = "/home/operator/.config/blackbox/code-collectors/checkout-host-a.token"
 interval_secs = 120
 mutation_interval_secs = 10
-
-[[projects]]
-root = "/home/operator/repos/project"
-scope = { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." }
-git_history = true
-provenance = true
-published_knowledge = { full_ref = "refs/heads/main" }
+enroll_roots = ["~/repos"]
+host_label = "checkout-host-a"
+service_label = "code-collector"
 ```
+
+Operator-authored projects remain in the main configuration. Projects enrolled
+by the collector are stored in a sibling sidecar named
+`<config-stem>.enrolled.toml` by default. Set `enrolled_projects_file` to use a
+different path. The sidecar uses the same `[[projects]]` entries as the main
+configuration, and the effective project set is the union of both files. When
+the same canonical root or scope appears in both, the main configuration wins
+and the collector logs a warning.
+
+`enroll_roots` is empty by default. Each configured path expands `~`, must name
+an existing directory, and is canonicalized at load time. These roots bound
+daemon-routed enrollment requests. Host-local `add` commands do not require the
+target to be under an enroll root.
+
+`host_label` identifies the checkout host in remote-registration errors and
+defaults to the output of `hostname`, or `unknown` if that command fails.
+`service_label` is optional and can identify one collector service among several
+on the same host.
+
+On every checkout-mutation cadence, after checking for a live config reload,
+the collector polls the authenticated producer command channel. The poll sends
+the canonical config path, host and service labels, collector version, and the
+complete `enroll_roots` list, including an empty list. The daemon retains this
+presence in memory and can route `bbox_project_register(path)` to a fresh
+collector whose most specific root contains the path. Enrollment runs the same
+scaffolding, sidecar update, and catalog onboarding procedure as the host-shell
+`add` command. The response names any project files that still need to be
+committed on the returned published ref.
 
 `interval_secs` controls source collection. Queued gap and knowledge edits
 poll independently at `mutation_interval_secs` (default 10 seconds, minimum
@@ -155,6 +214,28 @@ uploads the atomic candidate with resumable content-addressed blobs, and then
 re-resolves the ref. Ref movement abandons the capture and retries. Working-tree
 files are never used, and a linked worktree remains ineligible.
 
+Enroll a main-worktree repository root or subtree and onboard it immediately:
+
+```sh
+bbox-code-collector --config /path/to/code-collector.toml add /path/to/project
+```
+
+`add` requires complete, non-shallow history and refuses linked worktrees. It
+scaffolds the project-owned `.bbox` files, derives the durable root or subtree
+scope, and chooses the published branch ref from `--ref`, `origin/HEAD`, or the
+current branch in that order. Git history, provenance, and published knowledge
+are enabled for the enrolled entry by default. Disable individual lanes with
+`--no-git-history`, `--no-provenance`, or `--no-published-knowledge`.
+
+The sidecar replacement is atomic. Re-adding an enrolled root does not add a
+duplicate. The command prints one JSON receipt containing the catalog ids,
+scope, published ref, sidecar path, and whether the `.bbox` identity is
+committed at that ref. An uncommitted receipt lists the exact repo-relative
+scaffolding paths to commit. If immediate onboarding is refused, the sidecar
+entry remains enrolled and the receipt includes the daemon HTTP status, error
+code, and message before the command exits nonzero. The command does not
+commit, push, or write outside `.bbox/` and the sidecar.
+
 Publish once and wait for a terminal generation state:
 
 ```sh
@@ -166,6 +247,13 @@ Run continuously with bounded retry backoff:
 ```sh
 bbox-code-collector --config /path/to/code-collector.toml run
 ```
+
+`run` checks the main configuration and enrolled-projects sidecar modification
+times on the checkout-mutation cadence. A valid replacement atomically becomes
+the shared snapshot read by every lane pass. An invalid replacement leaves the
+previous snapshot active. Changes to `server_url`, `token_file`, or
+`trusted_encrypted_network` are logged but retain their active values until the
+collector restarts.
 
 ## FreshV2 cutover rehearsal
 

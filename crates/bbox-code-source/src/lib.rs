@@ -40,6 +40,8 @@ pub enum ContractError {
     InvalidOnboardField(&'static str),
     #[error("invalid checkout mutation field: {0}")]
     InvalidCheckoutMutationField(&'static str),
+    #[error("invalid producer command field: {0}")]
+    InvalidProducerCommandField(&'static str),
     #[error("invalid producer id")]
     InvalidProducerId,
     #[error("invalid relative path: {0}")]
@@ -365,6 +367,279 @@ pub struct CatalogOnboardResponseV1 {
     pub epoch: u64,
     #[serde(default)]
     pub nominated_aliases: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Producer command backchannel (v1)
+// ---------------------------------------------------------------------------
+
+pub const PRODUCER_COMMAND_SCHEMA_VERSION: u32 = 1;
+pub const MAX_PRODUCER_ENROLL_ROOTS: usize = 64;
+pub const MAX_PRODUCER_COMMANDS_PER_POLL: usize = 64;
+pub const MAX_PRODUCER_COMMAND_PATH_BYTES: usize = 4096;
+pub const MAX_PRODUCER_COMMAND_LABEL_BYTES: usize = 256;
+pub const MAX_PRODUCER_COMMAND_VERSION_BYTES: usize = 128;
+pub const MAX_PRODUCER_COMMAND_REF_BYTES: usize = 1024;
+pub const MAX_PRODUCER_COMMAND_ERROR_BYTES: usize = 4096;
+pub const MAX_ENROLL_RECEIPT_COMMIT_PATHS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerPresenceV1 {
+    pub enroll_roots: Vec<String>,
+    pub host_label: String,
+    pub config_path: String,
+    pub service_label: Option<String>,
+    pub collector_version: String,
+}
+
+impl ProducerPresenceV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.enroll_roots.len() > MAX_PRODUCER_ENROLL_ROOTS {
+            return Err(ContractError::InvalidProducerCommandField("enroll_roots"));
+        }
+        for root in &self.enroll_roots {
+            validate_absolute_command_path(root, "enroll_roots")?;
+        }
+        validate_command_string(
+            &self.host_label,
+            MAX_PRODUCER_COMMAND_LABEL_BYTES,
+            "host_label",
+        )?;
+        validate_absolute_command_path(&self.config_path, "config_path")?;
+        if let Some(service_label) = &self.service_label {
+            validate_command_string(
+                service_label,
+                MAX_PRODUCER_COMMAND_LABEL_BYTES,
+                "service_label",
+            )?;
+        }
+        validate_command_string(
+            &self.collector_version,
+            MAX_PRODUCER_COMMAND_VERSION_BYTES,
+            "collector_version",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCommandPollRequestV1 {
+    pub schema_version: u32,
+    pub presence: ProducerPresenceV1,
+}
+
+impl ProducerCommandPollRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != PRODUCER_COMMAND_SCHEMA_VERSION {
+            return Err(ContractError::UnsupportedSchema(self.schema_version));
+        }
+        self.presence.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCommandPollResponseV1 {
+    pub commands: Vec<ProducerCommandV1>,
+}
+
+impl ProducerCommandPollResponseV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.commands.len() > MAX_PRODUCER_COMMANDS_PER_POLL {
+            return Err(ContractError::InvalidProducerCommandField("commands"));
+        }
+        self.commands
+            .iter()
+            .try_for_each(ProducerCommandV1::validate)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCommandV1 {
+    pub command_id: String,
+    pub kind: String,
+    pub path: String,
+    pub full_ref: Option<String>,
+}
+
+impl ProducerCommandV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_producer_command_id(&self.command_id)?;
+        if self.kind != "enroll" {
+            return Err(ContractError::InvalidProducerCommandField("kind"));
+        }
+        validate_absolute_command_path(&self.path, "path")?;
+        if let Some(full_ref) = &self.full_ref {
+            validate_command_string(full_ref, MAX_PRODUCER_COMMAND_REF_BYTES, "full_ref")?;
+            if !full_ref.starts_with("refs/") {
+                return Err(ContractError::InvalidProducerCommandField("full_ref"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+}
+
+impl ProducerCommandErrorV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_command_string(&self.code, MAX_PRODUCER_COMMAND_LABEL_BYTES, "error.code")?;
+        validate_command_string(
+            &self.message,
+            MAX_PRODUCER_COMMAND_ERROR_BYTES,
+            "error.message",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollOnboardErrorV1 {
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl EnrollOnboardErrorV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(code) = &self.code {
+            validate_command_string(code, MAX_PRODUCER_COMMAND_LABEL_BYTES, "onboard_error.code")?;
+        }
+        validate_command_string(
+            &self.message,
+            MAX_PRODUCER_COMMAND_ERROR_BYTES,
+            "onboard_error.message",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollReceiptV1 {
+    pub project_id: Option<String>,
+    pub attachment_id: Option<String>,
+    pub created_project: bool,
+    pub already_attached: bool,
+    pub scope: PublishedScope,
+    pub published_ref: String,
+    pub identity_committed: bool,
+    #[serde(default)]
+    pub commit_paths: Vec<String>,
+    pub onboard_error: Option<EnrollOnboardErrorV1>,
+}
+
+impl EnrollReceiptV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        for (value, field) in [
+            (&self.project_id, "project_id"),
+            (&self.attachment_id, "attachment_id"),
+        ] {
+            if let Some(value) = value {
+                validate_command_string(value, MAX_PRODUCER_COMMAND_LABEL_BYTES, field)?;
+            }
+        }
+        validate_scope(&self.scope)?;
+        validate_command_string(
+            &self.published_ref,
+            MAX_PRODUCER_COMMAND_REF_BYTES,
+            "published_ref",
+        )?;
+        if !self.published_ref.starts_with("refs/") {
+            return Err(ContractError::InvalidProducerCommandField("published_ref"));
+        }
+        if self.commit_paths.len() > MAX_ENROLL_RECEIPT_COMMIT_PATHS {
+            return Err(ContractError::InvalidProducerCommandField("commit_paths"));
+        }
+        for path in &self.commit_paths {
+            if path.len() > MAX_PRODUCER_COMMAND_PATH_BYTES || validate_relative_path(path).is_err()
+            {
+                return Err(ContractError::InvalidProducerCommandField("commit_paths"));
+            }
+        }
+        if self.identity_committed && !self.commit_paths.is_empty() {
+            return Err(ContractError::InvalidProducerCommandField("commit_paths"));
+        }
+        if let Some(error) = &self.onboard_error {
+            error.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCommandAckRequestV1 {
+    pub command_id: String,
+    pub outcome: String,
+    pub receipt: Option<EnrollReceiptV1>,
+    pub error: Option<ProducerCommandErrorV1>,
+}
+
+impl ProducerCommandAckRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_producer_command_id(&self.command_id)?;
+        match self.outcome.as_str() {
+            "applied" if self.receipt.is_some() && self.error.is_none() => self
+                .receipt
+                .as_ref()
+                .expect("checked receipt presence")
+                .validate(),
+            "failed" if self.receipt.is_none() && self.error.is_some() => self
+                .error
+                .as_ref()
+                .expect("checked error presence")
+                .validate(),
+            "applied" | "failed" => Err(ContractError::InvalidProducerCommandField(
+                "outcome payload",
+            )),
+            _ => Err(ContractError::InvalidProducerCommandField("outcome")),
+        }
+    }
+}
+
+fn validate_producer_command_id(value: &str) -> Result<(), ContractError> {
+    if value.len() != 19
+        || !value.starts_with("pc-")
+        || !value[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ContractError::InvalidProducerCommandField("command_id"));
+    }
+    Ok(())
+}
+
+fn validate_absolute_command_path(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if value.len() > MAX_PRODUCER_COMMAND_PATH_BYTES
+        || !Path::new(value).is_absolute()
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ContractError::InvalidProducerCommandField(field));
+    }
+    Ok(())
+}
+
+fn validate_command_string(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<(), ContractError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ContractError::InvalidProducerCommandField(field));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1309,133 @@ mod tests {
             reason: "bbox_gap(scope=project) via checkout-owner lane".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
         }
+    }
+
+    fn valid_presence() -> ProducerPresenceV1 {
+        ProducerPresenceV1 {
+            enroll_roots: vec!["/home/operator/repos".into()],
+            host_label: "checkout-host-a".into(),
+            config_path: "/etc/blackbox/code-collector.toml".into(),
+            service_label: Some("collector-a".into()),
+            collector_version: "0.0.1".into(),
+        }
+    }
+
+    fn valid_enroll_receipt() -> EnrollReceiptV1 {
+        EnrollReceiptV1 {
+            project_id: Some("p_00000000000000000000000000000001".into()),
+            attachment_id: Some("pa_000000000000000000000000000001".into()),
+            created_project: true,
+            already_attached: false,
+            scope: scope(),
+            published_ref: "refs/heads/main".into(),
+            identity_committed: false,
+            commit_paths: vec![
+                ".bbox/config.toml".into(),
+                ".bbox/mcp.json".into(),
+                ".bbox/local/.gitignore".into(),
+            ],
+            onboard_error: None,
+        }
+    }
+
+    #[test]
+    fn producer_command_contract_accepts_valid_poll_command_and_ack() {
+        ProducerCommandPollRequestV1 {
+            schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+            presence: valid_presence(),
+        }
+        .validate()
+        .unwrap();
+        ProducerCommandPollResponseV1 {
+            commands: vec![ProducerCommandV1 {
+                command_id: "pc-0123456789abcdef".into(),
+                kind: "enroll".into(),
+                path: "/home/operator/repos/example".into(),
+                full_ref: Some("refs/heads/main".into()),
+            }],
+        }
+        .validate()
+        .unwrap();
+        ProducerCommandAckRequestV1 {
+            command_id: "pc-0123456789abcdef".into(),
+            outcome: "applied".into(),
+            receipt: Some(valid_enroll_receipt()),
+            error: None,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn producer_command_contract_rejects_relative_paths_and_payload_mismatches() {
+        let mut relative_presence = valid_presence();
+        relative_presence.enroll_roots = vec!["repos".into()];
+        assert!(relative_presence.validate().is_err());
+
+        let mut relative_config = valid_presence();
+        relative_config.config_path = "collector.toml".into();
+        assert!(relative_config.validate().is_err());
+
+        let mut bad_command = ProducerCommandV1 {
+            command_id: "pc-0123456789abcdef".into(),
+            kind: "enroll".into(),
+            path: "repos/example".into(),
+            full_ref: None,
+        };
+        assert!(bad_command.validate().is_err());
+        bad_command.path = "/repos/example".into();
+        bad_command.kind = "delete".into();
+        assert!(bad_command.validate().is_err());
+
+        let mismatched_ack = ProducerCommandAckRequestV1 {
+            command_id: "pc-0123456789abcdef".into(),
+            outcome: "failed".into(),
+            receipt: Some(valid_enroll_receipt()),
+            error: None,
+        };
+        assert!(mismatched_ack.validate().is_err());
+    }
+
+    #[test]
+    fn producer_command_contract_enforces_string_and_list_bounds() {
+        let mut too_many_roots = valid_presence();
+        too_many_roots.enroll_roots =
+            vec!["/home/operator/repos".into(); MAX_PRODUCER_ENROLL_ROOTS + 1];
+        assert!(too_many_roots.validate().is_err());
+
+        let mut long_label = valid_presence();
+        long_label.host_label = "x".repeat(MAX_PRODUCER_COMMAND_LABEL_BYTES + 1);
+        assert!(long_label.validate().is_err());
+
+        let response = ProducerCommandPollResponseV1 {
+            commands: vec![
+                ProducerCommandV1 {
+                    command_id: "pc-0123456789abcdef".into(),
+                    kind: "enroll".into(),
+                    path: "/home/operator/repos/example".into(),
+                    full_ref: None,
+                };
+                MAX_PRODUCER_COMMANDS_PER_POLL + 1
+            ],
+        };
+        assert!(response.validate().is_err());
+
+        let mut too_many_paths = valid_enroll_receipt();
+        too_many_paths.commit_paths =
+            vec![".bbox/config.toml".into(); MAX_ENROLL_RECEIPT_COMMIT_PATHS + 1];
+        assert!(too_many_paths.validate().is_err());
+
+        let failed = ProducerCommandAckRequestV1 {
+            command_id: "pc-fedcba9876543210".into(),
+            outcome: "failed".into(),
+            receipt: None,
+            error: Some(ProducerCommandErrorV1 {
+                code: "enroll_failed".into(),
+                message: "x".repeat(MAX_PRODUCER_COMMAND_ERROR_BYTES + 1),
+            }),
+        };
+        assert!(failed.validate().is_err());
     }
 
     #[test]

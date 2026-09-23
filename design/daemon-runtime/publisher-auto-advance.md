@@ -8,7 +8,7 @@ topic:
   - knowledge
   - corpus
 tags: [publisher, accepted-publication, producer, policy, gap-a6911d0e]
-brief: "An opt-in, default-off, per-project grant that lets a Ready publication candidate from a project's already-bound producer be accepted on the linear fast path, through the exact acceptance path the operator tool uses, with the grant read from the currently accepted pointer so a candidate can never authorize itself."
+brief: "Default-off operator grants for establishing and advancing accepted publication from a project's owning producer through the exact operator acceptance path: producer-level auto_publish establishes the first pointer on the first candidate's full branch ref, then the pointer's auto-advance grant governs the linear fast path."
 ---
 
 # Publisher auto-advance
@@ -46,21 +46,23 @@ discretion. What it protects is the property that a checkout owner cannot
 make blackboxd serve content nobody approved. This feature leaves that
 property intact:
 
-- acceptance authority moves to the OPERATOR, ahead of time, per project,
-  through an audited act;
+- acceptance authority moves to the OPERATOR ahead of time, either per
+  project through an audited publisher act or per producer through daemon
+  config;
 - the producer gains no new capability whatsoever. It uploads and
   finalizes exactly as before, and cannot enable, widen, read, or infer
   the grant;
 - no model is anywhere on this path. The trigger is the daemon's own
   finalize handler;
-- the grant is scoped to a lane the operator already reviewed once: the
-  same bound producer, the same catalog scope, the same published ref.
-  Everything else still requires an operator.
+- the grant is scoped to the owning producer and the catalog scope. The first
+  candidate must name a full branch ref, which becomes the pointer's ref.
+  Later advances remain bound to that exact ref;
 
-The honest way to state the change: the operator's approval moves from
-per-generation to per-lane. That is a real reduction in review
-granularity and the operator should choose it explicitly, which is why the
-feature is opt-in, default off, and revocable.
+The operator's approval moves from per-generation to per-lane. The
+producer-level `auto_publish` grant covers only the first pointer for
+projects that producer currently owns. The pointer installed by that
+establish carries the per-project auto-advance grant for later generations.
+Both policies are opt-in and default off.
 
 Rejected framing: "the producer is trusted now". It is not. A granted
 project still refuses a candidate from a different producer, a different
@@ -100,7 +102,7 @@ consequence of accepting a commit rather than an explicit act. An operator
 reading an audit trail should see the moment they granted acceptance, not
 have to infer it from a config diff inside an accepted generation.
 
-### 2.2 Chosen: operator-set metadata on the accepted-publication pointer
+### 2.2 Accepted-pointer metadata for continuing auto-advance
 
 The grant is a field on `AcceptedPublicationPointerV1`:
 
@@ -108,9 +110,11 @@ The grant is a field on `AcceptedPublicationPointerV1`:
 auto_advance: Option<{ enabled: bool, granted_reason: String }>
 ```
 
-It is set only by an explicit `auto_advance` parameter on
-`bbox_project_publisher_advance`, and `granted_reason` is that call's own
-bounded `audit_reason`.
+It is set by an explicit `auto_advance` parameter on
+`bbox_project_publisher_advance`, or by a successful producer-level
+`auto_publish` establish. An operator call uses its bounded
+`audit_reason`; auto-publish uses
+`policy:auto_publish producer=<id>`.
 
 Why the pointer and not the catalog record (`CorpusProject`): the catalog
 was the other operator-owned candidate, and it would work. It was rejected
@@ -136,32 +140,64 @@ Properties this buys:
   never checked.
 - **Unreachable by the producer.** No transport route writes a pointer.
 
+### 2.3 Producer config for the first pointer
+
+`auto_publish = true` on one `[[code_collection.producers]]` entry is an
+operator-authored pre-grant. It applies only while that producer is the
+project's effective owner through a config pin or durable claim. A Ready
+candidate qualifies only when its producer is that owner, its scope is the
+project's catalog scope, its full ref is a non-empty `refs/heads/...` branch,
+and the project has an attached, repo-knowledge capable attachment with the
+same validated scope. The attachment's checked-out `branch_ref` does not
+constrain publication. The first candidate's branch ref becomes the pointer's
+ref.
+
+The daemon establishes through `publish_from_ready_candidate` with
+`PublisherPublishMode::Establish` and
+`AutoAdvanceGrantUpdate::Set { enabled: true, ... }`. The ordinary
+acceptance path performs candidate validation, catalog epoch checks,
+source revalidation, and the pointer swap. The installed pointer therefore
+contains both the accepted producer binding and the standing auto-advance
+grant.
+
 ## 3. The activation rule
 
-> A policy attempt reads the grant from the pointer that is CURRENTLY
-> accepted. Only an operator advance writes that pointer's grant.
-> Therefore the candidate being accepted can never be what authorizes its
-> acceptance.
+> Continuing auto-advance reads the grant from the pointer that is CURRENTLY
+> accepted. That pointer grant comes from an operator publisher act or from
+> operator daemon config authorizing the first auto-publish establish.
+> Candidate bytes can never authorize their own acceptance.
 
-Consequences that fall out of the rule rather than being enforced
-separately:
+Consequences for continuing auto-advance:
 
 - **Enabling takes one operator advance.** The operator passes
   `auto_advance=true` on an advance (or an establish). That call is
   ordinary operator authority with full CAS tokens and an audit reason.
   The FIRST candidate the policy may accept is the next one.
-- **Establish is never automatic.** With no installed pointer there is no
-  grant to read, and the attempt reports `no_accepted_publication`.
-- **A policy acceptance cannot widen itself.** The policy path always
-  passes `AutoAdvanceGrantUpdate::Inherit`, which carries the operator's
-  grant forward unchanged. `Set` exists only on the operator parameter.
+- **Establish requires the separate producer pre-grant.** With no installed
+  pointer and no `auto_publish` grant on the effective owner, the attempt
+  reports `no_accepted_publication`.
+- **Continuing auto-advance cannot widen itself.** It passes
+  `AutoAdvanceGrantUpdate::Inherit`, which carries the operator's grant
+  forward unchanged. The auto-publish establish passes `Set` only because
+  operator config already authorized that producer.
 - **Revocation is symmetric.** `auto_advance=false` on any later operator
   advance clears the grant.
 
-## 4. Scope: the linear fast path only
+## 4. Scope: first publication and the linear fast path
 
-An attempt proceeds only when all of these hold, checked against the
-accepted pointer:
+With no pointer, auto-publish proceeds only when all of these hold:
+
+| Condition | Otherwise |
+|---|---|
+| The effective owner has `auto_publish = true` | `no_accepted_publication` |
+| The candidate's producer is the effective owner | `producer_mismatch` |
+| The candidate's scope is the catalog scope | `scope_changed` |
+| The candidate's ref is a non-empty full branch ref | `ref_changed` |
+| An attached repo-knowledge capable attachment has the catalog scope | `ref_changed` |
+| This candidate has not been attempted | `already_attempted` |
+
+With a pointer, continuing auto-advance proceeds only when all of these hold,
+checked against the accepted pointer:
 
 | Condition | Otherwise |
 |---|---|
@@ -175,9 +211,11 @@ accepted pointer:
 | This candidate has not been attempted | `already_attempted` |
 
 Establish, rollback to a prior arm, scope migration, producer rebind, and
-any other non-linear move stay manual by construction: none of them is
-reachable from `PublisherPublishMode::Advance` with the current pointer's
-own tokens.
+any other non-linear move stay manual by construction. The only automatic
+establish is the no-pointer `auto_publish` case. Once any pointer exists,
+including a disabled or rolled-back pointer, that establish path is closed.
+Continuing policy moves remain reachable only through
+`PublisherPublishMode::Advance` with the current pointer's own tokens.
 
 ## 5. Reuse, not a parallel path
 
@@ -188,10 +226,16 @@ two similar functions. It returns `PublishError` rather than `anyhow` so
 the operator tool keeps `may_have_swapped()` and its post-failure
 reconvergence.
 
-The policy caller differs from the operator caller in exactly three ways:
-its mode is always `Advance` with tokens read from the pointer it is
-replacing, its grant update is always `Inherit`, and its audit reason is
-generated rather than supplied.
+The continuing auto-advance caller uses `Advance` with tokens read from the
+pointer it is replacing, passes `Inherit`, and generates
+`policy:auto_advance producer=<id> source=<generation>`.
+
+The first-publication caller uses `Establish`, passes `Set` with
+`enabled=true`, and generates `policy:auto_publish producer=<id>`. It runs
+only after proving that no pointer exists, the candidate matches the effective
+owner and catalog scope, its ref is a full branch ref, and an eligible
+attachment exists. The accepted pointer records that first candidate's ref;
+normal auto-advance binds every later candidate to it.
 
 ## 6. Trigger, failure, and the no-storm rule
 
@@ -266,6 +310,8 @@ last_attempt: { source_generation_id, producer_id, outcome, ... }
 in-process and bounded: it answers "what did the policy just do", not
 "what has it ever done". The durable answer to the latter is the accepted
 pointer's own producer binding, which names the exact source generation.
+For an auto-published first pointer, `grant.granted_reason` durably exposes
+`policy:auto_publish producer=<id>`.
 
 **Gap.** `bbox_project_publisher_advance` does not thread `audit_reason`
 into any durable record today. It is a structured log field and a response
@@ -280,9 +326,11 @@ callers at once rather than only for the policy lane.
 
 ## 8. Non-goals
 
-- No producer-supplied policy, in any encoding, over any route.
+- No producer-supplied policy, in any encoding, over any route. The
+  producer-level grant is operator daemon config.
 - No model on the acceptance path.
-- No establish, rollback, scope change, or producer rebind by policy.
+- No establish except the operator-configured `auto_publish` first pointer.
+  No rollback, scope change, or producer rebind by policy.
 - No retry, backoff, or queue. One attempt, then the operator.
 - No durable per-attempt history. The ledger is bounded and in-process.
 - No change to accepted content, its normalization, or its hashes.

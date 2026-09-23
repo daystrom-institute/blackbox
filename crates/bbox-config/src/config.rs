@@ -309,6 +309,8 @@ struct RawDaemonConfig {
     pub port: u16,
     #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub advertise_url: Option<String>,
     #[serde(default = "default_daemon_mcp_name")]
     pub mcp_name: String,
     #[serde(default = "default_daemon_mcp_allowed_hosts")]
@@ -579,6 +581,7 @@ pub struct ResolvedPathConfig {
     pub notes_path: PathBuf,
     pub pins_path: PathBuf,
     pub checkout_mutations_path: PathBuf,
+    pub producer_claims_path: PathBuf,
     pub projects_path: PathBuf,
     pub packets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
@@ -607,6 +610,7 @@ pub struct ResolvedPathConfig {
 pub struct DaemonConfig {
     pub port: u16,
     pub bind: String,
+    pub advertise_url: Option<String>,
     pub mcp_name: String,
     pub mcp_allowed_hosts: Vec<String>,
     pub shutdown_grace_secs: u64,
@@ -671,6 +675,20 @@ pub struct CodeCollectionProducerConfig {
     pub token_files: Vec<PathBuf>,
     #[serde(default)]
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
+    #[serde(default)]
+    pub claim_scopes: ProducerScopeClaimPolicy,
+    /// Operator pre-grant for establishing the first accepted publication
+    /// from this producer's current project assignment.
+    #[serde(default)]
+    pub auto_publish: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerScopeClaimPolicy {
+    #[default]
+    None,
+    Unclaimed,
 }
 
 impl CodeCollectionProducerConfig {
@@ -1038,6 +1056,7 @@ impl Config {
             daemon: RawDaemonConfig {
                 port: default_daemon_port(),
                 bind: default_daemon_bind(),
+                advertise_url: None,
                 mcp_name: default_daemon_mcp_name(),
                 mcp_allowed_hosts: default_daemon_mcp_allowed_hosts(),
                 shutdown_grace_secs: default_daemon_shutdown_grace_secs(),
@@ -1114,6 +1133,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !bind.trim().is_empty()
     {
         raw.daemon.bind = bind;
+    }
+
+    if let Ok(advertise_url) = std::env::var("BLACKBOX_ADVERTISE_URL")
+        && !advertise_url.trim().is_empty()
+    {
+        raw.daemon.advertise_url = Some(advertise_url);
     }
 
     if let Ok(mcp_name) = std::env::var("BLACKBOX_MCP_NAME")
@@ -1413,6 +1438,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         daemon: DaemonConfig {
             port: raw.daemon.port,
             bind: raw.daemon.bind,
+            advertise_url: raw.daemon.advertise_url,
             mcp_name: raw.daemon.mcp_name,
             mcp_allowed_hosts: raw.daemon.mcp_allowed_hosts,
             shutdown_grace_secs: raw.daemon.shutdown_grace_secs,
@@ -1935,6 +1961,12 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("checkout-mutations.json"));
 
+    let producer_claims_path = std::env::var("BLACKBOX_PRODUCER_CLAIMS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("producer-claims.json"));
+
     let projects_path = std::env::var("BLACKBOX_PROJECTS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -2057,6 +2089,7 @@ fn resolve_paths(
         notes_path,
         pins_path,
         checkout_mutations_path,
+        producer_claims_path,
         projects_path,
         packets_dir,
         artifacts_dir,
@@ -3371,7 +3404,79 @@ state_dir = "~"
             token_file: PathBuf::from(token_file),
             token_files: token_files.into_iter().map(PathBuf::from).collect(),
             scopes: Vec::new(),
+            claim_scopes: ProducerScopeClaimPolicy::None,
+            auto_publish: false,
         }
+    }
+
+    #[test]
+    fn code_collection_producer_claim_policy_defaults_to_none_and_parses_unclaimed() {
+        let defaulted: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(defaulted.claim_scopes, ProducerScopeClaimPolicy::None);
+
+        let unclaimed: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 claim_scopes = \"unclaimed\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(unclaimed.claim_scopes, ProducerScopeClaimPolicy::Unclaimed);
+        assert!(!defaulted.auto_publish);
+
+        let auto_publish: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 auto_publish = true\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(auto_publish.auto_publish);
+    }
+
+    #[test]
+    fn daemon_advertise_url_is_optional_and_parses() {
+        let defaulted: RawDaemonConfig = Figment::new().extract().unwrap();
+        assert_eq!(defaulted.advertise_url, None);
+
+        let configured: RawDaemonConfig = Figment::new()
+            .merge(Toml::string(
+                "advertise_url = \"https://blackbox.example.test\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            configured.advertise_url.as_deref(),
+            Some("https://blackbox.example.test")
+        );
+    }
+
+    #[test]
+    fn code_collection_producer_auto_publish_defaults_off_and_parses_true() {
+        let defaulted: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(!defaulted.auto_publish);
+
+        let enabled: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 auto_publish = true\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(enabled.auto_publish);
     }
 
     #[test]

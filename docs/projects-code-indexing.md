@@ -15,16 +15,25 @@ bbox_project_list()
 bbox_project_catalog_get(project="<project-selector>")
 ```
 
-For remote checkouts, configure the [Code Source Collector](code-source-collector.md)
-on their owning host and enroll its exact published scope on the daemon. The
-collector's authenticated onboarding lane admits project identity; subsequent
-publication and indexing make source searchable. A producer grant does not grant
-arbitrary daemon filesystem access.
+For remote checkouts, configure one daemon producer with
+`claim_scopes = "unclaimed"` and configure the
+[Code Source Collector](code-source-collector.md) on the owning host with an
+`enroll_roots` entry that contains the checkout. Then call:
 
-`bbox_project_register(path="/absolute/path/to/repo")` remains a compatibility
-operation for a daemon that can verify the local checkout. It is not a remote
-upload API. Catalog attachments record host-local coordinates and capabilities;
-their recorded status alone does not prove the checkout is currently accessible.
+```text
+bbox_project_register(path="/absolute/path/to/repo")
+```
+
+When the daemon cannot stat the path, registration automatically selects a
+fresh checkout-host collector by the longest containing enroll root. The
+optional `producer` parameter resolves an equal-depth tie. The collector
+scaffolds `.bbox`, updates its enrolled-projects sidecar, and performs catalog
+onboarding without a per-project config edit. Commit exactly the returned
+`commit_paths` on `published_ref` when `identity_committed` is false.
+
+A producer grant does not grant arbitrary daemon filesystem access. Catalog
+attachments record host-local coordinates and capabilities; their recorded
+status alone does not prove the checkout is currently accessible.
 
 ## Project IDs
 
@@ -39,19 +48,9 @@ compatibility behavior is not the portable catalog identity contract.
 
 ## Initialize `.bbox`
 
-On the checkout owner, initialize missing scaffolding:
-
-```sh
-bbox-code-collector --config /path/to/code-collector.toml init /absolute/path/to/repo
-```
-
-This creates local project config and directories and records Git repository
-identity. Commit identity-bearing config before the configured collector's next
-`once` or `run` cycle. Initialization alone does not publish source.
-
-`bbox_project_init` is the compatibility MCP operation for an authorized checkout
-that the daemon can access. Passing a path to a remote daemon does not initialize
-that path on the caller's host.
+`bbox_project_init` initializes a checkout that the daemon can access directly.
+For a remote checkout, use `bbox_project_register`; collector enrollment includes
+the initialization step and returns the exact identity-bearing paths to commit.
 
 ## Relocation And Administration
 

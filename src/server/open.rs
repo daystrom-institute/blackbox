@@ -15,6 +15,7 @@ use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::packets::Packets;
 use crate::pins::Pins;
+use crate::producer_claims::ProducerClaims;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
@@ -703,6 +704,15 @@ pub(super) fn open_shared_state(
         checkout_mutations_path.display()
     );
 
+    let producer_claims_path = cfg.paths.producer_claims_path.clone();
+    let producer_claims_store = Arc::new(RwLock::new(ProducerClaims::open(&producer_claims_path)?));
+    let producer_claims_persister = StorePersister::spawn(
+        "producer-claims",
+        producer_claims_store.clone(),
+        producer_claims_path.clone(),
+    );
+    tracing::info!("Producer claims store: {}", producer_claims_path.display());
+
     let project_authority = match (&projects_store, &catalog_store) {
         (Some(registry), None) => {
             let persister =
@@ -750,6 +760,7 @@ pub(super) fn open_shared_state(
         catalog_store.clone(),
         checkout_access.clone(),
         code_source_locality_cutover.clone(),
+        &producer_claims_store.read().records_snapshot(),
     )?);
     // Opened beside the code lane and unconditionally: the store is a
     // directory tree with no producer state, so opening it when no connector
@@ -954,6 +965,10 @@ pub(super) fn open_shared_state(
         pins_persister,
         checkout_mutations: checkout_mutations_store,
         checkout_mutations_persister,
+        producer_claims: producer_claims_store,
+        producer_claims_persister,
+        producer_claim_lock: tokio::sync::Mutex::new(()),
+        producer_commands: Arc::new(super::producer_commands::ProducerCommandRuntime::new()),
         project_authority,
         accepted_publications,
         records_provider,
