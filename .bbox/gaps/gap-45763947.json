@@ -1,0 +1,21 @@
+{
+  "id": "gap-45763947",
+  "title": "Checkout-owner delivery leaves project gap and knowledge writes as uncommitted files that nothing commits",
+  "gap_kind": "tooling",
+  "domain": "checkout-mutations",
+  "wanted_capability": "Project-scoped .bbox writes delivered through the checkout-owner lane (bbox_gap, bbox_gap_update, bbox_gap_resolve, and the project knowledge writes) reach the published ref without anyone sweeping the attached checkout. Either the collector commits what it applies (one commit per delivery batch on the attached branch, touching only the delivered paths), or delivery lands on a ref instead of the working tree. Today every delivery becomes an uncommitted file in the attached checkout: the published view stays stale until someone commits it, the attached checkout is never clean, and the files are exposed to any reset or checkout done there.",
+  "missing_primitive": "A committing apply step for checkout-owner deliveries, or a ref-based delivery target.",
+  "fallback_used": "A scheduled automation commits delivered .bbox/gaps records in the attached checkout by explicit path every 30 minutes and pushes them.",
+  "evidence": [
+    "Five untracked delivered gap records (gap-2fd9c80a, gap-5cd017cc, gap-7da04b93, gap-a60692b3, gap-c6eb8348) sat in the attached checkout with no committer until swept in 9556b281",
+    "Sweep commit 6aa21b8d committed further deliveries (gap-6ac18d37, gap-c6eb8348)",
+    "sm-gap-notes: a queued project-gap reply means delivery was accepted; the owner still commits and publishes the delivered changes"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/checkout-mutations/delivered-writes-left-uncommitted",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-23T21:06:21Z",
+  "updated_at": "2026-09-23T21:06:21Z"
+}
