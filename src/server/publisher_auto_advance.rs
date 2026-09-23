@@ -7,22 +7,24 @@
 //!    path. `bbox_project_publisher_advance` and the policy trigger both
 //!    call it, so "auto-advance reuses the exact same acceptance path" is
 //!    a structural fact rather than a claim about two similar functions.
-//! 2. [`PublisherAutoAdvanceLedger`], the bounded per-project record of
-//!    what the last policy attempt did, which makes a refusal observable
-//!    in `bbox_project_publisher_status` instead of only in logs.
+//! 2. The finalize-triggered policy: operator config may establish the first
+//!    pointer for the project's owning producer, and the pointer's durable
+//!    grant may advance later candidates.
+//! 3. [`PublisherAutoAdvanceLedger`], the bounded per-project record of what
+//!    the last policy attempt did, which makes a refusal observable in
+//!    `bbox_project_publisher_status` instead of only in logs.
 //!
 //! The narrowing argument for the transport plan's "no automatic knowledge
 //! acceptance by a producer or model" non-goal lives in the design doc. In
-//! code it reduces to one invariant: the grant that authorizes an
-//! acceptance is read from the pointer the operator installed, never from
-//! the candidate being accepted, and a policy attempt always passes
-//! [`AutoAdvanceGrantUpdate::Inherit`] so it cannot widen its own
-//! authority.
+//! code it reduces to one invariant: authority comes from operator-owned
+//! daemon config or from the pointer the operator installed, never from the
+//! candidate being accepted. Continuing auto-advance always passes
+//! [`AutoAdvanceGrantUpdate::Inherit`] so it cannot widen its own authority.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId, ProjectScope};
 use bbox_indexing::accepted_publication_runtime::{
     AcceptedPublicationRuntime, AutoAdvanceGrantUpdate, PublishError, PublishReceipt,
     PublishSourceFile, PublishSources, PublisherPublishMode,
@@ -206,8 +208,8 @@ pub(crate) fn publish_from_ready_candidate(
 pub(crate) enum AutoAdvanceOutcome {
     /// The pointer moved. `generation_id` is the newly accepted generation.
     Accepted { generation_id: String },
-    /// The project has no installed pointer, so there is nothing to
-    /// advance from. Establish stays manual by design.
+    /// The project has no installed pointer and its owning producer has no
+    /// operator-configured auto-publish grant.
     NoAcceptedPublication,
     /// A pointer exists and carries no standing operator grant. This is
     /// the default for every project.
@@ -400,6 +402,31 @@ pub(crate) fn policy_audit_reason(producer_id: &str, source_generation_id: &str)
     reason.chars().take(MAX_AUDIT_REASON_BYTES / 4).collect()
 }
 
+/// The audit reason written into a pointer established by the producer-level
+/// auto-publish pre-grant.
+pub(crate) fn auto_publish_audit_reason(producer_id: &str) -> String {
+    let reason = format!("policy:auto_publish producer={producer_id}");
+    if reason.len() <= MAX_AUDIT_REASON_BYTES {
+        return reason;
+    }
+    reason.chars().take(MAX_AUDIT_REASON_BYTES / 4).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublisherPolicyKind {
+    AutoAdvance,
+    AutoPublish,
+}
+
+impl PublisherPolicyKind {
+    fn audit_reason(self, producer_id: &str, source_generation_id: &str) -> String {
+        match self {
+            Self::AutoAdvance => policy_audit_reason(producer_id, source_generation_id),
+            Self::AutoPublish => auto_publish_audit_reason(producer_id),
+        }
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -408,7 +435,8 @@ fn now_unix_secs() -> u64 {
 }
 
 impl super::BlackboxServer {
-    /// One policy attempt for one freshly Ready publication candidate.
+    /// One establish-or-advance policy attempt for one freshly Ready
+    /// publication candidate.
     ///
     /// Blocking, at most once per candidate, and never retried. Every exit
     /// records a reason in the ledger, so `bbox_project_publisher_status`
@@ -425,9 +453,9 @@ impl super::BlackboxServer {
         if !ledger.claim_attempt(project_id, source_generation_id) {
             return AutoAdvanceOutcome::AlreadyAttempted;
         }
-        let (producer_id, outcome) =
+        let (producer_id, policy, outcome) =
             self.run_publisher_auto_advance(project_id, source_generation_id);
-        let audit_reason = policy_audit_reason(&producer_id, source_generation_id);
+        let audit_reason = policy.audit_reason(&producer_id, source_generation_id);
         ledger.record(
             project_id,
             AutoAdvanceAttempt {
@@ -509,19 +537,21 @@ impl super::BlackboxServer {
         &self,
         project_id: &str,
         source_generation_id: &str,
-    ) -> (String, AutoAdvanceOutcome) {
+    ) -> (String, PublisherPolicyKind, AutoAdvanceOutcome) {
         // Each early exit builds its own empty producer label: the
         // producer is not known until the accepted binding is read.
         let unknown_producer = String::new;
         let Some(store) = self.state.project_authority.catalog_store().cloned() else {
             return (
                 unknown_producer(),
+                PublisherPolicyKind::AutoAdvance,
                 AutoAdvanceOutcome::NoAcceptedPublication,
             );
         };
         let Some(runtime) = self.state.accepted_publications.clone() else {
             return (
                 unknown_producer(),
+                PublisherPolicyKind::AutoAdvance,
                 AutoAdvanceOutcome::NoAcceptedPublication,
             );
         };
@@ -530,30 +560,39 @@ impl super::BlackboxServer {
             Err(error) => {
                 return (
                     unknown_producer(),
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
-        // THE activation rule: the grant comes from the pointer that is
-        // currently accepted, which an operator installed. Nothing about
-        // the incoming candidate can put it there.
+        // Continuing auto-advance reads authority from the currently
+        // accepted pointer. The no-pointer branch below reads the separate
+        // producer-level operator grant.
         let grant = match runtime.auto_advance_grant(&parsed) {
             Ok(Some(grant)) => grant,
             Ok(None) => {
-                return (
-                    unknown_producer(),
-                    AutoAdvanceOutcome::NoAcceptedPublication,
+                let (producer_id, outcome) = self.run_publisher_auto_publish(
+                    &store,
+                    runtime.as_ref(),
+                    &parsed,
+                    source_generation_id,
                 );
+                return (producer_id, PublisherPolicyKind::AutoPublish, outcome);
             }
             Err(error) => {
                 return (
                     unknown_producer(),
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
         if !grant.enabled {
-            return (unknown_producer(), AutoAdvanceOutcome::PolicyDisabled);
+            return (
+                unknown_producer(),
+                PublisherPolicyKind::AutoAdvance,
+                AutoAdvanceOutcome::PolicyDisabled,
+            );
         }
         let (accepted_producer, accepted_source_generation) = match (
             grant.source.producer_id(),
@@ -563,10 +602,20 @@ impl super::BlackboxServer {
             // An attachment-bound project is out of scope: its accepted
             // content comes from a checkout the operator drives, and the
             // linear fast path this policy covers does not exist there.
-            _ => return (unknown_producer(), AutoAdvanceOutcome::BindingNotProducer),
+            _ => {
+                return (
+                    unknown_producer(),
+                    PublisherPolicyKind::AutoAdvance,
+                    AutoAdvanceOutcome::BindingNotProducer,
+                );
+            }
         };
         if accepted_source_generation == source_generation_id {
-            return (accepted_producer, AutoAdvanceOutcome::AlreadyAccepted);
+            return (
+                accepted_producer,
+                PublisherPolicyKind::AutoAdvance,
+                AutoAdvanceOutcome::AlreadyAccepted,
+            );
         }
         let knowledge_sources = self.state.knowledge_sources.store();
         let pinned = match knowledge_sources.pin_ready_publication_candidate(source_generation_id) {
@@ -574,6 +623,7 @@ impl super::BlackboxServer {
             Err(error) => {
                 return (
                     accepted_producer,
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!(
                         "error.accepted_publication_candidate_required: {error}"
                     )),
@@ -588,18 +638,21 @@ impl super::BlackboxServer {
             if candidate.producer_id != accepted_producer {
                 return (
                     candidate.producer_id.clone(),
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::ProducerMismatch,
                 );
             }
             if candidate.descriptor.scope != grant.accepted_scope {
                 return (
                     candidate.producer_id.clone(),
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::ScopeChanged,
                 );
             }
             if candidate.descriptor.full_ref != grant.full_ref {
                 return (
                     candidate.producer_id.clone(),
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::RefChanged,
                 );
             }
@@ -610,6 +663,7 @@ impl super::BlackboxServer {
             Err(error) => {
                 return (
                     accepted_producer,
+                    PublisherPolicyKind::AutoAdvance,
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
@@ -622,9 +676,8 @@ impl super::BlackboxServer {
             knowledge_sources.as_ref(),
             &parsed,
             source_generation_id,
-            // Advance only. Establish is the operator's first pointer and
-            // is also the act that can grant this policy in the first
-            // place, so a policy establish is a contradiction in terms.
+            // A current pointer always uses the linear advance path. The
+            // separate no-pointer branch is the only policy establish path.
             PublisherPublishMode::Advance {
                 expected_generation_id: grant.expected_generation_id.clone(),
                 expected_pointer_sha256: grant.expected_pointer_sha256.clone(),
@@ -638,12 +691,136 @@ impl super::BlackboxServer {
         match outcome {
             Ok(receipt) => (
                 accepted_producer,
+                PublisherPolicyKind::AutoAdvance,
                 AutoAdvanceOutcome::Accepted {
                     generation_id: receipt.generation_id().to_string(),
                 },
             ),
             Err(error) => (
                 accepted_producer,
+                PublisherPolicyKind::AutoAdvance,
+                AutoAdvanceOutcome::from_publish_error(&error),
+            ),
+        }
+    }
+
+    /// Establish the first pointer only when operator config pre-grants the
+    /// current owning producer and the Ready candidate matches the project's
+    /// catalog scope and enrolled publication ref.
+    fn run_publisher_auto_publish(
+        &self,
+        store: &ProjectCatalogStore,
+        runtime: &AcceptedPublicationRuntime,
+        project_id: &ProjectId,
+        source_generation_id: &str,
+    ) -> (String, AutoAdvanceOutcome) {
+        let snapshot = match store.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return (
+                    String::new(),
+                    AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
+                );
+            }
+        };
+        let Some(project) = snapshot.catalog().projects.get(project_id) else {
+            return (
+                String::new(),
+                AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                    "error.project_catalog_admin_unknown_project: the requested project is not in the catalog"
+                )),
+            );
+        };
+        let ProjectScope::Published(catalog_scope) = &project.scope else {
+            return (
+                String::new(),
+                AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                    "error.project_catalog_admin_scope_required: a legacy-local project has no published scope"
+                )),
+            );
+        };
+        let producer_auth = self.state.code_sources.producer_auth();
+        let Some((owning_producer, auto_publish)) =
+            producer_auth.project_assignment(project_id, catalog_scope)
+        else {
+            return (String::new(), AutoAdvanceOutcome::NoAcceptedPublication);
+        };
+        if !auto_publish {
+            return (String::new(), AutoAdvanceOutcome::NoAcceptedPublication);
+        }
+        let owning_producer = owning_producer.to_string();
+        let knowledge_sources = self.state.knowledge_sources.store();
+        let pinned = match knowledge_sources.pin_ready_publication_candidate(source_generation_id) {
+            Ok(pinned) => pinned,
+            Err(error) => {
+                return (
+                    owning_producer,
+                    AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                        "error.accepted_publication_candidate_required: {error}"
+                    )),
+                );
+            }
+        };
+        {
+            let candidate = pinned.candidate();
+            if candidate.producer_id != owning_producer {
+                return (
+                    candidate.producer_id.clone(),
+                    AutoAdvanceOutcome::ProducerMismatch,
+                );
+            }
+            if candidate.descriptor.scope != *catalog_scope {
+                return (
+                    candidate.producer_id.clone(),
+                    AutoAdvanceOutcome::ScopeChanged,
+                );
+            }
+            let ref_is_enrolled = snapshot
+                .attachments()
+                .attachments
+                .values()
+                .any(|attachment| {
+                    attachment.project_id == *project_id
+                        && attachment.status == AttachmentStatus::Attached
+                        && attachment.capabilities.repo_knowledge
+                        && attachment.validated_scope.as_ref() == Some(catalog_scope)
+                        && attachment.branch_ref.as_deref()
+                            == Some(candidate.descriptor.full_ref.as_str())
+                });
+            if !ref_is_enrolled {
+                return (
+                    candidate.producer_id.clone(),
+                    AutoAdvanceOutcome::RefChanged,
+                );
+            }
+        }
+        drop(pinned);
+
+        let audit_reason = auto_publish_audit_reason(&owning_producer);
+        let outcome = publish_from_ready_candidate(
+            store,
+            runtime,
+            producer_auth.as_ref(),
+            knowledge_sources.as_ref(),
+            project_id,
+            source_generation_id,
+            PublisherPublishMode::Establish,
+            snapshot.epoch(),
+            false,
+            AutoAdvanceGrantUpdate::Set {
+                enabled: true,
+                reason: audit_reason,
+            },
+        );
+        match outcome {
+            Ok(receipt) => (
+                owning_producer,
+                AutoAdvanceOutcome::Accepted {
+                    generation_id: receipt.generation_id().to_string(),
+                },
+            ),
+            Err(error) => (
+                owning_producer,
                 AutoAdvanceOutcome::from_publish_error(&error),
             ),
         }
@@ -689,6 +866,14 @@ mod tests {
         assert!(reason.contains("producer=producer-a"), "{reason}");
         assert!(reason.contains("source=kps_abc"), "{reason}");
         assert!(reason.len() <= MAX_AUDIT_REASON_BYTES);
+    }
+
+    #[test]
+    fn the_auto_publish_audit_reason_names_the_policy_and_producer() {
+        assert_eq!(
+            auto_publish_audit_reason("producer-a"),
+            "policy:auto_publish producer=producer-a"
+        );
     }
 
     #[test]

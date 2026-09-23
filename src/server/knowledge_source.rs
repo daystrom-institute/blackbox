@@ -1469,9 +1469,10 @@ async fn finalize_publication_upload(
         blocking(move || store.finalize_publication_upload(&authority, &upload_id)).await?
     };
     // The candidate is durable and Ready by the time finalize returns, so
-    // this is where a project whose OPERATOR granted auto-advance gets its
-    // one policy attempt. Default OFF: without a standing grant on the
-    // currently accepted pointer this reads one pointer and stops.
+    // this is where operator policy gets its one attempt. With no pointer,
+    // producer config may pre-grant the owning producer's first publication.
+    // With a pointer, its standing auto-advance grant governs the attempt.
+    // Both policies default off.
     //
     // The attempt runs before the response so a producer that polls status
     // immediately cannot observe an unserved Ready candidate that the
@@ -3123,6 +3124,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finalized.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn auto_publish_refusal_is_recorded_without_failing_finalize() {
+        use std::io::Cursor;
+
+        use bbox_corpus_core::project_catalog::{
+            AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus,
+            CheckoutAttachment,
+        };
+
+        let catalog_fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let project_id = ProjectId::parse("p_auto_publish_finalize").unwrap();
+        catalog_fixture.add_published_project(project_id.as_str(), &scope);
+        let attachment_id = AttachmentId::parse("att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let checkout_dir = catalog_fixture
+            .root()
+            .join("remote-checkout")
+            .to_string_lossy()
+            .into_owned();
+        let epoch = catalog_fixture.store().snapshot().unwrap().epoch();
+        catalog_fixture
+            .store()
+            .transact(epoch, |_catalog, attachments| {
+                attachments.attachments.insert(
+                    attachment_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: attachment_id.clone(),
+                        project_id: project_id.clone(),
+                        checkout_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                        checkout_dir: checkout_dir.clone(),
+                        checkout_project_dir: checkout_dir.clone(),
+                        project_root_relpath: ".".into(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities: AttachmentCapabilities {
+                            repo_knowledge: true,
+                            ..Default::default()
+                        },
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-09-23T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let state = catalog_fixture.server().state.clone();
+        let producer_id = "auto-publish-producer";
+        let grant = ProducerGrant {
+            producer_id: producer_id.into(),
+            projects: BTreeMap::from([(scope.clone(), project_id.as_str().to_string())]),
+        };
+        let catalog = catalog_fixture
+            .store()
+            .snapshot()
+            .unwrap()
+            .catalog()
+            .clone();
+        state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_catalog_with_auto_publish(
+                vec![(ServiceToken::parse("6".repeat(64)).unwrap(), grant.clone())],
+                catalog.as_ref(),
+                BTreeSet::from([producer_id.to_string()]),
+            ),
+        ));
+
+        let store = state.knowledge_sources.store();
+        let authority = PublicationAuthorityV1 {
+            producer_id: producer_id.into(),
+            project_id: project_id.as_str().to_string(),
+            scope: scope.clone(),
+        };
+        let mut descriptor = publication_descriptor(scope);
+        descriptor.full_ref = "refs/heads/release".into();
+        let upload = store
+            .begin_publication_upload(&authority, descriptor)
+            .unwrap();
+        store
+            .put_publication_manifest_page(
+                &authority,
+                &upload.upload_id,
+                SourceLaneV1::Knowledge,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: vec![entry()],
+                },
+            )
+            .unwrap();
+        store
+            .missing_publication_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
+        let manifest_entry = entry();
+        store
+            .install_publication_blob(
+                &authority,
+                &upload.upload_id,
+                &manifest_entry.content_sha256,
+                manifest_entry.encoded_bytes,
+                Cursor::new(KNOWLEDGE_BYTES),
+            )
+            .unwrap();
+
+        let (status, _) = finalize_publication_upload(
+            State(state.clone()),
+            Extension(grant),
+            Path(upload.upload_id),
+        )
+        .await
+        .expect("auto-publish refusal must not fail finalize");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let attempt = state
+            .knowledge_sources
+            .auto_advance_ledger()
+            .last_attempt(project_id.as_str())
+            .expect("the refusal is recorded for publisher status");
+        assert_eq!(
+            attempt.outcome,
+            crate::server::publisher_auto_advance::AutoAdvanceOutcome::RefChanged
+        );
     }
 
     #[tokio::test]
