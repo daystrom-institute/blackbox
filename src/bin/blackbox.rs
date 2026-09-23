@@ -59,6 +59,8 @@ use bbox_indexing::render_locality_cutover::{
     RenderLocalityCutoverApplyRequestV1, RenderLocalityCutoverPreflightRequestV1,
     RenderLocalityCutoverVerifyRequestV1,
 };
+use bbox_stores::producer_claims::ProducerClaims;
+use bbox_stores::store_persister::StorePersister;
 use bbox_vectors::migration_inventory as vector_inventory;
 use blackbox::project_catalog_rebuild_admin::PathFreeRebuildApplyRequestV1;
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -78,6 +80,35 @@ struct Cli {
 enum TopLevelCommand {
     /// Inspect or rehearse the durable project-catalog migration.
     ProjectCatalog(ProjectCatalogArgs),
+    /// Inspect or revoke durable code-collection producer scope claims.
+    ProducerClaims(ProducerClaimsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProducerClaimsArgs {
+    /// Load the same configuration file used by blackboxd.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: ProducerClaimsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProducerClaimsCommand {
+    /// List every durable producer scope claim.
+    List,
+    /// Revoke one exact producer scope claim.
+    Revoke(ProducerClaimRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProducerClaimRevokeArgs {
+    /// Producer id recorded on the claim.
+    #[arg(long)]
+    producer: String,
+    /// Exact published scope as `<repo_id>/<bbox_root_relpath>`.
+    #[arg(long)]
+    scope: String,
 }
 
 #[derive(Debug, Args)]
@@ -957,6 +988,14 @@ fn command_name(cli: &Cli) -> &'static str {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::RetirementJournal(_),
         }) => "project_catalog_retirement_journal",
+        TopLevelCommand::ProducerClaims(ProducerClaimsArgs {
+            command: ProducerClaimsCommand::List,
+            ..
+        }) => "producer_claims_list",
+        TopLevelCommand::ProducerClaims(ProducerClaimsArgs {
+            command: ProducerClaimsCommand::Revoke(_),
+            ..
+        }) => "producer_claims_revoke",
     }
 }
 
@@ -1022,7 +1061,58 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::RetirementJournal(args),
         }) => execute_retirement_journal(args),
+        TopLevelCommand::ProducerClaims(args) => execute_producer_claims(args),
     }
+}
+
+fn execute_producer_claims(args: ProducerClaimsArgs) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config)?;
+    let path = config.paths.producer_claims_path;
+    let store = Arc::new(parking_lot::RwLock::new(
+        ProducerClaims::open(&path).map_err(|_| {
+            CommandFailure::new(
+                "error.producer_claims_store",
+                "producer claims store is invalid or unreadable",
+            )
+        })?,
+    ));
+    match args.command {
+        ProducerClaimsCommand::List => serialize_result(&store.read().claims().to_vec()),
+        ProducerClaimsCommand::Revoke(args) => {
+            let scope = parse_claim_scope(&args.scope)?;
+            let revoked = store.write().revoke(&args.producer, &scope);
+            if revoked {
+                StorePersister::spawn("producer-claims-cli", store, path)
+                    .flush_blocking()
+                    .map_err(|_| {
+                        CommandFailure::new(
+                            "error.producer_claims_store",
+                            "producer claims store could not be persisted durably",
+                        )
+                    })?;
+            }
+            Ok(serde_json::json!({
+                "producer_id": args.producer,
+                "scope": scope,
+                "revoked": revoked,
+            }))
+        }
+    }
+}
+
+fn parse_claim_scope(value: &str) -> Result<PublishedScope, CommandFailure> {
+    let Some((repo_id, relpath)) = value.split_once('/') else {
+        return Err(CommandFailure::new(
+            "error.producer_claims_scope",
+            "--scope must use <repo_id>/<bbox_root_relpath>",
+        ));
+    };
+    PublishedScope::try_new(repo_id, relpath).map_err(|_| {
+        CommandFailure::new(
+            "error.producer_claims_scope",
+            "--scope is not a valid published scope",
+        )
+    })
 }
 
 /// The target one `migrate` invocation operates on, after layer two of the
@@ -2206,6 +2296,73 @@ mod tests {
     #[test]
     fn command_definition_is_self_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parser_selects_producer_claim_commands() {
+        let list = Cli::try_parse_from(["blackbox", "producer-claims", "list"]).unwrap();
+        assert_eq!(command_name(&list), "producer_claims_list");
+
+        let revoke = Cli::try_parse_from([
+            "blackbox",
+            "producer-claims",
+            "revoke",
+            "--producer",
+            "producer-a",
+            "--scope",
+            "repo-a/.",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&revoke), "producer_claims_revoke");
+    }
+
+    #[test]
+    fn producer_claim_commands_list_and_revoke_the_configured_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("blackbox.toml");
+        std::fs::write(
+            &config_path,
+            format!("[paths]\nstate_dir = \"{}\"\n", state_dir.display()),
+        )
+        .unwrap();
+        let claims_path = state_dir.join("producer-claims.json");
+        let store = Arc::new(parking_lot::RwLock::new(
+            ProducerClaims::open(&claims_path).unwrap(),
+        ));
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        store
+            .write()
+            .claim("producer-a", scope.clone(), "2026-09-23T00:00:00Z".into())
+            .unwrap();
+        StorePersister::spawn("producer-claims-cli-test", store, claims_path.clone())
+            .flush_blocking()
+            .unwrap();
+
+        let listed = execute_producer_claims(ProducerClaimsArgs {
+            config: Some(config_path.clone()),
+            command: ProducerClaimsCommand::List,
+        })
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let revoked = execute_producer_claims(ProducerClaimsArgs {
+            config: Some(config_path),
+            command: ProducerClaimsCommand::Revoke(ProducerClaimRevokeArgs {
+                producer: "producer-a".into(),
+                scope: "repo-a/.".into(),
+            }),
+        })
+        .unwrap();
+        assert_eq!(revoked["revoked"], true);
+        assert!(
+            ProducerClaims::open(&claims_path)
+                .unwrap()
+                .claims()
+                .is_empty()
+        );
     }
 
     #[test]
