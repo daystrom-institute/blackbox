@@ -53,6 +53,7 @@ max_provenance_logical_bytes = 2147483648
 [[code_collection.producers]]
 producer_id = "checkout-host-a"
 token_file = "~/.config/blackbox/code-collectors/checkout-host-a.token"
+auto_publish = true
 scopes = [
   { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." },
 ]
@@ -73,6 +74,11 @@ Producer fields are:
 - `scopes`: operator-pinned published scopes. Pins override durable claims.
 - `claim_scopes`: `none` by default, or `unclaimed` to let this producer claim
   an unassigned catalog scope on its first authenticated onboard request.
+- `auto_publish`: `false` by default. When `true`, this producer may establish
+  the first accepted publication for a project it currently owns, only from a
+  Ready candidate on the project's catalog scope and enrolled published ref.
+  The establish uses the normal publisher acceptance path and installs the
+  project's auto-advance grant.
 
 With `claim_scopes = "unclaimed"`, `scopes` may be empty. A new claim is
 accepted only when no other producer owns that scope or any scope with the same
