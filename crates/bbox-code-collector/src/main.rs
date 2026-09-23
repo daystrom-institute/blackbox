@@ -1,17 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
     BeginUploadRequest, BeginUploadResponse, CodeSourceProbeRequestV1, CodeSourceProbeResponseV1,
-    ErrorResponse, FinalizeResponse, GenerationDescriptor, GenerationState, GenerationStatus,
-    ManifestEntry, ManifestPage, MissingBlobsPage, SCHEMA_VERSION, WALKER_POLICY_VERSION,
+    EnrollOnboardErrorV1, EnrollReceiptV1, ErrorResponse, FinalizeResponse, GenerationDescriptor,
+    GenerationState, GenerationStatus, MAX_PRODUCER_COMMAND_ERROR_BYTES, ManifestEntry,
+    ManifestPage, MissingBlobsPage, PRODUCER_COMMAND_SCHEMA_VERSION, ProducerCommandAckRequestV1,
+    ProducerCommandErrorV1, ProducerCommandPollRequestV1, ProducerCommandPollResponseV1,
+    ProducerCommandV1, ProducerPresenceV1, SCHEMA_VERSION, WALKER_POLICY_VERSION,
     dirty_fingerprint, is_skipped_component, manifest_sha256, max_bytes_for_path,
 };
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
@@ -94,6 +97,9 @@ struct CollectorConfig {
     status_timeout_secs: u64,
     enrolled_projects_file: PathBuf,
     enroll_roots: Vec<PathBuf>,
+    host_label: String,
+    service_label: Option<String>,
+    config_path: PathBuf,
     projects: Vec<ProjectConfig>,
 }
 
@@ -120,6 +126,10 @@ struct CollectorConfigFile {
     enrolled_projects_file: Option<PathBuf>,
     #[serde(default)]
     enroll_roots: Vec<PathBuf>,
+    #[serde(default)]
+    host_label: Option<String>,
+    #[serde(default)]
+    service_label: Option<String>,
     #[serde(default)]
     projects: Vec<ProjectConfig>,
 }
@@ -264,6 +274,26 @@ fn default_status_timeout_secs() -> u64 {
     6 * 60 * 60
 }
 
+fn default_host_label() -> String {
+    static HOST_LABEL: OnceLock<String> = OnceLock::new();
+    HOST_LABEL
+        .get_or_init(|| {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the configured default requires one bounded hostname command per process"
+            )]
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .clone()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -402,6 +432,18 @@ async fn run_checkout_mutation_lane(
         reloader.reload_if_changed(&config);
         let snapshot = config.snapshot();
         let interval = Duration::from_secs(snapshot.mutation_interval_secs.max(1));
+        match apply_producer_commands(runtime, &snapshot).await {
+            Ok(applied) => {
+                if applied > 0 {
+                    reloader.reload_now(&config);
+                    tracing::info!(applied, "producer enroll commands applied");
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "producer command lane failed");
+            }
+        }
+        let snapshot = config.snapshot();
         match apply_checkout_mutations(runtime, &snapshot).await {
             Ok(applied) => {
                 if applied > 0 {
@@ -416,6 +458,164 @@ async fn run_checkout_mutation_lane(
         }
         tokio::time::sleep(jittered(backoff)).await;
     }
+}
+
+async fn apply_producer_commands(runtime: &Runtime, config: &CollectorConfig) -> Result<usize> {
+    let presence = ProducerPresenceV1 {
+        enroll_roots: config
+            .enroll_roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+        host_label: config.host_label.clone(),
+        config_path: config.config_path.to_string_lossy().into_owned(),
+        service_label: config.service_label.clone(),
+        collector_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let poll = ProducerCommandPollRequestV1 {
+        schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+        presence,
+    };
+    poll.validate()
+        .map_err(|error| anyhow!("invalid producer command poll request: {error}"))?;
+    let response = runtime
+        .request(
+            reqwest::Method::POST,
+            runtime.endpoint("internal/code-source/v1/producer-commands/poll")?,
+        )
+        .json(&poll)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(response_error_value(response).await);
+    }
+    let page: ProducerCommandPollResponseV1 = response.json().await?;
+    page.validate()
+        .map_err(|error| anyhow!("invalid producer command poll response: {error}"))?;
+
+    let mut applied = 0usize;
+    for command in page.commands {
+        let (ack, command_applied) = execute_producer_command(runtime, config, command).await;
+        ack.validate()
+            .map_err(|error| anyhow!("invalid producer command ack: {error}"))?;
+        let response = runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/producer-commands/ack")?,
+            )
+            .json(&ack)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(response_error_value(response).await);
+        }
+        if command_applied {
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
+async fn execute_producer_command(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+    command: ProducerCommandV1,
+) -> (ProducerCommandAckRequestV1, bool) {
+    let failure = |code: &str, message: String| ProducerCommandAckRequestV1 {
+        command_id: command.command_id.clone(),
+        outcome: "failed".into(),
+        receipt: None,
+        error: Some(ProducerCommandErrorV1 {
+            code: code.into(),
+            message: bounded_command_error(message),
+        }),
+    };
+    let path = match Path::new(&command.path).canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(path) => {
+            return (
+                failure(
+                    "enroll_invalid_path",
+                    format!("enroll path is not a directory: {}", path.display()),
+                ),
+                false,
+            );
+        }
+        Err(error) => {
+            return (
+                failure(
+                    "enroll_invalid_path",
+                    format!("canonicalizing {}: {error}", command.path),
+                ),
+                false,
+            );
+        }
+    };
+    if !config
+        .enroll_roots
+        .iter()
+        .any(|root| path.starts_with(root))
+    {
+        return (
+            failure(
+                "enroll_outside_roots",
+                format!(
+                    "{} is outside this collector's configured enroll roots",
+                    path.display()
+                ),
+            ),
+            false,
+        );
+    }
+
+    match execute_add(
+        runtime,
+        &config.config_path,
+        path,
+        command.full_ref,
+        true,
+        true,
+        true,
+    )
+    .await
+    {
+        Ok((receipt, None)) => (
+            ProducerCommandAckRequestV1 {
+                command_id: command.command_id,
+                outcome: "applied".into(),
+                receipt: Some(receipt.command_receipt()),
+                error: None,
+            },
+            true,
+        ),
+        Ok((receipt, Some(error))) => {
+            let onboard = receipt.onboard_error.unwrap_or(AddOnboardError {
+                status: None,
+                code: Some("enroll_onboard_failed".into()),
+                message: format!("{error:#}"),
+            });
+            (
+                failure(
+                    onboard.code.as_deref().unwrap_or("enroll_onboard_failed"),
+                    onboard.message,
+                ),
+                false,
+            )
+        }
+        Err(error) => (failure("enroll_failed", format!("{error:#}")), false),
+    }
+}
+
+fn bounded_command_error(mut message: String) -> String {
+    if message.len() <= MAX_PRODUCER_COMMAND_ERROR_BYTES {
+        return message;
+    }
+    let mut end = MAX_PRODUCER_COMMAND_ERROR_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message
 }
 
 async fn apply_checkout_mutations(runtime: &Runtime, config: &CollectorConfig) -> Result<usize> {
@@ -612,7 +812,7 @@ async fn onboard_project(
     response.json().await.map_err(Into::into)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AddReceipt {
     project_id: Option<String>,
     attachment_id: Option<String>,
@@ -628,15 +828,47 @@ struct AddReceipt {
     onboard_error: Option<AddOnboardError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AddOnboardError {
     status: Option<u16>,
     code: Option<String>,
     message: String,
 }
 
+impl AddReceipt {
+    fn command_receipt(&self) -> EnrollReceiptV1 {
+        EnrollReceiptV1 {
+            project_id: self.project_id.clone(),
+            attachment_id: self.attachment_id.clone(),
+            created_project: self.created_project,
+            already_attached: self.already_attached,
+            scope: self.scope.clone(),
+            published_ref: self.published_ref.clone(),
+            identity_committed: self.identity_committed,
+            commit_paths: self.commit_paths.clone().unwrap_or_default(),
+            onboard_error: self
+                .onboard_error
+                .as_ref()
+                .map(|error| EnrollOnboardErrorV1 {
+                    status: error.status,
+                    code: error.code.clone(),
+                    message: bounded_command_error(error.message.clone()),
+                }),
+        }
+    }
+}
+
 async fn add_project(runtime: &Runtime, config_path: &Path, args: AddArgs) -> Result<()> {
-    let (receipt, onboard_error) = execute_add(runtime, config_path, args).await?;
+    let (receipt, onboard_error) = execute_add(
+        runtime,
+        config_path,
+        args.path,
+        args.full_ref,
+        !args.no_git_history,
+        !args.no_provenance,
+        !args.no_published_knowledge,
+    )
+    .await?;
     println!("{}", serde_json::to_string(&receipt)?);
     match onboard_error {
         None => Ok(()),
@@ -647,13 +879,15 @@ async fn add_project(runtime: &Runtime, config_path: &Path, args: AddArgs) -> Re
 async fn execute_add(
     runtime: &Runtime,
     config_path: &Path,
-    args: AddArgs,
+    path: PathBuf,
+    full_ref: Option<String>,
+    git_history: bool,
+    provenance: bool,
+    published_knowledge: bool,
 ) -> Result<(AddReceipt, Option<anyhow::Error>)> {
-    let loaded = load_config(config_path, DuplicateHandling::Error)?;
-    let project_dir = args
-        .path
+    let project_dir = path
         .canonicalize()
-        .with_context(|| format!("canonicalizing {}", args.path.display()))?;
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
     if !project_dir.is_dir() {
         bail!(
             "project path must be an existing directory: {}",
@@ -669,6 +903,9 @@ async fn execute_add(
 
     init_project_scaffolding(&project_dir, false)?;
     let scope = derive_working_scope(&git_root, &project_dir)?;
+    let sidecar_path = resolve_enrolled_projects_path(config_path)?;
+    let sidecar_lock = lock_enrolled_projects(&sidecar_path)?;
+    let loaded = load_config(config_path, DuplicateHandling::Error)?;
     reject_configured_duplicate(&loaded.configured_projects, &project_dir, &scope)?;
 
     let existing = loaded
@@ -676,7 +913,7 @@ async fn execute_add(
         .iter()
         .find(|project| comparable_root(&project.root) == project_dir)
         .cloned();
-    let derived_ref = derive_published_ref(&git_root, args.full_ref.as_deref())?;
+    let derived_ref = derive_published_ref(&git_root, full_ref.as_deref())?;
     let (project, published_ref) = if let Some(existing) = existing {
         if existing.scope != scope {
             bail!("enrolled project root has a different recorded scope");
@@ -698,9 +935,9 @@ async fn execute_add(
         let project = ProjectConfig {
             root: project_dir.clone(),
             scope: scope.clone(),
-            git_history: !args.no_git_history,
-            provenance: !args.no_provenance,
-            published_knowledge: (!args.no_published_knowledge).then(|| PublishedKnowledgeConfig {
+            git_history,
+            provenance,
+            published_knowledge: published_knowledge.then(|| PublishedKnowledgeConfig {
                 full_ref: derived_ref.clone(),
             }),
         };
@@ -709,6 +946,7 @@ async fn execute_add(
         write_enrolled_projects(&loaded.effective.enrolled_projects_file, enrolled)?;
         (project, derived_ref)
     };
+    drop(sidecar_lock);
 
     let identity_committed = identity_committed_at_ref(&project_dir, &published_ref, &scope);
     let commit_paths =
@@ -834,6 +1072,25 @@ fn write_enrolled_projects(path: &Path, projects: Vec<ProjectConfig>) -> Result<
         .map_err(|error| error.error)
         .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+fn lock_enrolled_projects(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 fn identity_committed_at_ref(
@@ -3101,7 +3358,11 @@ impl ConfigReloader {
         }
         self.config_stamp = config_stamp;
         self.sidecar_stamp = sidecar_stamp;
+        self.reload_now(shared)
+    }
 
+    fn reload_now(&mut self, shared: &SharedCollectorConfig) -> bool {
+        let current = shared.snapshot();
         match load_config_sources(&self.config_path, DuplicateHandling::WarnConfigWins) {
             Ok(loaded) => {
                 let mut replacement = loaded.effective;
@@ -3114,6 +3375,7 @@ impl ConfigReloader {
                     return false;
                 }
                 self.sidecar_path = replacement.enrolled_projects_file.clone();
+                self.config_stamp = file_stamp(&self.config_path);
                 self.sidecar_stamp = file_stamp(&self.sidecar_path);
                 shared.replace(replacement);
                 tracing::info!("collector configuration reloaded");
@@ -3153,6 +3415,23 @@ fn load_config(path: &Path, duplicates: DuplicateHandling) -> Result<LoadedColle
     Ok(loaded)
 }
 
+fn resolve_enrolled_projects_path(path: &Path) -> Result<PathBuf> {
+    let config_path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let parsed: CollectorConfigFile =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", config_path.display()))?;
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("collector config has no parent directory"))?;
+    match parsed.enrolled_projects_file {
+        Some(sidecar) => resolve_config_path(config_dir, &sidecar),
+        None => default_enrolled_projects_file(&config_path),
+    }
+}
+
 fn load_config_sources(
     path: &Path,
     duplicates: DuplicateHandling,
@@ -3176,6 +3455,15 @@ fn load_config_sources(
         .iter()
         .map(|root| canonical_enroll_root(root))
         .collect::<Result<Vec<_>>>()?;
+    let host_label = parsed
+        .host_label
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(default_host_label);
+    let service_label = parsed
+        .service_label
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty());
     let enrolled_projects = load_enrolled_projects(&enrolled_projects_file)?;
     let configured_projects = parsed.projects;
     let projects = merge_projects(
@@ -3193,6 +3481,9 @@ fn load_config_sources(
         status_timeout_secs: parsed.status_timeout_secs,
         enrolled_projects_file,
         enroll_roots,
+        host_label,
+        service_label,
+        config_path,
         projects,
     };
     tracing::debug!(
@@ -3211,7 +3502,20 @@ fn validate_loaded_config(config: &CollectorConfig) -> Result<()> {
         bail!("collector status_timeout_secs must be greater than zero");
     }
     let url = Url::parse(&config.server_url).context("parsing server_url")?;
-    validate_server_url(&url, config.trusted_encrypted_network)
+    validate_server_url(&url, config.trusted_encrypted_network)?;
+    ProducerPresenceV1 {
+        enroll_roots: config
+            .enroll_roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+        host_label: config.host_label.clone(),
+        config_path: config.config_path.to_string_lossy().into_owned(),
+        service_label: config.service_label.clone(),
+        collector_version: env!("CARGO_PKG_VERSION").into(),
+    }
+    .validate()
+    .map_err(|error| anyhow!("invalid producer presence configuration: {error}"))
 }
 
 fn load_enrolled_projects(path: &Path) -> Result<Vec<ProjectConfig>> {
@@ -3493,6 +3797,9 @@ mod tests {
             status_timeout_secs: 1,
             enrolled_projects_file: root.join("collector.enrolled.toml"),
             enroll_roots: Vec::new(),
+            host_label: "collector-test".into(),
+            service_label: None,
+            config_path: root.join("collector.toml"),
             projects: vec![ProjectConfig {
                 root: root.to_path_buf(),
                 scope,
@@ -3662,6 +3969,73 @@ mod tests {
         (runtime, server, requests)
     }
 
+    async fn command_test_runtime(
+        command: ProducerCommandV1,
+    ) -> (
+        Runtime,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<ProducerPresenceV1>>>,
+        Arc<std::sync::Mutex<Vec<ProducerCommandAckRequestV1>>>,
+    ) {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+
+        let presences = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let presence_sink = presences.clone();
+        let command_for_poll = command.clone();
+        let acks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ack_sink = acks.clone();
+        let app = Router::new()
+            .route(
+                "/internal/code-source/v1/producer-commands/poll",
+                post(move |Json(request): Json<ProducerCommandPollRequestV1>| {
+                    let presence_sink = presence_sink.clone();
+                    let command = command_for_poll.clone();
+                    async move {
+                        presence_sink.lock().unwrap().push(request.presence);
+                        Json(ProducerCommandPollResponseV1 {
+                            commands: vec![command],
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/producer-commands/ack",
+                post(move |Json(request): Json<ProducerCommandAckRequestV1>| {
+                    let ack_sink = ack_sink.clone();
+                    async move {
+                        ack_sink.lock().unwrap().push(request);
+                        Json(serde_json::json!({"status": "accepted"}))
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/catalog/onboard",
+                post(
+                    |Json(_request): Json<bbox_code_source::CatalogOnboardRequestV1>| async move {
+                        Json(bbox_code_source::CatalogOnboardResponseV1 {
+                            project_id: "p_collector_test".into(),
+                            attachment_id: "a_collector_test".into(),
+                            created_project: true,
+                            already_attached: false,
+                            epoch: 1,
+                            nominated_aliases: Vec::new(),
+                        })
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Runtime {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            token: ServiceToken::parse("8".repeat(64)).unwrap(),
+            client: Client::builder().build().unwrap(),
+        };
+        (runtime, server, presences, acks)
+    }
+
     fn add_args(path: &Path) -> AddArgs {
         AddArgs {
             path: path.to_path_buf(),
@@ -3670,6 +4044,157 @@ mod tests {
             no_provenance: false,
             no_published_knowledge: false,
         }
+    }
+
+    async fn execute_add_for_test(
+        runtime: &Runtime,
+        config_path: &Path,
+        args: AddArgs,
+    ) -> Result<(AddReceipt, Option<anyhow::Error>)> {
+        execute_add(
+            runtime,
+            config_path,
+            args.path,
+            args.full_ref,
+            !args.no_git_history,
+            !args.no_provenance,
+            !args.no_published_knowledge,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn producer_command_refuses_enrollment_outside_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let mut config = mutation_config(&allowed, PublishedScope::try_new("repo-a", ".").unwrap());
+        config.enroll_roots = vec![allowed.canonicalize().unwrap()];
+        let (runtime, server, _) = onboard_test_runtime(axum::http::StatusCode::OK).await;
+
+        let (ack, applied) = execute_producer_command(
+            &runtime,
+            &config,
+            ProducerCommandV1 {
+                command_id: "pc-0000000000000001".into(),
+                kind: "enroll".into(),
+                path: outside.to_string_lossy().into_owned(),
+                full_ref: None,
+            },
+        )
+        .await;
+        assert!(!applied);
+        assert_eq!(ack.outcome, "failed");
+        assert_eq!(ack.error.unwrap().code, "enroll_outside_roots");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn producer_command_runs_add_and_acks_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_fixture_repo(&repo);
+        let config_path = root.join("collector.toml");
+        let settings = format!(
+            "enroll_roots = [{:?}]\nhost_label = \"fixture-host\"\nservice_label = \"fixture-service\"",
+            root.to_string_lossy()
+        );
+        let command = ProducerCommandV1 {
+            command_id: "pc-0000000000000002".into(),
+            kind: "enroll".into(),
+            path: repo.to_string_lossy().into_owned(),
+            full_ref: Some("refs/heads/main".into()),
+        };
+        let (runtime, server, presences, acks) = command_test_runtime(command).await;
+        write_collector_config(
+            &config_path,
+            runtime.base_url.as_str(),
+            &settings,
+            Vec::new(),
+        );
+        let config = load_config(&config_path, DuplicateHandling::Error)
+            .unwrap()
+            .effective;
+
+        assert_eq!(apply_producer_commands(&runtime, &config).await.unwrap(), 1);
+        let presences = presences.lock().unwrap();
+        assert_eq!(presences.len(), 1);
+        assert_eq!(presences[0].host_label, "fixture-host");
+        assert_eq!(
+            presences[0].service_label.as_deref(),
+            Some("fixture-service")
+        );
+        drop(presences);
+        let acks = acks.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].outcome, "applied");
+        assert_eq!(
+            acks[0].receipt.as_ref().unwrap().published_ref,
+            "refs/heads/main"
+        );
+        drop(acks);
+        let loaded = load_config(&config_path, DuplicateHandling::Error).unwrap();
+        assert_eq!(loaded.enrolled_projects.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_lock_serializes_concurrent_adds_without_losing_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first_repo = root.join("first");
+        let second_repo = root.join("second");
+        fs::create_dir_all(&first_repo).unwrap();
+        fs::create_dir_all(&second_repo).unwrap();
+        init_fixture_repo(&first_repo);
+        init_fixture_repo(&second_repo);
+        fs::write(second_repo.join("README.md"), "second fixture\n").unwrap();
+        git(&second_repo, &["add", "README.md"]);
+        git(&second_repo, &["commit", "--quiet", "--amend", "--no-edit"]);
+        let config_path = root.join("collector.toml");
+        let (runtime, server, _) = onboard_test_runtime(axum::http::StatusCode::OK).await;
+        write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
+        let runtime = Arc::new(runtime);
+
+        let first_runtime = runtime.clone();
+        let first_config = config_path.clone();
+        let first = tokio::spawn(async move {
+            execute_add(
+                first_runtime.as_ref(),
+                &first_config,
+                first_repo,
+                None,
+                true,
+                true,
+                true,
+            )
+            .await
+        });
+        let second_runtime = runtime.clone();
+        let second_config = config_path.clone();
+        let second = tokio::spawn(async move {
+            execute_add(
+                second_runtime.as_ref(),
+                &second_config,
+                second_repo,
+                None,
+                true,
+                true,
+                true,
+            )
+            .await
+        });
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        let loaded = load_config(&config_path, DuplicateHandling::Error).unwrap();
+        assert_eq!(loaded.enrolled_projects.len(), 2);
+        server.abort();
     }
 
     #[test]
@@ -3723,7 +4248,7 @@ mod tests {
         let config_path = directory.path().join("collector.toml");
         write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
 
-        let (first, error) = execute_add(&runtime, &config_path, add_args(&root))
+        let (first, error) = execute_add_for_test(&runtime, &config_path, add_args(&root))
             .await
             .unwrap();
         assert!(error.is_none());
@@ -3751,7 +4276,7 @@ mod tests {
             Some("refs/heads/main")
         );
 
-        let (again, error) = execute_add(&runtime, &config_path, add_args(&root))
+        let (again, error) = execute_add_for_test(&runtime, &config_path, add_args(&root))
             .await
             .unwrap();
         assert!(error.is_none());
@@ -3771,7 +4296,7 @@ mod tests {
             ],
         );
         git(&root, &["commit", "--quiet", "-m", "record identity"]);
-        let (committed, error) = execute_add(&runtime, &config_path, add_args(&root))
+        let (committed, error) = execute_add_for_test(&runtime, &config_path, add_args(&root))
             .await
             .unwrap();
         assert!(error.is_none());
@@ -3807,9 +4332,10 @@ mod tests {
         fs::create_dir(&subtree).unwrap();
         let config_path = directory.path().join("origin.toml");
         write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
-        let (origin_receipt, error) = execute_add(&runtime, &config_path, add_args(&subtree))
-            .await
-            .unwrap();
+        let (origin_receipt, error) =
+            execute_add_for_test(&runtime, &config_path, add_args(&subtree))
+                .await
+                .unwrap();
         assert!(error.is_none());
         assert_eq!(origin_receipt.scope.bbox_root_relpath(), "component");
         assert_eq!(origin_receipt.published_ref, "refs/heads/main");
@@ -3829,9 +4355,10 @@ mod tests {
         git(&current_repo, &["checkout", "--quiet", "-b", "release"]);
         let config_path = directory.path().join("current.toml");
         write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
-        let (current_receipt, error) = execute_add(&runtime, &config_path, add_args(&current_repo))
-            .await
-            .unwrap();
+        let (current_receipt, error) =
+            execute_add_for_test(&runtime, &config_path, add_args(&current_repo))
+                .await
+                .unwrap();
         assert!(error.is_none());
         assert_eq!(current_receipt.published_ref, "refs/heads/release");
 
@@ -3844,7 +4371,9 @@ mod tests {
         write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
         let mut args = add_args(&explicit_repo);
         args.full_ref = Some("refs/heads/published".into());
-        let (explicit_receipt, error) = execute_add(&runtime, &config_path, args).await.unwrap();
+        let (explicit_receipt, error) = execute_add_for_test(&runtime, &config_path, args)
+            .await
+            .unwrap();
         assert!(error.is_none());
         assert_eq!(explicit_receipt.published_ref, "refs/heads/published");
         server.abort();
@@ -3875,7 +4404,7 @@ mod tests {
         args.no_git_history = true;
         args.no_provenance = true;
         args.no_published_knowledge = true;
-        let (receipt, error) = execute_add(&runtime, &collector_config, args)
+        let (receipt, error) = execute_add_for_test(&runtime, &collector_config, args)
             .await
             .unwrap();
         assert!(error.is_none());
@@ -3922,14 +4451,14 @@ mod tests {
         let (runtime, server, _) = onboard_test_runtime(axum::http::StatusCode::OK).await;
         let shallow_config = directory.path().join("shallow.toml");
         write_collector_config(&shallow_config, runtime.base_url.as_str(), "", Vec::new());
-        let shallow_error = execute_add(&runtime, &shallow_config, add_args(&shallow))
+        let shallow_error = execute_add_for_test(&runtime, &shallow_config, add_args(&shallow))
             .await
             .unwrap_err();
         assert!(shallow_error.to_string().contains("shallow repository"));
 
         let linked_config = directory.path().join("linked.toml");
         write_collector_config(&linked_config, runtime.base_url.as_str(), "", Vec::new());
-        let linked_error = execute_add(&runtime, &linked_config, add_args(&linked))
+        let linked_error = execute_add_for_test(&runtime, &linked_config, add_args(&linked))
             .await
             .unwrap_err();
         assert!(linked_error.to_string().contains("main worktree"));
@@ -3947,7 +4476,7 @@ mod tests {
         let config_path = directory.path().join("collector.toml");
         write_collector_config(&config_path, runtime.base_url.as_str(), "", Vec::new());
 
-        let (receipt, error) = execute_add(&runtime, &config_path, add_args(&root))
+        let (receipt, error) = execute_add_for_test(&runtime, &config_path, add_args(&root))
             .await
             .unwrap();
         assert!(error.is_some());
@@ -4044,7 +4573,7 @@ mod tests {
             "",
             vec![configured],
         );
-        let error = execute_add(&runtime, &config_path, add_args(&root))
+        let error = execute_add_for_test(&runtime, &config_path, add_args(&root))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("already contains"));
