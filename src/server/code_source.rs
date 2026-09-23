@@ -24,6 +24,7 @@ use bbox_code_source_store::{
     MixedActivationRecord, MixedStoredGeneration, RetirementRecord, RuntimeRecordMode, StoreLimits,
     StoreRequestError,
 };
+use bbox_config::config::ProducerScopeClaimPolicy;
 use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, ProjectId, RepoHistoryMaterialization};
@@ -38,6 +39,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::SharedState;
 use super::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+use crate::producer_claims::ProducerClaimStore;
 
 const UPLOAD_BODY_TEMP_PREFIX: &str = ".upload-body-";
 const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
@@ -546,6 +548,7 @@ impl CodeSourceRuntime {
         code_source_locality_cutover: Arc<
             bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
         >,
+        claims: &ProducerClaimStore,
     ) -> Result<Self> {
         let transition_guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
         let reconciler = if catalog_store.is_some() {
@@ -559,6 +562,7 @@ impl CodeSourceRuntime {
             catalog_store.as_ref(),
             None,
             &checkout_access,
+            claims,
         )?);
         let catalog_projects = catalog_project_ids(catalog_store.as_deref())?;
         code_source_locality_cutover
@@ -582,6 +586,7 @@ impl CodeSourceRuntime {
         &self,
         config: &crate::config::Config,
         projects: &[ProjectRecord],
+        claims: &ProducerClaimStore,
     ) -> Result<SourceTransitions> {
         let previous = self.snapshot.read().clone();
         let replacement = Arc::new(build_snapshot(
@@ -590,6 +595,7 @@ impl CodeSourceRuntime {
             self.catalog_store.as_ref(),
             Some(previous.store.clone()),
             &self.checkout_access,
+            claims,
         )?);
         let catalog_projects = catalog_project_ids(self.catalog_store.as_deref())?;
         self.code_source_locality_cutover
@@ -813,6 +819,7 @@ fn build_snapshot(
     catalog_store: Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
     existing_store: Option<Arc<CodeSourceStore>>,
     checkout_access: &CheckoutAccessBroker,
+    claims: &ProducerClaimStore,
 ) -> Result<CodeSourceSnapshot> {
     let limits = store_limits(config);
     if config.code_collection.enabled
@@ -845,6 +852,7 @@ fn build_snapshot(
         projects,
         catalog_store,
         checkout_access,
+        claims,
     )?);
     if auth.enabled() {
         reap_upload_body_tempfiles(store.root())?;
@@ -1167,17 +1175,6 @@ async fn catalog_onboard(
     request
         .validate()
         .map_err(|error| HttpError::unprocessable("invalid_onboard_request", error.to_string()))?;
-    if let Err(forbidden) = require_scope(&grant, &request.scope) {
-        // A configured-but-unregistered scope is usable ONLY here: it is the
-        // onboarding case. Publication lanes keep their plain grant check.
-        if !state
-            .code_sources
-            .producer_auth()
-            .is_pending_onboard_scope(&request.scope)
-        {
-            return Err(forbidden);
-        }
-    }
     let store = state
         .project_authority
         .catalog_store()
@@ -1189,6 +1186,17 @@ async fn catalog_onboard(
                 "the project catalog is unavailable",
             )
         })?;
+    if let Err(forbidden) = require_scope(&grant, &request.scope) {
+        // A pinned or claimed scope with no catalog project is usable only
+        // here. Publication lanes keep their plain grant check.
+        if !state
+            .code_sources
+            .producer_auth()
+            .is_pending_onboard_scope_for(&grant.producer_id, &request.scope)
+        {
+            claim_scope_for_onboard(&state, &grant.producer_id, &request.scope, forbidden).await?;
+        }
+    }
     let receipt = blocking(move || -> Result<CatalogOnboardResponseV1> {
         let kind = match request.checkout_kind.as_str() {
             "base" => bbox_corpus_core::project_catalog::AttachmentKind::Base,
@@ -1257,10 +1265,12 @@ async fn catalog_onboard(
     // collection-disabled config would replace the runtime with a disabled
     // one.
     if receipt.created_project || !receipt.already_attached {
+        let _claim_guard = state.producer_claim_lock.lock().await;
         let config = state.config.read().clone();
         if config.code_collection.enabled {
             let projects = state.records_provider.records_snapshot().records;
-            match state.code_sources.reload(&config, &projects) {
+            let claims = state.producer_claims.read().records_snapshot();
+            match state.code_sources.reload(&config, &projects, &claims) {
                 Ok(transitions) => apply_source_transitions(state.clone(), transitions),
                 Err(error) => tracing::warn!(
                     error = %error,
@@ -1271,6 +1281,137 @@ async fn catalog_onboard(
     }
     state.nudge_edge_index_rebuild();
     Ok((StatusCode::CREATED, Json(receipt)))
+}
+
+async fn claim_scope_for_onboard(
+    state: &Arc<SharedState>,
+    producer_id: &str,
+    scope: &PublishedScope,
+    forbidden: HttpError,
+) -> Result<(), HttpError> {
+    let _claim_guard = state.producer_claim_lock.lock().await;
+    let config = state.config.read().clone();
+    let claim_policy = config
+        .code_collection
+        .producers
+        .iter()
+        .find(|producer| producer.producer_id == producer_id)
+        .map(|producer| producer.claim_scopes);
+    let Some(claim_policy) = claim_policy else {
+        return Err(forbidden);
+    };
+    let claims = state.producer_claims.read().records_snapshot();
+
+    let exact_pin_owner = config
+        .code_collection
+        .producers
+        .iter()
+        .find(|producer| producer.scopes.iter().any(|pinned| pinned == scope))
+        .map(|producer| producer.producer_id.clone());
+    if let Some(owner) = exact_pin_owner
+        .as_deref()
+        .filter(|owner| *owner != producer_id)
+    {
+        return Err(HttpError::new(
+            StatusCode::FORBIDDEN,
+            "scope_forbidden",
+            format!("scope is assigned to producer {owner}"),
+        ));
+    }
+
+    let exact_claim_owner = if exact_pin_owner.is_none() {
+        claims
+            .claims
+            .iter()
+            .find(|claim| claim.scope == *scope)
+            .map(|claim| claim.producer_id.clone())
+    } else {
+        None
+    };
+    if let Some(owner) = exact_claim_owner
+        .as_deref()
+        .filter(|owner| *owner != producer_id)
+    {
+        return Err(HttpError::new(
+            StatusCode::FORBIDDEN,
+            "scope_forbidden",
+            format!("scope is assigned to producer {owner}"),
+        ));
+    }
+
+    for configured in &config.code_collection.producers {
+        if configured.producer_id == producer_id {
+            continue;
+        }
+        if configured
+            .scopes
+            .iter()
+            .any(|assigned| assigned.repo_id() == scope.repo_id())
+        {
+            return Err(HttpError::new(
+                StatusCode::CONFLICT,
+                "repo_history_scope_split",
+                format!(
+                    "repository history is assigned to producer {}",
+                    configured.producer_id
+                ),
+            ));
+        }
+    }
+    for claim in &claims.claims {
+        if claim.producer_id == producer_id
+            || !config
+                .code_collection
+                .producers
+                .iter()
+                .any(|configured| configured.producer_id == claim.producer_id)
+            || config.code_collection.producers.iter().any(|configured| {
+                configured
+                    .scopes
+                    .iter()
+                    .any(|pinned| pinned == &claim.scope)
+            })
+        {
+            continue;
+        }
+        if claim.scope.repo_id() == scope.repo_id() {
+            return Err(HttpError::new(
+                StatusCode::CONFLICT,
+                "repo_history_scope_split",
+                format!(
+                    "repository history is assigned to producer {}",
+                    claim.producer_id
+                ),
+            ));
+        }
+    }
+
+    let already_owned = exact_pin_owner.as_deref() == Some(producer_id)
+        || exact_claim_owner.as_deref() == Some(producer_id);
+    if !already_owned {
+        if claim_policy != ProducerScopeClaimPolicy::Unclaimed {
+            return Err(forbidden);
+        }
+        let claimed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        state
+            .producer_claims
+            .write()
+            .claim(producer_id, scope.clone(), claimed_at)
+            .map_err(HttpError::storage)?;
+        state
+            .persist_producer_claims_durable()
+            .await
+            .map_err(HttpError::storage)?;
+    }
+
+    let claims = state.producer_claims.read().records_snapshot();
+    let projects = state.records_provider.records_snapshot().records;
+    let transitions = state
+        .code_sources
+        .reload(&config, &projects, &claims)
+        .map_err(HttpError::storage)?;
+    apply_source_transitions(state.clone(), transitions);
+    Ok(())
 }
 
 /// Checkout-owner delivery lane: the collector polls pending repo-owned
@@ -6956,7 +7097,7 @@ mod tests {
         encode_collision_retirement_pending_for_migration,
         encode_stored_generation_v2_for_migration,
     };
-    use bbox_config::config::CodeCollectionProducerConfig;
+    use bbox_config::config::{CodeCollectionProducerConfig, ProducerScopeClaimPolicy};
     use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
     use bbox_indexing::checkout_access::{
         CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
@@ -6966,6 +7107,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::producer_claims::{
+        PRODUCER_CLAIM_STORE_VERSION, ProducerClaimStore, ProducerScopeClaim,
+    };
     use crate::server::producer_auth::{
         GrantScopeResolution, resolve_catalog_project, resolve_grant_scope,
     };
@@ -7059,6 +7203,7 @@ mod tests {
             token_file,
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
+            claim_scopes: Default::default(),
         }];
         let catalog = catalog_grant_store(
             &root.join("catalog"),
@@ -7078,6 +7223,7 @@ mod tests {
                     project_id,
                 ),
             ),
+            &ProducerClaimStore::default(),
         )
         .unwrap();
         let original_revision = runtime
@@ -7088,7 +7234,7 @@ mod tests {
         removed.code_collection.enabled = false;
         removed.code_collection.producers.clear();
         let error = runtime
-            .reload(&removed, &[])
+            .reload(&removed, &[], &ProducerClaimStore::default())
             .err()
             .expect("assignment removal must fail closed");
 
@@ -7199,9 +7345,16 @@ mod tests {
         let mut config = base.clone();
         config.code_collection.enabled = true;
         config.code_collection.producers = producers;
-        let error = build_snapshot(&config, projects, None, Some(store), broker)
-            .err()
-            .expect("invalid enabled code-source configuration must fail closed");
+        let error = build_snapshot(
+            &config,
+            projects,
+            None,
+            Some(store),
+            broker,
+            &ProducerClaimStore::default(),
+        )
+        .err()
+        .expect("invalid enabled code-source configuration must fail closed");
         assert_eq!(error.to_string(), expected);
     }
 
@@ -7625,7 +7778,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scope = PublishedScope::try_new("http-contract", ".").unwrap();
         let (state, token) = enabled_http_state(directory.path(), &scope);
-        let app = router(state.clone()).with_state(state);
+        let app = router(state.clone()).with_state(state.clone());
         let request = BeginUploadRequest {
             descriptor: GenerationDescriptor {
                 schema_version: SCHEMA_VERSION + 1,
@@ -7709,6 +7862,44 @@ mod tests {
                 )],
             )));
         (state, token_secret)
+    }
+
+    fn claiming_catalog_onboard_state(
+        root: &Path,
+        catalog_projects_path: &Path,
+        producers: Vec<CodeCollectionProducerConfig>,
+        claims: Vec<(&str, PublishedScope)>,
+    ) -> Arc<SharedState> {
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            catalog_projects_path,
+        )
+        .unwrap();
+        let mut state = SharedState::for_test_catalog(root, catalog_projects_path);
+        for (producer_id, scope) in claims {
+            state
+                .producer_claims
+                .write()
+                .claim(producer_id, scope, "2026-09-23T00:00:00Z".to_string())
+                .unwrap();
+        }
+        state.producer_claims_persister.flush_blocking().unwrap();
+        let mut config = state.config.read().clone();
+        config.paths.state_dir = root.join("claim-runtime");
+        config.code_collection.enabled = true;
+        config.code_collection.producers = producers;
+        state.code_sources = Arc::new(
+            CodeSourceRuntime::open(
+                &config,
+                &[],
+                state.project_authority.catalog_store().cloned(),
+                state.checkout_access.clone(),
+                state.code_source_locality_cutover.clone(),
+                &state.producer_claims.read().records_snapshot(),
+            )
+            .unwrap(),
+        );
+        *state.config.write() = config;
+        Arc::new(state)
     }
 
     #[tokio::test]
@@ -8044,7 +8235,7 @@ mod tests {
                 BTreeSet::from([pending.clone()]),
             ),
         ));
-        let app = router(state.clone()).with_state(state);
+        let app = router(state.clone()).with_state(state.clone());
 
         let response = app
             .oneshot(authenticated_request(
@@ -8059,6 +8250,206 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let receipt: CatalogOnboardResponseV1 = serde_json::from_slice(&body).unwrap();
         assert!(receipt.created_project);
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_first_claim_persists_and_admits_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let token_file = root.join("claim-token");
+        write_service_token(&token_file, 'a');
+        let token = "a".repeat(64);
+        let scope = PublishedScope::try_new("repo-first-claim", ".").unwrap();
+        let state = claiming_catalog_onboard_state(
+            &root,
+            &catalog_projects_path,
+            vec![CodeCollectionProducerConfig {
+                producer_id: "claiming-producer".into(),
+                token_file,
+                token_files: Vec::new(),
+                scopes: Vec::new(),
+                claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+            }],
+            Vec::new(),
+        );
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard_request(&scope)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let claims = state.producer_claims.read().records_snapshot();
+        assert_eq!(claims.claims.len(), 1);
+        assert_eq!(claims.claims[0].producer_id, "claiming-producer");
+        assert_eq!(claims.claims[0].scope, scope);
+        let reopened =
+            crate::producer_claims::ProducerClaims::open(&root.join("producer-claims.json"))
+                .unwrap();
+        assert_eq!(reopened.claims(), claims.claims.as_slice());
+
+        let descriptor = empty_generation_descriptor(scope.clone(), &"1".repeat(40));
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&BeginUploadRequest { descriptor }).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_refuses_scope_pinned_or_claimed_by_another_producer() {
+        for claimed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let catalog_projects_path = root.join("catalog").join("projects.json");
+            fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+            let token_a = root.join("token-a");
+            let token_b = root.join("token-b");
+            write_service_token(&token_a, 'a');
+            write_service_token(&token_b, 'b');
+            let scope = PublishedScope::try_new("repo-owned-scope", ".").unwrap();
+            let state = claiming_catalog_onboard_state(
+                &root,
+                &catalog_projects_path,
+                vec![
+                    CodeCollectionProducerConfig {
+                        producer_id: "producer-a".into(),
+                        token_file: token_a,
+                        token_files: Vec::new(),
+                        scopes: Vec::new(),
+                        claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                    },
+                    CodeCollectionProducerConfig {
+                        producer_id: "producer-b".into(),
+                        token_file: token_b,
+                        token_files: Vec::new(),
+                        scopes: (!claimed).then(|| scope.clone()).into_iter().collect(),
+                        claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                    },
+                ],
+                claimed
+                    .then(|| vec![("producer-b", scope.clone())])
+                    .unwrap_or_default(),
+            );
+            let app = router(state.clone()).with_state(state);
+
+            let response = app
+                .oneshot(authenticated_request(
+                    "POST",
+                    "/internal/code-source/v1/catalog/onboard",
+                    &"a".repeat(64),
+                    Body::from(serde_json::to_vec(&onboard_request(&scope)).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, "scope_forbidden");
+            assert!(error.message.contains("producer-b"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_refuses_repository_history_owned_by_another_producer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let token_a = root.join("token-a");
+        let token_b = root.join("token-b");
+        write_service_token(&token_a, 'a');
+        write_service_token(&token_b, 'b');
+        let requested = PublishedScope::try_new("repo-history-owner", ".").unwrap();
+        let sibling = PublishedScope::try_new("repo-history-owner", "packages/sibling").unwrap();
+        let state = claiming_catalog_onboard_state(
+            &root,
+            &catalog_projects_path,
+            vec![
+                CodeCollectionProducerConfig {
+                    producer_id: "producer-a".into(),
+                    token_file: token_a,
+                    token_files: Vec::new(),
+                    scopes: Vec::new(),
+                    claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+                },
+                CodeCollectionProducerConfig {
+                    producer_id: "producer-b".into(),
+                    token_file: token_b,
+                    token_files: Vec::new(),
+                    scopes: vec![sibling],
+                    claim_scopes: ProducerScopeClaimPolicy::None,
+                },
+            ],
+            Vec::new(),
+        );
+        let app = router(state.clone()).with_state(state);
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &"a".repeat(64),
+                Body::from(serde_json::to_vec(&onboard_request(&requested)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "repo_history_scope_split");
+        assert!(error.message.contains("producer-b"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_policy_none_refuses_a_new_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let token_file = root.join("token");
+        write_service_token(&token_file, 'a');
+        let pinned = PublishedScope::try_new("already-pinned", ".").unwrap();
+        let requested = PublishedScope::try_new("new-claim", ".").unwrap();
+        let state = claiming_catalog_onboard_state(
+            &root,
+            &catalog_projects_path,
+            vec![CodeCollectionProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file,
+                token_files: Vec::new(),
+                scopes: vec![pinned],
+                claim_scopes: ProducerScopeClaimPolicy::None,
+            }],
+            Vec::new(),
+        );
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &"a".repeat(64),
+                Body::from(serde_json::to_vec(&onboard_request(&requested)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.producer_claims.read().claims().is_empty());
     }
 
     #[tokio::test]
@@ -8236,6 +8627,7 @@ mod tests {
                 token_file: token_file.to_path_buf(),
                 token_files: Vec::new(),
                 scopes,
+                claim_scopes: Default::default(),
             };
 
         let broker = snapshot_broker(Vec::new());
@@ -8671,8 +9063,208 @@ mod tests {
             token_file: token_file.to_path_buf(),
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
+            claim_scopes: Default::default(),
         }];
         config
+    }
+
+    #[test]
+    fn empty_pinned_scopes_require_unclaimed_policy_without_an_existing_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_file = root.join("token");
+        write_service_token(&token_file, 'a');
+        let catalog = catalog_grant_store(&root.join("catalog"), &[]);
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+
+        let mut none = base.clone();
+        none.code_collection.enabled = true;
+        none.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "producer-a".into(),
+            token_file: token_file.clone(),
+            token_files: Vec::new(),
+            scopes: Vec::new(),
+            claim_scopes: ProducerScopeClaimPolicy::None,
+        }];
+        let error = build_snapshot(
+            &none,
+            &[],
+            Some(&catalog),
+            None,
+            &broker,
+            &ProducerClaimStore::default(),
+        )
+        .err()
+        .expect("empty pins under policy none must fail");
+        assert_eq!(
+            error.to_string(),
+            "enabled code-collection producer has no scopes"
+        );
+
+        none.code_collection.producers[0].claim_scopes = ProducerScopeClaimPolicy::Unclaimed;
+        build_snapshot(
+            &none,
+            &[],
+            Some(&catalog),
+            None,
+            &broker,
+            &ProducerClaimStore::default(),
+        )
+        .expect("the unclaimed policy permits an empty pin set");
+    }
+
+    #[test]
+    fn config_pin_overrides_claim_and_orphaned_claim_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_a = root.join("token-a");
+        let token_b = root.join("token-b");
+        write_service_token(&token_a, 'a');
+        write_service_token(&token_b, 'b');
+        let scope = PublishedScope::try_new("pin-wins", ".").unwrap();
+        let project_id = "p_000000000000000000000000000000e1";
+        let catalog = catalog_grant_store(
+            &root.join("catalog"),
+            &[(project_id, ProjectScope::Published(scope.clone()))],
+        );
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let mut config = base.clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![
+            CodeCollectionProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: token_a,
+                token_files: Vec::new(),
+                scopes: vec![scope.clone()],
+                claim_scopes: ProducerScopeClaimPolicy::None,
+            },
+            CodeCollectionProducerConfig {
+                producer_id: "producer-b".into(),
+                token_file: token_b,
+                token_files: Vec::new(),
+                scopes: Vec::new(),
+                claim_scopes: ProducerScopeClaimPolicy::Unclaimed,
+            },
+        ];
+        let claims = ProducerClaimStore {
+            version: PRODUCER_CLAIM_STORE_VERSION,
+            claims: vec![
+                ProducerScopeClaim {
+                    producer_id: "producer-b".into(),
+                    scope: scope.clone(),
+                    claimed_at: "2026-09-23T00:00:00Z".into(),
+                },
+                ProducerScopeClaim {
+                    producer_id: "removed-producer".into(),
+                    scope: PublishedScope::try_new("orphaned-claim", ".").unwrap(),
+                    claimed_at: "2026-09-23T00:00:00Z".into(),
+                },
+            ],
+        };
+
+        let snapshot =
+            build_snapshot(&config, &[], Some(&catalog), None, &broker, &claims).unwrap();
+
+        assert_eq!(
+            snapshot.auth.assignment_map().get(&scope),
+            Some(&(project_id.to_string(), "producer-a".to_string()))
+        );
+        assert!(
+            snapshot
+                .auth
+                .producer_scopes("producer-b")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn existing_claim_remains_valid_under_none_and_survives_reopen_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let mut config = crate::config::load().unwrap();
+        let token_file = root.join("token");
+        write_service_token(&token_file, 'a');
+        let scope = PublishedScope::try_new("durable-claim", ".").unwrap();
+        let project_id = "p_000000000000000000000000000000e2";
+        let catalog = catalog_grant_store(
+            &root.join("catalog"),
+            &[(project_id, ProjectScope::Published(scope.clone()))],
+        );
+        config.code_collection.enabled = true;
+        config.paths.state_dir = root.join("runtime");
+        config.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "producer-a".into(),
+            token_file,
+            token_files: Vec::new(),
+            scopes: Vec::new(),
+            claim_scopes: ProducerScopeClaimPolicy::None,
+        }];
+        let claims_path = root.join("producer-claims.json");
+        let claims_store = Arc::new(parking_lot::RwLock::new(
+            crate::producer_claims::ProducerClaims::open(&claims_path).unwrap(),
+        ));
+        claims_store
+            .write()
+            .claim("producer-a", scope.clone(), "2026-09-23T00:00:00Z".into())
+            .unwrap();
+        crate::store_persister::StorePersister::spawn(
+            "claims-restart-test",
+            claims_store,
+            claims_path.clone(),
+        )
+        .flush_blocking()
+        .unwrap();
+        let reopened = crate::producer_claims::ProducerClaims::open(&claims_path).unwrap();
+        let claims = reopened.records_snapshot();
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        ));
+        let runtime = CodeSourceRuntime::open(
+            &config,
+            &[],
+            Some(catalog),
+            broker,
+            Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+            ),
+            &claims,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.producer_auth().assignment_map().get(&scope),
+            Some(&(project_id.to_string(), "producer-a".to_string()))
+        );
+        runtime.reload(&config, &[], &claims).unwrap();
+        assert_eq!(
+            runtime.producer_auth().assignment_map().get(&scope),
+            Some(&(project_id.to_string(), "producer-a".to_string()))
+        );
     }
 
     /// Phase 3 plan section 6 item 6: in catalog mode a configured producer
@@ -8713,6 +9305,7 @@ mod tests {
             Some(&catalog),
             None,
             &broker,
+            &ProducerClaimStore::default(),
         )
         .expect("the catalog arm resolves without touching a checkout");
 
@@ -8790,6 +9383,7 @@ mod tests {
             Some(&unknown),
             None,
             &broker,
+            &ProducerClaimStore::default(),
         )
         .expect("an unregistered catalog scope is admitted as pending onboarding");
         assert!(snapshot.auth.is_pending_onboard_scope(&scope));
@@ -8872,10 +9466,19 @@ mod tests {
             token_file: token_file.to_path_buf(),
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
+            claim_scopes: Default::default(),
         }];
+        let claims = ProducerClaimStore {
+            version: PRODUCER_CLAIM_STORE_VERSION,
+            claims: vec![ProducerScopeClaim {
+                producer_id: "other-producer".into(),
+                scope: scope.clone(),
+                claimed_at: "2026-09-23T00:00:00Z".into(),
+            }],
+        };
 
-        // Bridge mode: no catalog_store passed, so resolution is lease-derived.
-        let snapshot = build_snapshot(&config, &[project], None, None, &broker)
+        // Bridge mode is lease-derived and ignores the claims store.
+        let snapshot = build_snapshot(&config, &[project], None, None, &broker, &claims)
             .expect("bridge mode resolves grants through leases");
 
         assert!(
@@ -8923,18 +9526,27 @@ mod tests {
                 token_file: token_a,
                 token_files: Vec::new(),
                 scopes: vec![scope.clone()],
+                claim_scopes: Default::default(),
             },
             CodeCollectionProducerConfig {
                 producer_id: "dup-producer-b".into(),
                 token_file: token_b,
                 token_files: Vec::new(),
                 scopes: vec![scope.clone()],
+                claim_scopes: Default::default(),
             },
         ];
 
-        let error = build_snapshot(&config, &[], Some(&catalog), None, &broker)
-            .map(|_| ())
-            .expect_err("a scope assigned to two producers must fail closed");
+        let error = build_snapshot(
+            &config,
+            &[],
+            Some(&catalog),
+            None,
+            &broker,
+            &ProducerClaimStore::default(),
+        )
+        .map(|_| ())
+        .expect_err("a scope assigned to two producers must fail closed");
         assert_eq!(
             error.to_string(),
             "code-collection scope is assigned more than once"
@@ -8981,6 +9593,7 @@ mod tests {
             Some(&catalog),
             None,
             &broker,
+            &ProducerClaimStore::default(),
         )
         .expect("cold open admits an unresolved catalog scope as pending onboarding");
         assert!(snapshot.auth.is_pending_onboard_scope(&configured_scope));

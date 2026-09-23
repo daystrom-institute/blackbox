@@ -16,6 +16,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bbox_code_source::{ErrorResponse, validate_producer_id, validate_scope};
+use bbox_config::config::ProducerScopeClaimPolicy;
 pub(crate) use bbox_corpus_core::git_transport_cutover::RepoTransportGrant;
 use bbox_corpus_core::git_transport_cutover::{
     RepoTransportGrantState, derive_repo_transport_grants,
@@ -34,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 use super::SharedState;
 use super::connector_grants::ConnectorGrantRuntime;
+use crate::producer_claims::ProducerClaimStore;
 
 /// Sentinel stored in [`AuthEntry::last_matched_slot`] before this
 /// producer's token set has ever verified a request this boot. Not a valid
@@ -124,7 +126,7 @@ pub(crate) struct ProducerAuthRuntime {
     scope_to_project: BTreeMap<PublishedScope, ProjectId>,
     /// Configured grant scopes with no catalog project yet. Startup admits
     /// them so onboarding can run; only the onboard endpoint may accept them.
-    pending_onboard_scopes: BTreeSet<PublishedScope>,
+    pending_onboard_scopes: BTreeMap<PublishedScope, String>,
     #[cfg(test)]
     producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>>,
     project_to_repo_history: BTreeMap<ProjectId, RepoHistoryId>,
@@ -176,6 +178,7 @@ impl ProducerAuthRuntime {
         projects: &[ProjectRecord],
         catalog_store: Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
         checkout_access: &CheckoutAccessBroker,
+        claims: &ProducerClaimStore,
     ) -> Result<Self> {
         // Connector grants are their own family: enabled independently of
         // code collection, so they are resolved BEFORE the code-collection
@@ -260,20 +263,92 @@ impl ProducerAuthRuntime {
             bail!("knowledge transport requires catalog project authority");
         }
 
-        let mut entries = Vec::new();
-        let mut scope_to_project = BTreeMap::new();
-        let mut pending_onboard_scopes = BTreeSet::new();
-        #[cfg(test)]
-        let mut producer_to_scopes = BTreeMap::new();
         let mut producer_ids = BTreeSet::new();
-        let mut token_digests = BTreeSet::new();
-        let mut assigned_scopes = BTreeSet::new();
-
         for producer in &config.code_collection.producers {
             validate_producer_id(&producer.producer_id)?;
             if !producer_ids.insert(producer.producer_id.clone()) {
                 bail!("duplicate code-collection producer id");
             }
+        }
+
+        let mut effective_scopes: BTreeMap<String, BTreeSet<PublishedScope>> = config
+            .code_collection
+            .producers
+            .iter()
+            .map(|producer| (producer.producer_id.clone(), BTreeSet::new()))
+            .collect();
+        let mut pinned_scope_owners = BTreeMap::new();
+        for producer in &config.code_collection.producers {
+            for scope in &producer.scopes {
+                validate_scope(scope)?;
+                if pinned_scope_owners
+                    .insert(scope.clone(), producer.producer_id.clone())
+                    .is_some()
+                {
+                    bail!("code-collection scope is assigned more than once");
+                }
+                effective_scopes
+                    .get_mut(&producer.producer_id)
+                    .expect("configured producer has an effective-scope set")
+                    .insert(scope.clone());
+            }
+        }
+
+        if matches!(resolution, GrantScopeResolution::Catalog { .. }) {
+            let mut claimed_scope_owners = BTreeMap::new();
+            for claim in &claims.claims {
+                if !producer_ids.contains(&claim.producer_id) {
+                    tracing::warn!(
+                        producer_id = %claim.producer_id,
+                        scope = %format_args!(
+                            "{}/{}",
+                            claim.scope.repo_id(),
+                            claim.scope.bbox_root_relpath()
+                        ),
+                        "ignoring producer scope claim for a producer absent from config"
+                    );
+                    continue;
+                }
+                validate_scope(&claim.scope)?;
+                if let Some(pinned_producer_id) = pinned_scope_owners.get(&claim.scope) {
+                    if pinned_producer_id != &claim.producer_id {
+                        tracing::warn!(
+                            claim_producer_id = %claim.producer_id,
+                            pinned_producer_id = %pinned_producer_id,
+                            scope = %format_args!(
+                                "{}/{}",
+                                claim.scope.repo_id(),
+                                claim.scope.bbox_root_relpath()
+                            ),
+                            "ignoring producer scope claim overridden by a config pin"
+                        );
+                    }
+                    continue;
+                }
+                if let Some(existing) =
+                    claimed_scope_owners.insert(claim.scope.clone(), claim.producer_id.clone())
+                {
+                    if existing != claim.producer_id {
+                        bail!("code-collection scope is assigned more than once");
+                    }
+                    continue;
+                }
+                effective_scopes
+                    .get_mut(&claim.producer_id)
+                    .expect("configured producer has an effective-scope set")
+                    .insert(claim.scope.clone());
+            }
+        }
+
+        let mut entries = Vec::new();
+        let mut scope_to_project = BTreeMap::new();
+        let mut pending_onboard_scopes = BTreeMap::new();
+        #[cfg(test)]
+        let mut producer_to_scopes = BTreeMap::new();
+        let mut token_digests = BTreeSet::new();
+        let mut assigned_scopes = BTreeSet::new();
+
+        for producer in &config.code_collection.producers {
             let token_paths = producer.resolved_token_files().with_context(|| {
                 format!(
                     "resolving code-collection token files for {}",
@@ -292,13 +367,18 @@ impl ProducerAuthRuntime {
                     bail!("code-collection token values must be unique");
                 }
             }
-            if producer.scopes.is_empty() {
+            let scopes = effective_scopes
+                .get(&producer.producer_id)
+                .expect("configured producer has an effective-scope set");
+            if producer.scopes.is_empty()
+                && scopes.is_empty()
+                && producer.claim_scopes != ProducerScopeClaimPolicy::Unclaimed
+            {
                 bail!("enabled code-collection producer has no scopes");
             }
 
             let mut resolved = BTreeMap::new();
-            for scope in &producer.scopes {
-                validate_scope(scope)?;
+            for scope in scopes {
                 if !assigned_scopes.insert(scope.clone()) {
                     bail!("code-collection scope is assigned more than once");
                 }
@@ -318,7 +398,8 @@ impl ProducerAuthRuntime {
                         let pending = matches!(resolution, GrantScopeResolution::Catalog { .. })
                             && error.downcast_ref::<UnregisteredCatalogScope>().is_some();
                         if pending {
-                            pending_onboard_scopes.insert(scope.clone());
+                            pending_onboard_scopes
+                                .insert(scope.clone(), producer.producer_id.clone());
                             tracing::info!(
                                 scope = %format_args!("{}/{}", scope.repo_id(), scope.bbox_root_relpath()),
                                 "code-collection scope is pending onboarding"
@@ -330,10 +411,7 @@ impl ProducerAuthRuntime {
                 }
             }
             #[cfg(test)]
-            producer_to_scopes.insert(
-                producer.producer_id.clone(),
-                producer.scopes.iter().cloned().collect(),
-            );
+            producer_to_scopes.insert(producer.producer_id.clone(), scopes.clone());
             entries.push(AuthEntry {
                 tokens,
                 last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
@@ -381,7 +459,7 @@ impl ProducerAuthRuntime {
             knowledge_transport_enabled: false,
             entries: Vec::new(),
             scope_to_project: BTreeMap::new(),
-            pending_onboard_scopes: BTreeSet::new(),
+            pending_onboard_scopes: BTreeMap::new(),
             #[cfg(test)]
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
@@ -449,7 +527,7 @@ impl ProducerAuthRuntime {
                 })
                 .collect(),
             scope_to_project: BTreeMap::new(),
-            pending_onboard_scopes: BTreeSet::new(),
+            pending_onboard_scopes: BTreeMap::new(),
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
             repo_grants: BTreeMap::new(),
@@ -498,7 +576,7 @@ impl ProducerAuthRuntime {
             knowledge_transport_enabled: true,
             entries,
             scope_to_project,
-            pending_onboard_scopes: BTreeSet::new(),
+            pending_onboard_scopes: BTreeMap::new(),
             producer_to_scopes,
             project_to_repo_history: projection.project_to_repo_history,
             repo_grants: projection.grants,
@@ -510,7 +588,17 @@ impl ProducerAuthRuntime {
     /// True when the scope is operator-configured but has no catalog project
     /// yet. Only the catalog onboarding endpoint may admit such a scope.
     pub(crate) fn is_pending_onboard_scope(&self, scope: &PublishedScope) -> bool {
-        self.pending_onboard_scopes.contains(scope)
+        self.pending_onboard_scopes.contains_key(scope)
+    }
+
+    pub(crate) fn is_pending_onboard_scope_for(
+        &self,
+        producer_id: &str,
+        scope: &PublishedScope,
+    ) -> bool {
+        self.pending_onboard_scopes
+            .get(scope)
+            .is_some_and(|owner| owner == producer_id)
     }
 
     #[cfg(test)]
@@ -519,7 +607,15 @@ impl ProducerAuthRuntime {
         pending: BTreeSet<PublishedScope>,
     ) -> Self {
         let mut runtime = Self::for_test(true, false, entries);
-        runtime.pending_onboard_scopes = pending;
+        let producer_id = runtime
+            .entries
+            .first()
+            .map(|entry| entry.grant.producer_id.clone())
+            .unwrap_or_default();
+        runtime.pending_onboard_scopes = pending
+            .into_iter()
+            .map(|scope| (scope, producer_id.clone()))
+            .collect();
         runtime
     }
 

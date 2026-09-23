@@ -579,6 +579,7 @@ pub struct ResolvedPathConfig {
     pub notes_path: PathBuf,
     pub pins_path: PathBuf,
     pub checkout_mutations_path: PathBuf,
+    pub producer_claims_path: PathBuf,
     pub projects_path: PathBuf,
     pub packets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
@@ -671,6 +672,16 @@ pub struct CodeCollectionProducerConfig {
     pub token_files: Vec<PathBuf>,
     #[serde(default)]
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
+    #[serde(default)]
+    pub claim_scopes: ProducerScopeClaimPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerScopeClaimPolicy {
+    #[default]
+    None,
+    Unclaimed,
 }
 
 impl CodeCollectionProducerConfig {
@@ -1935,6 +1946,12 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("checkout-mutations.json"));
 
+    let producer_claims_path = std::env::var("BLACKBOX_PRODUCER_CLAIMS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("producer-claims.json"));
+
     let projects_path = std::env::var("BLACKBOX_PROJECTS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -2057,6 +2074,7 @@ fn resolve_paths(
         notes_path,
         pins_path,
         checkout_mutations_path,
+        producer_claims_path,
         projects_path,
         packets_dir,
         artifacts_dir,
@@ -3371,7 +3389,29 @@ state_dir = "~"
             token_file: PathBuf::from(token_file),
             token_files: token_files.into_iter().map(PathBuf::from).collect(),
             scopes: Vec::new(),
+            claim_scopes: ProducerScopeClaimPolicy::None,
         }
+    }
+
+    #[test]
+    fn code_collection_producer_claim_policy_defaults_to_none_and_parses_unclaimed() {
+        let defaulted: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(defaulted.claim_scopes, ProducerScopeClaimPolicy::None);
+
+        let unclaimed: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_file = \"/tmp/token\"\n\
+                 claim_scopes = \"unclaimed\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(unclaimed.claim_scopes, ProducerScopeClaimPolicy::Unclaimed);
     }
 
     #[test]
