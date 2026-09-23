@@ -4780,6 +4780,18 @@ mod tests {
         }
 
         fn new_with_auto_publish(project_id: &str, auto_publish: bool) -> Self {
+            Self::new_with_auto_publish_and_attachment_branch(
+                project_id,
+                auto_publish,
+                Some("main"),
+            )
+        }
+
+        fn new_with_auto_publish_and_attachment_branch(
+            project_id: &str,
+            auto_publish: bool,
+            attachment_branch_ref: Option<&str>,
+        ) -> Self {
             use crate::server::state::catalog_fixture::CatalogFixture;
             use bbox_corpus_core::project_catalog::{
                 AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus,
@@ -4810,7 +4822,7 @@ mod tests {
                             kind: AttachmentKind::Base,
                             validated_scope: Some(scope.clone()),
                             computed_repo_hint: None,
-                            branch_ref: Some("refs/heads/main".into()),
+                            branch_ref: attachment_branch_ref.map(str::to_owned),
                             capabilities: AttachmentCapabilities {
                                 repo_knowledge: true,
                                 ..Default::default()
@@ -5256,6 +5268,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_publish_accepts_a_short_attachment_branch_name() {
+        use crate::server::state::catalog_fixture::COMMIT_ONE;
+
+        let fixture = AutoAdvanceFixture::new_with_auto_publish_and_attachment_branch(
+            "p_auto_publish_short_branch",
+            true,
+            Some("main"),
+        );
+        let candidate = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        let outcome = fixture
+            .server
+            .attempt_publisher_auto_advance("p_auto_publish_short_branch", &candidate);
+        assert!(outcome.accepted(), "{outcome:?}");
+        assert_eq!(fixture.status().await["full_ref"], "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn auto_publish_ignores_a_different_checked_out_attachment_branch() {
+        use crate::server::state::catalog_fixture::COMMIT_ONE;
+
+        let fixture = AutoAdvanceFixture::new_with_auto_publish_and_attachment_branch(
+            "p_auto_publish_different_branch",
+            true,
+            Some("feature-x"),
+        );
+        let candidate = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        let outcome = fixture
+            .server
+            .attempt_publisher_auto_advance("p_auto_publish_different_branch", &candidate);
+        assert!(outcome.accepted(), "{outcome:?}");
+        assert_eq!(fixture.status().await["full_ref"], "refs/heads/main");
+    }
+
+    #[tokio::test]
     async fn auto_publish_never_reestablishes_when_a_pointer_exists() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
 
@@ -5287,7 +5333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_publish_requires_the_owner_catalog_scope_and_enrolled_ref() {
+    async fn auto_publish_requires_the_owner_and_catalog_scope() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
 
         let non_owner = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_non_owner", true);
@@ -5305,6 +5351,20 @@ mod tests {
                 .attempt_publisher_auto_advance("p_auto_publish_non_owner", &candidate),
             crate::server::publisher_auto_advance::AutoAdvanceOutcome::ProducerMismatch
         );
+        let status = non_owner.status().await;
+        assert!(status["auto_advance"]["grant"].is_null());
+        assert_eq!(
+            status["auto_advance"]["last_attempt"]["outcome"], "producer_mismatch",
+            "the auto-publish failure is visible through auto-advance status"
+        );
+        let detail = page_publisher_status_detail(
+            &non_owner.server,
+            "p_auto_publish_non_owner",
+            ProjectPublisherStatusDetail::AutoAdvance,
+        )
+        .await;
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["last_attempt"]["outcome"], "producer_mismatch");
 
         let changed_scope = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_scope", true);
         let other_scope =
@@ -5322,35 +5382,6 @@ mod tests {
                 .attempt_publisher_auto_advance("p_auto_publish_scope", &candidate),
             crate::server::publisher_auto_advance::AutoAdvanceOutcome::ScopeChanged
         );
-
-        let changed_ref = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_ref", true);
-        let candidate = changed_ref.stage_candidate_at(
-            "knowledge-a",
-            "content",
-            COMMIT_ONE,
-            "refs/heads/release",
-            &changed_ref.scope,
-        );
-        assert_eq!(
-            changed_ref
-                .server
-                .attempt_publisher_auto_advance("p_auto_publish_ref", &candidate),
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::RefChanged
-        );
-        let status = changed_ref.status().await;
-        assert!(status["auto_advance"]["grant"].is_null());
-        assert_eq!(
-            status["auto_advance"]["last_attempt"]["outcome"], "ref_changed",
-            "the auto-publish failure is visible through auto-advance status"
-        );
-        let detail = page_publisher_status_detail(
-            &changed_ref.server,
-            "p_auto_publish_ref",
-            ProjectPublisherStatusDetail::AutoAdvance,
-        )
-        .await;
-        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
-        assert_eq!(detail["last_attempt"]["outcome"], "ref_changed");
     }
 
     /// Default OFF. A project whose operator never granted the policy sees

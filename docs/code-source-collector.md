@@ -76,9 +76,11 @@ Producer fields are:
   an unassigned catalog scope on its first authenticated onboard request.
 - `auto_publish`: `false` by default. When `true`, this producer may establish
   the first accepted publication for a project it currently owns, only from a
-  Ready candidate on the project's catalog scope and enrolled published ref.
-  The establish uses the normal publisher acceptance path and installs the
-  project's auto-advance grant.
+  Ready candidate on the project's catalog scope with a non-empty full branch
+  ref. An attached repo-knowledge capable attachment must exist for that scope,
+  but its checked-out branch does not constrain publication. The establish
+  uses the normal publisher acceptance path, makes the candidate's branch ref
+  the pointer's ref, and installs the project's auto-advance grant.
 
 With `claim_scopes = "unclaimed"`, `scopes` may be empty. A new claim is
 accepted only when no other producer owns that scope or any scope with the same

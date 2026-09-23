@@ -412,6 +412,12 @@ pub(crate) fn auto_publish_audit_reason(producer_id: &str) -> String {
     reason.chars().take(MAX_AUDIT_REASON_BYTES / 4).collect()
 }
 
+fn is_full_branch_ref(value: &str) -> bool {
+    value
+        .strip_prefix("refs/heads/")
+        .is_some_and(|branch| !branch.is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublisherPolicyKind {
     AutoAdvance,
@@ -706,7 +712,7 @@ impl super::BlackboxServer {
 
     /// Establish the first pointer only when operator config pre-grants the
     /// current owning producer and the Ready candidate matches the project's
-    /// catalog scope and enrolled publication ref.
+    /// catalog scope with a full branch ref.
     fn run_publisher_auto_publish(
         &self,
         store: &ProjectCatalogStore,
@@ -775,19 +781,24 @@ impl super::BlackboxServer {
                     AutoAdvanceOutcome::ScopeChanged,
                 );
             }
-            let ref_is_enrolled = snapshot
-                .attachments()
-                .attachments
-                .values()
-                .any(|attachment| {
-                    attachment.project_id == *project_id
-                        && attachment.status == AttachmentStatus::Attached
-                        && attachment.capabilities.repo_knowledge
-                        && attachment.validated_scope.as_ref() == Some(catalog_scope)
-                        && attachment.branch_ref.as_deref()
-                            == Some(candidate.descriptor.full_ref.as_str())
-                });
-            if !ref_is_enrolled {
+            if !is_full_branch_ref(&candidate.descriptor.full_ref) {
+                return (
+                    candidate.producer_id.clone(),
+                    AutoAdvanceOutcome::RefChanged,
+                );
+            }
+            let has_eligible_attachment =
+                snapshot
+                    .attachments()
+                    .attachments
+                    .values()
+                    .any(|attachment| {
+                        attachment.project_id == *project_id
+                            && attachment.status == AttachmentStatus::Attached
+                            && attachment.capabilities.repo_knowledge
+                            && attachment.validated_scope.as_ref() == Some(catalog_scope)
+                    });
+            if !has_eligible_attachment {
                 return (
                     candidate.producer_id.clone(),
                     AutoAdvanceOutcome::RefChanged,
@@ -874,6 +885,14 @@ mod tests {
             auto_publish_audit_reason("producer-a"),
             "policy:auto_publish producer=producer-a"
         );
+    }
+
+    #[test]
+    fn auto_publish_ref_validation_refuses_non_branch_refs() {
+        assert!(is_full_branch_ref("refs/heads/main"));
+        assert!(!is_full_branch_ref("refs/heads/"));
+        assert!(!is_full_branch_ref("refs/tags/v1"));
+        assert!(!is_full_branch_ref("main"));
     }
 
     #[test]

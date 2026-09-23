@@ -3161,9 +3161,9 @@ mod tests {
                         kind: AttachmentKind::Base,
                         validated_scope: Some(scope.clone()),
                         computed_repo_hint: None,
-                        branch_ref: Some("refs/heads/main".into()),
+                        branch_ref: Some("main".into()),
                         capabilities: AttachmentCapabilities {
-                            repo_knowledge: true,
+                            repo_knowledge: false,
                             ..Default::default()
                         },
                         status: AttachmentStatus::Attached,
@@ -3200,8 +3200,7 @@ mod tests {
             project_id: project_id.as_str().to_string(),
             scope: scope.clone(),
         };
-        let mut descriptor = publication_descriptor(scope);
-        descriptor.full_ref = "refs/heads/release".into();
+        let descriptor = publication_descriptor(scope);
         let upload = store
             .begin_publication_upload(&authority, descriptor)
             .unwrap();

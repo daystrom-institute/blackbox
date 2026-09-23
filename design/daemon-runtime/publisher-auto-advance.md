@@ -8,7 +8,7 @@ topic:
   - knowledge
   - corpus
 tags: [publisher, accepted-publication, producer, policy, gap-a6911d0e]
-brief: "Default-off operator grants for establishing and advancing accepted publication from a project's owning producer through the exact operator acceptance path: producer-level auto_publish establishes the first pointer on the enrolled ref, then the pointer's auto-advance grant governs the linear fast path."
+brief: "Default-off operator grants for establishing and advancing accepted publication from a project's owning producer through the exact operator acceptance path: producer-level auto_publish establishes the first pointer on the first candidate's full branch ref, then the pointer's auto-advance grant governs the linear fast path."
 ---
 
 # Publisher auto-advance
@@ -54,8 +54,9 @@ property intact:
   the grant;
 - no model is anywhere on this path. The trigger is the daemon's own
   finalize handler;
-- the grant is scoped to the owning producer, the catalog scope, and the
-  enrolled published ref. Everything else still requires an operator.
+- the grant is scoped to the owning producer and the catalog scope. The first
+  candidate must name a full branch ref, which becomes the pointer's ref.
+  Later advances remain bound to that exact ref;
 
 The operator's approval moves from per-generation to per-lane. The
 producer-level `auto_publish` grant covers only the first pointer for
@@ -145,8 +146,11 @@ Properties this buys:
 operator-authored pre-grant. It applies only while that producer is the
 project's effective owner through a config pin or durable claim. A Ready
 candidate qualifies only when its producer is that owner, its scope is the
-project's catalog scope, and its full ref is an attached, repo-knowledge
-capable enrolled ref for the project.
+project's catalog scope, its full ref is a non-empty `refs/heads/...` branch,
+and the project has an attached, repo-knowledge capable attachment with the
+same validated scope. The attachment's checked-out `branch_ref` does not
+constrain publication. The first candidate's branch ref becomes the pointer's
+ref.
 
 The daemon establishes through `publish_from_ready_candidate` with
 `PublisherPublishMode::Establish` and
@@ -188,7 +192,8 @@ With no pointer, auto-publish proceeds only when all of these hold:
 | The effective owner has `auto_publish = true` | `no_accepted_publication` |
 | The candidate's producer is the effective owner | `producer_mismatch` |
 | The candidate's scope is the catalog scope | `scope_changed` |
-| The candidate's ref is an attached enrolled publication ref | `ref_changed` |
+| The candidate's ref is a non-empty full branch ref | `ref_changed` |
+| An attached repo-knowledge capable attachment has the catalog scope | `ref_changed` |
 | This candidate has not been attempted | `already_attempted` |
 
 With a pointer, continuing auto-advance proceeds only when all of these hold,
@@ -227,8 +232,10 @@ pointer it is replacing, passes `Inherit`, and generates
 
 The first-publication caller uses `Establish`, passes `Set` with
 `enabled=true`, and generates `policy:auto_publish producer=<id>`. It runs
-only after proving that no pointer exists and that the candidate matches the
-effective owner, catalog scope, and enrolled ref.
+only after proving that no pointer exists, the candidate matches the effective
+owner and catalog scope, its ref is a full branch ref, and an eligible
+attachment exists. The accepted pointer records that first candidate's ref;
+normal auto-advance binds every later candidate to it.
 
 ## 6. Trigger, failure, and the no-storm rule
 
