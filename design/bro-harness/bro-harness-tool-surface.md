@@ -53,7 +53,7 @@ in `builtin_tools()` and how each tool's arg surface should look.
 | `list_dir` | `path?` | Immediate entries. |
 | `content_search` | `pattern (regex), path?, glob?, max_results?=200 (cap 5000)` | gitignore-aware; returns `relpath:line:text`. ~~No output_mode / context-lines / count~~ **[shipped]** now takes `mode` (content/files/count), `context_lines`, `case_insensitive`. |
 | `glob` | `pattern, path?` | gitignore-aware; **mtime sort by default** (`GlobSort::Mtime`), `name` opt-in; cap 2000. |
-| `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). `shell_run(mode="promise")` starts async and returns a `promise_id`. |
+| `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). Omitted `stdin` means `/dev/null`, so stdin readers see EOF; `stdin: ""` opens an empty pipe kept open for `shell_poll`. `shell_run(mode="promise")` starts async and returns a `promise_id`. |
 | `promise_*` | `promise_id` / `promise_ids` | **[shipped]** same-dispatch lifecycle for async built-ins: `promise_status`, `promise_wait`, `promise_when_all`, `promise_when_any`, `promise_cancel`, `promise_list`; terminal promises automatically inject a hidden `HARNESS_EVENT` turn at a safe boundary. |
 | `todo_write` | `todos[]` | **[shipped]** durable across `exec → resume` via the `side` cell. |
 | `clip_*` (×9) | (see `clipboard.rs`) | **[shipped]** register store: `clip_yank/set/paste/list/peek/clear` + `clip_transform`/`clip_slice`/`clip_grep`. |
@@ -129,6 +129,12 @@ Operator-confirmed for v1:
     (`READER_DRAIN_GRACE`) and aborts stragglers.
   - *`close_stdin`:* read-until-EOF commands (`cat`, `sort`) could never finish
     without an EOF; added on both run and poll.
+  - *stdin default:* a command's stdin is `/dev/null` unless `shell_run` passes
+    `stdin`, so tools that fall back to reading stdin (a pathless `rg`, `grep`,
+    `cat`, `jq`) finish instead of blocking on a pipe nobody feeds. Passing
+    `stdin` (an empty string opens an initially empty pipe) is the opt-in to an
+    interactive stream fed through `shell_poll`; `shell_poll` writes to a
+    session without a pipe report `input_error`.
   - *`shell_kill`:* the only prior way to stop a non-timeout session was
     `run()`-end drop; now there's an in-dispatch signal+reap with SIGKILL
     escalation after `grace_ms`.
@@ -180,7 +186,7 @@ shell_run {
   timeout_ms?,            // hard kill
   yield_time_ms?,        // return partial output + session_id after N ms
   max_output_tokens?,    // cap returned stdout/stderr (default ~4k)
-  stdin?,                // initial stdin
+  stdin?,                // initial stdin; omitted = /dev/null, "" = empty open pipe
   stdout_to?,            // Stage-2 chaining: stdout → clip register (see tool-chaining)
   stdin_from?,           // Stage-2 chaining: register → stdin
 }

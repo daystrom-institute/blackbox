@@ -914,13 +914,16 @@ struct ShellRunInput {
     /// When output_pending=true, keep calling shell_poll with session_id even
     /// after running=false. Output loss is reported separately.
     max_output_tokens: Option<usize>,
-    /// Initial stdin (at most 1 MiB). Writes wait at most 5 seconds or the
-    /// invocation yield budget; partial/error writes are reported as input_error.
-    /// The stream stays open for
-    /// shell_poll to feed more, unless close_stdin is set.
+    /// Initial stdin (at most 1 MiB). When omitted, the command's stdin is
+    /// /dev/null, so commands that read stdin see EOF immediately. When set
+    /// (an empty string opens an initially empty pipe), stdin is a pipe that
+    /// stays open for shell_poll to feed more, unless close_stdin is set.
+    /// Writes wait at most 5 seconds or the invocation yield budget;
+    /// partial/error writes are reported as input_error.
     stdin: Option<String>,
-    /// Close (EOF) the stdin stream after writing `stdin`. Required for
-    /// commands that read until EOF (e.g. `cat`, `sort`) to terminate.
+    /// Close (EOF) the stdin pipe after writing `stdin`. Required for
+    /// commands that read until EOF (e.g. `cat`, `sort`) to terminate when
+    /// `stdin` is set.
     #[serde(default)]
     close_stdin: bool,
     /// Extra environment variables for the process, merged onto the inherited
@@ -943,7 +946,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue shell_poll until running=false and output_pending=false; completed commands retain unread output. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; prefix pages retain remaining output; zero is metadata-only). output_filter keeps complete matching stdout/stderr lines after capture (lines over 256 KiB are excluded and counted) without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue shell_poll until running=false and output_pending=false; completed commands retain unread output. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; prefix pages retain remaining output; zero is metadata-only). output_filter keeps complete matching stdout/stderr lines after capture (lines over 256 KiB are excluded and counted) without changing the real exit_code. Omitted stdin means /dev/null (commands reading stdin see EOF); pass stdin to feed initial input through a pipe, or stdin=\"\" to keep an empty pipe open for shell_poll; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -998,7 +1001,11 @@ impl Tool for ShellRun {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-lc", &args.command])
             .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
+            .stdin(if args.stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -1107,7 +1114,9 @@ struct ShellPollInput {
     /// or output_pending=true, including output retained after process exit.
     session_id: String,
     /// Optional stdin (at most 1 MiB); waits at most 5 seconds or the yield
-    /// budget. Partial/error writes are reported as input_error.
+    /// budget. Partial/error writes are reported as input_error. Only sessions
+    /// started with shell_run `stdin` (possibly "") have a stdin pipe; writing
+    /// to a session started without it reports input_error "stdin is closed".
     stdin: Option<String>,
     /// Close (EOF) the stdin stream after writing `stdin`.
     #[serde(default)]
@@ -1137,7 +1146,7 @@ impl Tool for ShellPoll {
         "shell_poll"
     }
     fn description(&self) -> &str {
-        "Resume a running shell session from shell_run: optionally feed stdin, close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false means the process exited; keep polling while output_pending=true to receive remaining output. Output pages consume only returned text; overflow retains the newest 8 MiB per stream and reports dropped_bytes. output_filter changes apply to unselected lines; cached page remainders keep their prior selection. Output byte counters describe buffer bytes, not source offsets. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
+        "Resume a running shell session from shell_run: optionally feed stdin (only when shell_run passed stdin, e.g. stdin=\"\"; otherwise stdin is /dev/null and writes report input_error), close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false means the process exited; keep polling while output_pending=true to receive remaining output. Output pages consume only returned text; overflow retains the newest 8 MiB per stream and reports dropped_bytes. output_filter changes apply to unselected lines; cached page remainders keep their prior selection. Output byte counters describe buffer bytes, not source offsets. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellPollInput>()
@@ -2109,6 +2118,82 @@ mod tests {
         assert_eq!(v["running"], false, "EOF should let cat exit: {v}");
         assert_eq!(v["exit_code"], 0);
         assert_eq!(v["stdout"], "abc\n");
+    }
+
+    #[tokio::test]
+    async fn omitted_stdin_gives_stdin_readers_eof() {
+        let (_dir, c) = isolated_cx();
+        for (command, exit_code) in [("cat", 0), ("grep zq-no-such-token", 1)] {
+            let v = as_json(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ShellRun.call(json!({"command": command, "yield_time_ms": 0}), &c),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{command} blocked on stdin")),
+            );
+            assert_eq!(v["running"], false, "{command}: {v}");
+            assert_eq!(v["exit_code"], exit_code, "{command}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stdin_keeps_pipe_open_for_poll() {
+        let (_dir, c) = isolated_cx();
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "cat", "stdin": "", "yield_time_ms": 100}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(v["running"], true, "empty stdin should keep cat open: {v}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ShellPoll.call(
+                    json!({"session_id": sid, "stdin": "abc\n", "close_stdin": true,
+                           "yield_time_ms": 0}),
+                    &c,
+                ),
+            )
+            .await
+            .expect("close_stdin did not let cat finish"),
+        );
+        assert_eq!(p["running"], false, "{p}");
+        assert!(p.get("input_error").is_none(), "{p}");
+        assert_eq!(p["exit_code"], 0, "{p}");
+        assert_eq!(p["stdout"], "abc\n");
+    }
+
+    #[tokio::test]
+    async fn poll_stdin_without_opted_in_pipe_reports_input_error() {
+        let (_dir, c) = isolated_cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 5", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        assert_eq!(v["running"], true, "{v}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            ShellPoll
+                .call(
+                    json!({"session_id": sid, "stdin": "abc\n", "yield_time_ms": 50}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(p["input_error"], "stdin is closed", "{p}");
+        assert_eq!(p["stdin_bytes_written"], 0, "{p}");
+
+        let _ = ShellKill
+            .call(json!({"session_id": sid, "signal": "kill"}), &c)
+            .await;
     }
 
     #[tokio::test]
