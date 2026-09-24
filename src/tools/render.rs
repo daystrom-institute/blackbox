@@ -227,7 +227,11 @@ impl BlackboxServer {
                     let recorded = server
                         .state
                         .render_locality_observations
-                        .record_completed(&current, &receipt)?;
+                        .record_completed(
+                            &current,
+                            &receipt,
+                            bbox_project_render::execute::now_unix_ms(),
+                        )?;
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
                         "evidence_recorded": recorded.is_some(),

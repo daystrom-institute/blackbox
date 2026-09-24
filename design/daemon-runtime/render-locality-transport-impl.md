@@ -199,8 +199,9 @@ reconciled under the checkout lock without writing: an output holding the
 planned bytes is reported written, one still holding its preflight bytes as
 not published, and anything else as a conflict, so owner edits made since the
 interruption survive. An output that cannot be inspected is reported as a
-conflict and the receipt is incomplete; a reconciliation that cannot run at
-all leaves the operation pending for redelivery. Neither is ever reported as
+conflict and the receipt is incomplete; a reconciliation that cannot run,
+including when the owner cannot verify its checkout, leaves the operation
+pending for redelivery with its preflight record intact. Neither is ever reported as
 an application that wrote nothing. An operation whose sequence is older than
 the newest one applied to that scope is refused without writing. The daemon records the owner's exact result; an identical
 duplicate is `already_settled`, a different one conflicts.
@@ -215,7 +216,10 @@ validation that held at completion is kept as history; present validity is
 rechecked on every response, so a receipt stops being current when knowledge
 or owner authority changes even if no newer render was issued. An incomplete
 receipt, from either applier, is accepted but never recorded as completion
-evidence, so it cannot satisfy the cutover gate. A
+evidence, so it cannot satisfy the cutover gate. Completion evidence also
+records the applied plan's issuance: a completion of an older plan never
+replaces newer evidence for the same project and view, and a collector
+operation is recorded only while it is still the project's newest operation. A
 fresh render with unchanged knowledge still starts a new operation, so it
 re-observes `PROJECT.md` and restores deleted generated outputs. Operation
 state survives daemon and collector restarts.
@@ -229,9 +233,12 @@ re-observed before it is reported written. Otherwise the output stages in a
 unique sibling, the current target is moved aside, and the staged output is
 published without clobbering only if the moved bytes are exactly the bytes
 preflight observed; owner bytes written at any point are restored or kept
-beside the target and the receipt reports a conflict. The moved-aside file is
-deleted only once it is proven to hold the observed old projection; every
-error or uncertain exit restores it or leaves it under its sibling name. A publication failure
+beside the target and the receipt reports a conflict. The moved-aside
+original is never unlinked by a render, because a writer may still hold it
+open: after publication it moves into the bounded `.bbox/local/render-backups`
+directory (or stays beside the target), and every error or uncertain exit
+restores it or leaves it under its sibling name. Only the oldest backups
+beyond the bound are pruned. A publication failure
 after preflight is reported per output as a partial render, a failure that
 may follow an effect (such as the directory sync) marks the receipt
 incomplete, and only failures before the first write are reported as having

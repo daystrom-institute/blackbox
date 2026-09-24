@@ -19,9 +19,11 @@
 //!   sibling; the current target is moved aside and published over only if the
 //!   moved bytes are exactly the bytes preflight observed. Otherwise the
 //!   owner's bytes are restored (or retained beside the target) and the output
-//!   is reported as a conflict. The moved-aside file is deleted only after it
-//!   is proven to hold the observed old projection; every error path restores
-//!   it or leaves it under its sibling name.
+//!   is reported as a conflict. The moved-aside original is never unlinked:
+//!   after publication it moves into the bounded `.bbox/local/render-backups`
+//!   directory (or stays beside the target), so a write through a descriptor
+//!   held open at any moment stays reachable; every error path restores it
+//!   or leaves it under its sibling name.
 //! - A failure after any output was published is reported in the receipt as
 //!   an incomplete render, never as a render that wrote nothing.
 
@@ -50,6 +52,9 @@ const FENCE_DIR: &str = ".bbox/local";
 const FENCE_FILE: &str = "render-fence.json";
 const FENCE_VERSION: u32 = 1;
 const MAX_FENCE_BYTES: u64 = 4096;
+const BACKUP_DIR: &str = "render-backups";
+/// Replaced originals kept per checkout; older ones are pruned.
+pub const MAX_RENDER_BACKUPS: usize = 32;
 
 /// Current Unix time in milliseconds. Daemons stamp plans with it; every
 /// fence comparison uses daemon-issued values only.
@@ -269,6 +274,84 @@ fn fence_directory(root: &Path, create: bool) -> Result<Option<PathBuf>> {
     Ok(Some(current))
 }
 
+/// The ignored local-state directory, created with its ignore file when
+/// missing.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
+)]
+fn local_state_directory(root: &Path) -> Result<PathBuf> {
+    let directory = fence_directory(root, true)?.expect("created local state directory");
+    let ignore = directory.join(".gitignore");
+    if fs::symlink_metadata(&ignore).is_err() {
+        fs::write(&ignore, "*\n!.gitignore\n").context("writing the local state ignore file")?;
+    }
+    Ok(directory)
+}
+
+/// Move a replaced original into the bounded backup directory. A rename
+/// keeps the same file, so anything a writer still holding it open writes
+/// later stays reachable there. Only the oldest backups beyond the bound are
+/// removed.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
+)]
+fn back_up_previous_output(root: &Path, file_name: &str, aside: &Path) -> Result<PathBuf> {
+    let directory = local_state_directory(root)?.join(BACKUP_DIR);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "error.render_target_unsafe: render backup directory is not a real directory: {}",
+            directory.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory)
+                .with_context(|| format!("creating {}", directory.display()))?;
+        }
+        Err(error) => return Err(error).context("inspecting the render backup directory"),
+    }
+    let backup = tempfile::Builder::new()
+        .prefix(&format!("{:020}.{file_name}.", now_unix_ms()))
+        .suffix(".prev")
+        .tempfile_in(&directory)
+        .context("reserving a render backup")?
+        .into_temp_path()
+        .keep()
+        .context("reserving a render backup")?;
+    if let Err(error) = fs::rename(aside, &backup) {
+        let _ = fs::remove_file(&backup);
+        return Err(error).context("moving the previous output into the render backups");
+    }
+    prune_backups(&directory);
+    Ok(backup)
+}
+
+/// Keep the newest [`MAX_RENDER_BACKUPS`] backups. Names start with a
+/// zero-padded millisecond stamp, so name order is age order.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
+)]
+fn prune_backups(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut names = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    if names.len() <= MAX_RENDER_BACKUPS {
+        return;
+    }
+    names.sort();
+    let excess = names.len() - MAX_RENDER_BACKUPS;
+    for name in names.into_iter().take(excess) {
+        let _ = fs::remove_file(directory.join(name));
+    }
+}
+
 /// The newest plan issuance already applied to this checkout.
 #[allow(
     clippy::disallowed_methods,
@@ -303,11 +386,7 @@ fn advance_fence(root: &Path, issued_at_ms: u64) -> Result<()> {
     if read_fence(root)? >= issued_at_ms {
         return Ok(());
     }
-    let directory = fence_directory(root, true)?.expect("created fence directory");
-    let ignore = directory.join(".gitignore");
-    if fs::symlink_metadata(&ignore).is_err() {
-        fs::write(&ignore, "*\n!.gitignore\n").context("writing the local state ignore file")?;
-    }
+    let directory = local_state_directory(root)?;
     #[cfg(test)]
     tests::interleave("advance_fence", root)?;
     let mut staged = tempfile::NamedTempFile::new_in(&directory)?;
@@ -450,7 +529,7 @@ pub fn apply_project_render(
                 published |= published_output.disposition == ProjectRenderDispositionV1::Written;
                 if let Some(retained) = published_output.retained {
                     outcome.errors.push(format!(
-                        "{file_name}: the owner's concurrent bytes were preserved at {}",
+                        "{file_name}: the previous bytes were preserved at {}",
                         retained.display()
                     ));
                 }
@@ -604,7 +683,13 @@ fn publish_entrypoint(
             // Something created the path after it was vacated or observed
             // absent. Keep it, and keep the moved bytes too unless they are
             // provably the old projection.
-            let retained = aside.and_then(|aside| dispose_or_retain(aside, observed));
+            let retained =
+                aside.and_then(
+                    |aside| match dispose_or_retain(root, file_name, aside, observed) {
+                        Disposal::BackedUp => None,
+                        Disposal::Kept(path) | Disposal::Retained(path) => Some(path),
+                    },
+                );
             return Ok(PublishedOutput {
                 disposition: ProjectRenderDispositionV1::Conflict,
                 retained,
@@ -622,32 +707,63 @@ fn publish_entrypoint(
     if let Some(aside) = aside {
         // A writer that still held the old file open may have changed it
         // after the check; never discard such bytes.
-        if let Some(retained) = dispose_or_retain(aside, observed) {
-            return Ok(PublishedOutput {
-                disposition: ProjectRenderDispositionV1::Conflict,
-                retained: Some(retained),
-            });
+        match dispose_or_retain(root, file_name, aside, observed) {
+            Disposal::BackedUp => {}
+            Disposal::Kept(path) => {
+                return Ok(PublishedOutput {
+                    disposition: ProjectRenderDispositionV1::Written,
+                    retained: Some(path),
+                });
+            }
+            Disposal::Retained(path) => {
+                return Ok(PublishedOutput {
+                    disposition: ProjectRenderDispositionV1::Conflict,
+                    retained: Some(path),
+                });
+            }
         }
     }
     Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Written))
 }
 
-/// Delete moved-aside bytes only when they are provably the observed old
-/// projection; otherwise keep them and return where they are.
+/// Settle the moved-aside original after publication. It is never unlinked:
+/// a writer may still hold it open and write after any read. When it holds
+/// a different state than preflight observed, it stays beside the target and
+/// the output is a conflict. Otherwise it moves into the bounded backup
+/// directory, so a later write through a held descriptor stays reachable; if
+/// that move fails it simply stays beside the target.
 #[allow(
     clippy::disallowed_methods,
     reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
 )]
-fn dispose_or_retain(aside: PathBuf, observed: &TargetState) -> Option<PathBuf> {
+fn dispose_or_retain(
+    root: &Path,
+    file_name: &str,
+    aside: PathBuf,
+    observed: &TargetState,
+) -> Disposal {
     match fs::read(&aside) {
         Ok(bytes) if classify(&bytes) == *observed => {
-            // Leftover bytes of a stale projection are harmless if this
-            // cleanup fails.
-            let _ = fs::remove_file(&aside);
-            None
+            #[cfg(test)]
+            if tests::interleave("before_backup", root).is_err() {
+                return Disposal::Kept(aside);
+            }
+            match back_up_previous_output(root, file_name, &aside) {
+                Ok(_) => Disposal::BackedUp,
+                Err(_) => Disposal::Kept(aside),
+            }
         }
-        _ => Some(aside),
+        _ => Disposal::Retained(aside),
     }
+}
+
+enum Disposal {
+    /// Moved into the render backups.
+    BackedUp,
+    /// Holds the old projection but could not be moved; left in place.
+    Kept(PathBuf),
+    /// Holds bytes other than the observed ones.
+    Retained(PathBuf),
 }
 
 /// Put the owner's moved-aside bytes back at `target`. If the path was

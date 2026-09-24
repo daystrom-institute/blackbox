@@ -377,6 +377,7 @@ pub(crate) async fn execute_render_operation(
             entry.plan_sha256 == operation.plan_sha256 && entry.stage == JournalStage::Applying
         })
         .and_then(|entry| entry.preflight.clone());
+    let interrupted_attempt = interrupted.is_some();
     let outcome = if interrupted.is_none()
         && journal.applied_sequence(&operation.scope) > operation.sequence
     {
@@ -486,6 +487,19 @@ pub(crate) async fn execute_render_operation(
             }
         }
     };
+    // An interrupted attempt may already have written outputs. Until it is
+    // reconciled into a receipt, every failure (checkout verification,
+    // plan validation, or reconciliation itself) keeps its preflight record
+    // and leaves the operation pending, never a result that claims nothing
+    // was written.
+    if interrupted_attempt && let Err(error) = &outcome {
+        bail!(
+            "the interrupted render {} cannot be reconciled yet ({}: {}); it stays pending",
+            operation.operation_id,
+            error.code,
+            error.message
+        );
+    }
     #[cfg(test)]
     if tests::crash_before_result(journal_path) {
         bail!("injected crash before the render result was journaled");
@@ -893,6 +907,70 @@ mod tests {
                 .stage,
             JournalStage::Applied
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_apply_stays_pending_while_its_checkout_cannot_be_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        operation(&daemon, &scope, 7, 60, "VERIFY_FAILURE_MARKER");
+        let mut lane = RenderLaneState::default();
+
+        *CRASH_BEFORE_RESULT.lock().unwrap() = Some(journal_path(&config));
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        *CRASH_BEFORE_RESULT.lock().unwrap() = None;
+        let written = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert!(written.contains("VERIFY_FAILURE_MARKER"));
+
+        // The checkout's Git directory is temporarily unavailable: the root
+        // is still configured, but main-worktree verification fails.
+        fs::rename(root.join(".git"), root.join(".git-unavailable")).unwrap();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            daemon.lock().unwrap().results.is_empty(),
+            "no result claims the interrupted attempt wrote nothing"
+        );
+        let entry = load_journal(&journal_path(&config))
+            .unwrap()
+            .entry(&format_render_operation_id(7))
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.stage, JournalStage::Applying);
+        assert!(
+            entry.preflight.is_some(),
+            "the interrupted evidence is kept"
+        );
+
+        // With access restored, redelivery reconciles the original attempt.
+        fs::rename(root.join(".git-unavailable"), root.join(".git")).unwrap();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            1
+        );
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, "applied");
+        assert_eq!(
+            results[0].receipt.as_ref().unwrap().projections[0].disposition,
+            bbox_project_render::transport::ProjectRenderDispositionV1::Written
+        );
+        assert_eq!(fs::read_to_string(root.join("CLAUDE.md")).unwrap(), written);
         server.abort();
     }
 

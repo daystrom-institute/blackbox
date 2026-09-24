@@ -33,6 +33,10 @@ pub struct RenderLocalityCompletionV1 {
     pub refused_count: u64,
     pub sequence: u64,
     pub observed_at_unix_secs: u64,
+    /// Daemon-clock issuance of the plan this completion applied. A row is
+    /// never replaced by a completion of an older plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,10 +93,16 @@ impl RenderLocalityObservationsV1 {
     /// whatever its dispositions say, so it is not recorded and returns
     /// `None`. Both the bound harness and the checkout-owner collector
     /// complete through this boundary.
+    ///
+    /// `issued_at_ms` is the daemon-clock issuance of the applied plan. A
+    /// completion of a plan issued before the one already recorded for the
+    /// same project and view is historical: it never replaces the newer
+    /// evidence and returns `None`.
     pub fn record_completed(
         &self,
         plan: &ProjectRenderPlanV1,
         receipt: &ProjectRenderReceiptV1,
+        issued_at_ms: u64,
     ) -> Result<Option<u64>> {
         plan.validate()?;
         receipt.validate_against(plan)?;
@@ -116,6 +126,17 @@ impl RenderLocalityObservationsV1 {
             })
             .count() as u64;
         self.mutate(|snapshot| {
+            let key = (plan.project_id.as_str(), plan.view);
+            let position = snapshot
+                .completions
+                .binary_search_by(|current| (current.project_id.as_str(), current.view).cmp(&key));
+            if let Ok(index) = position
+                && snapshot.completions[index]
+                    .issued_at_ms
+                    .is_some_and(|recorded| recorded > issued_at_ms)
+            {
+                return Ok(None);
+            }
             snapshot.sequence = snapshot
                 .sequence
                 .checked_add(1)
@@ -131,24 +152,20 @@ impl RenderLocalityObservationsV1 {
                 refused_count,
                 sequence: snapshot.sequence,
                 observed_at_unix_secs: now_unix_secs(),
+                issued_at_ms: Some(issued_at_ms),
             };
-            let key = (completion.project_id.as_str(), completion.view);
-            match snapshot
-                .completions
-                .binary_search_by(|current| (current.project_id.as_str(), current.view).cmp(&key))
-            {
+            match position {
                 Ok(index) => snapshot.completions[index] = completion,
                 Err(index) => snapshot.completions.insert(index, completion),
             }
-            Ok(snapshot.sequence)
+            Ok(Some(snapshot.sequence))
         })
-        .map(Some)
     }
 
-    fn mutate(
+    fn mutate<T>(
         &self,
-        mutation: impl FnOnce(&mut RenderLocalityObservationSnapshotV1) -> Result<u64>,
-    ) -> Result<u64> {
+        mutation: impl FnOnce(&mut RenderLocalityObservationSnapshotV1) -> Result<T>,
+    ) -> Result<T> {
         let mut state = self.state.lock();
         let (next, sequence) = if let Some(store_path) = &self.store_path {
             with_store_lock(store_path, || {
@@ -332,7 +349,7 @@ mod tests {
         ] {
             let plan = plan(view);
             observations
-                .record_completed(&plan, &receipt(&plan))
+                .record_completed(&plan, &receipt(&plan), 100)
                 .unwrap();
         }
 
@@ -342,7 +359,9 @@ mod tests {
         let mut incomplete = receipt(&plan);
         incomplete.incomplete = true;
         assert_eq!(
-            observations.record_completed(&plan, &incomplete).unwrap(),
+            observations
+                .record_completed(&plan, &incomplete, 300)
+                .unwrap(),
             None
         );
 
@@ -360,5 +379,28 @@ mod tests {
                 .sequence,
             4
         );
+    }
+
+    #[test]
+    fn a_completion_of_an_older_plan_never_replaces_newer_evidence() {
+        let observations = RenderLocalityObservationsV1::in_memory();
+        let plan = plan(ProjectRenderViewV1::Published);
+        let newer = receipt(&plan);
+        observations
+            .record_completed(&plan, &newer, 200)
+            .unwrap()
+            .expect("the newer completion is recorded");
+        let recorded = observations.snapshot();
+        assert_eq!(
+            observations
+                .record_completed(&plan, &receipt(&plan), 150)
+                .unwrap(),
+            None
+        );
+        assert_eq!(observations.snapshot(), recorded);
+        observations
+            .record_completed(&plan, &receipt(&plan), 250)
+            .unwrap()
+            .expect("a later completion replaces the row");
     }
 }

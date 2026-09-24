@@ -486,11 +486,25 @@ impl BlackboxServer {
                                 if *validation == RenderCompletionValidation::Unverified {
                                     // The current plan is byte-identical to
                                     // the one the owner applied, so it
-                                    // proves the receipt.
-                                    if let Some(plan) = current_plan {
-                                        self.state
-                                            .render_locality_observations
-                                            .record_completed(&plan, receipt)?;
+                                    // proves the receipt. Only the project's
+                                    // newest operation is evidence, checked
+                                    // while no new operation can be issued.
+                                    if let Some(plan) = current_plan
+                                        && !*late
+                                    {
+                                        runtime.while_latest(
+                                            &record.project_id,
+                                            record.sequence,
+                                            || {
+                                                self.state
+                                                    .render_locality_observations
+                                                    .record_completed(
+                                                        &plan,
+                                                        receipt,
+                                                        record.issued_at_ms,
+                                                    )
+                                            },
+                                        )?;
                                     }
                                     runtime
                                         .set_validation(&record.operation_id, checked.clone())?;

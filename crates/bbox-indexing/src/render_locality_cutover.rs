@@ -152,6 +152,7 @@ impl RenderLocalityCutoverRuntimeV1 {
             refused_count: 0,
             sequence: index as u64 + 1,
             observed_at_unix_secs: 1,
+            issued_at_ms: None,
         })
         .collect();
         let row = RenderLocalityCutoverRowV1 {
@@ -701,7 +702,13 @@ mod tests {
                 .unwrap()
                 .receipt;
             receipt.incomplete = incomplete;
-            observations.record_completed(&plan, &receipt).unwrap();
+            let issued_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            observations
+                .record_completed(&plan, &receipt, issued_at_ms)
+                .unwrap();
         }
     }
 

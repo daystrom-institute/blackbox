@@ -461,6 +461,24 @@ impl RenderOperationRuntime {
             .cloned()
     }
 
+    /// Run `record` only if `sequence` is still the newest operation issued
+    /// for the project. Operation creation waits while it runs, so a newer
+    /// operation cannot be issued between the check and the effect.
+    pub(crate) fn while_latest<T>(
+        &self,
+        project_id: &str,
+        sequence: u64,
+        record: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let state = self.state.lock();
+        if state.index.sequences.get(project_id) != Some(&sequence) {
+            return Ok(None);
+        }
+        let result = record().map(Some);
+        drop(state);
+        result
+    }
+
     /// The newest issued sequence for a project.
     pub(crate) fn latest_sequence(&self, project_id: &str) -> Option<u64> {
         self.state.lock().index.sequences.get(project_id).copied()

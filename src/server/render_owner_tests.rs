@@ -855,3 +855,63 @@ async fn recovery_rechecks_present_validity_of_a_validated_receipt() {
     assert_eq!(revoked["current"], false, "{revoked}");
     assert_eq!(revoked["present_validation"]["status"], "stale");
 }
+
+/// Operation A completes but is not validated until after a newer operation
+/// B records its evidence. Validating A later must not replace B's evidence
+/// with A's historical counters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidence() {
+    let owner = OwnerFixture::new();
+    let (scope, _) = scopes();
+    let server = owner.server();
+    server
+        .state
+        .render_operations
+        .set_wait_timeout_for_test(Duration::from_millis(20));
+    announce(&server, owner.roots.keys().cloned().collect());
+    let pending = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    let first = pending["operation_id"].as_str().unwrap().to_string();
+    apply_one(&server, &owner.roots, |_| {}).unwrap();
+    assert!(
+        server
+            .state
+            .render_locality_observations
+            .snapshot()
+            .completions
+            .is_empty(),
+        "A has completed but has not been validated yet"
+    );
+
+    // The owner makes one provider file handwritten; B renders the same
+    // knowledge and records that refusal.
+    std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
+    server
+        .state
+        .render_operations
+        .set_wait_timeout_for_test(Duration::from_secs(10));
+    let newer = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
+    assert_eq!(newer["current"], true);
+    let evidence = server.state.render_locality_observations.snapshot();
+    assert_eq!(evidence.completions.len(), 1);
+    assert_eq!(evidence.completions[0].refused_count, 1);
+
+    let recovered = parse(
+        &server
+            .bbox_render(Parameters(RenderParams {
+                operation: Some(first),
+                project: Some(UNCOVERED.into()),
+                ..Default::default()
+            }))
+            .await,
+    );
+    assert_eq!(recovered["current"], false);
+    assert_eq!(
+        server.state.render_locality_observations.snapshot(),
+        evidence,
+        "historical completion never replaces newer evidence"
+    );
+}
