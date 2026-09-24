@@ -1243,6 +1243,9 @@ fn lane_name(lane: SourceLaneV1) -> &'static str {
         SourceLaneV1::Gaps => "gaps",
         SourceLaneV1::Graphs => "graphs",
         SourceLaneV1::Evidence => "evidence",
+        // Publication-only; provisional capture never walks it. Named for
+        // exhaustiveness, not because a workspace snapshot can carry it.
+        SourceLaneV1::Config => "config",
     }
 }
 

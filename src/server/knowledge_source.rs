@@ -1378,7 +1378,10 @@ async fn probe_publication(
         )
     })
     .await?;
-    Ok(Json(PublicationProbeResponseV1 { current }))
+    Ok(Json(PublicationProbeResponseV1 {
+        current,
+        config_lane_supported: true,
+    }))
 }
 
 async fn begin_publication_upload(
@@ -1399,7 +1402,7 @@ async fn put_publication_manifest_page(
     Path((upload_id, lane, page)): Path<(String, String, u64)>,
     Json(page_body): Json<SourceManifestPageV1>,
 ) -> Result<StatusCode, HttpError> {
-    let lane = parse_lane(&lane)?;
+    let lane = parse_publication_lane(&lane)?;
     let store = state.knowledge_sources.store();
     let authority = require_publication_upload_grant(&state, &store, &grant, &upload_id).await?;
     blocking(move || {
@@ -1865,6 +1868,17 @@ fn provisional_authority(grant: &WorkspaceBindingGrant) -> ProvisionalAuthorityV
     }
 }
 
+/// Publication manifests admit every provisional lane plus the
+/// publication-only configuration lane.
+fn parse_publication_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
+    match value {
+        "config" => Ok(SourceLaneV1::Config),
+        other => parse_lane(other),
+    }
+}
+
+/// Provisional workspace lanes. The configuration lane is commit-gated
+/// publication state and never travels in a workspace snapshot.
 fn parse_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
     match value {
         "knowledge" => Ok(SourceLaneV1::Knowledge),
@@ -2206,6 +2220,25 @@ mod tests {
     use crate::server::state::catalog_fixture::{
         COMMIT_ONE, COMMIT_TWO, CatalogFixture, gap_note, knowledge_entry,
     };
+
+    /// The configuration lane is publication-only: the publication manifest
+    /// route admits it, the provisional route refuses it with the same typed
+    /// invalid-lane error an unknown segment gets.
+    #[test]
+    fn config_lane_segment_is_publication_only() {
+        assert_eq!(
+            parse_publication_lane("config").unwrap(),
+            SourceLaneV1::Config
+        );
+        for lane in ["knowledge", "gaps", "graphs", "evidence"] {
+            assert_eq!(
+                parse_publication_lane(lane).unwrap(),
+                parse_lane(lane).unwrap()
+            );
+        }
+        assert!(parse_lane("config").is_err());
+        assert!(parse_publication_lane("configuration").is_err());
+    }
 
     const KNOWLEDGE_BYTES: &[u8] = br#"{"id":"knowledge-1"}"#;
 
@@ -2765,6 +2798,7 @@ mod tests {
             gaps: manifest(SourceLaneV1::Gaps, &[]),
             graphs: SourceManifestDescriptorV1::default(),
             evidence: SourceManifestDescriptorV1::default(),
+            config: None,
         }
     }
 
