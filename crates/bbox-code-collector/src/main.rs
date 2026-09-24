@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -259,6 +259,9 @@ struct CapturedPublicationCandidate {
     gap_entries: Vec<SourceFileManifestEntryV1>,
     graph_entries: Vec<SourceFileManifestEntryV1>,
     evidence_entries: Vec<SourceFileManifestEntryV1>,
+    /// `None` only after the configuration lane was stripped for a daemon
+    /// that does not accept it; capture always produces the lane.
+    config_entries: Option<Vec<SourceFileManifestEntryV1>>,
     blobs: tempfile::TempDir,
 }
 
@@ -622,6 +625,10 @@ async fn apply_checkout_mutations(runtime: &Runtime, config: &CollectorConfig) -
     let url = runtime.endpoint("internal/code-source/v1/checkout-mutations/poll")?;
     let response = runtime
         .request(reqwest::Method::POST, url)
+        .header(
+            bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER,
+            bbox_code_source::CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1,
+        )
         .json(&bbox_code_source::CheckoutMutationPollRequestV1 {
             schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
         })
@@ -634,53 +641,169 @@ async fn apply_checkout_mutations(runtime: &Runtime, config: &CollectorConfig) -
     if page.deferred > 0 {
         tracing::warn!(
             deferred = page.deferred,
-            "checkout mutations deferred (grant scope or poll cap); they redeliver on a later cycle"
+            "checkout mutations deferred (grant scope, poll cap, or pending predecessor); they redeliver on a later cycle"
         );
     }
     let mut applied = 0usize;
+    let mut state = MutationPageState::default();
     for mutation in &page.mutations {
-        let outcome = apply_checkout_mutation(config, mutation);
-        let (outcome_name, error, content_sha256) = match outcome {
-            Ok(digest) => {
-                applied += 1;
-                ("applied", None, digest)
-            }
-            Err(error) => ("failed", Some(format!("{error:#}")), None),
+        // Apply and ack one mutation at a time: a failed ack returns early,
+        // and everything after it redelivers next cycle in order.
+        let Some(ack) = state.process(config, mutation) else {
+            tracing::warn!(
+                mutation_id = %mutation.mutation_id,
+                path = %mutation.relative_path,
+                "checkout mutation held behind an unapplied predecessor on the same path"
+            );
+            continue;
         };
+        if ack.outcome == bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED {
+            applied += 1;
+        }
         let url = runtime.endpoint("internal/code-source/v1/checkout-mutations/ack")?;
         let response = runtime
             .request(reqwest::Method::POST, url)
-            .json(&bbox_code_source::CheckoutMutationAckRequestV1 {
-                schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
-                mutation_id: mutation.mutation_id.clone(),
-                outcome: outcome_name.to_string(),
-                error: error.clone(),
-                content_sha256,
-            })
+            .json(&ack)
             .send()
             .await?;
         if !response.status().is_success() {
-            // Un-acked mutations stay pending and redeliver next cycle; the
-            // apply is idempotent so a redelivery is harmless.
+            // Un-acked mutations stay pending and redeliver next cycle: a
+            // legacy rewrite of identical bytes is idempotent, and a guarded
+            // owner recognizes its own already-applied state.
             return Err(response_error_value(response).await);
         }
-        if let Some(error) = error {
+        if let Some(error) = &ack.error {
             tracing::error!(
                 mutation_id = %mutation.mutation_id,
+                outcome = %ack.outcome,
                 error = %error,
-                "checkout mutation failed; acked failed"
+                "checkout mutation not applied; acked"
             );
         }
     }
     Ok(applied)
 }
 
+/// Per-poll-page ordering state. Once a mutation on a path is not applied,
+/// every later mutation for the same scope and path in the page is held
+/// (neither applied nor acked), so no successor bypasses a failed or
+/// conflicted predecessor. The daemon settles the chain before redelivery.
+#[derive(Default)]
+struct MutationPageState {
+    blocked: BTreeSet<(PublishedScope, String)>,
+}
+
+impl MutationPageState {
+    /// The ack to send for this mutation, or `None` when it is held behind
+    /// an unapplied predecessor.
+    fn process(
+        &mut self,
+        config: &CollectorConfig,
+        mutation: &bbox_code_source::CheckoutMutationV1,
+    ) -> Option<bbox_code_source::CheckoutMutationAckRequestV1> {
+        let key = (mutation.scope.clone(), mutation.relative_path.clone());
+        if self.blocked.contains(&key) {
+            return None;
+        }
+        let ack = |outcome: &str,
+                   error: Option<String>,
+                   content_sha256: Option<String>,
+                   observed_sha256: Option<String>| {
+            bbox_code_source::CheckoutMutationAckRequestV1 {
+                schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                mutation_id: mutation.mutation_id.clone(),
+                outcome: outcome.to_string(),
+                error,
+                content_sha256,
+                observed_sha256,
+            }
+        };
+        match apply_checkout_mutation(config, mutation) {
+            Ok(MutationApplyOutcome::Applied { content_sha256 }) => Some(ack(
+                bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED,
+                None,
+                content_sha256,
+                None,
+            )),
+            Ok(MutationApplyOutcome::Conflicted {
+                observed_sha256,
+                message,
+            }) => {
+                self.blocked.insert(key);
+                Some(ack(
+                    bbox_code_source::CHECKOUT_MUTATION_OUTCOME_CONFLICTED,
+                    Some(message),
+                    None,
+                    observed_sha256,
+                ))
+            }
+            Err(error) => {
+                if mutation.guard.is_some() {
+                    self.blocked.insert(key);
+                }
+                Some(ack(
+                    bbox_code_source::CHECKOUT_MUTATION_OUTCOME_FAILED,
+                    Some(bounded_mutation_text(format!("{error:#}"))),
+                    None,
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MutationApplyOutcome {
+    /// The path holds the mutation's result, either written now or found
+    /// already in place (duplicate or lost-ack redelivery).
+    Applied { content_sha256: Option<String> },
+    /// A guarded precondition did not match; the owner's bytes are untouched.
+    Conflicted {
+        observed_sha256: Option<String>,
+        message: String,
+    },
+}
+
+fn bounded_mutation_text(mut message: String) -> String {
+    let limit = bbox_code_source::MAX_CHECKOUT_MUTATION_REASON_BYTES;
+    if message.len() <= limit {
+        return message;
+    }
+    let mut end = limit;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message
+}
+
+/// SHA-256 of the regular file `name` in `directory`, read without following
+/// a link at the final component, or `None` when absent. Streams, so a large
+/// local file hashes instead of failing as oversize. Symlinks, FIFOs,
+/// directories and other special files fail closed.
+fn current_file_sha256(
+    directory: &bbox_corpus_core::json_store::NofollowDirectory,
+    name: &str,
+) -> Result<Option<String>> {
+    let Some(mut file) = directory.open_regular(name, "checkout mutation target")? else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).context("reading checkout mutation target")?;
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
 /// Apply one mutation byte-for-byte under the configured checkout root for
-/// its scope. Idempotent: rewriting identical bytes is a success.
+/// its scope. Every path component is opened without following links and the
+/// target's parent directory is locked across check and replacement, so a
+/// symlinked component or target, a special file, or a concurrent owner can
+/// never redirect or interleave the write. Writes are durable atomic
+/// replacements. Legacy mutations stay idempotent; guarded mutations apply
+/// only over their exact expected predecessor bytes (or absence).
 fn apply_checkout_mutation(
     config: &CollectorConfig,
     mutation: &bbox_code_source::CheckoutMutationV1,
-) -> Result<Option<String>> {
+) -> Result<MutationApplyOutcome> {
     mutation
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid checkout mutation: {error}"))?;
@@ -698,45 +821,102 @@ fn apply_checkout_mutation(
         .root
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", project.root.display()))?;
-    let target = root.join(&mutation.relative_path);
-    if !target.starts_with(&root) {
+    let (parent_relative, name) = match mutation.relative_path.rsplit_once('/') {
+        Some((parent, name)) => (Some(parent), name),
+        None => (None, mutation.relative_path.as_str()),
+    };
+    let parent_path = match parent_relative {
+        Some(parent) => root.join(parent),
+        None => root.clone(),
+    };
+    if !parent_path.starts_with(&root) {
         bail!("mutation path escapes the checkout root");
     }
-    match mutation.mode.as_str() {
-        "write" => {
-            let content = mutation.content_json.as_deref().expect("validated write");
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if target.is_file() && fs::read_to_string(&target).ok().as_deref() == Some(content) {
-                // Idempotent redelivery: already applied.
-            } else {
-                fs::write(&target, content)
-                    .with_context(|| format!("writing {}", target.display()))?;
-            }
-            let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
-            tracing::info!(
-                mutation_id = %mutation.mutation_id,
-                path = %mutation.relative_path,
-                "checkout mutation applied"
-            );
-            Ok(Some(digest))
-        }
-        "delete" => {
-            match fs::remove_file(&target) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context(format!("deleting {}", target.display())),
-            }
-            tracing::info!(
-                mutation_id = %mutation.mutation_id,
-                path = %mutation.relative_path,
-                "checkout mutation delete applied"
-            );
-            Ok(None)
-        }
+    let is_write = match mutation.mode.as_str() {
+        "write" => true,
+        "delete" => false,
         other => bail!("unvalidated mutation mode {other}"),
+    };
+    let parent = if is_write {
+        Some(bbox_corpus_core::json_store::NofollowDirectory::open_or_create(&parent_path)?)
+    } else {
+        bbox_corpus_core::json_store::NofollowDirectory::open_existing(&parent_path)?
+    };
+    let target_sha256 = mutation.target_sha256();
+    let Some(parent) = parent else {
+        // Delete under a missing parent: the target is absent, which is the
+        // delete's own result (a guarded delete always expected presence, so
+        // this is a recognized redelivery, never a precondition match).
+        return Ok(MutationApplyOutcome::Applied {
+            content_sha256: None,
+        });
+    };
+    parent.lock_exclusive()?;
+    let current = current_file_sha256(&parent, name)?;
+    if let Some(guard) = &mutation.guard {
+        if current == target_sha256 {
+            tracing::info!(
+                mutation_id = %mutation.mutation_id,
+                path = %mutation.relative_path,
+                "guarded checkout mutation already applied"
+            );
+            return Ok(MutationApplyOutcome::Applied {
+                content_sha256: target_sha256,
+            });
+        }
+        if current != guard.expected_sha256 {
+            return Ok(MutationApplyOutcome::Conflicted {
+                message: conflict_message(mutation, current.as_deref()),
+                observed_sha256: current,
+            });
+        }
     }
+    if is_write {
+        let content = mutation.content_json.as_deref().expect("validated write");
+        if current != target_sha256 {
+            parent
+                .atomic_replace(name, content.as_bytes())
+                .with_context(|| format!("replacing {}", mutation.relative_path))?;
+        }
+        tracing::info!(
+            mutation_id = %mutation.mutation_id,
+            path = %mutation.relative_path,
+            "checkout mutation applied"
+        );
+        Ok(MutationApplyOutcome::Applied {
+            content_sha256: target_sha256,
+        })
+    } else {
+        parent
+            .remove_regular(name, "checkout mutation target")
+            .with_context(|| format!("deleting {}", mutation.relative_path))?;
+        tracing::info!(
+            mutation_id = %mutation.mutation_id,
+            path = %mutation.relative_path,
+            "checkout mutation delete applied"
+        );
+        Ok(MutationApplyOutcome::Applied {
+            content_sha256: None,
+        })
+    }
+}
+
+fn conflict_message(
+    mutation: &bbox_code_source::CheckoutMutationV1,
+    observed: Option<&str>,
+) -> String {
+    let expected = mutation
+        .guard
+        .as_ref()
+        .and_then(|guard| guard.expected_sha256.as_deref())
+        .unwrap_or("absent");
+    bounded_mutation_text(format!(
+        "error.checkout_mutation_conflict: {} at {} expected {expected} but the checkout holds {}; \
+         local bytes preserved; reconcile (commit and publish or revert the local edit) and retry",
+        mutation.mutation_id,
+        mutation.relative_path,
+        observed.unwrap_or("absent"),
+    ))
 }
 
 /// Catalog onboarding lane (design/daemon-runtime/remote-project-onboarding.md):
@@ -1485,6 +1665,8 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         &blobs,
         limits,
     )?;
+    let config_entries =
+        capture_config_lane(&commit, &actual_scope, &blobs, ConfigLaneLimits::default())?;
     let knowledge_pages = pack_source_manifest_pages(
         &knowledge_entries,
         limits.max_manifest_page_entries as usize,
@@ -1502,6 +1684,11 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
     )?;
     let evidence_pages = pack_source_manifest_pages(
         &evidence_entries,
+        limits.max_manifest_page_entries as usize,
+        limits.max_manifest_page_bytes as usize,
+    )?;
+    let config_pages = pack_source_manifest_pages(
+        &config_entries,
         limits.max_manifest_page_entries as usize,
         limits.max_manifest_page_bytes as usize,
     )?;
@@ -1527,6 +1714,11 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
             &evidence_entries,
             evidence_pages.len(),
         )?,
+        config: Some(source_manifest_descriptor(
+            SourceLaneV1::Config,
+            &config_entries,
+            config_pages.len(),
+        )?),
     };
     bbox_knowledge_source::validate_publication_candidate(
         &descriptor,
@@ -1534,6 +1726,7 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         &gap_entries,
         &graph_entries,
         &evidence_entries,
+        Some(&config_entries),
         limits,
     )?;
     let stable_commit = repository
@@ -1548,6 +1741,7 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         gap_entries,
         graph_entries,
         evidence_entries,
+        config_entries: Some(config_entries),
         blobs,
     })
 }
@@ -1564,6 +1758,7 @@ fn capture_publication_lane(
         SourceLaneV1::Gaps => "gaps",
         SourceLaneV1::Graphs => "graphs",
         SourceLaneV1::Evidence => "evidence",
+        SourceLaneV1::Config => bail!("the configuration lane is captured by capture_config_lane"),
     };
     let directory = if scope.bbox_root_relpath() == "." {
         format!(".bbox/{lane_name}")
@@ -1599,6 +1794,154 @@ fn capture_publication_lane(
         });
     }
     Ok(entries)
+}
+
+/// Tree-metadata budget for listing one configuration directory. Separate
+/// from the lane's content byte limit, which is enforced on file bytes.
+const CONFIG_LISTING_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounds for one configuration-lane capture. Production uses the contract
+/// ceilings; tests pass smaller ones.
+#[derive(Debug, Clone, Copy)]
+struct ConfigLaneLimits {
+    max_files: u64,
+    max_file_bytes: u64,
+    max_lane_bytes: u64,
+}
+
+impl Default for ConfigLaneLimits {
+    fn default() -> Self {
+        Self {
+            max_files: bbox_knowledge_source::MAX_CONFIG_SOURCE_FILES,
+            max_file_bytes: bbox_knowledge_source::MAX_CONFIG_SOURCE_FILE_BYTES,
+            max_lane_bytes: bbox_knowledge_source::MAX_CONFIG_SOURCE_LANE_BYTES,
+        }
+    }
+}
+
+/// Capture the project configuration inputs from the verified commit, never
+/// the working tree: the committed `.bbox/config.toml` and `.bbox/mcp.json`
+/// when present, and the direct `<name>.json` children of `.bro/brofiles`
+/// and `.bro/teamplates`. Siblings that are not configuration inputs
+/// (other extensions, nested directories, hidden names) are not
+/// configuration and are skipped; committed links fail the listing closed.
+/// An empty result is a present, empty lane.
+fn capture_config_lane(
+    commit: &bbox_corpus_core::git::VerifiedCommit,
+    scope: &PublishedScope,
+    blobs: &tempfile::TempDir,
+    limits: ConfigLaneLimits,
+) -> Result<Vec<SourceFileManifestEntryV1>> {
+    let repository_path = |relative: &str| {
+        bbox_knowledge_source::config_source_repository_relative_filename(scope, relative)
+    };
+    let max_file_bytes = usize::try_from(limits.max_file_bytes).unwrap_or(usize::MAX);
+    let mut files = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    let mut read = |path: String, bytes: Vec<u8>| -> Result<()> {
+        if bytes.is_empty() {
+            bail!("configuration source {path} is empty");
+        }
+        if files.len() as u64 >= limits.max_files {
+            bail!(
+                "configuration lane exceeds its {}-file limit at {path}",
+                limits.max_files
+            );
+        }
+        files.insert(path, bytes);
+        Ok(())
+    };
+    for relative in [
+        bbox_code_source::PROJECT_CONFIG_TOML_PATH,
+        bbox_code_source::PROJECT_MCP_STORE_PATH,
+    ] {
+        let path = repository_path(relative);
+        let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_optional_bounded(
+            commit,
+            &path,
+            max_file_bytes,
+        )
+        .with_context(|| {
+            format!(
+                "reading configuration source {path} (per-file limit {} bytes)",
+                limits.max_file_bytes
+            )
+        })?;
+        if let Some(bytes) = bytes {
+            read(path, bytes)?;
+        }
+    }
+    for directory in [".bro/brofiles", ".bro/teamplates"] {
+        let directory = repository_path(directory);
+        let listed = bbox_corpus_core::git::list_verified_committed_dir_bounded(
+            commit,
+            &directory,
+            usize::try_from(limits.max_files.saturating_mul(4)).unwrap_or(usize::MAX),
+            CONFIG_LISTING_MAX_BYTES,
+        )
+        .with_context(|| format!("listing configuration directory {directory}"))?;
+        for path in listed {
+            if bbox_knowledge_source::config_source_scope_relative_path(scope, &path).is_none() {
+                continue;
+            }
+            let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+                commit,
+                &path,
+                max_file_bytes,
+            )
+            .with_context(|| {
+                format!(
+                    "reading configuration source {path} (per-file limit {} bytes)",
+                    limits.max_file_bytes
+                )
+            })?;
+            read(path, bytes)?;
+        }
+    }
+    let mut entries = Vec::with_capacity(files.len());
+    let mut lane_bytes = 0_u64;
+    for (path, bytes) in files {
+        if bytes.len() as u64 > limits.max_file_bytes {
+            bail!(
+                "configuration source {path} exceeds the {}-byte per-file limit",
+                limits.max_file_bytes
+            );
+        }
+        lane_bytes = lane_bytes
+            .checked_add(bytes.len() as u64)
+            .context("configuration lane byte count overflow")?;
+        if lane_bytes > limits.max_lane_bytes {
+            bail!(
+                "configuration lane exceeds its {}-byte limit at {path}",
+                limits.max_lane_bytes
+            );
+        }
+        let hash = source_file_blob_sha256(&bytes);
+        install_captured_source_blob(blobs.path(), &hash, &bytes)?;
+        entries.push(SourceFileManifestEntryV1 {
+            repository_relative_filename: path,
+            encoded_bytes: bytes.len() as u64,
+            content_sha256: hash,
+        });
+    }
+    Ok(entries)
+}
+
+/// Decide whether a probed candidate needs uploading, and shape it for the
+/// daemon. A daemon that does not accept the configuration lane never sees
+/// it. An already-current candidate is re-uploaded only to add the lane to a
+/// same-commit generation minted before the lane existed.
+fn plan_publication_upload(
+    probe: &PublicationProbeResponseV1,
+    captured: &mut CapturedPublicationCandidate,
+) -> bool {
+    if !probe.config_lane_supported {
+        captured.descriptor.config = None;
+        captured.config_entries = None;
+    }
+    match &probe.current {
+        None => true,
+        Some(current) => captured.config_entries.is_some() && current.config_files.is_none(),
+    }
 }
 
 fn install_captured_source_blob(root: &Path, hash: &str, bytes: &[u8]) -> Result<()> {
@@ -1685,7 +2028,7 @@ fn pack_source_manifest_pages(
 
 async fn publish_publication_candidate(
     runtime: &Runtime,
-    captured: CapturedPublicationCandidate,
+    mut captured: CapturedPublicationCandidate,
     status_timeout: Duration,
 ) -> Result<()> {
     let probe: PublicationProbeResponseV1 = send_json(
@@ -1702,13 +2045,16 @@ async fn publish_publication_candidate(
             }),
     )
     .await?;
-    if let Some(current) = probe.current {
-        tracing::info!(
-            source_generation = %current.source_generation_id,
-            knowledge_files = current.knowledge_files,
-            gap_files = current.gap_files,
-            "published knowledge candidate is already current"
-        );
+    if !plan_publication_upload(&probe, &mut captured) {
+        if let Some(current) = &probe.current {
+            tracing::info!(
+                source_generation = %current.source_generation_id,
+                knowledge_files = current.knowledge_files,
+                gap_files = current.gap_files,
+                config_files = ?current.config_files,
+                "published knowledge candidate is already current"
+            );
+        }
         return Ok(());
     }
 
@@ -1744,6 +2090,15 @@ async fn publish_publication_candidate(
             captured.evidence_entries.as_slice(),
             captured.descriptor.evidence.page_count,
         ),
+        (
+            SourceLaneV1::Config,
+            captured.config_entries.as_deref().unwrap_or_default(),
+            captured
+                .descriptor
+                .config
+                .as_ref()
+                .map_or(0, |config| config.page_count),
+        ),
     ] {
         let pages = pack_source_manifest_pages(
             entries,
@@ -1758,6 +2113,7 @@ async fn publish_publication_candidate(
             SourceLaneV1::Gaps => "gaps",
             SourceLaneV1::Graphs => "graphs",
             SourceLaneV1::Evidence => "evidence",
+            SourceLaneV1::Config => "config",
         };
         for page in pages {
             let url = runtime.endpoint(&format!(
@@ -1781,6 +2137,7 @@ async fn publish_publication_candidate(
         .chain(&captured.gap_entries)
         .chain(&captured.graph_entries)
         .chain(&captured.evidence_entries)
+        .chain(captured.config_entries.iter().flatten())
         .map(|entry| (entry.content_sha256.as_str(), entry))
         .collect::<HashMap<_, _>>();
     loop {
@@ -3824,7 +4181,735 @@ mod tests {
             content_json: Some(content.into()),
             reason: "collector test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
+            guard: None,
         }
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn guarded(
+        scope: &PublishedScope,
+        id: &str,
+        path: &str,
+        content: Option<&str>,
+        expected: Option<&[u8]>,
+    ) -> bbox_code_source::CheckoutMutationV1 {
+        bbox_code_source::CheckoutMutationV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: id.into(),
+            scope: scope.clone(),
+            relative_path: path.into(),
+            mode: if content.is_some() { "write" } else { "delete" }.into(),
+            content_json: content.map(str::to_owned),
+            reason: "collector guarded test".into(),
+            enqueued_at: "2026-08-12T00:00:00Z".into(),
+            guard: Some(bbox_code_source::CheckoutMutationGuardV1 {
+                expected_sha256: expected.map(sha),
+                predecessor: None,
+            }),
+        }
+    }
+
+    fn applied(content: Option<&str>) -> MutationApplyOutcome {
+        MutationApplyOutcome::Applied {
+            content_sha256: content.map(|content| sha(content.as_bytes())),
+        }
+    }
+
+    fn guarded_fixture() -> (tempfile::TempDir, PathBuf, PublishedScope, CollectorConfig) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let scope = PublishedScope::try_new("repo-guarded", ".").unwrap();
+        let config = mutation_config(&root, scope.clone());
+        (directory, root, scope, config)
+    }
+
+    const BROFILE: &str = ".bro/brofiles/reviewer.json";
+    const V1: &str = "{\"name\":\"reviewer\",\"v\":1}";
+    const V2: &str = "{\"name\":\"reviewer\",\"v\":2}";
+
+    #[test]
+    fn guarded_mutations_apply_over_exact_bytes_or_absence() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let create = guarded(&scope, "cm-00000000000000b1", BROFILE, Some(V1), None);
+        assert_eq!(
+            apply_checkout_mutation(&config, &create).unwrap(),
+            applied(Some(V1))
+        );
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V1);
+        let replace = guarded(
+            &scope,
+            "cm-00000000000000b2",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &replace).unwrap(),
+            applied(Some(V2))
+        );
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
+        let delete = guarded(
+            &scope,
+            "cm-00000000000000b3",
+            BROFILE,
+            None,
+            Some(V2.as_bytes()),
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            applied(None)
+        );
+        assert!(!root.join(BROFILE).exists());
+        let recreate = guarded(&scope, "cm-00000000000000b4", BROFILE, Some(V1), None);
+        assert_eq!(
+            apply_checkout_mutation(&config, &recreate).unwrap(),
+            applied(Some(V1))
+        );
+        let mcp = guarded(
+            &scope,
+            "cm-00000000000000b5",
+            ".bbox/mcp.json",
+            Some("{\"servers\":{}}"),
+            None,
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &mcp).unwrap(),
+            applied(Some("{\"servers\":{}}"))
+        );
+    }
+
+    #[test]
+    fn guarded_conflicts_preserve_local_bytes() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        let local = "{\"name\":\"reviewer\",\"local\":true}";
+        fs::write(root.join(BROFILE), local).unwrap();
+        for mutation in [
+            guarded(
+                &scope,
+                "cm-00000000000000c1",
+                BROFILE,
+                Some(V2),
+                Some(V1.as_bytes()),
+            ),
+            guarded(&scope, "cm-00000000000000c2", BROFILE, Some(V2), None),
+            guarded(
+                &scope,
+                "cm-00000000000000c3",
+                BROFILE,
+                None,
+                Some(V1.as_bytes()),
+            ),
+        ] {
+            match apply_checkout_mutation(&config, &mutation).unwrap() {
+                MutationApplyOutcome::Conflicted {
+                    observed_sha256,
+                    message,
+                } => {
+                    assert_eq!(observed_sha256, Some(sha(local.as_bytes())));
+                    assert!(message.contains(&mutation.mutation_id));
+                    assert!(message.contains(BROFILE));
+                    assert!(message.contains("local bytes preserved"));
+                    assert!(message.len() <= bbox_code_source::MAX_CHECKOUT_MUTATION_REASON_BYTES);
+                }
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+            assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), local);
+        }
+        fs::remove_file(root.join(BROFILE)).unwrap();
+        let expects_present = guarded(
+            &scope,
+            "cm-00000000000000c4",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        match apply_checkout_mutation(&config, &expects_present).unwrap() {
+            MutationApplyOutcome::Conflicted {
+                observed_sha256, ..
+            } => assert_eq!(observed_sha256, None),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(!root.join(BROFILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_redelivery_is_recognized_without_rewriting() {
+        use std::os::unix::fs::MetadataExt;
+        let (_directory, root, scope, config) = guarded_fixture();
+        let create = guarded(&scope, "cm-00000000000000d1", BROFILE, Some(V1), None);
+        apply_checkout_mutation(&config, &create).unwrap();
+        let inode = fs::metadata(root.join(BROFILE)).unwrap().ino();
+        // Duplicate delivery and apply-before-lost-ack redelivery both find
+        // the mutation's own result in place.
+        for _ in 0..2 {
+            assert_eq!(
+                apply_checkout_mutation(&config, &create).unwrap(),
+                applied(Some(V1))
+            );
+            assert_eq!(fs::metadata(root.join(BROFILE)).unwrap().ino(), inode);
+        }
+        let delete = guarded(
+            &scope,
+            "cm-00000000000000d2",
+            BROFILE,
+            None,
+            Some(V1.as_bytes()),
+        );
+        apply_checkout_mutation(&config, &delete).unwrap();
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            applied(None)
+        );
+        // A redelivered delete whose parent is gone is also already applied.
+        fs::remove_dir_all(root.join(".bro")).unwrap();
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            applied(None)
+        );
+        assert!(!root.join(".bro").exists());
+    }
+
+    #[test]
+    fn replaying_an_older_mutation_never_restores_older_bytes() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let first = guarded(&scope, "cm-00000000000000e1", BROFILE, Some(V1), None);
+        let second = guarded(
+            &scope,
+            "cm-00000000000000e2",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        apply_checkout_mutation(&config, &first).unwrap();
+        apply_checkout_mutation(&config, &second).unwrap();
+        assert!(matches!(
+            apply_checkout_mutation(&config, &first).unwrap(),
+            MutationApplyOutcome::Conflicted { .. }
+        ));
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_and_special_files_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let (directory, root, scope, config) = guarded_fixture();
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(outside.join("brofiles")).unwrap();
+
+        // Symlinked parent component.
+        symlink(&outside, root.join(".bro")).unwrap();
+        let create = guarded(&scope, "cm-00000000000000f1", BROFILE, Some(V1), None);
+        assert!(apply_checkout_mutation(&config, &create).is_err());
+        assert!(!outside.join("brofiles/reviewer.json").exists());
+        fs::remove_file(root.join(".bro")).unwrap();
+
+        // Symlink target.
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        fs::write(outside.join("target.json"), V1).unwrap();
+        symlink(outside.join("target.json"), root.join(BROFILE)).unwrap();
+        let replace = guarded(
+            &scope,
+            "cm-00000000000000f2",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        assert!(apply_checkout_mutation(&config, &replace).is_err());
+        let delete = guarded(
+            &scope,
+            "cm-00000000000000f3",
+            BROFILE,
+            None,
+            Some(V1.as_bytes()),
+        );
+        assert!(apply_checkout_mutation(&config, &delete).is_err());
+        assert_eq!(fs::read_to_string(outside.join("target.json")).unwrap(), V1);
+        assert!(
+            fs::symlink_metadata(root.join(BROFILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(root.join(BROFILE)).unwrap();
+
+        // FIFO target (must not block) and directory target.
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.join(BROFILE))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(apply_checkout_mutation(&config, &replace).is_err());
+        fs::remove_file(root.join(BROFILE)).unwrap();
+        fs::create_dir(root.join(BROFILE)).unwrap();
+        assert!(apply_checkout_mutation(&config, &replace).is_err());
+        assert!(root.join(BROFILE).is_dir());
+
+        // Legacy knowledge/gap mutations now refuse symlinked components too.
+        let knowledge_outside = directory.path().join("knowledge-outside");
+        fs::create_dir_all(&knowledge_outside).unwrap();
+        symlink(&knowledge_outside, root.join(".bbox")).unwrap();
+        let legacy = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{}");
+        assert!(apply_checkout_mutation(&config, &legacy).is_err());
+        assert!(fs::read_dir(&knowledge_outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_failure_reports_failed_and_keeps_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_directory, root, scope, config) = guarded_fixture();
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        fs::write(root.join(BROFILE), V1).unwrap();
+        let brofiles = root.join(".bro/brofiles");
+        fs::set_permissions(&brofiles, fs::Permissions::from_mode(0o555)).unwrap();
+        let replace = guarded(
+            &scope,
+            "cm-00000000000000a1",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        let ack = MutationPageState::default()
+            .process(&config, &replace)
+            .unwrap();
+        fs::set_permissions(&brofiles, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            ack.outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_FAILED
+        );
+        assert!(ack.error.is_some());
+        assert_eq!(ack.observed_sha256, None);
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V1);
+        let leftovers = fs::read_dir(&brofiles).unwrap().count();
+        assert_eq!(leftovers, 1, "no staged temporary file survives");
+    }
+
+    #[test]
+    fn a_page_holds_successors_behind_an_unapplied_predecessor() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        fs::write(root.join(BROFILE), "{\"local\":1}").unwrap();
+        let conflicted = guarded(
+            &scope,
+            "cm-0000000000000011",
+            BROFILE,
+            Some(V1),
+            Some(V2.as_bytes()),
+        );
+        let successor = guarded(
+            &scope,
+            "cm-0000000000000012",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        let other_path = guarded(
+            &scope,
+            "cm-0000000000000013",
+            ".bro/teamplates/squad.json",
+            Some("{\"name\":\"squad\"}"),
+            None,
+        );
+        let legacy = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{}");
+        let mut state = MutationPageState::default();
+        let acks = [&conflicted, &successor, &other_path, &legacy]
+            .into_iter()
+            .map(|mutation| state.process(&config, mutation))
+            .collect::<Vec<_>>();
+        let first = acks[0].as_ref().unwrap();
+        assert_eq!(
+            first.outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_CONFLICTED
+        );
+        assert_eq!(first.observed_sha256, Some(sha(b"{\"local\":1}")));
+        assert!(
+            acks[1].is_none(),
+            "the successor is neither applied nor acked"
+        );
+        assert_eq!(
+            acks[2].as_ref().unwrap().outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED
+        );
+        assert_eq!(
+            acks[3].as_ref().unwrap().outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(BROFILE)).unwrap(),
+            "{\"local\":1}"
+        );
+        // Legacy acks keep their encoding: no observed_sha256 field.
+        let encoded = serde_json::to_value(acks[3].as_ref().unwrap()).unwrap();
+        assert!(encoded.get("observed_sha256").is_none());
+
+        // A failed guarded predecessor holds its successor the same way.
+        let (_directory, root, scope, config) = guarded_fixture();
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        fs::create_dir(root.join(BROFILE)).unwrap();
+        let mut state = MutationPageState::default();
+        let failed = guarded(&scope, "cm-0000000000000021", BROFILE, Some(V1), None);
+        let held = guarded(
+            &scope,
+            "cm-0000000000000022",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        assert_eq!(
+            state.process(&config, &failed).unwrap().outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_FAILED
+        );
+        assert!(state.process(&config, &held).is_none());
+    }
+
+    #[test]
+    fn concurrent_owner_delivery_serializes_on_the_target() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let config = Arc::new(config);
+        // Two owners delivering the same mutation: one write, both applied.
+        let same = guarded(&scope, "cm-0000000000000031", BROFILE, Some(V1), None);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let config = Arc::clone(&config);
+                let barrier = Arc::clone(&barrier);
+                let mutation = same.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_checkout_mutation(&config, &mutation).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), applied(Some(V1)));
+        }
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V1);
+        assert_eq!(
+            fs::read_dir(root.join(".bro/brofiles")).unwrap().count(),
+            1,
+            "no staged temporary file survives"
+        );
+        // Two competing creations from one absent base: exactly one lands.
+        let path = ".bro/teamplates/squad.json";
+        let competing = [
+            guarded(&scope, "cm-0000000000000032", path, Some(V1), None),
+            guarded(&scope, "cm-0000000000000033", path, Some(V2), None),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let outcomes = competing
+            .into_iter()
+            .map(|mutation| {
+                let config = Arc::clone(&config);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_checkout_mutation(&config, &mutation).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let landed = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, MutationApplyOutcome::Applied { .. }))
+            .count();
+        assert_eq!(landed, 1, "{outcomes:?}");
+        let written = fs::read_to_string(root.join(path)).unwrap();
+        assert!(written == V1 || written == V2);
+    }
+
+    #[test]
+    fn publication_upload_plan_keeps_the_config_lane_optional_on_the_wire() {
+        let captured = || {
+            let blobs = tempfile::tempdir().unwrap();
+            let config = vec![SourceFileManifestEntryV1 {
+                repository_relative_filename: ".bbox/config.toml".into(),
+                encoded_bytes: 1,
+                content_sha256: "a".repeat(64),
+            }];
+            CapturedPublicationCandidate {
+                descriptor: PublicationCandidateDescriptorV1 {
+                    schema_version: KNOWLEDGE_SOURCE_SCHEMA_VERSION,
+                    scope: PublishedScope::try_new("repo-plan", ".").unwrap(),
+                    full_ref: "refs/heads/main".into(),
+                    publisher_commit: "1".repeat(40),
+                    object_format: KnowledgeGitObjectFormatV1::Sha1,
+                    knowledge: SourceManifestDescriptorV1::default(),
+                    gaps: SourceManifestDescriptorV1::default(),
+                    graphs: SourceManifestDescriptorV1::default(),
+                    evidence: SourceManifestDescriptorV1::default(),
+                    config: Some(
+                        source_manifest_descriptor(SourceLaneV1::Config, &config, 1).unwrap(),
+                    ),
+                },
+                knowledge_entries: Vec::new(),
+                gap_entries: Vec::new(),
+                graph_entries: Vec::new(),
+                evidence_entries: Vec::new(),
+                config_entries: Some(config),
+                blobs,
+            }
+        };
+        let status = |config_files: Option<u64>| PublicationCandidateStatusV1 {
+            source_generation_id: "kps_x".into(),
+            state: SourceGenerationStateV1::Ready,
+            producer_id: "p".into(),
+            full_ref: "refs/heads/main".into(),
+            publisher_commit: "1".repeat(40),
+            object_format: KnowledgeGitObjectFormatV1::Sha1,
+            observed_at_unix_secs: 1,
+            knowledge_manifest_sha256: String::new(),
+            gap_manifest_sha256: String::new(),
+            graph_manifest_sha256: String::new(),
+            evidence_manifest_sha256: String::new(),
+            knowledge_files: 0,
+            gap_files: 0,
+            graph_files: 0,
+            evidence_files: 0,
+            config_manifest_sha256: None,
+            config_files,
+            logical_bytes: 0,
+            diagnostic: None,
+        };
+        let probe = |current, config_lane_supported| PublicationProbeResponseV1 {
+            current,
+            config_lane_supported,
+        };
+
+        let mut old_daemon = captured();
+        assert!(plan_publication_upload(
+            &probe(None, false),
+            &mut old_daemon
+        ));
+        assert!(old_daemon.descriptor.config.is_none());
+        assert!(old_daemon.config_entries.is_none());
+        assert!(
+            serde_json::to_value(&old_daemon.descriptor)
+                .unwrap()
+                .get("config")
+                .is_none()
+        );
+        let mut old_current = captured();
+        assert!(!plan_publication_upload(
+            &probe(Some(status(None)), false),
+            &mut old_current
+        ));
+
+        let mut fresh = captured();
+        assert!(plan_publication_upload(&probe(None, true), &mut fresh));
+        assert!(fresh.descriptor.config.is_some());
+        let mut pre_lane_current = captured();
+        assert!(plan_publication_upload(
+            &probe(Some(status(None)), true),
+            &mut pre_lane_current
+        ));
+        let mut current = captured();
+        assert!(!plan_publication_upload(
+            &probe(Some(status(Some(1))), true),
+            &mut current
+        ));
+    }
+
+    fn config_repo() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.name", "Config Fixture"]);
+        git(&root, &["config", "user.email", "config@example.invalid"]);
+        (directory, root)
+    }
+
+    fn write_file(root: &Path, path: &str, bytes: &[u8]) {
+        let target = root.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, bytes).unwrap();
+    }
+
+    fn head_commit(root: &Path) -> bbox_corpus_core::git::VerifiedCommit {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let oid = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(root)
+            .unwrap()
+            .unwrap();
+        bbox_corpus_core::git::open_stable_git_repository(&directory)
+            .unwrap()
+            .unwrap()
+            .verify_commit_oid(&oid)
+            .unwrap()
+    }
+
+    fn captured_names(entries: &[SourceFileManifestEntryV1]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| entry.repository_relative_filename.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn config_lane_capture_is_committed_only_and_exact() {
+        let (_directory, root) = config_repo();
+        let config_toml =
+            b"[project]\nrepo_id = \"config-capture-fixture\"\n[mcp]\nenabled = false\n";
+        write_file(&root, ".bbox/config.toml", config_toml);
+        write_file(&root, ".bbox/mcp.json", br#"{"servers":{}}"#);
+        write_file(&root, ".bro/brofiles/reviewer.json", V1.as_bytes());
+        write_file(&root, ".bro/brofiles/README.md", b"docs");
+        write_file(&root, ".bro/brofiles/nested/deep.json", b"{}");
+        write_file(&root, ".bro/brofiles/.hidden.json", b"{}");
+        write_file(&root, ".bro/teamplates/squad.json", br#"{"name":"squad"}"#);
+        write_file(&root, ".bro/accounts.json", b"{}");
+        git(&root, &["add", ".bbox", ".bro"]);
+        git(&root, &["commit", "--quiet", "-m", "configuration"]);
+        write_file(&root, ".bro/brofiles/reviewer.json", V2.as_bytes());
+        write_file(&root, ".bro/brofiles/untracked.json", b"{}");
+
+        let captured = capture_publication_candidate(&ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new("config-capture-fixture", ".").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: Some(PublishedKnowledgeConfig {
+                full_ref: "refs/heads/main".to_string(),
+            }),
+        })
+        .unwrap();
+        let config = captured.config_entries.as_ref().unwrap();
+        assert_eq!(
+            captured_names(config),
+            vec![
+                ".bbox/config.toml",
+                ".bbox/mcp.json",
+                ".bro/brofiles/reviewer.json",
+                ".bro/teamplates/squad.json",
+            ]
+        );
+        assert_eq!(
+            config[0].content_sha256,
+            source_file_blob_sha256(config_toml)
+        );
+        assert_eq!(
+            config[2].content_sha256,
+            source_file_blob_sha256(V1.as_bytes())
+        );
+        assert_eq!(
+            fs::read(captured.blobs.path().join(&config[2].content_sha256)).unwrap(),
+            V1.as_bytes()
+        );
+        let descriptor = captured.descriptor.config.as_ref().unwrap();
+        assert_eq!(descriptor.file_count, 4);
+        assert_eq!(
+            descriptor.manifest_sha256,
+            source_manifest_sha256(SourceLaneV1::Config, config)
+        );
+    }
+
+    #[test]
+    fn config_lane_capture_maps_nested_scopes_and_yields_an_empty_present_lane() {
+        let (_directory, root) = config_repo();
+        write_file(&root, ".bro/brofiles/root-only.json", b"{}");
+        write_file(&root, "svc/api/.bbox/config.toml", b"[project]\n");
+        write_file(
+            &root,
+            "svc/api/.bro/brofiles/api.json",
+            br#"{"name":"api"}"#,
+        );
+        write_file(&root, "svc/web/src/main.rs", b"fn main() {}\n");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "-m", "nested"]);
+        let commit = head_commit(&root);
+        let blobs = tempfile::tempdir().unwrap();
+        let api = PublishedScope::try_new("repo-nested", "svc/api").unwrap();
+        let entries =
+            capture_config_lane(&commit, &api, &blobs, ConfigLaneLimits::default()).unwrap();
+        assert_eq!(
+            captured_names(&entries),
+            vec![
+                "svc/api/.bbox/config.toml",
+                "svc/api/.bro/brofiles/api.json"
+            ]
+        );
+        let web = PublishedScope::try_new("repo-nested", "svc/web").unwrap();
+        assert!(
+            capture_config_lane(&commit, &web, &blobs, ConfigLaneLimits::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn config_lane_capture_enforces_file_count_and_lane_limits() {
+        let (_directory, root) = config_repo();
+        write_file(&root, ".bbox/config.toml", b"[project]\n");
+        write_file(&root, ".bro/brofiles/a.json", b"{\"a\":1}");
+        write_file(&root, ".bro/brofiles/b.json", b"{\"b\":1}");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "-m", "limits"]);
+        // A failed bounded read invalidates that commit's object session, so
+        // each case verifies its own commit handle.
+        let scope = PublishedScope::try_new("repo-limits", ".").unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let generous = ConfigLaneLimits {
+            max_files: 16,
+            max_file_bytes: 1024,
+            max_lane_bytes: 4096,
+        };
+        assert_eq!(
+            capture_config_lane(&head_commit(&root), &scope, &blobs, generous)
+                .unwrap()
+                .len(),
+            3
+        );
+        let error = capture_config_lane(
+            &head_commit(&root),
+            &scope,
+            &blobs,
+            ConfigLaneLimits {
+                max_file_bytes: 8,
+                ..generous
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(".bbox/config.toml"),
+            "{error:#}"
+        );
+        let error = capture_config_lane(
+            &head_commit(&root),
+            &scope,
+            &blobs,
+            ConfigLaneLimits {
+                max_files: 2,
+                ..generous
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("2-file limit"), "{error:#}");
+        let error = capture_config_lane(
+            &head_commit(&root),
+            &scope,
+            &blobs,
+            ConfigLaneLimits {
+                max_lane_bytes: 20,
+                ..generous
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("20-byte limit"), "{error:#}");
     }
 
     #[test]
@@ -3840,7 +4925,12 @@ mod tests {
             "{\"id\":\"gap-0123abcd\"}",
         );
         let digest = apply_checkout_mutation(&config, &mutation).unwrap();
-        assert!(digest.is_some());
+        assert!(matches!(
+            digest,
+            MutationApplyOutcome::Applied {
+                content_sha256: Some(_)
+            }
+        ));
         let target = root.join(".bbox/gaps/gap-0123abcd.json");
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
@@ -3852,7 +4942,12 @@ mod tests {
         let mut delete = mutation.clone();
         delete.mode = "delete".into();
         delete.content_json = None;
-        assert!(apply_checkout_mutation(&config, &delete).unwrap().is_none());
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            MutationApplyOutcome::Applied {
+                content_sha256: None
+            }
+        );
         assert!(!target.exists());
         // Deleting an absent file is also a success (idempotent redelivery).
         apply_checkout_mutation(&config, &delete).unwrap();
