@@ -14,7 +14,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/response-cap/per-tool-oversized-producers",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-12T17:08:03Z",
-  "updated_at": "2026-06-12T17:08:03Z"
+  "updated_at": "2026-09-24T07:33:07Z",
+  "resolved_at": "2026-09-24T07:33:07Z",
+  "resolution_note": "obsolete: 8ccdcd06 replaced the spill-to-disk cap with a typed producer error (error.response_too_large with a per-tool hint and a blackbox::tool response_too_large warn carrying tool and bytes, src/server/response.rs::bounded_response), so over-cap output is no longer an implicit export. The known chronic producers now shape their own output: bro_wait structured results (gap-55be3518, bro_arc_result), bbox_thread get detail views and paged body (src/tools/threads.rs), bro_brofile list/get summary and body pages (src/tools/roster.rs), bbox_storage_health file pages (src/tools/storage_health.rs), and bbox_storage_gc detail cursor (src/tools/storage_gc.rs), each with under-cap tests. A newly identified over-producer should be filed as its own gap naming the tool."
 }
