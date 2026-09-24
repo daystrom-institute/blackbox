@@ -43,7 +43,7 @@ const INDEX_VERSION: u32 = 1;
 const INDEX_FILE: &str = "index.json";
 const PLANS_DIR: &str = "plans";
 /// Settled records retained for explicit recovery, oldest dropped first.
-const MAX_RETAINED_OPERATIONS: usize = 512;
+pub(crate) const MAX_RETAINED_OPERATIONS: usize = 512;
 /// Pending operations across all projects; a new render beyond it refuses.
 const MAX_PENDING_OPERATIONS: usize = 256;
 const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
@@ -126,6 +126,27 @@ struct RenderOperationIndex {
     /// receipt is never reported current.
     #[serde(default)]
     workspace_renders: Vec<WorkspaceRenderMark>,
+    /// The newest issuance among evicted workspace marks. Every owner
+    /// receipt issued before it is treated as having a newer workspace
+    /// render, so discarding marks never restores currentness.
+    #[serde(default)]
+    workspace_renders_evicted_through: u64,
+}
+
+impl RenderOperationIndex {
+    fn newer_workspace_render(
+        &self,
+        project_id: &str,
+        scope: &PublishedScope,
+        issued_at_ms: u64,
+    ) -> bool {
+        issued_at_ms < self.workspace_renders_evicted_through
+            || self.workspace_renders.iter().any(|mark| {
+                mark.project_id == project_id
+                    && &mark.scope == scope
+                    && mark.issued_at_ms > issued_at_ms
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +164,7 @@ impl Default for RenderOperationIndex {
             sequences: BTreeMap::new(),
             operations: Vec::new(),
             workspace_renders: Vec::new(),
+            workspace_renders_evicted_through: 0,
         }
     }
 }
@@ -481,17 +503,26 @@ impl RenderOperationRuntime {
             .cloned()
     }
 
-    /// Run `record` only if `sequence` is still the newest operation issued
-    /// for the project. Operation creation waits while it runs, so a newer
-    /// operation cannot be issued between the check and the effect.
-    pub(crate) fn while_latest<T>(
+    /// Run `record` only if the operation is still the newest render of its
+    /// checkout scope known to this daemon: its `sequence` is the newest
+    /// issued for the project, and no bound-workspace render of the scope
+    /// issued after `issued_at_ms` has completed, whether or not that render
+    /// produced evidence. Operation creation and workspace completion wait
+    /// while it runs, so neither can land between the check and the effect.
+    pub(crate) fn while_newest_render<T>(
         &self,
         project_id: &str,
+        scope: &PublishedScope,
         sequence: u64,
+        issued_at_ms: u64,
         record: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
         let state = self.state.lock();
-        if state.index.sequences.get(project_id) != Some(&sequence) {
+        if state.index.sequences.get(project_id) != Some(&sequence)
+            || state
+                .index
+                .newer_workspace_render(project_id, scope, issued_at_ms)
+        {
             return Ok(None);
         }
         let result = record().map(Some);
@@ -527,8 +558,8 @@ impl RenderOperationRuntime {
                 issued_at_ms,
             }),
         }
-        // Bounded: the oldest marks describe renders long superseded by
-        // newer owner operations.
+        // Bounded. An evicted mark raises the watermark instead of being
+        // forgotten, so every receipt it made historical stays historical.
         while next.workspace_renders.len() > MAX_RETAINED_OPERATIONS {
             let oldest = next
                 .workspace_renders
@@ -537,7 +568,10 @@ impl RenderOperationRuntime {
                 .min_by_key(|(_, mark)| mark.issued_at_ms)
                 .map(|(position, _)| position)
                 .expect("the list is non-empty");
-            next.workspace_renders.remove(oldest);
+            let evicted = next.workspace_renders.remove(oldest);
+            next.workspace_renders_evicted_through = next
+                .workspace_renders_evicted_through
+                .max(evicted.issued_at_ms);
         }
         self.persist_index(&next)?;
         state.index = next;
@@ -545,7 +579,7 @@ impl RenderOperationRuntime {
     }
 
     /// Whether a bound-workspace render of `project_id` in `scope`, issued
-    /// after `issued_at_ms`, has completed.
+    /// after `issued_at_ms`, may have completed.
     pub(crate) fn newer_workspace_render(
         &self,
         project_id: &str,
@@ -555,13 +589,7 @@ impl RenderOperationRuntime {
         self.state
             .lock()
             .index
-            .workspace_renders
-            .iter()
-            .any(|mark| {
-                mark.project_id == project_id
-                    && &mark.scope == scope
-                    && mark.issued_at_ms > issued_at_ms
-            })
+            .newer_workspace_render(project_id, scope, issued_at_ms)
     }
 
     /// Page the persisted plan of a pending operation to its owner.

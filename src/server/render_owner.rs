@@ -495,15 +495,18 @@ impl BlackboxServer {
                                 if *validation == RenderCompletionValidation::Unverified {
                                     // The current plan is byte-identical to
                                     // the one the owner applied, so it
-                                    // proves the receipt. Only the project's
-                                    // newest operation is evidence, checked
-                                    // while no new operation can be issued.
+                                    // proves the receipt. Only the newest
+                                    // render of the checkout scope, by any
+                                    // applier, is evidence, checked while no
+                                    // newer render can be issued or complete.
                                     if let Some(plan) = current_plan
                                         && !*late
                                     {
-                                        runtime.while_latest(
+                                        runtime.while_newest_render(
                                             &record.project_id,
+                                            &record.scope,
                                             record.sequence,
+                                            record.issued_at_ms,
                                             || {
                                                 self.state
                                                     .render_locality_observations

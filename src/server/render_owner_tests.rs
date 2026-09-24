@@ -1000,23 +1000,17 @@ async fn a_superseded_operation_that_was_delivered_is_never_reported_unapplied()
     assert_eq!(never_delivered["application"], "not_applied");
 }
 
-/// Collector render A completes; the owner makes one provider file
-/// handwritten; a newer bound-workspace render B of the same knowledge in
-/// that checkout scope records the refusal. Recovering A must then report it
-/// as historical, not current.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
+/// Run one bound-workspace render of `UNCOVERED` in `root` through the
+/// Plan/Complete locality exchange, the way the bound harness does, letting
+/// `edit` alter the receipt before completion.
+async fn complete_harness_render(
+    server: &BlackboxServer,
+    scope: &PublishedScope,
+    root: &Path,
+    edit: impl Fn(&mut ProjectRenderReceiptV1),
+) -> Value {
     use crate::knowledge::ProjectRenderLocalityRequestV1;
 
-    let owner = OwnerFixture::new();
-    let (scope, _) = scopes();
-    let server = owner.server();
-    announce(&server, owner.roots.keys().cloned().collect());
-    let first = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
-    assert_eq!(first["current"], true);
-    let first = first["operation_id"].as_str().unwrap().to_string();
-
-    std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
     let harness = BlackboxServer::new(server.state.clone());
     let workspace_id = bro_core::WorkspaceId::parse("e".repeat(32)).unwrap();
     assert!(
@@ -1064,10 +1058,10 @@ async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
         }
         offset = next.unwrap();
     };
-    let receipt = bbox_project_render::execute::execute_workspace_render_plan(
+    let mut receipt = bbox_project_render::execute::execute_workspace_render_plan(
         &assembled.plan,
-        owner.root(&scope),
-        &scope,
+        root,
+        scope,
         workspace_id.as_str(),
         assembled.issued_at_ms,
     )
@@ -1079,7 +1073,8 @@ async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
             .iter()
             .any(|projection| projection.disposition == ProjectRenderDispositionV1::Refused)
     );
-    let completed = parse(
+    edit(&mut receipt);
+    parse(
         &harness
             .bbox_render(Parameters(RenderParams {
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
@@ -1087,21 +1082,44 @@ async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
                     receipt,
                     issued_at_ms: assembled.issued_at_ms,
                 }),
-                ..params.clone()
+                ..params
             }))
             .await,
-    );
-    assert_eq!(completed["status"], "render_locality_complete");
+    )
+}
 
-    let recovered = parse(
+async fn recover(server: &BlackboxServer, operation_id: &str) -> Value {
+    parse(
         &server
             .bbox_render(Parameters(RenderParams {
-                operation: Some(first),
+                operation: Some(operation_id.to_string()),
                 project: Some(UNCOVERED.into()),
                 ..Default::default()
             }))
             .await,
-    );
+    )
+}
+
+/// Collector render A completes; the owner makes one provider file
+/// handwritten; a newer bound-workspace render B of the same knowledge in
+/// that checkout scope records the refusal. Recovering A must then report it
+/// as historical, not current, even after the workspace history is evicted
+/// and the daemon restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
+    let owner = OwnerFixture::new();
+    let (scope, _) = scopes();
+    let server = owner.server();
+    announce(&server, owner.roots.keys().cloned().collect());
+    let first = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
+    assert_eq!(first["current"], true);
+    let first = first["operation_id"].as_str().unwrap().to_string();
+
+    std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
+    let completed = complete_harness_render(&server, &scope, owner.root(&scope), |_| {}).await;
+    assert_eq!(completed["status"], "render_locality_complete");
+
+    let recovered = recover(&server, &first).await;
     assert_eq!(recovered["status"], "render_complete");
     assert_eq!(recovered["current"], false, "{recovered}");
     assert!(
@@ -1109,5 +1127,70 @@ async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
             .as_str()
             .unwrap()
             .contains("bound workspace")
+    );
+
+    // Workspace renders of many other projects push B's mark out of the
+    // bounded history; no further owner operation is issued.
+    let runtime = &server.state.render_operations;
+    for number in 0..(crate::server::render_operations::MAX_RETAINED_OPERATIONS + 8) {
+        runtime
+            .note_workspace_render(
+                &format!("p_{:032x}", 0x10000 + number),
+                &scope,
+                bbox_project_render::execute::issue_render_ms(),
+            )
+            .unwrap();
+    }
+    assert_eq!(recover(&server, &first).await["current"], false);
+
+    // A restart with a live owner keeps A historical.
+    let restarted = owner.server();
+    announce(&restarted, owner.roots.keys().cloned().collect());
+    let recovered = recover(&restarted, &first).await;
+    assert_eq!(recovered["status"], "render_complete");
+    assert_eq!(recovered["current"], false, "{recovered}");
+}
+
+/// Collector render A completes but is not yet validated; the owner makes one
+/// provider file handwritten; newer harness render B returns an incomplete
+/// receipt, so it records no evidence. Validating A afterwards must neither
+/// report it current nor admit its historical counters as evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_newer_harness_render_keeps_an_owner_receipt_out_of_evidence() {
+    let owner = OwnerFixture::new();
+    let (scope, _) = scopes();
+    let server = owner.server();
+    server
+        .state
+        .render_operations
+        .set_wait_timeout_for_test(Duration::from_millis(20));
+    announce(&server, owner.roots.keys().cloned().collect());
+    let pending = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    assert_eq!(pending["status"], "render_pending");
+    let first = pending["operation_id"].as_str().unwrap().to_string();
+    apply_one(&server, &owner.roots, |_| {}).unwrap();
+
+    std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
+    let completed = complete_harness_render(&server, &scope, owner.root(&scope), |receipt| {
+        receipt.incomplete = true;
+    })
+    .await;
+    assert_eq!(completed["evidence_recorded"], false);
+
+    let recovered = recover(&server, &first).await;
+    assert_eq!(recovered["status"], "render_complete");
+    assert_eq!(recovered["current"], false, "{recovered}");
+    assert!(
+        server
+            .state
+            .render_locality_observations
+            .snapshot()
+            .completions
+            .is_empty(),
+        "a receipt made historical by a newer render is never evidence"
     );
 }
