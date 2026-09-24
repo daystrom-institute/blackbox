@@ -22,6 +22,11 @@
 #   scripts/acceptance-checkout-callsites.sh --write-skeleton
 # then fill the judgment columns by reading each site. The skeleton never
 # invents them: it emits TODO, and TODO is a failure.
+#
+# Only test-gated code is excluded: a `#[cfg(test)]` item, or the body of a
+# `#[cfg(test)] mod`. The exclusion ends where that item ends. The scoping
+# is pinned by a fixture:
+#   scripts/acceptance-checkout-callsites.sh --self-test
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -47,6 +52,186 @@ HELPERS = [
 CALL = re.compile('|'.join(HELPERS))
 DEFN = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)')
 
+CFG_TEST = re.compile(r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]')
+LEAD_WORD = re.compile(r'(?:pub\b\s*(?:\([^)]*\))?\s*)?([A-Za-z_][A-Za-z0-9_]*!?)')
+# Leading words of an item or statement whose own text may hold a
+# top-level comma (generics, where clauses, typed initializers).
+ITEM_WORDS = {
+    "pub", "use", "fn", "mod", "impl", "struct", "enum", "trait", "union",
+    "type", "const", "static", "async", "unsafe", "extern", "let",
+    "macro_rules!",
+}
+IDENT = re.compile(r'[A-Za-z0-9_]')
+
+
+def blank(text):
+    """Same-length text with comments and string and char literal contents
+    replaced by spaces (newlines kept), so braces inside them do not count."""
+    out, i, n = list(text), 0, len(text)
+
+    def wipe(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            wipe(i, j)
+            i = j
+        elif text.startswith("/*", i):
+            j, depth = i + 2, 1
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            wipe(i, j)
+            i = j
+        elif c == "r" and (i == 0 or not IDENT.match(text[i - 1])
+                           or (text[i - 1] == "b" and (i < 2 or not IDENT.match(text[i - 2])))):
+            m = re.match(r'r(#*)"', text[i:i + 300])
+            if not m:
+                i += 1
+                continue
+            close = '"' + m.group(1)
+            j = text.find(close, i + len(m.group(0)))
+            j = n if j < 0 else j + len(close)
+            wipe(i, j)
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            wipe(i, j + 1)
+            i = j + 1
+        elif c == "'":
+            if text.startswith("\\", i + 1):
+                j = text.find("'", i + 3)
+                j = n if j < 0 else j
+                wipe(i, j + 1)
+                i = j + 1
+            elif i + 2 < n and text[i + 2] == "'":
+                wipe(i, i + 3)
+                i += 3
+            else:
+                i += 1              # a lifetime, not a literal
+        else:
+            i += 1
+    return "".join(out)
+
+
+def test_mask(code):
+    """Per-character flags: True inside a `#[cfg(test)]`-gated item.
+
+    The exclusion is scoped to the gated item: it starts at the attribute
+    and ends where that item ends (its `;`, the `}` closing its body, a
+    top-level `,` for a gated field or arm, or the close of the enclosing
+    scope). A `#[cfg(test)] mod` therefore excludes exactly its body."""
+    mask, n = [False] * len(code), len(code)
+    depth, i = 0, 0
+    while i < n:
+        m = CFG_TEST.match(code, i)
+        if not m:
+            c = code[i]
+            if c in "{([":
+                depth += 1
+            elif c in "})]":
+                depth -= 1
+            i += 1
+            continue
+        start, base, j = i, depth, m.end()
+        # Further attributes belong to the same item.
+        while True:
+            while j < n and code[j].isspace():
+                j += 1
+            if not code.startswith("#", j):
+                break
+            k, level = code.find("[", j), 0
+            if k < 0:
+                break
+            j = k
+            while j < n:
+                level += {"[": 1, "]": -1}.get(code[j], 0)
+                j += 1
+                if not level:
+                    break
+        lead = LEAD_WORD.match(code, j)
+        comma_ends = not (lead and lead.group(1) in ITEM_WORDS)
+        end = n
+        while j < n:
+            c = code[j]
+            j += 1
+            if c in "{([":
+                depth += 1
+            elif c in "})]":
+                depth -= 1
+                if depth < base:
+                    end = j - 1     # the enclosing scope closed
+                    break
+                if depth == base and c == "}":
+                    end = j
+                    break
+            elif depth == base and (c == ";" or (c == "," and comma_ends)):
+                end = j
+                break
+        for k in range(start, end):
+            mask[k] = True
+        i = j
+    return mask
+
+
+def scan_source(text):
+    """(enclosing fn, line number) for every production acquisition line."""
+    if not CALL.search(text):
+        return []
+    mask, found = test_mask(blank(text)), []
+    fn, offset = "<module>", 0
+    for lineno, line in enumerate(text.split("\n"), 1):
+        at, offset = offset, offset + len(line) + 1
+        m = DEFN.match(line)
+        if m:
+            fn = m.group(1)
+            continue                # the definition is not a call site
+        # Test-gated items are allowlisted (14.2); nothing else is.
+        if any(not mask[at + c.start()] for c in CALL.finditer(line)):
+            found.append((fn, lineno))
+    return found
+
+
+FIXTURE = "scripts/fixtures/checkout-callsites/scoped_test_exclusion.rs"
+EXPECT = re.compile(r'//\s*expect:\s*(\S+)\s*$')
+
+if mode == "--self-test":
+    # Each acquisition line in the fixture names the fn it must be counted
+    # under, or `excluded` when it sits inside test-gated code.
+    text = open(FIXTURE, encoding="utf-8").read()
+    expected = set()
+    for lineno, line in enumerate(text.split("\n"), 1):
+        e = EXPECT.search(line)
+        if e and e.group(1) != "excluded":
+            expected.add((e.group(1), lineno))
+    marked = sum(1 for line in text.split("\n") if EXPECT.search(line))
+    actual = set(scan_source(text))
+    if not expected or marked == len(expected) or actual != expected:
+        for fn, lineno in sorted(expected - actual, key=lambda s: s[1]):
+            print(f"acceptance-checkout-callsites: self-test {FIXTURE}:{lineno} "
+                  f"not counted under {fn}", file=sys.stderr)
+        for fn, lineno in sorted(actual - expected, key=lambda s: s[1]):
+            print(f"acceptance-checkout-callsites: self-test {FIXTURE}:{lineno} "
+                  f"counted under {fn} but expected otherwise", file=sys.stderr)
+        if not expected or marked == len(expected):
+            print("acceptance-checkout-callsites: self-test fixture needs both "
+                  "counted and excluded acquisitions", file=sys.stderr)
+        sys.exit(1)
+    print(f"acceptance-checkout-callsites: self-test ok ({len(expected)} counted, "
+          f"{marked - len(expected)} excluded)")
+    sys.exit(0)
+
 files = subprocess.run(
     ["git", "ls-files", "src/*.rs", "src/**/*.rs",
      "crates/*/src/*.rs", "crates/*/src/**/*.rs"],
@@ -58,19 +243,10 @@ for path in files:
     if path == "crates/bbox-indexing/src/checkout_access.rs":
         continue
     try:
-        lines = open(path, encoding="utf-8").read().split("\n")
+        text = open(path, encoding="utf-8").read()
     except OSError:
         continue
-    fn, in_test = "<module>", False
-    for line in lines:
-        if line.startswith("#[cfg(test)]"):
-            in_test = True          # test scopes are allowlisted (14.2)
-        m = DEFN.match(line)
-        if m:
-            fn = m.group(1)
-            continue                # the definition is not a call site
-        if in_test or not CALL.search(line):
-            continue
+    for fn, _ in scan_source(text):
         sites[f"{path}::{fn}"] += 1
 
 COLUMNS = [
@@ -133,8 +309,9 @@ for site, n in sorted(sites.items()):
 
 for site in sorted(audited):
     if site not in sites:
-        print(f"acceptance-checkout-callsites: audited site {site} no longer "
-              f"exists; remove the row", file=sys.stderr)
+        print(f"acceptance-checkout-callsites: audited site {site} not found "
+              f"by the scan (removed, renamed, or excluded as test code)",
+              file=sys.stderr)
         failures += 1
 
 if failures:

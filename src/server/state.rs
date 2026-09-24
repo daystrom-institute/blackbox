@@ -1057,8 +1057,13 @@ mod blocking_acceptance_proofs {
     }
 
     fn run_acceptance(script: &str) -> (bool, String) {
+        run_acceptance_with(script, &[])
+    }
+
+    fn run_acceptance_with(script: &str, args: &[&str]) -> (bool, String) {
         let output = std::process::Command::new("bash")
             .arg(repo_root().join("scripts").join(script))
+            .args(args)
             .current_dir(repo_root())
             .output()
             .unwrap_or_else(|error| panic!("running {script}: {error}"));
@@ -1112,6 +1117,16 @@ mod blocking_acceptance_proofs {
     fn checkout_callsite_audit_is_complete() {
         let (ok, rendered) = run_acceptance("acceptance-checkout-callsites.sh");
         assert!(ok, "checkout call-site audit failed:\n{rendered}");
+    }
+
+    /// The audit's test exclusion is scoped to the gated item: a test-gated
+    /// item ahead of production code leaves that code in the scan, and a
+    /// `#[cfg(test)] mod` body stays out of it.
+    #[test]
+    fn checkout_callsite_scan_scopes_test_exclusion() {
+        let (ok, rendered) =
+            run_acceptance_with("acceptance-checkout-callsites.sh", &["--self-test"]);
+        assert!(ok, "checkout call-site scan scoping failed:\n{rendered}");
     }
 
     /// The lower corpus crate must never gain the upward dependency that
