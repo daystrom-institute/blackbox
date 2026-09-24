@@ -270,6 +270,9 @@ impl BlackboxServer {
         owner: RenderOwner,
         handle: &tokio::runtime::Handle,
     ) -> Result<String> {
+        if p.global_plan.is_some() {
+            bail!("error.bad_input: global_plan is only valid with scope \"global\"");
+        }
         let requested_scope = p.scope.clone().unwrap_or_else(|| "both".into());
         if !matches!(requested_scope.as_str(), "project" | "both") {
             bail!("a checkout-owner render requires scope=project or scope=both");

@@ -337,6 +337,22 @@ async fn owner_renders_keep_view_provider_project_doc_and_file_semantics() {
         server.state.render_operations.latest_sequence(UNCOVERED),
         None
     );
+    // A global render plan applies only to scope=global, owner or not.
+    let global_plan = server
+        .bbox_render(Parameters(RenderParams {
+            global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                offset: None,
+                plan_sha256: None,
+                host_common_target: "/host/.blackbox/BLACKBOX.md".into(),
+            }),
+            ..project_params(UNCOVERED)
+        }))
+        .await;
+    assert_eq!(global_plan.is_error, Some(true));
+    assert_eq!(
+        server.state.render_operations.latest_sequence(UNCOVERED),
+        None
+    );
 
     let all = render_with_owner(
         &server,
