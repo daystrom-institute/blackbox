@@ -12,7 +12,10 @@
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "mcp_surface/search-surfaces/atom-agent-vector-asymmetry",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-12T22:48:53Z",
-  "updated_at": "2026-06-12T22:48:53Z"
+  "updated_at": "2026-09-24T11:31:31Z",
+  "resolved_at": "2026-09-24T11:31:31Z",
+  "resolution_note": "obsolete: referenced code removed in 41913b20 (src/tools/atoms.rs and the atom registry under src/orchestration/atoms were deleted; atom_search is marked retire in design/orchestration/bro-execution-retirement-map.json). No atom registry or atom search surface remains, so there is no sibling registry for bro_agent_search (src/tools/agents.rs) to be asymmetric with."
 }
