@@ -1,19 +1,27 @@
 {
   "id": "gap-e2fb024c",
-  "title": "Harness self-validation should run against the rebuilt local harness binary",
+  "title": "Harness changes can be exercised live against a worktree-built bro-harness without replacing the fleet binary",
   "gap_kind": "workflow",
   "domain": "harness/dev-validation",
-  "wanted_capability": "When editing bro-harness turn machinery, developers should have a narrow workflow or tool hook to rebuild and exercise a nested/local harness session from the current worktree, so behavior changes can be smoke-tested against the new binary without replacing or restarting the active fleet session.",
-  "missing_primitive": "local rebuilt harness smoke workflow",
+  "wanted_capability": "A narrow, documented way to run a real harness session (agent loop, promise/HARNESS_EVENT machinery, daemon-injected MCP catalog) on a bro-harness binary built from the current worktree, while every other dispatch keeps using the installed binary. Today the daemon picks the harness binary once, daemon-wide: prepare_harness_child_launch fills WorkerSpawnSpec.bin_override from bin_with_config, which for harness providers is BRO_HARNESS_BIN or the bro-harness on PATH, with no per-provider config override and no per-dispatch or per-brofile override. Validating a turn-machinery change live therefore means installing the new binary for the whole fleet. Standalone `bro-harness -p` from a worktree build runs without the daemon's catalog injection or dispatch context, and the `isolate` binary covers bindings only, not the agent loop; docs/project-guides/validation.md documents neither route for turn-machinery changes.",
+  "missing_primitive": "per-dispatch harness binary override (or an equivalent documented worktree smoke path) for turn-machinery validation",
   "fallback_used": "Relied on unit tests and noted that the live fleet session kept using the pre-change harness binary, so repeated HARNESS_EVENT messages during validation were expected until reinstall/restart.",
   "evidence": [
-    "RETRO_HARNESS.md:11-15",
-    "current session: terminal promise_wait results were followed by stale HARNESS_EVENT messages because the running harness process was pre-change"
+    "src/orchestration/mod.rs prepare_harness_child_launch (bin_override taken from provider.bin_with_config, daemon-wide)",
+    "src/orchestration/providers/exec_args.rs bin_with_env / bin_with_config (harness providers: BRO_HARNESS_BIN else bro-harness; no per-provider override)",
+    "crates/bro-protocol/src/worker.rs WorkerSpawnSpec.bin_override (field exists; only the daemon-wide value is ever sent)",
+    "crates/fleetd/src/spawn.rs raw_bin_for (executor honors spec.bin_override)",
+    "crates/bro-harness/src/cli.rs (standalone -p mode, no daemon catalog)",
+    "docs/project-guides/validation.md (isolate covers bindings only; no turn-machinery live-smoke recipe)"
   ],
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "workflow/harness/live-harness-self-validation-after-code-change",
-  "resolution": "unresolved",
+  "notes": "Triage trace: still relevant. Each dispatch now spawns a fresh harness process, so an installed binary swap takes effect without restarts, but the binary remains one daemon-wide choice; there is no way to point a single dispatch at a worktree build.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "created_at": "2026-06-02T06:11:09Z",
-  "updated_at": "2026-06-02T06:11:09Z"
+  "updated_at": "2026-09-24T11:03:18Z",
+  "resolved_at": "2026-09-24T11:03:18Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/85"
 }
