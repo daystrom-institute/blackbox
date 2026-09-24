@@ -2122,7 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_stdin_gives_stdin_readers_eof() {
-        let c = cx();
+        let (_dir, c) = isolated_cx();
         for (command, exit_code) in [("cat", 0), ("grep zq-no-such-token", 1)] {
             let v = as_json(
                 tokio::time::timeout(
@@ -2139,7 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_stdin_keeps_pipe_open_for_poll() {
-        let c = cx();
+        let (_dir, c) = isolated_cx();
         let v = as_json(
             ShellRun
                 .call(
@@ -2171,7 +2171,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_stdin_without_opted_in_pipe_reports_input_error() {
-        let c = cx();
+        let (_dir, c) = isolated_cx();
         let v = as_json(
             ShellRun
                 .call(json!({"command": "sleep 5", "yield_time_ms": 50}), &c)
