@@ -7773,7 +7773,7 @@ mod tests {
         let (state, first_token, second_token) = two_producer_http_state(&root);
         let scope = PublishedScope::try_new("repo-a", ".").unwrap();
         let runtime = &state.render_operations;
-        let (operation_id, sequence) = runtime.reserve("project-a").unwrap();
+        let (operation_id, sequence, _) = runtime.reserve("project-a").unwrap();
         let plan = ProjectRenderPlanV1 {
             version: PROJECT_RENDER_TRANSPORT_VERSION,
             project_id: "project-a".into(),

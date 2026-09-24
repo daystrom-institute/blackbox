@@ -30,6 +30,7 @@
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +66,26 @@ pub fn now_unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+static LAST_RENDER_ISSUANCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate one daemon-clock render issuance. Every plan a daemon issues,
+/// for any applier, takes its issuance here, so no two renders issued by
+/// one process share a value even within one millisecond: the result is the
+/// current Unix millisecond, or one past the previous issuance when the
+/// clock has not advanced past it.
+pub fn issue_render_ms() -> u64 {
+    next_render_issuance(&LAST_RENDER_ISSUANCE_MS, now_unix_ms())
+}
+
+fn next_render_issuance(last: &AtomicU64, now_ms: u64) -> u64 {
+    let mut issued = now_ms;
+    let _ = last.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+        issued = now_ms.max(previous.saturating_add(1));
+        Some(issued)
+    });
+    issued
 }
 
 /// Holds the exclusive render lock of one checkout root until dropped.
@@ -159,6 +180,9 @@ pub struct ApplyOptions<'a> {
     /// refused before any write, and the fence advances before the first
     /// output write.
     pub issued_at_ms: Option<u64>,
+    /// Identity of the render at `issued_at_ms`. A different render with an
+    /// equal issuance is refused, as is any render without an identity.
+    pub render_id: Option<String>,
     /// Runs after preflight and before the first write. An error aborts the
     /// application with nothing written.
     pub before_publish: Option<&'a mut dyn FnMut(&[OutputObservation]) -> Result<()>>,
@@ -242,6 +266,11 @@ pub fn verify_render_root(root: &Path) -> Result<PathBuf> {
 struct RenderFence {
     version: u32,
     issued_at_ms: u64,
+    /// Identity of the render that set `issued_at_ms`: the applied plan's
+    /// transport digest. An equal issuance from a different render is
+    /// refused; only the same render may apply at the same issuance again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_id: Option<String>,
 }
 
 /// Every component of the fence directory must be a real directory.
@@ -352,18 +381,19 @@ fn prune_backups(directory: &Path) {
     }
 }
 
-/// The newest plan issuance already applied to this checkout.
+/// The newest plan issuance already applied to this checkout, with the
+/// identity of the render that applied it.
 #[allow(
     clippy::disallowed_methods,
     reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
 )]
-fn read_fence(root: &Path) -> Result<u64> {
+fn read_fence(root: &Path) -> Result<Option<RenderFence>> {
     let Some(directory) = fence_directory(root, false)? else {
-        return Ok(0);
+        return Ok(None);
     };
     let path = directory.join(FENCE_FILE);
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("inspecting the render fence"),
         Ok(metadata) if !metadata.is_file() || metadata.len() > MAX_FENCE_BYTES => {
             bail!("error.render_target_unsafe: the render fence is not a bounded regular file")
@@ -375,15 +405,26 @@ fn read_fence(root: &Path) -> Result<u64> {
     if fence.version != FENCE_VERSION {
         bail!("unsupported render fence version {}", fence.version);
     }
-    Ok(fence.issued_at_ms)
+    Ok(Some(fence))
+}
+
+impl RenderFence {
+    /// Whether a render may apply over this fence: its issuance is newer, or
+    /// it is the very render that set the fence.
+    fn admits(&self, issued_at_ms: u64, render_id: Option<&str>) -> bool {
+        issued_at_ms > self.issued_at_ms
+            || (issued_at_ms == self.issued_at_ms
+                && render_id.is_some()
+                && self.render_id.as_deref() == render_id)
+    }
 }
 
 #[allow(
     clippy::disallowed_methods,
     reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
 )]
-fn advance_fence(root: &Path, issued_at_ms: u64) -> Result<()> {
-    if read_fence(root)? >= issued_at_ms {
+fn advance_fence(root: &Path, issued_at_ms: u64, render_id: Option<&str>) -> Result<()> {
+    if read_fence(root)?.is_some_and(|fence| fence.issued_at_ms >= issued_at_ms) {
         return Ok(());
     }
     let directory = local_state_directory(root)?;
@@ -393,6 +434,7 @@ fn advance_fence(root: &Path, issued_at_ms: u64) -> Result<()> {
     staged.write_all(&serde_json::to_vec(&RenderFence {
         version: FENCE_VERSION,
         issued_at_ms,
+        render_id: render_id.map(str::to_owned),
     })?)?;
     staged.as_file().sync_all()?;
     staged
@@ -475,10 +517,12 @@ pub fn apply_project_render(
     }
 
     if let Some(issued_at_ms) = options.issued_at_ms {
-        let applied = read_fence(root)?;
-        if issued_at_ms < applied {
+        if let Some(fence) = read_fence(root)?
+            && !fence.admits(issued_at_ms, options.render_id.as_deref())
+        {
             bail!(
-                "error.render_superseded: a project render issued at {applied} ms already applied to this checkout; this plan, issued at {issued_at_ms} ms, was not applied"
+                "error.render_superseded: a project render issued at {} ms already applied to this checkout; this plan, issued at {issued_at_ms} ms, was not applied",
+                fence.issued_at_ms
             );
         }
     }
@@ -489,7 +533,8 @@ pub fn apply_project_render(
     // older plan stays refused even if this application is interrupted
     // after its first publication.
     if let Some(issued_at_ms) = options.issued_at_ms {
-        advance_fence(root, issued_at_ms).context("advancing the render fence")?;
+        advance_fence(root, issued_at_ms, options.render_id.as_deref())
+            .context("advancing the render fence")?;
     }
 
     if let Err(error) = bbox_util::guidance::publish_files(&bbox_root, satellites, false) {
@@ -954,6 +999,7 @@ pub fn execute_project_render_plan_with(
         ApplyOptions {
             dry_run: plan.dry_run,
             issued_at_ms,
+            render_id: Some(plan.transport_sha256()?),
             before_publish: Some(&mut record_preflight),
         },
     )?;

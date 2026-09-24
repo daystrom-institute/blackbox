@@ -307,12 +307,12 @@ impl BlackboxServer {
         let mut attempt = 0;
         let (record, diagnostics) = loop {
             attempt += 1;
-            let (operation_id, sequence) = runtime.reserve(&owner.project_id)?;
+            let (operation_id, sequence, issued_at_ms) = runtime.reserve(&owner.project_id)?;
             let authority = ProjectRenderProducerAuthorityV1 {
                 producer_id: owner.producer_id.clone(),
                 operation_id,
                 sequence,
-                issued_at_ms: bbox_project_render::execute::now_unix_ms(),
+                issued_at_ms,
             };
             let (plan, _) = self.owner_render_plan(&owner, &request, authority)?;
             match runtime.create(
@@ -455,7 +455,16 @@ impl BlackboxServer {
                 response["status"] = "render_superseded".into();
                 response["superseded_by"] = by.clone().into();
                 response["current"] = false.into();
-                response["detail"] = "A newer render of this project was issued before this operation settled; it was not applied.".into();
+                // Supersession stops delivery; it is not evidence about the
+                // checkout. An operation already handed to its owner may
+                // have written outputs before the newer render was issued.
+                if record.delivered_at_unix_secs.is_some() {
+                    response["application"] = "unknown".into();
+                    response["detail"] = "A newer render of this project was issued after this operation was delivered to its checkout owner and before the owner returned a receipt. The owner may have written some or all of its outputs; whether it applied is unknown. Follow the newer render for the checkout's current state.".into();
+                } else {
+                    response["application"] = "not_applied".into();
+                    response["detail"] = "A newer render of this project was issued before this operation was delivered to its checkout owner; it was not applied.".into();
+                }
             }
             RenderOperationState::Failed { error } => {
                 bail!(

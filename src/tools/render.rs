@@ -206,7 +206,7 @@ impl BlackboxServer {
                     // checkout freshness fence and echoes it on completion,
                     // where it orders the completion evidence.
                     if offset == 0 {
-                        let issued_at_ms = bbox_project_render::execute::now_unix_ms();
+                        let issued_at_ms = bbox_project_render::execute::issue_render_ms();
                         server
                             .state
                             .render_locality_observations
@@ -1600,8 +1600,9 @@ mod catalog_render_tests {
         );
 
         // The owner makes CLAUDE.md handwritten. Render B of the unchanged
-        // knowledge refuses it and completes first.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // knowledge, fetched with no wait (typically within A's
+        // millisecond), still gets a later issuance; it refuses the file and
+        // completes first.
         std::fs::write(local_root.join("CLAUDE.md"), "handwritten by the owner\n").unwrap();
         let newer = fetch_render_plan_for_test(&server, params.clone()).await;
         assert_eq!(older.plan_sha256, newer.plan_sha256);

@@ -574,6 +574,42 @@ fn execute_operation(plan: &ProjectRenderPlanV1, root: &Path) -> Result<ProjectR
 }
 
 #[test]
+fn render_issuances_are_strictly_increasing_at_an_equal_clock() {
+    let last = std::sync::atomic::AtomicU64::new(0);
+    assert_eq!(next_render_issuance(&last, 500), 500);
+    assert_eq!(next_render_issuance(&last, 500), 501);
+    assert_eq!(next_render_issuance(&last, 400), 502, "a clock step back");
+    assert_eq!(next_render_issuance(&last, 900), 900);
+    let first = issue_render_ms();
+    assert!(issue_render_ms() > first);
+}
+
+#[test]
+fn a_different_render_at_an_equal_issuance_never_replaces_its_output() {
+    let (_directory, root) = temp_root();
+    // The collector fetched plan A; the bound harness was issued plan B,
+    // with different content, in the same millisecond, and applied first.
+    let collector = plan_issued_at("EQUAL_CLOCK_COLLECTOR_PLAN", 51, 500);
+    let mut harness = producer_plan(Some("claude"), false);
+    harness.producer = None;
+    harness.workspace_id = "workspace-a".into();
+    harness.entries[0].content = "EQUAL_CLOCK_HARNESS_PLAN".into();
+    execute_workspace_render_plan(&harness, &root, &scope(), "workspace-a", Some(500)).unwrap();
+    let harness_bytes = fs::read(root.join("CLAUDE.md")).unwrap();
+
+    let error = execute_operation(&collector, &root).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("error.render_superseded"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(root.join("CLAUDE.md")).unwrap(), harness_bytes);
+
+    // Only the render that set the fence applies again at its issuance.
+    execute_workspace_render_plan(&harness, &root, &scope(), "workspace-a", Some(500)).unwrap();
+    assert_eq!(fs::read(root.join("CLAUDE.md")).unwrap(), harness_bytes);
+}
+
+#[test]
 fn an_older_plan_never_replaces_output_a_newer_harness_render_produced() {
     let (_directory, root) = temp_root();
     // The collector fetched an older plan, then paused.
@@ -1133,11 +1169,14 @@ fn a_write_after_the_final_check_stays_reachable_in_the_render_backups() {
 #[test]
 fn render_backups_are_bounded() {
     let (_directory, root) = temp_root();
-    let plan_a = plan_issued_at("BACKUP_A", 41, 1_000);
-    let plan_b = plan_issued_at("BACKUP_B", 42, 1_000);
     for round in 0..(MAX_RENDER_BACKUPS + 5) {
-        let plan = if round % 2 == 0 { &plan_a } else { &plan_b };
-        execute_operation(plan, &root).unwrap();
+        let (content, operation) = if round % 2 == 0 {
+            ("BACKUP_A", 41)
+        } else {
+            ("BACKUP_B", 42)
+        };
+        let plan = plan_issued_at(content, operation, 1_000 + round as u64);
+        execute_operation(&plan, &root).unwrap();
     }
     let backups = fs::read_dir(root.join(".bbox/local/render-backups"))
         .unwrap()

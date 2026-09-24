@@ -21,7 +21,7 @@ use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite
 use bbox_corpus_core::project_selector::project_scope_matches;
 
 use bbox_project_render::execute::{
-    ApplyOptions, ProjectEntrypoint, apply_project_render, now_unix_ms,
+    ApplyOptions, ProjectEntrypoint, apply_project_render, issue_render_ms,
 };
 pub use bbox_project_render::execute::{
     CheckoutRenderLock, DEFAULT_RENDER_LOCK_TIMEOUT, execute_project_render_plan,
@@ -3198,14 +3198,15 @@ impl Knowledge {
                 })
                 .collect::<Vec<_>>();
             // This adapter renders the knowledge current at this instant, so
-            // its issuance is now on the daemon clock.
+            // its issuance is allocated now on the daemon clock.
             let applied = apply_project_render(
                 root,
                 &satellites,
                 &entrypoints,
                 ApplyOptions {
                     dry_run,
-                    issued_at_ms: Some(now_unix_ms()),
+                    issued_at_ms: Some(issue_render_ms()),
+                    render_id: None,
                     before_publish: None,
                 },
             )?;

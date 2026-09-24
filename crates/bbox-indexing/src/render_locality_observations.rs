@@ -124,7 +124,8 @@ impl RenderLocalityObservationsV1 {
     /// `issued_at_ms` is the daemon-clock issuance of the applied plan. A
     /// completion of a plan issued before the one already recorded for the
     /// same project and view is historical: it never replaces the newer
-    /// evidence and returns `None`.
+    /// evidence and returns `None`. So is a different receipt at the same
+    /// issuance.
     pub fn record_completed(
         &self,
         plan: &ProjectRenderPlanV1,
@@ -157,10 +158,14 @@ impl RenderLocalityObservationsV1 {
             let position = snapshot
                 .completions
                 .binary_search_by(|current| (current.project_id.as_str(), current.view).cmp(&key));
+            // Issuances are allocated strictly increasing, so an equal one
+            // is the same render reporting again; a different receipt at an
+            // equal issuance cannot be ordered and never replaces the row.
             if let Ok(index) = position
-                && snapshot.completions[index]
-                    .issued_at_ms
-                    .is_some_and(|recorded| recorded > issued_at_ms)
+                && let Some(recorded) = snapshot.completions[index].issued_at_ms
+                && (recorded > issued_at_ms
+                    || (recorded == issued_at_ms
+                        && snapshot.completions[index].receipt_sha256 != receipt_sha256))
             {
                 return Ok(None);
             }
@@ -429,5 +434,36 @@ mod tests {
             .record_completed(&plan, &receipt(&plan), 250)
             .unwrap()
             .expect("a later completion replaces the row");
+    }
+
+    /// Two renders cannot share an issuance, so a different receipt at the
+    /// recorded issuance is never ordered after it: a written receipt at an
+    /// equal clock reading never replaces a refusal.
+    #[test]
+    fn a_different_completion_at_an_equal_issuance_never_replaces_evidence() {
+        let observations = RenderLocalityObservationsV1::in_memory();
+        let plan = plan(ProjectRenderViewV1::Published);
+        let mut written = receipt(&plan);
+        written.project_doc_nonempty = true;
+        written.projections = plan.expected_projections(true, Some(200)).unwrap();
+        let mut refused = written.clone();
+        refused.projections[0].disposition = ProjectRenderDispositionV1::Refused;
+        observations
+            .record_completed(&plan, &refused, 200)
+            .unwrap()
+            .expect("the refusal is recorded");
+        let recorded = observations.snapshot();
+        assert_eq!(recorded.completions[0].refused_count, 1);
+        assert_eq!(
+            observations.record_completed(&plan, &written, 200).unwrap(),
+            None
+        );
+        assert_eq!(observations.snapshot(), recorded);
+        // The same render reporting again stays recorded as itself.
+        observations
+            .record_completed(&plan, &refused, 200)
+            .unwrap()
+            .expect("an identical report is accepted");
+        assert_eq!(observations.snapshot().completions[0].refused_count, 1);
     }
 }

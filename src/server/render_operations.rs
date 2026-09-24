@@ -56,7 +56,8 @@ pub(crate) enum RenderOperationState {
     /// Plan persisted; awaiting the owner.
     Pending,
     /// A newer operation for the project was issued before this one
-    /// settled. It is no longer delivered.
+    /// settled. It is no longer delivered. If it was already delivered, the
+    /// owner may have applied it; supersession alone does not say.
     Superseded { by: String },
     /// The owner applied the plan and returned this exact receipt.
     Completed {
@@ -350,7 +351,10 @@ impl RenderOperationRuntime {
     /// Mint the id and sequence of a new operation. The caller builds the
     /// plan with them and hands it to [`Self::create`], which rechecks the
     /// sequence against concurrent renders of the same project.
-    pub(crate) fn reserve(&self, project_id: &str) -> Result<(String, u64)> {
+    /// Reserve an operation id, a sequence, and a daemon-clock issuance. The
+    /// issuance is allocated under the same lock that orders creation, so an
+    /// operation created after another always has the later issuance.
+    pub(crate) fn reserve(&self, project_id: &str) -> Result<(String, u64, u64)> {
         let state = self.state.lock();
         let pending = state
             .index
@@ -369,7 +373,8 @@ impl RenderOperationRuntime {
         let now_millis = self.clock.now_secs().saturating_mul(1000);
         let sequence = last.saturating_add(1).max(now_millis);
         let operation_id = format_render_operation_id(uuid::Uuid::new_v4().as_u128());
-        Ok((operation_id, sequence))
+        let issued_at_ms = bbox_project_render::execute::issue_render_ms();
+        Ok((operation_id, sequence, issued_at_ms))
     }
 
     /// Persist a reserved operation with its immutable plan bytes. Older
@@ -880,7 +885,7 @@ mod tests {
         runtime: &RenderOperationRuntime,
         entry: KnowledgeEntry,
     ) -> RenderOperationRecord {
-        let (operation_id, sequence) = runtime.reserve(PROJECT).unwrap();
+        let (operation_id, sequence, _) = runtime.reserve(PROJECT).unwrap();
         let plan = ProjectRenderPlanV1 {
             version: PROJECT_RENDER_TRANSPORT_VERSION,
             project_id: PROJECT.into(),

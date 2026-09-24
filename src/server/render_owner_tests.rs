@@ -15,7 +15,9 @@ use bbox_project_render::transport::{
     ExpectedRenderAuthority, PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderDispositionV1,
     ProjectRenderPlanAssemblerV1, ProjectRenderReceiptV1, ProjectRenderViewV1,
 };
-use bbox_project_render::wire::{RENDER_LANE_SCHEMA_VERSION, RenderLanePollRequestV1};
+use bbox_project_render::wire::{
+    RENDER_LANE_SCHEMA_VERSION, RenderLanePollRequestV1, RenderOperationDeliveryV1,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
 
@@ -166,6 +168,28 @@ fn apply_one(
     roots: &BTreeMap<PublishedScope, PathBuf>,
     edit: impl Fn(&mut ProjectRenderReceiptV1),
 ) -> Option<(String, ProjectRenderReceiptV1)> {
+    let (operation, mut receipt) = deliver_and_execute(server, roots)?;
+    edit(&mut receipt);
+    server
+        .state
+        .render_operations
+        .settle(
+            PRODUCER,
+            &operation.operation_id,
+            &operation.plan_sha256,
+            &grant_of(server, PRODUCER),
+            Ok(receipt.clone()),
+        )
+        .unwrap();
+    Some((operation.operation_id, receipt))
+}
+
+/// Take one delivered operation and apply its plan the way the collector
+/// does, without reporting a result.
+fn deliver_and_execute(
+    server: &BlackboxServer,
+    roots: &BTreeMap<PublishedScope, PathBuf>,
+) -> Option<(RenderOperationDeliveryV1, ProjectRenderReceiptV1)> {
     let grant = grant_of(server, PRODUCER);
     let runtime = &server.state.render_operations;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -198,7 +222,7 @@ fn apply_one(
             }
             offset = next.unwrap();
         };
-        let mut receipt = execute_project_render_plan_as(
+        let receipt = execute_project_render_plan_as(
             &plan,
             &roots[&operation.scope],
             &operation.scope,
@@ -209,17 +233,7 @@ fn apply_one(
         )
         .unwrap()
         .receipt;
-        edit(&mut receipt);
-        runtime
-            .settle(
-                PRODUCER,
-                &operation.operation_id,
-                &operation.plan_sha256,
-                &grant,
-                Ok(receipt.clone()),
-            )
-            .unwrap();
-        return Some((operation.operation_id, receipt));
+        return Some((operation, receipt));
     }
     None
 }
@@ -914,4 +928,74 @@ async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidenc
         evidence,
         "historical completion never replaces newer evidence"
     );
+}
+
+/// Supersession stops delivery; it says nothing about what an owner already
+/// wrote. A that was delivered and published before its owner stopped, then
+/// superseded by B, is never reported as not applied. An operation
+/// superseded before delivery is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_operation_that_was_delivered_is_never_reported_unapplied() {
+    let owner = OwnerFixture::new();
+    let (scope, _) = scopes();
+    let server = owner.server();
+    server
+        .state
+        .render_operations
+        .set_wait_timeout_for_test(Duration::from_millis(20));
+    announce(&server, owner.roots.keys().cloned().collect());
+    let recover = |operation_id: String| {
+        let server = server.clone();
+        async move {
+            parse(
+                &server
+                    .bbox_render(Parameters(RenderParams {
+                        operation: Some(operation_id),
+                        project: Some(UNCOVERED.into()),
+                        ..Default::default()
+                    }))
+                    .await,
+            )
+        }
+    };
+
+    // A publishes CLAUDE.md, then its owner stops before reporting.
+    let first = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    let first = first["operation_id"].as_str().unwrap().to_string();
+    let (delivered, _) = deliver_and_execute(&server, &owner.roots).unwrap();
+    assert_eq!(delivered.operation_id, first);
+    assert!(owner.root(&scope).join("CLAUDE.md").is_file());
+
+    // B is issued and supersedes A; B is never delivered before C.
+    let second = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    assert_eq!(second["status"], "render_pending");
+    let second = second["operation_id"].as_str().unwrap().to_string();
+    let third = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    assert_eq!(third["status"], "render_pending");
+
+    let applied = recover(first).await;
+    assert_eq!(applied["status"], "render_superseded");
+    assert_eq!(applied["application"], "unknown");
+    assert_eq!(applied["current"], false);
+    assert!(
+        !applied["detail"].as_str().unwrap().contains("not applied"),
+        "{applied}"
+    );
+    assert!(owner.root(&scope).join("CLAUDE.md").is_file());
+
+    let never_delivered = recover(second).await;
+    assert_eq!(never_delivered["status"], "render_superseded");
+    assert_eq!(never_delivered["application"], "not_applied");
 }
