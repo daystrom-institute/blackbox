@@ -134,9 +134,13 @@ pub(crate) fn combine_dispatch_filters(
     }
 }
 
+/// `project` is the project MCP store the caller resolved for this dispatch
+/// (`BlackboxServer::dispatch_project_mcp_store`): the daemon-local store in
+/// bridge mode, the accepted store in catalog mode. This function never reads
+/// a project path itself.
 pub(crate) fn resolve_dispatch_filters(
     provider: Provider,
-    project_dir: Option<&str>,
+    project: Option<&orchestration::mcp::McpStore>,
     allow_recursion: bool,
     _task_id: &str,
     extra: Option<&orchestration::mcp::McpFilters>,
@@ -144,13 +148,10 @@ pub(crate) fn resolve_dispatch_filters(
     let global = orchestration::mcp::global_store_path()
         .and_then(|p| orchestration::mcp::McpStore::load(&p).ok())
         .unwrap_or_default();
-    let project = project_dir
-        .map(|pd| orchestration::mcp::project_store_path(Path::new(pd)))
-        .and_then(|p| orchestration::mcp::McpStore::load(&p).ok());
 
     let mut eff = orchestration::mcp::resolve_effective(
         &global,
-        project.as_ref(),
+        project,
         /* include_default_guard */ !allow_recursion,
     );
 

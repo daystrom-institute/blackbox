@@ -20,17 +20,29 @@ pub(crate) fn infer_provider_from_path(path: &Path) -> Option<Provider> {
     None
 }
 
+/// Roster rows resolve each member's brofile through the same project view
+/// dispatch uses: the team's project association selects the accepted
+/// configuration in catalog mode and the daemon-local checkout in bridge mode.
+/// A view that cannot answer leaves the row's provider unknown and is logged;
+/// it never falls back to another store.
 pub(crate) fn build_member_entry(
     team: &orchestration::team::Team,
     member: &orchestration::team::TeamMember,
-    store_dir: &Path,
+    state: &crate::server::state::SharedState,
     config: &index::ReindexConfig,
 ) -> BroRosterEntry {
-    let brofile = orchestration::brofile::resolve_brofile(
-        &member.brofile,
-        store_dir,
-        team.project_dir.as_deref(),
-    );
+    let store_dir: &Path = &state.store_dir;
+    let brofile = state
+        .dispatch_brofile(&member.brofile, team.project_dir.as_deref())
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                team = %team.name,
+                member = %member.name,
+                error = %error,
+                "roster member brofile unavailable"
+            );
+            None
+        });
     let provider = brofile.as_ref().map(|b| b.provider);
     let session_id = member
         .session_id

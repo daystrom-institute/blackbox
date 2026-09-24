@@ -546,9 +546,12 @@ impl BlackboxServer {
         );
         let extra =
             combine_dispatch_filters(request.brofile_filters.as_ref(), params_extra.as_ref());
+        let project_mcp = self
+            .state.dispatch_project_mcp_store(request.cwd.as_deref())
+            .map_err(|error| error.to_string())?;
         let dispatch_filters = resolve_dispatch_filters(
             request.provider,
-            request.cwd.as_deref(),
+            project_mcp.as_ref(),
             request.allow_recursion,
             &task_id,
             extra.as_ref(),
@@ -663,11 +666,15 @@ impl BlackboxServer {
                 "bro_exec requires a dispatch selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`",
             );
         };
-        let brofile_runtime = p
+        let brofile_runtime = match p
             .bro
             .as_deref()
-            .and_then(|name| self.resolve_exec_brofile_for_allocator(name, p.cwd.as_deref()))
-            .and_then(|bf| bf.runtime);
+            .map(|name| self.resolve_exec_brofile_for_allocator(name, p.cwd.as_deref()))
+            .transpose()
+        {
+            Ok(brofile) => brofile.flatten().and_then(|bf| bf.runtime),
+            Err(error) => return Self::err_text(&error),
+        };
         let mut allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
             Ok(request) => request,
             Err(err) => return Self::err_text(&err),
@@ -915,9 +922,13 @@ impl BlackboxServer {
         let params_extra =
             extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
         let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
+        let project_mcp = match self.state.dispatch_project_mcp_store(cwd.as_deref()) {
+            Ok(store) => store,
+            Err(error) => return Self::err_text(&error.to_string()),
+        };
         let dispatch_filters = match resolve_dispatch_filters(
             provider,
-            cwd.as_deref(),
+            project_mcp.as_ref(),
             allow_recursion,
             &task_id,
             extra.as_ref(),
@@ -1823,14 +1834,17 @@ impl BlackboxServer {
                     continue;
                 }
             }
-            let brofile = match orchestration::brofile::resolve_brofile(
-                &member.brofile,
-                &store_dir,
-                super::roster::team_source_project_dir(self, team.project_dir.as_deref()),
-            ) {
-                Some(bf) => bf,
-                None => {
+            let brofile = match self
+                .state
+                .dispatch_brofile(&member.brofile, team.project_dir.as_deref())
+            {
+                Ok(Some(bf)) => bf,
+                Ok(None) => {
                     launched.push(json!({"bro": member.name, "error": format!("Brofile not found: {}", member.brofile)}));
+                    continue;
+                }
+                Err(error) => {
+                    launched.push(json!({"bro": member.name, "error": error}));
                     continue;
                 }
             };
@@ -1991,9 +2005,17 @@ impl BlackboxServer {
                         Some(&dispatch_context),
                         exec_opts.as_ref(),
                     );
+                    let project_mcp = match self.state.dispatch_project_mcp_store(member_cwd.as_deref())
+                    {
+                        Ok(store) => store,
+                        Err(error) => {
+                            launched.push(json!({"bro":member.name,"error":error.to_string()}));
+                            continue;
+                        }
+                    };
                     let df = match resolve_dispatch_filters(
                         effective_provider,
-                        member_cwd.as_deref(),
+                        project_mcp.as_ref(),
                         allow_recursion,
                         &task_id,
                         extra.as_ref(),
@@ -2054,9 +2076,16 @@ impl BlackboxServer {
                     cwd.as_deref(),
                     exec_opts.as_ref(),
                 );
+                let project_mcp = match self.state.dispatch_project_mcp_store(cwd.as_deref()) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        launched.push(json!({"bro":member.name,"error":error.to_string()}));
+                        continue;
+                    }
+                };
                 let df = match resolve_dispatch_filters(
                     brofile.provider,
-                    cwd.as_deref(),
+                    project_mcp.as_ref(),
                     allow_recursion,
                     &task_id,
                     extra.as_ref(),
@@ -2474,8 +2503,12 @@ impl BlackboxServer {
         let mut args = provider.build_resume_args(session_id, &prompt, None, exec_opts.as_ref());
         // Retro probes never orchestrate — keep the mechanical recursion
         // guard on so a probe can't fan out (or re-trigger prune-retro).
+        let project_mcp = self
+            .state
+            .dispatch_project_mcp_store(cwd.as_deref())
+            .map_err(|error| error.to_string())?;
         let dispatch_filters =
-            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, None)?;
+            resolve_dispatch_filters(provider, project_mcp.as_ref(), false, &task_id, None)?;
         args.extend(dispatch_filters.args);
         let task = orch::spawn_task(
             task_id.clone(),
@@ -2558,16 +2591,12 @@ impl BlackboxServer {
             ) {
                 Ok(Some(bro_match)) => {
                     let member = &bro_match.team.members[bro_match.member_idx];
-                    orchestration::brofile::resolve_brofile(
+                    self.state.dispatch_brofile(
                         &member.brofile,
-                        &self.state.store_dir,
-                        super::roster::team_source_project_dir(
-                            self,
-                            bro_match.team.project_dir.as_deref(),
-                        ),
-                    )
+                        bro_match.team.project_dir.as_deref(),
+                    )?
                 }
-                _ => orchestration::brofile::resolve_brofile(label, &self.state.store_dir, cwd),
+                _ => self.state.dispatch_brofile(label, cwd)?,
             };
             if let Some(bf) = brofile {
                 orchestration::brofile::enforce_provider_defaults(provider, bf.context.as_ref())?;
@@ -2704,18 +2733,16 @@ impl BlackboxServer {
         &self,
         bro_name: &str,
         project_dir: Option<&str>,
-    ) -> Option<orchestration::brofile::Brofile> {
+    ) -> Result<Option<orchestration::brofile::Brofile>, String> {
         let store_dir = &self.state.store_dir;
         let teams = orchestration::team::load_all_teams(store_dir);
         if let Ok(Some(bro_match)) = orchestration::team::resolve_bro_selector(bro_name, &teams) {
             let member = &bro_match.team.members[bro_match.member_idx];
-            return orchestration::brofile::resolve_brofile(
-                &member.brofile,
-                store_dir,
-                super::roster::team_source_project_dir(self, bro_match.team.project_dir.as_deref()),
-            );
+            return self
+                .state
+                .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref());
         }
-        orchestration::brofile::resolve_brofile(bro_name, store_dir, project_dir)
+        self.state.dispatch_brofile(bro_name, project_dir)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2745,15 +2772,10 @@ impl BlackboxServer {
             match orchestration::team::resolve_bro_selector(name, &teams)? {
                 Some(bro_match) => {
                     let member = &bro_match.team.members[bro_match.member_idx];
-                    let bf = orchestration::brofile::resolve_brofile(
-                        &member.brofile,
-                        store_dir,
-                        super::roster::team_source_project_dir(
-                            self,
-                            bro_match.team.project_dir.as_deref(),
-                        ),
-                    )
-                    .ok_or(format!("Brofile not found: {}", member.brofile))?;
+                    let bf = self
+                        .state
+                        .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
+                        .ok_or(format!("Brofile not found: {}", member.brofile))?;
                     orchestration::brofile::enforce_provider_defaults(
                         bf.provider,
                         bf.context.as_ref(),
@@ -2815,7 +2837,9 @@ impl BlackboxServer {
                     // Standalone brofile fallback
                 }
             }
-            let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
+            let bf = self
+                .state
+                .dispatch_brofile(name, project_dir)?
                 .ok_or(format!("Unknown bro or brofile: {name}"))?;
             orchestration::brofile::enforce_provider_defaults(bf.provider, bf.context.as_ref())?;
             let env = orchestration::brofile::resolve_provider_env(
@@ -2944,9 +2968,7 @@ impl BlackboxServer {
             let teams = orchestration::team::load_all_teams(store_dir);
             let bro_match = orchestration::team::resolve_bro_selector(name, &teams)?
                 .ok_or_else(|| {
-                    if orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
-                        .is_some()
-                    {
+                    if matches!(self.state.dispatch_brofile(name, project_dir), Ok(Some(_))) {
                         format!(
                             "Brofile \"{name}\" is not in a team — use exec first or provide session_id + provider"
                         )
@@ -2966,12 +2988,10 @@ impl BlackboxServer {
                 sid,
                 member.task_history.last().map(String::as_str),
             )?;
-            let bf = orchestration::brofile::resolve_brofile(
-                &member.brofile,
-                store_dir,
-                super::roster::team_source_project_dir(self, bro_match.team.project_dir.as_deref()),
-            )
-            .ok_or(format!("Brofile not found: {}", member.brofile))?;
+            let bf = self
+                .state
+                .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
+                .ok_or(format!("Brofile not found: {}", member.brofile))?;
             let lease = member.task_history.last().and_then(|task_id| {
                 orchestration::allocator::lookup_lease_for_task(store_dir, task_id)
             });
@@ -3329,6 +3349,7 @@ mod tests {
         };
         let bf = server
             .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+            .unwrap()
             .unwrap();
         assert_eq!(bf.provider, expected_provider);
         let (provider, _, opts, _, cwd, _, _, _, _) = server
@@ -3364,6 +3385,7 @@ mod tests {
             assert!(
                 server
                     .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+                    .unwrap()
                     .is_none()
             );
             assert!(

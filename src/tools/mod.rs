@@ -26,6 +26,7 @@ pub mod mcp_surface;
 pub mod notes;
 pub mod packets;
 pub mod project_catalog;
+pub mod project_config;
 pub mod projects;
 pub mod render;
 pub mod roster;
