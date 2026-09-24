@@ -17,7 +17,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/contextual-recall/overfires-on-procedural-state-work",
   "notes": "Existing gap gap-5e3e3dff is marked addressed, but the current session reproduced the same operator-visible failure mode: while checking whether a bbox_knowledge over-nudging gap already existed, the agent used bbox_gaps as requested and still received repeated recall/reporting nudges. The operator explicitly challenged the noise ('why do you keep mentioning bbox_knowledge?') in the preceding task, making this a UX defect rather than just prompt-compliance chatter.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-13T21:52:38Z",
-  "updated_at": "2026-06-13T21:52:38Z"
+  "updated_at": "2026-09-24T08:31:37Z",
+  "resolved_at": "2026-09-24T08:31:37Z",
+  "resolution_note": "obsolete: 36ef9610 made the recall and milestone directives standing instead of per-turn (no repeated injection after tool calls) and RECALL_DIRECTIVE in src/orchestration/mod.rs now exempts gap-store checks/writes (bbox_gaps/bbox_gap*), threads, notes, and repo-owned state commits; pinned by dispatch_context_recall_directive_is_standing_and_exempts_live_state_surfaces. The only remaining bbox_knowledge harness nudge (HedgedConventionHook in crates/bro-harness/src/hooks.rs) is lexical on hedged-convention phrasing and throttled, not triggered by gap-store tool calls."
 }
