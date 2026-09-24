@@ -7,16 +7,22 @@
   "missing_primitive": "automatic knowledge-transport coverage for producer-onboarded projects, or producer-binding-aware reconciliation that does not fall back to local discovery",
   "fallback_used": "None; the warnings and overlay diagnostics are cosmetic once the accepted publication is producer-bound. Enrolling through the offline knowledge-transport-cutover ceremony would require another daemon maintenance window.",
   "evidence": [
-    "src/server/knowledge_lifecycle.rs checkout reconciliation loop: knowledge_transport_cutover.covers_project_str gate before acquire_selected_project_access(ArtifactWatchDiscovery)",
+    "src/server/knowledge_lifecycle.rs reconcile_dark_knowledge_checkouts: discovery loop skips only knowledge_transport_cutover-covered projects, else acquire_selected_project_access(ArtifactWatchDiscovery) and WARN 'checkout reconciliation skipped unavailable discovery authority'",
     "crates/bbox-indexing/src/checkout_access_v2.rs canonical_directory maps canonicalize failure to AttachmentInactive",
-    "src/server/knowledge_view.rs from_checkout_access renders AttachmentInactive as \"the attachment is detached\"",
-    "daemon boot log 2026-09-04: one warning per project onboarded on 2026-09-03; bbox_gaps diagnostics list the same projects"
+    "src/server/open.rs and src/server/routes.rs sync_kb_project_roots: every uncovered project becomes a gap/knowledge carrier; crates/bbox-gaps/src/gaps.rs load_project_entries records degraded_carriers; src/tools/gaps.rs and src/tools/knowledge.rs emit 'store overlay skipped' per call",
+    "src/server/knowledge_view.rs OverlayDegradation::from_checkout_access renders AttachmentInactive as 'the attachment is detached'",
+    "src/server/code_source.rs catalog_onboard never extends the cutover marker; marker loaded once at boot in src/server/open.rs, written only by ProjectCatalogKnowledgeTransportCutoverFacadeV1::apply",
+    "crates/bbox-indexing/src/knowledge_transport_cutover.rs classify_project returns Uncovered without consulting a producer binding",
+    "src/bin/blackbox.rs execute_knowledge_transport_cutover --apply/--verify require the daemon stopped"
   ],
   "impact": "low",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/project-catalog/onboard-knowledge-transport-cutover-enrollment",
-  "resolution": "unresolved",
+  "notes": "Triage trace at a66c6813: still relevant; live bbox_gaps diagnostics still show one 'gap store overlay skipped ... checkout authority root cannot be canonicalized' row. Correction: the per-call diagnostic comes from the gap/knowledge stores' degraded carrier list (recorded at carrier load), not the view overlays. An unmerged hygiene commit only rate-limits the reconciliation WARN; it adds no coverage.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-04T14:46:55Z",
-  "updated_at": "2026-09-04T14:46:55Z"
+  "updated_at": "2026-09-24T02:36:22Z",
+  "resolved_at": "2026-09-24T02:36:22Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/48"
 }

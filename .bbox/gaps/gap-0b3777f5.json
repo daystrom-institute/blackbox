@@ -7,16 +7,23 @@
   "missing_primitive": "staleness/starvation telemetry on the accepted-publication pointer and its candidate producer",
   "fallback_used": "Diagnosed by hand (publisher_status last_attempt=null, host collector log grep), rebuilt and stablesign-redeployed the host bbox-code-collector to clear the wire skew, then let the granted auto-advance accept the next Ready candidate.",
   "evidence": [
-    "bbox_project_publisher_status 89bd722f 2026-08-14: accepted c0d3345f, grant enabled+eligible, last_attempt=null",
-    "~/Library/Logs/bbox-code-collector.log: kps candidates quiet after 2026-08-13T20:47, decode ERRORs through 2026-08-14T19:53, recovered 20:01 after binary redeploy",
+    "src/tools/project_catalog.rs bbox_project_publisher_status: accepted_state reports pointer integrity (current/prior/missing/corrupt), not freshness; no pointer age, ref-tip comparison, or last-candidate fields",
+    "crates/bbox-indexing/src/accepted_publication_store.rs AcceptedPublicationPointerV1 carries no install/accept timestamp",
+    "src/server/publisher_auto_advance.rs PublisherAutoAdvanceLedger: last_attempt is in-process only and cleared on restart, so last_attempt=null cannot distinguish never-fired from restarted",
+    "crates/bbox-code-collector/src/main.rs run_published_knowledge_lane and LanePassOutcome::record: lane failures are tracing::error only, nothing reaches the daemon",
+    "src/tools/attention.rs collect_conversation_producer_silence: inbox producer-silence rows exist only for conversation connectors",
+    "crates/bbox-code-collector/src/main.rs send_json: plain response.json(), never reads DAEMON_BUILD_ID_HEADER; code-source response DTOs in crates/bbox-code-source/src/lib.rs still deny_unknown_fields",
     "thread-21347ce5"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/knowledge-publication/auto-advance-starved-silently",
-  "resolution": "unresolved",
+  "notes": "Triage trace at a66c6813: still relevant. Commit 0393b6d8 made knowledge-source response DTOs tolerant (item 3 partly addressed for that lane), but the collector does not report daemon build-id skew and code-source/git-source responses it decodes remain strict. Items 1, 2 and 4 (staleness surfacing, loud producer failure, candidate-production health) are unimplemented.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-21347ce5",
   "created_at": "2026-08-14T20:01:42Z",
-  "updated_at": "2026-08-14T20:01:42Z"
+  "updated_at": "2026-09-24T02:36:19Z",
+  "resolved_at": "2026-09-24T02:36:19Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/45"
 }

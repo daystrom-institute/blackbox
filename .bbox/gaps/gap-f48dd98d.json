@@ -7,17 +7,23 @@
   "missing_primitive": "ref-update-triggered publish on checkout attachments (watcher registration) plus incremental post-acceptance view application",
   "fallback_used": "Dropped this host's collector interval_secs from 900 to 120 (cycles are ~200ms no-ops when current, so faster polling is nearly free); auto-advance grants remove the manual acceptance wait; own-visibility workspace captures already give sub-second iteration for the authoring checkout.",
   "evidence": [
-    "thread-a2062843",
-    "bbox_project_publisher_status watcher block (capable_but_unregistered)",
-    "gap-a6911d0e (acceptance half of the same latency story, addressed)"
+    "crates/bbox-code-collector/src/main.rs run_published_knowledge_lane: timer loop on interval_secs (default_interval_secs = 120, +-10% jitter), backoff to 15 min on whole-lane failure",
+    "crates/bbox-code-source/src/lib.rs ProducerCommandV1: only kind=enroll, no publish-now command",
+    "src/server/checkout_access.rs catalog_watch_carriers skips cutover-covered projects; collector-owned attachments always report capable_but_unregistered",
+    "src/server/state.rs watcher_runtime_view; src/tools/project_catalog.rs publisher_health_summary watcher block",
+    "src/server/background.rs start_bbox_watcher reacts only to local .bbox/knowledge and .bbox/gaps changes, not .git refs",
+    "src/server/knowledge_view.rs refresh_published_graph_views: post-acceptance graph view is rebuilt per project synchronously; edge_index_warming is the separate EdgeIndex watcher (issue #44)",
+    "thread-a2062843"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/knowledge-transport-latency/event-driven-checkout-publication",
-  "notes": "Surfaced by the operator during the graph exemplar closeout: a 20-30 minute commit-to-useful wall clock reads as broken to an iterating user even though every stage is individually healthy. The latency budget worth designing to: commit to candidate in under 5s (event), acceptance instant (grant, shipped), serving under 30s (incremental view application).",
-  "resolution": "unresolved",
+  "notes": "Triage trace at a66c6813: still relevant for the commit-to-candidate half; only the collector timer triggers publication. Correction to the record: the post-acceptance tail for knowledge, gaps and the published graph view is applied synchronously per project on accept; the edge_index_warming / store-only nudge deferral belongs to the code EdgeIndex watcher, which the accept path does not nudge and which is tracked by issue #44.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-13T16:51:56Z",
-  "updated_at": "2026-08-13T16:51:56Z"
+  "updated_at": "2026-09-24T02:36:21Z",
+  "resolved_at": "2026-09-24T02:36:21Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/47"
 }

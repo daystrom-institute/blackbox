@@ -7,18 +7,22 @@
   "missing_primitive": "Graphs-lane manifest enumeration that filters to the four known graph files (or a validator that tolerates non-graph provenance files under a graph directory) plus a loud per-project failure signal",
   "fallback_used": "Diagnosed by hand from publisher_status plus a host log grep. Interim unblock proposed to the operator: relocate the committed plan file out of the graph directory (and amend the plans convention) so the next collector cycle produces a candidate; substrate fix to follow.",
   "evidence": [
-    "crates/bbox-knowledge-source/src/lib.rs:1483-1503 (Graphs lane path validator, InvalidGraphSourcePath)",
-    "host collector log: repeated ERROR lane=published-knowledge root=<primary checkout> error=graph source path is not exactly <graph-id>/<known-file>, every ~2 min from 2026-08-18T22:57Z onward",
-    "bbox_project_publisher_status 89bd722f 2026-08-19T01:00Z: accepted 45606cdf, auto_advance grant enabled and eligible, last_attempt null",
-    ".bbox/graphs/design/plans/2026-08-18-gap-campaigns.jsonl committed in 906c3ef5",
+    "crates/bbox-knowledge-source/src/lib.rs validate_source_filename (Graphs lane, InvalidGraphSourcePath) and validate_graph_source_manifest",
+    "crates/bbox-code-collector/src/main.rs capture_publication_lane: every file from list_verified_committed_dir_bounded(.bbox/graphs) becomes a manifest entry, no filename or depth filter",
+    "crates/bbox-corpus-core/src/git.rs list_verified_committed_dir_bounded walks subtrees recursively",
+    "crates/bbox-knowledge-source-client/src/lib.rs capture_working_graphs rejects unknown files in a graph directory for provisional captures",
+    "crates/bbox-knowledge-source-store/src/lib.rs re-validates candidates daemon-side",
+    "b3745b6d moved the plan file to .bbox/design/plans/ as a workaround; validator and enumeration unchanged",
     "gap-0b3777f5 (silent staleness, the surfacing half)"
   ],
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/knowledge-source/graphs-lane-rejects-nested-plan-files",
-  "notes": "Filed by the gap manager 2026-08-19 during the pulse survey; substrate-genuine (any project that keeps non-graph files under a graph directory hits it). Acknowledged at triage. Escalated to the operator in-session as blocks_class_of_work; not self-dispatched.",
-  "resolution": "unresolved",
+  "notes": "Triage trace at a66c6813: still relevant. The plan file was relocated (b3745b6d) so this repo publishes today, but any non-graph file under .bbox/graphs/<id>/ still fails the whole project's publication candidate (all four lanes validate together). Only design/corpus/agentic-corpus/gap-campaign-migration.md names a plans location; docs/design-graph.md says plans are committed alongside the landing without a path.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-19T01:03:33Z",
-  "updated_at": "2026-08-19T01:03:33Z"
+  "updated_at": "2026-09-24T02:36:20Z",
+  "resolved_at": "2026-09-24T02:36:20Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/46"
 }
