@@ -49,6 +49,11 @@ pub const MAX_MANIFEST_PAGES: u64 = 100_000;
 pub const MAX_OPEN_UPLOADS: u64 = 1_024;
 pub const MAX_GENERATION_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_REPOSITORY_RELATIVE_FILENAME_BYTES: usize = 4096;
+/// The configuration lane is small, hand-authored state: bounded well below
+/// the knowledge lanes so a stray large file fails closed at capture.
+pub const MAX_CONFIG_SOURCE_FILES: u64 = 2_048;
+pub const MAX_CONFIG_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+pub const MAX_CONFIG_SOURCE_LANE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_FULL_REF_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +178,12 @@ pub enum ContractError {
     GraphLimitExceeded,
     #[error("evidence source path is not exactly the single bindings document")]
     InvalidEvidenceSourcePath,
+    #[error("configuration source path is not a project configuration input")]
+    InvalidConfigSourcePath,
+    #[error("configuration source exceeds an enforced configuration limit")]
+    ConfigLimitExceeded,
+    #[error("configuration lane presence does not match its descriptor")]
+    ConfigLanePresenceMismatch,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +220,14 @@ pub enum SourceLaneV1 {
     /// most one file, because one complete valid document replaces one
     /// project's accepted binding set.
     Evidence,
+    /// Repo-owned project bro configuration: `.bro/brofiles/<name>.json`,
+    /// `.bro/teamplates/<name>.json`, `.bbox/mcp.json`, and the committed
+    /// `.bbox/config.toml` its MCP enablement reporting reads. Publication
+    /// only: provisional workspace snapshots never carry it. Unlike the
+    /// other lanes it is explicitly optional on the candidate, so "this
+    /// producer publishes configuration and there is none" and "this
+    /// producer predates the lane" stay distinguishable.
+    Config,
 }
 
 impl SourceLaneV1 {
@@ -218,6 +237,7 @@ impl SourceLaneV1 {
             Self::Gaps => "gaps",
             Self::Graphs => "graphs",
             Self::Evidence => "evidence",
+            Self::Config => "config",
         }
     }
 
@@ -229,6 +249,7 @@ impl SourceLaneV1 {
             Self::Gaps => 2,
             Self::Graphs => 3,
             Self::Evidence => 4,
+            Self::Config => 5,
         }
     }
 }
@@ -353,6 +374,12 @@ pub struct PublicationCandidateDescriptorV1 {
     /// `default` decodes those to the canonical empty lane.
     #[serde(default)]
     pub evidence: SourceManifestDescriptorV1,
+    /// `None` when the producer predates the configuration lane (or the
+    /// daemon it talks to does). `Some` with an empty manifest is a producer
+    /// that captured the lane and found no configuration. Omitted from the
+    /// encoding when absent, so a pre-lane candidate is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SourceManifestDescriptorV1>,
 }
 
 impl PublicationCandidateDescriptorV1 {
@@ -365,12 +392,23 @@ impl PublicationCandidateDescriptorV1 {
         self.gaps.validate_header(limits)?;
         self.graphs.validate_header(limits)?;
         self.evidence.validate_header(limits)?;
+        if let Some(config) = &self.config {
+            config.validate_header(limits)?;
+            if config.file_count > MAX_CONFIG_SOURCE_FILES
+                || config.logical_bytes > MAX_CONFIG_SOURCE_LANE_BYTES
+            {
+                return Err(ContractError::ConfigLimitExceeded);
+            }
+        }
         validate_total_bytes(
             [
                 self.knowledge.logical_bytes,
                 self.gaps.logical_bytes,
                 self.graphs.logical_bytes,
                 self.evidence.logical_bytes,
+                self.config
+                    .as_ref()
+                    .map_or(0, |config| config.logical_bytes),
             ],
             limits.max_generation_bytes,
         )
@@ -474,6 +512,11 @@ pub struct PublicationProbeRequestV1 {
 pub struct PublicationProbeResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<PublicationCandidateStatusV1>,
+    /// The daemon accepts the configuration lane. A producer that captures
+    /// the lane sends it only when this is true, so a newer producer never
+    /// sends an older daemon a descriptor field it would refuse.
+    #[serde(default)]
+    pub config_lane_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -608,6 +651,11 @@ pub struct PublicationCandidateStatusV1 {
     pub graph_files: u64,
     #[serde(default)]
     pub evidence_files: u64,
+    /// `None` when the candidate carries no configuration lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_files: Option<u64>,
     pub logical_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
@@ -902,8 +950,11 @@ pub fn validate_source_manifest(
     if logical_bytes != descriptor.logical_bytes {
         return Err(ContractError::ManifestCountMismatch);
     }
+    // The configuration lane's absence is explicit (`None` on the
+    // candidate), so a present configuration lane never borrows the
+    // canonical absent-lane digest.
     if source_manifest_sha256(lane, entries) != descriptor.manifest_sha256
-        && !absent_lane_commitment(descriptor, entries)
+        && (lane == SourceLaneV1::Config || !absent_lane_commitment(descriptor, entries))
     {
         return Err(ContractError::ManifestCommitmentMismatch);
     }
@@ -931,15 +982,31 @@ fn absent_lane_commitment(
     entries.is_empty() && descriptor.is_absent_lane()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn validate_publication_candidate(
     descriptor: &PublicationCandidateDescriptorV1,
     knowledge: &[SourceFileManifestEntryV1],
     gaps: &[SourceFileManifestEntryV1],
     graphs: &[SourceFileManifestEntryV1],
     evidence: &[SourceFileManifestEntryV1],
+    config: Option<&[SourceFileManifestEntryV1]>,
     limits: KnowledgeSourceLimits,
 ) -> Result<(), ContractError> {
     descriptor.validate_header(limits)?;
+    match (&descriptor.config, config) {
+        (None, None) => {}
+        (Some(manifest), Some(entries)) => {
+            validate_source_manifest(
+                &descriptor.scope,
+                SourceLaneV1::Config,
+                manifest,
+                entries,
+                limits,
+            )?;
+            validate_config_source_manifest(entries)?;
+        }
+        _ => return Err(ContractError::ConfigLanePresenceMismatch),
+    }
     validate_source_manifest(
         &descriptor.scope,
         SourceLaneV1::Knowledge,
@@ -1200,6 +1267,14 @@ fn publication_generation_id_for(
     if vintage.includes_evidence() {
         hash_manifest_descriptor(&mut encoded, &descriptor.evidence);
     }
+    // The configuration lane is explicitly optional, so it needs no rung of
+    // its own: a candidate without it hashes exactly the preimage every
+    // earlier binary minted, and one with it appends a domain-separated
+    // presence field no earlier preimage can contain.
+    if let Some(config) = &descriptor.config {
+        push_field(&mut encoded, b"config-lane-v1");
+        hash_manifest_descriptor(&mut encoded, config);
+    }
     format!("kps_{}", sha256(&encoded))
 }
 
@@ -1229,6 +1304,10 @@ fn admissible_publication_vintages(
     descriptor: &PublicationCandidateDescriptorV1,
 ) -> Vec<LaneVintage> {
     let mut vintages = Vec::new();
+    // No binary older than the configuration lane could carry it.
+    if descriptor.config.is_some() {
+        return vintages;
+    }
     if descriptor.evidence.is_absent_lane() {
         vintages.push(LaneVintage::PreEvidence);
         if descriptor.graphs.is_absent_lane() {
@@ -1453,6 +1532,61 @@ fn validate_full_ref(value: &str) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Scope-root-relative project configuration input a repository-relative
+/// config-lane filename names, or `None` when it names none. The writable
+/// targets are exactly `bbox_code_source::ProjectConfigTargetV1`; the
+/// committed `.bbox/config.toml` is the one read-only input beside them.
+pub fn config_source_scope_relative_path<'a>(
+    scope: &PublishedScope,
+    repository_relative_filename: &'a str,
+) -> Option<&'a str> {
+    let relative = if scope.bbox_root_relpath() == "." {
+        repository_relative_filename
+    } else {
+        repository_relative_filename
+            .strip_prefix(scope.bbox_root_relpath())?
+            .strip_prefix('/')?
+    };
+    (relative == bbox_code_source::PROJECT_CONFIG_TOML_PATH
+        || bbox_code_source::ProjectConfigTargetV1::from_relative_path(relative).is_some())
+    .then_some(relative)
+}
+
+/// Repository-relative filename of a scope-root-relative configuration input.
+pub fn config_source_repository_relative_filename(
+    scope: &PublishedScope,
+    scope_relative_path: &str,
+) -> String {
+    if scope.bbox_root_relpath() == "." {
+        scope_relative_path.to_string()
+    } else {
+        format!("{}/{scope_relative_path}", scope.bbox_root_relpath())
+    }
+}
+
+/// The configuration lane's own count and byte ceilings. The generic
+/// manifest validation already pinned names, order and the per-lane digest.
+fn validate_config_source_manifest(
+    entries: &[SourceFileManifestEntryV1],
+) -> Result<(), ContractError> {
+    if entries.len() as u64 > MAX_CONFIG_SOURCE_FILES {
+        return Err(ContractError::ConfigLimitExceeded);
+    }
+    let mut total = 0_u64;
+    for entry in entries {
+        if entry.encoded_bytes > MAX_CONFIG_SOURCE_FILE_BYTES {
+            return Err(ContractError::ConfigLimitExceeded);
+        }
+        total = total
+            .checked_add(entry.encoded_bytes)
+            .ok_or(ContractError::ConfigLimitExceeded)?;
+    }
+    if total > MAX_CONFIG_SOURCE_LANE_BYTES {
+        return Err(ContractError::ConfigLimitExceeded);
+    }
+    Ok(())
+}
+
 fn validate_source_filename(
     scope: &PublishedScope,
     lane: SourceLaneV1,
@@ -1471,6 +1605,11 @@ fn validate_source_filename(
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
         return Err(ContractError::InvalidSourceFilename);
+    }
+    if lane == SourceLaneV1::Config {
+        return config_source_scope_relative_path(scope, value)
+            .map(|_| ())
+            .ok_or(ContractError::InvalidConfigSourcePath);
     }
     let prefix = if scope.bbox_root_relpath() == "." {
         format!(".bbox/{}/", lane.directory())
@@ -1819,6 +1958,7 @@ mod tests {
             gaps: manifest(SourceLaneV1::Gaps, &gaps),
             graphs: SourceManifestDescriptorV1::default(),
             evidence: SourceManifestDescriptorV1::default(),
+            config: None,
         };
         (descriptor, knowledge, gaps)
     }
@@ -1928,7 +2068,7 @@ mod tests {
             &gaps,
             &[],
             &[],
-            KnowledgeSourceLimits::default(),
+            None,            KnowledgeSourceLimits::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2843,12 +2983,15 @@ mod tests {
             gap_files: 0,
             graph_files: 0,
             evidence_files: 0,
+            config_manifest_sha256: None,
+            config_files: None,
             logical_bytes: 0,
             diagnostic: None,
         };
         assert_eq!(with_extra(&candidate), candidate);
         let publication_probe = PublicationProbeResponseV1 {
             current: Some(candidate),
+            config_lane_supported: true,
         };
         assert_eq!(with_extra(&publication_probe), publication_probe);
     }
@@ -2864,5 +3007,258 @@ mod tests {
         let mut json = serde_json::to_value(&request).unwrap();
         json["stale_field"] = serde_json::json!(1);
         assert!(serde_json::from_value::<ProvisionalProbeRequestV1>(json).is_err());
+    }
+
+    fn config_entries(prefix: &str) -> Vec<SourceFileManifestEntryV1> {
+        let mut entries = vec![
+            entry(&format!("{prefix}.bbox/config.toml"), b"[mcp]\nenabled = true\n"),
+            entry(&format!("{prefix}.bbox/mcp.json"), br#"{"servers":{}}"#),
+            entry(
+                &format!("{prefix}.bro/brofiles/reviewer.json"),
+                br#"{"name":"reviewer"}"#,
+            ),
+            entry(
+                &format!("{prefix}.bro/teamplates/squad.json"),
+                br#"{"name":"squad"}"#,
+            ),
+        ];
+        entries.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        entries
+    }
+
+    fn with_config(
+        mut descriptor: PublicationCandidateDescriptorV1,
+        entries: &[SourceFileManifestEntryV1],
+    ) -> PublicationCandidateDescriptorV1 {
+        descriptor.config = Some(manifest(SourceLaneV1::Config, entries));
+        descriptor
+    }
+
+    #[test]
+    fn config_lane_admits_exactly_the_configuration_inputs_at_root_and_nested_scopes() {
+        let (descriptor, knowledge, gaps) = publication();
+        let config = config_entries("");
+        let descriptor = with_config(descriptor, &config);
+        validate_publication_candidate(
+            &descriptor,
+            &knowledge,
+            &gaps,
+            &[],
+            &[],
+            Some(&config),
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+
+        let nested_scope = PublishedScope::try_new("repo-family", "services/api").unwrap();
+        let nested = config_entries("services/api/");
+        validate_source_manifest(
+            &nested_scope,
+            SourceLaneV1::Config,
+            &manifest(SourceLaneV1::Config, &nested),
+            &nested,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        for entry in &nested {
+            let relative = config_source_scope_relative_path(
+                &nested_scope,
+                &entry.repository_relative_filename,
+            )
+            .unwrap();
+            assert!(!relative.starts_with("services/"));
+            assert_eq!(
+                config_source_repository_relative_filename(&nested_scope, relative),
+                entry.repository_relative_filename
+            );
+        }
+        // A root-scope path is foreign to a nested scope and vice versa.
+        assert!(
+            validate_source_manifest(
+                &nested_scope,
+                SourceLaneV1::Config,
+                &manifest(SourceLaneV1::Config, &config),
+                &config,
+                KnowledgeSourceLimits::default(),
+            )
+            .is_err()
+        );
+
+        for path in [
+            ".bro/brofiles/nested/reviewer.json",
+            ".bro/brofiles/.hidden.json",
+            ".bro/brofiles/reviewer.md",
+            ".bro/accounts.json",
+            ".bro/mcp.json",
+            ".bbox/knowledge/k.json",
+            ".bbox/config.json",
+            "services/api/.bbox/mcp.json",
+            "../.bbox/mcp.json",
+            "/.bbox/mcp.json",
+        ] {
+            let entries = vec![entry(path, b"{}")];
+            assert!(
+                validate_source_manifest(
+                    &scope(),
+                    SourceLaneV1::Config,
+                    &manifest(SourceLaneV1::Config, &entries),
+                    &entries,
+                    KnowledgeSourceLimits::default(),
+                )
+                .is_err(),
+                "{path} must not enter the configuration lane"
+            );
+        }
+    }
+
+    #[test]
+    fn config_lane_enforces_its_own_count_and_byte_limits() {
+        let oversized = vec![SourceFileManifestEntryV1 {
+            repository_relative_filename: ".bbox/mcp.json".into(),
+            encoded_bytes: MAX_CONFIG_SOURCE_FILE_BYTES + 1,
+            content_sha256: "a".repeat(64),
+        }];
+        assert_eq!(
+            validate_config_source_manifest(&oversized),
+            Err(ContractError::ConfigLimitExceeded)
+        );
+        let too_many = (0..=MAX_CONFIG_SOURCE_FILES)
+            .map(|index| SourceFileManifestEntryV1 {
+                repository_relative_filename: format!(".bro/brofiles/b{index:05}.json"),
+                encoded_bytes: 2,
+                content_sha256: "a".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_config_source_manifest(&too_many),
+            Err(ContractError::ConfigLimitExceeded)
+        );
+        let lane_bytes = (0..17)
+            .map(|index| SourceFileManifestEntryV1 {
+                repository_relative_filename: format!(".bro/brofiles/b{index:02}.json"),
+                encoded_bytes: MAX_CONFIG_SOURCE_FILE_BYTES,
+                content_sha256: "a".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_config_source_manifest(&lane_bytes),
+            Err(ContractError::ConfigLimitExceeded)
+        );
+        let (descriptor, ..) = publication();
+        let mut header = descriptor.clone();
+        header.config = Some(SourceManifestDescriptorV1 {
+            manifest_sha256: "a".repeat(64),
+            file_count: MAX_CONFIG_SOURCE_FILES + 1,
+            logical_bytes: MAX_CONFIG_SOURCE_FILES + 1,
+            page_count: 2,
+        });
+        assert_eq!(
+            header.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::ConfigLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn config_lane_presence_must_match_the_descriptor() {
+        let (descriptor, knowledge, gaps) = publication();
+        assert_eq!(
+            validate_publication_candidate(
+                &descriptor,
+                &knowledge,
+                &gaps,
+                &[],
+                &[],
+                Some(&[]),
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::ConfigLanePresenceMismatch)
+        );
+        let empty = with_config(descriptor, &[]);
+        assert_eq!(
+            validate_publication_candidate(
+                &empty,
+                &knowledge,
+                &gaps,
+                &[],
+                &[],
+                None,
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::ConfigLanePresenceMismatch)
+        );
+        validate_publication_candidate(
+            &empty,
+            &knowledge,
+            &gaps,
+            &[],
+            &[],
+            Some(&[]),
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        // A present lane never borrows the canonical absent-lane digest.
+        let mut borrowed = empty.clone();
+        borrowed.config = Some(SourceManifestDescriptorV1::default());
+        assert_eq!(
+            validate_publication_candidate(
+                &borrowed,
+                &knowledge,
+                &gaps,
+                &[],
+                &[],
+                Some(&[]),
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::ManifestCommitmentMismatch)
+        );
+    }
+
+    /// A candidate without the configuration lane keeps exactly the identity
+    /// the pre-lane binary minted; the literal is that binary's current-rung
+    /// value for these fixtures. An empty present lane and a populated one
+    /// each mint their own identity, and neither is admissible on any older
+    /// rung.
+    #[test]
+    fn config_lane_identity_is_explicit_and_preserves_pre_lane_identity() {
+        let (descriptor, ..) = publication();
+        let absent = publication_candidate_generation_id("producer-a", &descriptor).unwrap();
+        assert_eq!(
+            absent,
+            "kps_b6c1476997d6e506c62137a81c5f4535dfdfce25914ba263a421bbb6ce61bcaa"
+        );
+        assert!(
+            serde_json::to_value(&descriptor)
+                .unwrap()
+                .get("config")
+                .is_none(),
+            "a pre-lane candidate encodes byte-identically"
+        );
+        let empty = with_config(descriptor.clone(), &[]);
+        let config = config_entries("");
+        let populated = with_config(descriptor.clone(), &config);
+        let empty_id = publication_candidate_generation_id("producer-a", &empty).unwrap();
+        let populated_id = publication_candidate_generation_id("producer-a", &populated).unwrap();
+        assert_ne!(empty_id, absent);
+        assert_ne!(populated_id, absent);
+        assert_ne!(populated_id, empty_id);
+        for candidate in [&empty, &populated] {
+            for stored in [
+                absent.clone(),
+                pre_evidence_publication_candidate_generation_id("producer-a", candidate),
+                legacy_publication_candidate_generation_id("producer-a", candidate),
+            ] {
+                assert!(
+                    !publication_generation_id_matches("producer-a", candidate, &stored).unwrap(),
+                    "a configuration-bearing candidate has no older identity"
+                );
+            }
+        }
+        assert!(publication_generation_id_matches("producer-a", &empty, &empty_id).unwrap());
+        let decoded: PublicationCandidateDescriptorV1 =
+            serde_json::from_value(serde_json::to_value(&empty).unwrap()).unwrap();
+        assert_eq!(decoded.config, empty.config);
     }
 }
