@@ -16,7 +16,10 @@
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "mcp_surface/rx-v1-dispatch/no-operator-grant-channel",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-07-19T22:31:22Z",
-  "updated_at": "2026-07-19T22:31:22Z"
+  "updated_at": "2026-09-24T01:31:22Z",
+  "resolved_at": "2026-09-24T01:31:22Z",
+  "resolution_note": "obsolete: 5a2d0fd0 added per-dispatch grant channels. bro_exec/bro_resume take tool_defaults (src/tools/bro_params.rs), brofiles carry tool_defaults (src/orchestration/brofile.rs), and orch::merge_tool_arg_defaults layers ambient < brofile < per-dispatch into the harness --additional-context map loaded by load_tool_arg_defaults (crates/bro-harness/src/agent_loop.rs). Tests in src/orchestration/mod.rs cover acknowledge_* grants."
 }
