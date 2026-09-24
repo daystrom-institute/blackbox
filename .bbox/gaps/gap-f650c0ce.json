@@ -14,8 +14,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/context-telemetry/cumulative-usage-and-rotation-alarm",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-06T03:53:10Z",
-  "updated_at": "2026-09-06T03:53:10Z"
+  "updated_at": "2026-09-24T04:31:44Z",
+  "resolved_at": "2026-09-24T04:31:44Z",
+  "resolution_note": "obsolete: fixed in 919b8f4a. The Fleet footer reads last_turn_input_tokens and never cumulative usage (crates/bro-fleet-client/src/fleet.rs parse_transcript, test context_footer_never_uses_cumulative_usage_as_occupancy). The harness result events carry last_turn_input_tokens separately from usage (crates/bro-harness/src/emit.rs). Status and dashboard use ContextPressure::observation_json, which has no approaching_ceiling (crates/bro-protocol/src/lib.rs), and only under debug (src/orchestration/mod.rs). The bro_status and bro_dashboard docs no longer tell agents to rotate."
 }
