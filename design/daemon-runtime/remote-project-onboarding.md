@@ -279,8 +279,11 @@ uncovered; nothing fails open.
 
 - Claims never reassign a scope or repository history held by another
   producer.
-- No checkout writes outside `.bbox/` scaffolding; no commits or pushes by
-  the collector.
+- Enrollment writes nothing outside `.bbox/` scaffolding. The collector's
+  only other checkout writes are daemon-issued project render operations,
+  bounded to the fixed provider entrypoints and `.bbox/guidance` satellites
+  ([render-locality-transport-impl.md](render-locality-transport-impl.md)).
+  No commits or pushes by the collector.
 - No automatic alias acceptance; declared aliases stay pending nominations.
 - No automatic marker coverage for new projects.
 

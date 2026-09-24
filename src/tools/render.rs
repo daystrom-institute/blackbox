@@ -72,6 +72,7 @@ fn workspace_project_render_plan(
         project_id: grant.project_id.clone(),
         scope: grant.scope.clone(),
         workspace_id: grant.workspace_id.as_str().to_string(),
+        producer: None,
         provider: p.provider.clone(),
         dry_run: p.dry_run.unwrap_or(false),
         view: ProjectRenderViewV1::parse(p.provisional.as_deref())?,
@@ -88,6 +89,7 @@ fn workspace_project_render_plan(
             dry_run: Some(plan.dry_run),
             global_plan: None,
             provisional: None,
+            operation: None,
             scope_project: None,
             locality: None,
         })?)
@@ -175,10 +177,18 @@ impl BlackboxServer {
         Parameters(p): Parameters<RenderParams>,
     ) -> CallToolResult {
         let server = self.clone();
+        let handle = tokio::runtime::Handle::current();
         Self::run_blocking("bbox_render", move || {
             let mut p = p;
             let project_render = p.project.is_some()
                 && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
+            if let Some(operation_id) = p.operation.clone() {
+                anyhow::ensure!(
+                    p.locality.is_none() && p.global_plan.is_none(),
+                    "operation recovery takes only project and operation"
+                );
+                return server.recover_owner_render(&p, &operation_id, &handle);
+            }
             match p.locality.clone() {
                 Some(ProjectRenderLocalityRequestV1::Plan {
                     offset,
@@ -220,7 +230,7 @@ impl BlackboxServer {
                     && server.authoritative_session_workspace_binding().is_some() =>
                 {
                     anyhow::bail!(
-                        "error.render_locality_required: a workspace-bound project render must execute in its checkout owner; call bbox_render(scope=project, project=<selector>) from a managed bro-harness session bound to that checkout so its locality client applies the plan"
+                        "error.render_locality_required: this connection is bound to a checkout workspace, so its project render applies in that workspace through the render locality exchange (the `_render_locality` plan and complete phases its locality client sends). Retry through that exchange, or render from a connection without a workspace binding so the project's checkout-owner collector applies it"
                     );
                 }
                 None => {}
@@ -238,14 +248,28 @@ impl BlackboxServer {
                     // `render_output` gate, so render resolves identity and
                     // acquires its one capability directly.
                     let project_id = server.validate_project_selection(&raw)?;
+                    // The checkout owner applies the project half whenever
+                    // one covers the project. A daemon checkout lease is
+                    // only the compatibility lane for a project no owner
+                    // covers, and never for one the cutover governs.
+                    match server.render_owner_for(&project_id)? {
+                        crate::server::render_owner::RenderOwnerSelection::Owner(owner) => {
+                            return server.owner_project_render(&p, owner, &handle);
+                        }
+                        crate::server::render_owner::RenderOwnerSelection::Refused(refusal) => {
+                            anyhow::bail!(refusal.message(&project_id));
+                        }
+                        crate::server::render_owner::RenderOwnerSelection::None => {}
+                    }
                     if server
                         .state
                         .render_locality_cutover
                         .transport_governed(&project_id)
                     {
-                        anyhow::bail!(
-                            "error.render_locality_required: this project's render authority is checkout-local; call bbox_render(scope=project, project=<selector>) from a managed bro-harness session bound to the owning checkout so its locality client applies the plan"
-                        );
+                        anyhow::bail!(crate::server::render_owner::owner_required_message(
+                            &project_id,
+                            None,
+                        ));
                     }
                     let view = server
                         .session_knowledge_view(Some(&project_id), p.provisional.as_deref())?;
@@ -257,7 +281,13 @@ impl BlackboxServer {
                         &project_id,
                         bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
                         bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(crate::server::render_owner::owner_required_message(
+                            &project_id,
+                            Some(&format!("{error:#}")),
+                        ))
+                    })?;
                     p.project = Some(lease.project_root().to_string_lossy().into_owned());
                     let rendered = view.knowledge.render(&p);
                     broker.revalidate(&lease).map_err(anyhow::Error::new)?;
@@ -819,6 +849,7 @@ mod tests {
                     dry_run: Some(true),
                     global_plan: None,
                     provisional: Some(view.into()),
+                    operation: None,
                     scope_project: None,
                     locality: None,
                 },
@@ -1376,6 +1407,7 @@ mod catalog_render_tests {
                 dry_run: Some(false),
                 global_plan: None,
                 provisional: Some("published".into()),
+                operation: None,
                 scope_project: None,
                 locality: None,
             },
@@ -1413,6 +1445,7 @@ mod catalog_render_tests {
                 dry_run: Some(false),
                 global_plan: None,
                 provisional: Some("published".into()),
+                operation: None,
                 scope_project: None,
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
                     plan_sha256,

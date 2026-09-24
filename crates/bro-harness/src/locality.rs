@@ -1659,6 +1659,7 @@ mod tests {
             project_id: "project-render-locality".into(),
             scope: runtime.scope.clone(),
             workspace_id: runtime.workspace_id.as_str().to_string(),
+            producer: None,
             provider: Some("claude".into()),
             dry_run: false,
             view: bbox_knowledge::knowledge::ProjectRenderViewV1::Own,

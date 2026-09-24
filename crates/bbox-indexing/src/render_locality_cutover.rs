@@ -681,6 +681,7 @@ mod tests {
                 project_id: PROJECT.into(),
                 scope: scope.clone(),
                 workspace_id: "workspace".into(),
+                producer: None,
                 provider: None,
                 dry_run: false,
                 view,

@@ -18,7 +18,7 @@ pub(crate) trait ProducerCommandClock: Send + Sync {
     fn now_secs(&self) -> u64;
 }
 
-struct SystemProducerCommandClock;
+pub(crate) struct SystemProducerCommandClock;
 
 impl ProducerCommandClock for SystemProducerCommandClock {
     fn now_secs(&self) -> u64 {

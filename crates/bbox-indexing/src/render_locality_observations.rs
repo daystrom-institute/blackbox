@@ -272,6 +272,7 @@ mod tests {
             project_id: "project".into(),
             scope: PublishedScope::try_new("repo", ".").unwrap(),
             workspace_id: "workspace".into(),
+            producer: None,
             provider: None,
             dry_run: false,
             view,
@@ -287,6 +288,7 @@ mod tests {
             project_id: plan.project_id.clone(),
             scope: plan.scope.clone(),
             workspace_id: plan.workspace_id.clone(),
+            producer: None,
             project_doc_nonempty: false,
             projections: ["claude", "agents", "gemini"]
                 .into_iter()
