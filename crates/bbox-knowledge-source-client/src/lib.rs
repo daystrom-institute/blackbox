@@ -14,13 +14,14 @@ use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_knowledge_source::{
     AncestryCommitV1, AncestryDescriptorV1, AncestryPageV1, BeginProvisionalUploadRequestV1,
     BeginSourceUploadResponseV1, FinalizeProvisionalUploadRequestV1,
-    FinalizeSourceUploadResponseV1, GitObjectFormatV1, KnowledgeSourceLimits,
-    MissingSourceBlobsPageV1, ProvisionalCaptureContextV1, ProvisionalProbeRequestV1,
-    ProvisionalProbeResponseV1, ProvisionalWorkspaceDescriptorV1, ProvisionalWorkspaceStatusV1,
-    RenewProvisionalGenerationRequestV1, SCHEMA_VERSION, SnapshotClassV1,
-    SourceFileManifestEntryV1, SourceGenerationStateV1, SourceLaneV1, SourceManifestDescriptorV1,
-    SourceManifestPageV1, StableCaptureV1, ancestry_sha256, source_file_blob_sha256,
-    source_manifest_sha256, validate_provisional_workspace, working_pair_sha256,
+    FinalizeSourceUploadResponseV1, GRAPH_SOURCE_FILENAMES, GitObjectFormatV1,
+    KnowledgeSourceLimits, MissingSourceBlobsPageV1, ProvisionalCaptureContextV1,
+    ProvisionalProbeRequestV1, ProvisionalProbeResponseV1, ProvisionalWorkspaceDescriptorV1,
+    ProvisionalWorkspaceStatusV1, RenewProvisionalGenerationRequestV1, SCHEMA_VERSION,
+    SnapshotClassV1, SourceFileManifestEntryV1, SourceGenerationStateV1, SourceLaneV1,
+    SourceManifestDescriptorV1, SourceManifestPageV1, StableCaptureV1, ancestry_sha256,
+    is_graph_source_path, source_file_blob_sha256, source_manifest_sha256,
+    validate_provisional_workspace, working_pair_sha256,
 };
 use bro_core::WorkspaceId;
 use bro_protocol::WorkspaceBindingToken;
@@ -924,6 +925,11 @@ fn capture_committed_lane(
     )?;
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
+        // Only a graph's source files publish; the accepted baseline must list
+        // the same Graphs manifest the committed publisher produced.
+        if lane == SourceLaneV1::Graphs && !is_graph_source_path(scope, &path) {
+            continue;
+        }
         let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
             commit,
             &path,
@@ -1007,13 +1013,19 @@ fn capture_working_graphs(
         .with_context(|| format!("reading bound graph lane {}", directory_path.display()))?
     {
         let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("bound graph lane contains a symlink entry");
+        }
+        // A plain file directly under the lane is never a graph source; it is
+        // left out unopened.
+        if !file_type.is_dir() {
+            continue;
+        }
         let graph_id = entry
             .file_name()
             .into_string()
             .map_err(|_| anyhow!("bound graph id is not UTF-8"))?;
-        if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
-            bail!("bound graph lane contains a non-directory or symlink entry");
-        }
         graph_ids.insert(graph_id);
     }
     if graph_ids.len() as u64 > limits.max_graphs_per_lane {
@@ -1021,7 +1033,7 @@ fn capture_working_graphs(
     }
     let prefix = lane_repository_directory(scope, SourceLaneV1::Graphs);
     let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
-    let allowed = BTreeSet::from(["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"]);
+    let allowed = BTreeSet::from(GRAPH_SOURCE_FILENAMES);
     let mut entries = Vec::with_capacity(graph_ids.len().saturating_mul(3));
     for graph_id in graph_ids {
         let graph_path = directory_path.join(&graph_id);
@@ -1032,17 +1044,27 @@ fn capture_working_graphs(
             .with_context(|| format!("reading bound graph {}", graph_path.display()))?
         {
             let entry = entry?;
-            let name = entry
+            // Anything not named as a graph source file (notes, plans,
+            // subdirectories) is left out unopened.
+            let Some(name) = entry
                 .file_name()
-                .into_string()
-                .map_err(|_| anyhow!("bound graph filename is not UTF-8"))?;
-            if entry.file_type()?.is_symlink()
-                || !entry.file_type()?.is_file()
-                || !allowed.contains(name.as_str())
-            {
-                bail!("bound graph directory contains an unknown or unsafe file");
+                .to_str()
+                .filter(|name| allowed.contains(name))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                bail!("bound graph source file is a symlink or not a regular file");
             }
             names.insert(name);
+        }
+        // A directory holding no graph source file is not a graph, matching a
+        // committed tree where such a directory contributes no manifest entry.
+        if names.is_empty() {
+            graph_directory.ensure_still_current()?;
+            continue;
         }
         let present = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
         if !required.is_subset(&present) || !present.is_subset(&allowed) {
@@ -1534,27 +1556,100 @@ mod tests {
         graph
     }
 
-    #[test]
-    fn graph_capture_rejects_unknown_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let graph = write_working_graph(&root, "records");
-        fs::write(graph.join("unknown.json"), b"{}\n").unwrap();
+    fn capture_graph_lane(root: &Path) -> Result<Vec<SourceFileManifestEntryV1>> {
         let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
             .unwrap()
             .unwrap();
         let mut blobs = BTreeMap::new();
-
-        let error = capture_working_graphs(
+        capture_working_graphs(
             &root.join(".bbox/graphs"),
             &lane,
             &PublishedScope::try_new("capture-test", ".").unwrap(),
             KnowledgeSourceLimits::default(),
             &mut blobs,
         )
-        .unwrap_err();
+    }
 
-        assert!(format!("{error:#}").contains("unknown or unsafe file"));
+    #[test]
+    fn graph_capture_leaves_non_graph_files_out_unopened() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let graph = write_working_graph(&root, "design");
+        fs::write(graph.join("graph.json"), br#"{"graph_id":"design"}"#).unwrap();
+        fs::create_dir_all(graph.join("plans")).unwrap();
+        // Over the per-file byte limit: opening it as a source would fail the
+        // capture, so a successful capture proves it was never read.
+        let oversized = vec![b'x'; KnowledgeSourceLimits::default().max_file_bytes as usize + 1];
+        fs::write(graph.join("plans/2026-01-01-plan.jsonl"), &oversized).unwrap();
+        fs::write(graph.join("README.md"), &oversized).unwrap();
+        fs::write(root.join(".bbox/graphs/NOTES.md"), &oversized).unwrap();
+        // A directory with no graph source file is not a graph.
+        fs::create_dir_all(root.join(".bbox/graphs/notes")).unwrap();
+        fs::write(root.join(".bbox/graphs/notes/README.md"), b"notes\n").unwrap();
+
+        let entries = capture_graph_lane(&root).unwrap();
+
+        let listed = entries
+            .iter()
+            .map(|entry| entry.repository_relative_filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                ".bbox/graphs/design/edges.jsonl",
+                ".bbox/graphs/design/graph.json",
+                ".bbox/graphs/design/schema.json",
+                ".bbox/graphs/design/vertices.jsonl",
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_capture_leaves_committed_and_working_non_graph_files_out() {
+        let (_directory, root, workspace_id, _) = managed_repository();
+        let graph = write_working_graph(&root, "design");
+        fs::create_dir_all(graph.join("plans")).unwrap();
+        let oversized = vec![b'x'; KnowledgeSourceLimits::default().max_file_bytes as usize + 1];
+        fs::write(graph.join("plans/2026-01-01-plan.jsonl"), &oversized).unwrap();
+        fs::write(graph.join("README.md"), b"# design graph\n").unwrap();
+        fs::write(root.join(".bbox/graphs/NOTES.md"), b"notes\n").unwrap();
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "-q", "-m", "graph source"]);
+        let accepted = git(&root, &["rev-parse", "HEAD"]);
+
+        let captured =
+            capture_workspace(&root, &root, workspace_id, capture_context(accepted), 1).unwrap();
+
+        let expected = [
+            ".bbox/graphs/design/edges.jsonl",
+            ".bbox/graphs/design/schema.json",
+            ".bbox/graphs/design/vertices.jsonl",
+        ];
+        for lane in [&captured.baseline_graphs, &captured.working_graphs] {
+            let listed = lane
+                .iter()
+                .map(|entry| entry.repository_relative_filename.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(listed, expected);
+        }
+        assert_eq!(
+            captured.descriptor.baseline_graphs.manifest_sha256,
+            captured.descriptor.working_graphs.manifest_sha256
+        );
+    }
+
+    #[test]
+    fn graph_capture_refuses_malformed_graph_source_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let graph = write_working_graph(&root, "records");
+        fs::remove_file(graph.join("edges.jsonl")).unwrap();
+        let error = capture_graph_lane(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("missing a required source file"));
+
+        fs::create_dir_all(graph.join("edges.jsonl")).unwrap();
+        let error = capture_graph_lane(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
     }
 
     #[test]

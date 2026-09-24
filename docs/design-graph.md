@@ -114,8 +114,12 @@ bump. Ops mirror the CLI verbs:
   or a staged graph that fails `check` aborts the WHOLE batch; nothing lands.
 - `--dry-run` prints the per-op verdicts (`apply` / `no-op` / `CONFLICT`)
   and lands nothing. Run it, read it, then apply. Blank lines are skipped;
-  a plan file is committed alongside the landing so provenance reads per
-  batch.
+  a plan file is committed alongside the landing, under
+  `.bbox/design/plans/`, so provenance reads per batch.
+- Plans live outside `.bbox/graphs/`. Knowledge publication carries only the
+  four graph source files (`<graph-id>/graph.json`, `schema.json`,
+  `vertices.jsonl`, `edges.jsonl`); any other file under `.bbox/graphs/` is
+  not published.
 
 ## Supersession
 
