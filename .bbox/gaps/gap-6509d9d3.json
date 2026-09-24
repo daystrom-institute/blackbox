@@ -1,22 +1,26 @@
 {
   "id": "gap-6509d9d3",
-  "title": "Edit algebra lacks batch createFile operation",
+  "title": "Edit algebra has no batch create: every transform recipe loops edits.createFile over its creates",
   "gap_kind": "tooling",
   "domain": "edit algebra",
-  "wanted_capability": "An edits operation that accepts multiple `{path, content}` creates in one call so transforms that create several files do not need model-authored loops.",
+  "wanted_capability": "One edits call that queues several {path, content} creates (or folds a transform result's changes and creates together), with the same collision checks as edits.createFile, so transform recipes stop repeating a per-file createFile loop.",
   "missing_primitive": "edits.createFiles",
   "fallback_used": "Looped over `creates` and called `edits.createFile` once per file.",
   "evidence": [
-    "thread-370679a5",
-    "session:cb377cca-dc09-4487-91a1-1701cd691812"
+    "crates/bro-harness/src/bindings/edit_algebra.rs (EditsCreateFile: single path; EditsMerge: changes only)",
+    "crates/bro-harness/src/bindings/java_transforms.rs (transform recipes: for (const c of r.creates) await edits.createFile(...))",
+    "crates/bro-harness/src/bindings/rust_transforms/mod.rs (same loop in rust.* recipes)"
   ],
   "impact": "low",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edits/batch-create-files",
   "notes": "This probe only created one file, so it was not painful here; the resumed probe flagged it as a scaling issue for sweeps.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "session_id": "cb377cca-dc09-4487-91a1-1701cd691812",
   "thread_id": "thread-370679a5",
   "created_at": "2026-06-13T18:04:47Z",
-  "updated_at": "2026-06-13T18:04:47Z"
+  "updated_at": "2026-09-24T00:33:20Z",
+  "resolved_at": "2026-09-24T00:33:20Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/36"
 }
