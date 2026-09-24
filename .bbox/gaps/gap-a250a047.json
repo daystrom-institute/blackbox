@@ -14,8 +14,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/project-catalog/scope-migrate-locality-cutover-state",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-03T22:28:12Z",
-  "updated_at": "2026-09-03T22:28:12Z"
+  "updated_at": "2026-09-24T04:03:12Z",
+  "resolved_at": "2026-09-24T04:03:12Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/54"
 }

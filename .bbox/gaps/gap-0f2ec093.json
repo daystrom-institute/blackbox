@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/project-catalog/corpse-project-retirement",
   "suggested_owner": "blackbox",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-25T23:13:58Z",
-  "updated_at": "2026-08-25T23:13:58Z"
+  "updated_at": "2026-09-24T04:03:16Z",
+  "resolved_at": "2026-09-24T04:03:16Z",
+  "resolution_note": "obsolete: premise does not hold. Catalog projects with no active attachment are listed by bbox_project_catalog_list (src/tools/project_catalog.rs project_catalog_list_page, since 95c33ca3), and bbox_project_list now routes catalog-mode logical discovery there. A detached project is retired by the offline `blackbox project-catalog retire` surface (retire_project in crates/bbox-indexing/src/project_catalog_admin.rs), which requires zero active attachments; catalog deletion is offline by design, and bbox_project_unregister in catalog mode is detach."
 }
