@@ -18,10 +18,23 @@
 //!   * non-empty string  ⇒ explicit override; this discovery is skipped.
 //!   * empty string `""`  ⇒ explicit suppress (no overlay).
 //!   * absent (`None`)    ⇒ not overridden ⇒ this Codex-style overlay.
+//!
+//! Every filesystem call runs through [`crate::instruction_io`] under one
+//! deadline per operation. Startup discovery is best effort: a timeout discards
+//! the partial result and the ledger keeps its root and global candidates
+//! enrolled, so the first boundary refresh reads strictly. Refresh, resume, and
+//! structured checks fail closed. Workers only compute detached scans; the
+//! awaiting caller commits a scan under one short ledger critical section, and
+//! only when no other ledger change landed since its snapshot.
 
-use std::collections::HashSet;
+use crate::instruction_io::{
+    self, InstructionFs, InstructionTimeout, IoFailure, Phase, Probe, WorkerSlot,
+};
+use std::collections::{BTreeSet, HashSet};
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Large-overlay warning threshold. This never truncates instructions; it only
 /// catches unexpectedly huge project-doc chains. The default must stay above
@@ -51,13 +64,15 @@ fn default_project_doc_files() -> Vec<String> {
     vec![AGENTS_OVERRIDE_FILE.to_string(), AGENTS_FILE.to_string()]
 }
 
-// Called during startup or on the instruction ledger's blocking executor.
-#[allow(clippy::disallowed_methods)]
-fn selected_project_doc(directory: &Path, names: &[String]) -> std::io::Result<Option<PathBuf>> {
+fn selected_project_doc(
+    probe: &Probe,
+    directory: &Path,
+    names: &[String],
+) -> std::io::Result<Option<PathBuf>> {
     for name in names {
         let candidate = directory.join(name);
-        match std::fs::metadata(&candidate) {
-            Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+        match probe.metadata(&candidate) {
+            Ok(metadata) if metadata.is_file => return Ok(Some(candidate)),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -87,20 +102,42 @@ fn codex_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex"))
 }
 
+/// Session settings that shape discovery, resolved on the caller's session
+/// context. Worker threads have no task-local session env, so they receive
+/// this immutable copy instead of reading settings themselves.
+#[derive(Debug, Clone)]
+struct DiscoveryConfig {
+    codex_home: Option<PathBuf>,
+    names: Vec<String>,
+    warn_bytes: usize,
+    timeout: Duration,
+}
+
+impl DiscoveryConfig {
+    fn from_session() -> Self {
+        Self {
+            codex_home: codex_home(),
+            names: project_doc_files(),
+            warn_bytes: project_doc_warn_bytes(),
+            timeout: instruction_io::session_timeout(),
+        }
+    }
+}
+
 /// Collect repo `AGENTS.md` paths walking from `cwd` up to (and including) the
 /// git root, ordered outermost-first (git root → cwd) so the most-specific doc
 /// lands last. If `cwd` is not inside a git repo, only `cwd/AGENTS.md` is
 /// considered — Codex does not walk arbitrarily up the filesystem outside a
 /// repo.
-fn project_agents_paths(cwd: &Path, names: &[String]) -> Vec<PathBuf> {
+fn project_agents_paths(probe: &Probe, cwd: &Path, names: &[String]) -> Vec<PathBuf> {
     let mut git_root: Option<PathBuf> = None;
-    let mut probe = Some(cwd);
-    while let Some(d) = probe {
-        if d.join(".git").exists() {
+    let mut cursor = Some(cwd);
+    while let Some(d) = cursor {
+        if probe.exists(&d.join(".git")) {
             git_root = Some(d.to_path_buf());
             break;
         }
-        probe = d.parent();
+        cursor = d.parent();
     }
 
     let dirs = match git_root {
@@ -121,17 +158,15 @@ fn project_agents_paths(cwd: &Path, names: &[String]) -> Vec<PathBuf> {
     };
     let mut chain: Vec<PathBuf> = Vec::new();
     for dir in dirs {
-        if let Ok(Some(candidate)) = selected_project_doc(&dir, names) {
+        if let Ok(Some(candidate)) = selected_project_doc(probe, &dir, names) {
             chain.push(candidate);
         }
     }
     chain
 }
 
-// one-time session-start project-doc read, before the loop serves turns.
-#[allow(clippy::disallowed_methods)]
-fn read_nonempty(path: &Path) -> Option<String> {
-    match std::fs::read_to_string(path) {
+fn read_nonempty(probe: &Probe, path: &Path) -> Option<String> {
+    match probe.read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => Some(s),
         Ok(_) => None,
         Err(e) => {
@@ -141,9 +176,9 @@ fn read_nonempty(path: &Path) -> Option<String> {
     }
 }
 
-fn canonical_file(path: &Path) -> Option<PathBuf> {
-    let canonical = path.canonicalize().ok()?;
-    canonical.is_file().then_some(canonical)
+fn canonical_file(probe: &Probe, path: &Path) -> Option<PathBuf> {
+    let canonical = probe.canonicalize(path).ok()?;
+    probe.is_file(&canonical).then_some(canonical)
 }
 
 fn is_allowed_instruction_doc(path: &Path) -> bool {
@@ -168,7 +203,7 @@ fn is_allowed_instruction_doc(path: &Path) -> bool {
     )
 }
 
-fn resolve_include(referrer: &Path, mention: &str) -> Option<PathBuf> {
+fn resolve_include(probe: &Probe, referrer: &Path, mention: &str) -> Option<PathBuf> {
     let raw = mention.strip_prefix('@')?;
     if raw.is_empty() {
         return None;
@@ -178,7 +213,7 @@ fn resolve_include(referrer: &Path, mention: &str) -> Option<PathBuf> {
     } else {
         referrer.parent()?.join(raw)
     };
-    let canonical = canonical_file(&candidate)?;
+    let canonical = canonical_file(probe, &candidate)?;
     is_allowed_instruction_doc(&canonical).then_some(canonical)
 }
 
@@ -211,56 +246,49 @@ fn extract_at_mentions(body: &str) -> Vec<String> {
     out
 }
 
-fn read_doc_tree(
-    path: &Path,
-    loaded_paths: &mut HashSet<PathBuf>,
-    loaded: &mut Vec<String>,
-    depth: usize,
-    scope: &Path,
-    origin: &Path,
-    documents: &mut Vec<InstructionDocument>,
-) -> Vec<String> {
-    if depth > MAX_INCLUDE_DEPTH {
-        tracing::warn!(
-            path = %path.display(),
-            max_depth = MAX_INCLUDE_DEPTH,
-            "skipping nested AGENTS include beyond max depth"
-        );
-        return Vec::new();
-    }
-    let Some(canonical) = canonical_file(path) else {
-        return Vec::new();
-    };
-    if !loaded_paths.insert(canonical.clone()) {
-        return Vec::new();
-    }
-    let Some(body) = read_nonempty(&canonical) else {
-        return Vec::new();
-    };
-    loaded.push(canonical.display().to_string());
-    documents.push(InstructionDocument::new(
-        canonical.clone(),
-        scope.to_path_buf(),
-        origin.to_path_buf(),
-        body.clone(),
-    ));
+struct DocTree<'a> {
+    probe: &'a Probe,
+    loaded_paths: HashSet<PathBuf>,
+    loaded: Vec<String>,
+    documents: Vec<InstructionDocument>,
+}
 
-    let mut sections = vec![body.clone()];
-    for mention in extract_at_mentions(&body) {
-        let Some(include) = resolve_include(&canonical, &mention) else {
-            continue;
+impl DocTree<'_> {
+    fn read(&mut self, path: &Path, depth: usize, scope: &Path, origin: &Path) -> Vec<String> {
+        if depth > MAX_INCLUDE_DEPTH {
+            tracing::warn!(
+                path = %path.display(),
+                max_depth = MAX_INCLUDE_DEPTH,
+                "skipping nested AGENTS include beyond max depth"
+            );
+            return Vec::new();
+        }
+        let Some(canonical) = canonical_file(self.probe, path) else {
+            return Vec::new();
         };
-        sections.extend(read_doc_tree(
-            &include,
-            loaded_paths,
-            loaded,
-            depth + 1,
-            scope,
-            origin,
-            documents,
+        if !self.loaded_paths.insert(canonical.clone()) {
+            return Vec::new();
+        }
+        let Some(body) = read_nonempty(self.probe, &canonical) else {
+            return Vec::new();
+        };
+        self.loaded.push(canonical.display().to_string());
+        self.documents.push(InstructionDocument::new(
+            canonical.clone(),
+            scope.to_path_buf(),
+            origin.to_path_buf(),
+            body.clone(),
         ));
+
+        let mut sections = vec![body.clone()];
+        for mention in extract_at_mentions(&body) {
+            let Some(include) = resolve_include(self.probe, &canonical, &mention) else {
+                continue;
+            };
+            sections.extend(self.read(&include, depth + 1, scope, origin));
+        }
+        sections
     }
-    sections
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,61 +298,38 @@ pub(crate) struct ProjectDocOverlay {
     pub(crate) documents: Vec<InstructionDocument>,
 }
 
-/// Assemble the Codex-equivalent overlay from the process cwd + `$CODEX_HOME`.
-/// Returns `None` when no AGENTS docs exist, in which case the caller sends no
-/// system prompt (identical to the prior provider-defaults behavior).
-pub(crate) fn discover(cwd: &Path) -> Option<ProjectDocOverlay> {
-    let project_doc_files = project_doc_files();
-    assemble(
-        cwd,
-        codex_home().as_deref(),
-        &project_doc_files,
-        project_doc_warn_bytes(),
-    )
-}
-
-/// Pure assembly seam: explicit `cwd` and `codex_home` make this testable
-/// without touching process-global env/cwd.
+/// Assemble the Codex-equivalent overlay from an explicit `cwd` and
+/// `codex_home`. Returns `None` when no AGENTS docs exist, in which case the
+/// caller sends no system prompt (identical to the prior provider-defaults
+/// behavior).
 fn assemble(
+    probe: &Probe,
     cwd: &Path,
     codex_home: Option<&Path>,
     project_doc_files: &[String],
     project_doc_warn_bytes: usize,
 ) -> Option<ProjectDocOverlay> {
     let mut sections: Vec<String> = Vec::new();
-    let mut documents = Vec::new();
-    let mut loaded: Vec<String> = Vec::new();
-    let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
+    let mut tree = DocTree {
+        probe,
+        loaded_paths: HashSet::new(),
+        loaded: Vec::new(),
+        documents: Vec::new(),
+    };
 
     // Global scope: $CODEX_HOME/AGENTS.md (+ override), uncapped.
     if let Some(home) = codex_home {
         for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
             let p = home.join(name);
-            sections.extend(read_doc_tree(
-                &p,
-                &mut loaded_paths,
-                &mut loaded,
-                0,
-                cwd,
-                &p,
-                &mut documents,
-            ));
+            sections.extend(tree.read(&p, 0, cwd, &p));
         }
     }
 
     // Project scope: repo AGENTS.md, git root → cwd. Never truncate
     // instructions here; a large overlay is the operator's context decision.
     let mut project: Vec<String> = Vec::new();
-    for p in project_agents_paths(cwd, project_doc_files) {
-        project.extend(read_doc_tree(
-            &p,
-            &mut loaded_paths,
-            &mut loaded,
-            0,
-            p.parent().unwrap_or(cwd),
-            &p,
-            &mut documents,
-        ));
+    for p in project_agents_paths(probe, cwd, project_doc_files) {
+        project.extend(tree.read(&p, 0, p.parent().unwrap_or(cwd), &p));
     }
     if !project.is_empty() {
         let joined = project.join("\n\n");
@@ -341,6 +346,9 @@ fn assemble(
     if sections.is_empty() {
         return None;
     }
+    let DocTree {
+        loaded, documents, ..
+    } = tree;
     let manifest = format!(
         "[project-docs]\nselected: {}\nloaded:\n{}\n[/project-docs]",
         project_doc_files.join(", "),
@@ -395,17 +403,20 @@ pub(crate) struct InstructionBatch {
 #[derive(Debug)]
 struct ActiveInstruction {
     document: InstructionDocument,
-    origins: std::collections::BTreeSet<PathBuf>,
+    origins: BTreeSet<PathBuf>,
     occurrence: u64,
     delivered_generation: Option<u64>,
 }
 
 #[derive(Debug, Default)]
 struct InstructionLedger {
-    explicit_origins: std::collections::BTreeSet<(PathBuf, PathBuf)>,
+    explicit_origins: BTreeSet<(PathBuf, PathBuf)>,
     active: Vec<ActiveInstruction>,
-    observed_paths: std::collections::BTreeSet<PathBuf>,
+    observed_paths: BTreeSet<PathBuf>,
     next_occurrence: u64,
+    /// Advances on every ledger change. A scan commits only against the
+    /// revision it was planned from.
+    revision: u64,
 }
 
 impl InstructionLedger {
@@ -426,7 +437,7 @@ impl InstructionLedger {
         } else {
             self.next_occurrence += 1;
             self.active.push(ActiveInstruction {
-                origins: std::collections::BTreeSet::from([document.origin.clone()]),
+                origins: BTreeSet::from([document.origin.clone()]),
                 document,
                 occurrence: self.next_occurrence,
                 delivered_generation: None,
@@ -461,15 +472,201 @@ impl InstructionLedger {
             self.observe(document);
         }
     }
+
+    fn admit(
+        &self,
+        access: bro_tools::InstructionAccess,
+        touched: &[PathBuf],
+        generation: u64,
+    ) -> Result<(), bro_tools::ToolResult> {
+        if access == bro_tools::InstructionAccess::Read {
+            return Ok(());
+        }
+        let blocked: Vec<_> = self
+            .active
+            .iter()
+            .filter(|active| {
+                touched
+                    .iter()
+                    .any(|path| path.starts_with(&active.document.scope))
+                    && active
+                        .delivered_generation
+                        .is_none_or(|delivered| delivered > generation)
+            })
+            .map(|active| active.document.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if blocked.is_empty() {
+            return Ok(());
+        }
+        Err(bro_tools::ToolResult::Error(serde_json::json!({
+            "error": "instructions_required", "paths": blocked,
+            "message": "No filesystem effects were performed. Covering instructions are queued for an authoritative model boundary. Retrying in this same batch or cell cannot acknowledge them."
+        }).to_string()))
+    }
+}
+
+/// Ledger state a scan reads, copied under a short lock.
+struct ScanPlan {
+    root: PathBuf,
+    names: Vec<String>,
+    explicit_origins: BTreeSet<(PathBuf, PathBuf)>,
+    observed_paths: BTreeSet<PathBuf>,
+    /// `(origin, scope)` for every origin of every active document.
+    active_origins: Vec<(PathBuf, PathBuf)>,
+}
+
+impl ScanPlan {
+    fn capture(root: &Path, names: &[String], ledger: &InstructionLedger) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            names: names.to_vec(),
+            explicit_origins: ledger.explicit_origins.clone(),
+            observed_paths: ledger.observed_paths.clone(),
+            active_origins: ledger
+                .active
+                .iter()
+                .flat_map(|active| {
+                    active
+                        .origins
+                        .iter()
+                        .map(|origin| (origin.clone(), active.document.scope.clone()))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A completed read graph. Non-empty `errors` means it is incomplete: its
+/// successful observations may be applied, but it must not cause removals.
+struct Scan {
+    documents: Vec<InstructionDocument>,
+    errors: Vec<String>,
+}
+
+/// Rebuild complete include graphs and rewalk visited ancestry. Removed edges
+/// revoke old instructions; new AGENTS in already visited scopes are discovered
+/// without another tool invocation. An `Err` means nothing may be reconciled.
+fn scan(probe: &Probe, plan: &ScanPlan) -> Result<Scan, String> {
+    let root = canonical_existing_ancestor(probe, &plan.root)?;
+    let mut origins = plan.explicit_origins.clone();
+    let mut directories = BTreeSet::new();
+    for path in &plan.observed_paths {
+        let canonical = canonical_existing_ancestor(probe, path)?;
+        for touched in [path, &canonical] {
+            directories.extend(instruction_ancestry(probe, &root, touched));
+        }
+    }
+    // Restored origins preserve previously visited scopes, but project
+    // candidates must be selected again: an override can appear or vanish.
+    for (origin, scope) in &plan.active_origins {
+        if plan
+            .explicit_origins
+            .contains(&(origin.clone(), scope.clone()))
+        {
+            continue;
+        }
+        if origin
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| plan.names.iter().any(|candidate| candidate == name))
+        {
+            if let Some(directory) = origin.parent() {
+                directories.insert(directory.to_path_buf());
+            }
+        } else {
+            origins.insert((origin.clone(), scope.clone()));
+        }
+    }
+    for directory in directories {
+        if let Some(candidate) = selected_project_doc(probe, &directory, &plan.names)
+            .map_err(|error| format!("{}: {error}", directory.display()))?
+        {
+            origins.insert((candidate, directory));
+        }
+    }
+    let mut documents = Vec::new();
+    let mut errors = Vec::new();
+    let mut origins: Vec<_> = origins.into_iter().collect();
+    origins.sort_by(|left, right| {
+        left.1
+            .components()
+            .count()
+            .cmp(&right.1.components().count())
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (origin, scope) in origins {
+        match probe.symlink_metadata(&origin) {
+            Ok(()) => {
+                if let Err(error) = read_instruction_tree(
+                    probe,
+                    &origin,
+                    &scope,
+                    &origin,
+                    &mut HashSet::new(),
+                    &mut documents,
+                    0,
+                ) {
+                    errors.push(error);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("{}: {error}", origin.display())),
+        }
+    }
+    Ok(Scan { documents, errors })
+}
+
+/// A structured tool's touched paths (lexical and canonical) plus the scan of
+/// the ledger with those paths observed.
+struct CheckScan {
+    touched: Vec<PathBuf>,
+    scan: Result<Scan, String>,
+}
+
+fn check_scan(probe: &Probe, mut plan: ScanPlan, paths: Vec<PathBuf>) -> Result<CheckScan, String> {
+    let root = canonical_existing_ancestor(probe, &plan.root)?;
+    let mut touched = Vec::new();
+    for path in paths {
+        let lexical = normalize_lexical(&if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        });
+        let canonical = canonical_existing_ancestor(probe, &lexical)?;
+        touched.push(lexical);
+        touched.push(canonical);
+    }
+    plan.observed_paths.extend(touched.iter().cloned());
+    Ok(CheckScan {
+        touched,
+        scan: scan(probe, &plan),
+    })
 }
 
 /// Session-owned version ledger. Shell and remote tools are explicit escape
 /// hatches; this policy only admits tool-owned structured filesystem scopes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ScopedProjectDocs {
     root: PathBuf,
     names: Vec<String>,
-    ledger: std::sync::Arc<std::sync::Mutex<InstructionLedger>>,
+    timeout: Duration,
+    slot: Arc<WorkerSlot>,
+    diagnostics: Option<crate::emit::Emitter>,
+    ledger: Arc<std::sync::Mutex<InstructionLedger>>,
+}
+
+impl std::fmt::Debug for ScopedProjectDocs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedProjectDocs")
+            .field("root", &self.root)
+            .field("names", &self.names)
+            .field("timeout", &self.timeout)
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ScopedProjectDocs {
@@ -480,22 +677,82 @@ impl Default for ScopedProjectDocs {
 
 impl ScopedProjectDocs {
     /// Apply the same startup discovery/suppression contract to every session.
-    pub(crate) fn for_session(root: PathBuf, system_prompt: Option<&str>) -> Self {
-        let startup = system_prompt.is_none().then(|| discover(&root)).flatten();
-        let docs = Self::new(root, startup.as_ref());
+    /// Settings are captured here, on the session's context. Startup discovery
+    /// is best effort within the instruction budget; the root and global
+    /// candidates stay enrolled either way.
+    pub(crate) async fn for_session(
+        root: PathBuf,
+        system_prompt: Option<&str>,
+        fs: Arc<dyn InstructionFs>,
+        diagnostics: Option<crate::emit::Emitter>,
+    ) -> Self {
+        let config = DiscoveryConfig::from_session();
+        let docs = Self::with_io(
+            root,
+            None,
+            config.names.clone(),
+            config.timeout,
+            fs,
+            diagnostics,
+        );
         if system_prompt.is_some() {
             docs.suppress_startup_discovery();
-        } else {
-            docs.enroll_global_candidates();
+            return docs;
+        }
+        if let Some(home) = &config.codex_home {
+            docs.enroll_global_candidates_at(home);
+        }
+        let root = docs.root.clone();
+        let startup = docs
+            .bounded(
+                Phase::Startup,
+                move |_| (root.clone(), config.clone()),
+                |probe, (root, config)| {
+                    assemble(
+                        probe,
+                        &root,
+                        config.codex_home.as_deref(),
+                        &config.names,
+                        config.warn_bytes,
+                    )
+                },
+                |ledger, overlay| {
+                    for document in overlay.into_iter().flat_map(|overlay| overlay.documents) {
+                        ledger.observe(document);
+                    }
+                },
+            )
+            .await;
+        if let Err(IoFailure::Worker(error)) = startup {
+            tracing::warn!(%error, "startup instruction discovery failed");
         }
         docs
     }
 
+    #[cfg(test)]
     pub(crate) fn new(root: PathBuf, startup: Option<&ProjectDocOverlay>) -> Self {
         Self::with_names(root, startup, project_doc_files())
     }
 
     fn with_names(root: PathBuf, startup: Option<&ProjectDocOverlay>, names: Vec<String>) -> Self {
+        Self::with_io(
+            root,
+            startup,
+            names,
+            instruction_io::session_timeout(),
+            Arc::new(instruction_io::StdFs),
+            None,
+        )
+    }
+
+    fn with_io(
+        root: PathBuf,
+        startup: Option<&ProjectDocOverlay>,
+        names: Vec<String>,
+        timeout: Duration,
+        fs: Arc<dyn InstructionFs>,
+        diagnostics: Option<crate::emit::Emitter>,
+    ) -> Self {
         let mut ledger = InstructionLedger::default();
         ledger.observed_paths.insert(root.clone());
         if let Some(startup) = startup {
@@ -506,31 +763,41 @@ impl ScopedProjectDocs {
         Self {
             root,
             names,
-            ledger: std::sync::Arc::new(std::sync::Mutex::new(ledger)),
+            timeout,
+            slot: Arc::new(WorkerSlot::new(fs)),
+            diagnostics,
+            ledger: Arc::new(std::sync::Mutex::new(ledger)),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InstructionLedger> {
+        self.ledger.lock().expect("instruction ledger poisoned")
+    }
+
+    /// Mutate the ledger under its lock and advance its revision.
+    fn change<R>(&self, mutate: impl FnOnce(&mut InstructionLedger) -> R) -> R {
+        let mut ledger = self.lock();
+        let result = mutate(&mut ledger);
+        ledger.revision += 1;
+        result
     }
 
     /// Register global candidates even when discovery could not read them.
     /// An explicit system override skips this startup enrollment.
-    pub(crate) fn enroll_global_candidates(&self) {
-        if let Some(home) = codex_home() {
-            self.enroll_global_candidates_at(&home);
-        }
-    }
-
     fn enroll_global_candidates_at(&self, home: &Path) {
-        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
-        for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
-            ledger
-                .explicit_origins
-                .insert((home.join(name), self.root.clone()));
-        }
+        self.change(|ledger| {
+            for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
+                ledger
+                    .explicit_origins
+                    .insert((home.join(name), self.root.clone()));
+            }
+        });
     }
 
     /// Taking a batch grants nothing. Append its exact text to authoritative
     /// transport input before acknowledging this exact batch.
     pub(crate) fn pending_batch(&self, generation: u64) -> Option<InstructionBatch> {
-        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let ledger = self.lock();
         let pending: Vec<_> = ledger
             .active
             .iter()
@@ -554,7 +821,7 @@ impl ScopedProjectDocs {
     /// A replacement system section needs all current versions, including
     /// explicit revocations, rather than only the newly changed documents.
     pub(crate) fn snapshot_batch(&self, generation: u64) -> InstructionBatch {
-        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let ledger = self.lock();
         let documents: Vec<_> = ledger
             .active
             .iter()
@@ -573,35 +840,37 @@ impl ScopedProjectDocs {
     }
 
     pub(crate) fn acknowledge(&self, batch: &InstructionBatch) {
-        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
-        for (document, occurrence) in batch.documents.iter().zip(&batch.occurrences) {
-            if let Some(active) = ledger.active.iter_mut().find(|active| {
-                active.document.path == document.path && active.document.scope == document.scope
-            }) && active.occurrence == *occurrence
-                && active.document == *document
-            {
-                active.delivered_generation = Some(
-                    active
-                        .delivered_generation
-                        .map_or(batch.generation, |previous| previous.min(batch.generation)),
-                );
+        self.change(|ledger| {
+            for (document, occurrence) in batch.documents.iter().zip(&batch.occurrences) {
+                if let Some(active) = ledger.active.iter_mut().find(|active| {
+                    active.document.path == document.path && active.document.scope == document.scope
+                }) && active.occurrence == *occurrence
+                    && active.document == *document
+                {
+                    active.delivered_generation = Some(
+                        active
+                            .delivered_generation
+                            .map_or(batch.generation, |previous| previous.min(batch.generation)),
+                    );
+                }
             }
-        }
+        });
     }
 
     /// Compaction replaces instruction-bearing history. An acknowledgment
     /// already in flight cannot revive a version from the previous history.
     pub(crate) fn invalidate_delivery(&self) {
-        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
-        for index in 0..ledger.active.len() {
-            ledger.next_occurrence += 1;
-            ledger.active[index].occurrence = ledger.next_occurrence;
-            ledger.active[index].delivered_generation = None;
-        }
+        self.change(|ledger| {
+            for index in 0..ledger.active.len() {
+                ledger.next_occurrence += 1;
+                ledger.active[index].occurrence = ledger.next_occurrence;
+                ledger.active[index].delivered_generation = None;
+            }
+        });
     }
 
     pub(crate) fn active_documents(&self) -> Vec<InstructionDocument> {
-        let ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        let ledger = self.lock();
         ledger
             .active
             .iter()
@@ -621,29 +890,15 @@ impl ScopedProjectDocs {
     /// An explicit system prompt suppresses automatic startup discovery. Later
     /// structured file accesses still opt their actual paths into scoped checks.
     pub(crate) fn suppress_startup_discovery(&self) {
-        self.ledger
-            .lock()
-            .expect("instruction ledger poisoned")
-            .observed_paths
-            .remove(&self.root);
+        self.change(|ledger| ledger.observed_paths.remove(&self.root));
     }
 
     pub(crate) fn observed_paths(&self) -> Vec<PathBuf> {
-        self.ledger
-            .lock()
-            .expect("instruction ledger poisoned")
-            .observed_paths
-            .iter()
-            .cloned()
-            .collect()
+        self.lock().observed_paths.iter().cloned().collect()
     }
 
     pub(crate) fn restore_observed_paths(&self, paths: Vec<PathBuf>) {
-        self.ledger
-            .lock()
-            .expect("instruction ledger poisoned")
-            .observed_paths
-            .extend(paths);
+        self.change(|ledger| ledger.observed_paths.extend(paths));
     }
 
     /// Restore graph origins/scopes only, never proof of delivery. Refresh
@@ -652,152 +907,111 @@ impl ScopedProjectDocs {
         &self,
         documents: Vec<InstructionDocument>,
     ) -> Result<(), String> {
-        {
-            let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
+        self.change(|ledger| {
             for document in documents {
                 ledger.observe(document);
             }
-        }
-        self.invalidate_delivery();
-        self.refresh().await
-    }
-
-    /// Rebuild complete include graphs and rewalk visited ancestry before each
-    /// provider boundary. Removed edges revoke old instructions; new AGENTS in
-    /// already visited scopes are discovered without another tool invocation.
-    pub(crate) async fn refresh(&self) -> Result<(), String> {
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut ledger = this.ledger.lock().expect("instruction ledger poisoned");
-            this.refresh_blocking(&mut ledger)
-        })
-        .await
-        .map_err(|error| format!("instruction refresh task failed: {error}"))?
-    }
-
-    // All filesystem discovery runs on the owning blocking executor, with the
-    // session mutex serializing observation and exact version acknowledgment.
-    #[allow(clippy::disallowed_methods)]
-    fn refresh_blocking(&self, ledger: &mut InstructionLedger) -> Result<(), String> {
-        let root = canonical_existing_ancestor(&self.root)?;
-        let mut origins = ledger.explicit_origins.clone();
-        let mut directories = std::collections::BTreeSet::new();
-        for path in &ledger.observed_paths {
-            let canonical = canonical_existing_ancestor(path)?;
-            for touched in [path, &canonical] {
-                directories.extend(instruction_ancestry(&root, touched));
-            }
-        }
-        // Restored origins preserve previously visited scopes, but project
-        // candidates must be selected again: an override can appear or vanish.
-        for active in &ledger.active {
-            for origin in &active.origins {
-                if ledger
-                    .explicit_origins
-                    .contains(&(origin.clone(), active.document.scope.clone()))
-                {
-                    continue;
-                }
-                if origin
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| self.names.iter().any(|candidate| candidate == name))
-                {
-                    if let Some(directory) = origin.parent() {
-                        directories.insert(directory.to_path_buf());
-                    }
-                } else {
-                    origins.insert((origin.clone(), active.document.scope.clone()));
-                }
-            }
-        }
-        for directory in directories {
-            if let Some(candidate) = selected_project_doc(&directory, &self.names)
-                .map_err(|error| format!("{}: {error}", directory.display()))?
-            {
-                origins.insert((candidate, directory));
-            }
-        }
-        let mut documents = Vec::new();
-        let mut errors = Vec::new();
-        let mut origins: Vec<_> = origins.into_iter().collect();
-        origins.sort_by(|left, right| {
-            left.1
-                .components()
-                .count()
-                .cmp(&right.1.components().count())
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.0.cmp(&right.0))
         });
-        for (origin, scope) in origins {
-            match std::fs::symlink_metadata(&origin) {
-                Ok(_) => {
-                    if let Err(error) = read_instruction_tree(
-                        &origin,
-                        &scope,
-                        &origin,
-                        &mut HashSet::new(),
-                        &mut documents,
-                        0,
-                    ) {
-                        errors.push(error);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => errors.push(format!("{}: {error}", origin.display())),
-            }
-        }
-        ledger.reconcile(documents, errors.is_empty());
-        errors.into_iter().next().map_or(Ok(()), Err)
+        self.invalidate_delivery();
+        self.refresh_in(Phase::Resume).await
     }
 
-    fn check_blocking(
+    /// Strictly reread every scope before each provider boundary.
+    pub(crate) async fn refresh(&self) -> Result<(), String> {
+        self.refresh_in(Phase::Refresh).await
+    }
+
+    async fn refresh_in(&self, phase: Phase) -> Result<(), String> {
+        self.bounded(
+            phase,
+            |ledger| ScanPlan::capture(&self.root, &self.names, ledger),
+            |probe, plan| scan(probe, &plan),
+            |ledger, scanned| {
+                let Scan { documents, errors } = scanned?;
+                ledger.reconcile(documents, errors.is_empty());
+                errors.into_iter().next().map_or(Ok(()), Err)
+            },
+        )
+        .await
+        .map_err(|failure| failure.message())?
+    }
+
+    /// Run one instruction operation under a single deadline. Admission, the
+    /// worker's filesystem calls, and conflict retries share the budget. A
+    /// scan commits only when the ledger revision still matches its plan;
+    /// otherwise the result is discarded and the operation replans.
+    async fn bounded<P, T, R>(
         &self,
-        request: bro_tools::InstructionPaths,
-        generation: u64,
-    ) -> Result<(), bro_tools::ToolResult> {
-        let mut ledger = self.ledger.lock().expect("instruction ledger poisoned");
-        let root = canonical_existing_ancestor(&self.root).map_err(instruction_read_error)?;
-        let mut touched = Vec::new();
-        for path in request.paths {
-            let lexical = normalize_lexical(&if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            });
-            let canonical =
-                canonical_existing_ancestor(&lexical).map_err(instruction_read_error)?;
-            touched.push(lexical);
-            touched.push(canonical);
+        phase: Phase,
+        plan: impl Fn(&InstructionLedger) -> P,
+        job: impl Fn(&Probe, P) -> T + Clone + Send + 'static,
+        mut commit: impl FnMut(&mut InstructionLedger, T) -> R,
+    ) -> Result<R, IoFailure>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+    {
+        let budget = self.timeout;
+        let deadline = tokio::time::Instant::now() + budget;
+        let outcome = async {
+            let mut admission = self.slot.admit(phase, budget, deadline).await?;
+            let mut conflicts = 0;
+            loop {
+                let (planned, revision) = {
+                    let ledger = self.lock();
+                    (plan(&ledger), ledger.revision)
+                };
+                let job = job.clone();
+                let (value, returned) = self
+                    .slot
+                    .run(
+                        admission,
+                        phase,
+                        budget,
+                        deadline,
+                        conflicts,
+                        move |probe| job(probe, planned),
+                    )
+                    .await?;
+                admission = returned;
+                let mut ledger = self.lock();
+                if ledger.revision == revision {
+                    let result = commit(&mut ledger, value);
+                    ledger.revision += 1;
+                    return Ok(result);
+                }
+                drop(ledger);
+                conflicts += 1;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(IoFailure::Timeout(InstructionTimeout {
+                        phase,
+                        budget,
+                        attempt: self.slot.active_attempt(),
+                        waiting_for_admission: false,
+                        conflicts,
+                    }));
+                }
+            }
         }
-        ledger.observed_paths.extend(touched.iter().cloned());
-        self.refresh_blocking(&mut ledger)
-            .map_err(instruction_read_error)?;
-        if request.access == bro_tools::InstructionAccess::Read {
-            return Ok(());
+        .await;
+        if let Err(IoFailure::Timeout(timeout)) = &outcome {
+            self.report_timeout(timeout);
         }
-        let blocked: Vec<_> = ledger
-            .active
-            .iter()
-            .filter(|active| {
-                touched
-                    .iter()
-                    .any(|path| path.starts_with(&active.document.scope))
-                    && active
-                        .delivered_generation
-                        .is_none_or(|delivered| delivered > generation)
-            })
-            .map(|active| active.document.path.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if blocked.is_empty() {
-            return Ok(());
+        outcome
+    }
+
+    fn report_timeout(&self, timeout: &InstructionTimeout) {
+        tracing::warn!(
+            phase = timeout.phase.as_str(),
+            operation = timeout.operation(),
+            path = ?timeout.path(),
+            budget_ms = timeout.budget_ms(),
+            "{}",
+            timeout.message()
+        );
+        if let Some(emitter) = &self.diagnostics {
+            emitter.instruction_read_timeout(timeout);
         }
-        Err(bro_tools::ToolResult::Error(serde_json::json!({
-            "error": "instructions_required", "paths": blocked,
-            "message": "No filesystem effects were performed. Covering instructions are queued for an authoritative model boundary. Retrying in this same batch or cell cannot acknowledge them."
-        }).to_string()))
     }
 }
 
@@ -808,12 +1022,35 @@ impl bro_tools::InstructionPolicy for ScopedProjectDocs {
         request: bro_tools::InstructionPaths,
         authoring_generation: u64,
     ) -> Result<(), bro_tools::ToolResult> {
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || this.check_blocking(request, authoring_generation))
-            .await
-            .map_err(|error| {
-                bro_tools::ToolResult::Error(format!("instruction discovery task failed: {error}"))
-            })?
+        let access = request.access;
+        let paths = request.paths;
+        let outcome = self
+            .bounded(
+                Phase::Check,
+                |ledger| {
+                    (
+                        ScanPlan::capture(&self.root, &self.names, ledger),
+                        paths.clone(),
+                    )
+                },
+                |probe, (plan, paths)| check_scan(probe, plan, paths),
+                |ledger, checked| {
+                    let CheckScan { touched, scan } = checked?;
+                    ledger.observed_paths.extend(touched.iter().cloned());
+                    let Scan { documents, errors } = scan?;
+                    ledger.reconcile(documents, errors.is_empty());
+                    if let Some(error) = errors.into_iter().next() {
+                        return Err(error);
+                    }
+                    Ok(ledger.admit(access, &touched, authoring_generation))
+                },
+            )
+            .await;
+        match outcome {
+            Ok(Ok(admission)) => admission,
+            Ok(Err(message)) => Err(instruction_read_error(message)),
+            Err(failure) => Err(instruction_read_error(failure.message())),
+        }
     }
 }
 
@@ -833,16 +1070,16 @@ fn render_instruction_documents(documents: &[InstructionDocument]) -> String {
     )
 }
 
-// Blocking executor only. Canonicalize a new target through its nearest
-// existing parent, retaining absent suffixes without dropping symlink ancestry.
-#[allow(clippy::disallowed_methods)]
-fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
+/// Canonicalize a new target through its nearest existing parent, retaining
+/// absent suffixes without dropping symlink ancestry.
+fn canonical_existing_ancestor(probe: &Probe, path: &Path) -> Result<PathBuf, String> {
     let mut cursor = path;
     let mut suffix = Vec::new();
     loop {
-        match std::fs::symlink_metadata(cursor) {
-            Ok(_) => {
-                let mut canonical = std::fs::canonicalize(cursor)
+        match probe.symlink_metadata(cursor) {
+            Ok(()) => {
+                let mut canonical = probe
+                    .canonicalize(cursor)
                     .map_err(|error| format!("{}: {error}", cursor.display()))?;
                 for component in suffix.iter().rev() {
                     canonical.push(component);
@@ -867,8 +1104,8 @@ fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn instruction_ancestry(root: &Path, touched: &Path) -> Vec<PathBuf> {
-    let directory = if touched.is_dir() {
+fn instruction_ancestry(probe: &Probe, root: &Path, touched: &Path) -> Vec<PathBuf> {
+    let directory = if probe.is_dir(touched) {
         touched
     } else {
         touched.parent().unwrap_or(touched)
@@ -876,13 +1113,13 @@ fn instruction_ancestry(root: &Path, touched: &Path) -> Vec<PathBuf> {
     let in_workspace = touched.starts_with(root);
     let boundary = root
         .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
+        .find(|ancestor| probe.exists(&ancestor.join(".git")))
         .unwrap_or(root);
     let mut ancestors = Vec::new();
     for ancestor in directory.ancestors() {
         ancestors.push(ancestor.to_path_buf());
         if (in_workspace && ancestor == boundary)
-            || (!in_workspace && ancestor.join(".git").exists())
+            || (!in_workspace && probe.exists(&ancestor.join(".git")))
         {
             break;
         }
@@ -891,10 +1128,10 @@ fn instruction_ancestry(root: &Path, touched: &Path) -> Vec<PathBuf> {
     ancestors
 }
 
-// Blocking executor only. Missing optional AGENTS candidates are filtered by
-// the caller; a selected document or allowed explicit include must be readable.
-#[allow(clippy::disallowed_methods)]
+/// Missing optional AGENTS candidates are filtered by the caller; a selected
+/// document or allowed explicit include must be readable.
 fn read_instruction_tree(
+    probe: &Probe,
     path: &Path,
     scope: &Path,
     origin: &Path,
@@ -902,8 +1139,9 @@ fn read_instruction_tree(
     documents: &mut Vec<InstructionDocument>,
     depth: usize,
 ) -> Result<(), String> {
-    let canonical =
-        std::fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let canonical = probe
+        .canonicalize(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
@@ -913,7 +1151,8 @@ fn read_instruction_tree(
             path.display()
         ));
     }
-    let body = std::fs::read_to_string(&canonical)
+    let body = probe
+        .read_to_string(&canonical)
         .map_err(|error| format!("{}: {error}", canonical.display()))?;
     documents.push(InstructionDocument::new(
         canonical.clone(),
@@ -929,7 +1168,15 @@ fn read_instruction_tree(
             canonical.parent().unwrap().join(raw)
         };
         if is_allowed_instruction_doc(&candidate) {
-            read_instruction_tree(&candidate, scope, origin, visited, documents, depth + 1)?;
+            read_instruction_tree(
+                probe,
+                &candidate,
+                scope,
+                origin,
+                visited,
+                documents,
+                depth + 1,
+            )?;
         }
     }
     Ok(())
@@ -948,6 +1195,10 @@ fn normalize_lexical(p: &Path) -> PathBuf {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "project_doc_bounded_tests.rs"]
+mod bounded_tests;
 
 #[cfg(test)]
 mod tests {
@@ -970,6 +1221,21 @@ mod tests {
 
     fn default_docs() -> Vec<String> {
         default_project_doc_files()
+    }
+
+    fn assemble(
+        cwd: &Path,
+        codex_home: Option<&Path>,
+        project_doc_files: &[String],
+        project_doc_warn_bytes: usize,
+    ) -> Option<ProjectDocOverlay> {
+        super::assemble(
+            &Probe::std(),
+            cwd,
+            codex_home,
+            project_doc_files,
+            project_doc_warn_bytes,
+        )
     }
 
     fn assemble_default(

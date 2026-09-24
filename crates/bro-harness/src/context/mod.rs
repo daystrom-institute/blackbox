@@ -1,7 +1,6 @@
 use bro_tools::ToolCx;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::Path;
 use std::path::PathBuf;
 
 pub(crate) mod budget;
@@ -200,16 +199,6 @@ pub struct UserInstructions {
     pub directory: String,
     pub text: String,
     pub loaded_paths: Vec<PathBuf>,
-}
-
-impl UserInstructions {
-    pub fn from_project(cwd: &Path) -> Option<Self> {
-        crate::project_doc::discover(cwd).map(|overlay| Self {
-            directory: cwd.to_string_lossy().into_owned(),
-            text: overlay.text,
-            loaded_paths: overlay.loaded_paths,
-        })
-    }
 }
 
 impl ContextualUserFragment for UserInstructions {

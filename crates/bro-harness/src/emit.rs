@@ -178,6 +178,29 @@ impl Emitter {
         }));
     }
 
+    /// `system/instruction_read_timeout`: an instruction-document operation
+    /// missed its deadline. Names the phase, the attempted operation and path,
+    /// and the budget; never document bodies or environment values. A startup
+    /// timeout is a warning (the session starts without an initial overlay);
+    /// refresh and resume timeouts prevent inference, and check timeouts fail
+    /// the structured tool call without filesystem effects.
+    pub(crate) fn instruction_read_timeout(
+        &self,
+        timeout: &crate::instruction_io::InstructionTimeout,
+    ) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "instruction_read_timeout",
+            "session_id": self.session_id,
+            "phase": timeout.phase.as_str(),
+            "operation": timeout.operation(),
+            "path": timeout.path().map(|path| path.to_string_lossy()),
+            "budget_ms": timeout.budget_ms(),
+            "waiting_for_admission": timeout.waiting_for_admission,
+            "reason": timeout.reason(),
+        }));
+    }
+
     /// `system/termination_signal`: the process received SIGTERM/SIGINT. The
     /// in-flight turn ends as an interrupt and the session checkpoints before
     /// exit, so the daemon sees why the turn stopped.
@@ -610,6 +633,52 @@ impl crate::transport::TurnSink for Emitter {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The daemon's status-tail acceptance test ingests this same fixture.
+    const INSTRUCTION_TIMEOUT_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/harness-events/instruction_read_timeout.json");
+
+    #[test]
+    fn instruction_read_timeout_is_sequenced_logged_and_matches_the_daemon_fixture() {
+        use crate::instruction_io::{Attempt, FsOp, InstructionTimeout, Phase};
+        let directory = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::at_path(directory.path().join("s.events.jsonl")));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| captured.lock().unwrap().push(event))
+        };
+        let counter = Arc::new(AtomicU64::new(41));
+        let emitter = Emitter::with_callback("fixture-session".into(), sink)
+            .with_event_log(log.clone())
+            .with_seq_counter(counter);
+        emitter.instruction_read_timeout(&InstructionTimeout {
+            phase: Phase::Refresh,
+            budget: std::time::Duration::from_secs(10),
+            attempt: Some(Attempt {
+                operation: FsOp::Read,
+                path: "/workspace/project/AGENTS.md".into(),
+            }),
+            waiting_for_admission: false,
+            conflicts: 0,
+        });
+        log.flush_blocking();
+        let logged: Value = serde_json::from_str(
+            std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let emitted = captured.lock().unwrap()[0].clone();
+        assert_eq!(emitted["seq"], 42);
+        assert_eq!(logged["event"], emitted);
+        let mut unsequenced = emitted;
+        unsequenced.as_object_mut().unwrap().remove("seq");
+        let fixture: Value = serde_json::from_str(INSTRUCTION_TIMEOUT_FIXTURE).unwrap();
+        assert_eq!(unsequenced, fixture);
+    }
 
     #[test]
     fn terminal_events_separate_prompt_occupancy_from_session_usage() {
