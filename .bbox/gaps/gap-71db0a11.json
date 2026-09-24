@@ -7,16 +7,19 @@
   "missing_primitive": "readiness-fence semantics that distinguish \"rebuild deferred, prior view still complete\" from \"rebuild in progress\"",
   "fallback_used": "Operator-side knob available: set BLACKBOX_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES above the published edge count in the cage deployment env so nudges rebuild (about 11 seconds each).",
   "evidence": [
-    "src/server/routes.rs should_rebuild_edge_index, DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES, store_refresh_deferred",
+    "src/server/routes.rs should_rebuild_edge_index, DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES, store_refresh_deferred branch",
+    "src/server/code_source.rs republish_code_read_view installs EdgeIndex::default() and lowers edge_index_ready",
     "src/server/state.rs complete_code_read_view",
-    "src/server/git_source.rs provenance_export_page maps the readiness error to HttpError::edge_index_warming",
-    "collector log: provenance lane succeeded=1 failed=13 after every pass; daemon log: edge-index watcher deferred a store-only nudge published_edge_count=1412493 limit=250000"
+    "src/server/git_source.rs provenance_export_page maps the readiness error to HttpError::edge_index_warming"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edge-index/nudge-deferral-leaves-readiness-fence-down",
-  "resolution": "unresolved",
+  "notes": "Triage trace: the described mechanism does not reproduce from current code. Every fence-lowering publish (code_source.rs republish_code_read_view and activation sites, file_source_activation.rs) installs an empty EdgeIndex placeholder, so the watcher reads published_edge_count=0 and admits the nudged rebuild; the manifest change also flips sidecars_changed. The deferral branch only runs with the fence already up. The observed edge_index_warming stall is real but its root cause is unconfirmed. Covered together with gap-7da04b93 by one issue on readiness-fence semantics: consumers must recover after every publish within one rebuild.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-03T22:52:14Z",
-  "updated_at": "2026-09-03T22:52:14Z"
+  "updated_at": "2026-09-24T02:04:28Z",
+  "resolved_at": "2026-09-24T02:04:28Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/44"
 }

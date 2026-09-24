@@ -1,21 +1,25 @@
 {
   "id": "gap-e4e67530",
-  "title": "Edge-index sidecar read latch never releases after a completed watcher rebuild",
+  "title": "Edge-index watcher holds the reindex publication guard on passes that do not rebuild, starving reindex admission",
   "gap_kind": "tooling",
   "domain": "edge-index-watcher",
-  "wanted_capability": "bbox_reindex (and any caller gated on the sidecar-publication read guard) should be admitted once the edge-index watcher rebuild completes. Observed live (2026-08-14): the watcher logged \"EdgeIndex rebuilt ... elapsed_ms=12529\" and the runtime went idle, yet bbox_reindex kept refusing with \"an edge-index rebuild is already reading the sidecar publication\" for 10+ minutes until a daemon restart, with repeated \"deferred a store-only nudge\" warnings in the same window (prime suspect for a set-without-release path). Wanted: exit-path-audited release (or an RAII guard) on the latch across success, deferral, and error paths; a release log line; and an owner timestamp on the guard so a stale hold is detected and reported instead of impersonating an active rebuild.",
-  "missing_primitive": "exit-path-audited release on the sidecar publication read latch",
+  "wanted_capability": "bbox_reindex should be refused with EdgeIndexRebuildInProgress only while an edge-index rebuild parse or publication is actually running. The watcher currently takes the publication guard (index_writer.try_begin_edge_index_rebuild) at the top of every pass, before deciding whether to rebuild, and holds it through store-only nudge deferrals, searcher refreshes, authority capture, and health-record writes. Under a steady stream of store nudges the guard is held for most of wall-clock time, so reindex admission (which fails fast rather than waiting) keeps being refused after the last real rebuild finished. Wanted: acquire the guard only for passes that will rebuild (re-capturing authority under the guard), and report the holder's start time in the refusal so a long hold is visible.",
+  "missing_primitive": "publication-guard scope limited to actual rebuilds, plus holder age in the EdgeIndexRebuildInProgress refusal",
   "fallback_used": "Daemon restart clears the latch (at the cost of restarting any in-flight schema rebuild, which is expensive).",
   "evidence": [
-    "thread-21347ce5",
-    "daemon log 2026-08-14: rebuild complete 03:45:29 vs refusals through 03:54+"
+    "src/server/routes.rs spawn_edge_index_rebuild_watcher: try_begin_edge_index_rebuild precedes should_rebuild_edge_index and the deferral and searcher-refresh branches",
+    "crates/bbox-indexing/src/index/writer_actor.rs EdgeIndexRebuildActivityGuard (RAII Drop release), reserve_reindex fails fast with IndexWriterRetryableError::EdgeIndexRebuildInProgress",
+    "src/server/state.rs nudge_edge_index_rebuild (sync_channel(1) coalesced nudges)"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edge-index-watcher/sidecar-read-latch-stuck",
-  "resolution": "unresolved",
+  "notes": "Triage trace: the guard has been an RAII Drop guard since before this gap was filed, so a set-without-release path is not the mechanism. The traced cause is guard scope: every watcher pass, including store-only nudge deferrals, holds it. Whether that alone explains the originally observed 10+ minute refusal window is not proven.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-21347ce5",
   "created_at": "2026-08-14T04:39:18Z",
-  "updated_at": "2026-08-14T04:39:18Z"
+  "updated_at": "2026-09-24T02:04:26Z",
+  "resolved_at": "2026-09-24T02:04:26Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/43"
 }
