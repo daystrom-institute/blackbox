@@ -5404,7 +5404,7 @@ fn classify_staging_error(error: &anyhow::Error) -> CutbackAttemptOutcome {
         match cause.downcast_ref::<IndexWriterRetryableError>() {
             Some(
                 IndexWriterRetryableError::ReindexPassInProgress
-                | IndexWriterRetryableError::EdgeIndexRebuildInProgress,
+                | IndexWriterRetryableError::EdgeIndexRebuildInProgress { .. },
             ) => {
                 return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::ReindexPass);
             }

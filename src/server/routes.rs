@@ -1229,157 +1229,268 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             if !pending_nudge {
                 std::thread::sleep(std::time::Duration::from_secs(20));
             }
-            let mut last_seen: u64 = state.idx.read().num_docs();
             let edges_dir = edge_sidecar_dir(&state);
-            let mut last_signature = capture_edge_rebuild_authority(
-                &edges_dir,
-                Some(&state.corpus_registered_project_ids()),
-            )
-            .ok()
-            .map(|authority| authority.signature);
+            let mut cursor = EdgeIndexWatcherCursor::capture(&state, &edges_dir);
             loop {
                 if !pending_nudge {
                     pending_nudge = match &nudge_rx {
-                    Some(rx) => match rx.recv_timeout(interval) {
-                        Ok(()) => true,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-                        // All senders dropped — SharedState is gone; exit.
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                    },
-                    None => {
-                        std::thread::sleep(interval);
-                        false
-                    }
+                        Some(rx) => match rx.recv_timeout(interval) {
+                            Ok(()) => true,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                            // All senders dropped — SharedState is gone; exit.
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        },
+                        None => {
+                            std::thread::sleep(interval);
+                            false
+                        }
                     };
                 }
-                let Some(publication_guard) =
-                    state.index_writer.try_begin_edge_index_rebuild()
-                else {
-                    tracing::debug!(
-                        pending_nudge,
-                        "edge-index watcher deferred while a reindex publication is active"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                };
                 let nudged = std::mem::take(&mut pending_nudge);
-                let current = state.idx.read().num_docs();
-                let registered_project_ids = state.corpus_registered_project_ids();
-                let signature = match capture_edge_rebuild_authority(
+                match run_edge_index_watcher_pass(
+                    &state,
                     &edges_dir,
-                    Some(&registered_project_ids),
+                    &mut cursor,
+                    nudged,
+                    edge_index_nudge_max_current_edges(),
                 ) {
-                    Ok(authority) => authority.signature,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
+                    EdgeIndexWatcherPass::PublicationBusy => {
+                        tracing::debug!(
                             nudged,
-                            "edge-index watcher authority capture failed; keeping the last published graph"
+                            "edge-index watcher deferred while a reindex publication is active"
                         );
+                        pending_nudge = nudged;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    EdgeIndexWatcherPass::AuthorityUnavailable
+                    | EdgeIndexWatcherPass::RebuildFailed => {
                         if !state
                             .edge_index_ready
                             .load(std::sync::atomic::Ordering::Acquire)
                         {
                             pending_nudge = true;
-                            drop(publication_guard);
                             std::thread::sleep(interval);
                         }
-                        last_seen = current;
-                        continue;
                     }
-                };
-                let sidecars_changed = Some(signature) != last_signature;
-                let published_edge_count = state
-                    .code_read_view
-                    .read()
-                    .edge_index
-                    .edge_count();
-                if should_rebuild_edge_index(
-                    nudged,
-                    sidecars_changed,
-                    published_edge_count,
-                    edge_index_nudge_max_current_edges(),
-                ) {
-                    let started = std::time::Instant::now();
-                    tracing::info!(
-                        current_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        nudged,
-                        sidecars_changed,
-                        "edge-index watcher rebuild started"
-                    );
-                    match rebuild_edge_index_from_shared(&state, false) {
-                        Ok(()) => {
-                            tracing::info!(
-                                prev_docs = last_seen,
-                                new_docs = current,
-                                sidecar_files = signature.files,
-                                sidecar_bytes = signature.bytes,
-                                nudged,
-                                sidecars_changed,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
-                            );
-                            last_signature = capture_edge_rebuild_authority(
-                                &edges_dir,
-                                Some(&state.corpus_registered_project_ids()),
-                            )
-                            .ok()
-                            .map(|authority| authority.signature)
-                            .or(Some(signature));
-                            let _ = state.code_sources.store().clear_health_failure(
-                                "_edge_index",
-                                "store_refresh_deferred",
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                nudged,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                "edge-index watcher rebuild failed; retaining prior signature for retry"
-                            );
-                            if !state
-                                .edge_index_ready
-                                .load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                pending_nudge = true;
-                                drop(publication_guard);
-                                std::thread::sleep(interval);
-                            }
-                        }
-                    }
-                } else if nudged {
-                    let detail = format!(
-                        "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
-                        edge_index_nudge_max_current_edges()
-                    );
-                    let _ = state.code_sources.store().record_health_failure(
-                        "_edge_index",
-                        "store_refresh_deferred",
-                        &detail,
-                    );
-                    tracing::warn!(
-                        published_edge_count,
-                        limit = edge_index_nudge_max_current_edges(),
-                        "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
-                    );
-                } else if current != last_seen {
-                    let searcher = { state.idx.read().searcher() };
-                    state.publish_code_read_searcher(searcher);
-                    tracing::debug!(
-                        prev_docs = last_seen,
-                        new_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
-                    );
+                    EdgeIndexWatcherPass::Rebuilt
+                    | EdgeIndexWatcherPass::StoreRefreshDeferred
+                    | EdgeIndexWatcherPass::SearcherRefreshed
+                    | EdgeIndexWatcherPass::Unchanged => {}
                 }
-                last_seen = current;
             }
         })
         .expect("failed to spawn edge index rebuild watcher");
+}
+
+/// What the watcher last observed: the corpus document count and the sidecar
+/// authority signature of the last published graph.
+struct EdgeIndexWatcherCursor {
+    last_seen: u64,
+    last_signature: Option<EdgeSidecarSignature>,
+}
+
+impl EdgeIndexWatcherCursor {
+    fn capture(state: &SharedState, edges_dir: &std::path::Path) -> Self {
+        Self {
+            last_seen: state.idx.read().num_docs(),
+            last_signature: capture_edge_rebuild_authority(
+                edges_dir,
+                Some(&state.corpus_registered_project_ids()),
+            )
+            .ok()
+            .map(|authority| authority.signature),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeIndexWatcherPass {
+    /// Sidecar authority could not be captured; the last published graph stays.
+    AuthorityUnavailable,
+    /// A rebuild is due but another publication holds the sidecar guard.
+    PublicationBusy,
+    Rebuilt,
+    RebuildFailed,
+    /// A store-only nudge against a published graph above the nudge limit.
+    StoreRefreshDeferred,
+    SearcherRefreshed,
+    Unchanged,
+}
+
+struct EdgeIndexWatcherDecision {
+    signature: EdgeSidecarSignature,
+    sidecars_changed: bool,
+    published_edge_count: usize,
+    rebuild: bool,
+}
+
+fn decide_edge_index_watcher_pass(
+    state: &SharedState,
+    edges_dir: &std::path::Path,
+    cursor: &EdgeIndexWatcherCursor,
+    nudged: bool,
+    nudge_limit: usize,
+) -> anyhow::Result<EdgeIndexWatcherDecision> {
+    let registered_project_ids = state.corpus_registered_project_ids();
+    let signature =
+        capture_edge_rebuild_authority(edges_dir, Some(&registered_project_ids))?.signature;
+    let sidecars_changed = Some(signature) != cursor.last_signature;
+    let published_edge_count = state.code_read_view.read().edge_index.edge_count();
+    Ok(EdgeIndexWatcherDecision {
+        signature,
+        sidecars_changed,
+        published_edge_count,
+        rebuild: should_rebuild_edge_index(
+            nudged,
+            sidecars_changed,
+            published_edge_count,
+            nudge_limit,
+        ),
+    })
+}
+
+/// One watcher pass. The rebuild decision is made without the sidecar
+/// publication guard; only a pass that will rebuild takes it, then decides
+/// again against the authority it is about to parse. Passes that defer a
+/// store-only nudge or refresh the pinned searcher never hold the guard, so
+/// they cannot refuse a concurrent reindex admission.
+fn run_edge_index_watcher_pass(
+    state: &SharedState,
+    edges_dir: &std::path::Path,
+    cursor: &mut EdgeIndexWatcherCursor,
+    nudged: bool,
+    nudge_limit: usize,
+) -> EdgeIndexWatcherPass {
+    let current = state.idx.read().num_docs();
+    let authority_unavailable = |cursor: &mut EdgeIndexWatcherCursor, error: anyhow::Error| {
+        tracing::warn!(
+            %error,
+            nudged,
+            "edge-index watcher authority capture failed; keeping the last published graph"
+        );
+        cursor.last_seen = current;
+        EdgeIndexWatcherPass::AuthorityUnavailable
+    };
+    let mut decision =
+        match decide_edge_index_watcher_pass(state, edges_dir, cursor, nudged, nudge_limit) {
+            Ok(decision) => decision,
+            Err(error) => return authority_unavailable(cursor, error),
+        };
+    if decision.rebuild {
+        let Some(publication_guard) = state.index_writer.try_begin_edge_index_rebuild() else {
+            return EdgeIndexWatcherPass::PublicationBusy;
+        };
+        decision =
+            match decide_edge_index_watcher_pass(state, edges_dir, cursor, nudged, nudge_limit) {
+                Ok(decision) => decision,
+                Err(error) => return authority_unavailable(cursor, error),
+            };
+        if decision.rebuild {
+            let outcome = rebuild_edge_index_for_watcher(
+                state, edges_dir, cursor, current, nudged, &decision,
+            );
+            drop(publication_guard);
+            cursor.last_seen = current;
+            return outcome;
+        }
+    }
+    let EdgeIndexWatcherDecision {
+        signature,
+        published_edge_count,
+        ..
+    } = decision;
+    let outcome = if nudged {
+        let detail = format!(
+            "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {nudge_limit}) and sidecar authority did not change"
+        );
+        let _ = state.code_sources.store().record_health_failure(
+            "_edge_index",
+            "store_refresh_deferred",
+            &detail,
+        );
+        tracing::warn!(
+            published_edge_count,
+            limit = nudge_limit,
+            "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
+        );
+        EdgeIndexWatcherPass::StoreRefreshDeferred
+    } else if current != cursor.last_seen {
+        let searcher = { state.idx.read().searcher() };
+        state.publish_code_read_searcher(searcher);
+        tracing::debug!(
+            prev_docs = cursor.last_seen,
+            new_docs = current,
+            sidecar_files = signature.files,
+            sidecar_bytes = signature.bytes,
+            "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
+        );
+        EdgeIndexWatcherPass::SearcherRefreshed
+    } else {
+        EdgeIndexWatcherPass::Unchanged
+    };
+    cursor.last_seen = current;
+    outcome
+}
+
+/// Rebuild step of a watcher pass. The caller holds the sidecar publication
+/// guard for the whole call.
+fn rebuild_edge_index_for_watcher(
+    state: &SharedState,
+    edges_dir: &std::path::Path,
+    cursor: &mut EdgeIndexWatcherCursor,
+    current: u64,
+    nudged: bool,
+    decision: &EdgeIndexWatcherDecision,
+) -> EdgeIndexWatcherPass {
+    let EdgeIndexWatcherDecision {
+        signature,
+        sidecars_changed,
+        ..
+    } = *decision;
+    let started = std::time::Instant::now();
+    tracing::info!(
+        current_docs = current,
+        sidecar_files = signature.files,
+        sidecar_bytes = signature.bytes,
+        nudged,
+        sidecars_changed,
+        "edge-index watcher rebuild started"
+    );
+    match rebuild_edge_index_from_shared(state, false) {
+        Ok(()) => {
+            tracing::info!(
+                prev_docs = cursor.last_seen,
+                new_docs = current,
+                sidecar_files = signature.files,
+                sidecar_bytes = signature.bytes,
+                nudged,
+                sidecars_changed,
+                elapsed_ms = started.elapsed().as_millis(),
+                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
+            );
+            cursor.last_signature = capture_edge_rebuild_authority(
+                edges_dir,
+                Some(&state.corpus_registered_project_ids()),
+            )
+            .ok()
+            .map(|authority| authority.signature)
+            .or(Some(signature));
+            let _ = state
+                .code_sources
+                .store()
+                .clear_health_failure("_edge_index", "store_refresh_deferred");
+            EdgeIndexWatcherPass::Rebuilt
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                nudged,
+                elapsed_ms = started.elapsed().as_millis(),
+                "edge-index watcher rebuild failed; retaining prior signature for retry"
+            );
+            EdgeIndexWatcherPass::RebuildFailed
+        }
+    }
 }
 
 pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result<Value> {
@@ -2552,6 +2663,113 @@ mod tests {
         assert!(
             should_rebuild_edge_index(false, true, usize::MAX, 0),
             "authority changes still require a rebuild regardless of current graph size"
+        );
+    }
+
+    /// Publish a sidecar graph and return the watcher cursor over it plus the
+    /// published edge count.
+    fn published_watcher_graph(state: &SharedState) -> (EdgeIndexWatcherCursor, usize) {
+        let edges_dir = edge_sidecar_dir(state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::edge_sidecar::append_edges(
+            &edges_dir,
+            "agents",
+            &[signature_test_edge("A"), signature_test_edge("B")],
+        )
+        .unwrap();
+        rebuild_edge_index_from_shared(state, false).unwrap();
+        let published = state.code_read_view.read().edge_index.edge_count();
+        assert!(published > 0, "the fixture must publish a non-empty graph");
+        (
+            EdgeIndexWatcherCursor::capture(state, &edges_dir),
+            published,
+        )
+    }
+
+    #[test]
+    fn store_only_nudges_above_the_limit_never_hold_the_reindex_publication_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root.join("bro"));
+        let edges_dir = edge_sidecar_dir(&state);
+        let (mut cursor, published) = published_watcher_graph(&state);
+        let nudge_limit = published - 1;
+        let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take().unwrap();
+
+        for _ in 0..3 {
+            state.nudge_edge_index_rebuild();
+            let nudged = nudge_rx.try_recv().is_ok();
+            assert!(nudged);
+            assert_eq!(
+                run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, nudged, nudge_limit),
+                EdgeIndexWatcherPass::StoreRefreshDeferred
+            );
+            state
+                .index_writer
+                .run_reindex_pass(false, true)
+                .expect("reindex admission succeeds between watcher passes");
+        }
+
+        // A deferral pass never takes the guard: it settles even while another
+        // publication holds it, and leaves that holder's reservation intact.
+        let held = state
+            .index_writer
+            .try_begin_edge_index_rebuild()
+            .expect("idle publication admits an edge rebuild");
+        state.nudge_edge_index_rebuild();
+        assert!(nudge_rx.try_recv().is_ok());
+        assert_eq!(
+            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, true, nudge_limit),
+            EdgeIndexWatcherPass::StoreRefreshDeferred
+        );
+        assert!(state.index_writer.try_begin_edge_index_rebuild().is_none());
+        drop(held);
+        state
+            .index_writer
+            .run_reindex_pass(false, true)
+            .expect("reindex admission succeeds once the other holder releases");
+        assert_eq!(
+            state.code_read_view.read().edge_index.edge_count(),
+            published,
+            "deferral passes must not republish the graph"
+        );
+    }
+
+    #[test]
+    fn watcher_rebuild_waits_for_the_publication_guard_and_rechecks_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root.join("bro"));
+        let edges_dir = edge_sidecar_dir(&state);
+        let (mut cursor, published) = published_watcher_graph(&state);
+        let published_signature = cursor.last_signature;
+
+        bbox_edge_sidecar::edge_sidecar::append_edges(
+            &edges_dir,
+            "agents",
+            &[signature_test_edge("C")],
+        )
+        .unwrap();
+        let held = state
+            .index_writer
+            .try_begin_edge_index_rebuild()
+            .expect("idle publication admits an edge rebuild");
+        assert_eq!(
+            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, false, usize::MAX),
+            EdgeIndexWatcherPass::PublicationBusy
+        );
+        assert_eq!(cursor.last_signature, published_signature);
+        drop(held);
+
+        assert_eq!(
+            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, false, usize::MAX),
+            EdgeIndexWatcherPass::Rebuilt
+        );
+        assert_ne!(cursor.last_signature, published_signature);
+        assert!(state.code_read_view.read().edge_index.edge_count() > published);
+        assert!(
+            state.index_writer.try_begin_edge_index_rebuild().is_some(),
+            "the rebuild releases the guard when the pass ends"
         );
     }
 
