@@ -417,12 +417,23 @@ pub struct CheckoutAccessError {
     pub diagnostic: String,
 }
 
+/// Diagnostic for a recorded checkout or project root that does not resolve
+/// on this host: the host does not hold that checkout.
+pub const ROOT_NOT_CANONICALIZABLE: &str = "checkout authority root cannot be canonicalized";
+
 impl CheckoutAccessError {
     pub fn new(code: CheckoutAccessErrorCode, diagnostic: impl Into<String>) -> Self {
         Self {
             code,
             diagnostic: diagnostic.into(),
         }
+    }
+
+    /// Whether the refusal is a recorded root that does not resolve on this
+    /// host, as opposed to any other inactive or mismatched checkout.
+    pub fn is_root_not_canonicalizable(&self) -> bool {
+        self.code == CheckoutAccessErrorCode::AttachmentInactive
+            && self.diagnostic == ROOT_NOT_CANONICALIZABLE
     }
 }
 

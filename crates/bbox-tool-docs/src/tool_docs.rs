@@ -329,7 +329,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_blame",
         category: ToolCategory::Graph,
         summary: "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it.",
-        when_to_use: "Use for WHY-this-line-exists questions; check anchor-matched vs git-only.",
+        when_to_use: "Use for WHY-this-line-exists questions; check anchor-matched vs git-only. When the daemon cannot run blame against the project's checkout itself (a workspace-bound or operator-bound session, a project whose blame authority is checkout-local, or a catalog checkout that is not on the daemon host), the call refuses with `error.blame_locality_required`. Run `bro blame --token-file <FILE> --entity-ref <REF>` or `bro blame --token-file <FILE> --file <PATH> --line <N>` on the checkout host instead.",
         example: None,
     },
     ToolDoc {

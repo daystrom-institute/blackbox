@@ -70,11 +70,28 @@ struct AcquiredCheckoutFile {
 }
 
 fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
-    anyhow!(
-        "error.checkout_access.{}: {}",
-        error.code.as_str(),
-        error.diagnostic
-    )
+    crate::server::checkout_access::checkout_access_error(error)
+}
+
+/// The lane a blame the daemon cannot run itself belongs to.
+const BLAME_LOCALITY_LANE: &str = "run `bro blame --token-file <FILE> --entity-ref <REF>` or `bro blame --token-file <FILE> --file <PATH> --line <N>` on the checkout host";
+
+fn blame_locality_required(reason: &str) -> anyhow::Error {
+    anyhow!("error.blame_locality_required: {reason}; {BLAME_LOCALITY_LANE}")
+}
+
+/// A catalog checkout whose recorded root does not resolve on the daemon host
+/// is held elsewhere, so its blame belongs to the checkout host's lane rather
+/// than to a canonicalization refusal. Every other error passes through.
+fn refuse_daemon_absent_checkout(server: &BlackboxServer, error: anyhow::Error) -> anyhow::Error {
+    let absent = !server.state.project_authority.is_bridge()
+        && error
+            .downcast_ref::<crate::server::checkout_access::CheckoutAccessRefusal>()
+            .is_some_and(|refusal| refusal.0.is_root_not_canonicalizable());
+    if absent {
+        return blame_locality_required("this project's checkout is not on the daemon host");
+    }
+    error
 }
 
 /// Acquire one lease for an operation named by project identity alone.
@@ -169,9 +186,135 @@ fn enforce_blame_locality_cutover(
             .blame_locality_cutover
             .transport_governed(project_id)
     }) {
-        bail!("error.blame_locality_required: this project's blame authority is checkout-local");
+        return Err(blame_locality_required(
+            "this project's blame authority is checkout-local",
+        ));
     }
     Ok(())
+}
+
+/// Blame through the daemon's own checkout lease: the lane for a caller that
+/// holds no blame binding and sends no locality phase.
+fn checkout_blame(
+    server: &BlackboxServer,
+    target: mcp_tools::blame::BlameTargetIdentity,
+    read_view: &crate::server::state::CodeReadView,
+    projects: &[ProjectRecord],
+) -> Result<String> {
+    enforce_blame_locality_cutover(server, &target)?;
+    let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+    let BlameCheckoutTarget {
+        acquired,
+        line,
+        byte_offset,
+        source,
+    } = acquire_blame_target(server, &broker, target, read_view, projects)
+        .map_err(|error| refuse_daemon_absent_checkout(server, error))?;
+    let project_rel = acquired
+        .lease
+        .project_root()
+        .strip_prefix(acquired.lease.checkout_root())
+        .map_err(|_| anyhow!("error.checkout_scope_invalid: project root escaped checkout root"))?;
+    let git_relative_path = project_rel.join(&acquired.relative_path);
+    let output = mcp_tools::blame::blame(
+        mcp_tools::blame::ValidatedBlameTarget {
+            git_root: acquired.lease.checkout_root().to_path_buf(),
+            git_relative_path,
+            display_path: acquired.relative_path.clone(),
+            line,
+            byte_offset,
+            source,
+        },
+        read_view.edge_index.as_ref(),
+    )?;
+    broker
+        .revalidate(&acquired.lease)
+        .map_err(checkout_access_error)?;
+    Ok(output)
+}
+
+struct BlameCheckoutTarget {
+    acquired: AcquiredCheckoutFile,
+    line: Option<u64>,
+    byte_offset: Option<u64>,
+    source: mcp_tools::blame::BlameSource,
+}
+
+fn acquire_blame_target(
+    server: &BlackboxServer,
+    broker: &CheckoutAccessBroker,
+    target: mcp_tools::blame::BlameTargetIdentity,
+    read_view: &crate::server::state::CodeReadView,
+    projects: &[ProjectRecord],
+) -> Result<BlameCheckoutTarget> {
+    Ok(match target {
+        mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+            project_id,
+            indexed_path_hint,
+            line,
+            byte_offset,
+        } => {
+            validate_explicit_project_selection(server, &project_id)?;
+            let acquired =
+                acquire_project_file(server, broker, &project_id, &indexed_path_hint, projects)?;
+            // Catalog corpus identity is answered AT the snapshot
+            // commit. The bridge has no overlay lane at all
+            // (`read_git_overlays_for_view` returns an empty map there
+            // by contract), so requiring evidence on that arm would
+            // change bridge output, which section 11 forbids; the
+            // bridge keeps its current-checkout behavior verbatim.
+            let source = if server.state.project_authority.is_bridge() {
+                mcp_tools::blame::BlameSource::WorkingTree {
+                    content: acquired.content.clone(),
+                }
+            } else {
+                mcp_tools::blame::BlameSource::Snapshot {
+                    commit: snapshot_commit_for_blame(
+                        &read_view.git_overlays,
+                        &project_id,
+                        acquired.lease.checkout_root(),
+                    )?,
+                }
+            };
+            BlameCheckoutTarget {
+                acquired,
+                line,
+                byte_offset: Some(byte_offset),
+                source,
+            }
+        }
+        mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
+            let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
+            let selection = file_selection(
+                server,
+                broker,
+                &input_path,
+                None,
+                server.authoritative_session_checkout().as_deref(),
+                projects,
+                &checkout_rows,
+            )?;
+            let acquired = acquire_file_selection(
+                server,
+                broker,
+                selection,
+                CheckoutAccessKind::Blame,
+                CheckoutAccessIntent::Read,
+            )?;
+            // A blame the caller addressed by PATH names no corpus
+            // snapshot, so current history is the only history it
+            // could mean. The fix condition preserves this arm.
+            let source = mcp_tools::blame::BlameSource::WorkingTree {
+                content: acquired.content.clone(),
+            };
+            BlameCheckoutTarget {
+                acquired,
+                line: Some(line),
+                byte_offset: None,
+                source,
+            }
+        }
+    })
 }
 
 /// Internal slice matcher over records the handler boundary has already
@@ -1720,102 +1863,14 @@ impl BlackboxServer {
                     if server.authoritative_session_workspace_binding().is_some()
                         || server.authoritative_operator_blame_binding().is_some() =>
                 {
-                    bail!(
-                        "error.blame_locality_required: a workspace-bound blame must execute in its checkout owner"
-                    );
+                    return Err(blame_locality_required(
+                        "a workspace-bound blame must execute in its checkout owner",
+                    ));
                 }
                 None => {}
             }
 
-            enforce_blame_locality_cutover(&server, &target)?;
-            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
-            let acquired = match target {
-                mcp_tools::blame::BlameTargetIdentity::ProjectFile {
-                    project_id,
-                    indexed_path_hint,
-                    line,
-                    byte_offset,
-                } => {
-                    validate_explicit_project_selection(&server, &project_id)?;
-                    let acquired = acquire_project_file(
-                        &server,
-                        &broker,
-                        &project_id,
-                        &indexed_path_hint,
-                        &projects,
-                    )?;
-                    // Catalog corpus identity is answered AT the snapshot
-                    // commit. The bridge has no overlay lane at all
-                    // (`read_git_overlays_for_view` returns an empty map there
-                    // by contract), so requiring evidence on that arm would
-                    // change bridge output, which section 11 forbids; the
-                    // bridge keeps its current-checkout behavior verbatim.
-                    let source = if server.state.project_authority.is_bridge() {
-                        mcp_tools::blame::BlameSource::WorkingTree {
-                            content: acquired.content.clone(),
-                        }
-                    } else {
-                        mcp_tools::blame::BlameSource::Snapshot {
-                            commit: snapshot_commit_for_blame(
-                                &read_view.git_overlays,
-                                &project_id,
-                                acquired.lease.checkout_root(),
-                            )?,
-                        }
-                    };
-                    (acquired, line, Some(byte_offset), source)
-                }
-                mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
-                    let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
-                    let selection = file_selection(
-                        &server,
-                        &broker,
-                        &input_path,
-                        None,
-                        server.authoritative_session_checkout().as_deref(),
-                        &projects,
-                        &checkout_rows,
-                    )?;
-                    let acquired = acquire_file_selection(
-                        &server,
-                        &broker,
-                        selection,
-                        CheckoutAccessKind::Blame,
-                        CheckoutAccessIntent::Read,
-                    )?;
-                    // A blame the caller addressed by PATH names no corpus
-                    // snapshot, so current history is the only history it
-                    // could mean. The fix condition preserves this arm.
-                    let source = mcp_tools::blame::BlameSource::WorkingTree {
-                        content: acquired.content.clone(),
-                    };
-                    (acquired, Some(line), None, source)
-                }
-            };
-            let (acquired, line, byte_offset, source) = acquired;
-            let project_rel = acquired
-                .lease
-                .project_root()
-                .strip_prefix(acquired.lease.checkout_root())
-                .map_err(|_| {
-                    anyhow!("error.checkout_scope_invalid: project root escaped checkout root")
-                })?;
-            let git_relative_path = project_rel.join(&acquired.relative_path);
-            let output = mcp_tools::blame::blame(
-                mcp_tools::blame::ValidatedBlameTarget {
-                    git_root: acquired.lease.checkout_root().to_path_buf(),
-                    git_relative_path,
-                    display_path: acquired.relative_path.clone(),
-                    line,
-                    byte_offset,
-                    source,
-                },
-                edge_index,
-            )?;
-            broker
-                .revalidate(&acquired.lease)
-                .map_err(checkout_access_error)?;
-            Ok(output)
+            checkout_blame(&server, target, &read_view, &projects)
         })
         .await
     }
@@ -2139,6 +2194,19 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+
+    /// A blame locality refusal names the working lane and never surfaces a
+    /// daemon-side canonicalization failure.
+    pub(super) fn assert_names_bro_blame_lane(text: &str) {
+        assert!(text.contains("error.blame_locality_required"), "{text}");
+        assert!(
+            text.contains("`bro blame --token-file <FILE> --entity-ref <REF>`")
+                && text.contains("`bro blame --token-file <FILE> --file <PATH> --line <N>`")
+                && text.contains("on the checkout host"),
+            "{text}"
+        );
+        assert!(!text.contains("attachment_inactive"), "{text}");
     }
 
     fn extract_text(result: &CallToolResult) -> String {
@@ -4976,7 +5044,7 @@ mod tests {
             }))
             .await;
         assert_eq!(fallback.is_error, Some(true));
-        assert!(extract_text(&fallback).contains("error.blame_locality_required"));
+        assert_names_bro_blame_lane(&extract_text(&fallback));
         assert_eq!(server.state.checkout_access.health().sequence, before);
 
         let expired_tmp = tempfile::tempdir().unwrap();
@@ -5077,7 +5145,7 @@ mod tests {
             }))
             .await;
         assert_eq!(fallback.is_error, Some(true));
-        assert!(extract_text(&fallback).contains("error.blame_locality_required"));
+        assert_names_bro_blame_lane(&extract_text(&fallback));
         assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
@@ -5864,6 +5932,7 @@ mod catalog_adapter_tests {
     use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
     use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 
+    use super::tests::assert_names_bro_blame_lane;
     use super::*;
     use crate::server::state::SharedState;
 
@@ -6718,7 +6787,7 @@ mod catalog_adapter_tests {
             }))
             .await;
         assert_eq!(path.is_error, Some(true));
-        assert!(extract_text(&path).contains("error.blame_locality_required"));
+        assert_names_bro_blame_lane(&extract_text(&path));
         let entity = mcp_tools::blame::BlameTargetIdentity::ProjectFile {
             project_id: PROJECT_ONE.into(),
             indexed_path_hint: PathBuf::from("file.rs"),
@@ -6728,7 +6797,7 @@ mod catalog_adapter_tests {
         let entity_error = enforce_blame_locality_cutover(&governed, &entity)
             .unwrap_err()
             .to_string();
-        assert!(entity_error.contains("error.blame_locality_required"));
+        assert_names_bro_blame_lane(&entity_error);
         assert_eq!(governed.state.checkout_access.health().sequence, before);
 
         let uncovered = fixture.server();
@@ -6747,6 +6816,85 @@ mod catalog_adapter_tests {
             .await;
         assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
         assert!(uncovered.state.checkout_access.health().sequence > before);
+    }
+
+    /// A catalog checkout whose recorded root does not exist on the daemon
+    /// host is refused toward the checkout host's `bro blame` lane for both
+    /// target forms, while every other broker refusal keeps its own code.
+    #[tokio::test]
+    async fn blame_of_a_checkout_absent_from_the_daemon_host_names_bro_blame() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        std::fs::remove_dir_all(&checkout).unwrap();
+        assert!(!checkout.exists());
+        let server = fixture.server();
+        server
+            .surface_project
+            .set(Some(Arc::from(PROJECT_ONE)))
+            .unwrap();
+
+        let path = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("file.rs".into()),
+                line: Some(1),
+                entity_ref: None,
+                locality: None,
+            }))
+            .await;
+        assert_eq!(path.is_error, Some(true));
+        let path = extract_text(&path);
+        assert_names_bro_blame_lane(&path);
+        assert!(
+            path.contains("checkout is not on the daemon host"),
+            "{path}"
+        );
+
+        let read_view = server.state.complete_code_read_view().unwrap();
+        let entity = checkout_blame(
+            &server,
+            mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+                project_id: PROJECT_ONE.into(),
+                indexed_path_hint: PathBuf::from("file.rs"),
+                line: Some(1),
+                byte_offset: 0,
+            },
+            &read_view,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_names_bro_blame_lane(&entity);
+        assert!(
+            entity.contains("checkout is not on the daemon host"),
+            "{entity}"
+        );
+
+        // A checkout the daemon host does hold, but whose identity marker is
+        // gone, is a different refusal and passes through unchanged.
+        let present = CatalogAdapters::new();
+        present.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = present.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        std::fs::remove_file(checkout.join(".bbox/local/checkout-id")).unwrap();
+        let server = present.server();
+        let read_view = server.state.complete_code_read_view().unwrap();
+        let mismatch = checkout_blame(
+            &server,
+            mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+                project_id: PROJECT_ONE.into(),
+                indexed_path_hint: PathBuf::from("file.rs"),
+                line: Some(1),
+                byte_offset: 0,
+            },
+            &read_view,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mismatch.starts_with("error.checkout_access.checkout_identity_mismatch"),
+            "{mismatch}"
+        );
     }
 
     /// Corpus-identity blame refuses an absolute indexed hint in catalog

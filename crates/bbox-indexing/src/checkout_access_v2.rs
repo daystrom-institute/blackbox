@@ -35,6 +35,7 @@ use crate::checkout_access::{
     CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError, CheckoutAccessErrorCode,
     CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
     CheckoutAttachmentSelector, CheckoutAttachmentStatus, CheckoutRecordedProjectScope,
+    ROOT_NOT_CANONICALIZABLE,
 };
 use crate::project_catalog_store::{ProjectCatalogState, ProjectCatalogStore};
 use crate::project_resolver::ProjectResolverEngine;
@@ -408,7 +409,7 @@ fn canonical_directory(path: &Path) -> std::result::Result<PathBuf, CheckoutAcce
     let canonical = std::fs::canonicalize(path).map_err(|_| {
         access_error(
             CheckoutAccessErrorCode::AttachmentInactive,
-            "checkout authority root cannot be canonicalized",
+            ROOT_NOT_CANONICALIZABLE,
         )
     })?;
     if !canonical.is_dir() {

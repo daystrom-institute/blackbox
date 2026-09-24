@@ -122,9 +122,10 @@ checkout_root_path	src/server/repo_io.rs	fn with_access	1	collapse into the leas
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_resolve	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_update	1	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn acquire_blame_target	1	collapse into the lease confined readers
 checkout_root_path	src/tools/graph.rs	fn acquire_file_selection	1	collapse into the lease confined readers
 checkout_root_path	src/tools/graph.rs	fn acquire_provenance_projects	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn bbox_blame	4	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn checkout_blame	3	collapse into the lease confined readers
 checkout_root_path	src/tools/graph.rs	fn lexical_absolute_selection	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	collapse into the lease confined readers

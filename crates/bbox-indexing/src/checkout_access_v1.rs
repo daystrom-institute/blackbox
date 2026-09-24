@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::checkout_access::{
     CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError, CheckoutAccessErrorCode,
     CheckoutAccessIntent, CheckoutAccessRequest, CheckoutAccessSourceLane,
-    CheckoutAttachmentSelector, CheckoutAttachmentStatus,
+    CheckoutAttachmentSelector, CheckoutAttachmentStatus, ROOT_NOT_CANONICALIZABLE,
 };
 use crate::checkout_registry::{CheckoutRegistry, CheckoutRow};
 use crate::projects::{ProjectRegistry, ResolveIntent, resolve_project_context};
@@ -587,7 +587,7 @@ fn canonical_directory(path: &Path) -> std::result::Result<PathBuf, CheckoutAcce
     let canonical = std::fs::canonicalize(path).map_err(|_| {
         access_error(
             CheckoutAccessErrorCode::AttachmentInactive,
-            "checkout authority root cannot be canonicalized",
+            ROOT_NOT_CANONICALIZABLE,
         )
     })?;
     if !canonical.is_dir() {
