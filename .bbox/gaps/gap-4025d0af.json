@@ -7,15 +7,18 @@
   "missing_primitive": "pending checkout-mutation listing plus reconcile/discard for stale queued mutations",
   "fallback_used": "Left the target gap unresolved and reported it; the checkout carried no delivered or uncommitted change for the record, and bbox_gaps(provisional=all) showed no provisional variant to reconcile.",
   "evidence": [
-    "bbox_gap_resolve(gap-900d052c) -> error.checkout_mutation_conflict naming mutation cm-eb156f55da928432 awaiting publication, repeated after a fresh commit and push on beta/blackbox-v2 (fe79e7de)",
-    ".bbox/gaps/gap-900d052c.json clean in the owning checkout",
+    "crates/bbox-stores/src/checkout_mutations.rs: write_base refuses with error.checkout_mutation_conflict while an outstanding intent's base differs from publication; outstanding_intents keeps applied-but-unobserved writes",
+    "No MCP or CLI surface lists or reconciles queued checkout mutations; CheckoutMutations::failed has no caller outside the store",
+    "bbox_gap_resolve on gap-900d052c refused naming mutation cm-eb156f55da928432 awaiting publication, repeated after fresh commit and push fe79e7de, with the record clean in the owning checkout",
     "related: gap-92bd3d34 (delivery preconditions and replay), gap-45763947 (delivered writes left uncommitted)"
   ],
   "impact": "medium",
   "blocking_level": "blocks_task",
   "dedupe_key": "tooling/checkout-mutations/stuck-pending-mutation-blocks-record",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-23T23:03:04Z",
-  "updated_at": "2026-09-23T23:03:04Z"
+  "updated_at": "2026-09-24T05:03:07Z",
+  "resolved_at": "2026-09-24T05:03:07Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/58"
 }

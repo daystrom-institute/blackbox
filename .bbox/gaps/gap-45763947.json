@@ -7,15 +7,18 @@
   "missing_primitive": "A committing apply step for checkout-owner deliveries, or a ref-based delivery target.",
   "fallback_used": "A scheduled automation commits delivered .bbox/gaps records in the attached checkout by explicit path every 30 minutes and pushes them.",
   "evidence": [
-    "Five untracked delivered gap records (gap-2fd9c80a, gap-5cd017cc, gap-7da04b93, gap-a60692b3, gap-c6eb8348) sat in the attached checkout with no committer until swept in 9556b281",
-    "Sweep commit 6aa21b8d committed further deliveries (gap-6ac18d37, gap-c6eb8348)",
-    "sm-gap-notes: a queued project-gap reply means delivery was accepted; the owner still commits and publishes the delivered changes"
+    "crates/bbox-code-collector/src/main.rs: apply_checkout_mutation writes the delivered file into the working tree and acks; no stage, commit, or push follows",
+    "docs/code-source-collector.md: delivery changes the checkout; publication waits for the configured committed ref",
+    "crates/bbox-stores/src/checkout_mutations.rs: observe_publication retires the overlay only once the content is published",
+    "Delivered gap records sat untracked in the attached checkout until swept by manual commits 9556b281 and 6aa21b8d"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/checkout-mutations/delivered-writes-left-uncommitted",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-09-23T21:06:21Z",
-  "updated_at": "2026-09-23T21:06:21Z"
+  "updated_at": "2026-09-24T05:03:08Z",
+  "resolved_at": "2026-09-24T05:03:08Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/59"
 }
