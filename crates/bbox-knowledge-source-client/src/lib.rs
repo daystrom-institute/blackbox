@@ -1013,13 +1013,10 @@ fn capture_working_graphs(
         .with_context(|| format!("reading bound graph lane {}", directory_path.display()))?
     {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            bail!("bound graph lane contains a symlink entry");
-        }
-        // A plain file directly under the lane is never a graph source; it is
-        // left out unopened.
-        if !file_type.is_dir() {
+        // The entry type is read without following links. Anything directly
+        // under the lane that is not a real directory, symlinks included, is
+        // never a graph and is left out unopened.
+        if !entry.file_type()?.is_dir() {
             continue;
         }
         let graph_id = entry
@@ -1027,14 +1024,17 @@ fn capture_working_graphs(
             .into_string()
             .map_err(|_| anyhow!("bound graph id is not UTF-8"))?;
         graph_ids.insert(graph_id);
-    }
-    if graph_ids.len() as u64 > limits.max_graphs_per_lane {
-        bail!("bound graph lane exceeds its graph limit");
+        // Bounds how many candidate directories are opened; the graph limit
+        // applies below, to directories that actually hold graph sources.
+        if graph_ids.len() as u64 > limits.max_files_per_lane {
+            bail!("bound graph lane exceeds its entry limit");
+        }
     }
     let prefix = lane_repository_directory(scope, SourceLaneV1::Graphs);
     let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
     let allowed = BTreeSet::from(GRAPH_SOURCE_FILENAMES);
     let mut entries = Vec::with_capacity(graph_ids.len().saturating_mul(3));
+    let mut graph_count = 0_u64;
     for graph_id in graph_ids {
         let graph_path = directory_path.join(&graph_id);
         let graph_directory = NofollowDirectory::open_existing(&graph_path)?
@@ -1065,6 +1065,10 @@ fn capture_working_graphs(
         if names.is_empty() {
             graph_directory.ensure_still_current()?;
             continue;
+        }
+        graph_count += 1;
+        if graph_count > limits.max_graphs_per_lane {
+            bail!("bound graph lane exceeds its graph limit");
         }
         let present = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
         if !required.is_subset(&present) || !present.is_subset(&allowed) {
@@ -1728,7 +1732,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn graph_capture_rejects_symlinked_directories_and_files() {
+    fn graph_capture_refuses_source_named_symlinks_and_skips_lane_symlinks() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1738,38 +1742,64 @@ mod tests {
         fs::write(&external, b"{}\n").unwrap();
         fs::remove_file(graph.join("schema.json")).unwrap();
         symlink(&external, graph.join("schema.json")).unwrap();
-        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
-            .unwrap()
-            .unwrap();
-        let mut blobs = BTreeMap::new();
-        assert!(
-            capture_working_graphs(
-                &root.join(".bbox/graphs"),
-                &lane,
-                &PublishedScope::try_new("capture-test", ".").unwrap(),
-                KnowledgeSourceLimits::default(),
-                &mut blobs,
-            )
-            .is_err()
-        );
+        let error = capture_graph_lane(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink or not a regular file"));
 
+        // Symlinks directly under the lane are never graphs, whether they
+        // point at a notes file or at a graph-shaped directory elsewhere.
         fs::remove_dir_all(root.join(".bbox/graphs")).unwrap();
-        fs::create_dir_all(root.join(".bbox/graphs")).unwrap();
-        let external_graph = write_working_graph(&root.join("external"), "records");
+        write_working_graph(&root, "records");
+        let notes = root.join("notes.md");
+        fs::write(&notes, b"notes\n").unwrap();
+        symlink(&notes, root.join(".bbox/graphs/NOTES.md")).unwrap();
+        let external_graph = write_working_graph(&root.join("external"), "linked");
         symlink(external_graph, root.join(".bbox/graphs/linked")).unwrap();
-        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
-            .unwrap()
-            .unwrap();
-        assert!(
+
+        let entries = capture_graph_lane(&root).unwrap();
+
+        let listed = entries
+            .iter()
+            .map(|entry| entry.repository_relative_filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                ".bbox/graphs/records/edges.jsonl",
+                ".bbox/graphs/records/schema.json",
+                ".bbox/graphs/records/vertices.jsonl",
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_capture_counts_only_source_bearing_directories_against_the_graph_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write_working_graph(&root, "design");
+        fs::create_dir_all(root.join(".bbox/graphs/notes")).unwrap();
+        fs::write(root.join(".bbox/graphs/notes/README.md"), b"notes\n").unwrap();
+        let limits = KnowledgeSourceLimits {
+            max_graphs_per_lane: 1,
+            ..KnowledgeSourceLimits::default()
+        };
+        let capture = |root: &Path| {
+            let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+                .unwrap()
+                .unwrap();
             capture_working_graphs(
                 &root.join(".bbox/graphs"),
                 &lane,
                 &PublishedScope::try_new("capture-test", ".").unwrap(),
-                KnowledgeSourceLimits::default(),
-                &mut blobs,
+                limits,
+                &mut BTreeMap::new(),
             )
-            .is_err()
-        );
+        };
+
+        assert_eq!(capture(&root).unwrap().len(), 3);
+
+        write_working_graph(&root, "records");
+        let error = capture(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds its graph limit"));
     }
 
     #[test]
