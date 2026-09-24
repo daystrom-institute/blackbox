@@ -16,10 +16,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/refactor-tools/ts-query-node-kind-introspection",
   "notes": "Traced 2026-09-23: no node-kind or grammar introspection binding exists; the code namespace lists eight methods (items, fields, files, query, read, readLines, signature, spanUnion). Inline mitigations remain in the namespace description (two example queries, empty-vs-invalid semantics). No retrievable tree-sitter guidance memory exists.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-06-12T19:27:18Z",
-  "updated_at": "2026-09-23T22:33:22Z",
-  "resolved_at": "2026-09-23T22:33:22Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/20"
+  "updated_at": "2026-09-24T03:35:17Z",
+  "resolved_at": "2026-09-24T03:35:17Z",
+  "resolution_note": "implemented in PR #51, commit 2578941d33169d6d7b415fdc318641c39db0692c"
 }
