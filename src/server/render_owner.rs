@@ -312,6 +312,7 @@ impl BlackboxServer {
                 producer_id: owner.producer_id.clone(),
                 operation_id,
                 sequence,
+                issued_at_ms: bbox_project_render::execute::now_unix_ms(),
             };
             let (plan, _) = self.owner_render_plan(&owner, &request, authority)?;
             match runtime.create(
@@ -405,6 +406,7 @@ impl BlackboxServer {
             producer_id: record.producer_id.clone(),
             operation_id: record.operation_id.clone(),
             sequence: record.sequence,
+            issued_at_ms: record.issued_at_ms,
         };
         let (plan, _) = self.owner_render_plan(&owner, request, authority)?;
         if plan.transport_sha256()? != record.plan_sha256 {
@@ -469,32 +471,49 @@ impl BlackboxServer {
                 validation,
                 late,
             } => {
-                let mut validation = validation.clone();
-                if validation == RenderCompletionValidation::Unverified {
-                    match self.revalidate_owner_completion(record, request) {
-                        Ok((checked, current_plan)) => {
-                            // The current plan is byte-identical to the one
-                            // the owner applied, so it proves the receipt.
-                            if let Some(plan) = current_plan {
-                                self.state
-                                    .render_locality_observations
-                                    .record_completed(&plan, receipt)?;
+                // `validation` is what held when the receipt arrived; it is
+                // history. Present validity is rechecked on every response,
+                // so a receipt stops being current once knowledge or owner
+                // authority changes, even without a newer render.
+                let (at_completion, present) = match validation {
+                    RenderCompletionValidation::Stale { .. } => {
+                        (validation.clone(), Some(validation.clone()))
+                    }
+                    RenderCompletionValidation::Unverified
+                    | RenderCompletionValidation::Current => {
+                        match self.revalidate_owner_completion(record, request) {
+                            Ok((checked, current_plan)) => {
+                                if *validation == RenderCompletionValidation::Unverified {
+                                    // The current plan is byte-identical to
+                                    // the one the owner applied, so it
+                                    // proves the receipt.
+                                    if let Some(plan) = current_plan {
+                                        self.state
+                                            .render_locality_observations
+                                            .record_completed(&plan, receipt)?;
+                                    }
+                                    runtime
+                                        .set_validation(&record.operation_id, checked.clone())?;
+                                    (checked.clone(), Some(checked))
+                                } else {
+                                    (validation.clone(), Some(checked))
+                                }
                             }
-                            runtime.set_validation(&record.operation_id, checked.clone())?;
-                            validation = checked;
-                        }
-                        Err(error) => {
-                            response["validation_error"] =
-                                bounded_text(format!("{error:#}")).into();
+                            Err(error) => {
+                                response["validation_error"] =
+                                    bounded_text(format!("{error:#}")).into();
+                                (validation.clone(), None)
+                            }
                         }
                     }
-                }
-                let current = validation == RenderCompletionValidation::Current
+                };
+                let current = present == Some(RenderCompletionValidation::Current)
                     && !late
                     && latest == Some(record.sequence);
                 let outcome = receipt.outcome();
-                response["status"] = match (&validation, outcome) {
-                    (RenderCompletionValidation::Stale { .. }, _) => "render_stale",
+                let stale = matches!(present, Some(RenderCompletionValidation::Stale { .. }));
+                response["status"] = match (stale, outcome) {
+                    (true, _) => "render_stale",
                     (_, bbox_project_render::transport::ProjectRenderOutcomeV1::Partial) => {
                         "render_partial"
                     }
@@ -502,10 +521,16 @@ impl BlackboxServer {
                 }
                 .into();
                 response["outcome"] = serde_json::to_value(outcome)?;
-                response["validation"] = serde_json::to_value(&validation)?;
+                response["validation"] = serde_json::to_value(&at_completion)?;
+                response["present_validation"] = match &present {
+                    Some(present) => serde_json::to_value(present)?,
+                    None => serde_json::json!({"status": "unverified"}),
+                };
                 response["current"] = current.into();
                 if !current && latest.is_some_and(|latest| latest > record.sequence) {
                     response["detail"] = "A newer render of this project exists; this receipt is historical and does not describe current checkout state.".into();
+                } else if !current && stale {
+                    response["detail"] = "Project knowledge or checkout-owner authority changed since this receipt; it does not describe current convergence. Render again for a fresh operation.".into();
                 }
                 response["dispositions"] = serde_json::to_value(receipt.disposition_counts())?;
                 response["receipt"] = serde_json::to_value(receipt)?;

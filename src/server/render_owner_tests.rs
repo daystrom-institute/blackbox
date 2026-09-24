@@ -752,3 +752,58 @@ async fn a_partial_owner_render_is_reported_as_partial() {
     assert_eq!(recovered["outcome"], "partial");
     assert_eq!(recovered["dispositions"]["failed"], 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_rechecks_present_validity_of_a_validated_receipt() {
+    let owner = OwnerFixture::new();
+    let (uncovered, _) = scopes();
+    let server = owner.server();
+    let recover = |server: BlackboxServer, project: &'static str, operation_id: String| async move {
+        parse(
+            &server
+                .bbox_render(Parameters(RenderParams {
+                    operation: Some(operation_id),
+                    project: Some(project.into()),
+                    ..Default::default()
+                }))
+                .await,
+        )
+    };
+
+    let completed = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
+    assert_eq!(completed["validation"]["status"], "current");
+    let uncovered_operation = completed["operation_id"].as_str().unwrap().to_string();
+    let covered = render_with_owner(&server, &owner, project_params(COVERED)).await;
+    let covered_operation = covered["operation_id"].as_str().unwrap().to_string();
+    let again = recover(server.clone(), UNCOVERED, uncovered_operation.clone()).await;
+    assert_eq!(again["current"], true);
+
+    // Knowledge changes without another render being issued.
+    owner.fixture.install_publication(
+        UNCOVERED,
+        &uncovered,
+        COMMIT_TWO,
+        &[marker_entry(
+            UNCOVERED,
+            "owner-uncovered",
+            "CHANGED_WITHOUT_A_RENDER",
+        )],
+        &[],
+    );
+    let changed = owner.server();
+    announce(&changed, owner.roots.keys().cloned().collect());
+    let recovered = recover(changed.clone(), UNCOVERED, uncovered_operation).await;
+    assert_eq!(recovered["current"], false, "{recovered}");
+    assert_eq!(recovered["status"], "render_stale");
+    assert_eq!(
+        recovered["validation"]["status"], "current",
+        "history is kept"
+    );
+    assert_eq!(recovered["present_validation"]["status"], "stale");
+
+    // Owner authority is revoked without another render being issued.
+    owner.install_grant(&changed, PRODUCER, false);
+    let revoked = recover(changed.clone(), COVERED, covered_operation).await;
+    assert_eq!(revoked["current"], false, "{revoked}");
+    assert_eq!(revoked["present_validation"]["status"], "stale");
+}

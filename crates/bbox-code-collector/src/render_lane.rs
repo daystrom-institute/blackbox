@@ -15,7 +15,9 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use bbox_project_render::execute::execute_project_render_plan_as;
+use bbox_project_render::execute::{
+    ExecuteOptions, PreflightRecord, execute_project_render_plan_with, reconcile_interrupted_render,
+};
 use bbox_project_render::transport::{
     ExpectedRenderAuthority, MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES, PROJECT_RENDER_TRANSPORT_VERSION,
     ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1, ProjectRenderPlanV1,
@@ -63,6 +65,9 @@ struct JournalEntry {
     receipt: Option<ProjectRenderReceiptV1>,
     #[serde(default)]
     error: Option<RenderOperationErrorV1>,
+    /// Recorded before the first write of an application.
+    #[serde(default)]
+    preflight: Option<PreflightRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,7 +352,7 @@ pub(crate) async fn execute_render_operation(
     journal_path: &Path,
     operation: &RenderOperationDeliveryV1,
 ) -> Result<bool> {
-    let mut journal = load_journal(journal_path)?;
+    let journal = load_journal(journal_path)?;
     if let Some(entry) = journal.entry(&operation.operation_id)
         && entry.plan_sha256 == operation.plan_sha256
     {
@@ -363,7 +368,18 @@ pub(crate) async fn execute_render_operation(
             _ => {}
         }
     }
-    let outcome = if journal.applied_sequence(&operation.scope) > operation.sequence {
+    // An operation journaled as applying recorded its preflight and was
+    // interrupted before its result was recorded. It is reconciled against
+    // that preflight, never applied again over whatever is there now.
+    let interrupted = journal
+        .entry(&operation.operation_id)
+        .filter(|entry| {
+            entry.plan_sha256 == operation.plan_sha256 && entry.stage == JournalStage::Applying
+        })
+        .and_then(|entry| entry.preflight.clone());
+    let outcome = if interrupted.is_none()
+        && journal.applied_sequence(&operation.scope) > operation.sequence
+    {
         Err(render_failure(
             "render_superseded",
             "a newer render operation already applied to this checkout; this older plan was not applied".into(),
@@ -390,27 +406,50 @@ pub(crate) async fn execute_render_operation(
                         "the plan's authority does not match the delivered operation".into(),
                     ))
                 } else {
-                    journal.upsert(JournalEntry {
-                        operation_id: operation.operation_id.clone(),
-                        scope: operation.scope.clone(),
-                        sequence: operation.sequence,
-                        plan_sha256: operation.plan_sha256.clone(),
-                        stage: JournalStage::Applying,
-                        receipt: None,
-                        error: None,
-                    });
-                    save_journal(journal_path, &journal)?;
                     let scope = operation.scope.clone();
                     let operation_id = operation.operation_id.clone();
+                    let sequence = operation.sequence;
+                    let plan_sha256 = operation.plan_sha256.clone();
+                    let hook_journal = journal_path.to_path_buf();
                     let executed = tokio::task::spawn_blocking(move || {
-                        execute_project_render_plan_as(
+                        let authority = ExpectedRenderAuthority::Producer {
+                            operation_id: &operation_id,
+                        };
+                        if let Some(record) = interrupted {
+                            return reconcile_interrupted_render(
+                                &plan,
+                                &root,
+                                &scope,
+                                authority,
+                                &record,
+                                RENDER_LOCK_TIMEOUT,
+                            );
+                        }
+                        // The preflight is durable before the first write.
+                        let mut journal_preflight = |record: &PreflightRecord| -> Result<()> {
+                            let mut journal = load_journal(&hook_journal)?;
+                            journal.upsert(JournalEntry {
+                                operation_id: operation_id.clone(),
+                                scope: scope.clone(),
+                                sequence,
+                                plan_sha256: plan_sha256.clone(),
+                                stage: JournalStage::Applying,
+                                receipt: None,
+                                error: None,
+                                preflight: Some(record.clone()),
+                            });
+                            save_journal(&hook_journal, &journal)
+                        };
+                        execute_project_render_plan_with(
                             &plan,
                             &root,
                             &scope,
-                            ExpectedRenderAuthority::Producer {
-                                operation_id: &operation_id,
+                            authority,
+                            ExecuteOptions {
+                                lock_timeout: RENDER_LOCK_TIMEOUT,
+                                issued_at_ms: None,
+                                before_publish: Some(&mut journal_preflight),
                             },
-                            RENDER_LOCK_TIMEOUT,
                         )
                     })
                     .await
@@ -422,12 +461,27 @@ pub(crate) async fn execute_render_operation(
                             // redelivery.
                             return Err(error);
                         }
-                        Err(error) => Err(render_failure("render_rejected", format!("{error:#}"))),
+                        // Execution errors all precede the first write; a
+                        // failure after it is carried in the receipt.
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            let code = if message.contains("error.render_superseded") {
+                                "render_superseded"
+                            } else {
+                                "render_rejected"
+                            };
+                            Err(render_failure(code, message))
+                        }
                     }
                 }
             }
         }
     };
+    #[cfg(test)]
+    if tests::crash_before_result(journal_path) {
+        bail!("injected crash before the render result was journaled");
+    }
+    let mut journal = load_journal(journal_path)?;
     journal.upsert(JournalEntry {
         operation_id: operation.operation_id.clone(),
         scope: operation.scope.clone(),
@@ -440,6 +494,7 @@ pub(crate) async fn execute_render_operation(
         },
         receipt: outcome.as_ref().ok().cloned(),
         error: outcome.as_ref().err().cloned(),
+        preflight: None,
     });
     save_journal(journal_path, &journal)?;
     submit_result(runtime, operation, outcome).await
@@ -499,6 +554,14 @@ mod tests {
     };
     use bbox_project_render::wire::RENDER_PROJECT_COMMAND_KIND;
     use std::sync::Mutex;
+
+    static CRASH_BEFORE_RESULT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// Crash injection after the executor returned and before its result is
+    /// journaled, scoped to one test's journal.
+    pub(super) fn crash_before_result(journal_path: &Path) -> bool {
+        CRASH_BEFORE_RESULT.lock().unwrap().as_deref() == Some(journal_path)
+    }
 
     #[derive(Default)]
     struct FakeDaemon {
@@ -662,6 +725,7 @@ mod tests {
                 producer_id: "producer-a".into(),
                 operation_id: operation_id.clone(),
                 sequence,
+                issued_at_ms: sequence,
             }),
             provider: Some("claude".into()),
             dry_run: false,
@@ -753,6 +817,72 @@ mod tests {
         assert_eq!(
             receipt.producer.as_ref().unwrap().operation_id,
             format_render_operation_id(1)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_apply_interrupted_before_its_result_is_reconciled_not_repeated() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        operation(&daemon, &scope, 6, 50, "INTERRUPTED_RENDER_MARKER");
+        let mut lane = RenderLaneState::default();
+
+        // The collector publishes the plan, then crashes before journaling
+        // or reporting the result.
+        *CRASH_BEFORE_RESULT.lock().unwrap() = Some(journal_path(&config));
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        *CRASH_BEFORE_RESULT.lock().unwrap() = None;
+        assert!(daemon.lock().unwrap().results.is_empty());
+        let journal = load_journal(&journal_path(&config)).unwrap();
+        let entry = journal.entry(&format_render_operation_id(6)).unwrap();
+        assert_eq!(entry.stage, JournalStage::Applying);
+        assert!(
+            entry.preflight.is_some(),
+            "the preflight is durable before any write"
+        );
+        assert!(
+            fs::read_to_string(root.join("CLAUDE.md"))
+                .unwrap()
+                .contains("INTERRUPTED_RENDER_MARKER")
+        );
+
+        // The owner edits the generated file before the collector restarts.
+        let edited = "<!-- Generated by blackbox -->\nowner edit after the crash\n";
+        fs::write(root.join("CLAUDE.md"), edited).unwrap();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            edited,
+            "redelivery reconciles instead of applying the old plan again"
+        );
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1);
+        let receipt = results[0].receipt.as_ref().unwrap();
+        assert_eq!(
+            receipt.projections[0].disposition,
+            bbox_project_render::transport::ProjectRenderDispositionV1::Conflict
+        );
+        assert_eq!(
+            load_journal(&journal_path(&config))
+                .unwrap()
+                .entry(&format_render_operation_id(6))
+                .unwrap()
+                .stage,
+            JournalStage::Applied
         );
         server.abort();
     }

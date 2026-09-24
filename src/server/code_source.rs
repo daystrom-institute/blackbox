@@ -7783,6 +7783,7 @@ mod tests {
                 producer_id: "producer-a".into(),
                 operation_id: operation_id.clone(),
                 sequence,
+                issued_at_ms: 1_000,
             }),
             provider: Some("claude".into()),
             dry_run: false,

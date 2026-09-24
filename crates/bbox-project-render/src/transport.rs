@@ -43,6 +43,10 @@ pub struct ProjectRenderProducerAuthorityV1 {
     pub producer_id: String,
     pub operation_id: String,
     pub sequence: u64,
+    /// Daemon-clock issuance in Unix milliseconds. Appliers compare it with
+    /// the checkout freshness fence so an older plan never replaces output
+    /// a newer plan already produced.
+    pub issued_at_ms: u64,
 }
 
 impl ProjectRenderProducerAuthorityV1 {
@@ -175,6 +179,11 @@ pub struct ProjectRenderPlanChunkV1 {
     pub next_offset: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_result: Option<String>,
+    /// Daemon-clock issuance of a workspace plan, on the first chunk only.
+    /// It is outside the plan bytes, so the plan digest stays stable across
+    /// pages and completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +191,7 @@ pub struct AssembledProjectRenderPlanV1 {
     pub plan: ProjectRenderPlanV1,
     pub plan_sha256: String,
     pub global_result: Option<String>,
+    pub issued_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +200,7 @@ pub struct ProjectRenderPlanAssemblerV1 {
     plan_bytes: Option<usize>,
     bytes: Vec<u8>,
     global_result: Option<String>,
+    issued_at_ms: Option<u64>,
     complete: bool,
 }
 
@@ -203,6 +214,10 @@ pub struct ProjectRenderReceiptV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer: Option<ProjectRenderProducerAuthorityV1>,
     pub project_doc_nonempty: bool,
+    /// An output may have been written but the applier could not confirm
+    /// completion. The receipt is then partial whatever its dispositions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     pub projections: Vec<ProjectRenderProjectionReceiptV1>,
 }
 
@@ -243,7 +258,8 @@ pub enum ProjectRenderOutcomeV1 {
     /// At least one handwritten or concurrently changed file was preserved;
     /// every other output converged.
     Preserved,
-    /// At least one output failed to publish.
+    /// At least one output failed to publish, or completion could not be
+    /// confirmed after an output was written.
     Partial,
 }
 
@@ -481,6 +497,7 @@ pub fn transport_chunk_of(
         chunk_base64: BASE64_STANDARD.encode(&bytes[offset..end]),
         next_offset: (end < bytes.len()).then_some(end),
         global_result,
+        issued_at_ms: None,
     };
     if serde_json::to_vec(&chunk)?.len() > MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES {
         anyhow::bail!("project render plan chunk exceeds the wire bound");
@@ -527,13 +544,16 @@ impl ProjectRenderPlanAssemblerV1 {
                 self.plan_bytes = Some(chunk.plan_bytes);
                 self.bytes.reserve(chunk.plan_bytes);
                 self.global_result = chunk.global_result.clone();
+                self.issued_at_ms = chunk.issued_at_ms;
             }
             (Some(plan_sha256), Some(plan_bytes)) => {
                 if plan_sha256 != &chunk.plan_sha256 || plan_bytes != chunk.plan_bytes {
                     anyhow::bail!("project render plan authority changed between chunks");
                 }
-                if chunk.global_result.is_some() {
-                    anyhow::bail!("project render global result repeated after the first chunk");
+                if chunk.global_result.is_some() || chunk.issued_at_ms.is_some() {
+                    anyhow::bail!(
+                        "project render first-chunk fields repeated after the first chunk"
+                    );
                 }
             }
             _ => anyhow::bail!("project render plan assembler state is inconsistent"),
@@ -578,6 +598,7 @@ impl ProjectRenderPlanAssemblerV1 {
             plan,
             plan_sha256,
             global_result: self.global_result.take(),
+            issued_at_ms: self.issued_at_ms,
         }))
     }
 }
@@ -664,6 +685,9 @@ impl ProjectRenderReceiptV1 {
     }
 
     pub fn outcome(&self) -> ProjectRenderOutcomeV1 {
+        if self.incomplete {
+            return ProjectRenderOutcomeV1::Partial;
+        }
         let dispositions = self
             .projections
             .iter()

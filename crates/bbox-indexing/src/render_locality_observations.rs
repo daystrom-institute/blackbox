@@ -290,6 +290,7 @@ mod tests {
             workspace_id: plan.workspace_id.clone(),
             producer: None,
             project_doc_nonempty: false,
+            incomplete: false,
             projections: ["claude", "agents", "gemini"]
                 .into_iter()
                 .map(|provider| ProjectRenderProjectionReceiptV1 {

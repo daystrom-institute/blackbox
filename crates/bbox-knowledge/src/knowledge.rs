@@ -20,11 +20,13 @@ use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_corpus_core::project_selector::project_scope_matches;
 
+use bbox_project_render::execute::{
+    ApplyOptions, ProjectEntrypoint, apply_project_render, now_unix_ms,
+};
 pub use bbox_project_render::execute::{
     CheckoutRenderLock, DEFAULT_RENDER_LOCK_TIMEOUT, execute_project_render_plan,
-    execute_project_render_plan_as, lock_checkout_for_render,
+    execute_project_render_plan_as, execute_workspace_render_plan, lock_checkout_for_render,
 };
-use bbox_project_render::execute::{ProjectEntrypoint, apply_project_render};
 pub use bbox_project_render::model::{
     Approval, Category, GuidanceTopic, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry, Priority,
     RenderPlacement, Scope, Status,
@@ -3195,7 +3197,18 @@ impl Knowledge {
                     content: projection.project_projection(prov, scope_dir, doc_nonempty),
                 })
                 .collect::<Vec<_>>();
-            let applied = apply_project_render(root, &satellites, &entrypoints, dry_run)?;
+            // This adapter renders the knowledge current at this instant, so
+            // its issuance is now on the daemon clock.
+            let applied = apply_project_render(
+                root,
+                &satellites,
+                &entrypoints,
+                ApplyOptions {
+                    dry_run,
+                    issued_at_ms: Some(now_unix_ms()),
+                    before_publish: None,
+                },
+            )?;
             for (file, disposition) in satellites.iter().zip(&applied.satellites) {
                 results.push(format!(
                     "{}SATELLITE .bbox/{} ({} bytes){}",

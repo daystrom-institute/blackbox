@@ -196,11 +196,16 @@ impl BlackboxServer {
                 }) => {
                     let (plan, global_result) =
                         workspace_project_render_plan(&server, &p, offset == 0)?;
-                    let chunk = plan.transport_chunk(
+                    let mut chunk = plan.transport_chunk(
                         offset,
                         plan_sha256.as_deref(),
                         global_result,
                     )?;
+                    // The issuance rides outside the plan bytes so the plan
+                    // digest stays stable; the harness passes it to the
+                    // checkout freshness fence.
+                    chunk.issued_at_ms = (offset == 0)
+                        .then(bbox_project_render::execute::now_unix_ms);
                     return Ok(serde_json::to_string(&serde_json::json!({
                         "status": "render_locality_plan_chunk",
                         "chunk": chunk,
