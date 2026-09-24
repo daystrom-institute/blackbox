@@ -6,18 +6,19 @@
   "wanted_capability": "Exact-symbol queries should surface symbol-typed entities through bbox_hybrid_search. The resolution half landed (commit 08b49f4a: inspect/find_paths/bundle_evidence/ref_size/blame resolve symbol refs via edge-index fallback with source=edge_projection), but the retrieval half remains: no indexer emits symbol entity docs (doc_type inventory has project_file, transcript, commit, knowledge, thread, roadmap, tool_call, code_source_activation, project_graph_vertex; zero symbol), and hybrid_search has no symbol lane or search-time edge-sidecar resolution - exact-name queries hit the containing project_file chunk instead of a symbol entity. Corpus-design decision pending: emit symbol docs at index time vs a search-time edge-sidecar lane.",
   "fallback_used": "Derived current symbol refs mechanically via bbox_refactor_project_refs (defn_hash == defining chunk_hash) and verified existence through the chunk's DEFINED_IN in-edge instead of inspect/search.",
   "evidence": [
-    "crates/bbox-providers/src/providers/symbol.rs:140 (entity_properties not_found path)",
-    "crates/bbox-corpus-index/src/index/project_files.rs:709 (symbol_ref derivation)",
-    "live probe 2026-06-12: symbol:d723917f:KnowledgeStore:40e76235... not_found via inspect while DEFINED_IN edge names it",
-    "thread-098387b3"
+    "crates/bbox-providers/src/providers/symbol.rs entity_properties edge-projection fallback when no indexed doc exists",
+    "crates/bbox-corpus-index/src/index/project_files.rs symbol_ref derivation (edges only, no symbol entity doc)",
+    "crates/bbox-mcp-tools/src/mcp_tools/hybrid_search.rs (no symbol lane)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/corpus-index/symbol-entities-unsearchable",
   "notes": "Narrowed 2026-08-18 after Batch C verification at HEAD 075a0077: partial fix (edge-projection resolution) confirmed landed; remainder restated above. Original broader text claimed symbols wholly invisible to inspect_entity, which is no longer true.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-098387b3",
   "created_at": "2026-06-12T23:43:18Z",
-  "updated_at": "2026-08-18T23:21:29Z"
+  "updated_at": "2026-09-24T01:04:09Z",
+  "resolved_at": "2026-09-24T01:04:09Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/42"
 }
