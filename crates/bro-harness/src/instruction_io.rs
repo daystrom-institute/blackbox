@@ -195,6 +195,9 @@ pub(crate) struct InstructionTimeout {
     pub(crate) waiting_for_admission: bool,
     /// Completed reads discarded because the ledger changed underneath them.
     pub(crate) conflicts: u32,
+    /// The attempt returned, but only after the deadline; its result was
+    /// discarded.
+    pub(crate) completed_late: bool,
 }
 
 impl InstructionTimeout {
@@ -221,6 +224,8 @@ impl InstructionTimeout {
             format!(
                 "waited for admission behind the active instruction read ({call}); this operation did not start its own read"
             )
+        } else if self.completed_late {
+            format!("the read ending with {call} completed after the deadline and was discarded")
         } else if self.attempt.is_some() {
             format!("{call} did not return")
         } else {
@@ -258,6 +263,10 @@ impl IoFailure {
             Self::Worker(message) => message.clone(),
         }
     }
+}
+
+pub(crate) fn expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
 }
 
 /// Admission to the single instruction-I/O slot of one ledger.
@@ -308,7 +317,29 @@ impl WorkerSlot {
             .clone()
     }
 
-    /// Wait asynchronously, within the caller's deadline, for the slot.
+    /// A timeout attributed to the most recent attempt of this slot.
+    pub(crate) fn timeout(
+        &self,
+        phase: Phase,
+        budget: Duration,
+        waiting_for_admission: bool,
+        conflicts: u32,
+        completed_late: bool,
+    ) -> IoFailure {
+        IoFailure::Timeout(InstructionTimeout {
+            phase,
+            budget,
+            attempt: self.active_attempt(),
+            waiting_for_admission,
+            conflicts,
+            completed_late,
+        })
+    }
+
+    /// Wait asynchronously, within the caller's deadline, for the slot. A
+    /// ready future wins over an elapsed timer when both are ready at the
+    /// same poll, so readiness is never taken as proof of timeliness: every
+    /// step rechecks the absolute deadline.
     pub(crate) async fn admit(
         &self,
         phase: Phase,
@@ -316,17 +347,12 @@ impl WorkerSlot {
         deadline: Instant,
     ) -> Result<Admission, IoFailure> {
         match tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned()).await {
+            Ok(Ok(_)) if expired(deadline) => Err(self.timeout(phase, budget, true, 0, false)),
             Ok(Ok(permit)) => Ok(Admission { _permit: permit }),
             Ok(Err(_)) => Err(IoFailure::Worker(
                 "instruction worker slot closed".to_owned(),
             )),
-            Err(_) => Err(IoFailure::Timeout(InstructionTimeout {
-                phase,
-                budget,
-                attempt: self.active_attempt(),
-                waiting_for_admission: true,
-                conflicts: 0,
-            })),
+            Err(_) => Err(self.timeout(phase, budget, true, 0, false)),
         }
     }
 
@@ -346,6 +372,9 @@ impl WorkerSlot {
         T: Send + 'static,
         J: FnOnce(&Probe) -> T + Send + 'static,
     {
+        if expired(deadline) {
+            return Err(self.timeout(phase, budget, false, conflicts, false));
+        }
         *self.progress.lock().expect("instruction progress poisoned") = None;
         let probe = Probe {
             fs: self.fs.clone(),
@@ -370,17 +399,14 @@ impl WorkerSlot {
         }
         self.spawned.fetch_add(1, Ordering::SeqCst);
         match tokio::time::timeout_at(deadline, receiver).await {
+            Ok(Ok(_)) if expired(deadline) => {
+                Err(self.timeout(phase, budget, false, conflicts, true))
+            }
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(IoFailure::Worker(
                 "instruction worker exited without a result".to_owned(),
             )),
-            Err(_) => Err(IoFailure::Timeout(InstructionTimeout {
-                phase,
-                budget,
-                attempt: self.active_attempt(),
-                waiting_for_admission: false,
-                conflicts,
-            })),
+            Err(_) => Err(self.timeout(phase, budget, false, conflicts, false)),
         }
     }
 

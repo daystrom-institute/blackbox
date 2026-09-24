@@ -729,3 +729,87 @@ async fn timeout_diagnostics_omit_instruction_text_and_environment_values() {
     assert_eq!(events[0]["budget_ms"], 200);
     cleanup(&fs, &docs).await;
 }
+
+/// Poll `operation` once so it starts (or queues), then stop polling past its
+/// deadline while the stalled worker is released and exits. The next poll
+/// sees the worker result (or admission) and the elapsed timer ready together.
+async fn resume_after_expiry<F: std::future::Future>(
+    operation: F,
+    fs: &Arc<GatedFs>,
+    docs: &ScopedProjectDocs,
+) -> F::Output {
+    let mut operation = std::pin::pin!(operation);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut operation)
+            .await
+            .is_err(),
+        "operation must be pending on the stalled read"
+    );
+    std::thread::sleep(BUDGET + Duration::from_millis(50));
+    fs.release();
+    wait_workers_exit(&docs.slot);
+    operation.await
+}
+
+#[tokio::test]
+async fn results_ready_only_after_the_deadline_never_commit_or_admit_effects() {
+    let (_directory, root, _home) = workspace();
+    let document = root.join("AGENTS.md");
+
+    // A delivered ledger would admit this mutation if the late scan counted.
+    let fs = GatedFs::new();
+    let (emitter, events) = capture();
+    let docs = gated(&root, &fs, BUDGET, Some(emitter));
+    docs.refresh().await.unwrap();
+    docs.acknowledge(&docs.pending_batch(1).unwrap());
+    fs.stall_on(FsOp::Read, document.clone());
+    let target = root.join("child/new.txt");
+    let result =
+        resume_after_expiry(docs.check(request(target.clone(), Mutate), 1), &fs, &docs).await;
+    let error = tool_error(result);
+    assert_eq!(error["error"], "instruction_read_error");
+    assert_eq!(error["filesystem_effects"], false);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("completed after the deadline"),
+        "{error}"
+    );
+    assert!(!docs.observed_paths().contains(&target));
+    let emitted = timeouts(&events);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["phase"], "check");
+
+    // A late refresh scan of changed bytes is not reconciled.
+    let fs = GatedFs::new();
+    let (emitter, events) = capture();
+    let docs = gated(&root, &fs, BUDGET, Some(emitter));
+    docs.refresh().await.unwrap();
+    docs.acknowledge(&docs.pending_batch(1).unwrap());
+    write(&document, "ROOT RULES v2\nRead @rules.md.");
+    fs.stall_on(FsOp::Read, document.clone());
+    let error = resume_after_expiry(docs.refresh(), &fs, &docs)
+        .await
+        .unwrap_err();
+    assert!(error.contains("instruction refresh timed out"), "{error}");
+    assert!(docs.pending_batch(2).is_none());
+    assert_eq!(timeouts(&events).len(), 1);
+
+    // Admission that becomes ready only after the deadline starts no scan.
+    let fs = GatedFs::new();
+    let docs = gated(&root, &fs, BUDGET, None);
+    fs.stall_on(FsOp::Read, document.clone());
+    let first = tokio::spawn({
+        let docs = docs.clone();
+        async move { docs.refresh().await }
+    });
+    wait_stalled(&fs).await;
+    let error = resume_after_expiry(docs.refresh(), &fs, &docs)
+        .await
+        .unwrap_err();
+    assert!(error.contains("waited for admission"), "{error}");
+    assert!(first.await.unwrap().is_err());
+    assert_eq!(docs.slot.spawned_workers(), 1);
+    assert!(docs.pending_batch(1).is_none());
+}

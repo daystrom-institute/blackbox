@@ -975,6 +975,10 @@ impl ScopedProjectDocs {
                     .await?;
                 admission = returned;
                 let mut ledger = self.lock();
+                // Only an unexpired caller may apply a scan.
+                if instruction_io::expired(deadline) {
+                    return Err(self.slot.timeout(phase, budget, false, conflicts, true));
+                }
                 if ledger.revision == revision {
                     let result = commit(&mut ledger, value);
                     ledger.revision += 1;
@@ -982,14 +986,8 @@ impl ScopedProjectDocs {
                 }
                 drop(ledger);
                 conflicts += 1;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(IoFailure::Timeout(InstructionTimeout {
-                        phase,
-                        budget,
-                        attempt: self.slot.active_attempt(),
-                        waiting_for_admission: false,
-                        conflicts,
-                    }));
+                if instruction_io::expired(deadline) {
+                    return Err(self.slot.timeout(phase, budget, false, conflicts, false));
                 }
             }
         }

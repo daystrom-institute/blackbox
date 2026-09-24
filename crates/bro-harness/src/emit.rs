@@ -661,6 +661,7 @@ mod tests {
             }),
             waiting_for_admission: false,
             conflicts: 0,
+            completed_late: false,
         });
         log.flush_blocking();
         let logged: Value = serde_json::from_str(
