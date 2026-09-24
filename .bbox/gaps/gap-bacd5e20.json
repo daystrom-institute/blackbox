@@ -14,11 +14,11 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/daemon-runtime-acceptance-audits/callsite-scanner-sticky-cfg-test",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-15T02:59:06Z",
-  "updated_at": "2026-09-24T05:33:54Z",
-  "resolved_at": "2026-09-24T05:33:54Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/61"
+  "updated_at": "2026-09-24T20:42:59Z",
+  "resolved_at": "2026-09-24T20:42:59Z",
+  "resolution_note": "implemented in PR #87, commit a5cad6fe3125b2da277eedbd0233db9cb6d96263"
 }
