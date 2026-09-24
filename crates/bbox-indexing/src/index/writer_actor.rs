@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{Count, TopDocs};
@@ -53,19 +53,27 @@ use bbox_corpus_core::project_record::ProjectRecordsProvider;
 #[derive(Debug)]
 pub enum IndexWriterRetryableError {
     ReindexPassInProgress,
-    EdgeIndexRebuildInProgress,
+    /// `held_for` is how long the current edge-index rebuild has held the
+    /// sidecar publication guard.
+    EdgeIndexRebuildInProgress {
+        held_for: Duration,
+    },
     VectorStoreWarming,
 }
 
 impl std::fmt::Display for IndexWriterRetryableError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::ReindexPassInProgress => "an index reindex pass is already running",
-            Self::EdgeIndexRebuildInProgress => {
-                "an edge-index rebuild is already reading the sidecar publication"
+        match self {
+            Self::ReindexPassInProgress => {
+                formatter.write_str("an index reindex pass is already running")
             }
-            Self::VectorStoreWarming => "the vector store is still warming up",
-        })
+            Self::EdgeIndexRebuildInProgress { held_for } => write!(
+                formatter,
+                "an edge-index rebuild is already reading the sidecar publication (held for {:.1}s)",
+                held_for.as_secs_f64()
+            ),
+            Self::VectorStoreWarming => formatter.write_str("the vector store is still warming up"),
+        }
     }
 }
 
@@ -242,6 +250,7 @@ pub enum IndexWriteOp {
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
     publication_activity: Arc<AtomicU8>,
+    edge_rebuild_acquired_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     reader: IndexReader,
     fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
@@ -370,11 +379,18 @@ impl Drop for ReindexActivityGuard {
 /// doubling peak memory. Holding this guard makes that race impossible; an
 /// interactive reindex request fails fast and the periodic pass retries on
 /// its next tick.
-pub struct EdgeIndexRebuildActivityGuard(Arc<AtomicU8>);
+/// The guard records when it was acquired so a refused reindex can report how
+/// long the current holder has held the publication.
+pub struct EdgeIndexRebuildActivityGuard {
+    activity: Arc<AtomicU8>,
+    acquired_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+}
 
 impl Drop for EdgeIndexRebuildActivityGuard {
     fn drop(&mut self) {
-        self.0.store(PUBLICATION_IDLE, Ordering::Release);
+        let mut acquired_at = self.acquired_at.lock();
+        *acquired_at = None;
+        self.activity.store(PUBLICATION_IDLE, Ordering::Release);
     }
 }
 
@@ -1100,6 +1116,7 @@ impl IndexWriterActor {
         Self {
             tx,
             publication_activity,
+            edge_rebuild_acquired_at: Arc::new(parking_lot::Mutex::new(None)),
             reader,
             fields,
             post_commit_hook,
@@ -1309,6 +1326,7 @@ impl IndexWriterActor {
     /// rebuild. The caller must hold the returned guard through both parsing
     /// and publication so reindex admission cannot slip into that window.
     pub fn try_begin_edge_index_rebuild(&self) -> Option<EdgeIndexRebuildActivityGuard> {
+        let mut acquired_at = self.edge_rebuild_acquired_at.lock();
         self.publication_activity
             .compare_exchange(
                 PUBLICATION_IDLE,
@@ -1316,8 +1334,21 @@ impl IndexWriterActor {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .ok()
-            .map(|_| EdgeIndexRebuildActivityGuard(self.publication_activity.clone()))
+            .ok()?;
+        *acquired_at = Some(Instant::now());
+        Some(EdgeIndexRebuildActivityGuard {
+            activity: self.publication_activity.clone(),
+            acquired_at: self.edge_rebuild_acquired_at.clone(),
+        })
+    }
+
+    /// How long the current edge-index rebuild guard has been held. Zero when
+    /// the holder released it between the refused admission and this read.
+    fn edge_rebuild_held_for(&self) -> Duration {
+        self.edge_rebuild_acquired_at
+            .lock()
+            .map(|acquired_at| acquired_at.elapsed())
+            .unwrap_or_default()
     }
 
     fn reserve_reindex(&self) -> Result<()> {
@@ -1331,7 +1362,9 @@ impl IndexWriterActor {
             .map(|_| ())
             .map_err(|activity| {
                 let error = if activity == PUBLICATION_EDGE_REBUILD {
-                    IndexWriterRetryableError::EdgeIndexRebuildInProgress
+                    IndexWriterRetryableError::EdgeIndexRebuildInProgress {
+                        held_for: self.edge_rebuild_held_for(),
+                    }
                 } else {
                     IndexWriterRetryableError::ReindexPassInProgress
                 };
@@ -4234,7 +4267,7 @@ mod tests {
                 .downcast_ref::<IndexWriterRetryableError>()
                 .is_some_and(|error| matches!(
                     error,
-                    IndexWriterRetryableError::EdgeIndexRebuildInProgress
+                    IndexWriterRetryableError::EdgeIndexRebuildInProgress { .. }
                 ))
         );
         drop(edge_rebuild);
@@ -4257,6 +4290,57 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!actor.reindex_in_progress());
+    }
+
+    #[test]
+    fn edge_rebuild_refusal_message_reports_how_long_the_guard_is_held() {
+        let message = IndexWriterRetryableError::EdgeIndexRebuildInProgress {
+            held_for: Duration::from_millis(12_340),
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "an edge-index rebuild is already reading the sidecar publication (held for 12.3s)"
+        );
+    }
+
+    #[test]
+    fn edge_rebuild_refusal_carries_the_current_holders_elapsed_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+
+        let guard = actor
+            .try_begin_edge_index_rebuild()
+            .expect("idle publication admits an edge rebuild");
+        std::thread::sleep(Duration::from_millis(200));
+        let refused = actor.reserve_reindex().unwrap_err();
+        let first_held_for = match refused.downcast_ref::<IndexWriterRetryableError>() {
+            Some(IndexWriterRetryableError::EdgeIndexRebuildInProgress { held_for }) => *held_for,
+            other => panic!("unexpected refusal: {other:?}"),
+        };
+        assert!(
+            first_held_for >= Duration::from_millis(200),
+            "held_for {first_held_for:?}"
+        );
+        drop(guard);
+        assert!(actor.edge_rebuild_acquired_at.lock().is_none());
+
+        let guard = actor
+            .try_begin_edge_index_rebuild()
+            .expect("released guard readmits an edge rebuild");
+        let refused = actor.reserve_reindex().unwrap_err();
+        let held_for = match refused.downcast_ref::<IndexWriterRetryableError>() {
+            Some(IndexWriterRetryableError::EdgeIndexRebuildInProgress { held_for }) => *held_for,
+            other => panic!("unexpected refusal: {other:?}"),
+        };
+        assert!(
+            held_for < first_held_for,
+            "a new holder reports its own acquisition time, got {held_for:?}"
+        );
+        drop(guard);
+        actor.reserve_reindex().unwrap();
     }
 
     #[test]
