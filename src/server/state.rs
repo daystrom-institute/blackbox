@@ -607,15 +607,20 @@ impl SharedState {
     }
 
     /// Clone one internally coherent code read view and reject the deferred
-    /// placeholder. Selector-changing publishers lower the readiness fence
-    /// before swapping the view, so checking after the clone can return only
-    /// a complete old view or a complete new view, never the placeholder.
+    /// placeholder. Every publisher changes the fence and swaps the view under
+    /// the manifest coordinator: placeholder publishers lower the fence before
+    /// the swap, and the watcher raises it only after installing a complete
+    /// graph. Reading the fence while the view guard is held pairs it with the
+    /// view that guard shows, so a placeholder is never returned as complete,
+    /// even when a watcher publication lands right after the clone.
     pub(crate) fn complete_code_read_view(&self) -> anyhow::Result<Arc<CodeReadView>> {
-        let view = self.code_read_view.read().clone();
-        if !self
+        let guard = self.code_read_view.read();
+        let ready = self
             .edge_index_ready
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+            .load(std::sync::atomic::Ordering::Acquire);
+        let view = guard.clone();
+        drop(guard);
+        if !ready {
             anyhow::bail!(
                 "error.edge_index_warming: the complete graph view is still rebuilding; retry this request"
             );

@@ -3020,31 +3020,41 @@ pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
         &state.idx.read().reindex_config().projects_path,
     );
-    let index = state.idx.write();
-    let selectors = index.active_code_selectors();
-    state
-        .edge_index_ready
-        .store(false, std::sync::atomic::Ordering::Release);
-    *state.code_read_view.write() = Arc::new(super::CodeReadView {
-        active_selectors: selectors,
-        searcher: index.searcher(),
-        // Fail closed until the bounded watcher parses the newly selected
-        // sidecars. Keeping the outgoing graph here would expose edges from a
-        // selector this view no longer names; rebuilding inline made this
-        // post-activation path a multi-minute blocking operation.
-        edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
-        catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
-        // Read AFTER the overlay selector landed in the manifest: this
-        // republish is what makes the freshly staged overlay visible to
-        // readers, so pinning a pre-swap map here would publish edges the
-        // view claims not to have.
-        git_overlays: super::state::read_git_overlays_for_view(
-            &state.project_authority,
-            &edges_dir,
-            &state.git_transport_cutover,
-            &state.code_sources,
-        ),
-    });
+    // The fence store and the view swap run under the manifest coordinator,
+    // the same lock the watcher publishes under, and in the same order the
+    // activation callbacks use (coordinator, then `idx.write()`). Without it
+    // a watcher publication could land between the two steps and leave the
+    // fence raised over the placeholder graph. The coordinator is not
+    // reentrant: no caller of this function may already hold it.
+    bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let index = state.idx.write();
+        let selectors = index.active_code_selectors();
+        state
+            .edge_index_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        *state.code_read_view.write() = Arc::new(super::CodeReadView {
+            active_selectors: selectors,
+            searcher: index.searcher(),
+            // Fail closed until the bounded watcher parses the newly selected
+            // sidecars. Keeping the outgoing graph here would expose edges
+            // from a selector this view no longer names; rebuilding inline
+            // made this post-activation path a multi-minute blocking
+            // operation.
+            edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
+            catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+            // Read AFTER the overlay selector landed in the manifest: this
+            // republish is what makes the freshly staged overlay visible to
+            // readers, so pinning a pre-swap map here would publish edges the
+            // view claims not to have.
+            git_overlays: super::state::read_git_overlays_for_view(
+                &state.project_authority,
+                &edges_dir,
+                &state.git_transport_cutover,
+                &state.code_sources,
+            ),
+        });
+        Ok(())
+    })?;
     state.nudge_edge_index_rebuild();
     Ok(())
 }
