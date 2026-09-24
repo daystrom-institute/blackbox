@@ -1785,21 +1785,34 @@ fn format_wait_duration(duration: Duration) -> String {
 // pod-built `target/` holds ELF proc-macro `.so` files the host proc-macro
 // server cannot load. Scrubbing the spawn env fixes both knobs (which cargo
 // runs, where artifacts land) with no server-side surgery.
+//
+// The same sessions also start with automatic flycheck disabled
+// (`checkOnSave: false`), so the host never runs a workspace `cargo check` at
+// startup or on save. Build scripts and proc macros keep their defaults: those
+// analysis builds stay on the host and may rerun when their inputs change.
 
 /// Detect a lane host-build session: the root canonicalizes under `~/lanes/`,
 /// or `BRO_LSP_RA_HOST_BUILD=1` is set (covers non-lane NFS/sshfs layouts).
-/// Rust-only at the call site; the flag is read here so detection stays
-/// pure and unit-testable.
+/// Rust-only at the call site.
 fn is_lane_host_build(root: &Path) -> bool {
-    if let Some(value) = std::env::var("BRO_LSP_RA_HOST_BUILD")
-        .ok()
-        .map(|v| v.trim().to_string())
+    lane_host_build_detected(
+        root,
+        std::env::var("BRO_LSP_RA_HOST_BUILD").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// Pure lane detection over an explicit flag value and home dir. The flag is
+/// an opt-in: a trimmed value that is non-empty and not `0` forces lane mode,
+/// while `0` or an empty value leaves path detection in charge.
+fn lane_host_build_detected(root: &Path, flag: Option<&str>, home: Option<&Path>) -> bool {
+    if let Some(value) = flag.map(str::trim)
         && !value.is_empty()
         && value != "0"
     {
         return true;
     }
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = home else {
         return false;
     };
     let Ok(home) = home.canonicalize() else {
@@ -1961,7 +1974,10 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
         .stderr(Stdio::null())
         .kill_on_drop(true);
     apply_child_environment(&mut command, config);
-    if matches!(key.language, Language::Rust) && is_lane_host_build(&key.root) {
+    // One decision per spawn drives both the environment scrub and the
+    // initialize options, so the two can never disagree.
+    let lane_host_build = matches!(key.language, Language::Rust) && is_lane_host_build(&key.root);
+    if lane_host_build {
         let shim_dir = lane_shim_dir();
         let target_dir = lane_host_build_target_dir(&key.root)?;
         apply_lane_environment(
@@ -2005,7 +2021,7 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
         language: key.language,
     };
     let init_id = session.next_id();
-    let init_params = build_init_params(&key.root, key.language, config)?;
+    let init_params = build_init_params(&key.root, key.language, config, lane_host_build)?;
     write_request(
         &mut session.stdin,
         Initialize::METHOD,
@@ -2073,29 +2089,11 @@ fn build_init_params(
     root: &Path,
     language: Language,
     config: &LspConfig,
+    lane_host_build: bool,
 ) -> anyhow::Result<InitializeParams> {
     let root_uri = Url::from_directory_path(root)
         .map_err(|_| anyhow!("failed to convert {} to file URL", root.display()))?;
-    // JDTLS workaround: gradle 9.x hardened configuration resolution to
-    // require an exclusive lock, which trips JDTLS's injected
-    // GradleAnnotationProcessorPatchPlugin during the Buildship model fetch
-    // (`annotationProcessor ... without an exclusive lock`) — breaking the
-    // whole gradle import and leaving the classpath unresolved. Pinning
-    // `java.import.gradle.version` makes JDTLS download + import with a
-    // pre-9 gradle that doesn't have the hardening. Opt-in via env so it
-    // imposes nothing on projects that import cleanly on their wrapper.
-    let initialization_options = match (language, config.jdtls_gradle_version.as_ref()) {
-        (Language::Java, Some(gv)) => Some(serde_json::json!({
-            // JDTLS reads config under initializationOptions.settings.java.*
-            // (the wrapper vscode-java uses), not a bare java.* key.
-            "settings": { "java": { "import": { "gradle": {
-                "version": gv,
-                // Force the pinned version over the project wrapper.
-                "wrapper": { "enabled": false }
-            } } } }
-        })),
-        _ => None,
-    };
+    let initialization_options = initialization_options(language, config, lane_host_build);
     Ok(InitializeParams {
         process_id: Some(std::process::id()),
         root_uri: Some(root_uri.clone()),
@@ -2174,6 +2172,43 @@ fn build_init_params(
         }]),
         ..Default::default()
     })
+}
+
+/// Server configuration sent in `initialize`. `lane_host_build` is the
+/// per-spawn Rust lane decision (always false for other languages).
+fn initialization_options(
+    language: Language,
+    config: &LspConfig,
+    lane_host_build: bool,
+) -> Option<Value> {
+    // Lane host-build sessions: rust-analyzer's automatic flycheck would run a
+    // workspace `cargo check` on the host at startup and whenever it receives
+    // a save notification. Compiler verification for lane checkouts is the
+    // explicit lane-routed `build.gate`; native analysis and build data are
+    // unaffected.
+    if matches!(language, Language::Rust) && lane_host_build {
+        return Some(serde_json::json!({ "checkOnSave": false }));
+    }
+    // JDTLS workaround: gradle 9.x hardened configuration resolution to
+    // require an exclusive lock, which trips JDTLS's injected
+    // GradleAnnotationProcessorPatchPlugin during the Buildship model fetch
+    // (`annotationProcessor ... without an exclusive lock`) — breaking the
+    // whole gradle import and leaving the classpath unresolved. Pinning
+    // `java.import.gradle.version` makes JDTLS download + import with a
+    // pre-9 gradle that doesn't have the hardening. Opt-in via env so it
+    // imposes nothing on projects that import cleanly on their wrapper.
+    match (language, config.jdtls_gradle_version.as_ref()) {
+        (Language::Java, Some(gv)) => Some(serde_json::json!({
+            // JDTLS reads config under initializationOptions.settings.java.*
+            // (the wrapper vscode-java uses), not a bare java.* key.
+            "settings": { "java": { "import": { "gradle": {
+                "version": gv,
+                // Force the pinned version over the project wrapper.
+                "wrapper": { "enabled": false }
+            } } } }
+        })),
+        _ => None,
+    }
 }
 
 fn absolutize_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
@@ -2364,6 +2399,9 @@ fn env_string(key: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
+#[cfg(all(test, unix))]
+mod lane_flycheck_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2880,24 +2918,6 @@ mod tests {
             .1
             .clone();
         assert_eq!(path_entry, "/usr/bin");
-    }
-
-    #[test]
-    fn non_lane_root_without_env_flag_is_not_detected() {
-        // A random tempdir is not under ~/lanes/ and (when the operator has
-        // not opted in via BRO_LSP_RA_HOST_BUILD) must not trigger the lane
-        // host-build path. Skipped if the operator has the flag set, since
-        // that makes the detection true regardless of root.
-        if env_string("BRO_LSP_RA_HOST_BUILD")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-        {
-            // Operator opted in globally; this assertion is meaningless.
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        assert!(!is_lane_host_build(&root));
     }
 
     #[test]
