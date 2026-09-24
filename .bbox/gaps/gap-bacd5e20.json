@@ -7,17 +7,18 @@
   "missing_primitive": "scope-aware cfg(test) detection in the checkout call-site scanner",
   "fallback_used": "Removed the stray column-0 cfg(test) import from src/server/producer_auth.rs and kept test-only imports inside the trailing cfg(test) mod tests block, matching the shape the scanner expects (feat/producer-grant-rotation, sha 7f12891d).",
   "evidence": [
-    "scripts/acceptance-checkout-callsites.sh",
-    "src/server/state.rs::blocking_acceptance_proofs::checkout_callsite_audit_is_complete",
-    "verify bbox-verify-5nnnf (2026-08-14): false 'audited site src/server/producer_auth.rs::build no longer exists'",
-    "thread-a2062843"
+    "scripts/acceptance-checkout-callsites.sh: in_test set on any line starting '#[cfg(test)]' and never reset for the rest of the file",
+    "src/server/state.rs::blocking_acceptance_proofs::checkout_callsite_audit_is_complete runs the scanner",
+    "Currently hidden production sites absent from scripts/checkout-callsite-audit.tsv while the scanner reports ok: src/tools/render.rs::bbox_render (3, after a cfg(test) use at line 8), src/server/routes.rs::enqueue_project_knowledge_embeds (1, after a cfg(test) fn), src/server/code_source.rs::probe_ladder and ::attempt_cutback_catalog (1 each, after a cfg(test) static)"
   ],
-  "impact": "medium",
+  "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/daemon-runtime-acceptance-audits/callsite-scanner-sticky-cfg-test",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-15T02:59:06Z",
-  "updated_at": "2026-08-15T02:59:06Z"
+  "updated_at": "2026-09-24T05:33:54Z",
+  "resolved_at": "2026-09-24T05:33:54Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/61"
 }

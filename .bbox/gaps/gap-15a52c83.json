@@ -14,9 +14,9 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/daemon-runtime/thread-mutation-blocks-on-edge-rebuild",
-  "notes": "Triage trace: left open as uncertain. No fix has landed; the contended resource is still unidentified. The rebuild holds store read guards only during project_store_edges (fast), not the sidecar parse, and the manifest coordinator only at publish. Candidates in the bbox_thread path: resolve_worktree_scope_and_dir, threads.write(), persist_threads_durable. The slow-phase instrumentation in src/tools/threads.rs (resolve_project, store_write_guard, persist_durable) is in place but no recurrence log naming a phase was available to this triage. Missing: one prod occurrence with a 'slow bbox_thread phase' line.",
+  "notes": "Triage trace: left open as uncertain. No fix has landed; the contended resource is still unidentified. The rebuild holds store read guards (idx, kb, threads, notes, task_store) only during project_store_edges in src/server/routes.rs::build_edge_index_from_shared_at_authority, not during the sidecar parse, and the manifest coordinator only at publish. Candidates in the bbox_thread path (src/tools/threads.rs): resolve_worktree_scope_and_dir (Write-intent resolver), threads.write(), persist_threads_durable. Slow-phase instrumentation ('slow bbox_thread phase', >5s) is in place. Re-check of the production daemon log over a 10h window: zero bbox_thread calls, zero slow tool calls, edge-index rebuilds now take about 11-33s (not 170-375s), and store-only nudges on the large graph are deferred by the watcher. Still missing: one occurrence with a 'slow bbox_thread phase' line naming the blocked phase.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:29Z",
-  "updated_at": "2026-09-24T02:03:49Z"
+  "updated_at": "2026-09-24T05:33:14Z"
 }
