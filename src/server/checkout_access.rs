@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bbox_artifacts::watcher::{
     ArtifactWatchAccess, ArtifactWatchAttachment, ArtifactWatchCarrier, ArtifactWatchRead,
     ArtifactWatchReconcileReport,
@@ -27,14 +27,28 @@ use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use super::SharedState;
 use crate::server::BlackboxServer;
 
+/// A broker refusal carried through `anyhow` with its typed code intact, so a
+/// tool boundary can downcast it instead of parsing the rendered text.
+#[derive(Debug)]
+pub(crate) struct CheckoutAccessRefusal(pub(crate) CheckoutAccessError);
+
+impl std::fmt::Display for CheckoutAccessRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "error.checkout_access.{}: {}",
+            self.0.code.as_str(),
+            self.0.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for CheckoutAccessRefusal {}
+
 /// The catalog lease refusals adapters surface, in the code-prefixed shape
 /// the tool boundary renders through `err_text` (plan section 4.18).
-fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
-    anyhow!(
-        "error.checkout_access.{}: {}",
-        error.code.as_str(),
-        error.diagnostic
-    )
+pub(crate) fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
+    anyhow::Error::new(CheckoutAccessRefusal(error))
 }
 
 /// Return the daemon-owned broker over the shared version-1 registries and
