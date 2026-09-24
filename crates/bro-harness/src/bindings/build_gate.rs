@@ -104,6 +104,49 @@ struct BuildCounts {
     warnings: usize,
 }
 
+/// Outcomes of Gradle tasks whose last path segment starts with `compile`,
+/// counted once per full task path per invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct GradleCompileTasks {
+    executed: usize,
+    from_cache: usize,
+    up_to_date: usize,
+    no_source: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// What the output establishes about compile-task outcomes. `Unavailable`
+/// never degrades into zero counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompileTaskObservation {
+    /// No compile-task record was observed.
+    Absent,
+    /// Compile-task records were observed, but an outcome was unknown or
+    /// conflicting, or the collected text carries a truncation marker.
+    Unavailable,
+    Counts(GradleCompileTasks),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradleTaskOutcome {
+    Executed,
+    FromCache,
+    UpToDate,
+    NoSource,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradleTaskRecord<'a> {
+    /// `> Task :path` without a suffix: executed unless a terminal outcome
+    /// for the same path says otherwise.
+    Bare(&'a str),
+    Terminal(&'a str, GradleTaskOutcome),
+    Unknown(&'a str),
+}
+
 #[derive(Debug, Clone)]
 struct ParsedBuildOutput {
     tool: BuildTool,
@@ -111,6 +154,7 @@ struct ParsedBuildOutput {
     counts: BuildCounts,
     truncated: bool,
     status_lines: Vec<String>,
+    compile_tasks: CompileTaskObservation,
 }
 
 pub struct BuildGate;
@@ -122,7 +166,7 @@ impl Tool for BuildGate {
     }
 
     fn description(&self) -> &str {
-        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Collects retained shell output pages before parsing; diagnostics_complete=false discloses lost or unread output. Uses shell_run and shell_poll but never returns raw logs."
+        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Collects retained shell output pages before parsing; diagnostics_complete=false discloses lost or unread output. Completely observed Gradle output with compile-task records adds optional gradle_compile_tasks outcome counts and compiled. Uses shell_run and shell_poll but never returns raw logs."
     }
 
     fn input_schema(&self) -> Value {
@@ -256,6 +300,18 @@ impl Tool for BuildGate {
                     result[key] = value.clone();
                 }
             }
+            // Capture completeness before diagnostic-array limits: capping
+            // diagnostics must not discard complete task evidence.
+            let observed_to_completion = shell_json["diagnostics_complete"] == true
+                && !timed_out
+                && shell_json["cancelled"] != true
+                && shell_json["running"] != true;
+            attach_compile_tasks(
+                &mut result,
+                parsed.tool,
+                &parsed.compile_tasks,
+                observed_to_completion,
+            );
             ToolResult::Json(result)
         })
         .await
@@ -439,19 +495,149 @@ fn parse_build_output(
     let diagnostics_truncated = diagnostics.len() > max_diagnostics;
     diagnostics.truncate(max_diagnostics);
 
+    // Task records are reduced from the whole output, independent of the
+    // status-line and diagnostic caps.
+    let (has_gradle_task_records, mut compile_tasks) = scan_gradle_tasks(output);
+    if output_truncated && compile_tasks != CompileTaskObservation::Absent {
+        compile_tasks = CompileTaskObservation::Unavailable;
+    }
+
     ParsedBuildOutput {
         tool: detect_tool(
             command,
             output,
             has_cargo_diagnostics,
             has_javac_diagnostics,
+            has_gradle_task_records,
             &status_lines,
         ),
         diagnostics,
         counts,
         truncated: output_truncated || diagnostics_truncated,
         status_lines,
+        compile_tasks,
     }
+}
+
+/// Parse one `> Task :path [OUTCOME]` line from Gradle's plain console.
+fn parse_gradle_task_record(line: &str) -> Option<GradleTaskRecord<'_>> {
+    let rest = line.trim().strip_prefix("> Task ")?;
+    let (path, suffix) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(path, suffix)| (path, suffix.trim()));
+    let segments = path.strip_prefix(':')?;
+    if segments.split(':').any(str::is_empty) {
+        return None;
+    }
+    let outcome = match suffix {
+        "" => return Some(GradleTaskRecord::Bare(path)),
+        "EXECUTED" => GradleTaskOutcome::Executed,
+        "FROM-CACHE" => GradleTaskOutcome::FromCache,
+        "UP-TO-DATE" => GradleTaskOutcome::UpToDate,
+        "NO-SOURCE" => GradleTaskOutcome::NoSource,
+        "SKIPPED" => GradleTaskOutcome::Skipped,
+        "FAILED" => GradleTaskOutcome::Failed,
+        _ => return Some(GradleTaskRecord::Unknown(path)),
+    };
+    Some(GradleTaskRecord::Terminal(path, outcome))
+}
+
+/// Naming convention only: the last path segment starts with `compile`.
+fn is_gradle_compile_task(path: &str) -> bool {
+    path.rsplit(':')
+        .next()
+        .is_some_and(|name| name.starts_with("compile"))
+}
+
+/// Returns whether any recognized task record was seen (a Gradle detection
+/// signal) and the compile-task observation. Each task path counts once; a
+/// bare header never overrides a terminal outcome, and conflicting terminal
+/// outcomes or unknown suffixes make the observation unavailable.
+fn scan_gradle_tasks(output: &str) -> (bool, CompileTaskObservation) {
+    let mut has_task_records = false;
+    let mut unavailable = false;
+    let mut tasks: BTreeMap<&str, Option<GradleTaskOutcome>> = BTreeMap::new();
+    for line in output.lines() {
+        let (path, outcome) = match parse_gradle_task_record(line) {
+            Some(GradleTaskRecord::Bare(path)) => (path, None),
+            Some(GradleTaskRecord::Terminal(path, outcome)) => (path, Some(outcome)),
+            Some(GradleTaskRecord::Unknown(path)) => {
+                unavailable |= is_gradle_compile_task(path);
+                continue;
+            }
+            None => continue,
+        };
+        has_task_records = true;
+        if !is_gradle_compile_task(path) {
+            continue;
+        }
+        let recorded = tasks.entry(path).or_insert(None);
+        match (*recorded, outcome) {
+            (_, None) => {}
+            (None, Some(outcome)) => *recorded = Some(outcome),
+            (Some(previous), Some(outcome)) => unavailable |= previous != outcome,
+        }
+    }
+    if unavailable {
+        return (has_task_records, CompileTaskObservation::Unavailable);
+    }
+    if tasks.is_empty() {
+        return (has_task_records, CompileTaskObservation::Absent);
+    }
+    let mut counts = GradleCompileTasks::default();
+    for outcome in tasks.values() {
+        let slot = match outcome.unwrap_or(GradleTaskOutcome::Executed) {
+            GradleTaskOutcome::Executed => &mut counts.executed,
+            GradleTaskOutcome::FromCache => &mut counts.from_cache,
+            GradleTaskOutcome::UpToDate => &mut counts.up_to_date,
+            GradleTaskOutcome::NoSource => &mut counts.no_source,
+            GradleTaskOutcome::Skipped => &mut counts.skipped,
+            GradleTaskOutcome::Failed => &mut counts.failed,
+        };
+        *slot += 1;
+    }
+    (has_task_records, CompileTaskObservation::Counts(counts))
+}
+
+const COMPILE_TASKS_UNAVAILABLE_HINT: &str = "Gradle compile-task outcomes could not be established: task output was incomplete, unfinished, or ambiguous. Run one narrow Gradle invocation with normal lifecycle logging and --console=plain.";
+
+/// Emit `gradle_compile_tasks`/`compiled` only for detected Gradle output
+/// observed to completion with unambiguous outcomes. Existing recovery hints
+/// take precedence over the informational ones added here.
+fn attach_compile_tasks(
+    result: &mut Value,
+    tool: BuildTool,
+    observation: &CompileTaskObservation,
+    observed_to_completion: bool,
+) {
+    if tool != BuildTool::Gradle {
+        return;
+    }
+    let has_hint = result.get("next_step").is_some();
+    match observation {
+        CompileTaskObservation::Counts(counts) if observed_to_completion => {
+            result["gradle_compile_tasks"] = json!(counts);
+            result["compiled"] = json!(counts.executed > 0);
+            if result["ok"] == true && counts.executed == 0 && !has_hint {
+                result["next_step"] = json!(no_compile_execution_hint(counts));
+            }
+        }
+        CompileTaskObservation::Counts(_) | CompileTaskObservation::Unavailable if !has_hint => {
+            result["next_step"] = json!(COMPILE_TASKS_UNAVAILABLE_HINT);
+        }
+        _ => {}
+    }
+}
+
+fn no_compile_execution_hint(counts: &GradleCompileTasks) -> String {
+    let mut hint = "No matched Gradle compile task reported execution.".to_string();
+    if counts.from_cache + counts.up_to_date > 0 {
+        hint.push_str(" FROM-CACHE/UP-TO-DATE reuse earlier outputs for identical inputs; when fresh execution is required, run one explicit module compile task, e.g. `./gradlew :<module>:compileJava --console=plain --rerun-tasks`, which reruns that task and its dependencies. --no-build-cache alone does not force execution.");
+    }
+    if counts.no_source + counts.skipped > 0 {
+        hint.push_str(" NO-SOURCE/SKIPPED tasks compiled nothing: check task selection, source inputs, and skip conditions (enabled/onlyIf) before rerunning.");
+    }
+    hint
 }
 
 /// Parse `cargo ... --message-format=json` (or raw rustc `--error-format=json`)
@@ -748,6 +934,7 @@ fn detect_tool(
     output: &str,
     has_cargo_diagnostics: bool,
     has_javac_diagnostics: bool,
+    has_gradle_task_records: bool,
     status_lines: &[String],
 ) -> BuildTool {
     let command_lower = command.to_ascii_lowercase();
@@ -761,6 +948,7 @@ fn detect_tool(
         || command_lower.contains("gradlew")
         || output.contains("BUILD SUCCESSFUL")
         || output.contains("BUILD FAILED")
+        || has_gradle_task_records
         || status_lines
             .iter()
             .any(|line| line.trim_start().starts_with("> Task "))
@@ -929,14 +1117,20 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "build".to_string(),
-        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. It collects retained output pages before parsing; diagnostics_complete=false means capture or diagnostic results are incomplete, with session_id/output_pending when further raw pages remain. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
+        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses Cargo JSON (`--message-format=json`), raw rustc JSON (`--error-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. It collects retained output pages before parsing; diagnostics_complete=false means capture or diagnostic results are incomplete, with session_id/output_pending when further raw pages remain. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits. For Gradle, run one narrow invocation with normal lifecycle logging and `--console=plain` (e.g. `./gradlew :<module>:compileJava --console=plain`): tasks whose last path segment starts with `compile` are counted once each into optional `gradle_compile_tasks` (executed, from_cache, up_to_date, no_source, skipped, failed), and `compiled` is `executed > 0`. Both are omitted, never zeroed, when no compile-task record was seen or outcomes were ambiguous, capture was incomplete, or the process timed out, was cancelled, or is still running; quiet, filtered, rich-console, dry-run, or missing output is not proof that nothing compiled. The match is a naming convention, not task-type introspection; `compiled` does not show that edited files were inputs or every edited module was covered, failed tasks count only in `failed`, and `ok` keeps its own meaning. When nothing executed, next_step suggests `--rerun-tasks` on an explicit module task (reruns it and its dependencies) or checking task selection and skip conditions; existing shell recovery hints take precedence."
             .to_string(),
         declarations: r#"type BuildSpan = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type BuildSuggestion = { file: string; byte_start: number; byte_end: number; replacement: string; applicability: "MachineApplicable" | "MaybeIncorrect" | "HasPlaceholders"; span?: BuildSpan };
 type BuildDiagnostic = { file?: string; line?: number; column?: number; severity: "error" | "warning"; message: string; symbol?: string; code?: string; span?: BuildSpan; suggestions?: BuildSuggestion[] };
-type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "cargo" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number }; truncated: boolean; diagnostics_complete: boolean; running: boolean; timed_out: boolean; cancelled: boolean; output_pending?: boolean; session_id?: string; capture_error?: string; next_step?: string; output?: Record<string, Record<string, number | boolean | string>>; metadata_omitted?: boolean; input_error_details_omitted?: boolean; process_error_details_omitted?: boolean; status_lines: string[]; duration_ms: number };
+/** Gradle compile-task outcomes, one count per task path. Tasks match by name only: the last path segment starts with `compile`. */
+type GradleCompileTasks = { executed: number; from_cache: number; up_to_date: number; no_source: number; skipped: number; failed: number };
+type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "cargo" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number };
+  /** Present only for completely observed Gradle output with unambiguous compile-task records; absent means unknown, never zero. */
+  gradle_compile_tasks?: GradleCompileTasks;
+  /** `gradle_compile_tasks.executed > 0`, present with it. Says nothing about which sources were inputs or whether compilation succeeded. */
+  compiled?: boolean; truncated: boolean; diagnostics_complete: boolean; running: boolean; timed_out: boolean; cancelled: boolean; output_pending?: boolean; session_id?: string; capture_error?: string; next_step?: string; output?: Record<string, Record<string, number | boolean | string>>; metadata_omitted?: boolean; input_error_details_omitted?: boolean; process_error_details_omitted?: boolean; status_lines: string[]; duration_ms: number };
 declare const build: {
-  /** Run a bounded compile/test gate command and parse cargo/rustc JSON, javac, Gradle-wrapped javac, or generic nonzero output into structured diagnostics. cargo/rustc diagnostics carry compiler codes and machine-applicable suggestion spans. */
+  /** Run a bounded compile/test gate command and parse cargo/rustc JSON, javac, Gradle-wrapped javac, or generic nonzero output into structured diagnostics. cargo/rustc diagnostics carry compiler codes and machine-applicable suggestion spans. Gradle runs report optional compile-task outcomes (`gradle_compile_tasks`, `compiled`). */
   gate(args: { command: string; cwd?: string; timeout_ms?: number; timeoutMs?: number; max_diagnostics?: number; maxDiagnostics?: number; anchor_spans?: boolean; anchorSpans?: boolean }): Promise<BuildGateResult>;
 };"#
             .to_string(),
@@ -983,8 +1177,11 @@ mod tests {
             let root = dir.path().canonicalize().unwrap();
             let mut cx = cx_in(&root);
             cx.output_budget = 1024;
+            // The first record is longer than one page, so it arrives split
+            // across retained pages; later records arrive on later pages.
+            let long_module = "m".repeat(2048);
             tokio::fs::write(root.join("gate.log"), format!(
-                "{}\nFixture.java:3: error: cannot find symbol\n  symbol: variable missing\n  location: class Fixture\n1 error\n",
+                "> Task :{long_module}:compileJava\n{}> Task :util:compileJava FROM-CACHE\n> Task :util:jar\n> Task :lib:compileJava FAILED\nFixture.java:3: error: cannot find symbol\n  symbol: variable missing\n  location: class Fixture\n1 error\n",
                 "compiling fixture\n".repeat(1000)
             )).await.unwrap();
             if refuse_poll {
@@ -1013,9 +1210,28 @@ mod tests {
                         .unwrap()
                         .contains("pin conflict")
                 );
+                // Unread pages leave compile outcomes unknown, and the shell's
+                // recovery hint survives unchanged.
+                assert_eq!(result["tool"], "gradle");
+                assert!(result.get("gradle_compile_tasks").is_none(), "{result}");
+                assert!(result.get("compiled").is_none(), "{result}");
+                assert!(
+                    result["next_step"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Call shell_poll"),
+                    "{result}"
+                );
                 bro_tools::shell::shutdown_shell_sessions(&cx).await;
             } else {
                 assert_eq!(result["diagnostics_complete"], true, "{result}");
+                assert_eq!(result["tool"], "gradle");
+                assert_eq!(
+                    result["gradle_compile_tasks"],
+                    json!({"executed":1,"from_cache":1,"up_to_date":0,"no_source":0,"skipped":0,"failed":1})
+                );
+                assert_eq!(result["compiled"], true);
+                assert!(result.get("next_step").is_none(), "{result}");
                 assert_eq!(result["counts"]["errors"], 1);
                 assert_eq!(result["diagnostics"][0]["file"], "Fixture.java");
                 assert_eq!(result["diagnostics"][0]["line"], 3);
@@ -1338,6 +1554,486 @@ BUILD FAILED in 1s
                 .iter()
                 .any(|line| line == "BUILD FAILED in 1s")
         );
+    }
+
+    // ---- Gradle compile-task outcomes ----
+
+    fn compile_counts(
+        executed: usize,
+        from_cache: usize,
+        up_to_date: usize,
+        no_source: usize,
+        skipped: usize,
+        failed: usize,
+    ) -> CompileTaskObservation {
+        CompileTaskObservation::Counts(GradleCompileTasks {
+            executed,
+            from_cache,
+            up_to_date,
+            no_source,
+            skipped,
+            failed,
+        })
+    }
+
+    fn gradle_compile_tasks_of(output: &str) -> CompileTaskObservation {
+        parse_build_output(
+            "./gradlew :app:compileJava --console=plain",
+            output,
+            0,
+            false,
+            100,
+        )
+        .compile_tasks
+    }
+
+    /// Plain-console transcripts from a minimal two-module fixture (`:lib`,
+    /// `:app` depending on it) run with Gradle 9.
+    #[test]
+    fn gradle_fixture_transcripts_reduce_to_observed_compile_outcomes() {
+        let normal = "> Task :lib:compileJava\n> Task :lib:processResources NO-SOURCE\n> Task :lib:classes\n> Task :lib:jar\n> Task :app:compileJava\n> Task :app:processResources NO-SOURCE\n> Task :app:classes\n> Task :app:compileTestJava NO-SOURCE\n\nBUILD SUCCESSFUL in 2s\n3 actionable tasks: 3 executed\n";
+        let up_to_date = "> Task :lib:compileJava UP-TO-DATE\n> Task :lib:processResources NO-SOURCE\n> Task :lib:classes UP-TO-DATE\n> Task :lib:jar UP-TO-DATE\n> Task :app:compileJava UP-TO-DATE\n> Task :app:processResources NO-SOURCE\n> Task :app:classes UP-TO-DATE\n> Task :app:compileTestJava NO-SOURCE\n\nBUILD SUCCESSFUL in 2s\n3 actionable tasks: 3 up-to-date\n";
+        let cached = "> Task :lib:compileJava FROM-CACHE\n> Task :lib:processResources NO-SOURCE\n> Task :lib:classes UP-TO-DATE\n> Task :lib:jar\n> Task :app:compileJava FROM-CACHE\n\nBUILD SUCCESSFUL in 2s\n3 actionable tasks: 1 executed, 2 from cache\n";
+        let skipped = "> Task :lib:compileJava SKIPPED\n> Task :lib:processResources NO-SOURCE\n> Task :lib:classes UP-TO-DATE\n> Task :lib:jar UP-TO-DATE\n> Task :app:compileJava SKIPPED\n\nBUILD SUCCESSFUL in 2s\n1 actionable task: 1 up-to-date\n";
+        let rerun = "> Task :lib:compileJava\n> Task :lib:processResources NO-SOURCE\n> Task :lib:classes\n> Task :lib:jar\n> Task :app:compileJava\n\nBUILD SUCCESSFUL in 2s\n3 actionable tasks: 3 executed\n";
+        let failed = "> Task :lib:compileJava FAILED\n/work/lib/src/main/java/com/acme/OrderService.java:1: error: cannot find symbol\npackage com.acme; public class OrderService { public int total() { return missing(); } }\n                                                                          ^\n  symbol:   method missing()\n  location: class OrderService\n1 error\n\nFAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':lib:compileJava'.\n> Compilation failed; see the compiler output below.\n\nBUILD FAILED in 2s\n1 actionable task: 1 executed\n";
+        assert_eq!(
+            gradle_compile_tasks_of(normal),
+            compile_counts(2, 0, 0, 1, 0, 0)
+        );
+        assert_eq!(
+            gradle_compile_tasks_of(up_to_date),
+            compile_counts(0, 0, 2, 1, 0, 0)
+        );
+        assert_eq!(
+            gradle_compile_tasks_of(cached),
+            compile_counts(0, 2, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            gradle_compile_tasks_of(skipped),
+            compile_counts(0, 0, 0, 0, 2, 0)
+        );
+        assert_eq!(
+            gradle_compile_tasks_of(rerun),
+            compile_counts(2, 0, 0, 0, 0, 0)
+        );
+        let parsed = parse_build_output("./gradlew :app:compileJava", failed, 1, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Gradle);
+        assert_eq!(parsed.compile_tasks, compile_counts(0, 0, 0, 0, 0, 1));
+        assert_eq!(parsed.counts.errors, 1);
+    }
+
+    #[test]
+    fn gradle_compile_tasks_count_each_path_once_across_repeats_and_interleaving() {
+        let output = "> Task :a:compileJava\n> Task :b:compileKotlin\n> Task :a:compileJava\n> Task :b:compileKotlin FROM-CACHE\n> Task :c:compileTestJava UP-TO-DATE\n> Task :a:compileJava\n> Task :d:compileGroovy NO-SOURCE\n> Task :e:compileJava SKIPPED\n> Task :f:compileJava\n> Task :f:compileJava FAILED\n> Task :f:compileJava\n> Task :g:compileJava EXECUTED\n> Task :g:compileJava\n> Task :c:compileTestJava UP-TO-DATE\n> Task :compileJava\n> Task :a:jar\n> Task :a:compilation-report\n";
+        // Prefix match on the last segment: `compilation-report` is not a compile task.
+        assert_eq!(
+            gradle_compile_tasks_of(output),
+            compile_counts(3, 1, 1, 1, 1, 1)
+        );
+        let reordered: String = output
+            .lines()
+            .rev()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            gradle_compile_tasks_of(&reordered),
+            compile_counts(3, 1, 1, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn gradle_compile_tasks_ignore_status_line_and_diagnostic_caps() {
+        let mut output = String::new();
+        for idx in 0..(STATUS_LINE_CAP + 5) {
+            output.push_str(&format!(
+                "> Task :m{idx}:compileJava FAILED\n/work/m{idx}/Broken.java:1: error: failure {idx}\n"
+            ));
+        }
+        output.push_str("BUILD FAILED in 1s\n");
+        let parsed = parse_build_output("./gradlew compileJava", &output, 1, false, 0);
+        assert_eq!(parsed.status_lines.len(), STATUS_LINE_CAP);
+        assert!(parsed.diagnostics.is_empty());
+        assert!(parsed.truncated);
+        assert_eq!(parsed.counts.errors, STATUS_LINE_CAP + 5);
+        assert_eq!(
+            parsed.compile_tasks,
+            compile_counts(0, 0, 0, 0, 0, STATUS_LINE_CAP + 5)
+        );
+    }
+
+    #[test]
+    fn gradle_compile_tasks_are_unavailable_or_absent_rather_than_guessed() {
+        for output in [
+            "> Task :a:compileJava UP-TO-DATE\n> Task :a:compileJava FROM-CACHE\n",
+            "> Task :a:compileJava EXECUTED\n> Task :a:compileJava FAILED\n",
+            "> Task :a:compileJava\n> Task :b:compileJava WEIRD\n",
+            "> Task :a:compileJava UP-TO-DATE extra\n",
+            "> Task :a:compileJava\n[... 12 lines truncated]\n",
+        ] {
+            assert_eq!(
+                gradle_compile_tasks_of(output),
+                CompileTaskObservation::Unavailable,
+                "{output}"
+            );
+        }
+        for output in [
+            "",
+            "BUILD SUCCESSFUL in 1s\n",
+            "> Task :a:jar\n> Task :a:test UP-TO-DATE\nBUILD SUCCESSFUL in 1s\n",
+            // An unknown suffix on a non-compile task does not taint compile evidence.
+            "> Task :a:jar WEIRD\n",
+            // Not full task paths.
+            "> Task compileJava\n> Task ::compileJava\n> Task :a::compileJava\n",
+            "> Configure project :a\n> Compilation failed; see the compiler output below.\n",
+        ] {
+            assert_eq!(
+                gradle_compile_tasks_of(output),
+                CompileTaskObservation::Absent,
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradle_task_records_detect_wrapper_output_without_changing_other_precedence() {
+        let success = "> Task :lib:compileJava UP-TO-DATE\n> Task :lib:classes UP-TO-DATE\n";
+        let parsed = parse_build_output("make build", success, 0, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Gradle);
+        assert_eq!(parsed.compile_tasks, compile_counts(0, 0, 1, 0, 0, 0));
+        assert!(parsed.status_lines.is_empty());
+        // Non-compile task records still establish detection.
+        let parsed = parse_build_output("make build", "> Task :lib:jar\n", 0, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Gradle);
+        // Cargo/rustc JSON keeps precedence over task records.
+        let cargo = format!(
+            "> Task :native:compileRust\n{}",
+            compiler_message_json("error", Some("E0308"), "boom")
+        );
+        let parsed = parse_build_output("make build", &cargo, 1, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Cargo);
+        // Malformed records and unrelated output keep their prior classification.
+        let parsed = parse_build_output("make build", "> Task compileJava\n", 0, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Generic);
+        let parsed = parse_build_output(
+            "javac Broken.java",
+            "Broken.java:3: error: cannot find symbol\n",
+            1,
+            false,
+            100,
+        );
+        assert_eq!(parsed.tool, BuildTool::Javac);
+    }
+
+    fn assembled(
+        ok: bool,
+        next_step: Option<&str>,
+        tool: BuildTool,
+        observation: CompileTaskObservation,
+        observed_to_completion: bool,
+    ) -> Value {
+        let mut result = json!({"ok": ok, "exit_code": if ok { 0 } else { 1 }});
+        if let Some(hint) = next_step {
+            result["next_step"] = json!(hint);
+        }
+        attach_compile_tasks(&mut result, tool, &observation, observed_to_completion);
+        result
+    }
+
+    #[test]
+    fn result_assembly_reports_complete_compile_outcomes_without_changing_ok() {
+        let result = assembled(
+            false,
+            None,
+            BuildTool::Gradle,
+            compile_counts(2, 1, 1, 1, 1, 1),
+            true,
+        );
+        assert_eq!(
+            result["gradle_compile_tasks"],
+            json!({"executed":2,"from_cache":1,"up_to_date":1,"no_source":1,"skipped":1,"failed":1})
+        );
+        assert_eq!(result["compiled"], true);
+        assert_eq!(result["ok"], false);
+        assert!(result.get("next_step").is_none());
+
+        let result = assembled(
+            true,
+            None,
+            BuildTool::Gradle,
+            compile_counts(1, 3, 0, 0, 0, 0),
+            true,
+        );
+        assert_eq!(result["compiled"], true);
+        assert!(result.get("next_step").is_none());
+
+        // Failed-only is not "compiled", and a failed gate gets no rerun hint.
+        let result = assembled(
+            false,
+            None,
+            BuildTool::Gradle,
+            compile_counts(0, 0, 0, 0, 0, 1),
+            true,
+        );
+        assert_eq!(result["compiled"], false);
+        assert!(result.get("next_step").is_none());
+    }
+
+    #[test]
+    fn result_assembly_withholds_compile_outcomes_unless_observed_to_completion() {
+        for observation in [
+            compile_counts(0, 2, 0, 0, 0, 0),
+            CompileTaskObservation::Unavailable,
+        ] {
+            for observed in [false, true] {
+                if observed && observation != CompileTaskObservation::Unavailable {
+                    continue;
+                }
+                let result =
+                    assembled(true, None, BuildTool::Gradle, observation.clone(), observed);
+                assert!(result.get("gradle_compile_tasks").is_none(), "{result}");
+                assert!(result.get("compiled").is_none(), "{result}");
+                assert_eq!(result["next_step"], COMPILE_TASKS_UNAVAILABLE_HINT);
+                // An existing recovery hint is never replaced.
+                let hint =
+                    "Call shell_poll with session_id until running=false and output_pending=false.";
+                let result = assembled(
+                    false,
+                    Some(hint),
+                    BuildTool::Gradle,
+                    observation.clone(),
+                    observed,
+                );
+                assert!(result.get("gradle_compile_tasks").is_none(), "{result}");
+                assert!(result.get("compiled").is_none(), "{result}");
+                assert_eq!(result["next_step"], hint);
+            }
+        }
+        let result = assembled(
+            true,
+            None,
+            BuildTool::Gradle,
+            CompileTaskObservation::Absent,
+            true,
+        );
+        assert!(result.get("gradle_compile_tasks").is_none());
+        assert!(result.get("compiled").is_none());
+        assert!(result.get("next_step").is_none());
+        for tool in [BuildTool::Cargo, BuildTool::Javac, BuildTool::Generic] {
+            let result = assembled(true, None, tool, compile_counts(0, 1, 0, 0, 0, 0), true);
+            assert!(result.get("gradle_compile_tasks").is_none());
+            assert!(result.get("compiled").is_none());
+            assert!(result.get("next_step").is_none());
+        }
+    }
+
+    #[test]
+    fn result_assembly_hints_when_a_successful_gate_executed_no_compile_task() {
+        let result = assembled(
+            true,
+            None,
+            BuildTool::Gradle,
+            compile_counts(0, 1, 1, 0, 0, 0),
+            true,
+        );
+        assert_eq!(result["compiled"], false);
+        let hint = result["next_step"].as_str().unwrap();
+        assert!(hint.starts_with("No matched Gradle compile task reported execution."));
+        assert!(hint.contains("--console=plain --rerun-tasks"), "{hint}");
+        assert!(hint.contains("its dependencies"), "{hint}");
+        assert!(
+            hint.contains("--no-build-cache alone does not force execution"),
+            "{hint}"
+        );
+        assert!(!hint.contains("skip conditions"), "{hint}");
+
+        let result = assembled(
+            true,
+            None,
+            BuildTool::Gradle,
+            compile_counts(0, 0, 0, 1, 1, 0),
+            true,
+        );
+        let hint = result["next_step"].as_str().unwrap();
+        assert!(
+            hint.contains("task selection, source inputs, and skip conditions"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--rerun-tasks"), "{hint}");
+
+        let existing = "existing recovery hint";
+        let result = assembled(
+            true,
+            Some(existing),
+            BuildTool::Gradle,
+            compile_counts(0, 1, 0, 1, 0, 0),
+            true,
+        );
+        assert_eq!(result["compiled"], false);
+        assert_eq!(result["next_step"], existing);
+    }
+
+    #[tokio::test]
+    async fn gate_withholds_compile_outcomes_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let result = json_of(
+            BuildGate
+                .call(
+                    json!({"command":"printf '> Task :a:compileJava UP-TO-DATE\\n'; sleep 5","timeout_ms":200}),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        assert_eq!(result["timed_out"], true, "{result}");
+        assert_eq!(result["tool"], "gradle");
+        assert!(result.get("gradle_compile_tasks").is_none(), "{result}");
+        assert!(result.get("compiled").is_none(), "{result}");
+        assert!(result["next_step"].is_string(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn gate_reports_successful_wrapper_compile_outcomes_with_zero_max_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let result = json_of(
+            BuildGate
+                .call(
+                    json!({"command":"printf '> Task :lib:compileJava FROM-CACHE\\n> Task :app:compileJava UP-TO-DATE\\n> Task :app:compileJava\\n'","max_diagnostics":0}),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["tool"], "gradle");
+        assert_eq!(
+            result["gradle_compile_tasks"],
+            json!({"executed":0,"from_cache":1,"up_to_date":1,"no_source":0,"skipped":0,"failed":0})
+        );
+        assert_eq!(result["compiled"], false);
+        assert!(
+            result["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("--rerun-tasks"),
+            "{result}"
+        );
+    }
+
+    /// Opt-in live check against a real Gradle: set `BUILD_GATE_GRADLE` to a
+    /// Gradle executable and run with `--run-ignored`. Builds an isolated
+    /// two-module project with its own user home and build cache.
+    #[tokio::test]
+    #[ignore = "requires BUILD_GATE_GRADLE and a JDK; runs several Gradle builds"]
+    async fn build_gate_live_gradle_fixture_outcomes() {
+        let Ok(gradle) = std::env::var("BUILD_GATE_GRADLE") else {
+            eprintln!("skipping live Gradle build.gate test: BUILD_GATE_GRADLE is unset");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        for module in ["lib", "app"] {
+            std::fs::create_dir_all(project.join(module).join("src/main/java/com/acme")).unwrap();
+        }
+        std::fs::write(
+            project.join("settings.gradle"),
+            "rootProject.name = 'fixture'\ninclude 'lib', 'app'\nbuildCache { local { directory = file(\"$rootDir/../cache\") } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("build.gradle"),
+            "subprojects {\n  apply plugin: 'java'\n  if (project.hasProperty('skipCompile')) { tasks.named('compileJava') { enabled = false } }\n}\nproject(':app') { dependencies { implementation project(':lib') } }\n",
+        )
+        .unwrap();
+        let source = project.join("lib/src/main/java/com/acme/OrderService.java");
+        let good =
+            "package com.acme; public class OrderService { public int total() { return 1; } }\n";
+        std::fs::write(&source, good).unwrap();
+        std::fs::write(
+            project.join("app/src/main/java/com/acme/App.java"),
+            "package com.acme; class App { int run() { return new OrderService().total(); } }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+        let gate = |args: &str| {
+            let command = format!(
+                "cd proj && '{gradle}' -g '{}' --no-daemon --offline --console=plain {args}",
+                root.join("gradle-home").display()
+            );
+            let cx = &cx;
+            async move {
+                json_of(
+                    BuildGate
+                        .call(json!({"command": command, "max_diagnostics": 0}), cx)
+                        .await,
+                )
+            }
+        };
+        let counts = |result: &Value| result["gradle_compile_tasks"].clone();
+
+        let normal = gate(":app:compileJava :app:compileTestJava --build-cache").await;
+        assert_eq!(normal["ok"], true, "{normal}");
+        assert_eq!(normal["tool"], "gradle");
+        assert_eq!(
+            counts(&normal),
+            json!({"executed":2,"from_cache":0,"up_to_date":0,"no_source":1,"skipped":0,"failed":0})
+        );
+        assert_eq!(normal["compiled"], true);
+
+        let up_to_date = gate(":app:compileJava --build-cache").await;
+        assert_eq!(
+            counts(&up_to_date),
+            json!({"executed":0,"from_cache":0,"up_to_date":2,"no_source":0,"skipped":0,"failed":0})
+        );
+        assert_eq!(up_to_date["compiled"], false);
+        assert!(
+            up_to_date["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("--rerun-tasks")
+        );
+
+        assert_eq!(gate("clean").await["ok"], true);
+        let cached = gate(":app:compileJava --build-cache").await;
+        assert_eq!(
+            counts(&cached),
+            json!({"executed":0,"from_cache":2,"up_to_date":0,"no_source":0,"skipped":0,"failed":0})
+        );
+        assert_eq!(cached["compiled"], false);
+
+        let skipped = gate(":app:compileJava -PskipCompile").await;
+        assert_eq!(
+            counts(&skipped),
+            json!({"executed":0,"from_cache":0,"up_to_date":0,"no_source":0,"skipped":2,"failed":0})
+        );
+        assert!(
+            skipped["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("skip conditions")
+        );
+
+        let rerun = gate(":app:compileJava --rerun-tasks").await;
+        assert_eq!(
+            counts(&rerun),
+            json!({"executed":2,"from_cache":0,"up_to_date":0,"no_source":0,"skipped":0,"failed":0})
+        );
+        assert_eq!(rerun["compiled"], true);
+
+        std::fs::write(
+            &source,
+            "package com.acme; public class OrderService { public int total() { return missing(); } }\n",
+        )
+        .unwrap();
+        let failed = gate(":app:compileJava").await;
+        assert_eq!(failed["ok"], false);
+        assert_eq!(
+            counts(&failed),
+            json!({"executed":0,"from_cache":0,"up_to_date":0,"no_source":0,"skipped":0,"failed":1})
+        );
+        assert_eq!(failed["compiled"], false);
+        assert!(failed["counts"]["errors"].as_u64().unwrap() >= 1);
     }
 
     #[test]
