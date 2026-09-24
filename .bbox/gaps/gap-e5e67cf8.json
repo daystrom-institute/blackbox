@@ -7,16 +7,18 @@
   "missing_primitive": "A supervision-surface field (or sibling probe) that annotates idle_seconds with the currently running shell sessions from shell_list.",
   "fallback_used": "Orchestrators poll shell_list by hand when a bro goes quiet (as done for the 2026-08-16 rg incident in gap-aa2baeb3).",
   "evidence": [
-    "deferred second half of gap-aa2baeb3",
-    "fix child report on branch fix/shell-run-stdin-open-pipe (d1f95d3c, 97fffd1f)",
-    "crates/bro-tools/src/shell.rs no-low-cap yield contract; supervision.rs neutral-idle design comment"
+    "src/orchestration/supervision.rs snapshot / snapshot_for_response / idle_notice: idle_seconds and tool_running only, no shell session data",
+    "crates/bro-tools/src/shell.rs shell_list: harness-local list of retained sessions (id, command, elapsed, running) with no daemon-visible projection",
+    "related: gap-aa2baeb3 (shell_run stdin default)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-shell/supervision-idle-shell-session-annotation",
-  "notes": "Filed by the gap manager 2026-08-19 as the deferred second half of gap-aa2baeb3. The stdin root cause is fixed; this is the residual observability half. Design-shaped: touches the supervision surface contract, so it wants a design decision before a diff.",
-  "resolution": "unresolved",
+  "notes": "Triage: the note that the gap-aa2baeb3 stdin root cause is fixed is inaccurate; its fix commit was never merged into beta/blackbox-v2. This observability half stands on its own either way.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-19T02:56:29Z",
-  "updated_at": "2026-08-19T02:56:29Z"
+  "updated_at": "2026-09-24T00:04:31Z",
+  "resolved_at": "2026-09-24T00:04:31Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/33"
 }

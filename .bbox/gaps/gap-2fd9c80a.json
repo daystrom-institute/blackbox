@@ -4,20 +4,24 @@
   "gap_kind": "tooling",
   "domain": "bro-harness/lsp",
   "wanted_capability": "When a dispatched harness child opens a rust-analyzer session for a checkout whose builds are lane-routed (a ~/lanes/<name> checkout), flycheck must not spawn a local `cargo check --workspace --all-targets` on the control-plane host. Either the LSP session initializes rust-analyzer with check-on-save disabled (initializationOptions `checkOnSave: false`, or `check.overrideCommand` pointing at the lane shim), or the harness routes rust-analyzer's cargo invocations through the same cwd-keyed shim that bare cargo uses. Observed: a glm dispatch in a pool lane spawned rust-analyzer, whose flycheck ran `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo check --workspace --message-format=json --manifest-path ~/lanes/bpool6/blackbox/Cargo.toml --keep-going --all-targets` on the Mac after every file save, with two rustc processes at 96% CPU compiling the root crate over NFS into ~/Library/Caches/blackbox/ra-target. That is the exact local cold-build path the lane contract exists to prevent, and it competes with every sibling lane on the host.",
-  "missing_primitive": "rust-analyzer initializationOptions in crates/bbox-lsp/src/session_manager.rs build_init_params (sends capabilities only; no checkOnSave or check.overrideCommand), and lane-aware routing for LSP-spawned cargo",
+  "missing_primitive": "Rust initializationOptions in crates/bro-lsp/src/lib.rs build_init_params (only Java gets options; rust-analyzer keeps its checkOnSave=true default), or a lane-aware flycheck command for host-built rust-analyzer sessions",
   "fallback_used": "None during the session; the local checks were left running. Operator-side mitigation would be BLACKBOX_RUST_ANALYZER_BIN pointing at a wrapper that passes --config for checkOnSave=false, or dispatching Rust edit work with the lsp surface disabled.",
   "evidence": [
-    "crates/bbox-lsp/src/session_manager.rs spawn_session and build_init_params: no initialization_options are sent, so rust-analyzer defaults to checkOnSave=true",
-    "process tree on the checkout host 2026-09-20: bro-harness -> rust-analyzer -> cargo check --workspace --all-targets --manifest-path ~/lanes/bpool6/blackbox/Cargo.toml (absolute toolchain path, not the ~/.lane/shims/cargo shim)",
+    "crates/bro-lsp/src/lib.rs build_init_params: initialization_options is Some only for Language::Java, so rust-analyzer runs with checkOnSave enabled",
+    "crates/bro-lsp/src/lib.rs spawn_session / apply_lane_environment / lane_host_build_env: lane-rooted sessions strip the lane shim from PATH and set a host CARGO_TARGET_DIR, so flycheck's cargo check runs on the host",
+    "design/refactor-tools/rust/rust-isolate-surface.md lane host-build section: budgets one cold host build of proc macros and build scripts, not a full workspace check per save",
     "PROJECT.md Where Heavy Work Runs: cargo/rustc route into the lane pod only when invoked by bare name from a lane cwd",
     "thread-f51d2132"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-lsp/rust-analyzer-flycheck-bypasses-lane-routing",
-  "resolution": "unresolved",
+  "notes": "Triage: the harness LSP client is crates/bro-lsp (bro-harness depends on bro-lsp), not crates/bbox-lsp; the original evidence pointed at the daemon crate. The host-side spawn for lane checkouts is deliberate (proc-macro dylib format mismatch), so the fix is scoped to flycheck, not to where rust-analyzer runs.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-f51d2132",
   "created_at": "2026-09-20T03:39:28Z",
-  "updated_at": "2026-09-20T03:39:28Z"
+  "updated_at": "2026-09-24T00:04:32Z",
+  "resolved_at": "2026-09-24T00:04:32Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/34"
 }

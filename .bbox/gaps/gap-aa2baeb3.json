@@ -7,19 +7,22 @@
   "missing_primitive": "stdin=/dev/null default (or explicit stdin control) on shell_run; hang detection/timeout on shell tools",
   "fallback_used": "Orchestrator killed the rg process on the host, then bro_steer'd the worker to always pass an explicit path or `< /dev/null` and prefer code.* / file tools for repo search.",
   "evidence": [
-    "bro task df7a62ef-1183-4b8d-8f67-c37c9f177b8f (session 99c1b23d-da8a-4edf-9e8e-8bf07ca943ef), seq 1894",
-    "file:crates/bro-tools/src/shell.rs",
+    "crates/bro-tools/src/shell.rs ShellRun::call: spawns bash -lc with Stdio::piped() stdin unconditionally",
+    "crates/bro-tools/src/shell.rs feed_stdin: returns immediately when no stdin and close_stdin=false, leaving the pipe open for the command's lifetime",
+    "fix commit d1f95d3c (stdin to /dev/null) exists only on branch fix/shell-run-stdin-open-pipe and is not an ancestor of beta/blackbox-v2",
     "thread-a2062843"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-shell/stdin-open-pipe-hang",
-  "notes": "Recurrence tally 2026-08-16: four hangs across two glm-5.3 workers in one afternoon (three on the docs worker, one on the M9a worker), each 7-15 minutes of dead time until the orchestrator killed the host-side rg by hand. Steering the worker to always pass a path helped but did not fully generalize (one worker read `-g '*.md'` as a path). The fix belongs in shell_run, not in prompts.",
-  "resolution": "unresolved",
+  "notes": "Triage: the stdin default is still an open pipe on beta/blackbox-v2. The earlier fix (d1f95d3c) was never merged, and shell_poll now documents feeding more stdin to a running session, so a fix must keep an explicit opt-in for interactive stdin while defaulting to EOF.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "task_id": "df7a62ef-1183-4b8d-8f67-c37c9f177b8f",
   "provider": "glm",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-16T16:43:33Z",
-  "updated_at": "2026-08-16T20:26:55Z"
+  "updated_at": "2026-09-24T00:04:30Z",
+  "resolved_at": "2026-09-24T00:04:30Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/32"
 }
