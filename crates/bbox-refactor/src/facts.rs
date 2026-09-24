@@ -249,6 +249,137 @@ pub fn file_query(
     })
 }
 
+/// One supertype of a grammar. `subtypes` is `None` when the loaded grammar
+/// carries no subtype table (tree-sitter ABI below 15): unknown, not empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupertypeFact {
+    pub kind: String,
+    pub subtypes: Option<Vec<String>>,
+}
+
+/// Node-kind and field vocabulary of one loaded tree-sitter grammar. Every
+/// list is sorted and deduplicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarInventory {
+    pub language: String,
+    /// Named, visible kinds: written `(kind)` in a query.
+    pub node_kinds: Vec<String>,
+    /// Visible anonymous kinds: written quoted, `"kind"`, in a query.
+    pub anonymous_kinds: Vec<String>,
+    /// Supertypes, enumerated separately because they are hidden symbols
+    /// that queries still accept.
+    pub supertypes: Vec<SupertypeFact>,
+    /// The grammar's flat field vocabulary, not a per-kind field table.
+    pub fields: Vec<String>,
+}
+
+/// First tree-sitter ABI whose grammars carry supertype/subtype tables.
+const ABI_WITH_SUBTYPE_TABLES: usize = 15;
+
+impl GrammarInventory {
+    /// Case-sensitive substring view. An empty pattern is the full
+    /// inventory. A supertype stays when its name or a known subtype
+    /// matches, and keeps its whole subtype list.
+    pub fn filtered(&self, pattern: &str) -> Self {
+        let keep = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|name| name.contains(pattern))
+                .cloned()
+                .collect()
+        };
+        Self {
+            language: self.language.clone(),
+            node_kinds: keep(&self.node_kinds),
+            anonymous_kinds: keep(&self.anonymous_kinds),
+            supertypes: self
+                .supertypes
+                .iter()
+                .filter(|supertype| {
+                    supertype.kind.contains(pattern)
+                        || supertype
+                            .subtypes
+                            .as_ref()
+                            .is_some_and(|subtypes| subtypes.iter().any(|s| s.contains(pattern)))
+                })
+                .cloned()
+                .collect(),
+            fields: keep(&self.fields),
+        }
+    }
+}
+
+/// Language names [`grammar_inventory`] accepts: exactly the names a source
+/// path resolves to, so the vocabulary matches what [`file_query`] loads.
+pub fn query_language_names() -> Vec<&'static str> {
+    let names: BTreeSet<_> = chunker::code::path_language_names().collect();
+    names.into_iter().collect()
+}
+
+/// Grammar vocabulary for `language`, loaded through the same resolver
+/// [`file_query`] uses (language pack first, then the bundled grammars).
+pub fn grammar_inventory(language: &str) -> Result<GrammarInventory> {
+    if !chunker::code::path_language_names().any(|name| name == language) {
+        return Err(anyhow!(
+            "unsupported language {language} (supported: {})",
+            query_language_names().join(", ")
+        ));
+    }
+    let ts_language = chunker::code::ts_language_for_name(language)?;
+    Ok(grammar_inventory_for(language, &ts_language))
+}
+
+/// Grammar vocabulary read from a loaded grammar's runtime metadata.
+pub fn grammar_inventory_for(
+    language: &str,
+    ts_language: &tree_sitter::Language,
+) -> GrammarInventory {
+    let mut node_kinds = BTreeSet::new();
+    let mut anonymous_kinds = BTreeSet::new();
+    let mut supertype_ids: BTreeMap<&str, Vec<u16>> = BTreeMap::new();
+    // Symbol ids are u16 in tree-sitter, so the count always fits.
+    for id in 0..ts_language.node_kind_count() as u16 {
+        let Some(name) = ts_language.node_kind_for_id(id) else {
+            continue;
+        };
+        if ts_language.node_kind_is_supertype(id) {
+            supertype_ids.entry(name).or_default().push(id);
+        } else if ts_language.node_kind_is_named(id) {
+            node_kinds.insert(name.to_string());
+        } else if ts_language.node_kind_is_visible(id) {
+            anonymous_kinds.insert(name.to_string());
+        }
+    }
+    let has_subtype_tables = ts_language.abi_version() >= ABI_WITH_SUBTYPE_TABLES;
+    let supertypes = supertype_ids
+        .into_iter()
+        .map(|(kind, ids)| SupertypeFact {
+            kind: kind.to_string(),
+            subtypes: has_subtype_tables.then(|| {
+                let subtypes: BTreeSet<_> = ids
+                    .iter()
+                    .flat_map(|id| ts_language.subtypes_for_supertype(*id))
+                    .filter_map(|subtype| ts_language.node_kind_for_id(*subtype))
+                    .map(str::to_string)
+                    .collect();
+                subtypes.into_iter().collect()
+            }),
+        })
+        .collect();
+    // Field id 0 means "no field"; named fields occupy 1..=field_count.
+    let fields: BTreeSet<_> = (1..=ts_language.field_count() as u16)
+        .filter_map(|id| ts_language.field_name_for_id(id))
+        .map(str::to_string)
+        .collect();
+    GrammarInventory {
+        language: language.to_string(),
+        node_kinds: node_kinds.into_iter().collect(),
+        anonymous_kinds: anonymous_kinds.into_iter().collect(),
+        supertypes,
+        fields: fields.into_iter().collect(),
+    }
+}
+
 /// One Java field declaration fact.
 #[derive(Debug, Clone)]
 pub struct JavaFieldFact {
@@ -1719,5 +1850,178 @@ class OrderView {
         .unwrap();
         assert_eq!(closure["FIRST"], vec!["BASE"]);
         assert_eq!(closure["SECOND"], vec!["BASE", "FIRST"]);
+    }
+
+    fn assert_sorted_unique(names: &[String]) {
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]), "{names:?}");
+    }
+
+    fn assert_inventory_matches_metadata(inv: &GrammarInventory, ts: &tree_sitter::Language) {
+        for list in [&inv.node_kinds, &inv.anonymous_kinds, &inv.fields] {
+            assert_sorted_unique(list);
+        }
+        let supertype_names: Vec<String> = inv.supertypes.iter().map(|s| s.kind.clone()).collect();
+        assert_sorted_unique(&supertype_names);
+        for kind in &inv.node_kinds {
+            let id = ts.id_for_node_kind(kind, true);
+            assert!(id != 0 && ts.node_kind_is_named(id), "{kind}");
+        }
+        for kind in &inv.anonymous_kinds {
+            let id = ts.id_for_node_kind(kind, false);
+            assert!(
+                ts.node_kind_is_visible(id) && !ts.node_kind_is_named(id),
+                "{kind:?}"
+            );
+        }
+        for supertype in &inv.supertypes {
+            assert!(
+                (0..ts.node_kind_count() as u16).any(|id| ts.node_kind_is_supertype(id)
+                    && ts.node_kind_for_id(id) == Some(supertype.kind.as_str())),
+                "{}",
+                supertype.kind
+            );
+            if let Some(subtypes) = &supertype.subtypes {
+                assert_sorted_unique(subtypes);
+            }
+        }
+        // Field ids run 1..=field_count; 0 and count+1 are not fields.
+        let count = ts.field_count() as u16;
+        assert_eq!(ts.field_name_for_id(0), None);
+        assert_eq!(ts.field_name_for_id(count + 1), None);
+        let expected: BTreeSet<String> = (1..=count)
+            .map(|id| ts.field_name_for_id(id).unwrap().to_string())
+            .collect();
+        assert_eq!(inv.fields, expected.into_iter().collect::<Vec<_>>());
+        // Every listed kind and field is legal query syntax for this grammar.
+        for kind in &inv.node_kinds {
+            tree_sitter::Query::new(ts, &format!("({kind}) @n")).unwrap();
+        }
+        for supertype in &inv.supertypes {
+            tree_sitter::Query::new(ts, &format!("({}) @n", supertype.kind)).unwrap();
+        }
+    }
+
+    #[test]
+    fn grammar_inventory_matches_resolver_metadata() {
+        for (language, kinds, fields) in [
+            ("rust", &["function_item"][..], &["name"][..]),
+            (
+                "java",
+                &["method_declaration", "constructor_declaration"][..],
+                &["parameters", "name"][..],
+            ),
+            // Supported without an authored query guide.
+            ("go", &["function_declaration"][..], &["name"][..]),
+        ] {
+            let inv = grammar_inventory(language).unwrap();
+            let ts = chunker::code::ts_language_for_name(language).unwrap();
+            assert_eq!(inv.language, language);
+            assert_eq!(inv, grammar_inventory_for(language, &ts));
+            assert_inventory_matches_metadata(&inv, &ts);
+            for kind in kinds {
+                assert!(
+                    inv.node_kinds.iter().any(|k| k == kind),
+                    "{language}: {kind}"
+                );
+            }
+            for field in fields {
+                assert!(inv.fields.iter().any(|f| f == field), "{language}: {field}");
+            }
+            assert!(!inv.anonymous_kinds.is_empty(), "{language}");
+        }
+    }
+
+    #[test]
+    fn bundled_abi14_java_keeps_supertypes_with_unknown_subtypes() {
+        let ts = chunker::code::bundled_ts_language_for_name("java").unwrap();
+        assert!(ts.abi_version() < ABI_WITH_SUBTYPE_TABLES);
+        assert!(
+            ts.supertypes().is_empty(),
+            "ABI 14 exposes no supertype table"
+        );
+        let inv = grammar_inventory_for("java", &ts);
+        assert_inventory_matches_metadata(&inv, &ts);
+        for name in ["expression", "statement", "declaration"] {
+            let supertype = inv
+                .supertypes
+                .iter()
+                .find(|s| s.kind == name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", inv.supertypes));
+            assert_eq!(supertype.subtypes, None, "{name}");
+        }
+        // Hidden supertypes are not reported as named kinds.
+        assert!(!inv.node_kinds.iter().any(|k| k == "expression"));
+    }
+
+    #[test]
+    fn bundled_abi15_rust_reports_subtype_tables() {
+        let ts = chunker::code::bundled_ts_language_for_name("rust").unwrap();
+        assert!(ts.abi_version() >= ABI_WITH_SUBTYPE_TABLES);
+        let inv = grammar_inventory_for("rust", &ts);
+        assert_inventory_matches_metadata(&inv, &ts);
+        let expression = inv
+            .supertypes
+            .iter()
+            .find(|s| s.kind == "_expression")
+            .unwrap();
+        let subtypes = expression.subtypes.as_ref().unwrap();
+        assert!(
+            subtypes.iter().any(|s| s == "binary_expression"),
+            "{subtypes:?}"
+        );
+        tree_sitter::Query::new(&ts, "(_expression/binary_expression) @e").unwrap();
+    }
+
+    #[test]
+    fn grammar_inventory_filters_by_case_sensitive_substring() {
+        let ts = chunker::code::bundled_ts_language_for_name("rust").unwrap();
+        let inv = grammar_inventory_for("rust", &ts);
+        assert_eq!(inv.filtered(""), inv);
+
+        let function = inv.filtered("function");
+        assert!(function.node_kinds.iter().any(|k| k == "function_item"));
+        assert!(function.node_kinds.iter().all(|k| k.contains("function")));
+        assert!(function.fields.iter().all(|f| f.contains("function")));
+        assert!(function.anonymous_kinds.is_empty());
+        assert!(inv.filtered("FUNCTION").node_kinds.is_empty());
+
+        // A supertype survives through a matching subtype, full list intact.
+        let binary = inv.filtered("binary_expression");
+        let expression = binary
+            .supertypes
+            .iter()
+            .find(|s| s.kind == "_expression")
+            .unwrap();
+        assert_eq!(
+            expression,
+            inv.supertypes
+                .iter()
+                .find(|s| s.kind == "_expression")
+                .unwrap()
+        );
+
+        let none = inv.filtered("no_such_kind_anywhere");
+        assert_eq!(none.language, "rust");
+        assert!(none.node_kinds.is_empty() && none.anonymous_kinds.is_empty());
+        assert!(none.supertypes.is_empty() && none.fields.is_empty());
+
+        // Unknown subtype lists match on the supertype name only.
+        let java = chunker::code::bundled_ts_language_for_name("java").unwrap();
+        let java = grammar_inventory_for("java", &java);
+        assert!(java.filtered("binary_expression").supertypes.is_empty());
+        assert_eq!(java.filtered("statement").supertypes.len(), 1);
+    }
+
+    #[test]
+    fn grammar_inventory_rejects_unsupported_languages() {
+        for language in ["klingon", "", "Rust", "rust "] {
+            let error = grammar_inventory(language).unwrap_err().to_string();
+            assert!(
+                error.contains("unsupported language"),
+                "{language:?}: {error}"
+            );
+            assert!(error.contains("rust"), "{error}");
+        }
+        assert!(query_language_names().contains(&"java"));
     }
 }

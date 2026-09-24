@@ -120,6 +120,12 @@ pub fn ts_language_for_name(language: &str) -> Result<tree_sitter::Language> {
     if let Ok(language) = tree_sitter_language_pack::get_language(language) {
         return Ok(language);
     }
+    bundled_ts_language_for_name(language)
+}
+
+/// The grammars compiled into this crate: the fallback leg of
+/// [`ts_language_for_name`] when the language pack cannot supply a grammar.
+pub fn bundled_ts_language_for_name(language: &str) -> Result<tree_sitter::Language> {
     match language {
         "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
         "python" => Ok(tree_sitter_python::LANGUAGE.into()),
@@ -143,35 +149,47 @@ pub fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
     Ok(parser)
 }
 
+/// Source extensions and the language name each one resolves to. The
+/// language names are exactly the names [`language_for_path`] can produce.
+const EXTENSION_LANGUAGES: &[(&[&str], &str)] = &[
+    (&["rs"], "rust"),
+    (&["py"], "python"),
+    (&["cs"], "csharp"),
+    (&["java"], "java"),
+    (&["go"], "go"),
+    (&["ts", "tsx"], "typescript"),
+    (&["js", "jsx", "mjs", "cjs"], "javascript"),
+    (&["c", "h"], "c"),
+    (&["cc", "cpp", "cxx", "hh", "hpp", "hxx"], "cpp"),
+    (&["erl", "hrl"], "erlang"),
+    (&["ex", "exs"], "elixir"),
+    (&["rb"], "ruby"),
+    (&["ml", "mli"], "ocaml"),
+    (&["hs"], "haskell"),
+    (&["swift"], "swift"),
+    (&["kt"], "kotlin"),
+    (&["scala"], "scala"),
+    (&["lua"], "lua"),
+    (&["sh", "bash"], "bash"),
+    (&["json"], "json"),
+    (&["yaml", "yml"], "yaml"),
+    (&["toml"], "toml"),
+    (&["html", "htm"], "html"),
+    (&["css"], "css"),
+    (&["sql"], "sql"),
+];
+
 pub fn language_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("rs") => Some("rust"),
-        Some("py") => Some("python"),
-        Some("cs") => Some("csharp"),
-        Some("java") => Some("java"),
-        Some("go") => Some("go"),
-        Some("ts" | "tsx") => Some("typescript"),
-        Some("js" | "jsx" | "mjs" | "cjs") => Some("javascript"),
-        Some("c" | "h") => Some("c"),
-        Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => Some("cpp"),
-        Some("erl" | "hrl") => Some("erlang"),
-        Some("ex" | "exs") => Some("elixir"),
-        Some("rb") => Some("ruby"),
-        Some("ml" | "mli") => Some("ocaml"),
-        Some("hs") => Some("haskell"),
-        Some("swift") => Some("swift"),
-        Some("kt") => Some("kotlin"),
-        Some("scala") => Some("scala"),
-        Some("lua") => Some("lua"),
-        Some("sh" | "bash") => Some("bash"),
-        Some("json") => Some("json"),
-        Some("yaml" | "yml") => Some("yaml"),
-        Some("toml") => Some("toml"),
-        Some("html" | "htm") => Some("html"),
-        Some("css") => Some("css"),
-        Some("sql") => Some("sql"),
-        _ => None,
-    }
+    let ext = path.extension()?.to_str()?;
+    EXTENSION_LANGUAGES
+        .iter()
+        .find(|(exts, _)| exts.contains(&ext))
+        .map(|(_, language)| *language)
+}
+
+/// Every language name a source path can resolve to, in table order.
+pub fn path_language_names() -> impl Iterator<Item = &'static str> {
+    EXTENSION_LANGUAGES.iter().map(|(_, language)| *language)
 }
 
 fn chunks_from_symbols(

@@ -1396,6 +1396,63 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
     }
 
     #[tokio::test]
+    async fn cell_authors_a_query_from_grammar_introspection() {
+        // No daemon: the harness bindings alone answer vocabulary and
+        // guidance, and neither method leaks onto the flat tools object.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("probe.rs"),
+            "pub fn beta() -> u8 {\n    7\n}\n",
+        )
+        .unwrap();
+        let cx = ToolCx {
+            tool_observations: Default::default(),
+            instruction_generation: 0,
+            instruction_policy: None,
+            root: dir.path().to_path_buf(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            cancellation: Default::default(),
+            output_budget: 16 * 1024,
+            child_env: Arc::new(Default::default()),
+            session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
+            shell_env: Arc::new(Default::default()),
+        };
+        let callable = crate::bindings::binding_tools();
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            cx.clone(),
+        ));
+        let exec = code_mode_tools(
+            &callable,
+            seam,
+            CodeMode::Only,
+            &crate::bindings::namespace_descriptions(),
+        )
+        .remove(0);
+        let source = r#"
+const vocab = await code.nodeKinds({ language: "rust", match: "function" });
+const guide = await code.describe({ topic: "query", language: "rust" });
+const kind = vocab.node_kinds.find(k => k === "function_item");
+const hits = await code.query({ file: "probe.rs", query: `(${kind} name: (identifier) @name)` });
+text(`${kind}:${guide.contract.includes("RUST SHAPES")}:${hits.captures[0].text}`);
+text(`${typeof tools["code.nodeKinds"]}:${typeof tools["code.describe"]}`);
+"#;
+        let result = exec.call(json!({ "source": source }), &cx).await;
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("function_item:true:beta"), "got: {t}");
+                assert!(t.contains("undefined:undefined"), "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn cell_composes_facts_algebra_and_choke_point() {
         // Full mutation slice in one cell: query a span, queue a replacement,
         // apply — and the bytes land on disk with the EditSet consumed.

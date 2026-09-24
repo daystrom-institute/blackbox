@@ -6,7 +6,9 @@
 //! substrate); provenance tier `syntax_only`. Every binding returns
 //! hash-anchored [`Span`]s — the hash is captured where the bytes are read,
 //! so drift-guarding is a property of the address, not a discipline
-//! (code-mode-cell-dsl.md §3).
+//! (code-mode-cell-dsl.md §3). `code.nodeKinds` and `code.describe` are the
+//! query-authoring aids: grammar vocabulary read from the loaded grammar, and
+//! guidance compiled into the harness and returned on demand.
 //!
 //! Paths are normalized by the same [`bro_tools::workspace::resolve_in_root`]
 //! helper the flat file tools use: relative paths join the session worktree
@@ -98,9 +100,19 @@ fn read_exact_source(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn exact_result(tool: &str, payload: Value) -> ToolResult {
-    if payload.to_string().len() > MAX_FACT_RESULT_BYTES {
+    bounded_result(
+        tool,
+        payload,
+        MAX_FACT_RESULT_BYTES,
+        "request a narrower span or line range. No partial text returned.",
+    )
+}
+
+/// Refuse, rather than truncate, a result advertised as complete.
+fn bounded_result(tool: &str, payload: Value, budget: usize, narrow: &str) -> ToolResult {
+    if payload.to_string().len() > budget {
         return err(format!(
-            "{tool}: exact_result_too_large: serialized result exceeds {MAX_FACT_RESULT_BYTES} bytes; request a narrower span or line range. No partial text returned."
+            "{tool}: exact_result_too_large: serialized result exceeds {budget} bytes; {narrow}"
         ));
     }
     ToolResult::Json(payload)
@@ -516,7 +528,7 @@ impl Tool for CodeQuery {
         "code.query"
     }
     fn description(&self) -> &str {
-        "Run a tree-sitter query over source files (pure; syntax_only tier). Captures carry hash-anchored Spans. Pass `file` for one file, or `files` for a host-side batch — cross-file symbol search is ONE call (captures from every file in a flat array; each span names its file). `within` restricts to a byte range (single-file only)."
+        "Run a tree-sitter query over source files (pure; syntax_only tier). Captures carry hash-anchored Spans. Pass `file` for one file, or `files` for a host-side batch: cross-file symbol search is ONE call (captures from every file in a flat array; each span names its file). `within` restricts to a byte range (single-file only). Before authoring a pattern, list valid node kinds and fields with code.nodeKinds({ language }) and read code.describe({ topic: \"query\", language }). An invalid query is an error; a valid query that matches nothing returns empty captures, which does not prove the construct is absent."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1109,6 +1121,162 @@ impl Tool for CodeSpanUnion {
     }
 }
 
+/// `code.nodeKinds`: the vocabulary of the grammar `code.query` compiles
+/// against, read from runtime metadata (no maintained kind lists).
+pub struct CodeNodeKinds;
+
+#[derive(Deserialize)]
+struct CodeNodeKindsParams {
+    language: String,
+    #[serde(default, rename = "match")]
+    pattern: Option<String>,
+}
+
+fn node_kinds_payload(inventory: &facts::GrammarInventory) -> Value {
+    let supertypes: Vec<Value> = inventory
+        .supertypes
+        .iter()
+        .map(|supertype| json!({ "kind": supertype.kind, "subtypes": supertype.subtypes }))
+        .collect();
+    json!({
+        "language": inventory.language,
+        "node_kinds": inventory.node_kinds,
+        "anonymous_kinds": inventory.anonymous_kinds,
+        "supertypes": supertypes,
+        "fields": inventory.fields,
+        "provenance": "syntax_only",
+    })
+}
+
+const NODE_KINDS_NARROW: &str = "pass a narrower `match` filter. No partial inventory returned.";
+
+#[async_trait]
+impl Tool for CodeNodeKinds {
+    fn name(&self) -> &str {
+        "code.nodeKinds"
+    }
+    fn description(&self) -> &str {
+        "List the tree-sitter vocabulary code.query compiles against for one language, read from the loaded grammar (pure; syntax_only tier): named node_kinds, anonymous_kinds (quoted tokens in queries), supertypes (hidden but legal query nodes; subtypes null when the grammar has no subtype table, meaning unknown) and the grammar-wide field names (a flat list, not per-kind membership). `language` is a name code.files reports. Optional `match` is a case-sensitive substring filter; no match returns empty lists."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "language": { "type": "string", "description": "Language name as code.files / code.items report it, e.g. \"rust\" or \"java\"." },
+                "match": { "type": "string", "description": "Optional case-sensitive substring filter over kinds, fields and supertypes (a supertype also matches through a known subtype). Omitted or empty returns the full inventory." }
+            },
+            "required": ["language"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "nodeKinds".to_string()))
+    }
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let params: CodeNodeKindsParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.nodeKinds: {e}")),
+        };
+        bro_tools::tool::call_blocking(move || match facts::grammar_inventory(&params.language) {
+            Ok(inventory) => {
+                let view = inventory.filtered(params.pattern.as_deref().unwrap_or_default());
+                bounded_result(
+                    "code.nodeKinds",
+                    node_kinds_payload(&view),
+                    MAX_FACT_RESULT_BYTES,
+                    NODE_KINDS_NARROW,
+                )
+            }
+            Err(e) => err(format!("code.nodeKinds: {e:#}")),
+        })
+        .await
+    }
+}
+
+/// `code.describe`: on-demand `code.*` guidance, compiled into the harness
+/// (matches the analysis.describe / java.describe pattern).
+pub struct CodeDescribe;
+
+const QUERY_GUIDE: &str = include_str!("code_guides/query_generic.md");
+const QUERY_GUIDE_RUST: &str = include_str!("code_guides/query_rust.md");
+const QUERY_GUIDE_JAVA: &str = include_str!("code_guides/query_java.md");
+const DESCRIBE_TOPICS: &str = "query";
+
+#[derive(Deserialize)]
+struct CodeDescribeParams {
+    topic: String,
+    language: String,
+}
+
+fn query_guide(language: &str) -> String {
+    match language {
+        "rust" => format!("{QUERY_GUIDE}\n{QUERY_GUIDE_RUST}"),
+        "java" => format!("{QUERY_GUIDE}\n{QUERY_GUIDE_JAVA}"),
+        other => format!(
+            "{QUERY_GUIDE}\nNO DEDICATED GUIDE FOR {other}\n  Call code.nodeKinds({{ language: \"{other}\" }}) for its node kinds, supertypes\n  and fields, then test each pattern on a file where the construct is known\n  to exist before trusting an empty result.\n"
+        ),
+    }
+}
+
+#[async_trait]
+impl Tool for CodeDescribe {
+    fn name(&self) -> &str {
+        "code.describe"
+    }
+    fn description(&self) -> &str {
+        "Return on-demand guidance for the code namespace as { contract }. topic \"query\" returns the code.query authoring guide for a language: query syntax, named versus anonymous and supertype nodes, metadata limits, invalid-query versus empty-result semantics, batch limits, and executable shapes for Rust and Java (other supported languages get the generic guide plus a code.nodeKinds pointer)."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string", "enum": ["query"], "description": "Guidance topic. Only \"query\" exists." },
+                "language": { "type": "string", "description": "Language name as code.files / code.items report it, e.g. \"rust\" or \"java\"." }
+            },
+            "required": ["topic", "language"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "describe".to_string()))
+    }
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let params: CodeDescribeParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "code.describe: {e}; pass {{ topic: \"query\", language }} (topics: {DESCRIBE_TOPICS})"
+                ));
+            }
+        };
+        if params.topic != "query" {
+            return err(format!(
+                "code.describe: unknown topic `{}` (available: {DESCRIBE_TOPICS})",
+                params.topic
+            ));
+        }
+        let supported = facts::query_language_names();
+        if !supported.contains(&params.language.as_str()) {
+            return err(format!(
+                "code.describe: unsupported language `{}` (supported: {})",
+                params.language,
+                supported.join(", ")
+            ));
+        }
+        ToolResult::Json(json!({ "contract": query_guide(&params.language) }))
+    }
+}
+
 /// The `code.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
@@ -1116,6 +1284,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(CodeItems) as Arc<dyn Tool>,
         Arc::new(CodeFields) as Arc<dyn Tool>,
         Arc::new(CodeQuery) as Arc<dyn Tool>,
+        Arc::new(CodeNodeKinds) as Arc<dyn Tool>,
+        Arc::new(CodeDescribe) as Arc<dyn Tool>,
         Arc::new(CodeRead) as Arc<dyn Tool>,
         Arc::new(CodeReadLines) as Arc<dyn Tool>,
         Arc::new(CodeSignature) as Arc<dyn Tool>,
@@ -1124,12 +1294,23 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 }
 
 /// Hand-authored namespace documentation + TS declarations (cell-dsl §5.2):
-/// the cross-binding value type (`Span`) and the four signatures, curated
-/// rather than schema-rendered.
+/// a compact method index plus the query-authoring signpost; method recipes
+/// live in the declarations, query guidance behind `code.describe`.
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-            description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The eight methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. `code.items` carries Java `declaring_type` and `nested` facts; pass `top_level_only: true` to skip members declared inside nested Java types before the payload enters the isolate. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. For line ranges from analysis.methodRegions, use `code.readLines({ file, startLine, endLine })` to produce exact oldText and a hash-anchored span. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex; it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time: a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. Keep intermediate facts in cell variables or `store()`; `text()` only the derived result, not raw inventories. Cross-file work is ONE call deep: `code.files` output feeds `files:` of `code.items`/`code.query` and the host fans out, never a cell for-loop. The ten methods below are the complete `code` surface:
+- files: enumerate parseable source files (optional dir/language).
+- items: syntax-item inventory with Spans; `files:` batches page by next_offset; Java items carry declaring_type/nested, `top_level_only: true` drops nested-type members.
+- fields: Java field declarations (type/modifiers/annotations/owner); use it instead of hand-rolled field_declaration queries.
+- query: tree-sitter query with hash-anchored captures; \"find symbol X in the crate\" is `code.query({ files, query })`; batches are aggregate-capped.
+- nodeKinds: node kinds, anonymous tokens, supertypes and field names of a language's loaded grammar.
+- describe: on-demand guidance as { contract }; topic \"query\" is the query-authoring guide.
+- read: exact text of a Span (whole file: span 0..source_len with the inventory's content_sha256).
+- readLines: exact text plus a Span for a 1-based line range (analysis.methodRegions ranges -> oldText).
+- signature: callable signature at a Span; signature predicates are items -> filter callable kinds -> Promise.all(signature) -> branch on language/kind.
+- spanUnion: union same-file Spans into one covering Span.
+QUERY AUTHORING: before writing a `code.query` pattern, call `code.nodeKinds({ language })` for the valid vocabulary and `code.describe({ topic: \"query\", language })` for syntax, shapes and how an invalid query (an error) differs from a valid query that matched nothing (empty captures)."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; visibility?: string; declaring_type?: string; nested: boolean; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
@@ -1137,22 +1318,28 @@ type JavaFieldFact = { name: string; type: string; owner_class?: string; visibil
 type QueryCapture = { capture: string; kind: string; text: string; span: Span };
 type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
 type FileFields = { file: string; language: "java"; content_sha256: string; source_len: number; fields: JavaFieldFact[] };
+type GrammarSupertype = { kind: string; subtypes: string[] | null };
+type GrammarInventory = { language: string; node_kinds: string[]; anonymous_kinds: string[]; supertypes: GrammarSupertype[]; fields: string[]; provenance: "syntax_only" };
 type RustSignature = { language: "rust"; kind: "function_item"; name?: string; visibility?: string; is_async: boolean; params: { pattern: string; type?: string }[]; return_type?: string; generics?: string; span: Span; signature_span: Span; params_span?: Span };
 type JavaSignature = { language: "java"; kind: "method_declaration" | "constructor_declaration"; name?: string; visibility?: string; modifiers: string[]; annotations: string[]; params: { name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean; span: Span }[]; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; span: Span; signature_span: Span; params_span?: Span };
 declare const code: {
   /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
-  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. Java field declarations are NOT items: use code.fields. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
-  items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
+  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. Java field declarations are NOT items: use code.fields. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }) paged at 128 files / 1 MiB: continue with next_offset and the same files array. Over 2000 items or 512 KiB in one file is inventory_too_large: use a focused code.query. */
+  items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean; offset?: number }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[]; files_total: number; files_scanned: number; offset: number; next_offset: number | null; truncated: boolean; aggregate_capped: boolean }>;
   /** Inventory Java field declarations with type/modifiers/annotations/owner and hash-anchored declaration/name spans. Use this instead of raw field_declaration queries. */
   fields(args: { file: string; className?: string }): Promise<FileFields>;
-  /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */
+  /** Tree-sitter query; captures carry hash-anchored Spans. Author patterns from code.nodeKinds({ language }) vocabulary and the code.describe({ topic: "query", language }) guide. An invalid query (e.g. Invalid node type) is an error; a valid query that matches nothing returns captures: [], which does not prove the construct is absent. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint; narrow the query or the file set and re-run rather than widening blindly. */
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
-  /** Read the exact text of a Span; errors with stale_span on content drift. `truncated` is always false for successful reads; UI/tool display may still elide long text. */
+  /** Vocabulary of the grammar code.query compiles against, from runtime metadata. node_kinds are written (kind), anonymous_kinds quoted ("fn"), supertypes (kind) or (super/sub); subtypes null = the grammar has no subtype table (unknown, not empty). fields is the grammar-wide field list, not per-kind membership. match is a case-sensitive substring filter; no match returns empty lists. */
+  nodeKinds(args: { language: string; match?: string }): Promise<GrammarInventory>;
+  /** On-demand guidance. topic "query" returns the query-authoring guide: generic syntax and semantics plus executable Rust/Java shapes; other supported languages get the generic guide and a code.nodeKinds pointer. */
+  describe(args: { topic: "query"; language: string }): Promise<{ contract: string }>;
+  /** Read the exact text of a Span; errors with stale_span on content drift. Whole file: code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } }) with inv from code.items. `truncated` is always false for successful reads; UI/tool display may still elide long text. */
   read(args: { span: Span }): Promise<{ text: string; span: Span; byte_length: number; char_length: number; truncated: false }>;
   /** Read exact text by 1-based inclusive line range and return a hash-anchored Span. Use for methodRegions line ranges -> oldText. */
   readLines(args: { file: string; startLine: number; endLine: number }): Promise<{ text: string; span: Span; startLine: number; endLine: number; byte_length: number; char_length: number; truncated: false }>;
-  /** Language-shaped callable signature at/enclosing a Span. Rust returns function facts; Java returns method/constructor facts. `span` covers the whole item; `signature_span` covers the declaration header; `params_span` covers the raw parameter list for formatting checks. Errors with stale_span on drift. */
+  /** Language-shaped callable signature at/enclosing a Span. Rust returns function facts; Java returns method/constructor facts. `span` covers the whole item; `signature_span` covers the declaration header; `params_span` covers the raw parameter list; for Java formatting checks read it rather than the whole file or a raw regex. Errors with stale_span on drift. THE RECIPE for signature predicates ("public Rust fns returning Result", "Java constructors with multiline params"): code.items → filter callable kinds (function_item, method_declaration, constructor_declaration) → Promise.all(items.map(i => code.signature({ span: i.span }))) → branch on language/kind. */
   signature(args: { span: Span }): Promise<RustSignature | JavaSignature>;
   /** Union same-file Spans into one covering Span (pure; no I/O). */
   spanUnion(args: { spans: Span[] }): Promise<{ span: Span }>;
@@ -1963,5 +2150,441 @@ class Probe {
             .filter_map(|i| i["name"].as_str())
             .collect();
         assert!(names.contains(&"hello"), "names: {names:?}");
+    }
+
+    fn error_of(result: ToolResult) -> String {
+        match result {
+            ToolResult::Error(e) => e,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    fn strings(value: &Value) -> Vec<&str> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn node_kinds_reports_the_resolver_grammar_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_in(&dir.path().canonicalize().unwrap());
+        for (language, kinds, fields) in [
+            ("rust", &["function_item"][..], &["name"][..]),
+            (
+                "java",
+                &["method_declaration", "constructor_declaration"][..],
+                &["parameters"][..],
+            ),
+            // Supported, but no authored guide.
+            ("go", &["function_declaration"][..], &["name"][..]),
+        ] {
+            let out = json_of(
+                CodeNodeKinds
+                    .call(json!({ "language": language }), &cx)
+                    .await,
+            );
+            let expected = facts::grammar_inventory(language).unwrap();
+            assert_eq!(out, node_kinds_payload(&expected), "{language}");
+            assert_eq!(out["language"], language);
+            assert_eq!(out["provenance"], "syntax_only");
+            let node_kinds = strings(&out["node_kinds"]);
+            let out_fields = strings(&out["fields"]);
+            for kind in kinds {
+                assert!(node_kinds.contains(kind), "{language}: {kind}");
+            }
+            for field in fields {
+                assert!(out_fields.contains(field), "{language}: {field}");
+            }
+            for key in ["node_kinds", "anonymous_kinds", "fields"] {
+                let list = strings(&out[key]);
+                assert!(list.windows(2).all(|w| w[0] < w[1]), "{language}.{key}");
+            }
+            assert!(
+                !out["supertypes"].as_array().unwrap().is_empty(),
+                "{language}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn node_kinds_supertypes_keep_unknown_subtypes_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_in(&dir.path().canonicalize().unwrap());
+        // Rust ships subtype tables: known lists come back as arrays.
+        let rust = json_of(CodeNodeKinds.call(json!({ "language": "rust" }), &cx).await);
+        let expression = rust["supertypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["kind"] == "_expression")
+            .unwrap();
+        assert!(strings(&expression["subtypes"]).contains(&"binary_expression"));
+        // The ABI-14 Java fallback has no subtype table: null, not [].
+        let java = facts::grammar_inventory_for(
+            "java",
+            &bbox_chunker::code::bundled_ts_language_for_name("java").unwrap(),
+        );
+        let payload = node_kinds_payload(&java);
+        let statement = payload["supertypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["kind"] == "statement")
+            .unwrap();
+        assert_eq!(statement["subtypes"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn node_kinds_match_filters_without_changing_the_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_in(&dir.path().canonicalize().unwrap());
+        let full = json_of(CodeNodeKinds.call(json!({ "language": "rust" }), &cx).await);
+        let empty_match = json_of(
+            CodeNodeKinds
+                .call(json!({ "language": "rust", "match": "" }), &cx)
+                .await,
+        );
+        assert_eq!(full, empty_match);
+        let function = json_of(
+            CodeNodeKinds
+                .call(json!({ "language": "rust", "match": "function" }), &cx)
+                .await,
+        );
+        let kinds = strings(&function["node_kinds"]);
+        assert!(kinds.contains(&"function_item"), "{function}");
+        assert!(kinds.iter().all(|k| k.contains("function")), "{function}");
+        let none = json_of(
+            CodeNodeKinds
+                .call(json!({ "language": "rust", "match": "no_such_kind" }), &cx)
+                .await,
+        );
+        for key in ["node_kinds", "anonymous_kinds", "supertypes", "fields"] {
+            assert_eq!(none[key], json!([]), "{key}");
+        }
+        assert_eq!(none["language"], "rust");
+    }
+
+    #[tokio::test]
+    async fn node_kinds_rejects_bad_arguments_and_unsupported_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_in(&dir.path().canonicalize().unwrap());
+        let missing = error_of(CodeNodeKinds.call(json!({}), &cx).await);
+        assert!(missing.contains("missing field `language`"), "{missing}");
+        let wrong_type = error_of(CodeNodeKinds.call(json!({ "language": 7 }), &cx).await);
+        assert!(
+            wrong_type.contains("code.nodeKinds: invalid type"),
+            "{wrong_type}"
+        );
+        let bad_match = error_of(
+            CodeNodeKinds
+                .call(json!({ "language": "rust", "match": 3 }), &cx)
+                .await,
+        );
+        assert!(bad_match.contains("invalid type"), "{bad_match}");
+        let unsupported = error_of(
+            CodeNodeKinds
+                .call(json!({ "language": "klingon" }), &cx)
+                .await,
+        );
+        assert!(
+            unsupported.contains("unsupported language klingon"),
+            "{unsupported}"
+        );
+    }
+
+    #[test]
+    fn node_kinds_refuses_an_inventory_over_the_payload_budget() {
+        let inventory = facts::grammar_inventory("rust").unwrap();
+        let payload = node_kinds_payload(&inventory);
+        assert!(payload.to_string().len() < MAX_FACT_RESULT_BYTES);
+        let refused = error_of(bounded_result(
+            "code.nodeKinds",
+            payload,
+            1024,
+            NODE_KINDS_NARROW,
+        ));
+        assert!(refused.contains("exact_result_too_large"), "{refused}");
+        assert!(refused.contains("`match`"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn anonymous_kinds_are_quoted_query_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cx = cx_in(&root);
+        std::fs::write(root.join("ops.rs"), "fn f() -> u8 { 1 + 2 }\n").unwrap();
+        let inventory = json_of(CodeNodeKinds.call(json!({ "language": "rust" }), &cx).await);
+        assert!(strings(&inventory["anonymous_kinds"]).contains(&"+"));
+        assert!(strings(&inventory["anonymous_kinds"]).contains(&"fn"));
+        assert!(!strings(&inventory["node_kinds"]).contains(&"fn"));
+        let quoted = json_of(
+            CodeQuery
+                .call(json!({ "file": "ops.rs", "query": "(\"fn\") @kw (binary_expression operator: \"+\" @op)" }), &cx)
+                .await,
+        );
+        let texts: Vec<&str> = quoted["captures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["fn", "+"], "{quoted}");
+        // Written as a named node, an anonymous kind is not a valid node type.
+        let unquoted = error_of(
+            CodeQuery
+                .call(json!({ "file": "ops.rs", "query": "(fn) @kw" }), &cx)
+                .await,
+        );
+        assert!(unquoted.contains("Invalid node type"), "{unquoted}");
+    }
+
+    #[tokio::test]
+    async fn describe_returns_language_guides_and_rejects_bad_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_in(&dir.path().canonicalize().unwrap());
+        let contract = |out: Value| out["contract"].as_str().unwrap().to_string();
+        let rust = contract(json_of(
+            CodeDescribe
+                .call(json!({ "topic": "query", "language": "rust" }), &cx)
+                .await,
+        ));
+        assert!(rust.starts_with(QUERY_GUIDE) && rust.contains("RUST SHAPES"));
+        assert!(!rust.contains("JAVA SHAPES"));
+        let java = contract(json_of(
+            CodeDescribe
+                .call(json!({ "topic": "query", "language": "java" }), &cx)
+                .await,
+        ));
+        assert!(java.starts_with(QUERY_GUIDE) && java.contains("JAVA SHAPES"));
+        let go = contract(json_of(
+            CodeDescribe
+                .call(json!({ "topic": "query", "language": "go" }), &cx)
+                .await,
+        ));
+        assert!(go.starts_with(QUERY_GUIDE), "{go}");
+        assert!(go.contains("code.nodeKinds({ language: \"go\" })"), "{go}");
+        assert!(!go.contains("RUST SHAPES") && !go.contains("JAVA SHAPES"));
+        // The generic guide states the limits instead of overclaiming.
+        for needle in [
+            "not a per-kind table",
+            "Null means unknown",
+            "does not prove the construct is absent",
+            "within:",
+            "aggregate_capped",
+            "(MISSING)",
+        ] {
+            assert!(QUERY_GUIDE.contains(needle), "{needle}");
+        }
+
+        for (input, needle) in [
+            (
+                json!({ "topic": "bogus", "language": "rust" }),
+                "unknown topic `bogus` (available: query)",
+            ),
+            (json!({ "language": "rust" }), "missing field `topic`"),
+            (json!({ "topic": "query" }), "missing field `language`"),
+            (json!({ "topic": "query", "language": 7 }), "invalid type"),
+            (
+                json!({ "topic": "query", "language": "klingon" }),
+                "unsupported language `klingon`",
+            ),
+        ] {
+            let error = error_of(CodeDescribe.call(input.clone(), &cx).await);
+            assert!(
+                error.starts_with("code.describe: ") && error.contains(needle),
+                "{input}: {error}"
+            );
+        }
+    }
+
+    /// One executable guide example: a fenced query plus its fixture and
+    /// expected outcome.
+    struct GuideExample {
+        title: String,
+        query: String,
+        fixture: Option<String>,
+        expected: Result<Vec<String>, String>,
+    }
+
+    fn guide_examples(guide: &str, language: &str) -> Vec<GuideExample> {
+        let mut examples = Vec::new();
+        let mut title = String::new();
+        let mut fixture = None;
+        let mut lines = guide.lines();
+        while let Some(line) = lines.next() {
+            let block = |lines: &mut std::str::Lines| {
+                lines
+                    .by_ref()
+                    .take_while(|l| *l != "```")
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            if let Some(heading) = line.strip_prefix("### ") {
+                title = heading.to_string();
+                fixture = None;
+            } else if line == format!("```{language}") {
+                fixture = Some(block(&mut lines));
+            } else if line == "```query" || line == "```query-invalid" {
+                let query = block(&mut lines);
+                let outcome = lines.next().unwrap_or_default();
+                let expected = if line == "```query" {
+                    let captures = outcome
+                        .strip_prefix("Captures: ")
+                        .unwrap_or_else(|| panic!("{title}: missing Captures line"));
+                    Ok(if captures == "none" {
+                        Vec::new()
+                    } else {
+                        captures.split(", ").map(str::to_string).collect()
+                    })
+                } else {
+                    Err(outcome
+                        .strip_prefix("Error: ")
+                        .unwrap_or_else(|| panic!("{title}: missing Error line"))
+                        .to_string())
+                };
+                examples.push(GuideExample {
+                    title: title.clone(),
+                    query,
+                    fixture: fixture.take(),
+                    expected,
+                });
+            } else if line.starts_with("```") {
+                panic!("{title}: unrecognized fence {line}");
+            }
+        }
+        examples
+    }
+
+    #[tokio::test]
+    async fn every_shipped_guide_example_runs_against_its_fixture() {
+        assert!(
+            !QUERY_GUIDE.contains("```"),
+            "generic guide carries no examples"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cx = cx_in(&root);
+        for (language, ext, guide) in [
+            ("rust", "rs", QUERY_GUIDE_RUST),
+            ("java", "java", QUERY_GUIDE_JAVA),
+        ] {
+            let examples = guide_examples(guide, language);
+            let (mut matched, mut empty, mut invalid) = (0, 0, BTreeMap::new());
+            for (i, example) in examples.iter().enumerate() {
+                let file = format!("example_{i}.{ext}");
+                let source = example.fixture.clone().unwrap_or_default();
+                std::fs::write(root.join(&file), &source).unwrap();
+                let result = CodeQuery
+                    .call(json!({ "file": file, "query": example.query }), &cx)
+                    .await;
+                match &example.expected {
+                    Ok(expected) => {
+                        let out = match result {
+                            ToolResult::Json(out) => out,
+                            other => panic!("{language} {}: {other:?}", example.title),
+                        };
+                        let got: Vec<String> = out["captures"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{}={}",
+                                    c["capture"].as_str().unwrap(),
+                                    c["text"].as_str().unwrap()
+                                )
+                            })
+                            .collect();
+                        assert_eq!(&got, expected, "{language} {}", example.title);
+                        if expected.is_empty() {
+                            empty += 1;
+                        } else {
+                            matched += 1;
+                        }
+                    }
+                    Err(reason) => {
+                        let error = error_of(result);
+                        assert!(
+                            error.contains("invalid tree-sitter query")
+                                && error.contains(reason.as_str()),
+                            "{language} {}: {error}",
+                            example.title
+                        );
+                        *invalid.entry(reason.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            assert!(matched >= 5, "{language}: {matched} matching examples");
+            assert!(empty >= 1, "{language}: needs a valid-empty example");
+            for reason in [
+                "Invalid node type",
+                "Invalid field name",
+                "Impossible pattern",
+            ] {
+                assert!(
+                    invalid.contains_key(reason),
+                    "{language}: needs `{reason}` example"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_index_declarations_and_registration_agree() {
+        let description = namespace_description();
+        let tools = tools();
+        assert_eq!(tools.len(), 10);
+        assert!(
+            description
+                .description
+                .contains("The ten methods below are the complete `code` surface")
+        );
+        for tool in &tools {
+            let (namespace, method) = tool.namespace_binding().expect("cell-only binding");
+            assert_eq!(namespace, "code");
+            assert_eq!(tool.name(), format!("code.{method}"));
+            assert!(tool.annotations().read_only && !tool.annotations().destructive);
+            assert!(
+                description.description.contains(&format!("\n- {method}: ")),
+                "index line for {method}"
+            );
+            let declaration = description
+                .declarations
+                .lines()
+                .find(|line| line.starts_with(&format!("  {method}(")))
+                .unwrap_or_else(|| panic!("declaration for {method}"));
+            let schema = tool.input_schema();
+            for property in schema["properties"].as_object().unwrap().keys() {
+                assert!(
+                    declaration.contains(&format!("{property}?:"))
+                        || declaration.contains(&format!("{property}:")),
+                    "{method}: schema property `{property}` missing from declaration"
+                );
+            }
+            for required in schema["required"].as_array().into_iter().flatten() {
+                let required = required.as_str().unwrap();
+                assert!(
+                    declaration.contains(&format!("{required}:")),
+                    "{method}: required `{required}` must not be optional"
+                );
+            }
+        }
+        // The query signpost replaced inline query examples.
+        assert!(
+            description
+                .description
+                .contains("code.nodeKinds({ language })")
+        );
+        assert!(
+            !description
+                .description
+                .contains("(function_item (visibility_modifier))")
+        );
+        assert!(CodeQuery.description().contains("code.nodeKinds"));
+        assert!(CodeQuery.description().contains("code.describe"));
     }
 }
