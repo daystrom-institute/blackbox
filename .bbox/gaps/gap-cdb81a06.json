@@ -1,14 +1,24 @@
 {
   "id": "gap-cdb81a06",
-  "title": "Surface verdict instructions field never exposed to callers",
+  "title": "Per-surface instructions are not delivered to MCP clients at initialize",
   "gap_kind": "mcp_surface",
   "domain": "mcp-surfaces",
-  "wanted_capability": "Per-surface instructions (human-readable guidance) surfaced through MCP ServerInfo or similar so callers see the surface's declared intent",
+  "wanted_capability": "A client connecting on a named MCP surface receives that surface's declared instructions in the initialize result (ServerInfo.instructions), alongside the base server instructions, so the surface's intent is visible without calling a tool.",
+  "evidence": [
+    "src/server/surface.rs ToolSurfaceVerdict::ToolSurface.instructions is parsed from the routing packet",
+    "system-defaults/mcp-surfaces/routing.json defines instructions for readonly, agent_internal, interactive, ops, and default surfaces",
+    "src/server/handler.rs initialize resolves the surface entry but returns self.get_info(), whose instructions are a fixed server-wide string",
+    "src/tools/mcp_surface.rs surface_verdict_summary exposes the text only as a 200-char instructions_preview in bbox_mcp_surface output",
+    "design/surfaces/mcp/mcp-surfaces.md open question on where per-surface instructions are exposed"
+  ],
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "tooling/mcp-surfaces/instructions-not-surfaced",
-  "notes": "ToolSurfaceVerdict::ToolSurface carries an `instructions: Option<String>` field. The routing packet supports it, the evaluator preserves it, and the system-defaults packet defines instructions for each surface (e.g. readonly: \"Read-only surface for reviewers...\"). But the field is never read by any code path — the handler's initialize/surface_entry don't inject it into ServerInfo.instructions, and no consumer can access it. The open question from design/surfaces/mcp/mcp-surfaces.md (\"Should surface decisions include instructions, and if so where can RMCP expose per-surface instructions cleanly?\") was never resolved.",
-  "resolution": "unresolved",
+  "notes": "Triage trace: partially stale premise corrected. The field is now read by bbox_mcp_surface (instructions_preview, truncated), but initialize still returns fixed server instructions regardless of surface.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T16:39:04Z",
-  "updated_at": "2026-06-11T16:39:04Z"
+  "updated_at": "2026-09-24T09:32:38Z",
+  "resolved_at": "2026-09-24T09:32:38Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/78"
 }
