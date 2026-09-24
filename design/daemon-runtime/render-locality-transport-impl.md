@@ -190,11 +190,16 @@ older pending ones for the same project; superseded operations are no longer
 delivered or paged. Delivery redelivers an unacknowledged operation after the
 redelivery window. Plan pages recheck the producer grant on every page.
 
-The owner journals each operation durably before applying it and records the
-receipt before reporting it. A redelivered operation that already applied
-reports its recorded receipt without applying again, and an operation whose
-sequence is older than the newest one applied to that scope is refused
-without writing. The daemon records the owner's exact result; an identical
+The owner journals each operation's preflight record (every output's
+observed state and the local `PROJECT.md` fact) durably before its first
+write, and records the receipt before reporting it. A redelivered operation
+that already applied reports its recorded receipt without applying again. A
+redelivered operation that was interrupted after its preflight record is
+reconciled under the checkout lock without writing: an output holding the
+planned bytes is reported written, one still holding its preflight bytes as
+not published, and anything else as a conflict, so owner edits made since the
+interruption survive. An operation whose sequence is older than the newest
+one applied to that scope is refused without writing. The daemon records the owner's exact result; an identical
 duplicate is `already_settled`, a different one conflicts.
 
 The MCP call waits a bounded time. A pending operation returns its id and the
@@ -202,7 +207,10 @@ recovery arguments; `bbox_render(project, operation)` retrieves that
 operation's recorded outcome and never re-applies it. Completion is reported
 as current only when the owner and the rebuilt plan still match the issued
 plan and no newer operation exists for the project; otherwise the receipt is
-reported as stale or historical and no completion evidence is recorded. A
+reported as stale or historical and no completion evidence is recorded. The
+validation that held at completion is kept as history; present validity is
+rechecked on every response, so a receipt stops being current when knowledge
+or owner authority changes even if no newer render was issued. A
 fresh render with unchanged knowledge still starts a new operation, so it
 re-observes `PROJECT.md` and restores deleted generated outputs. Operation
 state survives daemon and collector restarts.
@@ -211,14 +219,26 @@ state survives daemon and collector restarts.
 
 An applier preflights every target before writing: a symlinked root, parent,
 or target, or a special file, refuses the whole render. Satellites publish
-before entrypoints. Each entrypoint stages in a unique sibling and is renamed
-into place only if the target still holds the bytes preflight observed;
-otherwise the owner's bytes are preserved and the receipt reports a conflict.
-A publication failure after preflight is reported per output as a partial
-render, and a receipt cannot claim an entrypoint published ahead of a failed
-satellite. Renders of one checkout, from the harness, the collector, or the
-daemon compatibility adapter, serialize on an advisory lock of the checkout
-root directory.
+before entrypoints. An entrypoint that already holds the planned bytes is
+re-observed before it is reported written. Otherwise the output stages in a
+unique sibling, the current target is moved aside, and the staged output is
+published without clobbering only if the moved bytes are exactly the bytes
+preflight observed; owner bytes written at any point are restored or kept
+beside the target and the receipt reports a conflict. A publication failure
+after preflight is reported per output as a partial render, a failure that
+may follow an effect (such as the directory sync) marks the receipt
+incomplete, and only failures before the first write are reported as having
+written nothing. A receipt cannot claim an entrypoint published ahead of a
+failed satellite.
+
+Renders of one checkout, from the harness, the collector, or the daemon
+compatibility adapter, serialize on an advisory lock of the checkout root
+directory. Under that lock a freshness fence compares the plan's daemon-clock
+issuance (the producer authority's, the workspace plan's first chunk, or the
+compatibility adapter's render instant) with the newest issuance already
+applied to the checkout, recorded in ignored `.bbox/local` state. An older
+plan is refused before any write, so a delayed applier never replaces output
+that a newer render produced, whichever applier produced it.
 
 ### RL-D9: both upgrade directions stay compatible
 
@@ -227,7 +247,9 @@ proves the capability by polling the render lane; one that never polls it is
 never offered a `render_project` command, and the enroll command encoding is
 unchanged. A new collector that finds no render lane on an older daemon backs
 off and keeps enrolling and publishing. Workspace plans serialize without the
-producer field, so bound harness transport bytes are unchanged.
+producer field, so their plan bytes are unchanged; the first plan chunk gains
+an optional issuance that older harnesses ignore and newer ones pass to the
+fence.
 
 ## 3. Compatibility and parity
 
