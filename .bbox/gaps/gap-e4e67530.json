@@ -15,11 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edge-index-watcher/sidecar-read-latch-stuck",
   "notes": "Triage trace: the guard has been an RAII Drop guard since before this gap was filed, so a set-without-release path is not the mechanism. The traced cause is guard scope: every watcher pass, including store-only nudge deferrals, holds it. Whether that alone explains the originally observed 10+ minute refusal window is not proven.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-21347ce5",
   "created_at": "2026-08-14T04:39:18Z",
-  "updated_at": "2026-09-24T02:04:26Z",
-  "resolved_at": "2026-09-24T02:04:26Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/43"
+  "updated_at": "2026-09-24T15:21:17Z",
+  "resolved_at": "2026-09-24T15:21:17Z",
+  "resolution_note": "implemented in PR #84, commit 0221a953ce29c6cc5ef975bc396aac05d1728556"
 }
