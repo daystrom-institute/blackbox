@@ -411,6 +411,7 @@ pub(crate) async fn execute_render_operation(
                     let sequence = operation.sequence;
                     let plan_sha256 = operation.plan_sha256.clone();
                     let hook_journal = journal_path.to_path_buf();
+                    let reconciling = interrupted.is_some();
                     let executed = tokio::task::spawn_blocking(move || {
                         let authority = ExpectedRenderAuthority::Producer {
                             operation_id: &operation_id,
@@ -456,6 +457,14 @@ pub(crate) async fn execute_render_operation(
                     .context("render execution task failed")?;
                     match executed {
                         Ok(execution) => Ok(execution.receipt),
+                        Err(error) if reconciling => {
+                            // An interrupted application may already have
+                            // written outputs. Keep its preflight record and
+                            // retry on redelivery rather than reporting a
+                            // result that claims nothing was written.
+                            return Err(error
+                                .context("reconciling an interrupted render; it stays pending"));
+                        }
                         Err(error) if format!("{error:#}").contains("error.render_busy") => {
                             // Another applier holds the checkout; retry on
                             // redelivery.

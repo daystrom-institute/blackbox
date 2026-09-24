@@ -753,6 +753,54 @@ async fn a_partial_owner_render_is_reported_as_partial() {
     assert_eq!(recovered["dispositions"]["failed"], 1);
 }
 
+/// An owner that wrote every output but could not confirm completion
+/// reports an incomplete receipt. It is surfaced as partial and is never
+/// recorded as completion evidence for the cutover gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_all_written_receipt_is_never_completion_evidence() {
+    let owner = OwnerFixture::new();
+    let server = owner.server();
+    server
+        .state
+        .render_operations
+        .set_wait_timeout_for_test(Duration::from_millis(20));
+    announce(&server, owner.roots.keys().cloned().collect());
+    let pending = parse(
+        &server
+            .bbox_render(Parameters(project_params(UNCOVERED)))
+            .await,
+    );
+    let operation_id = pending["operation_id"].as_str().unwrap().to_string();
+    let (_, receipt) = apply_one(&server, &owner.roots, |receipt| {
+        receipt.incomplete = true;
+    })
+    .unwrap();
+    assert!(
+        receipt
+            .projections
+            .iter()
+            .all(|projection| projection.disposition == ProjectRenderDispositionV1::Written)
+    );
+    let recovered = parse(
+        &server
+            .bbox_render(Parameters(RenderParams {
+                operation: Some(operation_id),
+                project: Some(UNCOVERED.into()),
+                ..Default::default()
+            }))
+            .await,
+    );
+    assert_eq!(recovered["status"], "render_partial");
+    assert!(
+        server
+            .state
+            .render_locality_observations
+            .snapshot()
+            .completions
+            .is_empty()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_rechecks_present_validity_of_a_validated_receipt() {
     let owner = OwnerFixture::new();

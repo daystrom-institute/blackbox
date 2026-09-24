@@ -198,8 +198,11 @@ redelivered operation that was interrupted after its preflight record is
 reconciled under the checkout lock without writing: an output holding the
 planned bytes is reported written, one still holding its preflight bytes as
 not published, and anything else as a conflict, so owner edits made since the
-interruption survive. An operation whose sequence is older than the newest
-one applied to that scope is refused without writing. The daemon records the owner's exact result; an identical
+interruption survive. An output that cannot be inspected is reported as a
+conflict and the receipt is incomplete; a reconciliation that cannot run at
+all leaves the operation pending for redelivery. Neither is ever reported as
+an application that wrote nothing. An operation whose sequence is older than
+the newest one applied to that scope is refused without writing. The daemon records the owner's exact result; an identical
 duplicate is `already_settled`, a different one conflicts.
 
 The MCP call waits a bounded time. A pending operation returns its id and the
@@ -210,7 +213,9 @@ plan and no newer operation exists for the project; otherwise the receipt is
 reported as stale or historical and no completion evidence is recorded. The
 validation that held at completion is kept as history; present validity is
 rechecked on every response, so a receipt stops being current when knowledge
-or owner authority changes even if no newer render was issued. A
+or owner authority changes even if no newer render was issued. An incomplete
+receipt, from either applier, is accepted but never recorded as completion
+evidence, so it cannot satisfy the cutover gate. A
 fresh render with unchanged knowledge still starts a new operation, so it
 re-observes `PROJECT.md` and restores deleted generated outputs. Operation
 state survives daemon and collector restarts.
@@ -224,7 +229,9 @@ re-observed before it is reported written. Otherwise the output stages in a
 unique sibling, the current target is moved aside, and the staged output is
 published without clobbering only if the moved bytes are exactly the bytes
 preflight observed; owner bytes written at any point are restored or kept
-beside the target and the receipt reports a conflict. A publication failure
+beside the target and the receipt reports a conflict. The moved-aside file is
+deleted only once it is proven to hold the observed old projection; every
+error or uncertain exit restores it or leaves it under its sibling name. A publication failure
 after preflight is reported per output as a partial render, a failure that
 may follow an effect (such as the directory sync) marks the receipt
 incomplete, and only failures before the first write are reported as having
@@ -237,8 +244,10 @@ directory. Under that lock a freshness fence compares the plan's daemon-clock
 issuance (the producer authority's, the workspace plan's first chunk, or the
 compatibility adapter's render instant) with the newest issuance already
 applied to the checkout, recorded in ignored `.bbox/local` state. An older
-plan is refused before any write, so a delayed applier never replaces output
-that a newer render produced, whichever applier produced it.
+plan is refused before any write, and an application advances the fence
+durably before its first output write, so a delayed applier never replaces
+output that a newer render produced, whichever applier produced it and even
+if that render was interrupted.
 
 ### RL-D9: both upgrade directions stay compatible
 

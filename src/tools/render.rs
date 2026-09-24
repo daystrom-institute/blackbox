@@ -222,12 +222,15 @@ impl BlackboxServer {
                         );
                     }
                     receipt.validate_against(&current)?;
-                    server
+                    // An incomplete receipt is accepted but never recorded
+                    // as completion evidence.
+                    let recorded = server
                         .state
                         .render_locality_observations
                         .record_completed(&current, &receipt)?;
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
+                        "evidence_recorded": recorded.is_some(),
                         "diagnostics": current.diagnostics,
                     }))?);
                 }
@@ -1420,6 +1423,7 @@ mod catalog_render_tests {
         .await;
         let plan = fetched.plan;
         let plan_sha256 = fetched.plan_sha256;
+        let fetched_plan_sha256 = plan_sha256.clone();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.view, ProjectRenderViewV1::Published);
         assert_eq!(
@@ -1463,6 +1467,46 @@ mod catalog_render_tests {
         let observations = server.state.render_locality_observations.snapshot();
         assert_eq!(observations.completions.len(), 1);
         assert_eq!(observations.completions[0].project_id, PROJECT);
+        let recorded_sequence = observations.sequence;
+
+        // An incomplete receipt from the bound harness is accepted but never
+        // becomes completion evidence, even with every output written.
+        let incomplete = bbox_knowledge::knowledge::execute_project_render_plan(
+            &plan,
+            &local_root,
+            &scope,
+            workspace_id.as_str(),
+        )
+        .unwrap()
+        .receipt;
+        let mut incomplete = incomplete;
+        incomplete.incomplete = true;
+        let completed = server
+            .bbox_render(Parameters(RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                global_plan: None,
+                provisional: Some("published".into()),
+                operation: None,
+                scope_project: None,
+                locality: Some(ProjectRenderLocalityRequestV1::Complete {
+                    plan_sha256: fetched_plan_sha256,
+                    receipt: incomplete,
+                }),
+            }))
+            .await;
+        assert!(!is_error(&completed), "{}", text(&completed));
+        assert!(text(&completed).contains("\"evidence_recorded\": false"));
+        assert_eq!(
+            server
+                .state
+                .render_locality_observations
+                .snapshot()
+                .sequence,
+            recorded_sequence
+        );
         assert_eq!(
             observations.completions[0].view,
             ProjectRenderViewV1::Published

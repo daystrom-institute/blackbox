@@ -12,12 +12,16 @@
 //!   daemon compatibility adapter all take.
 //! - Under that lock a freshness fence refuses a plan issued before the plan
 //!   that last wrote this checkout, so a delayed applier never replaces newer
-//!   output with an older projection.
+//!   output with an older projection. An application advances the fence
+//!   durably before its first output write, so an interrupted newer render
+//!   still fences older plans.
 //! - Satellites publish before entrypoints. An entrypoint is staged in a unique
 //!   sibling; the current target is moved aside and published over only if the
 //!   moved bytes are exactly the bytes preflight observed. Otherwise the
 //!   owner's bytes are restored (or retained beside the target) and the output
-//!   is reported as a conflict.
+//!   is reported as a conflict. The moved-aside file is deleted only after it
+//!   is proven to hold the observed old projection; every error path restores
+//!   it or leaves it under its sibling name.
 //! - A failure after any output was published is reported in the receipt as
 //!   an incomplete render, never as a render that wrote nothing.
 
@@ -147,7 +151,8 @@ pub struct ApplyOptions<'a> {
     pub dry_run: bool,
     /// Daemon-clock issuance of the plan being applied. When present, a plan
     /// issued before the newest one already applied to this checkout is
-    /// refused before any write, and the fence advances after writes.
+    /// refused before any write, and the fence advances before the first
+    /// output write.
     pub issued_at_ms: Option<u64>,
     /// Runs after preflight and before the first write. An error aborts the
     /// application with nothing written.
@@ -401,6 +406,12 @@ pub fn apply_project_render(
     if let Some(before_publish) = options.before_publish {
         before_publish(&observations).context("recording the render preflight")?;
     }
+    // The freshness barrier is durable before any output changes, so an
+    // older plan stays refused even if this application is interrupted
+    // after its first publication.
+    if let Some(issued_at_ms) = options.issued_at_ms {
+        advance_fence(root, issued_at_ms).context("advancing the render fence")?;
+    }
 
     if let Err(error) = bbox_util::guidance::publish_files(&bbox_root, satellites, false) {
         outcome.satellites = vec![ProjectRenderDispositionV1::Failed; satellites.len()];
@@ -461,14 +472,6 @@ pub fn apply_project_render(
             outcome
                 .errors
                 .push(format!("published outputs may not be durable: {error:#}"));
-        }
-    }
-    if published && let Some(issued_at_ms) = options.issued_at_ms {
-        if let Err(error) = advance_fence(root, issued_at_ms) {
-            outcome.incomplete = true;
-            outcome
-                .errors
-                .push(format!("the render fence did not advance: {error:#}"));
         }
     }
     Ok(outcome)
@@ -549,27 +552,45 @@ fn publish_entrypoint(
     let aside = match observed {
         TargetState::Absent => None,
         TargetState::Generated(_) => {
+            // The reserved name is kept as a plain path: from the rename on,
+            // it may hold the only copy of the owner's file, and nothing
+            // deletes it implicitly.
             let aside = tempfile::Builder::new()
                 .prefix(&format!(".{file_name}."))
                 .suffix(".render-prev")
                 .tempfile_in(root)
                 .context("reserving the previous-output sibling")?
-                .into_temp_path();
+                .into_temp_path()
+                .keep()
+                .context("reserving the previous-output sibling")?;
             match fs::rename(&target, &aside) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // The owner removed the file after preflight.
-                    return Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Conflict));
-                }
                 Err(error) => {
+                    let _ = fs::remove_file(&aside);
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        // The owner removed the file after preflight.
+                        return Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Conflict));
+                    }
                     return Err(error).context("moving the previous output aside");
                 }
             }
-            let moved = classify(&fs::read(&aside).context("reading the previous output")?);
-            if moved != *observed {
-                return restore_aside(aside, &target);
+            #[cfg(test)]
+            if let Err(error) = tests::interleave("after_move_aside", root) {
+                return Err(restore_or_retain(&aside, &target, error));
             }
-            Some(aside)
+            match fs::read(&aside) {
+                Err(error) => {
+                    return Err(restore_or_retain(
+                        &aside,
+                        &target,
+                        anyhow::Error::new(error).context("reading the previous output"),
+                    ));
+                }
+                Ok(bytes) if classify(&bytes) != *observed => {
+                    return restore_aside(&aside, &target);
+                }
+                Ok(_) => Some(aside),
+            }
         }
         TargetState::Handwritten(_) => {
             return Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Refused));
@@ -581,31 +602,52 @@ fn publish_entrypoint(
         Ok(_) => {}
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Something created the path after it was vacated or observed
-            // absent. Keep it; the moved-aside bytes were the old projection.
-            return Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Conflict));
+            // absent. Keep it, and keep the moved bytes too unless they are
+            // provably the old projection.
+            let retained = aside.and_then(|aside| dispose_or_retain(aside, observed));
+            return Ok(PublishedOutput {
+                disposition: ProjectRenderDispositionV1::Conflict,
+                retained,
+            });
         }
         Err(error) => {
-            if let Some(aside) = aside {
-                let _ = restore_aside(aside, &target);
-            }
-            return Err(error.error).context("publishing the project render output");
+            let error =
+                anyhow::Error::new(error.error).context("publishing the project render output");
+            return Err(match aside {
+                Some(aside) => restore_or_retain(&aside, &target, error),
+                None => error,
+            });
         }
     }
     if let Some(aside) = aside {
         // A writer that still held the old file open may have changed it
         // after the check; never discard such bytes.
-        let moved = classify(&fs::read(&aside).context("rereading the previous output")?);
-        if moved != *observed {
-            let kept = aside
-                .keep()
-                .context("retaining the owner's concurrent bytes")?;
+        if let Some(retained) = dispose_or_retain(aside, observed) {
             return Ok(PublishedOutput {
                 disposition: ProjectRenderDispositionV1::Conflict,
-                retained: Some(kept),
+                retained: Some(retained),
             });
         }
     }
     Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Written))
+}
+
+/// Delete moved-aside bytes only when they are provably the observed old
+/// projection; otherwise keep them and return where they are.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
+)]
+fn dispose_or_retain(aside: PathBuf, observed: &TargetState) -> Option<PathBuf> {
+    match fs::read(&aside) {
+        Ok(bytes) if classify(&bytes) == *observed => {
+            // Leftover bytes of a stale projection are harmless if this
+            // cleanup fails.
+            let _ = fs::remove_file(&aside);
+            None
+        }
+        _ => Some(aside),
+    }
 }
 
 /// Put the owner's moved-aside bytes back at `target`. If the path was
@@ -614,27 +656,40 @@ fn publish_entrypoint(
     clippy::disallowed_methods,
     reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
 )]
-fn restore_aside(aside: tempfile::TempPath, target: &Path) -> Result<PublishedOutput> {
-    match fs::hard_link(&aside, target) {
-        Ok(()) => Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Conflict)),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let kept = aside
-                .keep()
-                .context("retaining the owner's concurrent bytes")?;
-            Ok(PublishedOutput {
-                disposition: ProjectRenderDispositionV1::Conflict,
-                retained: Some(kept),
-            })
+fn restore_aside(aside: &Path, target: &Path) -> Result<PublishedOutput> {
+    match fs::hard_link(aside, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(aside);
+            Ok(PublishedOutput::plain(ProjectRenderDispositionV1::Conflict))
         }
-        Err(error) => {
-            let kept = aside
-                .keep()
-                .context("retaining the owner's concurrent bytes")?;
-            Err(error).context(format!(
-                "restoring the owner's bytes; they remain at {}",
-                kept.display()
-            ))
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(PublishedOutput {
+            disposition: ProjectRenderDispositionV1::Conflict,
+            retained: Some(aside.to_path_buf()),
+        }),
+        Err(error) => Err(error).context(format!(
+            "restoring the owner's bytes; they remain at {}",
+            aside.display()
+        )),
+    }
+}
+
+/// On an error after the move-aside, put the original back when the path is
+/// still free, and otherwise leave it under its sibling name. The returned
+/// error says where the original is.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous renderer IO; daemon callers run on the blocking pool and owner callers are synchronous"
+)]
+fn restore_or_retain(aside: &Path, target: &Path, error: anyhow::Error) -> anyhow::Error {
+    match fs::hard_link(aside, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(aside);
+            error.context("the previous output was restored in place")
         }
+        Err(_) => error.context(format!(
+            "the previous output is preserved at {}",
+            aside.display()
+        )),
     }
 }
 
@@ -814,7 +869,8 @@ pub fn execute_project_render_plan_with(
 }
 
 /// Reconcile an application that recorded its preflight but was interrupted
-/// before recording its result. Nothing is written: each output is reported
+/// before recording its result. The interrupted application already advanced
+/// the freshness fence before its first write. Nothing is written: each output is reported
 /// as published when it holds the planned bytes, as not published when it
 /// still holds the preflight bytes, and as a conflict when it holds anything
 /// else, so owner edits made since the interruption are never replaced.
@@ -838,16 +894,37 @@ pub fn reconcile_interrupted_render(
     let _lock = lock_checkout_for_render(&root, lock_timeout)?;
     let outputs = plan.expected_outputs(record.project_doc_nonempty)?;
     let (mut projections, contents): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
+    // An output that cannot be inspected is neither proven published nor
+    // proven untouched: it is reported unconfirmed and the receipt is
+    // incomplete, never a result that claims nothing was written.
+    let mut incomplete = false;
+    let mut errors = vec![
+        "the previous application was interrupted; outputs were reconciled without writing"
+            .to_string(),
+    ];
     let mut satellites_published = true;
     for projection in projections
         .iter_mut()
         .filter(|projection| projection.file_name.starts_with(".bbox/guidance/"))
     {
         let path = root.join(&projection.file_name);
-        let present = fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
-            && fs::read(&path).is_ok_and(|bytes| {
-                Some(hex(&Sha256::digest(&bytes))) == projection.projection_sha256
-            });
+        let present = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => match fs::read(&path) {
+                Ok(bytes) => Some(hex(&Sha256::digest(&bytes))) == projection.projection_sha256,
+                Err(error) => {
+                    incomplete = true;
+                    errors.push(format!("{}: {error}", projection.file_name));
+                    false
+                }
+            },
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                incomplete = true;
+                errors.push(format!("{}: {error}", projection.file_name));
+                false
+            }
+        };
         projection.disposition = if present {
             ProjectRenderDispositionV1::Written
         } else {
@@ -855,7 +932,6 @@ pub fn reconcile_interrupted_render(
             ProjectRenderDispositionV1::Failed
         };
     }
-    let mut any_written = false;
     for projection in projections
         .iter_mut()
         .filter(|projection| !projection.file_name.starts_with(".bbox/guidance/"))
@@ -864,38 +940,42 @@ pub fn reconcile_interrupted_render(
             projection.disposition = ProjectRenderDispositionV1::Skipped;
             continue;
         }
-        let preflight = record
+        let Some(preflight) = record
             .outputs
             .iter()
             .find(|observation| observation.file_name == projection.file_name)
             .map(|observation| &observation.state)
-            .context("the preflight record does not cover a planned output")?;
+        else {
+            incomplete = true;
+            errors.push(format!(
+                "{}: the preflight record does not cover this output",
+                projection.file_name
+            ));
+            projection.disposition = ProjectRenderDispositionV1::Conflict;
+            continue;
+        };
         if matches!(preflight, ObservedOutputState::Handwritten { .. }) {
             projection.disposition = ProjectRenderDispositionV1::Refused;
             continue;
         }
-        let current = observe_target(&root.join(&projection.file_name))?.observation();
+        let current = match observe_target(&root.join(&projection.file_name)) {
+            Ok(current) => current.observation(),
+            Err(error) => {
+                incomplete = true;
+                errors.push(format!("{}: {error:#}", projection.file_name));
+                projection.disposition = ProjectRenderDispositionV1::Conflict;
+                continue;
+            }
+        };
         let planned = matches!(&current, ObservedOutputState::Generated { sha256 }
             if Some(sha256) == projection.projection_sha256.as_ref());
         projection.disposition = if planned && satellites_published {
-            any_written = true;
             ProjectRenderDispositionV1::Written
         } else if &current == preflight {
             ProjectRenderDispositionV1::Failed
         } else {
             ProjectRenderDispositionV1::Conflict
         };
-    }
-    let mut errors = vec![
-        "the previous application was interrupted; outputs were reconciled without writing"
-            .to_string(),
-    ];
-    let mut incomplete = false;
-    if any_written && let Some(issued_at_ms) = record.issued_at_ms {
-        if let Err(error) = advance_fence(&root, issued_at_ms) {
-            incomplete = true;
-            errors.push(format!("the render fence did not advance: {error:#}"));
-        }
     }
     let receipt = ProjectRenderReceiptV1 {
         version: PROJECT_RENDER_TRANSPORT_VERSION,

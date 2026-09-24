@@ -83,13 +83,22 @@ impl RenderLocalityObservationsV1 {
     /// Persist one completion only after the daemon has independently
     /// reconstructed the current plan and validated every projection hash in
     /// the checkout owner's receipt.
+    ///
+    /// An incomplete receipt (an output may have been written but the owner
+    /// could not confirm the application) is never completion evidence,
+    /// whatever its dispositions say, so it is not recorded and returns
+    /// `None`. Both the bound harness and the checkout-owner collector
+    /// complete through this boundary.
     pub fn record_completed(
         &self,
         plan: &ProjectRenderPlanV1,
         receipt: &ProjectRenderReceiptV1,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         plan.validate()?;
         receipt.validate_against(plan)?;
+        if receipt.incomplete {
+            return Ok(None);
+        }
         let receipt_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(receipt)?));
         let written_count = receipt
             .projections
@@ -133,6 +142,7 @@ impl RenderLocalityObservationsV1 {
             }
             Ok(snapshot.sequence)
         })
+        .map(Some)
     }
 
     fn mutate(
@@ -325,6 +335,16 @@ mod tests {
                 .record_completed(&plan, &receipt(&plan))
                 .unwrap();
         }
+
+        // An incomplete receipt that reports every provider written is not
+        // completion evidence.
+        let plan = plan(ProjectRenderViewV1::Published);
+        let mut incomplete = receipt(&plan);
+        incomplete.incomplete = true;
+        assert_eq!(
+            observations.record_completed(&plan, &incomplete).unwrap(),
+            None
+        );
 
         let reopened = RenderLocalityObservationsV1::open(&path)
             .unwrap()
