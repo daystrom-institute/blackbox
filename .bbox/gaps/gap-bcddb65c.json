@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/build/forge-ingress-omits-bbox-build",
   "notes": "Observed while preparing the native session browsing image on 2026-09-10. Any shared network policy repair requires operator approval; this task only uses the per-run public-origin parameter.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-10T18:05:18Z",
-  "updated_at": "2026-09-10T18:05:18Z"
+  "updated_at": "2026-09-24T10:02:16Z",
+  "resolved_at": "2026-09-24T10:02:16Z",
+  "resolution_note": "obsolete: the build namespace now reaches the Forgejo mirror through the default git-url (the VIP NodePort mirror address set in the cage build workflow templates). On 2026-09-24, bbox-verify and bbox-base-regen workflows in the same namespace, using the default git-url with a mandatory git fetch, succeeded repeatedly (for example bbox-verify-g24m2). build-bbox-image uses the identical default and fetch step. The build workflow and ingress policy are operator deployment infrastructure outside the blackbox repo, so any recurrence belongs to that infrastructure rather than a blackbox code issue."
 }
