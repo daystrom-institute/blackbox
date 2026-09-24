@@ -413,12 +413,12 @@ pub(crate) async fn execute_render_operation(
                     let plan_sha256 = operation.plan_sha256.clone();
                     let hook_journal = journal_path.to_path_buf();
                     let reconciling = interrupted.is_some();
-                    let executed = tokio::task::spawn_blocking(move || {
+                    let (executed, preflight_journaled) = tokio::task::spawn_blocking(move || {
                         let authority = ExpectedRenderAuthority::Producer {
                             operation_id: &operation_id,
                         };
                         if let Some(record) = interrupted {
-                            return reconcile_interrupted_render(
+                            let reconciled = reconcile_interrupted_render(
                                 &plan,
                                 &root,
                                 &scope,
@@ -426,7 +426,9 @@ pub(crate) async fn execute_render_operation(
                                 &record,
                                 RENDER_LOCK_TIMEOUT,
                             );
+                            return (reconciled, true);
                         }
+                        let mut preflight_journaled = false;
                         // The preflight is durable before the first write.
                         let mut journal_preflight = |record: &PreflightRecord| -> Result<()> {
                             let mut journal = load_journal(&hook_journal)?;
@@ -440,9 +442,13 @@ pub(crate) async fn execute_render_operation(
                                 error: None,
                                 preflight: Some(record.clone()),
                             });
-                            save_journal(&hook_journal, &journal)
+                            save_journal(&hook_journal, &journal)?;
+                            preflight_journaled = true;
+                            #[cfg(test)]
+                            tests::after_preflight(&hook_journal)?;
+                            Ok(())
                         };
-                        execute_project_render_plan_with(
+                        let executed = execute_project_render_plan_with(
                             &plan,
                             &root,
                             &scope,
@@ -452,7 +458,8 @@ pub(crate) async fn execute_render_operation(
                                 issued_at_ms: None,
                                 before_publish: Some(&mut journal_preflight),
                             },
-                        )
+                        );
+                        (executed, preflight_journaled)
                     })
                     .await
                     .context("render execution task failed")?;
@@ -466,13 +473,23 @@ pub(crate) async fn execute_render_operation(
                             return Err(error
                                 .context("reconciling an interrupted render; it stays pending"));
                         }
+                        Err(error) if preflight_journaled => {
+                            // Once the preflight is journaled, outputs may
+                            // have been written. The preflight stays and the
+                            // operation stays pending; redelivery reconciles
+                            // it into a receipt instead of a result that
+                            // claims nothing was written.
+                            return Err(error.context(
+                                "the render failed after its preflight was recorded; it stays pending and is reconciled on redelivery",
+                            ));
+                        }
                         Err(error) if format!("{error:#}").contains("error.render_busy") => {
                             // Another applier holds the checkout; retry on
                             // redelivery.
                             return Err(error);
                         }
-                        // Execution errors all precede the first write; a
-                        // failure after it is carried in the receipt.
+                        // Every remaining error precedes the preflight, so
+                        // nothing was written.
                         Err(error) => {
                             let message = format!("{error:#}");
                             let code = if message.contains("error.render_superseded") {
@@ -573,7 +590,7 @@ mod tests {
     };
     use bbox_project_render::transport::{
         PROJECT_RENDER_TRANSPORT_SCOPE, ProjectRenderProducerAuthorityV1, ProjectRenderViewV1,
-        format_render_operation_id, transport_chunk_of,
+        format_render_operation_id, iso_from_unix_ms, transport_chunk_of,
     };
     use bbox_project_render::wire::RENDER_PROJECT_COMMAND_KIND;
     use std::sync::Mutex;
@@ -584,6 +601,22 @@ mod tests {
     /// journaled, scoped to one test's journal.
     pub(super) fn crash_before_result(journal_path: &Path) -> bool {
         CRASH_BEFORE_RESULT.lock().unwrap().as_deref() == Some(journal_path)
+    }
+
+    type PreflightHook = fn() -> Result<()>;
+
+    static AFTER_PREFLIGHT: Mutex<Option<(PathBuf, PreflightHook)>> = Mutex::new(None);
+
+    /// Runs a test's hook after the preflight is journaled and before the
+    /// first write, scoped to one test's journal.
+    pub(super) fn after_preflight(journal_path: &Path) -> Result<()> {
+        let hook = AFTER_PREFLIGHT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(path, _)| path == journal_path)
+            .map(|(_, hook)| *hook);
+        hook.map_or(Ok(()), |hook| hook())
     }
 
     #[derive(Default)]
@@ -738,8 +771,19 @@ mod tests {
         sequence: u64,
         content: &str,
     ) -> RenderOperationDeliveryV1 {
+        operation_with(daemon, scope, number, sequence, content, |_| {})
+    }
+
+    fn operation_with(
+        daemon: &Shared,
+        scope: &PublishedScope,
+        number: u128,
+        sequence: u64,
+        content: &str,
+        edit: impl FnOnce(&mut ProjectRenderPlanV1),
+    ) -> RenderOperationDeliveryV1 {
         let operation_id = format_render_operation_id(number);
-        let plan = ProjectRenderPlanV1 {
+        let mut plan = ProjectRenderPlanV1 {
             version: PROJECT_RENDER_TRANSPORT_VERSION,
             project_id: "p_collector_render".into(),
             scope: scope.clone(),
@@ -785,6 +829,7 @@ mod tests {
             }],
             diagnostics: None,
         };
+        edit(&mut plan);
         let (bytes, plan_sha256) = plan.transport_bytes_and_sha256().unwrap();
         let delivery = RenderOperationDeliveryV1 {
             operation_id: operation_id.clone(),
@@ -841,6 +886,102 @@ mod tests {
             receipt.producer.as_ref().unwrap().operation_id,
             format_render_operation_id(1)
         );
+        server.abort();
+    }
+
+    static EXPIRES_AT: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Holds the render between projection and receipt validation until the
+    /// wall clock is past the plan entry's expiry.
+    fn wait_past_expiry() -> Result<()> {
+        let expires_at = EXPIRES_AT.lock().unwrap().clone().unwrap();
+        while iso_from_unix_ms(bbox_project_render::execute::now_unix_ms()) <= expires_at {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_entry_expiring_after_projection_still_completes_as_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        // The entry is live at issuance and expires while the owner applies.
+        let issued_at_ms = bbox_project_render::execute::now_unix_ms();
+        let expires_at = iso_from_unix_ms(issued_at_ms);
+        let expiring = expires_at.clone();
+        operation_with(&daemon, &scope, 8, 70, "EXPIRING_RENDER_MARKER", |plan| {
+            plan.producer.as_mut().unwrap().issued_at_ms = issued_at_ms;
+            plan.entries[0].expires_at = Some(expiring);
+        });
+        *EXPIRES_AT.lock().unwrap() = Some(expires_at);
+        *AFTER_PREFLIGHT.lock().unwrap() = Some((journal_path(&config), wait_past_expiry));
+        let mut lane = RenderLaneState::default();
+
+        let reported = apply_render_operations(&runtime, &config, &mut lane).await;
+        *AFTER_PREFLIGHT.lock().unwrap() = None;
+        assert_eq!(reported.unwrap(), 1);
+        assert!(
+            fs::read_to_string(root.join("CLAUDE.md"))
+                .unwrap()
+                .contains("EXPIRING_RENDER_MARKER")
+        );
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, "applied", "{:?}", results[0].error);
+        let receipt = results[0].receipt.clone().unwrap();
+        assert_eq!(
+            receipt.projections[0].disposition,
+            bbox_project_render::transport::ProjectRenderDispositionV1::Written
+        );
+        // A delayed submission after the expiry still validates: the plan is
+        // projected at its issuance, not when the receipt is checked.
+        let plan: ProjectRenderPlanV1 =
+            serde_json::from_slice(&daemon.lock().unwrap().plans[&format_render_operation_id(8)])
+                .unwrap();
+        receipt.validate_against(&plan).unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_preflight_stays_pending_and_is_reconciled() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        operation(&daemon, &scope, 9, 80, "AFTER_PREFLIGHT_MARKER");
+        fn fail() -> Result<()> {
+            bail!("injected failure after the preflight was journaled")
+        }
+        *AFTER_PREFLIGHT.lock().unwrap() = Some((journal_path(&config), fail));
+        let mut lane = RenderLaneState::default();
+
+        let reported = apply_render_operations(&runtime, &config, &mut lane).await;
+        *AFTER_PREFLIGHT.lock().unwrap() = None;
+        assert_eq!(reported.unwrap(), 0);
+        assert!(
+            daemon.lock().unwrap().results.is_empty(),
+            "no result claims that nothing was written"
+        );
+        let journal = load_journal(&journal_path(&config)).unwrap();
+        let entry = journal.entry(&format_render_operation_id(9)).unwrap();
+        assert_eq!(entry.stage, JournalStage::Applying);
+        assert!(entry.preflight.is_some());
+
+        // Redelivery reconciles the attempt into a receipt.
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            1
+        );
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, "applied");
+        assert!(!root.join("CLAUDE.md").exists());
         server.abort();
     }
 

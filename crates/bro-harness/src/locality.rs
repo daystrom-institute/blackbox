@@ -279,6 +279,7 @@ impl Tool for LocalRenderTool {
                 "phase": "complete",
                 "plan_sha256": plan_sha256,
                 "receipt": execution.receipt,
+                "issued_at_ms": issued_at_ms,
             }),
         );
         let diagnostics = match parse_render_completion(

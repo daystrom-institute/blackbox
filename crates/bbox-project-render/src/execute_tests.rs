@@ -730,6 +730,40 @@ fn an_interrupted_application_is_reconciled_without_replacing_owner_edits() {
 }
 
 #[test]
+fn an_entry_expiring_after_publication_is_validated_at_the_plan_issuance() {
+    let (_directory, root) = temp_root();
+    // The entry is live at issuance and expires after the output is
+    // published, before the receipt is validated.
+    let issued_at_ms = now_unix_ms();
+    let expires_at = crate::transport::iso_from_unix_ms(issued_at_ms);
+    let mut plan = plan_issued_at("EXPIRING_LEAF_MARKER", OPERATION, issued_at_ms);
+    plan.entries[0].expires_at = Some(expires_at.clone());
+    let execution = with_interleave(
+        move |point, _| {
+            if point == "sync_root" {
+                while crate::transport::iso_from_unix_ms(now_unix_ms()) <= expires_at {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Ok(())
+        },
+        || execute_operation(&plan, &root),
+    )
+    .unwrap();
+    assert_eq!(
+        disposition_of(&execution.receipt, "CLAUDE.md"),
+        ProjectRenderDispositionV1::Written
+    );
+    assert!(
+        fs::read_to_string(root.join("CLAUDE.md"))
+            .unwrap()
+            .contains("EXPIRING_LEAF_MARKER")
+    );
+    // A delayed submission, long after the expiry, validates the same way.
+    execution.receipt.validate_against(&plan).unwrap();
+}
+
+#[test]
 fn receipts_refuse_entrypoints_published_ahead_of_failed_satellites() {
     let (_directory, root) = temp_root();
     let plan = with_satellite(producer_plan(Some("claude"), false));

@@ -162,6 +162,11 @@ pub enum ProjectRenderLocalityRequestV1 {
     Complete {
         plan_sha256: String,
         receipt: ProjectRenderReceiptV1,
+        /// The issuance the first plan chunk carried, echoed back so the
+        /// daemon orders this completion by when its plan was issued, not by
+        /// when the completion arrives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_at_ms: Option<u64>,
     },
 }
 
@@ -362,8 +367,25 @@ impl ProjectRenderPlanV1 {
         Ok(())
     }
 
-    pub(crate) fn projection(&self) -> Projection<'_> {
-        Projection::new(&self.entries)
+    /// The daemon-clock issuance this plan's entry expiry is evaluated at.
+    /// A producer plan carries its own; a workspace plan's issuance travels
+    /// beside the plan bytes and is passed in.
+    pub fn issuance_ms(&self, workspace_issued_at_ms: Option<u64>) -> Option<u64> {
+        self.producer
+            .as_ref()
+            .map(|producer| producer.issued_at_ms)
+            .or(workspace_issued_at_ms)
+    }
+
+    /// Entry expiry is evaluated at the plan's issuance, never at the
+    /// moment of projection, so execution, receipt validation, and replay
+    /// all project the same outputs. Only a workspace plan issued without an
+    /// issuance falls back to the wall clock.
+    fn projection_at(&self, workspace_issued_at_ms: Option<u64>) -> Projection<'_> {
+        match self.issuance_ms(workspace_issued_at_ms) {
+            Some(issued_at_ms) => Projection::at(&self.entries, &iso_from_unix_ms(issued_at_ms)),
+            None => Projection::new(&self.entries),
+        }
     }
 
     /// The exact outputs this plan projects for one PROJECT.md observation:
@@ -372,9 +394,10 @@ impl ProjectRenderPlanV1 {
     pub fn expected_projections(
         &self,
         project_doc_nonempty: bool,
+        workspace_issued_at_ms: Option<u64>,
     ) -> Result<Vec<ProjectRenderProjectionReceiptV1>> {
         Ok(self
-            .expected_outputs(project_doc_nonempty)?
+            .expected_outputs(project_doc_nonempty, workspace_issued_at_ms)?
             .into_iter()
             .map(|(receipt, _)| receipt)
             .collect())
@@ -384,8 +407,9 @@ impl ProjectRenderPlanV1 {
     pub(crate) fn expected_outputs(
         &self,
         project_doc_nonempty: bool,
+        workspace_issued_at_ms: Option<u64>,
     ) -> Result<Vec<(ProjectRenderProjectionReceiptV1, Option<String>)>> {
-        let view = self.projection();
+        let view = self.projection_at(workspace_issued_at_ms);
         let nominal = if self.dry_run {
             ProjectRenderDispositionV1::DryRun
         } else {
@@ -605,6 +629,17 @@ impl ProjectRenderPlanAssemblerV1 {
 
 impl ProjectRenderReceiptV1 {
     pub fn validate_against(&self, plan: &ProjectRenderPlanV1) -> Result<()> {
+        self.validate_against_issued(plan, None)
+    }
+
+    /// Validate against `plan` projected at its issuance. A workspace plan's
+    /// issuance travels beside the plan bytes; a producer plan carries its
+    /// own and ignores `workspace_issued_at_ms`.
+    pub fn validate_against_issued(
+        &self,
+        plan: &ProjectRenderPlanV1,
+        workspace_issued_at_ms: Option<u64>,
+    ) -> Result<()> {
         plan.validate()?;
         if self.version != PROJECT_RENDER_TRANSPORT_VERSION
             || self.project_id != plan.project_id
@@ -617,7 +652,8 @@ impl ProjectRenderReceiptV1 {
         if serde_json::to_vec(self)?.len() > MAX_PROJECT_RENDER_RECEIPT_BYTES {
             anyhow::bail!("project render receipt exceeds its byte bound");
         }
-        let expected = plan.expected_projections(self.project_doc_nonempty)?;
+        let expected =
+            plan.expected_projections(self.project_doc_nonempty, workspace_issued_at_ms)?;
         if self.projections.len() != expected.len() {
             anyhow::bail!("project render receipt has the wrong provider cardinality");
         }
@@ -733,4 +769,13 @@ pub fn disposition_label(disposition: ProjectRenderDispositionV1) -> &'static st
 
 pub(crate) fn sha256_hex(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// A Unix-millisecond instant in the ISO-8601 form entry expiry compares
+/// against (`bbox_util::util::now_iso`).
+pub fn iso_from_unix_ms(unix_ms: u64) -> String {
+    let millis = i64::try_from(unix_ms).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

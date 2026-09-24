@@ -873,6 +873,13 @@ mod tests {
     }
 
     fn create(runtime: &RenderOperationRuntime, content: &str) -> RenderOperationRecord {
+        create_with(runtime, entry(content))
+    }
+
+    fn create_with(
+        runtime: &RenderOperationRuntime,
+        entry: KnowledgeEntry,
+    ) -> RenderOperationRecord {
         let (operation_id, sequence) = runtime.reserve(PROJECT).unwrap();
         let plan = ProjectRenderPlanV1 {
             version: PROJECT_RENDER_TRANSPORT_VERSION,
@@ -889,7 +896,7 @@ mod tests {
             dry_run: false,
             view: ProjectRenderViewV1::Published,
             requested_scope: "project".into(),
-            entries: vec![entry(content)],
+            entries: vec![entry],
             diagnostics: None,
         };
         runtime.create(new_operation(), &plan).unwrap()
@@ -1021,6 +1028,35 @@ mod tests {
             runtime.plan_page("producer-a", &record.operation_id, 0, &grant()),
             Err(RenderLaneError::Settled)
         );
+    }
+
+    #[test]
+    fn a_receipt_submitted_after_its_entry_expired_still_validates() {
+        let runtime = RenderOperationRuntime::in_memory();
+        // Live at the plan's issuance, expired on the wall clock by the time
+        // the owner's receipt is submitted.
+        let mut expiring = entry("expiring");
+        expiring.expires_at = Some("2000-01-01T00:00:00Z".into());
+        let record = create_with(&runtime, expiring);
+        let receipt = receipt_for(&runtime, &record);
+        assert_eq!(
+            receipt.projections[0].disposition,
+            bbox_project_render::transport::ProjectRenderDispositionV1::Written,
+            "the entry is projected as it was at issuance"
+        );
+        runtime
+            .settle(
+                "producer-a",
+                &record.operation_id,
+                &record.plan_sha256,
+                &grant(),
+                Ok(receipt),
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.record(&record.operation_id).unwrap().state,
+            RenderOperationState::Completed { .. }
+        ));
     }
 
     #[test]

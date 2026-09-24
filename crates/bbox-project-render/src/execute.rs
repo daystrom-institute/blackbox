@@ -933,12 +933,8 @@ pub fn execute_project_render_plan_with(
     let root = verify_render_root(project_root)?;
     let _lock = lock_checkout_for_render(&root, options.lock_timeout)?;
     let project_doc_nonempty = project_doc_nonempty(&root);
-    let issued_at_ms = plan
-        .producer
-        .as_ref()
-        .map(|producer| producer.issued_at_ms)
-        .or(options.issued_at_ms);
-    let outputs = plan.expected_outputs(project_doc_nonempty)?;
+    let issued_at_ms = plan.issuance_ms(options.issued_at_ms);
+    let outputs = plan.expected_outputs(project_doc_nonempty, issued_at_ms)?;
     let (entrypoints, satellites) = split_outputs(&outputs);
     let mut before_publish = options.before_publish;
     let mut record_preflight = |observations: &[OutputObservation]| -> Result<()> {
@@ -979,7 +975,7 @@ pub fn execute_project_render_plan_with(
         incomplete: applied.incomplete,
         projections,
     };
-    receipt.validate_against(plan)?;
+    receipt.validate_against_issued(plan, issued_at_ms)?;
     let output = render_output_text(&root, &receipt, &contents, &applied.errors, plan.dry_run);
     Ok(ProjectRenderExecutionV1 { output, receipt })
 }
@@ -1008,7 +1004,7 @@ pub fn reconcile_interrupted_render(
     }
     let root = verify_render_root(project_root)?;
     let _lock = lock_checkout_for_render(&root, lock_timeout)?;
-    let outputs = plan.expected_outputs(record.project_doc_nonempty)?;
+    let outputs = plan.expected_outputs(record.project_doc_nonempty, record.issued_at_ms)?;
     let (mut projections, contents): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
     // An output that cannot be inspected is neither proven published nor
     // proven untouched: it is reported unconfirmed and the receipt is
@@ -1103,7 +1099,7 @@ pub fn reconcile_interrupted_render(
         incomplete,
         projections,
     };
-    receipt.validate_against(plan)?;
+    receipt.validate_against_issued(plan, record.issued_at_ms)?;
     let output = render_output_text(&root, &receipt, &contents, &errors, false);
     Ok(ProjectRenderExecutionV1 { output, receipt })
 }

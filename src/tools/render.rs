@@ -203,9 +203,16 @@ impl BlackboxServer {
                     )?;
                     // The issuance rides outside the plan bytes so the plan
                     // digest stays stable; the harness passes it to the
-                    // checkout freshness fence.
-                    chunk.issued_at_ms = (offset == 0)
-                        .then(bbox_project_render::execute::now_unix_ms);
+                    // checkout freshness fence and echoes it on completion,
+                    // where it orders the completion evidence.
+                    if offset == 0 {
+                        let issued_at_ms = bbox_project_render::execute::now_unix_ms();
+                        server
+                            .state
+                            .render_locality_observations
+                            .note_workspace_issuance(&chunk.plan_sha256, issued_at_ms);
+                        chunk.issued_at_ms = Some(issued_at_ms);
+                    }
                     return Ok(serde_json::to_string(&serde_json::json!({
                         "status": "render_locality_plan_chunk",
                         "chunk": chunk,
@@ -214,6 +221,7 @@ impl BlackboxServer {
                 Some(ProjectRenderLocalityRequestV1::Complete {
                     plan_sha256,
                     receipt,
+                    issued_at_ms,
                 }) => {
                     let (current, _) = workspace_project_render_plan(&server, &p, false)?;
                     if current.transport_sha256()? != plan_sha256 {
@@ -221,17 +229,24 @@ impl BlackboxServer {
                             "error.render_plan_stale: project render authority changed after the checkout plan was issued"
                         );
                     }
-                    receipt.validate_against(&current)?;
-                    // An incomplete receipt is accepted but never recorded
-                    // as completion evidence.
-                    let recorded = server
-                        .state
-                        .render_locality_observations
-                        .record_completed(
-                            &current,
-                            &receipt,
-                            bbox_project_render::execute::now_unix_ms(),
-                        )?;
+                    // The harness projected the plan at its issuance, so the
+                    // receipt is checked at that same instant.
+                    receipt.validate_against_issued(&current, issued_at_ms)?;
+                    // Evidence is ordered by the plan's issuance. A
+                    // completion whose issuance this daemon cannot confirm
+                    // (absent, unknown, or from before a restart) is
+                    // accepted but never recorded, so a delayed older
+                    // completion cannot replace a newer render's evidence.
+                    // An incomplete receipt is never recorded either.
+                    let observations = &server.state.render_locality_observations;
+                    let recorded = match issued_at_ms.filter(|issued_at_ms| {
+                        observations.issued_workspace_plan(&plan_sha256, *issued_at_ms)
+                    }) {
+                        Some(issued_at_ms) => {
+                            observations.record_completed(&current, &receipt, issued_at_ms)?
+                        }
+                        None => None,
+                    };
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
                         "evidence_recorded": recorded.is_some(),
@@ -506,6 +521,7 @@ async fn bootstrap_mcp_refuses_without_reading_instruction_files() {
 struct FetchedRenderPlanForTest {
     plan: ProjectRenderPlanV1,
     plan_sha256: String,
+    issued_at_ms: Option<u64>,
     page_count: usize,
     max_response_bytes: usize,
 }
@@ -542,6 +558,7 @@ async fn fetch_render_plan_for_test(
             return FetchedRenderPlanForTest {
                 plan: assembled.plan,
                 plan_sha256: assembled.plan_sha256,
+                issued_at_ms: assembled.issued_at_ms,
                 page_count,
                 max_response_bytes,
             };
@@ -1463,6 +1480,7 @@ mod catalog_render_tests {
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
                     plan_sha256,
                     receipt: execution.receipt,
+                    issued_at_ms: fetched.issued_at_ms,
                 }),
             }))
             .await;
@@ -1498,6 +1516,7 @@ mod catalog_render_tests {
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
                     plan_sha256: fetched_plan_sha256,
                     receipt: incomplete,
+                    issued_at_ms: fetched.issued_at_ms,
                 }),
             }))
             .await;
@@ -1514,6 +1533,132 @@ mod catalog_render_tests {
         assert_eq!(
             observations.completions[0].view,
             ProjectRenderViewV1::Published
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delayed_older_harness_completion_never_replaces_newer_evidence() {
+        use bbox_knowledge::knowledge::ProjectRenderDispositionV1;
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(PROJECT, &scope, COMMIT_ONE, &[render_entry()], &[]);
+        let server = fixture.server();
+        let workspace_id = bro_core::WorkspaceId::parse("d".repeat(32)).unwrap();
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(std::sync::Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "render-ordering-task".into(),
+                        session_id: "render-ordering-session".into(),
+                        project_id: PROJECT.into(),
+                        scope: scope.clone(),
+                        workspace_id: workspace_id.clone(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+        let params = RenderParams {
+            provider: Some("claude".into()),
+            project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+            scope: Some("project".into()),
+            dry_run: Some(false),
+            provisional: Some("published".into()),
+            ..Default::default()
+        };
+        let complete = |plan_sha256: &str, receipt, issued_at_ms| RenderParams {
+            locality: Some(ProjectRenderLocalityRequestV1::Complete {
+                plan_sha256: plan_sha256.to_string(),
+                receipt,
+                issued_at_ms,
+            }),
+            ..params.clone()
+        };
+        let local = tempfile::tempdir().unwrap();
+        let local_root = local.path().canonicalize().unwrap();
+        let execute = |fetched: &FetchedRenderPlanForTest| {
+            bbox_project_render::execute::execute_workspace_render_plan(
+                &fetched.plan,
+                &local_root,
+                &scope,
+                workspace_id.as_str(),
+                fetched.issued_at_ms,
+            )
+            .unwrap()
+            .receipt
+        };
+
+        // Render A writes CLAUDE.md, but its completion is delayed.
+        let older = fetch_render_plan_for_test(&server, params.clone()).await;
+        let older_receipt = execute(&older);
+        assert_eq!(
+            older_receipt.projections[0].disposition,
+            ProjectRenderDispositionV1::Written
+        );
+
+        // The owner makes CLAUDE.md handwritten. Render B of the unchanged
+        // knowledge refuses it and completes first.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        std::fs::write(local_root.join("CLAUDE.md"), "handwritten by the owner\n").unwrap();
+        let newer = fetch_render_plan_for_test(&server, params.clone()).await;
+        assert_eq!(older.plan_sha256, newer.plan_sha256);
+        assert!(newer.issued_at_ms > older.issued_at_ms);
+        let newer_receipt = execute(&newer);
+        assert_eq!(
+            newer_receipt.projections[0].disposition,
+            ProjectRenderDispositionV1::Refused
+        );
+        let completed = server
+            .bbox_render(Parameters(complete(
+                &newer.plan_sha256,
+                newer_receipt,
+                newer.issued_at_ms,
+            )))
+            .await;
+        assert!(!is_error(&completed), "{}", text(&completed));
+        assert!(text(&completed).contains("\"evidence_recorded\": true"));
+        let evidence = server.state.render_locality_observations.snapshot();
+        assert_eq!(evidence.completions.len(), 1);
+        assert_eq!(evidence.completions[0].refused_count, 1);
+        assert_eq!(evidence.completions[0].written_count, 0);
+        assert_eq!(evidence.completions[0].issued_at_ms, newer.issued_at_ms);
+
+        // A's completion arrives last. It is acknowledged, but it is
+        // historical and never replaces B's refusal evidence.
+        let delayed = server
+            .bbox_render(Parameters(complete(
+                &older.plan_sha256,
+                older_receipt.clone(),
+                older.issued_at_ms,
+            )))
+            .await;
+        assert!(!is_error(&delayed), "{}", text(&delayed));
+        assert!(text(&delayed).contains("\"evidence_recorded\": false"));
+        assert_eq!(
+            server.state.render_locality_observations.snapshot(),
+            evidence
+        );
+
+        // Nor can A's receipt claim a newer issuance: without an issuance,
+        // or with one this daemon never issued, a completion is not evidence.
+        let unissued = newer.issued_at_ms.map(|issued_at_ms| issued_at_ms + 1);
+        for issued_at_ms in [None, unissued] {
+            let unordered = server
+                .bbox_render(Parameters(complete(
+                    &older.plan_sha256,
+                    older_receipt.clone(),
+                    issued_at_ms,
+                )))
+                .await;
+            assert!(!is_error(&unordered), "{}", text(&unordered));
+            assert!(text(&unordered).contains("\"evidence_recorded\": false"));
+        }
+        assert_eq!(
+            server.state.render_locality_observations.snapshot(),
+            evidence
         );
     }
 

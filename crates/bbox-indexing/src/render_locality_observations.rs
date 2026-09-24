@@ -1,5 +1,6 @@
 //! Durable path-free completion evidence for checkout-owned project renders.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
 const MAX_COMPLETIONS: usize = 65_536;
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WORKSPACE_ISSUANCES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +63,10 @@ impl Default for RenderLocalityObservationSnapshotV1 {
 pub struct RenderLocalityObservationsV1 {
     store_path: Option<Arc<PathBuf>>,
     state: Arc<Mutex<RenderLocalityObservationSnapshotV1>>,
+    /// Workspace plans this daemon issued, as `(issued_at_ms, plan_sha256)`.
+    /// In memory and bounded: a completion whose issuance is not held here
+    /// cannot be ordered and is never evidence.
+    workspace_issuances: Arc<Mutex<BTreeSet<(u64, String)>>>,
 }
 
 impl RenderLocalityObservationsV1 {
@@ -70,6 +76,7 @@ impl RenderLocalityObservationsV1 {
         Ok(Self {
             store_path: Some(Arc::new(store_path)),
             state: Arc::new(Mutex::new(snapshot)),
+            workspace_issuances: Arc::default(),
         })
     }
 
@@ -77,11 +84,31 @@ impl RenderLocalityObservationsV1 {
         Self {
             store_path: None,
             state: Arc::new(Mutex::new(Default::default())),
+            workspace_issuances: Arc::default(),
         }
     }
 
     pub fn snapshot(&self) -> RenderLocalityObservationSnapshotV1 {
         self.state.lock().clone()
+    }
+
+    /// Remember that this daemon issued the workspace plan `plan_sha256` at
+    /// `issued_at_ms`. The issuance leaves the daemon beside the plan bytes
+    /// and comes back with the completion; only a remembered one orders it.
+    pub fn note_workspace_issuance(&self, plan_sha256: &str, issued_at_ms: u64) {
+        let mut issuances = self.workspace_issuances.lock();
+        issuances.insert((issued_at_ms, plan_sha256.to_owned()));
+        while issuances.len() > MAX_WORKSPACE_ISSUANCES {
+            issuances.pop_first();
+        }
+    }
+
+    /// Whether this daemon issued the workspace plan `plan_sha256` at
+    /// `issued_at_ms`.
+    pub fn issued_workspace_plan(&self, plan_sha256: &str, issued_at_ms: u64) -> bool {
+        self.workspace_issuances
+            .lock()
+            .contains(&(issued_at_ms, plan_sha256.to_owned()))
     }
 
     /// Persist one completion only after the daemon has independently
@@ -105,7 +132,7 @@ impl RenderLocalityObservationsV1 {
         issued_at_ms: u64,
     ) -> Result<Option<u64>> {
         plan.validate()?;
-        receipt.validate_against(plan)?;
+        receipt.validate_against_issued(plan, Some(issued_at_ms))?;
         if receipt.incomplete {
             return Ok(None);
         }

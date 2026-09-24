@@ -15,6 +15,7 @@ anyhow = "1"
 base64 = "0.22"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-util = { path = "../bbox-util" }
+chrono = "0.4"
 fs2 = "0.4"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }

@@ -889,6 +889,7 @@ dependencies = [
  "base64 0.22.1",
  "bbox-corpus-core",
  "bbox-util",
+ "chrono",
  "fs2",
  "schemars 1.2.1",
  "serde",
