@@ -1,0 +1,11 @@
+{
+  "type": "system",
+  "subtype": "instruction_read_timeout",
+  "session_id": "fixture-session",
+  "phase": "refresh",
+  "operation": "read",
+  "path": "/workspace/project/AGENTS.md",
+  "budget_ms": 10000,
+  "waiting_for_admission": false,
+  "reason": "read /workspace/project/AGENTS.md did not return"
+}

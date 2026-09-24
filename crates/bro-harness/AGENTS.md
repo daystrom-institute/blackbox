@@ -30,6 +30,20 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   then delivers them afresh; compaction invalidates delivery. Never infer
   authority from strings in arbitrary file contents or historical tool results.
   Shell remains an explicit escape hatch outside structured path discovery.
+- **Instruction-document I/O is bounded.** Startup discovery, resume
+  restoration, boundary refresh, and structured checks each return within one
+  operation deadline (`BRO_HARNESS_INSTRUCTION_READ_TIMEOUT_MS`, default 10 s)
+  that covers admission, every filesystem probe, and conflict retries. Startup
+  is best effort: a timeout discards the partial result, keeps the root and
+  global candidates enrolled, and the session still starts. Refresh and resume
+  timeouts prevent inference; check timeouts return `instruction_read_error`
+  with no filesystem effects. Each ledger has one detached instruction worker;
+  a stalled one keeps its slot until it exits, and later callers wait only
+  within their own deadline. The ledger lock is never held across filesystem
+  calls, and only a caller still waiting may commit a worker's result against
+  an unchanged ledger revision. Every timeout emits a sequenced
+  `system/instruction_read_timeout` event naming the phase, operation, and
+  attempted path, never document text or environment values.
 
 ## Compaction policy
 

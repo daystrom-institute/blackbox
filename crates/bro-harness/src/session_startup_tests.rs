@@ -5,7 +5,7 @@
 use super::*;
 use async_trait::async_trait;
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 struct StartupTransport {
     snapshot: Value,
@@ -97,6 +97,18 @@ async fn build_with_compaction_log(
     root: &Path,
     compaction_models: Arc<StdMutex<Vec<String>>>,
 ) -> Session {
+    build_with_runtime(cli, root, compaction_models, None, Arc::new(|_| {}))
+        .await
+        .unwrap()
+}
+
+async fn build_with_runtime(
+    cli: &Cli,
+    root: &Path,
+    compaction_models: Arc<StdMutex<Vec<String>>>,
+    instruction_fs: Option<Arc<dyn crate::instruction_io::InstructionFs>>,
+    callback: crate::emit::EventCallback,
+) -> Result<Session> {
     let store = SessionStore::open_in(root, None, cli.session_id.as_deref(), cli.resume.as_deref())
         .unwrap();
     let event_log = Arc::new(EventLog::at_path(
@@ -104,7 +116,7 @@ async fn build_with_compaction_log(
     ));
     Session::build_with_runtime(
         cli,
-        Some(Arc::new(|_| {})),
+        Some(callback),
         Some(mcp::McpConfig {
             servers: Vec::new(),
             tool_placement: Default::default(),
@@ -121,10 +133,10 @@ async fn build_with_compaction_log(
             store,
             event_log,
             project_mutation_routes: Some(Vec::new()),
+            instruction_fs,
         }),
     )
     .await
-    .unwrap()
 }
 
 #[tokio::test]
@@ -388,4 +400,207 @@ async fn production_resume_recovers_an_uncheckpointed_tail_and_briefs_the_model(
             .count(),
         1
     );
+}
+
+const INSTRUCTION_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+/// Scheduling tolerance on top of the instruction budget for a build whose
+/// other stages are controlled.
+const BUILD_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Store under `base`; discover instructions (no `--system-prompt`) in
+/// `base/project`, a git root with one document and a synthetic Codex home.
+fn discovering_cli(base: &Path, resume: bool) -> Cli {
+    let project = base.join("project");
+    let mut args = vec![
+        "bro-harness",
+        "--cwd",
+        project.to_str().unwrap(),
+        "--code-mode",
+        "off",
+        "--output-schema",
+        "{}",
+        "--service-tier",
+        "default",
+    ];
+    if resume {
+        args.extend(["--resume", "startup"]);
+    } else {
+        args.extend(["--session-id", "startup", "--model", "gpt-5.5"]);
+    }
+    Cli::try_parse_from(args).unwrap()
+}
+
+fn discovering_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("project/.git")).unwrap();
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    std::fs::write(base.join("project/AGENTS.md"), "PROJECT RULE").unwrap();
+    (dir, base)
+}
+
+async fn build_discovering(
+    base: &Path,
+    resume: bool,
+    fs: &Arc<crate::instruction_io::testing::GatedFs>,
+) -> (Result<Session>, Arc<StdMutex<Vec<Value>>>) {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let vars = BTreeMap::from([
+        (
+            "CODEX_HOME".to_owned(),
+            base.join("home").display().to_string(),
+        ),
+        (
+            crate::instruction_io::TIMEOUT_ENV.to_owned(),
+            INSTRUCTION_BUDGET.as_millis().to_string(),
+        ),
+    ]);
+    let cli = discovering_cli(base, resume);
+    let session = transport::with_session_env(
+        vars,
+        build_with_runtime(
+            &cli,
+            base,
+            Arc::default(),
+            Some(fs.clone()),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
+        ),
+    )
+    .await;
+    (session, events)
+}
+
+fn logged_events(base: &Path) -> Vec<Value> {
+    std::fs::read_to_string(base.join("startup.events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+        .collect()
+}
+
+fn instruction_timeouts(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| event["subtype"] == "instruction_read_timeout")
+        .cloned()
+        .collect()
+}
+
+/// Released workers drop their filesystem handle when they exit.
+async fn wait_instruction_workers_exit(fs: &Arc<crate::instruction_io::testing::GatedFs>) {
+    fs.release();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Arc::strong_count(fs) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "instruction worker leaked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn production_startup_instruction_timeout_warns_starts_and_gates_inference() {
+    use crate::instruction_io::FsOp;
+    let (_dir, base) = discovering_workspace();
+    let document = base.join("project/AGENTS.md");
+    let fs = crate::instruction_io::testing::GatedFs::new();
+    fs.stall_on(FsOp::Read, document.clone());
+    let started = std::time::Instant::now();
+    let (session, events) = build_discovering(&base, false, &fs).await;
+    let mut session = session.unwrap();
+    assert!(started.elapsed() < INSTRUCTION_BUDGET + BUILD_TOLERANCE);
+
+    let emitted = instruction_timeouts(&events.lock().unwrap());
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["phase"], "startup");
+    assert_eq!(emitted[0]["operation"], "read");
+    assert_eq!(emitted[0]["path"], document.to_string_lossy().as_ref());
+    assert_eq!(emitted[0]["session_id"], "startup");
+    // The warning precedes the ordinary start milestone in the durable log.
+    let log = session.event_log.clone();
+    tokio::task::spawn_blocking(move || log.flush_blocking())
+        .await
+        .unwrap();
+    let logged = logged_events(&base);
+    let warning = logged
+        .iter()
+        .position(|event| event["subtype"] == "instruction_read_timeout")
+        .expect("timeout event in the durable log");
+    let start = logged
+        .iter()
+        .position(|event| event["milestone"] == "session_start")
+        .expect("session_start milestone");
+    assert!(warning < start, "{logged:?}");
+
+    // No provider request while the strict boundary refresh cannot complete.
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let error = session
+        .user_turn("task", cancel_rx, Arc::default())
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("instruction refresh timed out"), "{error}");
+    assert!(error.contains(&*document.to_string_lossy()), "{error}");
+    assert!(!session.tx.snapshot().to_string().contains("PROJECT RULE"));
+
+    // Once the stalled worker exits, a fresh strict refresh delivers the
+    // document before the request reaches the transport.
+    fs.release();
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let error = session
+        .user_turn("task", cancel_rx, Arc::default())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("startup tests must not request model inference"),
+        "{error:#}"
+    );
+    let delivered = format!(
+        "{}{}",
+        session.tx.snapshot(),
+        session.instruction_system.clone().unwrap_or_default()
+    );
+    assert!(delivered.contains("PROJECT RULE"), "{delivered}");
+    drop(session);
+    wait_instruction_workers_exit(&fs).await;
+}
+
+#[tokio::test]
+async fn production_resume_instruction_timeout_fails_before_session_resume() {
+    use crate::instruction_io::FsOp;
+    let (_dir, base) = discovering_workspace();
+    let document = base.join("project/AGENTS.md");
+    let fs = crate::instruction_io::testing::GatedFs::new();
+    let (initial, _) = build_discovering(&base, false, &fs).await;
+    let mut initial = initial.unwrap();
+    assert!(!initial.scoped_project_docs.active_documents().is_empty());
+    initial.persist().await.unwrap();
+    drop(initial);
+
+    let fs = crate::instruction_io::testing::GatedFs::new();
+    fs.stall_on(FsOp::Read, document.clone());
+    let started = std::time::Instant::now();
+    let (resumed, events) = build_discovering(&base, true, &fs).await;
+    let error = format!("{:#}", resumed.err().expect("resume must fail closed"));
+    // Startup discovery and resume restoration each spend their own budget.
+    assert!(started.elapsed() < INSTRUCTION_BUDGET * 2 + BUILD_TOLERANCE);
+    assert!(error.contains("instruction resume timed out"), "{error}");
+    assert!(error.contains(&*document.to_string_lossy()), "{error}");
+    let emitted = instruction_timeouts(&events.lock().unwrap());
+    let phases: Vec<_> = emitted.iter().map(|event| event["phase"].clone()).collect();
+    assert_eq!(phases, ["startup", "resume"], "{emitted:?}");
+    assert_eq!(emitted[1]["path"], document.to_string_lossy().as_ref());
+    // The failure is durable even though build returned before its
+    // session_resume milestone.
+    let logged = logged_events(&base);
+    assert_eq!(instruction_timeouts(&logged), emitted, "{logged:?}");
+    assert!(
+        !logged
+            .iter()
+            .any(|event| event["milestone"] == "session_resume"),
+        "{logged:?}"
+    );
+    wait_instruction_workers_exit(&fs).await;
 }

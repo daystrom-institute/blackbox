@@ -8585,6 +8585,42 @@ mod tests {
     }
 
     #[test]
+    fn harness_instruction_read_timeout_reaches_the_status_tail() {
+        // The harness emitter test pins this fixture to the exact event it
+        // emits and tees to the session log.
+        let mut evt: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/harness-events/instruction_read_timeout.json"
+        ))
+        .unwrap();
+        evt["seq"] = json!(7);
+        let task = mk_ingest_task("instruction-timeout", "fixture-session");
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        ingest_harness_event(
+            &task,
+            Provider::Brodex,
+            evt,
+            &tx,
+            "instruction-timeout",
+            None,
+        );
+        assert_eq!(task.inner.lock().status, TaskStatus::Running);
+        let status = mcp_task_status_json(&task, "summary", None, None, 5, false).unwrap();
+        let recent = status["recentEvents"].as_array().unwrap();
+        let timeout = recent
+            .iter()
+            .find(|event| event["subtype"] == "instruction_read_timeout")
+            .unwrap_or_else(|| panic!("timeout event missing from tail: {status}"));
+        assert_eq!(timeout["phase"], "refresh");
+        assert_eq!(timeout["operation"], "read");
+        assert_eq!(timeout["path"], "/workspace/project/AGENTS.md");
+        assert_eq!(
+            timeout["reason"],
+            "read /workspace/project/AGENTS.md did not return"
+        );
+        assert_eq!(timeout["seq"], 7);
+    }
+
+    #[test]
     fn latest_assistant_preview_tracks_streams_without_replacing_the_result() {
         let task = mk_ingest_task("preview", "session-preview");
         let (tx, _) = tokio::sync::broadcast::channel(16);

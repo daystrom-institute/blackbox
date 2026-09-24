@@ -975,6 +975,8 @@ struct SessionBuildRuntime {
     event_log: Arc<EventLog>,
     /// Already prepared locality routes, or None to install them during startup.
     project_mutation_routes: Option<Vec<Arc<dyn Tool>>>,
+    /// Instruction-document filesystem, or None for the real filesystem.
+    instruction_fs: Option<Arc<dyn crate::instruction_io::InstructionFs>>,
 }
 
 impl Session {
@@ -1043,6 +1045,7 @@ impl Session {
             store,
             event_log,
             project_mutation_routes,
+            instruction_fs,
         } = match runtime {
             Some(runtime) => runtime,
             None => {
@@ -1056,6 +1059,7 @@ impl Session {
                     store,
                     event_log,
                     project_mutation_routes: None,
+                    instruction_fs: None,
                 }
             }
         };
@@ -1072,10 +1076,23 @@ impl Session {
         let restored_last_event_seq = store.restored.as_ref().map_or(0, |r| r.last_event_seq);
         let log_tail_seq = EventLog::max_seq_in_log(event_log.path());
         let seq_counter = Arc::new(AtomicU64::new(restored_last_event_seq.max(log_tail_seq)));
-        let scoped_project_docs = Arc::new(crate::project_doc::ScopedProjectDocs::for_session(
-            root.clone(),
-            cli.system_prompt.as_deref(),
-        ));
+        // Created before instruction discovery so startup and resume
+        // diagnostics reach the event plane even when build returns early.
+        let emitter = make_emitter(
+            store.id.clone(),
+            callback.clone(),
+            Some(event_log.clone()),
+            seq_counter.clone(),
+        );
+        let scoped_project_docs = Arc::new(
+            crate::project_doc::ScopedProjectDocs::for_session(
+                root.clone(),
+                cli.system_prompt.as_deref(),
+                instruction_fs.unwrap_or_else(|| Arc::new(crate::instruction_io::StdFs)),
+                Some(emitter.clone()),
+            )
+            .await,
+        );
         // Hand the transport the stable session id, so it can populate the
         // codex-style `session-id` header + `prompt_cache_key` (vs a random
         // per-request id).
@@ -1100,10 +1117,11 @@ impl Session {
         if let Some(documents) = prior_side.get("instruction_documents") {
             let documents = serde_json::from_value(documents.clone())
                 .context("invalid persisted instruction documents")?;
-            scoped_project_docs
-                .restore_documents(documents)
-                .await
-                .map_err(anyhow::Error::msg)?;
+            if let Err(error) = scoped_project_docs.restore_documents(documents).await {
+                let log = event_log.clone();
+                let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
+                return Err(anyhow::Error::msg(error));
+            }
         }
         let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
             prior_side.get("todos").unwrap_or(&Value::Null),
@@ -1410,12 +1428,6 @@ impl Session {
                 .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
-        let emitter = make_emitter(
-            store.id.clone(),
-            callback,
-            Some(event_log.clone()),
-            seq_counter.clone(),
-        );
         if let Err(error) = reg.validate_resume_tool_schemas() {
             emitter.result_error(&format!("{error:#}"), 0);
             let log = event_log.clone();
@@ -4280,7 +4292,12 @@ mod tests {
                     "AGENTS.override.md,AGENTS.md".into(),
                 ),
             ]),
-            async { crate::project_doc::ScopedProjectDocs::for_session(root.to_path_buf(), None) },
+            crate::project_doc::ScopedProjectDocs::for_session(
+                root.to_path_buf(),
+                None,
+                Arc::new(crate::instruction_io::StdFs),
+                None,
+            ),
         )
         .await
     }
