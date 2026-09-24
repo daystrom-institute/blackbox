@@ -1524,6 +1524,13 @@ pub fn load_project(project_root: &Path) -> Result<ProjectConfig> {
     parse_project_config(&source).with_context(|| format!("parsing {}", config_path.display()))
 }
 
+/// Parse project configuration from already-authorized committed bytes, such
+/// as the accepted configuration lane's `.bbox/config.toml`. Never reads the
+/// filesystem.
+pub fn parse_project_config_source(source: &str) -> Result<ProjectConfig> {
+    parse_project_config(source)
+}
+
 fn parse_project_config(source: &str) -> Result<ProjectConfig> {
     Figment::new()
         .merge(Toml::string(source))

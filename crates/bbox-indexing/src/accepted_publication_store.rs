@@ -246,6 +246,17 @@ impl AcceptedPublicationGenerationId {
     }
 }
 
+fn deserialize_optional_unique_btree_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<K, V>>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    deserialize_unique_btree_map(deserializer).map(Some)
+}
+
 fn deserialize_unique_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
 where
     D: Deserializer<'de>,
@@ -484,6 +495,17 @@ pub struct AcceptedEvidenceSourceV1 {
     pub source_bytes: Vec<u8>,
 }
 
+/// One accepted project configuration input (`.bro/brofiles/<name>.json`,
+/// `.bro/teamplates/<name>.json`, `.bbox/mcp.json` or `.bbox/config.toml`).
+/// The store keeps exact bytes; the daemon's configuration domain parses them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedConfigSourceV1 {
+    pub source_content_sha256: PublicationSha256,
+    pub encoded_bytes: u64,
+    pub source_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedPublicationHashesV1 {
@@ -497,6 +519,11 @@ pub struct AcceptedPublicationHashesV1 {
     /// written before the lane existed recomputes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_sources_sha256: Option<PublicationSha256>,
+    /// `None` exactly when the generation carries no configuration lane. A
+    /// present lane always hashes, even when empty, so an accepted "no
+    /// configuration" stays distinct from a producer that never sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sources_sha256: Option<PublicationSha256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +537,9 @@ pub struct AcceptedPublicationCountsV1 {
     pub graph_files: u64,
     #[serde(default)]
     pub evidence_files: u64,
+    /// `None` exactly when the generation carries no configuration lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_files: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,6 +566,16 @@ pub(crate) struct AcceptedPublicationGenerationV1 {
     /// decodes those to the empty map so the record recomputes to itself.
     #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
     pub(crate) evidence_sources: BTreeMap<NormalizedRepoRelativeFilename, AcceptedEvidenceSourceV1>,
+    /// Absent in every generation written before the configuration lane and
+    /// in every generation whose producer did not send it; omitted from the
+    /// encoding then, so those records recompute to themselves.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_unique_btree_map"
+    )]
+    pub(crate) config_sources:
+        Option<BTreeMap<NormalizedRepoRelativeFilename, AcceptedConfigSourceV1>>,
     pub(crate) hashes: AcceptedPublicationHashesV1,
     pub(crate) counts: AcceptedPublicationCountsV1,
     pub(crate) total_encoded_bytes: u64,
@@ -629,6 +669,8 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) gaps: Vec<AcceptedGapSourceV1>,
     pub(crate) graphs: Vec<AcceptedGraphSourceV1Input>,
     pub(crate) evidence: Vec<AcceptedEvidenceSourceV1Input>,
+    /// `None` when the candidate carries no configuration lane.
+    pub(crate) config: Option<Vec<AcceptedConfigSourceV1Input>>,
     /// The auto-advance grant this pointer will carry. The runtime resolves
     /// it from the installed pointer plus the caller's explicit operator
     /// update before it gets here; the builder only writes what it is told.
@@ -644,6 +686,12 @@ pub(crate) struct AcceptedGraphSourceV1Input {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedEvidenceSourceV1Input {
+    pub(crate) repository_relative_filename: String,
+    pub(crate) source_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AcceptedConfigSourceV1Input {
     pub(crate) repository_relative_filename: String,
     pub(crate) source_bytes: Vec<u8>,
 }
@@ -1558,10 +1606,45 @@ pub(crate) fn prepare_accepted_publication_v1(
         }
     }
 
+    let config_sources = input
+        .config
+        .map(|sources| {
+            let mut accepted = BTreeMap::new();
+            for source in sources {
+                let supplied =
+                    NormalizedRepoRelativeFilename::parse(source.repository_relative_filename)?;
+                let encoded_bytes = u64::try_from(source.source_bytes.len())
+                    .map_err(|_| byte_limit("accepted configuration source file"))?;
+                if accepted
+                    .insert(
+                        supplied,
+                        AcceptedConfigSourceV1 {
+                            source_content_sha256: PublicationSha256::digest(&source.source_bytes),
+                            encoded_bytes,
+                            source_bytes: source.source_bytes,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(invalid_generation(
+                        "accepted configuration publication contains a duplicate source file",
+                    ));
+                }
+            }
+            Ok(accepted)
+        })
+        .transpose()?;
+    let config_source_bytes = config_sources
+        .as_ref()
+        .map(|sources| validate_accepted_config_sources(&input.scope, sources))
+        .transpose()?
+        .unwrap_or(0);
+
     let total_encoded_bytes = knowledge_source_bytes
         .checked_add(gap_source_bytes)
         .and_then(|bytes| bytes.checked_add(graph_source_bytes))
         .and_then(|bytes| bytes.checked_add(evidence_source_bytes))
+        .and_then(|bytes| bytes.checked_add(config_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     let hashes = AcceptedPublicationHashesV1 {
         knowledge_file_manifest_sha256: canonical_json_hash(
@@ -1590,6 +1673,10 @@ pub(crate) fn prepare_accepted_publication_v1(
                 "accepted evidence sources",
             )?)
         },
+        config_sources_sha256: config_sources
+            .as_ref()
+            .map(|sources| canonical_json_hash(sources, "accepted configuration sources"))
+            .transpose()?,
     };
     let counts = AcceptedPublicationCountsV1 {
         knowledge_files: usize_to_u64(knowledge_file_manifest.len(), "accepted knowledge file")?,
@@ -1598,6 +1685,10 @@ pub(crate) fn prepare_accepted_publication_v1(
         gap_entries: usize_to_u64(normalized_gaps.len(), "accepted gap entry")?,
         graph_files: usize_to_u64(graph_sources.len(), "accepted graph file")?,
         evidence_files: usize_to_u64(evidence_sources.len(), "accepted evidence file")?,
+        config_files: config_sources
+            .as_ref()
+            .map(|sources| usize_to_u64(sources.len(), "accepted configuration file"))
+            .transpose()?,
     };
     let generation = AcceptedPublicationGenerationV1 {
         version: ACCEPTED_PUBLICATION_VERSION,
@@ -1611,6 +1702,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         normalized_gaps,
         graph_sources,
         evidence_sources,
+        config_sources,
         hashes,
         counts,
         total_encoded_bytes,
@@ -1892,10 +1984,17 @@ fn validate_generation_v1(
         &generation.evidence_sources,
         limits,
     )?;
+    let config_source_bytes = generation
+        .config_sources
+        .as_ref()
+        .map(|sources| validate_accepted_config_sources(&generation.scope, sources))
+        .transpose()?
+        .unwrap_or(0);
     let expected_total = knowledge_source_bytes
         .checked_add(gap_source_bytes)
         .and_then(|bytes| bytes.checked_add(graph_source_bytes))
         .and_then(|bytes| bytes.checked_add(evidence_source_bytes))
+        .and_then(|bytes| bytes.checked_add(config_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     if generation.total_encoded_bytes != expected_total {
         return Err(invalid_generation(
@@ -1915,6 +2014,11 @@ fn validate_generation_v1(
         gap_entries: usize_to_u64(generation.normalized_gaps.len(), "accepted gap entry")?,
         graph_files: usize_to_u64(generation.graph_sources.len(), "accepted graph file")?,
         evidence_files: usize_to_u64(generation.evidence_sources.len(), "accepted evidence file")?,
+        config_files: generation
+            .config_sources
+            .as_ref()
+            .map(|sources| usize_to_u64(sources.len(), "accepted configuration file"))
+            .transpose()?,
     };
     if generation.counts != expected_counts {
         return Err(invalid_generation(
@@ -1954,6 +2058,11 @@ fn validate_generation_v1(
                 "accepted evidence sources",
             )?)
         },
+        config_sources_sha256: generation
+            .config_sources
+            .as_ref()
+            .map(|sources| canonical_json_hash(sources, "accepted configuration sources"))
+            .transpose()?,
     };
     if generation.hashes != expected_hashes {
         return Err(invalid_generation(
@@ -1961,6 +2070,53 @@ fn validate_generation_v1(
         ));
     }
     Ok(())
+}
+
+/// Validate the accepted configuration lane at build and on read: exact
+/// input paths for this scope, bounded counts and bytes, bytes that agree
+/// with their digest, and UTF-8 text. Typed parsing belongs to the daemon's
+/// configuration domain, which refuses a candidate whose configuration does
+/// not parse before it can displace an accepted generation.
+fn validate_accepted_config_sources(
+    scope: &PublishedScope,
+    sources: &BTreeMap<NormalizedRepoRelativeFilename, AcceptedConfigSourceV1>,
+) -> AcceptedPublicationStoreResult<u64> {
+    if sources.len() as u64 > bbox_knowledge_source::MAX_CONFIG_SOURCE_FILES {
+        return Err(byte_limit("accepted configuration file count"));
+    }
+    let mut total = 0_u64;
+    for (filename, source) in sources {
+        if bbox_knowledge_source::config_source_scope_relative_path(scope, filename.as_str())
+            .is_none()
+        {
+            return Err(invalid_generation(
+                "accepted configuration filename is not a configuration input of its scope",
+            ));
+        }
+        if source.encoded_bytes == 0
+            || source.encoded_bytes != source.source_bytes.len() as u64
+            || source.source_content_sha256 != PublicationSha256::digest(&source.source_bytes)
+        {
+            return Err(invalid_generation(
+                "accepted configuration source bytes disagree with their manifest",
+            ));
+        }
+        if source.encoded_bytes > bbox_knowledge_source::MAX_CONFIG_SOURCE_FILE_BYTES {
+            return Err(byte_limit("accepted configuration source file"));
+        }
+        if std::str::from_utf8(&source.source_bytes).is_err() {
+            return Err(invalid_generation(
+                "accepted configuration source is not UTF-8 text",
+            ));
+        }
+        total = total
+            .checked_add(source.encoded_bytes)
+            .ok_or_else(|| byte_limit("accepted configuration source lane"))?;
+        if total > bbox_knowledge_source::MAX_CONFIG_SOURCE_LANE_BYTES {
+            return Err(byte_limit("accepted configuration source lane"));
+        }
+    }
+    Ok(total)
 }
 
 /// Re-validate the accepted evidence lane on read.
@@ -3045,6 +3201,7 @@ pub(crate) mod fixtures {
             }],
             graphs: Vec::new(),
             evidence: Vec::new(),
+            config: None,
             // The shared fixture stays grant-free. A test that wants the
             // auto-advance policy installs the grant explicitly, so no
             // fixture consumer silently inherits one.
@@ -3221,6 +3378,7 @@ mod tests {
             gaps: vec![gap_source("gap-1234abcd", ".bbox/gaps/gap-1234abcd.json")],
             graphs: Vec::new(),
             evidence: Vec::new(),
+            config: None,
             auto_advance: None,
             prior_pointer: None,
         }
@@ -3390,6 +3548,131 @@ mod tests {
         assert_eq!(legacy.counts.graph_files, 0);
         assert_eq!(legacy.counts.evidence_files, 0);
         validate_generation_v1(&legacy, &AcceptedPublicationLimits::default()).unwrap();
+    }
+
+    fn config_sources(prefix: &str) -> Vec<AcceptedConfigSourceV1Input> {
+        [
+            (".bbox/config.toml", b"[mcp]\nenabled = false\n".as_slice()),
+            (".bbox/mcp.json", br#"{"servers":{}}"#.as_slice()),
+            (
+                ".bro/brofiles/reviewer.json",
+                br#"{"name":"reviewer","provider":"claude"}"#.as_slice(),
+            ),
+            (
+                ".bro/teamplates/squad.json",
+                br#"{"name":"squad","members":[]}"#.as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| AcceptedConfigSourceV1Input {
+            repository_relative_filename: format!("{prefix}{path}"),
+            source_bytes: bytes.to_vec(),
+        })
+        .collect()
+    }
+
+    /// A generation without the configuration lane encodes exactly as every
+    /// earlier binary wrote it, so its identity and stored hashes are
+    /// unchanged; an empty present lane and a populated one are each
+    /// distinct, verifiable generations.
+    #[test]
+    fn config_lane_absent_empty_and_populated_are_distinct_verified_generations() {
+        let limits = AcceptedPublicationLimits::default();
+        let absent = prepare_accepted_publication_v1(build_input(), &limits).unwrap();
+        let encoded = serde_json::to_value(&absent.generation).unwrap();
+        assert!(encoded.get("config_sources").is_none());
+        assert!(encoded["counts"].get("config_files").is_none());
+        assert!(encoded["hashes"].get("config_sources_sha256").is_none());
+        assert_eq!(absent.generation.config_sources, None);
+
+        let mut input = build_input();
+        input.config = Some(Vec::new());
+        let empty = prepare_accepted_publication_v1(input, &limits).unwrap();
+        assert_eq!(empty.generation.config_sources, Some(BTreeMap::new()));
+        assert_eq!(empty.generation.counts.config_files, Some(0));
+        assert!(empty.generation.hashes.config_sources_sha256.is_some());
+        assert_ne!(empty.generation_id, absent.generation_id);
+
+        let mut input = build_input();
+        input.config = Some(config_sources(""));
+        let populated = prepare_accepted_publication_v1(input, &limits).unwrap();
+        assert_eq!(populated.generation.counts.config_files, Some(4));
+        assert_ne!(populated.generation_id, empty.generation_id);
+        for generation in [&absent, &empty, &populated] {
+            validate_generation_v1(&generation.generation, &limits).unwrap();
+            let decoded: AcceptedPublicationGenerationV1 = serde_json::from_value(
+                serde_json::to_value(&generation.generation).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(decoded, generation.generation);
+        }
+
+        // Nested published scopes keep repository-relative names.
+        let mut input = build_input();
+        input.scope = scope("services/api");
+        input.knowledge = Vec::new();
+        input.gaps = Vec::new();
+        input.config = Some(config_sources("services/api/"));
+        prepare_accepted_publication_v1(input, &limits).unwrap();
+    }
+
+    #[test]
+    fn config_lane_refuses_foreign_paths_oversize_non_text_and_tampering() {
+        let limits = AcceptedPublicationLimits::default();
+        for filename in [
+            ".bro/brofiles/nested/reviewer.json",
+            ".bro/brofiles/.hidden.json",
+            ".bro/accounts.json",
+            ".bbox/knowledge/knowledge-a.json",
+            "services/api/.bbox/mcp.json",
+        ] {
+            let mut input = build_input();
+            input.config = Some(vec![AcceptedConfigSourceV1Input {
+                repository_relative_filename: filename.to_string(),
+                source_bytes: b"{}".to_vec(),
+            }]);
+            assert!(
+                prepare_accepted_publication_v1(input, &limits).is_err(),
+                "{filename} must not be accepted on the configuration lane"
+            );
+        }
+        for bytes in [
+            Vec::new(),
+            vec![0xff, 0xfe],
+            vec![b' '; bbox_knowledge_source::MAX_CONFIG_SOURCE_FILE_BYTES as usize + 1],
+        ] {
+            let mut input = build_input();
+            input.config = Some(vec![AcceptedConfigSourceV1Input {
+                repository_relative_filename: ".bbox/mcp.json".to_string(),
+                source_bytes: bytes,
+            }]);
+            assert!(prepare_accepted_publication_v1(input, &limits).is_err());
+        }
+        let mut input = build_input();
+        let mut duplicate = config_sources("");
+        duplicate.push(duplicate[0].clone());
+        input.config = Some(duplicate);
+        assert!(prepare_accepted_publication_v1(input, &limits).is_err());
+
+        let mut input = build_input();
+        input.config = Some(config_sources(""));
+        let prepared = prepare_accepted_publication_v1(input, &limits).unwrap();
+        let mut tampered = prepared.generation.clone();
+        let source = tampered
+            .config_sources
+            .as_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        source.source_bytes[0] ^= 1;
+        assert!(validate_generation_v1(&tampered, &limits).is_err());
+        let mut dropped = prepared.generation.clone();
+        dropped.config_sources = None;
+        assert!(
+            validate_generation_v1(&dropped, &limits).is_err(),
+            "dropping the lane must not validate against its stored hash and count"
+        );
     }
 
     #[test]

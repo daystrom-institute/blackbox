@@ -109,6 +109,7 @@ pub fn install_accepted_publication_for_test(
                 .collect(),
             graphs: Vec::new(),
             evidence: Vec::new(),
+            config: None,
             auto_advance: inherited_auto_advance,
             prior_pointer,
         },
