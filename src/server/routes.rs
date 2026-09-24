@@ -2499,6 +2499,95 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// A watcher publication parked on the view write lock holds the
+    /// manifest coordinator. A concurrent selector republish must serialize
+    /// behind it: lowering the fence first and swapping the view after the
+    /// watcher lets the watcher raise the fence and the republish then
+    /// overwrite the complete graph with the placeholder, which a reader
+    /// would take as complete.
+    #[test]
+    fn republish_interleaved_with_watcher_publish_never_exposes_placeholder_as_complete() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let edges_dir = edge_sidecar_dir(&state);
+        let (_cursor, published) = published_watcher_graph(&state);
+
+        // A reader polls the complete view for the whole interleaving. The
+        // fixture's rebuilt graph is non-empty, so an empty edge index can
+        // only be the placeholder.
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let state = state.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if let Ok(view) = state.complete_code_read_view() {
+                        assert!(
+                            view.edge_index.edge_count() > 0,
+                            "complete_code_read_view returned the placeholder as complete"
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Park the watcher's publish on the view write lock, inside the
+        // manifest coordinator.
+        let held = state.code_read_view.read();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let watcher = {
+            let state = state.clone();
+            let edges_dir = edges_dir.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                rebuild_edge_index_from_shared_at(&state, false, &edges_dir).unwrap();
+            })
+        };
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !watcher.is_finished(),
+            "precondition: the watcher publish must be parked on the view write lock"
+        );
+
+        // The republish starts while the watcher holds the coordinator.
+        let republish = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                super::super::code_source::republish_code_read_view(&state).unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !republish.is_finished(),
+            "precondition: the republish must wait behind the watcher publish"
+        );
+
+        drop(held);
+        watcher.join().unwrap();
+        republish.join().unwrap();
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+
+        // The republish ran last, so its lowered fence is what remains.
+        let Err(error) = state.complete_code_read_view() else {
+            panic!("the republish placeholder is readable as complete");
+        };
+        assert!(error.to_string().contains("error.edge_index_warming"));
+
+        // The next watcher publication restores the complete graph.
+        rebuild_edge_index_from_shared_at(&state, false, &edges_dir).unwrap();
+        let view = state.complete_code_read_view().unwrap();
+        assert_eq!(view.edge_index.edge_count(), published);
+    }
+
     fn signature_test_edge(kind: &str) -> edge_index::Edge {
         edge_index::Edge {
             source: entity_ref::EntityRef::Knowledge {
