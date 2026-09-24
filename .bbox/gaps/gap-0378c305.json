@@ -6,15 +6,20 @@
   "wanted_capability": "A connector profile for typed API datasets (Xero, Slack, and similar business systems): producer-side observation with named checkpoint sets, deterministic projection of accepted observations into connector-owned source graphs, declared targeted actions with typed inputs and placement policy, and status surfaces, so remote business systems become corpus-inspectable without forcing their domain objects into file trees or blackbox core types. The file-tree profile (remote store to manifest plus blobs over the collector wire) covers documents only; API datasets need semantic projection and action surfaces. Tracked by design/connectors/reflective-graph-connector-program.md.",
   "missing_primitive": "ConnectorSource observe/fetch_content/invoke contracts plus GraphProjection on the connector runtime",
   "evidence": [
-    "design/connectors/reflective-graph-connector-program.md",
-    "salvage branch campaign/reflective-graph-r2-projection (crates/bbox-connectors graph_projection donor code)"
+    "design/connectors/api-dataset-connector.md (lifecycle: proposed; dataset wire lane, satellite, projection, and action surface all new)",
+    "design/connectors/reflective-graph-connector-program.md M4 (file-tree and conversation transport landed; API-dataset proposed)",
+    "crates/bbox-source-graph (M2 projection substrate, not wired into the daemon)",
+    "no dataset source crate alongside crates/bbox-file-source and crates/bbox-conversation-source"
   ],
   "impact": "medium",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/connectors/api-dataset-connector-class",
   "suggested_owner": "blackbox",
   "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-11T00:00:00Z"
+  "updated_at": "2026-09-24T03:02:50Z",
+  "resolved_at": "2026-09-24T03:02:50Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/50"
 }

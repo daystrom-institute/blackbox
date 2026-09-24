@@ -1,21 +1,26 @@
 {
   "id": "gap-5d57d2bb",
-  "title": "Unified retrieval M9b-M9e outstanding: connector plane, provisional lane emission, evidence expansion, graph embeddings",
+  "title": "Unified retrieval M9b-M9d outstanding: connector plane, provisional lane emission, evidence expansion",
   "gap_kind": "ontology",
   "domain": "agentic-corpus/retrieval",
-  "wanted_capability": "Complete the remaining unified-retrieval milestones for reflective graph vertices. M9a is landed and verified (g13 project_graph_vertex docs with replace/purge write lane, GraphWordAuthority pre-ranking filter, graph identity on hybrid_search hits, find_paths traversal gates). Outstanding: M9b connector plane (search accepts graph_source=connector but the only prod doc builder hardcodes published); M9c provisional lane emission (provisional_project_graph_vertex ref type and find_paths filter exist, but no provisional docs are written outside tests); M9d evidence expansion and placed-chunk back-pointers (no expand_evidence implementation; EvidenceBindingSet only default() in tests); M9e schema-directed graph embeddings (no graph bucket, no vector retention). design/connectors/unified-retrieval.md still lifecycle: proposed.",
+  "wanted_capability": "Complete the remaining unified-retrieval milestones for reflective graph vertices (design/connectors/unified-retrieval.md sections 7.2-7.4). M9a (word-index participation, authority filter) and M9e (schema-directed graph embeddings, Bucket::Graph) are landed. Outstanding: M9b connector plane (hybrid search accepts graph_source=connector, but no daemon path builds connector-managed graph vertex documents; crates/bbox-source-graph is a workspace member only, not a dependency of the blackbox crate or bbox-indexing, and the connector read lane in ProjectGraphViewCatalog is exercised only by tests); M9c provisional lane emission (the provisional_project_graph_vertex ref type and find_paths filter exist, but crates/bbox-indexing/src/index/graph_docs.rs only writes provisional graph docs in tests); M9d evidence expansion and placed-chunk back-pointers (EvidenceBindingSet views exist in crates/bbox-indexing/src/project_graph_view.rs, but no expand_evidence on search results and no project_file back-pointer).",
   "fallback_used": "Exact-ref inspection and traversal of graph vertices; text search over the materialized files only.",
   "evidence": [
-    "design/connectors/reflective-graph-connector-program.md",
-    "design/corpus/agentic-corpus/reflective-project-graph.md (no full-text or vector indexing in v1)"
+    "design/connectors/unified-retrieval.md sections 7.2 M9b, 7.3 M9c, 7.4 M9d (lifecycle: proposed)",
+    "crates/bbox-indexing/src/index/graph_docs.rs (published_graph_vertex_documents is the only production builder)",
+    "crates/bbox-indexing/src/project_graph_view.rs (EvidenceBindingSet views, connector read lane)",
+    "crates/bbox-mcp-tools/src/mcp_tools/hybrid_search.rs (graph_source filter, no expand_evidence)",
+    "Cargo.toml (bbox-source-graph workspace member only)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "ontology/agentic-corpus/graph-retrieval-participation",
   "suggested_owner": "blackbox",
-  "notes": "Narrowed 2026-08-18 after Batch C verification at HEAD 075a0077: M9a confirmed landed (dff4faf6, 765707ca); original text claiming vertices wholly absent from retrieval is stale.",
-  "resolution": "unresolved",
+  "notes": "Triage: M9e landed in 373ff9e9 (was tracked by gap-58218542, now addressed); record narrowed to M9b-M9d, which remain unimplemented at 87d05123.",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-18T23:21:34Z"
+  "updated_at": "2026-09-24T03:02:49Z",
+  "resolved_at": "2026-09-24T03:02:49Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/49"
 }

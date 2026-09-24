@@ -3,18 +3,21 @@
   "title": "Project-graph vertices never embed: no vector route serves them despite embeddings_enabled and embed:true annotations",
   "gap_kind": "mcp_surface",
   "domain": "project-graph",
-  "wanted_capability": "Graph vertices whose schema properties carry embed:true (pg-campaigns: Idiom.statement, Decision.question, Directive.text, EndState.text, Finding.summary, Trigger.statement, Inquiry.question, Spike.hypothesis) should gain vector embeddings so bbox_hybrid_search's vector lane can rank them against prose competition. Observed: embedded_vertex_count stays 0 across multiple accepted generations (b71df430 through af7fe40e) with index_policy.embeddings_enabled true and the text index current; bbox_reembed exposes no project-graph route (valid routes: all, backfill, knowledge, code, docs, transcripts, git_message, notes, threads, agent_manifest) and an explicit backfill reembed changed nothing. Wanted: a project-graph embedding route wired into the publish/index cycle, or the graph vertices riding an existing route, plus bbox_reembed coverage.",
-  "fallback_used": "Text/BM25 lane only for graph retrieval (indexed_vertex_count current); findability calibration proceeds on the text lane and the campaign 46 search-annotations subunit stays gated on this gap for the vector half.",
+  "wanted_capability": "Graph vertices whose schema properties carry embed:true (in a consumer project's campaign graph, several claim-shaped vertex types) should gain vector embeddings so bbox_hybrid_search's vector lane can rank them against prose competition. Observed: embedded_vertex_count stayed 0 across multiple accepted generations with index_policy.embeddings_enabled true and the text index current; bbox_reembed exposed no project-graph route and an explicit backfill reembed changed nothing. Wanted: a project-graph embedding route wired into the publish/index cycle, or the graph vertices riding an existing route, plus bbox_reembed coverage.",
+  "fallback_used": "Text/BM25 lane only for graph retrieval; findability calibration proceeded on the text lane.",
   "evidence": [
-    "bbox_project_graph_describe pg-campaigns retrieval block: embedded_vertex_count 0 at accepted af7fe40ee6",
+    "bbox_project_graph_describe retrieval block on a consumer project's graph: embedded_vertex_count 0 at an accepted generation",
     "bbox_reembed route enumeration (no project_graph route)",
-    "planglobal thread-7b768d31 step 2"
+    "a campaign thread in another registered project"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/project-graph/vertex-embeddings-never-produced",
-  "notes": "2026-08-19 follow-up: the consumer-note item is done. Cage embed.toml now routes graph = \"voyage_text\" explicitly (bbox-cage commit 949baaa, ConfigMap converged, daemon replaced); all 312 graph vectors re-embedded on voyage-4-large into the shared voyage_text partition, verified with the same paraphrase probe (idiom/delete-then-insert@1 #1, vector-only), and the orphaned legacy `voyage` partition (voyage-voyage-code-3-1024-0103683e) was pruned via bbox_embed_partitions. Nothing pending on this gap.",
-  "resolution": "unresolved",
+  "notes": "Follow-up: the consumer embed config routes graph vertices to the shared text partition; all graph vectors were re-embedded and verified with a paraphrase probe, and the orphaned legacy partition was pruned via bbox_embed_partitions. Nothing pending on this gap.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-08-18T09:25:55Z",
-  "updated_at": "2026-08-19T22:04:14Z"
+  "updated_at": "2026-09-24T03:03:14Z",
+  "resolved_at": "2026-09-24T03:01:54Z",
+  "resolution_note": "obsolete: graph embed route landed in 373ff9e9 (Bucket::Graph route \"graph\" in crates/bbox-embed/src/embed/mod.rs, install-time enqueue and bbox_reembed(route=graph) backfill in src/embed_runtime.rs, embedded_vertex_count on bbox_project_graph_describe); design/connectors/unified-retrieval.md 7.5 M9e marked landed"
 }
