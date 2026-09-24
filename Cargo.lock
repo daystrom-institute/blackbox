@@ -1470,6 +1470,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bbox-chunker",
  "bbox-corpus-core",
  "bbox-gaps",
  "bbox-knowledge",
