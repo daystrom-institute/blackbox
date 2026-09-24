@@ -1,0 +1,20 @@
+{
+  "id": "6fbce8338e9b4f9e",
+  "title": "Blackbox work pipeline automations are maintained from ~/.config/bbox-automation",
+  "content": "The scheduled Orca automations that run the blackbox work pipeline (gap triage, issue review, design review, dispatcher, PR review, weekly review) are operator-local. Their prompts, prechecks, helper scripts, and the pipeline contract (issue Status and labels, PR labels and commit statuses, stage eligibility, merge rule, operator return paths) live in ~/.config/bbox-automation/. Read its AGENTS.md before changing any automation, prompt, pipeline label, or project Status. Orca stores its own copy of each prompt and precheck: edit the file, apply it with `orca automations edit`, and confirm the stored copy matches.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "project_id": "89bd722f",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-09-24T14:57:18Z",
+  "updated_at": "2026-09-24T14:57:18Z",
+  "recall_count": 0
+}
