@@ -4338,9 +4338,9 @@ mod tests {
         );
         let pending = server.state.checkout_mutations.read();
         assert_eq!(pending.pending_count(), 1);
-        let (mutations, deferred) = pending.poll(&std::collections::BTreeSet::from([scope]));
-        assert_eq!(deferred, 0);
-        let mutation = &mutations[0];
+        let poll = pending.poll(&std::collections::BTreeSet::from([scope]), false);
+        assert_eq!(poll.deferred, 0);
+        let mutation = &poll.mutations[0];
         assert_eq!(mutation.mode, "write");
         assert!(mutation.relative_path.starts_with(".bbox/gaps/gap-"));
         let content = mutation.content_json.as_deref().unwrap();
@@ -4600,6 +4600,7 @@ mod tests {
                 logical_bytes: 0,
                 page_count: 0,
             },
+            config: None,
         };
         let authority = PublicationAuthorityV1 {
             producer_id: "producer-a".into(),
@@ -4948,6 +4949,7 @@ mod tests {
                     logical_bytes: 0,
                     page_count: 0,
                 },
+                config: None,
             };
             let authority = PublicationAuthorityV1 {
                 producer_id: producer_id.into(),
@@ -5110,6 +5112,7 @@ mod tests {
                     logical_bytes: 0,
                     page_count: 0,
                 },
+                config: None,
             };
             let authority = PublicationAuthorityV1 {
                 producer_id: "producer-a".into(),

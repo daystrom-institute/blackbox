@@ -280,8 +280,8 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone()]))
-        .0;
+        .poll(&BTreeSet::from([scope.clone()]), false)
+        .mutations;
     for row in rows {
         server
             .state
@@ -427,8 +427,8 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone()]))
-        .0;
+        .poll(&BTreeSet::from([scope.clone()]), false)
+        .mutations;
     assert_eq!(rows.last().unwrap().mode, "delete");
     for row in rows {
         restarted
@@ -801,8 +801,8 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone()]))
-        .0;
+        .poll(&BTreeSet::from([scope.clone()]), false)
+        .mutations;
     for row in rows {
         server
             .state
@@ -847,8 +847,8 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone()]))
-        .0[0]
+        .poll(&BTreeSet::from([scope.clone()]), false)
+        .mutations[0]
         .clone();
     let created: KnowledgeEntry =
         serde_json::from_str(create.content_json.as_deref().unwrap()).unwrap();
@@ -876,8 +876,8 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone()]))
-        .0[0]
+        .poll(&BTreeSet::from([scope.clone()]), false)
+        .mutations[0]
         .clone();
     assert_eq!(delete.mode, "delete");
     server
@@ -1082,8 +1082,8 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
         .state
         .checkout_mutations
         .read()
-        .poll(&BTreeSet::from([scope.clone(), broken_scope]))
-        .0;
+        .poll(&BTreeSet::from([scope.clone(), broken_scope]), false)
+        .mutations;
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| row.scope == scope));
     assert_eq!(rows.last().unwrap().mode, "delete");
