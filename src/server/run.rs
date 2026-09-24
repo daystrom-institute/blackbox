@@ -76,8 +76,8 @@ pub async fn run() -> anyhow::Result<()> {
     // Select the harness executor BEFORE anything can dispatch. Default is
     // fleetd, so a worker outlives this daemon process; `BLACKBOX_EXECUTOR=local`
     // (or `daemon.executor = "local"`) is the explicit escape back to
-    // daemon-child workers. Installing here also arms fleetd re-adoption: the
-    // first connection re-attaches whatever survived our restart.
+    // daemon-child workers. Installing here also arms fleetd re-adoption, which
+    // starts once the listener is bound and background state is restored.
     crate::orchestration::install_configured_harness_executor(
         cfg.daemon.executor,
         store_dir.clone(),
@@ -100,6 +100,9 @@ pub async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
 
     start_background_tasks(shared.clone()).await?;
+    // Dial fleetd and re-attach whatever survived our restart now, rather than
+    // on the first dispatch. Never blocks or fails startup.
+    crate::orchestration::start_harness_readoption();
 
     // MCP service
     let ct = CancellationToken::new();

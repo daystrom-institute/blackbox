@@ -197,10 +197,13 @@ load-bearing.
 Whichever of the two starts first creates the token; the other loads it. If
 you ever delete it, stop both, delete it, and start `fleetd` first.
 
-**Re-adoption.** On every connect, first dial or reconnect, the daemon asks
-`fleetd` what it is holding and reattaches each session the task store knows,
-replaying from that task's own durable ingest cursor. So a restart looks like
-this in the log:
+**Re-adoption.** The daemon dials `fleetd` as soon as it starts, without
+waiting for a dispatch, and on every connect (that first dial or a reconnect)
+asks `fleetd` what it is holding and reattaches each session the task store
+knows, replaying from that task's own durable ingest cursor. No dispatch or
+resume is served on a new connection until that sweep has finished. An
+unreachable `fleetd` at startup is logged and does not stop the daemon; the
+next dispatch dials again. So a restart looks like this in the log:
 
 ```text
 connected to fleetd
@@ -208,11 +211,19 @@ re-adopting a fleetd session; replaying from our cursor
 fleetd replay complete; session is live
 ```
 
-Two behaviors worth knowing:
+Behaviors worth knowing:
 
 - A task the previous daemon marked `Failed` at load with "server restarted
   while task was running" flips **back** to `Running` when its session is
   re-adopted, and that notice is stripped. The child never died; the daemon did.
+- `bro_resume` on a session whose task is running, re-adopted or not, does not
+  spawn. It returns the running task id with the `bro_wait` and `bro_cancel`
+  calls to use instead.
+- A known task whose live session is **declined** (its workspace binding cannot
+  be restored) keeps `Failed`, but the restart notice is replaced by one naming
+  the reason and saying the worker is still live under `fleetd`, and the task
+  is no longer marked resumable. The worker keeps running; stop it by hand if
+  it is no longer wanted.
 - A session `fleetd` reports that the task store does **not** know (a TTL reap,
   a wiped store) is logged loudly and **left running**. It is never killed:
   killing work the daemon merely forgot is worse than leaking a process. Kill

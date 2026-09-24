@@ -860,6 +860,10 @@ impl BlackboxServer {
             .as_ref()
             .map(|a| a.identity.task_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // A worker re-adopted from fleetd is running again only once the
+        // sweep that reattaches it finishes; checking liveness before then
+        // would let this resume spawn onto the live supervision key.
+        orch::harness_readoption_settled().await;
         let resume_lease = match try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),
@@ -4843,6 +4847,46 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"synthetic provider ref
                 assert!(inner.recoverable);
             }
         }
+    }
+
+    /// A session whose task is running is returned to the caller, with how
+    /// to wait on or cancel it, before any spawn, even though the in-memory
+    /// resume lease is free (as it is after every restart).
+    #[tokio::test]
+    async fn bro_resume_returns_the_running_task_for_its_session_before_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let task = orch::test_task("live", orch::TaskStatus::Running, Provider::Glm);
+        task.inner.lock().origin = bro_core::Origin::AgentDispatch;
+        let session_id = task.inner.lock().session_id.clone();
+        server
+            .state
+            .task_store
+            .write()
+            .insert("live".into(), task)
+            .unwrap();
+        assert!(
+            server
+                .state
+                .resume_leases
+                .try_acquire(Provider::Glm, &session_id)
+                .is_some(),
+            "the lease is free"
+        );
+
+        let p = serde_json::from_value(json!({
+            "prompt": "continue", "session_id": session_id, "provider": "glm",
+        }))
+        .unwrap();
+        let result = server.bro_resume(Parameters(p)).await;
+        let text = call_result_text(&result);
+        assert_eq!(result.is_error, Some(true), "{text}");
+        assert!(
+            text.contains(r#"bro_wait(task_id="live""#)
+                && text.contains(r#"bro_cancel(task_id="live")"#),
+            "{text}"
+        );
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
     }
 
     #[tokio::test]

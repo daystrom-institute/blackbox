@@ -207,20 +207,34 @@ pub(crate) fn cleanup_policy_file_when_done(
     });
 }
 
+/// Single-flight admission for a resume of `(provider, session_id)`.
+///
+/// A session whose task is running is refused before the lease is consulted:
+/// the lease registry is in memory and starts empty after a restart, while a
+/// task re-adopted from fleetd is running again. Either way the caller gets
+/// the live task id and how to wait on or cancel it, never a second spawn
+/// onto the live session.
 pub(crate) fn try_acquire_resume_lease(
     task_store: &RwLock<TaskStore>,
     leases: &orchestration::resume_lease::ResumeLeaseRegistry,
     provider: Provider,
     session_id: &str,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if let Some(running_task) = running_task_for_session(task_store, provider, session_id) {
+        return Err(live_session_refusal(provider, session_id, &running_task));
+    }
     if let Some(lease) = leases.try_acquire(provider, session_id) {
         return Ok(lease);
     }
     let running_task = running_task_for_session(task_store, provider, session_id)
         .unwrap_or_else(|| "<unknown>".to_string());
-    Err(format!(
-        "session {session_id} for provider {provider} already has an in-flight resume task ({running_task}). Wait for it with bro_wait(task_id=\"{running_task}\", timeout_seconds=120) or cancel it with bro_cancel(task_id=\"{running_task}\") before calling bro_resume again."
-    ))
+    Err(live_session_refusal(provider, session_id, &running_task))
+}
+
+fn live_session_refusal(provider: Provider, session_id: &str, running_task: &str) -> String {
+    format!(
+        "session {session_id} for provider {provider} is already live in task {running_task}. Wait for it with bro_wait(task_id=\"{running_task}\", timeout_seconds=120) or cancel it with bro_cancel(task_id=\"{running_task}\") before calling bro_resume again."
+    )
 }
 
 pub(crate) fn running_task_for_session(

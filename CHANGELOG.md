@@ -8,6 +8,13 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Workers that survive a daemon restart under fleetd are re-adopted at daemon
+  startup instead of on the next dispatch, so their tasks read as running and
+  resume ingesting from the durable cursor with no manual step. `bro_resume`
+  on a session whose task is running now returns that task id with `bro_wait`
+  and `bro_cancel` guidance instead of spawning onto the live worker, including
+  right after a restart. A live worker whose re-adoption is declined is
+  reported on its task, which stops recommending `bro_resume`.
 - Project indexing passes are substantially faster on large projects. Three
   hot spots in the per-project index pass were fixed: the code-edge derivation
   compiled two regexes for every chunk, the chunker recounted newlines from

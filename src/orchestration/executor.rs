@@ -198,6 +198,16 @@ pub trait HarnessExecutor: Send + Sync {
 
     /// Spawn the worker described by `spec` and return its handle.
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle>;
+
+    /// Begin reattaching workers that outlived the previous daemon, called
+    /// once at daemon startup. Returns without waiting for the work; an
+    /// executor whose workers die with the daemon has nothing to do.
+    fn start_readoption(self: Arc<Self>) {}
+
+    /// Wait until no re-adoption sweep is in progress, so a caller deciding
+    /// whether a session is live reads the task store after any surviving
+    /// worker has been reattached to it.
+    async fn readoption_settled(&self) {}
 }
 
 /// Executes workers as direct child processes of the daemon on the local host.

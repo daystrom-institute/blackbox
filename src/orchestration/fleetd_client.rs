@@ -31,8 +31,10 @@
 //!
 //! ## Re-adoption
 //!
-//! Losing the connection is not session death on either side. After every
-//! successful connect (first dial or reconnect) the client asks
+//! Losing the connection is not session death on either side. Daemon startup
+//! dials without waiting for a dispatch
+//! ([`FleetdExecutor::spawn_startup_readoption`]), and after every successful
+//! connect (first dial or reconnect) the client asks
 //! `ListSessions` and hands each row fleetd still holds back to
 //! [`super::readopt_harness_session`], which reattaches the live task to fresh
 //! ingest/terminal plumbing and returns the task's durable ingest cursor. The
@@ -40,7 +42,9 @@
 //! every event it had not durably ingested and no event twice. Sessions fleetd
 //! reports that the task store does not know are logged loudly and left
 //! running: killing an orphan the daemon merely forgot would destroy work, and
-//! fleetd GCs terminal sessions on its own once acked.
+//! fleetd GCs terminal sessions on its own once acked. The sweep runs under the
+//! connection lock, so no caller holds a lane on a connection whose live
+//! sessions are not yet reattached.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -392,9 +396,12 @@ impl Shared {
 /// Executes workers as children of fleetd, over its Unix domain socket.
 pub struct FleetdExecutor {
     shared: Arc<Shared>,
-    /// Held across a dial so two concurrent dispatches cannot race two
-    /// connections into existence (the second would fence the first out).
-    connection: tokio::sync::Mutex<Option<Connection>>,
+    /// Held across a dial and its re-adoption sweep, so two concurrent
+    /// dispatches cannot race two connections into existence (the second
+    /// would fence the first out) and no caller gets a lane before the sweep
+    /// has reattached the new connection's live sessions. Shared so the
+    /// startup sweep can claim it before its task is scheduled.
+    connection: Arc<tokio::sync::Mutex<Option<Connection>>>,
 }
 
 impl FleetdExecutor {
@@ -407,7 +414,7 @@ impl FleetdExecutor {
                 workspace_waiters: Mutex::new(HashMap::new()),
                 message_counter: AtomicU64::new(0),
             }),
-            connection: tokio::sync::Mutex::new(None),
+            connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -416,20 +423,27 @@ impl FleetdExecutor {
     /// returning, so a caller that gets a lane is talking to a fleetd whose
     /// live sessions are already reattached.
     async fn lane(&self) -> anyhow::Result<Lane> {
-        let mut guard = self.connection.lock().await;
-        if let Some(connection) = guard.as_ref()
-            && connection.is_alive()
-        {
-            return Ok(connection.lane());
-        }
-        let connection = self.dial().await?;
-        let lane = connection.lane();
-        *guard = Some(connection);
-        drop(guard);
+        let mut connection = self.connection.lock().await;
+        self.lane_locked(&mut connection).await
+    }
 
-        // Re-adoption runs outside the connection lock: it awaits a
-        // ListSessions round trip, and holding the lock across that would
-        // serialize every concurrent dispatch behind it for no reason.
+    /// [`Self::lane`] for a caller already holding the connection lock.
+    ///
+    /// Re-adoption runs under the lock: a concurrent caller that finds the
+    /// fresh connection installed would otherwise get a lane (and could
+    /// spawn onto a supervision key) before the sweep reattached the live
+    /// sessions behind it. Only a new connection pays for the round trip; a
+    /// live one returns immediately.
+    async fn lane_locked(&self, connection: &mut Option<Connection>) -> anyhow::Result<Lane> {
+        if let Some(live) = connection.as_ref()
+            && live.is_alive()
+        {
+            return Ok(live.lane());
+        }
+        let fresh = self.dial().await?;
+        let lane = fresh.lane();
+        *connection = Some(fresh);
+
         if let Err(error) = readopt_live_sessions(&self.shared, &lane).await {
             tracing::warn!(
                 %error,
@@ -438,6 +452,37 @@ impl FleetdExecutor {
             );
         }
         Ok(lane)
+    }
+
+    /// Dial fleetd and run the re-adoption sweep at daemon startup, without
+    /// waiting for a dispatch to force the connect.
+    ///
+    /// The connection lock is claimed before the task is spawned, so any
+    /// dispatch or resume that arrives while the sweep is pending waits for
+    /// it instead of dialing its own connection. The returned task never
+    /// fails startup: an unreachable fleetd (local or remote) is logged and
+    /// the next [`Self::lane`] retries the dial.
+    pub fn spawn_startup_readoption(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let claimed = self.connection.clone().try_lock_owned().ok();
+        let executor = self.clone();
+        tokio::spawn(async move {
+            let mut connection = match claimed {
+                Some(connection) => connection,
+                None => executor.connection.clone().lock_owned().await,
+            };
+            match executor.lane_locked(&mut connection).await {
+                Ok(lane) => tracing::info!(
+                    generation = lane.generation,
+                    "fleetd connected at startup; surviving sessions re-adopted"
+                ),
+                Err(error) => tracing::warn!(
+                    endpoint = %executor.shared.config.endpoint.label(),
+                    %error,
+                    "fleetd unreachable at startup; surviving sessions will be \
+                     re-adopted when the next dispatch connects"
+                ),
+            }
+        })
     }
 
     /// Connect, authenticate, and start the connection actor.
@@ -585,6 +630,16 @@ impl HarnessExecutor for FleetdExecutor {
 
     fn worker_locality(&self) -> Option<&WorkerLocality> {
         self.shared.config.worker_locality.as_ref()
+    }
+
+    fn start_readoption(self: Arc<Self>) {
+        self.spawn_startup_readoption();
+    }
+
+    /// A dial and its sweep hold the connection lock, so acquiring it once
+    /// is exactly "no sweep is in progress".
+    async fn readoption_settled(&self) {
+        drop(self.connection.lock().await);
     }
 
     /// Inspection is a read-only, idempotent probe, so a failed attempt
@@ -1518,6 +1573,9 @@ mod tests {
         /// heartbeat alike, the shape of a silently dead peer.
         answer_lists: bool,
         inspections: InspectionScript,
+        /// Hold each `ListSessions` answer this long: a slow re-adoption
+        /// sweep, so lane ordering against it is observable.
+        list_delay: Duration,
     }
 
     impl Default for Script {
@@ -1525,6 +1583,7 @@ mod tests {
             Self {
                 answer_lists: true,
                 inspections: InspectionScript::Answer,
+                list_delay: Duration::ZERO,
             }
         }
     }
@@ -1636,6 +1695,7 @@ mod tests {
                         if !self.script.answer_lists {
                             continue;
                         }
+                        tokio::time::sleep(self.script.list_delay).await;
                         let sessions = self.sessions.lock().clone();
                         reply(
                             &mut io,
@@ -2387,6 +2447,7 @@ mod tests {
             Script {
                 answer_lists: false,
                 inspections: InspectionScript::Answer,
+                ..Script::default()
             },
         );
         let executor = FleetdExecutor::new(fast_config(dir.path()));
@@ -2422,6 +2483,7 @@ mod tests {
             Script {
                 answer_lists: true,
                 inspections: InspectionScript::Silent,
+                ..Script::default()
             },
         );
         let mut config = fast_config(dir.path());
@@ -2471,6 +2533,7 @@ mod tests {
             Script {
                 answer_lists: true,
                 inspections: InspectionScript::SilentFirstConnection,
+                ..Script::default()
             },
         );
         let mut config = fast_config(dir.path());
@@ -2486,6 +2549,121 @@ mod tests {
             fake.inspections.lock().len(),
             2,
             "first attempt timed out, retry was answered"
+        );
+    }
+
+    /// Startup dials without a dispatch, and a caller arriving while that
+    /// connection's sweep is still waiting on `ListSessions` gets its lane
+    /// only after the sweep finished: the dead slot is already reconciled
+    /// and nobody dialed a second connection.
+    #[tokio::test]
+    async fn startup_sweep_finishes_before_a_concurrent_caller_gets_a_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            vec![],
+            ReplayScript::Silent,
+            Script {
+                list_delay: Duration::from_millis(300),
+                ..Script::default()
+            },
+        );
+        let executor = Arc::new(FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path())));
+        let _outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
+
+        let startup = executor.spawn_startup_readoption();
+        executor.lane().await.unwrap();
+        assert!(
+            !slot_present(&executor, "sess-forgotten"),
+            "the lane was handed out before the startup sweep reconciled its sessions"
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.lists.load(Ordering::SeqCst), 1);
+        startup.await.unwrap();
+    }
+
+    /// The same ordering between two dispatches racing a fresh dial: the one
+    /// that waited on the lock is not served ahead of the sweep.
+    #[tokio::test]
+    async fn concurrent_callers_wait_for_the_new_connections_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            vec![],
+            ReplayScript::Silent,
+            Script {
+                list_delay: Duration::from_millis(300),
+                ..Script::default()
+            },
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
+
+        let observe = async {
+            executor.lane().await.unwrap();
+            slot_present(&executor, "sess-forgotten")
+        };
+        let (first, second) = tokio::join!(observe, async {
+            executor.lane().await.unwrap();
+            slot_present(&executor, "sess-forgotten")
+        });
+        assert!(
+            !first && !second,
+            "a lane was served before the sweep finished"
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+    }
+
+    /// An unreachable fleetd at startup is logged, never fatal, and leaves
+    /// the connection slot empty so the next lane dials again.
+    #[tokio::test]
+    async fn unreachable_fleetd_at_startup_leaves_the_next_lane_to_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetdConfig::in_state_dir(dir.path());
+        config.binary = Some(dir.path().join("definitely-not-a-supervisor"));
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        executor.spawn_startup_readoption().await.unwrap();
+        assert!(executor.connection.lock().await.is_none());
+
+        let fake = FakeFleetd::serve(dir.path(), vec![], ReplayScript::Silent);
+        executor.lane().await.unwrap();
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.lists.load(Ordering::SeqCst),
+            1,
+            "the retry ran the sweep"
+        );
+    }
+
+    /// A remote endpoint that refuses the connection is the same: startup
+    /// completes, nothing is auto-started, and no token is synthesized.
+    #[tokio::test]
+    async fn unreachable_remote_fleetd_at_startup_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let token = root.join("missing-fleetd.token");
+        let config = FleetdConfig::resolve(
+            &root,
+            Some(&format!("tcp://{address}")),
+            Some(&token),
+            Some(&root),
+            Some(&root),
+        )
+        .unwrap();
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        executor.spawn_startup_readoption().await.unwrap();
+        assert!(executor.connection.lock().await.is_none());
+        assert!(!token.exists(), "remote token must never be synthesized");
+        let error = executor.lane().await.err().expect("still unreachable");
+        assert!(
+            error
+                .to_string()
+                .contains("Remote fleetd is never auto-started")
         );
     }
 }

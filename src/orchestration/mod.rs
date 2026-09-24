@@ -185,6 +185,21 @@ fn harness_executor_storage() -> &'static OnceLock<Arc<dyn executor::HarnessExec
     &EXECUTOR
 }
 
+/// Start reattaching workers that outlived the previous daemon, without
+/// waiting for a dispatch to connect. Call once at daemon startup, after
+/// [`install_configured_harness_executor`]; it returns immediately and never
+/// fails startup. The local executor has nothing to reattach.
+pub fn start_harness_readoption() {
+    harness_executor().clone().start_readoption();
+}
+
+/// Wait out any in-progress re-adoption sweep, so a session-liveness check
+/// against the task store sees tasks the sweep is about to put back to
+/// running.
+pub(crate) async fn harness_readoption_settled() {
+    harness_executor().readoption_settled().await;
+}
+
 fn harness_worker_locality() -> Option<executor::WorkerLocality> {
     harness_executor().worker_locality().cloned()
 }
@@ -260,7 +275,8 @@ pub struct ReadoptedSession {
 /// `None` means "not ours": either the task store never knew this task (a TTL
 /// reap, a wiped store, another daemon's session) or it is already terminal, in
 /// which case there is nothing left to publish. The caller leaves those alone
-/// rather than killing them.
+/// rather than killing them. A known task whose workspace binding cannot be
+/// restored is declined too, and the decline is recorded on the task.
 ///
 /// A task the previous daemon left `Running` was flipped to `Failed`
 /// (`recoverable: true`) by `TaskStore::load` unless owner-managed. Re-adoption puts it back to
@@ -301,6 +317,13 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                     workspace_id = %workspace_id,
                     "refusing workspace-bound session re-adoption without binding authority"
                 );
+                record_declined_readoption(
+                    &task,
+                    state,
+                    pid,
+                    "this daemon has no workspace binding authority to restore its \
+                     workspace binding",
+                );
                 return None;
             };
             let identity = bro_protocol::WorkerWorkspaceIdentity {
@@ -315,6 +338,12 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                     error = %error,
                     "refusing mismatched workspace-bound session re-adoption"
                 );
+                record_declined_readoption(
+                    &task,
+                    state,
+                    pid,
+                    &format!("its workspace binding could not be restored ({error})"),
+                );
                 return None;
             }
         }
@@ -323,6 +352,12 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                 session_id = %session_id,
                 task_id = %task_id,
                 "refusing workspace binding token without complete workspace identity"
+            );
+            record_declined_readoption(
+                &task,
+                state,
+                pid,
+                "fleetd reported a workspace binding without a complete workspace identity",
             );
             return None;
         }
@@ -397,6 +432,51 @@ fn strip_restart_notice(stderr: &mut String) {
     if let Some(start) = stderr.find(RESTART_NOTICE_PREFIX) {
         stderr.truncate(start);
     }
+}
+
+/// Replaces the restart notice on a task whose live worker was not re-adopted.
+/// Deliberately not a prefix match for [`RESTART_NOTICE_PREFIX`].
+const READOPTION_DECLINED_PREFIX: &str =
+    "\n[blackbox] server restarted while task was running and did not re-adopt its live worker:";
+
+/// Report a declined re-adoption on the task it concerns.
+///
+/// The restart notice `TaskStore::load` appended recommends `bro_resume`,
+/// which would collide with the worker fleetd is still running under the
+/// same supervision key. The task says why it was not reattached instead, and
+/// stops advertising a resume, exactly as `TaskStore::load` already does for
+/// owner-managed tasks. Only the startup-flipped record is rewritten: a task
+/// that is running, already terminal, or already carries this notice is left
+/// alone, and a worker fleetd reports as exited is not live, so its record
+/// keeps the ordinary resume advice.
+fn record_declined_readoption(
+    task: &Task,
+    state: bro_protocol::SessionState,
+    pid: Option<u32>,
+    reason: &str,
+) {
+    if state != bro_protocol::SessionState::Running {
+        return;
+    }
+    {
+        let mut inner = task.inner.lock();
+        if inner.status == TaskStatus::Running
+            || !inner.recoverable
+            || !inner.stderr.contains(RESTART_NOTICE_PREFIX)
+        {
+            return;
+        }
+        strip_restart_notice(&mut inner.stderr);
+        let pid = pid.map(|pid| format!(" as pid {pid}")).unwrap_or_default();
+        inner.stderr.push_str(&format!(
+            "{READOPTION_DECLINED_PREFIX} {reason}. The worker is still live under fleetd{pid}, \
+             but this task no longer tracks it. bro_resume is unavailable while it runs, \
+             because a resume would collide with the live worker; let it finish, or stop it \
+             by hand if it is no longer wanted."
+        ));
+        inner.recoverable = false;
+    }
+    task.emit_roster_updated();
 }
 
 fn harness_controls() -> &'static RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Value>>>
@@ -7166,6 +7246,152 @@ mod tests {
             harness_killers().read().contains_key("adopt-task"),
             "cancel must reach the re-adopted child"
         );
+    }
+
+    struct MismatchedWorkspaceBindingAuthority;
+
+    impl WorkspaceBindingAuthority for MismatchedWorkspaceBindingAuthority {
+        fn candidate_scopes(&self) -> anyhow::Result<Vec<bro_protocol::WorkerWorkspaceScope>> {
+            Ok(Vec::new())
+        }
+
+        fn mint(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _identity: &bro_protocol::WorkerWorkspaceIdentity,
+        ) -> anyhow::Result<MintedWorkspaceBinding> {
+            anyhow::bail!("not used")
+        }
+
+        fn restore(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _identity: &bro_protocol::WorkerWorkspaceIdentity,
+            _token: &bro_protocol::WorkspaceBindingToken,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("binding does not match the recorded workspace")
+        }
+
+        fn revoke_task(&self, _task_id: &str) {}
+    }
+
+    /// A known task whose re-adoption is declined must say so on its own
+    /// record: the restart notice advising `bro_resume` is replaced by the
+    /// decline reason and the fact that the worker is still live, and the task
+    /// stops advertising a resume. A worker fleetd reports as exited is not
+    /// live, so that record keeps the ordinary resume advice.
+    #[tokio::test]
+    async fn declined_readoption_replaces_the_restart_notice_on_the_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let restart_notice = "\n[blackbox] server restarted while task was running. \
+             The provider session is still on disk; retry with \
+             `bro_resume(session_id=...)` to continue the conversation \
+             rather than starting a fresh session.";
+        let mut tasks = Vec::new();
+        for id in ["live", "exited"] {
+            let task = spawn_in_process_task(
+                format!("{id}-task"),
+                Provider::Glm,
+                format!("{id}-session"),
+                None,
+                root.clone(),
+                store.clone(),
+                tail_tx.clone(),
+                None,
+                None,
+                None,
+                None,
+                bro_core::Origin::AgentDispatch,
+            );
+            store
+                .write()
+                .insert_reserved(format!("{id}-task"), task.clone())
+                .ok();
+            {
+                let mut inner = task.inner.lock();
+                inner.status = TaskStatus::Failed;
+                inner.recoverable = true;
+                inner.completed_at = Some(now_ms());
+                inner.stderr.push_str(restart_notice);
+            }
+            tasks.push(task);
+        }
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root,
+            store,
+            tail_tx,
+            None,
+            Some(Arc::new(MismatchedWorkspaceBindingAuthority)),
+        );
+
+        let readopt = |id: &str, state| {
+            let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+            let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            readopt_harness_session(ReadoptedSession {
+                session_id: format!("{id}-session"),
+                task_id: format!("{id}-task"),
+                workspace_id: Some(
+                    bro_core::WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                ),
+                workspace_scope: Some(
+                    bro_protocol::WorkerWorkspaceScope::try_new("test-repo", ".").unwrap(),
+                ),
+                workspace_binding_token: Some(
+                    bro_protocol::WorkspaceBindingToken::parse("b".repeat(64)).unwrap(),
+                ),
+                pid: Some(4242),
+                state,
+                control: control_tx,
+                killer: executor::WorkerKill::via_fleetd(
+                    format!("{id}-session"),
+                    tokio::sync::mpsc::unbounded_channel().0,
+                ),
+                events: events_rx,
+                outcome: outcome_rx,
+            })
+        };
+
+        assert_eq!(readopt("live", bro_protocol::SessionState::Running), None);
+        let inner = tasks[0].inner.lock();
+        assert_eq!(inner.status, TaskStatus::Failed);
+        assert!(
+            !inner.recoverable,
+            "a declined live worker is not resumable"
+        );
+        assert!(
+            !inner.stderr.contains(RESTART_NOTICE_PREFIX)
+                && !inner.stderr.contains("bro_resume(session_id"),
+            "the restart notice must not keep recommending bro_resume: {}",
+            inner.stderr
+        );
+        assert!(
+            inner.stderr.contains(READOPTION_DECLINED_PREFIX)
+                && inner
+                    .stderr
+                    .contains("binding does not match the recorded workspace")
+                && inner.stderr.contains("still live under fleetd as pid 4242"),
+            "the decline reason and the live worker are on the record: {}",
+            inner.stderr
+        );
+        let declined = inner.stderr.clone();
+        drop(inner);
+        assert!(!harness_killers().read().contains_key("live-task"));
+
+        // A second sweep (a reconnect) declines again without stacking notices.
+        assert_eq!(readopt("live", bro_protocol::SessionState::Running), None);
+        assert_eq!(tasks[0].inner.lock().stderr, declined);
+
+        assert_eq!(readopt("exited", bro_protocol::SessionState::Exited), None);
+        let inner = tasks[1].inner.lock();
+        assert!(inner.recoverable);
+        assert!(inner.stderr.ends_with(restart_notice), "{}", inner.stderr);
     }
 
     /// A session fleetd holds that the task store never heard of is declined,
