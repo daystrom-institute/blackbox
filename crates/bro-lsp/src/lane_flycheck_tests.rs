@@ -5,7 +5,8 @@
 //! actually received; and a real rust-analyzer run with a recording `CARGO`
 //! wrapper that proves flycheck is observable under defaults and absent in
 //! lane mode while native analysis and host build data keep working. The
-//! real-server tests skip when no rust-analyzer binary resolves.
+//! real-server tests resolve the toolchain first, then run under a temporary
+//! home, XDG and Cargo state; they skip when no rust-analyzer binary resolves.
 
 // Test-only module that writes fixture trees and reads fake-server records.
 // The blocking-I/O lint guards production actor contexts (concurrency-model
@@ -503,8 +504,8 @@ struct CargoRecorder {
 }
 
 impl CargoRecorder {
-    fn new(dir: &Path) -> Self {
-        let real = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    fn new(dir: &Path, toolchain: &Toolchain) -> Self {
+        let real = toolchain.bin().join("cargo");
         let wrapper = dir.join("recording-cargo");
         let log = dir.join("cargo.log");
         write_executable(
@@ -521,6 +522,7 @@ fi
 exec '{real}' "$@"
 "#,
                 log = log.display(),
+                real = real.display(),
             ),
         );
         Self { wrapper, log }
@@ -558,34 +560,133 @@ fn is_flycheck(args: &str) -> bool {
     words.next() == Some("check") && !words.any(|word| word == "--quiet")
 }
 
-fn rust_analyzer_bin() -> Option<PathBuf> {
-    let runs = |path: &OsStr| {
-        std::process::Command::new(path)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    };
-    if let Some(path) = env_path("BRO_LSP_RUST_ANALYZER_BIN")
-        .or_else(|| env_path("BRO_RUST_ANALYZER_BIN"))
-        .or_else(|| env_path("BLACKBOX_RUST_ANALYZER_BIN"))
-        .filter(|path| runs(path.as_os_str()))
-    {
-        return Some(path);
-    }
-    if runs(OsStr::new("rust-analyzer")) {
-        return Some(PathBuf::from("rust-analyzer"));
-    }
-    let cargo_bin = dirs::home_dir()?.join(".cargo/bin/rust-analyzer");
-    runs(cargo_bin.as_os_str()).then_some(cargo_bin)
+/// Toolchain executables resolved from the ambient environment before a
+/// real-server test isolates it. The isolated run then reaches the compiler
+/// through explicit sysroot paths and reads no user configuration.
+struct Toolchain {
+    rust_analyzer: PathBuf,
+    sysroot: PathBuf,
 }
 
-fn real_config(rust_analyzer: PathBuf, cargo: &CargoRecorder) -> LspConfig {
+impl Toolchain {
+    fn resolve() -> Option<Self> {
+        let rustc = env_path("RUSTC").unwrap_or_else(|| PathBuf::from("rustc"));
+        let output = std::process::Command::new(rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let sysroot = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim())
+            .canonicalize()
+            .ok()?;
+        let bin = sysroot.join("bin");
+        if !bin.join("cargo").is_file() || !bin.join("rustc").is_file() {
+            return None;
+        }
+        let rust_analyzer = [
+            env_path("BRO_LSP_RUST_ANALYZER_BIN"),
+            env_path("BRO_RUST_ANALYZER_BIN"),
+            env_path("BLACKBOX_RUST_ANALYZER_BIN"),
+            Some(bin.join("rust-analyzer")),
+            Some(PathBuf::from("rust-analyzer")),
+            dirs::home_dir().map(|home| home.join(".cargo/bin/rust-analyzer")),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| absolute_executable(&candidate))
+        .find(|path| runs_version(path))?;
+        Some(Self {
+            rust_analyzer,
+            sysroot,
+        })
+    }
+
+    fn bin(&self) -> PathBuf {
+        self.sysroot.join("bin")
+    }
+}
+
+/// An absolute path for `candidate`, searching PATH for a bare name.
+fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
+    if candidate.components().count() > 1 {
+        return candidate
+            .is_file()
+            .then(|| std::path::absolute(candidate).ok())
+            .flatten();
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(candidate))
+        .find(|path| path.is_absolute() && path.is_file())
+}
+
+fn runs_version(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Run a real-server test with no operator state: temporary HOME, XDG
+/// config/cache/data/state and Cargo home, the resolved sysroot first on
+/// PATH, and no ambient build wrappers or target dirs. A rustup proxy keeps
+/// only the toolchain store and is pinned to the resolved toolchain.
+fn isolate_real_server_env(env: &mut EnvGuard, base: &Path, toolchain: &Toolchain) {
+    let rustup_home = env_path("RUSTUP_HOME")
+        .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
+        .filter(|dir| dir.is_dir());
+    let home = mkdir(&base.join("home"));
+    env.set("HOME", &home);
+    for (key, dir) in [
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_STATE_HOME", ".local/state"),
+    ] {
+        env.set(key, mkdir(&home.join(dir)));
+    }
+    env.set("CARGO_HOME", mkdir(&base.join("cargo-home")));
+    env.remove("RUSTUP_HOME");
+    env.remove("RUSTUP_TOOLCHAIN");
+    if let Some(rustup_home) = rustup_home {
+        if let (Some(toolchains), Some(name)) =
+            (toolchain.sysroot.parent(), toolchain.sysroot.file_name())
+            && toolchains == rustup_home.join("toolchains")
+        {
+            env.set("RUSTUP_TOOLCHAIN", name);
+        }
+        env.set("RUSTUP_HOME", rustup_home);
+    }
+    let bin = toolchain.bin();
+    env.set("RUSTC", bin.join("rustc"));
+    let path = std::env::var("PATH").unwrap_or_default();
+    env.set("PATH", format!("{}:{path}", bin.display()));
+    for key in [
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "BRO_LSP_LANE_SHIM_DIR",
+        "BRO_LSP_RA_TARGET_DIR",
+        "BRO_LSP_RA_HOST_BUILD",
+    ] {
+        env.remove(key);
+    }
+    assert!(
+        runs_version(&toolchain.rust_analyzer),
+        "{} must run under the isolated environment",
+        toolchain.rust_analyzer.display()
+    );
+}
+
+fn real_config(toolchain: &Toolchain, cargo: &CargoRecorder) -> LspConfig {
     LspConfig {
         child_env: BTreeMap::from([("CARGO".into(), cargo.wrapper.display().to_string())]),
         request_timeout: Duration::from_secs(90),
         init_timeout: Duration::from_secs(90),
         ready_timeout: Duration::from_secs(60),
-        rust_analyzer_bin: Some(rust_analyzer),
+        rust_analyzer_bin: Some(toolchain.rust_analyzer.clone()),
         ..LspConfig::default()
     }
 }
@@ -610,21 +711,21 @@ async fn send_saves(pool: &SessionPool, doc: &OpenDocument, count: usize) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_rust_session_runs_the_controlled_flycheck() {
-    let Some(rust_analyzer) = rust_analyzer_bin() else {
+    let mut env = EnvGuard::new();
+    let Some(toolchain) = Toolchain::resolve() else {
         eprintln!("skipping flycheck positive control: rust-analyzer not found");
         return;
     };
-    let mut env = EnvGuard::new();
-    env.remove("BRO_LSP_RA_HOST_BUILD");
     let (_dir, base) = canonical_tempdir();
+    isolate_real_server_env(&mut env, &base, &toolchain);
     let root = mkdir(&base.join("fixture"));
     let source = write_fixture(&root);
     assert!(
         !is_lane_host_build(&root),
         "positive control must be non-lane"
     );
-    let cargo = CargoRecorder::new(&base);
-    let mut config = real_config(rust_analyzer, &cargo);
+    let cargo = CargoRecorder::new(&base, &toolchain);
+    let mut config = real_config(&toolchain, &cargo);
     // Keep the control's analysis builds out of any shared target dir.
     config.child_env_scrub_keys.push("CARGO_TARGET_DIR".into());
     config.child_env.insert(
@@ -660,20 +761,21 @@ async fn default_rust_session_runs_the_controlled_flycheck() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_rust_session_keeps_analysis_without_flycheck() {
-    let Some(rust_analyzer) = rust_analyzer_bin() else {
+    let mut env = EnvGuard::new();
+    let Some(toolchain) = Toolchain::resolve() else {
         eprintln!("skipping lane flycheck test: rust-analyzer not found");
         return;
     };
-    let mut env = EnvGuard::new();
     let (_dir, base) = canonical_tempdir();
+    isolate_real_server_env(&mut env, &base, &toolchain);
     let target = mkdir(&base.join("ra-target"));
     env.set("BRO_LSP_RA_HOST_BUILD", "1");
     env.set("BRO_LSP_RA_TARGET_DIR", &target);
     let root = mkdir(&base.join("fixture"));
     let source = write_fixture(&root);
     assert!(is_lane_host_build(&root));
-    let cargo = CargoRecorder::new(&base);
-    let pool = SessionPool::new(real_config(rust_analyzer, &cargo));
+    let cargo = CargoRecorder::new(&base, &toolchain);
+    let pool = SessionPool::new(real_config(&toolchain, &cargo));
 
     // The harness path: didOpen, then semantic requests once build data loads.
     let doc = pool
