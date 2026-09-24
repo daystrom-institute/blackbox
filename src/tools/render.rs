@@ -239,14 +239,26 @@ impl BlackboxServer {
                     // completion cannot replace a newer render's evidence.
                     // An incomplete receipt is never recorded either.
                     let observations = &server.state.render_locality_observations;
-                    let recorded = match issued_at_ms.filter(|issued_at_ms| {
+                    let confirmed = issued_at_ms.filter(|issued_at_ms| {
                         observations.issued_workspace_plan(&plan_sha256, *issued_at_ms)
-                    }) {
+                    });
+                    let recorded = match confirmed {
                         Some(issued_at_ms) => {
                             observations.record_completed(&current, &receipt, issued_at_ms)?
                         }
                         None => None,
                     };
+                    // A render that may have written makes older owner
+                    // receipts of this checkout scope historical. Without a
+                    // confirmed issuance it is ordered after every issued
+                    // render.
+                    if !current.dry_run {
+                        server.state.render_operations.note_workspace_render(
+                            &current.project_id,
+                            &current.scope,
+                            confirmed.unwrap_or_else(bbox_project_render::execute::issue_render_ms),
+                        )?;
+                    }
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
                         "evidence_recorded": recorded.is_some(),

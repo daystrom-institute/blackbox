@@ -120,6 +120,20 @@ struct RenderOperationIndex {
     #[serde(default)]
     sequences: BTreeMap<String, u64>,
     operations: Vec<RenderOperationRecord>,
+    /// Newest bound-workspace render completed per project and published
+    /// scope. Path-free, the daemon cannot tell a workspace checkout from the
+    /// owner's checkout of the same scope, so a newer one means an owner
+    /// receipt is never reported current.
+    #[serde(default)]
+    workspace_renders: Vec<WorkspaceRenderMark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceRenderMark {
+    project_id: String,
+    scope: PublishedScope,
+    issued_at_ms: u64,
 }
 
 impl Default for RenderOperationIndex {
@@ -128,6 +142,7 @@ impl Default for RenderOperationIndex {
             version: INDEX_VERSION,
             sequences: BTreeMap::new(),
             operations: Vec::new(),
+            workspace_renders: Vec::new(),
         }
     }
 }
@@ -487,6 +502,66 @@ impl RenderOperationRuntime {
     /// The newest issued sequence for a project.
     pub(crate) fn latest_sequence(&self, project_id: &str) -> Option<u64> {
         self.state.lock().index.sequences.get(project_id).copied()
+    }
+
+    /// Record that a bound-workspace render of `project_id` issued at
+    /// `issued_at_ms` completed in a checkout of `scope`.
+    pub(crate) fn note_workspace_render(
+        &self,
+        project_id: &str,
+        scope: &PublishedScope,
+        issued_at_ms: u64,
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        let mut next = state.index.clone();
+        match next
+            .workspace_renders
+            .iter_mut()
+            .find(|mark| mark.project_id == project_id && &mark.scope == scope)
+        {
+            Some(mark) if mark.issued_at_ms >= issued_at_ms => return Ok(()),
+            Some(mark) => mark.issued_at_ms = issued_at_ms,
+            None => next.workspace_renders.push(WorkspaceRenderMark {
+                project_id: project_id.to_string(),
+                scope: scope.clone(),
+                issued_at_ms,
+            }),
+        }
+        // Bounded: the oldest marks describe renders long superseded by
+        // newer owner operations.
+        while next.workspace_renders.len() > MAX_RETAINED_OPERATIONS {
+            let oldest = next
+                .workspace_renders
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, mark)| mark.issued_at_ms)
+                .map(|(position, _)| position)
+                .expect("the list is non-empty");
+            next.workspace_renders.remove(oldest);
+        }
+        self.persist_index(&next)?;
+        state.index = next;
+        Ok(())
+    }
+
+    /// Whether a bound-workspace render of `project_id` in `scope`, issued
+    /// after `issued_at_ms`, has completed.
+    pub(crate) fn newer_workspace_render(
+        &self,
+        project_id: &str,
+        scope: &PublishedScope,
+        issued_at_ms: u64,
+    ) -> bool {
+        self.state
+            .lock()
+            .index
+            .workspace_renders
+            .iter()
+            .any(|mark| {
+                mark.project_id == project_id
+                    && &mark.scope == scope
+                    && mark.issued_at_ms > issued_at_ms
+            })
     }
 
     /// Page the persisted plan of a pending operation to its owner.

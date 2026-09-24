@@ -530,9 +530,17 @@ impl BlackboxServer {
                         }
                     }
                 };
+                // A newer bound-workspace render of this checkout scope is
+                // newer rendering the owner's sequence does not see.
+                let newer_workspace = runtime.newer_workspace_render(
+                    &record.project_id,
+                    &record.scope,
+                    record.issued_at_ms,
+                );
                 let current = present == Some(RenderCompletionValidation::Current)
                     && !late
-                    && latest == Some(record.sequence);
+                    && latest == Some(record.sequence)
+                    && !newer_workspace;
                 let outcome = receipt.outcome();
                 let stale = matches!(present, Some(RenderCompletionValidation::Stale { .. }));
                 response["status"] = match (stale, outcome) {
@@ -552,6 +560,8 @@ impl BlackboxServer {
                 response["current"] = current.into();
                 if !current && latest.is_some_and(|latest| latest > record.sequence) {
                     response["detail"] = "A newer render of this project exists; this receipt is historical and does not describe current checkout state.".into();
+                } else if !current && newer_workspace {
+                    response["detail"] = "A newer render of this project's checkout scope completed through a bound workspace; this receipt is historical and may not describe current checkout state.".into();
                 } else if !current && stale {
                     response["detail"] = "Project knowledge or checkout-owner authority changed since this receipt; it does not describe current convergence. Render again for a fresh operation.".into();
                 }

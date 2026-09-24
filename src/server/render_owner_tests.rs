@@ -999,3 +999,115 @@ async fn a_superseded_operation_that_was_delivered_is_never_reported_unapplied()
     assert_eq!(never_delivered["status"], "render_superseded");
     assert_eq!(never_delivered["application"], "not_applied");
 }
+
+/// Collector render A completes; the owner makes one provider file
+/// handwritten; a newer bound-workspace render B of the same knowledge in
+/// that checkout scope records the refusal. Recovering A must then report it
+/// as historical, not current.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_harness_render_makes_an_owner_receipt_historical() {
+    use crate::knowledge::ProjectRenderLocalityRequestV1;
+
+    let owner = OwnerFixture::new();
+    let (scope, _) = scopes();
+    let server = owner.server();
+    announce(&server, owner.roots.keys().cloned().collect());
+    let first = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
+    assert_eq!(first["current"], true);
+    let first = first["operation_id"].as_str().unwrap().to_string();
+
+    std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
+    let harness = BlackboxServer::new(server.state.clone());
+    let workspace_id = bro_core::WorkspaceId::parse("e".repeat(32)).unwrap();
+    assert!(
+        harness
+            .session_workspace_binding
+            .set(Some(Arc::new(
+                crate::server::knowledge_source::WorkspaceBindingGrant {
+                    task_id: "owner-harness-task".into(),
+                    session_id: "owner-harness-session".into(),
+                    project_id: UNCOVERED.into(),
+                    scope: scope.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expires_unix_secs: u64::MAX,
+                },
+            )))
+            .is_ok()
+    );
+    let params = RenderParams {
+        project: Some(crate::tools::render::BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+        scope: Some("project".into()),
+        provisional: Some("published".into()),
+        ..Default::default()
+    };
+    let mut assembler = ProjectRenderPlanAssemblerV1::default();
+    let mut offset = 0;
+    let mut plan_sha256 = None::<String>;
+    let assembled = loop {
+        let page = parse(
+            &harness
+                .bbox_render(Parameters(RenderParams {
+                    locality: Some(ProjectRenderLocalityRequestV1::Plan {
+                        offset,
+                        plan_sha256: plan_sha256.clone(),
+                    }),
+                    ..params.clone()
+                }))
+                .await,
+        );
+        let chunk: bbox_project_render::transport::ProjectRenderPlanChunkV1 =
+            serde_json::from_value(page["chunk"].clone()).unwrap();
+        let next = chunk.next_offset;
+        plan_sha256 = Some(chunk.plan_sha256.clone());
+        if let Some(assembled) = assembler.push(chunk).unwrap() {
+            break assembled;
+        }
+        offset = next.unwrap();
+    };
+    let receipt = bbox_project_render::execute::execute_workspace_render_plan(
+        &assembled.plan,
+        owner.root(&scope),
+        &scope,
+        workspace_id.as_str(),
+        assembled.issued_at_ms,
+    )
+    .unwrap()
+    .receipt;
+    assert!(
+        receipt
+            .projections
+            .iter()
+            .any(|projection| projection.disposition == ProjectRenderDispositionV1::Refused)
+    );
+    let completed = parse(
+        &harness
+            .bbox_render(Parameters(RenderParams {
+                locality: Some(ProjectRenderLocalityRequestV1::Complete {
+                    plan_sha256: assembled.plan_sha256.clone(),
+                    receipt,
+                    issued_at_ms: assembled.issued_at_ms,
+                }),
+                ..params.clone()
+            }))
+            .await,
+    );
+    assert_eq!(completed["status"], "render_locality_complete");
+
+    let recovered = parse(
+        &server
+            .bbox_render(Parameters(RenderParams {
+                operation: Some(first),
+                project: Some(UNCOVERED.into()),
+                ..Default::default()
+            }))
+            .await,
+    );
+    assert_eq!(recovered["status"], "render_complete");
+    assert_eq!(recovered["current"], false, "{recovered}");
+    assert!(
+        recovered["detail"]
+            .as_str()
+            .unwrap()
+            .contains("bound workspace")
+    );
+}

@@ -10,7 +10,9 @@
 //! A durable journal beside the enrolled-projects file makes delivery
 //! idempotent: a redelivered operation that already applied returns its
 //! recorded receipt instead of applying again, and an operation older than
-//! the newest one applied to the same scope is refused without writing.
+//! the newest one applied to the same scope is refused without writing. The
+//! journal's bound evicts only entries the daemon can no longer redeliver,
+//! and an operation below an evicted entry of its scope is never applied.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -68,6 +70,10 @@ struct JournalEntry {
     /// Recorded before the first write of an application.
     #[serde(default)]
     preflight: Option<PreflightRecord>,
+    /// The daemon recorded this entry's result, so it never redelivers the
+    /// operation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +89,11 @@ struct RenderJournal {
     version: u32,
     #[serde(default)]
     applied: Vec<AppliedSequence>,
+    /// Per scope, the highest sequence whose entry was evicted. An operation
+    /// at or below it with no entry has an unknown local history and is
+    /// never applied.
+    #[serde(default)]
+    retired: Vec<AppliedSequence>,
     #[serde(default)]
     entries: Vec<JournalEntry>,
 }
@@ -92,8 +103,19 @@ impl Default for RenderJournal {
         Self {
             version: JOURNAL_VERSION,
             applied: Vec::new(),
+            retired: Vec::new(),
             entries: Vec::new(),
         }
+    }
+}
+
+fn raise(sequences: &mut Vec<AppliedSequence>, scope: &PublishedScope, sequence: u64) {
+    match sequences.iter_mut().find(|current| &current.scope == scope) {
+        Some(current) => current.sequence = current.sequence.max(sequence),
+        None => sequences.push(AppliedSequence {
+            scope: scope.clone(),
+            sequence,
+        }),
     }
 }
 
@@ -112,26 +134,70 @@ impl RenderJournal {
             .unwrap_or(0)
     }
 
+    fn retired_sequence(&self, scope: &PublishedScope) -> u64 {
+        self.retired
+            .iter()
+            .find(|retired| &retired.scope == scope)
+            .map(|retired| retired.sequence)
+            .unwrap_or(0)
+    }
+
+    /// Mark an entry's result as recorded by the daemon.
+    fn acknowledge(&mut self, operation_id: &str) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.operation_id == operation_id && !entry.acknowledged)
+        {
+            Some(entry) => {
+                entry.acknowledged = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record an entry. Above the bound, only entries the daemon can no
+    /// longer redeliver are evicted, oldest first: acknowledged ones, and
+    /// ones a newer delivered operation of the same scope superseded. An
+    /// unacknowledged receipt or interrupted preflight of a scope's newest
+    /// operation is always kept, so capacity never turns a redelivered
+    /// operation into a fresh application.
     fn upsert(&mut self, entry: JournalEntry) {
         self.entries
             .retain(|existing| existing.operation_id != entry.operation_id);
         if entry.stage == JournalStage::Applied {
-            let sequence = entry.sequence;
-            match self
-                .applied
-                .iter_mut()
-                .find(|applied| applied.scope == entry.scope)
-            {
-                Some(applied) => applied.sequence = applied.sequence.max(sequence),
-                None => self.applied.push(AppliedSequence {
-                    scope: entry.scope.clone(),
-                    sequence,
-                }),
-            }
+            raise(&mut self.applied, &entry.scope, entry.sequence);
         }
         self.entries.push(entry);
-        let excess = self.entries.len().saturating_sub(MAX_JOURNAL_ENTRIES);
-        self.entries.drain(..excess);
+        let mut excess = self.entries.len().saturating_sub(MAX_JOURNAL_ENTRIES);
+        if excess == 0 {
+            return;
+        }
+        let mut newest = Vec::<AppliedSequence>::new();
+        for entry in &self.entries {
+            raise(&mut newest, &entry.scope, entry.sequence);
+        }
+        let newest_of = |scope: &PublishedScope| {
+            newest
+                .iter()
+                .find(|newest| &newest.scope == scope)
+                .map_or(0, |newest| newest.sequence)
+        };
+        let mut retired = Vec::new();
+        self.entries.retain(|entry| {
+            let evictable = entry.acknowledged || entry.sequence < newest_of(&entry.scope);
+            if excess > 0 && evictable {
+                excess -= 1;
+                retired.push((entry.scope.clone(), entry.sequence));
+                false
+            } else {
+                true
+            }
+        });
+        for (scope, sequence) in retired {
+            raise(&mut self.retired, &scope, sequence);
+        }
     }
 }
 
@@ -360,13 +426,25 @@ pub(crate) async fn execute_render_operation(
             // Applied before a lost acknowledgment: report the recorded
             // receipt; never apply the same operation twice.
             (JournalStage::Applied, Some(receipt), _) => {
-                return submit_result(runtime, operation, Ok(receipt.clone())).await;
+                return report_result(runtime, journal_path, operation, Ok(receipt.clone())).await;
             }
             (JournalStage::Failed, _, Some(error)) => {
-                return submit_result(runtime, operation, Err(error.clone())).await;
+                return report_result(runtime, journal_path, operation, Err(error.clone())).await;
             }
             _ => {}
         }
+    }
+    // An operation at or below an evicted entry of its scope, with no entry
+    // of its own, may already have been applied here. Its history is gone,
+    // so it is neither applied nor reported as having written nothing.
+    if journal.entry(&operation.operation_id).is_none()
+        && operation.sequence <= journal.retired_sequence(&operation.scope)
+    {
+        tracing::warn!(
+            operation_id = %operation.operation_id,
+            "render operation redelivered after its journal entry was retired; it is not applied"
+        );
+        return Ok(false);
     }
     // An operation journaled as applying recorded its preflight and was
     // interrupted before its result was recorded. It is reconciled against
@@ -441,6 +519,7 @@ pub(crate) async fn execute_render_operation(
                                 receipt: None,
                                 error: None,
                                 preflight: Some(record.clone()),
+                                acknowledged: false,
                             });
                             save_journal(&hook_journal, &journal)?;
                             preflight_journaled = true;
@@ -535,9 +614,28 @@ pub(crate) async fn execute_render_operation(
         receipt: outcome.as_ref().ok().cloned(),
         error: outcome.as_ref().err().cloned(),
         preflight: None,
+        acknowledged: false,
     });
     save_journal(journal_path, &journal)?;
-    submit_result(runtime, operation, outcome).await
+    report_result(runtime, journal_path, operation, outcome).await
+}
+
+/// Submit a journaled result and, once the daemon has recorded it, mark the
+/// entry acknowledged so it may be evicted.
+async fn report_result(
+    runtime: &Runtime,
+    journal_path: &Path,
+    operation: &RenderOperationDeliveryV1,
+    outcome: std::result::Result<ProjectRenderReceiptV1, RenderOperationErrorV1>,
+) -> Result<bool> {
+    let reported = submit_result(runtime, operation, outcome).await?;
+    if reported {
+        let mut journal = load_journal(journal_path)?;
+        if journal.acknowledge(&operation.operation_id) {
+            save_journal(journal_path, &journal)?;
+        }
+    }
+    Ok(reported)
 }
 
 async fn submit_result(
@@ -983,6 +1081,174 @@ mod tests {
         assert_eq!(results[0].outcome, "applied");
         assert!(!root.join("CLAUDE.md").exists());
         server.abort();
+    }
+
+    /// Fill the journal past its bound with acknowledged entries of another
+    /// scope, as a busy second checkout would.
+    fn retention_pressure(config: &CollectorConfig) {
+        let other = PublishedScope::try_new("repo-other-render", ".").unwrap();
+        let mut journal = load_journal(&journal_path(config)).unwrap();
+        for number in 0..(MAX_JOURNAL_ENTRIES as u64 + 40) {
+            journal.upsert(JournalEntry {
+                operation_id: format_render_operation_id(0x9000 + u128::from(number)),
+                scope: other.clone(),
+                sequence: number + 1,
+                plan_sha256: "0".repeat(64),
+                stage: JournalStage::Applied,
+                receipt: None,
+                error: None,
+                preflight: None,
+                acknowledged: true,
+            });
+        }
+        assert!(journal.entries.len() <= MAX_JOURNAL_ENTRIES);
+        save_journal(&journal_path(config), &journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_receipt_survives_retention_pressure_and_is_replayed() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        operation(&daemon, &scope, 11, 90, "RETAINED_RECEIPT_MARKER");
+        daemon.lock().unwrap().failing_results = 1;
+        let mut lane = RenderLaneState::default();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(daemon.lock().unwrap().results.is_empty());
+
+        // Other checkouts complete many renders; then the owner edits the
+        // generated file and the collector restarts.
+        retention_pressure(&config);
+        let edited = "<!-- Generated by blackbox -->\nowner edit after the lost ack\n";
+        fs::write(root.join("CLAUDE.md"), edited).unwrap();
+        let mut restarted = RenderLaneState::default();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut restarted)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(fs::read_to_string(root.join("CLAUDE.md")).unwrap(), edited);
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, "applied");
+        assert!(
+            load_journal(&journal_path(&config))
+                .unwrap()
+                .entry(&format_render_operation_id(11))
+                .unwrap()
+                .acknowledged
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_preflight_survives_retention_pressure_and_is_reconciled() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        operation(&daemon, &scope, 12, 95, "RETAINED_PREFLIGHT_MARKER");
+        let mut lane = RenderLaneState::default();
+        *CRASH_BEFORE_RESULT.lock().unwrap() = Some(journal_path(&config));
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        *CRASH_BEFORE_RESULT.lock().unwrap() = None;
+
+        retention_pressure(&config);
+        let edited = "<!-- Generated by blackbox -->\nowner edit after the crash\n";
+        fs::write(root.join("CLAUDE.md"), edited).unwrap();
+        let mut restarted = RenderLaneState::default();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut restarted)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(fs::read_to_string(root.join("CLAUDE.md")).unwrap(), edited);
+        let results = daemon.lock().unwrap().results.clone();
+        assert_eq!(
+            results[0].receipt.as_ref().unwrap().projections[0].disposition,
+            bbox_project_render::transport::ProjectRenderDispositionV1::Conflict
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_operation_whose_entry_was_retired_is_never_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (root, scope) = owned_checkout(&directory);
+        let config = config(&directory, &root, &scope);
+        let (runtime, server, daemon) = fake_daemon(true).await;
+        let mut journal = RenderJournal::default();
+        journal.retired.push(AppliedSequence {
+            scope: scope.clone(),
+            sequence: 100,
+        });
+        save_journal(&journal_path(&config), &journal).unwrap();
+        operation(&daemon, &scope, 13, 100, "RETIRED_MARKER");
+        let mut lane = RenderLaneState::default();
+        assert_eq!(
+            apply_render_operations(&runtime, &config, &mut lane)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!root.join("CLAUDE.md").exists());
+        assert!(
+            daemon.lock().unwrap().results.is_empty(),
+            "no result claims it wrote nothing"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn journal_eviction_keeps_each_scopes_newest_unacknowledged_entry() {
+        let first = PublishedScope::try_new("repo-first-render", ".").unwrap();
+        let second = PublishedScope::try_new("repo-second-render", ".").unwrap();
+        let entry = |number: u64, scope: &PublishedScope, acknowledged: bool| JournalEntry {
+            operation_id: format_render_operation_id(u128::from(number)),
+            scope: scope.clone(),
+            sequence: number,
+            plan_sha256: "0".repeat(64),
+            stage: JournalStage::Applied,
+            receipt: None,
+            error: None,
+            preflight: None,
+            acknowledged,
+        };
+        let mut journal = RenderJournal::default();
+        // An older unacknowledged entry that a newer delivery superseded,
+        // then the scope's newest, unacknowledged.
+        journal.upsert(entry(1, &first, false));
+        journal.upsert(entry(2, &first, false));
+        for number in 10..(10 + MAX_JOURNAL_ENTRIES as u64 * 2) {
+            journal.upsert(entry(number, &second, false));
+        }
+        assert!(journal.entries.len() <= MAX_JOURNAL_ENTRIES);
+        assert!(journal.entry(&format_render_operation_id(2)).is_some());
+        assert!(journal.entry(&format_render_operation_id(1)).is_none());
+        assert_eq!(journal.retired_sequence(&first), 1);
+        let newest = 10 + MAX_JOURNAL_ENTRIES as u64 * 2 - 1;
+        assert!(
+            journal
+                .entry(&format_render_operation_id(u128::from(newest)))
+                .is_some()
+        );
+        assert!(journal.retired_sequence(&second) >= 10);
     }
 
     #[tokio::test]
