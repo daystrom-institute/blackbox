@@ -15,8 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/daemon-runtime/thread-mutation-blocks-on-edge-rebuild",
   "notes": "Triage trace: left open as uncertain. No fix has landed and no code on the bbox_thread or edge-rebuild paths (src/tools/threads.rs, src/server/routes.rs) changed since the previous triage. Static trace: the watcher rebuild (src/server/routes.rs spawn_edge_index_rebuild_watcher) runs on its own std thread and holds, for the whole rebuild, only the index_writer publication-activity reservation (try_begin_edge_index_rebuild, an atomic); store read guards (idx, kb, threads, notes, task_store) are held only during project_store_edges, and the manifest coordinator only at publish. In bbox_thread (src/tools/threads.rs), persist_threads_durable awaits a oneshot and index_writer.enqueue is a non-blocking send, so neither can busy-block a tokio worker; the busy-blocked worker therefore points at a synchronous phase: resolve_worktree_scope_and_dir (catalog snapshot, no lease), threads.write(), or thread_mutation itself (which writes the .bbox/record snapshot). Slow-phase instrumentation ('slow bbox_thread phase', over 5s) is in place. Production log checks (four consecutive triage runs; latest covers about 6.7h of retained logs on the current daemon pod): no 'slow bbox_thread phase' lines and no bbox_thread tool lines in the window; edge-index rebuilds peak near 20s; max tokio worker busy duration about 3.7s; the watcher defers most store-only nudges because the published sidecar graph exceeds its edge-count limit (routes.rs), which further reduces rebuild frequency. Still missing: one occurrence with a 'slow bbox_thread phase' line naming the blocked phase, or a bbox_thread call observed during a rebuild without a stall. Until one is observed the multi-minute stall cannot be confirmed or ruled out; with rebuilds bounded near 20s the premise may no longer hold.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:29Z",
-  "updated_at": "2026-09-24T13:31:42Z"
+  "updated_at": "2026-09-24T14:02:42Z",
+  "resolved_at": "2026-09-24T14:02:42Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/86"
 }
