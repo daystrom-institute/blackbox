@@ -3,18 +3,24 @@
   "title": "fleetd default state-dir disagrees with the daemon's socket derivation",
   "gap_kind": "tooling",
   "domain": "fleetd",
-  "wanted_capability": "One shared code-owned derivation of the fleetd socket/token paths used by both the daemon client (which derives from its BRO dispatch store dir, state_dir/bro) and the fleetd binary's --state-dir default (which resolves the plain XDG state dir). Today only the daemon auto-start passes the correct explicit --state-dir; a launchd/systemd unit relying on fleetd's built-in default binds a socket the daemon never dials.",
+  "wanted_capability": "One code-owned derivation of the fleetd state dir (socket and token) shared by the daemon client and the fleetd binary's --state-dir default. Today the daemon derives fleetd paths from its BRO dispatch store dir (state_dir/bro) via FleetdConfig::in_state_dir(store_dir) in install_configured_harness_executor, while fleetd's default_state_dir resolves the plain blackbox state dir ($BLACKBOX_STATE_DIR, else $XDG_STATE_HOME/blackbox, else ~/.local/state/blackbox) with no /bro suffix. Only the daemon auto-start passes an explicit --state-dir; a service unit that relies on fleetd's built-in default binds a socket the daemon never dials, and the daemon then auto-starts a second fleetd.",
   "fallback_used": "First prod rollout 2026-07-19: launchd unit with the plain state dir orphaned its fleetd while the daemon auto-started a second one at the derived path. Fixed operationally by pointing the unit's --state-dir at .../blackbox/bro; deploy/fleetd.plist and fleetd-dev.plist corrected with a comment explaining the derivation.",
   "evidence": [
-    "deploy/fleetd.plist comment block",
-    "daemon log: 'harness executor: fleetd' socket=.../blackbox/bro/fleetd.sock vs unit --state-dir .../blackbox",
-    "crates/fleetd/src/paths.rs default resolution"
+    "crates/fleetd/src/paths.rs: default_state_dir (plain state dir, no bro suffix)",
+    "crates/fleetd/src/main.rs: --state-dir falls back to default_state_dir",
+    "src/orchestration/mod.rs: install_configured_harness_executor passes store_dir (state_dir/bro) to FleetdConfig::in_state_dir / resolve",
+    "src/orchestration/fleetd_client.rs: start_fleetd passes --state-dir config.state_dir explicitly",
+    "deploy/fleetd.plist, deploy/fleetd-dev.plist, deploy/fleetd.service, deploy/fleetd-dev.service: must hard-code the .../blackbox/bro state dir to match"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/fleetd/state-dir-derivation-mismatch",
-  "resolution": "unresolved",
+  "notes": "Triage trace: still live. The launchd plists were corrected to pass .../blackbox/bro and .../blackbox-dev/bro, but deploy/fleetd.service still runs fleetd with no --state-dir (its comment claims the default matches the daemon, which is false), and deploy/fleetd-dev.service passes .../blackbox-dev without the bro suffix. On a systemd host both units bind a socket the daemon never dials.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "thread_id": "thread-7eb3f795",
   "created_at": "2026-07-20T00:31:21Z",
-  "updated_at": "2026-07-20T00:31:21Z"
+  "updated_at": "2026-09-24T06:33:03Z",
+  "resolved_at": "2026-09-24T06:33:03Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/63"
 }

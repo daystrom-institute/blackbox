@@ -1,24 +1,26 @@
 {
   "id": "gap-a60692b3",
-  "title": "Daemon restart does not re-adopt live fleetd harness sessions: tasks are marked failed and resume refuses on the live supervision key",
+  "title": "Live fleetd sessions stay reported as failed after a daemon restart until a new dispatch dials fleetd, and bro_resume on them refuses",
   "gap_kind": "tooling",
   "domain": "orchestration/fleetd-readoption",
-  "wanted_capability": "When blackboxd restarts while fleetd-supervised harness children are running, the daemon should re-adopt each live session on startup: restore the task record as running, reattach to the fleetd event stream (replay from the durable event log), and let bro_status, bro_wait, bro_when_all, and bro_resume work against it. Observed 2026-09-20: two glm dispatches survived two daemon restarts (fleetd kept the harness children alive and they continued editing and committing), but the daemon reported both tasks as failed with \"server restarted while task was running ... retry with bro_resume\", and every bro_resume then failed at harness setup with \"fleetd session id ... is genuinely live (fleetd reports a running worker under this supervision key); refusing to multiplex two dispatches onto one supervision key\". The only way to observe the work was the on-disk events.jsonl and the lane git branches; the final assistant result and bro_report milestones are not captured in the task store. The process isolation delivered survival; the task plane lost the handle.",
+  "wanted_capability": "After a blackboxd restart, every harness session fleetd still holds is re-adopted into the task store at startup (task back to running, ingest replayed from its durable cursor), so bro_status, bro_wait, and bro_when_all see the live task without any new dispatch. bro_resume on a task whose supervision key is live attaches to (or points the caller at) the re-adopted task instead of failing with the multiplex refusal. Current code: re-adoption exists (FleetdExecutor::lane runs readopt_live_sessions after every successful dial, and readopt_harness_session flips the task back to running and strips the restart notice), but the dial is lazy: only spawn and inspect_workspace call lane(), so after a restart TaskStore::load marks running tasks failed with the 'server restarted while task was running' notice and they stay that way until some dispatch happens. A bro_resume of the same provider session collides with the live key in FleetdExecutor::spawn and bails with 'is genuinely live ... refusing to multiplex'. Re-adoption can also decline silently (owner-managed task, workspace-bound session without binding authority, mismatched binding), leaving a live worker the task plane cannot observe.",
   "missing_primitive": "startup re-adoption of live fleetd supervision keys into the daemon task store (or a bro_adopt verb), and a bro_resume path that attaches to a live session instead of refusing",
   "fallback_used": "Watched the lane branches and the on-disk event logs with a shell loop instead of the task plane.",
   "evidence": [
-    "bro_when_all result 2026-09-20T05:0x UTC: status failed, recoverable true, stderr 'server restarted while task was running'",
-    "bro_resume tasks a3f899a7 and 1f44af36: 'harness child setup failed: fleetd session id is genuinely live ... refusing to multiplex'",
-    "~/.local/state/blackbox/bro/harness-sessions/<session>.events.jsonl still growing after the restarts; lane branches receiving commits",
-    "bbox-cage README acceptance list names 'blackboxd restart re-adoption'",
-    "thread-f51d2132"
+    "src/orchestration/fleetd_client.rs: FleetdExecutor::lane (re-adoption only after a dial), spawn (supervision-key collision bail), readopt_live_sessions, readopt_one",
+    "src/orchestration/mod.rs: readopt_harness_session (decline paths return None with a warn log), RESTART_NOTICE_PREFIX / strip_restart_notice, install_harness_executor_with_config (no startup dial)",
+    "src/orchestration/mod.rs: harness_executor().inspect_workspace and harness_executor().spawn are the only dial triggers, both in the dispatch path",
+    "src/orchestration/fleetd_smoke.rs: a_replacement_daemon_reattaches_the_task_and_replays_what_it_missed forces the connect by dispatching",
+    "Observed: two fleetd-supervised dispatches survived daemon restarts and kept committing while their tasks read failed and bro_resume refused on the live supervision key"
   ],
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/orchestration/daemon-restart-does-not-readopt-live-fleetd-sessions",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "project_id": "89bd722f",
   "thread_id": "thread-436d9728",
   "created_at": "2026-09-20T05:22:49Z",
-  "updated_at": "2026-09-20T05:22:49Z"
+  "updated_at": "2026-09-24T06:33:03Z",
+  "resolved_at": "2026-09-24T06:33:03Z",
+  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/64"
 }
