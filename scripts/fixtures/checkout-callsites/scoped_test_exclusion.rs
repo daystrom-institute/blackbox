@@ -88,6 +88,21 @@ mod tests {
     }
 }
 
+fn literal_holds_attribute_text(project_id: &str) {
+    let plain = "an escaped \" #[cfg(test)] ";
+    let c_plain = c"an escaped \" #[cfg(test)] ";
+    let raw = r#"a quote " #[cfg(test)] "#;
+    let raw_bytes = br#"a quote " #[cfg(test)] "#;
+    // Last literal in the file: a misread here would run to EOF.
+    let raw_c = cr#"a quote " #[cfg(test)] "#;
+    let _ = acquire_selected_project_access(broker, project_id, kind, intent); // expect: literal_holds_attribute_text
+}
+
+#[cfg(test)]
+fn gated_after_literals(project_id: &str) {
+    let _ = acquire_selected_project_access(broker, project_id, kind, intent); // expect: excluded
+}
+
 pub(crate) fn after_gated_mod(checkout: &Checkout) {
     let _ = with_resolved_checkout_access(broker, checkout, kind, intent, |lease| ()); // expect: after_gated_mod
 }

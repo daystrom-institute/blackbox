@@ -92,8 +92,9 @@ def blank(text):
                     j += 1
             wipe(i, j)
             i = j
+        # Raw strings: r"..", br"..", cr"..", with any number of hashes.
         elif c == "r" and (i == 0 or not IDENT.match(text[i - 1])
-                           or (text[i - 1] == "b" and (i < 2 or not IDENT.match(text[i - 2])))):
+                           or (text[i - 1] in "bc" and (i < 2 or not IDENT.match(text[i - 2])))):
             m = re.match(r'r(#*)"', text[i:i + 300])
             if not m:
                 i += 1
