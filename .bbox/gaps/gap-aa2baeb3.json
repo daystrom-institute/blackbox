@@ -16,13 +16,13 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-shell/stdin-open-pipe-hang",
   "notes": "Triage: the stdin default is still an open pipe on beta/blackbox-v2. The earlier fix (d1f95d3c) was never merged, and shell_poll now documents feeding more stdin to a running session, so a fix must keep an explicit opt-in for interactive stdin while defaulting to EOF.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "task_id": "df7a62ef-1183-4b8d-8f67-c37c9f177b8f",
   "provider": "glm",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-16T16:43:33Z",
-  "updated_at": "2026-09-24T00:04:30Z",
-  "resolved_at": "2026-09-24T00:04:30Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/32"
+  "updated_at": "2026-09-24T16:51:18Z",
+  "resolved_at": "2026-09-24T16:51:18Z",
+  "resolution_note": "implemented in PR #66, commit 9b126e95bbccb00d54f03fa9bbac6fb427e41391"
 }
