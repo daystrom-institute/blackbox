@@ -511,25 +511,43 @@ removed, so `cargo`/`rustc` resolve to the host rustup proxies; (2)
 (`BRO_LSP_RA_TARGET_DIR` or `<dirs::cache_dir>/blackbox/ra-target/<sha256(root)[:16]>`, i.e.
 `~/Library/Caches/blackbox/ra-target/` on macOS, `~/.cache/blackbox/ra-target/` on Linux);
 (3) `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` unset, so a sccache lane
-shim cannot re-enter the pod. v2 (recorded, not built): pod-side
+shim cannot re-enter the pod; (4) `initializationOptions`
+`{"checkOnSave": false}`, so rust-analyzer never runs its automatic
+workspace flycheck on the host, neither at startup nor on a save
+notification. One lane decision per spawn drives both the environment and
+the initialize options; non-lane Rust sessions send no initialization
+options and keep rust-analyzer's defaults. v2 (recorded, not built): pod-side
 rust-analyzer with a bidirectional URI translation layer. Rejected:
 documenting rust `lsp.*` as unsupported in lanes (strands the semantic tier
 exactly where agents work); sharing the lane `target/` between pod and host
 (the proc-macro dylib format mismatch is the original bug).
 
-Reasoning: rust-analyzer derives build data by running `cargo metadata` and
-`cargo check` (flycheck) as child processes resolved through its own PATH
-with cwd at the workspace root. On a lane checkout two things conspire
-against the host server: the cwd-keyed shim routes those children back into
-the Linux pod, and the pod-built `target/` holds ELF proc-macro `.so` files
-the host proc-macro server cannot load. The two knobs that matter (which
-cargo runs, where artifacts land) are both environment-level, so scrubbing
-the spawn env fixes the whole chain with no initializationOptions surgery,
-no URI translation layer, and no fight with user `rust-analyzer.toml`
-config. The per-root host target dir costs one cold host-side build (proc
-macros + build scripts; minutes on a cold cache, incremental after) and can
-never collide with pod artifacts. Path detection keeps the common case
-zero-config; the explicit env var covers non-lane NFS/sshfs layouts.
+Reasoning: rust-analyzer derives analysis build data by running `cargo
+metadata` and a build-script/proc-macro `cargo check` as child processes
+resolved through its own environment with cwd at the workspace root; its
+automatic flycheck is a separate workspace `cargo check`. On a lane checkout
+two things conspire against the host server: the cwd-keyed shim routes those
+children back into the Linux pod, and the pod-built `target/` holds ELF
+proc-macro `.so` files the host proc-macro server cannot load. The two knobs
+that matter for build data (which cargo runs, where artifacts land) are both
+environment-level, so scrubbing the spawn env fixes that chain with no URI
+translation layer and no fight with user `rust-analyzer.toml` config. Build
+scripts and proc macros keep their defaults: the host runs analysis builds
+into the per-root target dir at workspace load and again when their inputs
+require a refresh, and those artifacts can never collide with pod artifacts.
+Path detection keeps the common case zero-config; the explicit env var covers
+non-lane NFS/sshfs layouts.
+
+Flycheck is not needed for the lane semantic tier and would be a heavy
+host-side workspace build, so lane sessions disable it outright rather than
+route it. Diagnostics from a lane `lsp.*` session are therefore native
+rust-analyzer analysis only: an empty set never proves the code compiles.
+Rustc-tier verification for a lane checkout is an explicit `build.gate` run
+of bare `cargo check --message-format=json` with the lane checkout as cwd,
+where the lane shim routes Cargo into the pod. `build.gate` delegates to
+shell execution, so that routing comes from the command and cwd, not from
+the gate itself. Suppression does not depend on how documents are synced:
+it covers the startup check and any save notification the server receives.
 
 Related readiness fix (gap-eeeab3bc, phase 2.0): `observe_rust_analyzer_status`
 must evaluate the `health` field (`error` before the `quiescent`

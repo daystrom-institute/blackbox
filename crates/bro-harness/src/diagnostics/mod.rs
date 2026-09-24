@@ -5,6 +5,14 @@
 //! fresh diagnostics against the per-file baseline in [`crate::lsp_baselines`],
 //! classifies what is new, and riders a concise block onto the tool result.
 //!
+//! Scope of the input: diagnostics are rust-analyzer's view of the file. Lane
+//! checkout sessions run with automatic flycheck disabled, so there they are
+//! native analysis only, and in any session an empty result never proves the
+//! code compiles. Compiler verification is an explicit
+//! `build.gate` run of bare `cargo check --message-format=json` with the lane
+//! checkout as cwd, which the lane shim routes into the lane pod; `build.gate`
+//! runs through the shell, so that routing comes from the command and cwd.
+//!
 //! Ownership split (wave-2 drones build against the types in THIS file):
 //! - [`engine`] — the SPINE: drain edits → run bro-lsp → diff vs baseline
 //!   (stable, line-number-independent identity) → update baseline, plus the
