@@ -118,7 +118,7 @@ impl Tool for RustExtractImplMethods {
         "rust.extractImplMethods"
     }
     fn description(&self) -> &str {
-        "Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: returns {changes, creates, findings, leftovers} for edits.merge + edits.createFile."
+        "Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: returns {changes, creates, findings, leftovers} for edits.merge + edits.createFiles."
     }
     fn input_schema(&self) -> Value {
         json!({
