@@ -2241,6 +2241,7 @@ mod tests {
                 &gaps,
                 &graphs,
                 &[],
+                None,
                 KnowledgeSourceLimits::default(),
             ),
             Err(ContractError::InvalidGraphSourcePath)
