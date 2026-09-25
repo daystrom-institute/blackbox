@@ -266,16 +266,26 @@ enum LaneVintage {
     PreGraphs,
     /// Before the evidence lane: knowledge, gaps, graphs.
     PreEvidence,
-    /// Current: knowledge, gaps, graphs, evidence.
+    /// Before the configuration lane: knowledge, gaps, graphs, evidence.
+    PreConfig,
+    /// Current: knowledge, gaps, graphs, evidence, and the configuration
+    /// lane. The configuration lane is publication-only and its absence is
+    /// explicit (`None`), so it commits only when present: a candidate
+    /// without it has exactly its pre-configuration preimage. Working pairs
+    /// and provisional identities never carry it.
     Current,
 }
 
 impl LaneVintage {
     fn includes_graphs(self) -> bool {
-        matches!(self, Self::PreEvidence | Self::Current)
+        matches!(self, Self::PreEvidence | Self::PreConfig | Self::Current)
     }
 
     fn includes_evidence(self) -> bool {
+        matches!(self, Self::PreConfig | Self::Current)
+    }
+
+    fn includes_config(self) -> bool {
         matches!(self, Self::Current)
     }
 }
@@ -1222,6 +1232,16 @@ pub fn publication_candidate_generation_id(
 }
 
 /// The publication generation identity exactly as it was minted before the
+/// configuration lane existed: the configuration descriptor contributed
+/// nothing. Same re-derivation contract as the pre-evidence variant.
+pub fn pre_config_publication_candidate_generation_id(
+    producer_id: &str,
+    descriptor: &PublicationCandidateDescriptorV1,
+) -> String {
+    publication_generation_id_for(producer_id, descriptor, LaneVintage::PreConfig)
+}
+
+/// The publication generation identity exactly as it was minted before the
 /// evidence lane existed: the evidence descriptor contributed nothing.
 ///
 /// A re-derivation of an identity already durable on disk, so it does not
@@ -1267,11 +1287,12 @@ fn publication_generation_id_for(
     if vintage.includes_evidence() {
         hash_manifest_descriptor(&mut encoded, &descriptor.evidence);
     }
-    // The configuration lane is explicitly optional, so it needs no rung of
-    // its own: a candidate without it hashes exactly the preimage every
-    // earlier binary minted, and one with it appends a domain-separated
-    // presence field no earlier preimage can contain.
-    if let Some(config) = &descriptor.config {
+    // Only the configuration rung commits the lane, behind a domain-separated
+    // presence field no earlier preimage contains. Every lower rung stops
+    // before it, whatever the descriptor carries.
+    if vintage.includes_config()
+        && let Some(config) = &descriptor.config
+    {
         push_field(&mut encoded, b"config-lane-v1");
         hash_manifest_descriptor(&mut encoded, config);
     }
@@ -1304,10 +1325,12 @@ fn admissible_publication_vintages(
     descriptor: &PublicationCandidateDescriptorV1,
 ) -> Vec<LaneVintage> {
     let mut vintages = Vec::new();
-    // No binary older than the configuration lane could carry it.
+    // No binary older than the configuration lane could carry it; `Some` of
+    // an empty lane is a present lane and admits the current rung alone.
     if descriptor.config.is_some() {
         return vintages;
     }
+    vintages.push(LaneVintage::PreConfig);
     if descriptor.evidence.is_absent_lane() {
         vintages.push(LaneVintage::PreEvidence);
         if descriptor.graphs.is_absent_lane() {
@@ -3220,19 +3243,31 @@ mod tests {
         );
     }
 
-    /// A candidate without the configuration lane keeps exactly the identity
-    /// the pre-lane binary minted; the literal is that binary's current-rung
-    /// value for these fixtures. An empty present lane and a populated one
-    /// each mint their own identity, and neither is admissible on any older
-    /// rung.
+    /// The literal is the identity the pre-configuration binary minted for
+    /// these fixtures, so it lives on the pre-configuration rung. The current
+    /// rung commits the lane only when it is present, so the explicitly
+    /// absent shape re-derives to the same value there and stays admissible
+    /// on every older rung it was admissible on before. A present lane, empty
+    /// or populated, mints its own identity and admits the current rung alone,
+    /// and no lower rung ever reads the configuration descriptor.
     #[test]
     fn config_lane_identity_is_explicit_and_preserves_pre_lane_identity() {
         let (descriptor, ..) = publication();
+        assert_eq!(
+            pre_config_publication_candidate_generation_id("producer-a", &descriptor),
+            "kps_b6c1476997d6e506c62137a81c5f4535dfdfce25914ba263a421bbb6ce61bcaa"
+        );
         let absent = publication_candidate_generation_id("producer-a", &descriptor).unwrap();
         assert_eq!(
             absent,
-            "kps_b6c1476997d6e506c62137a81c5f4535dfdfce25914ba263a421bbb6ce61bcaa"
+            pre_config_publication_candidate_generation_id("producer-a", &descriptor)
         );
+        for stored in [
+            pre_evidence_publication_candidate_generation_id("producer-a", &descriptor),
+            legacy_publication_candidate_generation_id("producer-a", &descriptor),
+        ] {
+            assert!(publication_generation_id_matches("producer-a", &descriptor, &stored).unwrap());
+        }
         assert!(
             serde_json::to_value(&descriptor)
                 .unwrap()
@@ -3249,6 +3284,20 @@ mod tests {
         assert_ne!(populated_id, absent);
         assert_ne!(populated_id, empty_id);
         for candidate in [&empty, &populated] {
+            // Lower rungs are blind to the lane: they re-derive exactly what
+            // they derive for the absent shape.
+            assert_eq!(
+                pre_config_publication_candidate_generation_id("producer-a", candidate),
+                absent
+            );
+            assert_eq!(
+                pre_evidence_publication_candidate_generation_id("producer-a", candidate),
+                pre_evidence_publication_candidate_generation_id("producer-a", &descriptor)
+            );
+            assert_eq!(
+                legacy_publication_candidate_generation_id("producer-a", candidate),
+                legacy_publication_candidate_generation_id("producer-a", &descriptor)
+            );
             for stored in [
                 absent.clone(),
                 pre_evidence_publication_candidate_generation_id("producer-a", candidate),
