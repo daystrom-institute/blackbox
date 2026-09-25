@@ -10,4 +10,8 @@
 - Each history pass probes the server with the cheap head identity (HEAD, object format, committed scope) before any history walk; the complete capture runs only on a probe miss, and the captured head is probed again before upload.
 - The per-project probes are the producer's currency reports: the daemon judges a project stale when no probe names it within three `interval_secs` (at least 30 minutes), and behind when a probed HEAD stays unserved that long. Keep every pass probing every configured project, and keep reporting `interval_secs` in the producer-command presence.
 - Published knowledge is independently opt-in and main-worktree-only. It pins one configured full branch ref, reads committed `.bbox/knowledge` and `.bbox/gaps` files through `StableGitRepository`, and re-resolves the ref after capture. It never reads either lane from the working tree and never links a daemon store.
+- History upload resumes from the state begin reports: replay every page from
+  zero in `ReceivingManifest`, skip straight to the idempotent complete in
+  `MissingRecords`. A typed `invalid_upload_state` is a concurrent state move
+  and gets a bounded re-probe and re-begin; content conflicts never retry.
 - Projects sharing one Git common directory publish history once per cycle. Server-derived whole-repository grants remain authoritative for monorepo membership.
