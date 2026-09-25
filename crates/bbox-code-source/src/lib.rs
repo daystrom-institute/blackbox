@@ -750,7 +750,7 @@ pub fn validate_project_config_name(name: &str) -> Result<(), ContractError> {
     Ok(())
 }
 
-/// Exact-byte precondition on a guarded mutation.
+/// Exact-byte precondition and delivery fence on a guarded mutation.
 ///
 /// `expected_sha256` is the SHA-256 of the bytes the owner must find at the
 /// path before applying, or `None` when the path must be absent. It is derived
@@ -758,11 +758,35 @@ pub fn validate_project_config_name(name: &str) -> Result<(), ContractError> {
 /// when there is none), never from the owner's current file. `predecessor`
 /// names that immediate predecessor so the owner and daemon can refuse to let
 /// a successor bypass it.
+///
+/// Bytes recur (a delete returns a path to absence), so a precondition alone
+/// cannot tell a stale delivery from a fresh one. `epoch` names the daemon
+/// queue that minted the mutation and `sequence` is that queue's durable,
+/// never-reused counter. The owner applies a guarded mutation only above the
+/// highest sequence it applied on the path in the same epoch, and never from
+/// an epoch it has seen superseded, so no delayed delivery can reapply.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationGuardV1 {
     pub expected_sha256: Option<String>,
     pub predecessor: Option<String>,
+    /// 32 lowercase hex characters.
+    pub epoch: String,
+    /// At least 1; strictly increasing within an epoch.
+    pub sequence: u64,
+}
+
+/// Whether a guard epoch is well formed.
+pub fn validate_guard_epoch(value: &str) -> Result<(), ContractError> {
+    if value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidCheckoutMutationField("guard.epoch"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -828,6 +852,12 @@ impl CheckoutMutationV1 {
                 } else if self.mode == "delete" {
                     return Err(ContractError::InvalidCheckoutMutationField(
                         "guarded delete requires an expected present file",
+                    ));
+                }
+                validate_guard_epoch(&guard.epoch)?;
+                if guard.sequence == 0 {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "guard.sequence",
                     ));
                 }
                 if let Some(predecessor) = &guard.predecessor {
@@ -1505,6 +1535,8 @@ mod tests {
             guard: Some(CheckoutMutationGuardV1 {
                 expected_sha256: None,
                 predecessor: None,
+                epoch: "0123456789abcdef0123456789abcdef".into(),
+                sequence: 1,
             }),
             ..valid_checkout_mutation()
         }
@@ -1755,6 +1787,12 @@ mod tests {
         self_predecessor.guard.as_mut().unwrap().predecessor =
             Some(self_predecessor.mutation_id.clone());
         assert!(self_predecessor.validate().is_err());
+        let mut bad_epoch = guarded_config_mutation(".bbox/mcp.json");
+        bad_epoch.guard.as_mut().unwrap().epoch = "0123".into();
+        assert!(bad_epoch.validate().is_err());
+        let mut zero_sequence = guarded_config_mutation(".bbox/mcp.json");
+        zero_sequence.guard.as_mut().unwrap().sequence = 0;
+        assert!(zero_sequence.validate().is_err());
         let mut bad_predecessor = guarded_config_mutation(".bbox/mcp.json");
         bad_predecessor.guard.as_mut().unwrap().predecessor = Some("cm-nothex".into());
         assert!(bad_predecessor.validate().is_err());

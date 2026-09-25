@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -793,47 +793,63 @@ fn current_file_sha256(
     Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
-/// Checkout-local record of the guarded mutations this checkout applied,
-/// kept under the gitignored `.bbox/local`. Byte preconditions alone cannot
-/// fence a stale duplicate: a path can return to an earlier state (a delete
-/// after a create), which a delayed copy of the create would match again. An
-/// id recorded here is never applied twice, whatever the bytes now say.
-const APPLIED_LEDGER_DIR: &str = ".bbox/local";
-const APPLIED_LEDGER_NAME: &str = "checkout-mutations-applied.json";
-/// Most recent guarded application ids retained. A duplicate delivery only
-/// arises before the daemon settles the first ack, so the window it has to
-/// cover is a handful of polls, far inside this bound.
-const APPLIED_LEDGER_MAX_ENTRIES: usize = 4096;
-const APPLIED_LEDGER_MAX_BYTES: usize = 1024 * 1024;
+/// Checkout-local delivery fence for guarded mutations, kept under the
+/// gitignored `.bbox/local`. Byte preconditions alone cannot fence a stale
+/// delivery: a path can return to an earlier state (a delete after a create),
+/// which a delayed copy of the create would match again, however long ago it
+/// was fetched. The fence records, per path, the queue epoch and the highest
+/// guarded sequence this checkout applied there, plus every epoch it has seen
+/// superseded. A guarded mutation applies only above that sequence in the
+/// same epoch, or from an epoch the path has never seen; nothing is ever
+/// evicted, so a delivery that was stale once stays stale forever.
+const MUTATION_FENCE_DIR: &str = ".bbox/local";
+const MUTATION_FENCE_NAME: &str = "checkout-mutations-fence.json";
+/// One entry per configuration path ever written by the lane. Exceeding the
+/// bound fails closed rather than forgetting a fence.
+const MUTATION_FENCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOCAL_GITIGNORE: &str = "*\n!.gitignore\n";
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct AppliedMutationLedger {
+struct MutationFenceFile {
     version: u32,
-    /// Oldest first.
-    applied: Vec<AppliedMutationRecord>,
+    /// Keyed by scope-relative path.
+    paths: BTreeMap<String, PathFence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct AppliedMutationRecord {
-    mutation_id: String,
-    relative_path: String,
+struct PathFence {
+    epoch: String,
+    sequence: u64,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    retired_epochs: BTreeSet<String>,
 }
 
-/// The locked ledger directory and its decoded contents. The directory lock
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceVerdict {
+    /// Above everything the path applied: check bytes and apply.
+    Fresh,
+    /// The path's most recent application, redelivered (a lost ack or a
+    /// duplicate poll): already in effect.
+    LatestApplied,
+    /// Behind the path's most recent application, or from a superseded
+    /// queue: a delayed copy that must never write.
+    Stale,
+}
+
+/// The locked fence directory and its decoded contents. The directory lock
 /// is held for the whole guarded application, so every owner of this
 /// checkout checks, applies and records one guarded mutation at a time.
-struct AppliedLedger {
+struct MutationFence {
     directory: bbox_corpus_core::json_store::NofollowDirectory,
-    ledger: AppliedMutationLedger,
+    fence: MutationFenceFile,
 }
 
-impl AppliedLedger {
+impl MutationFence {
     fn open_locked(root: &Path) -> Result<Self> {
         let directory = bbox_corpus_core::json_store::NofollowDirectory::open_or_create(
-            &root.join(APPLIED_LEDGER_DIR),
+            &root.join(MUTATION_FENCE_DIR),
         )?;
         directory.lock_exclusive()?;
         if directory
@@ -842,59 +858,85 @@ impl AppliedLedger {
         {
             directory.atomic_replace(".gitignore", LOCAL_GITIGNORE.as_bytes())?;
         }
-        let ledger = match directory.read_regular(
-            APPLIED_LEDGER_NAME,
-            APPLIED_LEDGER_MAX_BYTES,
-            "applied checkout mutation ledger",
+        let fence = match directory.read_regular(
+            MUTATION_FENCE_NAME,
+            MUTATION_FENCE_MAX_BYTES,
+            "guarded checkout mutation fence",
         )? {
-            None => AppliedMutationLedger {
+            None => MutationFenceFile {
                 version: 1,
-                applied: Vec::new(),
+                paths: BTreeMap::new(),
             },
             Some(bytes) => {
-                let ledger: AppliedMutationLedger = serde_json::from_slice(&bytes).with_context(|| {
+                let fence: MutationFenceFile = serde_json::from_slice(&bytes).with_context(|| {
                     format!(
-                        "{APPLIED_LEDGER_DIR}/{APPLIED_LEDGER_NAME} is unreadable; guarded mutations stay \
-                         undelivered until it is repaired or removed"
+                        "{MUTATION_FENCE_DIR}/{MUTATION_FENCE_NAME} is unreadable; guarded mutations stay \
+                         undelivered until it is repaired"
                     )
                 })?;
-                if ledger.version != 1 {
+                if fence.version != 1 {
                     bail!(
-                        "{APPLIED_LEDGER_DIR}/{APPLIED_LEDGER_NAME} has unsupported version {}",
-                        ledger.version
+                        "{MUTATION_FENCE_DIR}/{MUTATION_FENCE_NAME} has unsupported version {}",
+                        fence.version
                     );
                 }
-                ledger
+                fence
             }
         };
-        Ok(Self { directory, ledger })
+        Ok(Self { directory, fence })
     }
 
-    fn contains(&self, mutation_id: &str) -> bool {
-        self.ledger
-            .applied
-            .iter()
-            .any(|record| record.mutation_id == mutation_id)
-    }
-
-    /// Durably record one application before its ack is sent.
-    fn record(&mut self, mutation: &bbox_code_source::CheckoutMutationV1) -> Result<()> {
-        if self.contains(&mutation.mutation_id) {
-            return Ok(());
+    /// Where this delivery stands against what the path already applied.
+    fn verdict(
+        &self,
+        path: &str,
+        guard: &bbox_code_source::CheckoutMutationGuardV1,
+    ) -> FenceVerdict {
+        match self.fence.paths.get(path) {
+            None => FenceVerdict::Fresh,
+            Some(fence) if fence.retired_epochs.contains(&guard.epoch) => FenceVerdict::Stale,
+            Some(fence) if fence.epoch == guard.epoch => {
+                match guard.sequence.cmp(&fence.sequence) {
+                    std::cmp::Ordering::Greater => FenceVerdict::Fresh,
+                    std::cmp::Ordering::Equal => FenceVerdict::LatestApplied,
+                    std::cmp::Ordering::Less => FenceVerdict::Stale,
+                }
+            }
+            // A queue epoch this path has never seen: a fresh sequence space.
+            Some(_) => FenceVerdict::Fresh,
         }
-        self.ledger.applied.push(AppliedMutationRecord {
-            mutation_id: mutation.mutation_id.clone(),
-            relative_path: mutation.relative_path.clone(),
-        });
-        let excess = self
-            .ledger
-            .applied
-            .len()
-            .saturating_sub(APPLIED_LEDGER_MAX_ENTRIES);
-        self.ledger.applied.drain(..excess);
+    }
+
+    /// Durably advance the path's fence before the ack is sent.
+    fn record(&mut self, mutation: &bbox_code_source::CheckoutMutationV1) -> Result<()> {
+        let guard = mutation
+            .guard
+            .as_ref()
+            .expect("fenced mutations are guarded");
+        let entry = self
+            .fence
+            .paths
+            .entry(mutation.relative_path.clone())
+            .or_insert_with(|| PathFence {
+                epoch: guard.epoch.clone(),
+                sequence: 0,
+                retired_epochs: BTreeSet::new(),
+            });
+        if entry.epoch != guard.epoch {
+            let retired = std::mem::replace(&mut entry.epoch, guard.epoch.clone());
+            entry.retired_epochs.insert(retired);
+            entry.sequence = 0;
+        }
+        entry.sequence = entry.sequence.max(guard.sequence);
+        let bytes = serde_json::to_vec(&self.fence)?;
+        if bytes.len() > MUTATION_FENCE_MAX_BYTES {
+            bail!(
+                "{MUTATION_FENCE_DIR}/{MUTATION_FENCE_NAME} would exceed its {MUTATION_FENCE_MAX_BYTES}-byte bound"
+            );
+        }
         self.directory
-            .atomic_replace(APPLIED_LEDGER_NAME, &serde_json::to_vec(&self.ledger)?)
-            .context("recording an applied checkout mutation")
+            .atomic_replace(MUTATION_FENCE_NAME, &bytes)
+            .context("recording a guarded checkout mutation in the delivery fence")
     }
 }
 
@@ -943,22 +985,30 @@ fn apply_checkout_mutation(
         other => bail!("unvalidated mutation mode {other}"),
     };
     let target_sha256 = mutation.target_sha256();
-    let mut ledger = match &mutation.guard {
-        Some(_) => {
-            let ledger = AppliedLedger::open_locked(&root)?;
-            if ledger.contains(&mutation.mutation_id) {
-                // A duplicate of a mutation this checkout already applied,
-                // possibly delayed past later edits: never apply it again.
+    let mut fence = match &mutation.guard {
+        Some(guard) => {
+            let fence = MutationFence::open_locked(&root)?;
+            let verdict = fence.verdict(&mutation.relative_path, guard);
+            if verdict != FenceVerdict::Fresh {
+                // Already applied here, or a delayed copy of a delivery this
+                // path has moved past: never write, whatever the bytes say.
+                // Only the path's latest application reports its bytes; a
+                // stale copy wrote nothing and claims no content.
                 tracing::info!(
                     mutation_id = %mutation.mutation_id,
                     path = %mutation.relative_path,
-                    "guarded checkout mutation already applied by this checkout"
+                    sequence = guard.sequence,
+                    ?verdict,
+                    "guarded checkout mutation fenced"
                 );
                 return Ok(MutationApplyOutcome::Applied {
-                    content_sha256: target_sha256,
+                    content_sha256: match verdict {
+                        FenceVerdict::LatestApplied => target_sha256,
+                        _ => None,
+                    },
                 });
             }
-            Some(ledger)
+            Some(fence)
         }
         None => None,
     };
@@ -971,8 +1021,8 @@ fn apply_checkout_mutation(
         // Delete under a missing parent: the target is absent, which is the
         // delete's own result (a guarded delete always expected presence, so
         // this is a recognized redelivery, never a precondition match).
-        if let Some(ledger) = &mut ledger {
-            ledger.record(mutation)?;
+        if let Some(fence) = &mut fence {
+            fence.record(mutation)?;
         }
         return Ok(MutationApplyOutcome::Applied {
             content_sha256: None,
@@ -987,8 +1037,8 @@ fn apply_checkout_mutation(
                 path = %mutation.relative_path,
                 "guarded checkout mutation already applied"
             );
-            if let Some(ledger) = &mut ledger {
-                ledger.record(mutation)?;
+            if let Some(fence) = &mut fence {
+                fence.record(mutation)?;
             }
             return Ok(MutationApplyOutcome::Applied {
                 content_sha256: target_sha256,
@@ -1008,8 +1058,8 @@ fn apply_checkout_mutation(
                 .atomic_replace(name, content.as_bytes())
                 .with_context(|| format!("replacing {}", mutation.relative_path))?;
         }
-        if let Some(ledger) = &mut ledger {
-            ledger.record(mutation)?;
+        if let Some(fence) = &mut fence {
+            fence.record(mutation)?;
         }
         tracing::info!(
             mutation_id = %mutation.mutation_id,
@@ -1023,8 +1073,8 @@ fn apply_checkout_mutation(
         parent
             .remove_regular(name, "checkout mutation target")
             .with_context(|| format!("deleting {}", mutation.relative_path))?;
-        if let Some(ledger) = &mut ledger {
-            ledger.record(mutation)?;
+        if let Some(fence) = &mut fence {
+            fence.record(mutation)?;
         }
         tracing::info!(
             mutation_id = %mutation.mutation_id,
@@ -4344,6 +4394,10 @@ mod tests {
             guard: Some(bbox_code_source::CheckoutMutationGuardV1 {
                 expected_sha256: expected.map(sha),
                 predecessor: None,
+                epoch: TEST_EPOCH.into(),
+                // Test ids are minted in delivery order, so their hex suffix
+                // doubles as the queue sequence.
+                sequence: u64::from_str_radix(&id[3..], 16).unwrap(),
             }),
         }
     }
@@ -4363,6 +4417,7 @@ mod tests {
     }
 
     const BROFILE: &str = ".bro/brofiles/reviewer.json";
+    const TEST_EPOCH: &str = "0123456789abcdef0123456789abcdef";
     const V1: &str = "{\"name\":\"reviewer\",\"v\":1}";
     const V2: &str = "{\"name\":\"reviewer\",\"v\":2}";
 
@@ -4419,9 +4474,10 @@ mod tests {
 
     /// A byte precondition alone would let a delayed duplicate of a create
     /// match again after a later delete returned the path to absence. The
-    /// checkout-local ledger fences every duplicate of an applied id, across
-    /// create, delete and recreate, and across a restart (each call reopens
-    /// the durable ledger, exactly as a restarted owner would).
+    /// checkout-local fence rejects every delivery at or behind what the path
+    /// applied, across create, delete and recreate, and across a restart
+    /// (each call reopens the durable fence, exactly as a restarted owner
+    /// would).
     #[test]
     fn delayed_duplicates_never_resurrect_superseded_states() {
         let (_directory, root, scope, config) = guarded_fixture();
@@ -4443,10 +4499,10 @@ mod tests {
             applied(None)
         );
         // The path is absent again, so the create's precondition matches;
-        // its id does not.
+        // its sequence is behind the path's fence, so nothing is written.
         assert_eq!(
             apply_checkout_mutation(&config, &create).unwrap(),
-            applied(Some(V1))
+            applied(None)
         );
         assert!(
             !root.join(BROFILE).exists(),
@@ -4464,31 +4520,27 @@ mod tests {
             ));
             assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
         }
-        let ledger: AppliedMutationLedger = serde_json::from_slice(
-            &fs::read(root.join(APPLIED_LEDGER_DIR).join(APPLIED_LEDGER_NAME)).unwrap(),
+        let fence: MutationFenceFile = serde_json::from_slice(
+            &fs::read(root.join(MUTATION_FENCE_DIR).join(MUTATION_FENCE_NAME)).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            ledger
-                .applied
-                .iter()
-                .map(|record| record.mutation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "cm-00000000000000e1",
-                "cm-00000000000000e2",
-                "cm-00000000000000e3"
-            ]
+            fence.paths[BROFILE],
+            PathFence {
+                epoch: TEST_EPOCH.into(),
+                sequence: 0xe3,
+                retired_epochs: BTreeSet::new(),
+            }
         );
-        // The ledger stays out of version control.
+        // The fence stays out of version control.
         assert_eq!(
-            fs::read_to_string(root.join(APPLIED_LEDGER_DIR).join(".gitignore")).unwrap(),
+            fs::read_to_string(root.join(MUTATION_FENCE_DIR).join(".gitignore")).unwrap(),
             LOCAL_GITIGNORE
         );
     }
 
     #[test]
-    fn conflicts_are_not_recorded_and_a_damaged_ledger_fails_closed() {
+    fn conflicts_are_not_recorded_and_a_damaged_fence_fails_closed() {
         let (_directory, root, scope, config) = guarded_fixture();
         fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
         fs::write(root.join(BROFILE), "{\"local\":true}").unwrap();
@@ -4512,7 +4564,7 @@ mod tests {
         );
 
         fs::write(
-            root.join(APPLIED_LEDGER_DIR).join(APPLIED_LEDGER_NAME),
+            root.join(MUTATION_FENCE_DIR).join(MUTATION_FENCE_NAME),
             b"{not json",
         )
         .unwrap();
@@ -4525,33 +4577,126 @@ mod tests {
         );
         let error = apply_checkout_mutation(&config, &next).unwrap_err();
         assert!(
-            format!("{error:#}").contains(APPLIED_LEDGER_NAME),
+            format!("{error:#}").contains(MUTATION_FENCE_NAME),
             "{error:#}"
         );
         assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
-        // Legacy mutations never consult the ledger.
+        // Legacy mutations never consult the fence.
         let legacy = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{}");
         assert!(apply_checkout_mutation(&config, &legacy).is_ok());
     }
 
+    /// The reviewer's counterexample, past the point where a bounded id list
+    /// would have forgotten the create: a collector fetched create M1, then
+    /// paused. Meanwhile M1 and delete M2 applied, followed by more guarded
+    /// traffic on another path than any id-retention window, and the owner
+    /// restarted. The paused copy of M1 now resumes: the path is absent, so
+    /// its expected-absence precondition matches, yet the fence refuses it.
     #[test]
-    fn the_applied_ledger_is_bounded_to_its_most_recent_entries() {
-        let (_directory, root, scope, _config) = guarded_fixture();
-        let mut ledger = AppliedLedger::open_locked(&root).unwrap();
-        for index in 0..(APPLIED_LEDGER_MAX_ENTRIES + 3) {
-            let mutation = guarded(&scope, &format!("cm-{index:016x}"), BROFILE, Some(V1), None);
-            ledger.ledger.applied.push(AppliedMutationRecord {
-                mutation_id: mutation.mutation_id.clone(),
-                relative_path: mutation.relative_path.clone(),
-            });
+    fn a_delayed_duplicate_stays_fenced_after_unbounded_later_traffic() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let create = guarded(&scope, "cm-0000000000000001", BROFILE, Some(V1), None);
+        let delete = guarded(
+            &scope,
+            "cm-0000000000000002",
+            BROFILE,
+            None,
+            Some(V1.as_bytes()),
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &create).unwrap(),
+            applied(Some(V1))
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            applied(None)
+        );
+        const OTHER: &str = ".bro/teamplates/squad.json";
+        let mut previous: Option<String> = None;
+        for sequence in 3..=40_u64 {
+            let content = format!("{{\"name\":\"squad\",\"n\":{sequence}}}");
+            let traffic = guarded(
+                &scope,
+                &format!("cm-{sequence:016x}"),
+                OTHER,
+                Some(&content),
+                previous.as_deref().map(str::as_bytes),
+            );
+            assert_eq!(
+                apply_checkout_mutation(&config, &traffic).unwrap(),
+                applied(Some(&content))
+            );
+            previous = Some(content);
         }
-        let last = guarded(&scope, "cm-ffffffffffffffff", BROFILE, Some(V1), None);
-        ledger.record(&last).unwrap();
-        drop(ledger);
-        let reopened = AppliedLedger::open_locked(&root).unwrap();
-        assert_eq!(reopened.ledger.applied.len(), APPLIED_LEDGER_MAX_ENTRIES);
-        assert!(reopened.contains("cm-ffffffffffffffff"));
-        assert!(!reopened.contains(&format!("cm-{:016x}", 0)));
+        // Far more later traffic than any id-retention window, laid down
+        // directly (one durable apply per delivery would only add fsyncs):
+        // thousands of other paths advanced well past the create.
+        let fence_path = root.join(MUTATION_FENCE_DIR).join(MUTATION_FENCE_NAME);
+        let mut fence: MutationFenceFile =
+            serde_json::from_slice(&fs::read(&fence_path).unwrap()).unwrap();
+        for index in 0..4200_u64 {
+            fence.paths.insert(
+                format!(".bro/brofiles/traffic-{index}.json"),
+                PathFence {
+                    epoch: TEST_EPOCH.into(),
+                    sequence: 41 + index,
+                    retired_epochs: BTreeSet::new(),
+                },
+            );
+        }
+        fs::write(&fence_path, serde_json::to_vec(&fence).unwrap()).unwrap();
+        let restarted = mutation_config(&root, scope.clone());
+        assert!(matches!(
+            apply_checkout_mutation(&restarted, &create).unwrap(),
+            MutationApplyOutcome::Applied { .. }
+        ));
+        assert!(
+            !root.join(BROFILE).exists(),
+            "the delayed create must stay fenced"
+        );
+        // The fence holds one entry per path, not one per delivery.
+        let fence: MutationFenceFile = serde_json::from_slice(
+            &fs::read(root.join(MUTATION_FENCE_DIR).join(MUTATION_FENCE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fence.paths.len(), 4202);
+        assert_eq!(fence.paths[BROFILE].sequence, 2);
+    }
+
+    /// A new queue epoch starts a fresh sequence space on the path, and the
+    /// epoch it replaces is retired for good: a delayed delivery from the old
+    /// queue never applies, even with a sequence above anything it reached.
+    #[test]
+    fn a_superseded_queue_epoch_is_fenced_permanently() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let old_create = guarded(&scope, "cm-0000000000000005", BROFILE, Some(V1), None);
+        assert_eq!(
+            apply_checkout_mutation(&config, &old_create).unwrap(),
+            applied(Some(V1))
+        );
+        let mut new_delete = guarded(
+            &scope,
+            "cm-0000000000000001",
+            BROFILE,
+            None,
+            Some(V1.as_bytes()),
+        );
+        new_delete.guard.as_mut().unwrap().epoch = "fedcba9876543210fedcba9876543210".into();
+        assert_eq!(
+            apply_checkout_mutation(&config, &new_delete).unwrap(),
+            applied(None)
+        );
+        let old_late = guarded(&scope, "cm-0000000000000009", BROFILE, Some(V2), None);
+        assert!(matches!(
+            apply_checkout_mutation(&config, &old_late).unwrap(),
+            MutationApplyOutcome::Applied { .. }
+        ));
+        assert!(!root.join(BROFILE).exists(), "a retired epoch never writes");
+        let fence: MutationFenceFile = serde_json::from_slice(
+            &fs::read(root.join(MUTATION_FENCE_DIR).join(MUTATION_FENCE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert!(fence.paths[BROFILE].retired_epochs.contains(TEST_EPOCH));
     }
 
     #[test]
@@ -4660,10 +4805,10 @@ mod tests {
         );
         apply_checkout_mutation(&config, &first).unwrap();
         apply_checkout_mutation(&config, &second).unwrap();
-        // The replay is recognized by id and changes nothing.
+        // The replay is behind the path's fence and changes nothing.
         assert_eq!(
             apply_checkout_mutation(&config, &first).unwrap(),
-            applied(Some(V1))
+            applied(None)
         );
         assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
         // A foreign mutation this checkout never applied, carrying the same
@@ -4903,13 +5048,22 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>();
-        let landed = outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, MutationApplyOutcome::Applied { .. }))
-            .count();
-        assert_eq!(landed, 1, "{outcomes:?}");
+        // Exactly one wrote. The other either conflicted (it ran second and
+        // was newer) or was fenced as stale (it ran second and was older,
+        // so it claims no written content).
         let written = fs::read_to_string(root.join(path)).unwrap();
         assert!(written == V1 || written == V2);
+        let landed = outcomes
+            .iter()
+            .filter(|outcome| **outcome == applied(Some(V1)) || **outcome == applied(Some(V2)))
+            .count();
+        assert_eq!(landed, 1, "{outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| *outcome == applied(Some(&written))),
+            "{outcomes:?}"
+        );
     }
 
     #[test]

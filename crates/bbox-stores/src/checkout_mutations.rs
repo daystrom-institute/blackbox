@@ -35,6 +35,18 @@ use crate::store_persister::StoreSnapshot;
 pub struct CheckoutMutationStore {
     pub version: u32,
     pub mutations: Vec<PendingCheckoutMutation>,
+    /// Identity of this queue's guarded sequence space, minted with its
+    /// first guarded mutation. A fresh or restored queue mints a new one,
+    /// so an owner can tell its counter apart from an earlier queue's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarded_epoch: Option<String>,
+    /// Next guarded sequence. Durable and never reused within the epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub next_guarded_sequence: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Default for CheckoutMutationStore {
@@ -42,6 +54,8 @@ impl Default for CheckoutMutationStore {
         Self {
             version: 1,
             mutations: Vec::new(),
+            guarded_epoch: None,
+            next_guarded_sequence: 0,
         }
     }
 }
@@ -652,6 +666,7 @@ impl CheckoutMutations {
             })
             .last()
             .map(|row| row.mutation.mutation_id.clone());
+        let (epoch, sequence) = self.next_guarded_position();
         let mutation = CheckoutMutationV1 {
             schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
             mutation_id: self.mint_id(),
@@ -664,11 +679,15 @@ impl CheckoutMutations {
             guard: Some(CheckoutMutationGuardV1 {
                 expected_sha256: base.map(content_sha256),
                 predecessor,
+                epoch,
+                sequence,
             }),
         };
         mutation
             .validate()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.store.guarded_epoch = Some(epoch_of(&mutation));
+        self.store.next_guarded_sequence = sequence + 1;
         self.store.mutations.push(PendingCheckoutMutation {
             mutation: mutation.clone(),
             status: CheckoutMutationStatus::Pending,
@@ -686,6 +705,30 @@ impl CheckoutMutations {
             reconciled: None,
         });
         Ok(mutation)
+    }
+
+    /// The epoch and sequence the next guarded mutation carries. The
+    /// sequence also stays above every sequence already stored in the epoch,
+    /// so a hand-edited or partially restored counter can never reissue one.
+    fn next_guarded_position(&self) -> (String, u64) {
+        let epoch = self
+            .store
+            .guarded_epoch
+            .clone()
+            .unwrap_or_else(mint_guarded_epoch);
+        let highest = self
+            .store
+            .mutations
+            .iter()
+            .filter_map(|row| row.mutation.guard.as_ref())
+            .filter(|guard| guard.epoch == epoch)
+            .map(|guard| guard.sequence)
+            .max()
+            .unwrap_or(0);
+        (
+            epoch,
+            self.store.next_guarded_sequence.max(highest + 1).max(1),
+        )
     }
 
     pub fn get(&self, mutation_id: &str) -> Option<&PendingCheckoutMutation> {
@@ -868,6 +911,32 @@ impl CheckoutMutations {
         self.enqueue(mutation)?;
         Ok(id)
     }
+}
+
+fn epoch_of(mutation: &CheckoutMutationV1) -> String {
+    mutation
+        .guard
+        .as_ref()
+        .map(|guard| guard.epoch.clone())
+        .expect("guarded mutation")
+}
+
+/// 32 hex characters of a digest over the clock, process and thread: unique
+/// per queue creation, never derived from content.
+fn mint_guarded_epoch() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    hasher.update(std::process::id().to_be_bytes());
+    hasher.update(format!("{:?}", std::thread::current().id()).as_bytes());
+    hasher.update(format!("{:p}", &hasher as *const _).as_bytes());
+    format!("{:x}", hasher.finalize())[..32].to_string()
 }
 
 /// Lowercase hex SHA-256 of exact bytes, the precondition encoding.
@@ -1417,6 +1486,54 @@ mod tests {
                 .ack("cm-0000000000000009", "conflicted", None, None, "now")
                 .is_err()
         );
+    }
+
+    /// Every guarded mutation carries the queue's epoch and a sequence that
+    /// strictly increases across restarts and never repeats, including on
+    /// another path; a separate queue mints a different epoch.
+    #[test]
+    fn guarded_sequences_are_durable_monotonic_and_epoch_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("mutations.json");
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        let guard = |mutation: &CheckoutMutationV1| mutation.guard.clone().unwrap();
+        let first = guarded_edit(&mut store, &scope(), None, Some("{}")).unwrap();
+        let second = guarded_edit(&mut store, &scope(), None, Some(r#"{"v":2}"#)).unwrap();
+        assert_eq!(guard(&first).sequence, 1);
+        assert_eq!(guard(&second).sequence, 2);
+        assert_eq!(guard(&first).epoch, guard(&second).epoch);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&store.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        let other = store
+            .enqueue_guarded(
+                scope(),
+                ".bbox/mcp.json".into(),
+                Some("{}".into()),
+                None,
+                None,
+                "test".into(),
+                "now".into(),
+            )
+            .unwrap();
+        assert_eq!(guard(&other).sequence, 3);
+        assert_eq!(guard(&other).epoch, guard(&first).epoch);
+        // A counter that fell behind the stored rows never reissues one.
+        store.store.next_guarded_sequence = 1;
+        let next = guarded_edit(&mut store, &scope(), None, Some(r#"{"v":4}"#)).unwrap();
+        assert_eq!(guard(&next).sequence, 4);
+        let mut fresh = CheckoutMutations::open(&root.join("fresh.json")).unwrap();
+        let foreign = guarded_edit(&mut fresh, &scope(), None, Some("{}")).unwrap();
+        assert_ne!(guard(&foreign).epoch, guard(&first).epoch);
+        // A queue that never held a guarded mutation encodes as before.
+        let legacy = CheckoutMutations::open(&root.join("legacy.json")).unwrap();
+        let encoded = serde_json::to_value(legacy.snapshot().unwrap()).unwrap();
+        assert!(encoded.get("guarded_epoch").is_none());
+        assert!(encoded.get("next_guarded_sequence").is_none());
     }
 
     /// The owner compares exact bytes, so the chain does too: an intent that
