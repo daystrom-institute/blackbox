@@ -15,11 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "ontology/edge-index/agents-explicit-lane-input-not-loaded",
   "notes": "Re-traced at 15b91420: behavior unchanged. The legacy-missing loader (project_sidecar_edges) admits agents via the path-based predicate; only the manifest-mode explicit-lane loader drops it.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-f51d2132",
   "created_at": "2026-09-20T04:13:53Z",
-  "updated_at": "2026-09-24T01:04:07Z",
-  "resolved_at": "2026-09-24T01:04:07Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/39"
+  "updated_at": "2026-09-25T10:21:08Z",
+  "resolved_at": "2026-09-25T10:21:08Z",
+  "resolution_note": "implemented in PR #95, commit d6595def3fb8a40c572319cea6a531ee58fb88b7"
 }
