@@ -785,7 +785,11 @@ pub(crate) fn persist_agent_provenance_edges(
         edges.push(agent_derived_from_edge(source.clone(), target));
     }
     let edges_dir = edge_sidecar_dir(state);
-    let written = edge_index::append_explicit_edges(&edges_dir, "agents", &edges)?;
+    let written = edge_index::append_explicit_edges(
+        &edges_dir,
+        bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE,
+        &edges,
+    )?;
     if written > 0 {
         // Persist first and wake the single-flight watcher. An artifact tool
         // must never synchronously parse the complete project graph merely to
@@ -1083,18 +1087,6 @@ fn fold_sidecar_path(
     signature.path_identity ^= hasher.finish();
 }
 
-fn sidecar_project_is_admitted(
-    path: &std::path::Path,
-    registered_project_ids: Option<&std::collections::HashSet<String>>,
-) -> bool {
-    let Some(registered) = registered_project_ids else {
-        return true;
-    };
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|project_id| project_id == "agents" || registered.contains(project_id))
-}
-
 fn fold_jsonl_dir(
     signature: &mut EdgeSidecarSignature,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -1107,7 +1099,10 @@ fn fold_jsonl_dir(
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-            && sidecar_project_is_admitted(&path, registered_project_ids)
+            && bbox_edge_sidecar::edge_sidecar::sidecar_lane_is_admitted(
+                &path,
+                registered_project_ids,
+            )
         {
             fold_sidecar_path(signature, seen, &path);
         }
@@ -2716,6 +2711,83 @@ mod tests {
             edge_sidecar_signature(edges_dir).unwrap(),
             "volatile manifest timestamps are not graph inputs"
         );
+    }
+
+    #[test]
+    fn agent_provenance_edges_publish_in_manifest_mode_without_agents_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let edges_dir = edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            edge_index::SidecarManifestAuthority::capture(&edges_dir).unwrap(),
+            edge_index::SidecarManifestAuthority::Manifest(_)
+        ));
+        let registered = state.corpus_registered_project_ids();
+        assert!(
+            !registered.contains(bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE),
+            "the fixture's registered set must not name the agent lane"
+        );
+        rebuild_edge_index_from_shared(&state, false).unwrap();
+        let before = capture_edge_rebuild_authority(&edges_dir, Some(&registered))
+            .unwrap()
+            .signature;
+
+        let session = entity_ref::EntityRef::Session {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+        };
+        let manifest: orchestration::agents::types::AgentManifest =
+            serde_json::from_value(serde_json::json!({
+                "description": "distilled reviewer",
+                "provenance": {
+                    "kind": "distilled",
+                    "distilled_by": "distiller",
+                    "evidence_session_ids": [session.to_string()],
+                },
+            }))
+            .unwrap();
+        let agent_ref = orchestration::agents::types::AgentRef {
+            name: "reviewer".into(),
+            version: 1,
+        };
+        persist_agent_provenance_edges(&state, &agent_ref, &manifest).unwrap();
+        assert!(
+            edges_dir
+                .join("explicit")
+                .join(format!(
+                    "{}.jsonl",
+                    bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE
+                ))
+                .is_file()
+        );
+        let after = capture_edge_rebuild_authority(&edges_dir, Some(&registered))
+            .unwrap()
+            .signature;
+        assert_ne!(before, after, "the agent lane write must trigger a rebuild");
+
+        rebuild_edge_index_from_shared(&state, false).unwrap();
+        let agent = entity_ref::EntityRef::Agent {
+            name: "reviewer".into(),
+            version: 1,
+        };
+        let view = state.code_read_view.read();
+        let published = view.edge_index.forward_edges(&agent);
+        assert_eq!(published.len(), 1, "published agent edges: {published:?}");
+        assert_eq!(published[0].kind, "DERIVED_FROM");
+        assert_eq!(published[0].target, session);
     }
 
     #[test]

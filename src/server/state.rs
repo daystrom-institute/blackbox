@@ -1544,7 +1544,7 @@ mod clause_one_exit_proof {
         // twins lose the edge together, which still reds but proves only
         // that the seam was touched, not that the twins differ. This is the only lane the
         // rebuild's registered-project set actually gates
-        // (project_sidecar_edges_in_dir -> sidecar_project_is_registered),
+        // (project_sidecar_edges_in_dir -> sidecar_lane_is_admitted),
         // and it is what makes this row seam-relative rather than merely
         // populated: store-projected knowledge edges never pass through
         // that filter, so comparing them proved nothing about records.
