@@ -542,8 +542,8 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
     assert_eq!(next.predecessor, None);
 }
 
-#[test]
-fn simultaneous_read_modify_write_edits_serialize_without_losing_either() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_read_modify_write_edits_serialize_without_losing_either() {
     let scope = CatalogFixture::scope(".");
     let (_fixture, server) = accepted_fixture(&scope);
     let target = ProjectConfigTargetV1::McpStore;
@@ -554,7 +554,7 @@ fn simultaneous_read_modify_write_edits_serialize_without_losing_either() {
             let server = server.clone();
             let barrier = barrier.clone();
             let target = target.clone();
-            std::thread::spawn(move || {
+            tokio::task::spawn_blocking(move || {
                 barrier.wait();
                 server
                     .state
@@ -572,10 +572,10 @@ fn simultaneous_read_modify_write_edits_serialize_without_losing_either() {
             })
         })
         .collect::<Vec<_>>();
-    let mut receipts = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for handle in handles {
+        receipts.push(handle.await.unwrap());
+    }
     receipts.sort_by_key(|receipt| receipt.predecessor.is_some());
     let (first, second) = (&receipts[0], &receipts[1]);
     assert_eq!(

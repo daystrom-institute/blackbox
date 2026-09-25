@@ -102,6 +102,9 @@ pub struct ProjectConfigProvenance {
 /// One project's accepted configuration, parsed from exactly one accepted
 /// generation. Immutable: a new publication is a new snapshot.
 #[derive(Debug, Clone)]
+// The scope and exact-scope accessors serve the project-scope list/get and
+// enablement reporting of bro_brofile, bro_team and bro_mcp.
+#[allow(dead_code)]
 pub struct ProjectConfigSnapshot {
     provenance: ProjectConfigProvenance,
     scope: PublishedScope,
@@ -112,6 +115,7 @@ pub struct ProjectConfigSnapshot {
     accepted_bytes: BTreeMap<ProjectConfigTargetV1, String>,
 }
 
+#[allow(dead_code)] // see ProjectConfigSnapshot
 impl ProjectConfigSnapshot {
     /// Parse one accepted configuration lane. `sources` are the lane's
     /// repository-relative files and exact bytes. Any file that is not a

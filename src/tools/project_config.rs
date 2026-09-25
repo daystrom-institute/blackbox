@@ -39,6 +39,9 @@ pub(crate) enum ProjectConfigContext {
 }
 
 /// A verified accepted configuration view plus the identity it was read at.
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
 pub(crate) struct AcceptedProjectConfig {
     pub(crate) project_id: String,
     pub(crate) scope: PublishedScope,
@@ -47,6 +50,9 @@ pub(crate) struct AcceptedProjectConfig {
 }
 
 /// One queued guarded configuration mutation, as its producer reports it.
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectConfigMutationReceipt {
     pub(crate) mutation_id: String,
@@ -66,6 +72,9 @@ pub(crate) struct ProjectConfigMutationReceipt {
 
 /// The authorized landing place: the published scope whose checkout owner
 /// receives the mutation, and the file inside it.
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProjectConfigLanding {
     pub(crate) repo_id: String,
@@ -74,6 +83,7 @@ pub(crate) struct ProjectConfigLanding {
     pub(crate) repository_relative_path: String,
 }
 
+#[allow(dead_code)] // see ProjectConfigLanding
 impl ProjectConfigLanding {
     fn new(scope: &PublishedScope, scope_relative_path: &str) -> Self {
         Self {
@@ -90,6 +100,9 @@ impl ProjectConfigLanding {
 }
 
 /// Where one configuration mutation stands now.
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectConfigMutationStatus {
     pub(crate) mutation_id: String,
@@ -109,13 +122,18 @@ pub(crate) struct ProjectConfigMutationStatus {
 }
 
 /// The change a configuration edit makes to its base bytes.
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectConfigEdit {
     Write(String),
     Delete,
 }
 
+#[allow(dead_code)] // see ProjectConfigEdit
 const COMMIT_TO_PUBLISH: &str = "The checkout owner's collector applies it on its next mutation poll. Commit and publish the file on the project's publisher ref for it to take effect; until the next accepted publication includes it, reads and dispatch keep the accepted configuration";
+#[allow(dead_code)] // see ProjectConfigEdit
 const RECONCILE_AND_RETRY: &str = "The owner's file did not match the expected bytes, so the owner kept its bytes. Reconcile in the owning checkout (commit and publish the local version, or revert it), then re-issue the edit; it is recomputed from the accepted configuration with a fresh precondition";
 
 impl SharedState {
@@ -150,17 +168,6 @@ impl SharedState {
             .ok()?
             .project_id()
             .map(str::to_owned)
-    }
-
-    fn catalog_project_for_scope(&self, scope: &PublishedScope) -> Option<String> {
-        let store = self.project_authority.catalog_store()?.clone();
-        let snapshot = store.snapshot().ok()?;
-        snapshot
-            .catalog()
-            .projects
-            .values()
-            .find(|project| matches!(&project.scope, ProjectScope::Published(published) if published == scope))
-            .map(|project| project.project_id.as_str().to_string())
     }
 
     /// Load and parse one catalog project's accepted configuration. Every
@@ -322,6 +329,22 @@ impl SharedState {
             ProjectConfigContext::Local(None) | ProjectConfigContext::GlobalOnly => None,
             ProjectConfigContext::Accepted(snapshot) => snapshot.mcp_store().cloned(),
         })
+    }
+}
+
+// Guarded write-lane producer API: the project-scope configuration actions
+// of bro_brofile, bro_team and bro_mcp are its callers.
+#[allow(dead_code)]
+impl SharedState {
+    fn catalog_project_for_scope(&self, scope: &PublishedScope) -> Option<String> {
+        let store = self.project_authority.catalog_store()?.clone();
+        let snapshot = store.snapshot().ok()?;
+        snapshot
+            .catalog()
+            .projects
+            .values()
+            .find(|project| matches!(&project.scope, ProjectScope::Published(published) if published == scope))
+            .map(|project| project.project_id.as_str().to_string())
     }
 
     /// Prepare and queue one guarded configuration mutation for a catalog
