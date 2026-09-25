@@ -2988,109 +2988,46 @@ async fn publish_history_repositories_pass(
     outcome
 }
 
+/// Bound on re-observing an upload whose state another client advanced
+/// between this pass's begin and a later step. Exhaustion is an ordinary
+/// lane failure and takes the lane's retry backoff.
+const GIT_HISTORY_STATE_OBSERVATIONS: usize = 3;
+
 async fn publish_git_history(
     runtime: &Runtime,
     captured: CapturedGitHistory,
     status_timeout: Duration,
 ) -> Result<()> {
-    let probe: GitHistoryProbeResponseV1 = send_json(
-        runtime
-            .request(
-                reqwest::Method::POST,
-                runtime.endpoint("internal/code-source/v1/git-history/probe")?,
-            )
-            .json(&GitHistoryProbeRequestV1 {
-                scope: captured.descriptor.scope.clone(),
-                repo_head: captured.descriptor.repo_head.clone(),
-                object_format: captured.descriptor.object_format,
-            }),
-    )
-    .await?;
-    if let Some(current) = probe.current {
-        tracing::info!(
-            source_generation = %current.source_generation_id,
-            commits = current.commit_count,
-            bytes = current.logical_bytes,
-            "Git-history source is already current"
-        );
-        return Ok(());
-    }
-
-    let begin: BeginGitHistoryUploadResponseV1 = send_json(
-        runtime
-            .request(
-                reqwest::Method::POST,
-                runtime.endpoint("internal/code-source/v1/git-history/uploads")?,
-            )
-            .json(&BeginGitHistoryUploadRequestV1 {
-                descriptor: captured.descriptor.clone(),
-            }),
-    )
-    .await?;
-    let pages = pack_history_manifest_pages(
-        &captured.entries,
-        begin
-            .max_page_entries
-            .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_ENTRIES),
-        begin
-            .max_page_bytes
-            .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_BYTES),
-    )?;
-    for (page, page_body) in pages.into_iter().enumerate() {
-        let url = runtime.endpoint(&format!(
-            "internal/code-source/v1/git-history/uploads/{}/manifest/{page}",
-            begin.upload_id
-        ))?;
-        send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
-    }
-
-    let complete_url = runtime.endpoint(&format!(
-        "internal/code-source/v1/git-history/uploads/{}/manifest/complete",
-        begin.upload_id
-    ))?;
-    let mut missing: bbox_git_source::MissingHistoryRecordsPageV1 =
-        send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
-    let entries_by_hash = captured
-        .entries
-        .iter()
-        .map(|entry| (entry.content_sha256.as_str(), entry))
-        .collect::<HashMap<_, _>>();
-    loop {
-        for hash in &missing.hashes {
-            let entry = entries_by_hash
-                .get(hash.as_str())
-                .copied()
-                .ok_or_else(|| anyhow!("server requested an unknown Git-history record"))?;
-            let bytes = read_captured_history_record(&captured, entry)?;
-            let url = runtime.endpoint(&format!(
-                "internal/code-source/v1/git-history/uploads/{}/records/{hash}",
-                begin.upload_id
-            ))?;
-            send_empty(
-                runtime
-                    .request(reqwest::Method::PUT, url)
-                    .header(reqwest::header::CONTENT_LENGTH, bytes.len())
-                    .body(bytes),
-            )
-            .await?;
+    let mut observation = 1;
+    let finalized = loop {
+        if let Some(current) = probe_git_history(runtime, &captured).await? {
+            tracing::info!(
+                source_generation = %current.source_generation_id,
+                commits = current.commit_count,
+                bytes = current.logical_bytes,
+                "Git-history source is already current"
+            );
+            return Ok(());
         }
-        let Some(cursor) = missing.next_cursor.as_deref() else {
-            break;
-        };
-        let mut url = runtime.endpoint(&format!(
-            "internal/code-source/v1/git-history/uploads/{}/missing",
-            begin.upload_id
-        ))?;
-        url.query_pairs_mut().append_pair("cursor", cursor);
-        missing = send_json(runtime.request(reqwest::Method::GET, url)).await?;
-    }
-
-    let finalize_url = runtime.endpoint(&format!(
-        "internal/code-source/v1/git-history/uploads/{}/finalize",
-        begin.upload_id
-    ))?;
-    let finalized: FinalizeGitHistoryUploadResponseV1 =
-        send_json(runtime.request(reqwest::Method::POST, finalize_url)).await?;
+        match upload_git_history(runtime, &captured).await {
+            Ok(finalized) => break finalized,
+            // Begin's state is an observation, not a lease: a concurrent
+            // client with the same descriptor may complete the manifest or
+            // finalize in between. Re-probe and re-begin from the new state.
+            Err(error)
+                if observation < GIT_HISTORY_STATE_OBSERVATIONS
+                    && has_remote_error_code(&error, "invalid_upload_state") =>
+            {
+                tracing::info!(
+                    observation,
+                    error = %format!("{error:#}"),
+                    "Git-history upload state moved concurrently; re-observing"
+                );
+                observation += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
     with_status_timeout(status_timeout, async {
         loop {
@@ -3120,6 +3057,119 @@ async fn publish_git_history(
         }
     })
     .await
+}
+
+async fn probe_git_history(
+    runtime: &Runtime,
+    captured: &CapturedGitHistory,
+) -> Result<Option<GitHistorySourceStatusV1>> {
+    let probe: GitHistoryProbeResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/git-history/probe")?,
+            )
+            .json(&GitHistoryProbeRequestV1 {
+                scope: captured.descriptor.scope.clone(),
+                repo_head: captured.descriptor.repo_head.clone(),
+                object_format: captured.descriptor.object_format,
+            }),
+    )
+    .await?;
+    Ok(probe.current)
+}
+
+/// Begin (or resume) one upload and drive it from its reported state
+/// through finalize.
+async fn upload_git_history(
+    runtime: &Runtime,
+    captured: &CapturedGitHistory,
+) -> Result<FinalizeGitHistoryUploadResponseV1> {
+    let begin: BeginGitHistoryUploadResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/git-history/uploads")?,
+            )
+            .json(&BeginGitHistoryUploadRequestV1 {
+                descriptor: captured.descriptor.clone(),
+            }),
+    )
+    .await?;
+    match begin.state {
+        // Replay every page from zero, even on a resumed upload: the server
+        // accepts an already-stored page only when its digest matches, so
+        // the replay proves this pass rebuilt identical page boundaries.
+        GitHistorySourceStateV1::ReceivingManifest => {
+            let pages = pack_history_manifest_pages(
+                &captured.entries,
+                begin
+                    .max_page_entries
+                    .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_ENTRIES),
+                begin
+                    .max_page_bytes
+                    .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_BYTES),
+            )?;
+            for (page, page_body) in pages.into_iter().enumerate() {
+                let url = runtime.endpoint(&format!(
+                    "internal/code-source/v1/git-history/uploads/{}/manifest/{page}",
+                    begin.upload_id
+                ))?;
+                send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
+            }
+        }
+        // The manifest is already immutable; complete is idempotent there
+        // and returns the first missing-record page.
+        GitHistorySourceStateV1::MissingRecords => {}
+        state => bail!("server resumed Git-history upload in unexpected state {state:?}"),
+    }
+
+    let complete_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/git-history/uploads/{}/manifest/complete",
+        begin.upload_id
+    ))?;
+    let mut missing: bbox_git_source::MissingHistoryRecordsPageV1 =
+        send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
+    let entries_by_hash = captured
+        .entries
+        .iter()
+        .map(|entry| (entry.content_sha256.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    loop {
+        for hash in &missing.hashes {
+            let entry = entries_by_hash
+                .get(hash.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("server requested an unknown Git-history record"))?;
+            let bytes = read_captured_history_record(captured, entry)?;
+            let url = runtime.endpoint(&format!(
+                "internal/code-source/v1/git-history/uploads/{}/records/{hash}",
+                begin.upload_id
+            ))?;
+            send_empty(
+                runtime
+                    .request(reqwest::Method::PUT, url)
+                    .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                    .body(bytes),
+            )
+            .await?;
+        }
+        let Some(cursor) = missing.next_cursor.as_deref() else {
+            break;
+        };
+        let mut url = runtime.endpoint(&format!(
+            "internal/code-source/v1/git-history/uploads/{}/missing",
+            begin.upload_id
+        ))?;
+        url.query_pairs_mut().append_pair("cursor", cursor);
+        missing = send_json(runtime.request(reqwest::Method::GET, url)).await?;
+    }
+
+    let finalize_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/git-history/uploads/{}/finalize",
+        begin.upload_id
+    ))?;
+    send_json(runtime.request(reqwest::Method::POST, finalize_url)).await
 }
 
 async fn publish_project(
@@ -7103,5 +7153,577 @@ mod tests {
         LanePassOutcome::default()
             .into_lane_result("code-source")
             .expect("an empty pass is not an error");
+    }
+
+    /// The collector's Git-history publication against a daemon-shaped HTTP
+    /// surface backed by the real intake store: same routes, same typed
+    /// error codes, and the store's own state machine.
+    mod git_history_resume {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Json;
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode as AxumStatusCode;
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::{get, post, put};
+        use bbox_corpus_core::project_catalog::{CommitNamespace, RepoHistoryId};
+        use bbox_git_source::{
+            GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitObjectFormatV1,
+            MissingHistoryRecordsPageV1, SCHEMA_VERSION as GIT_SCHEMA_VERSION,
+            encode_history_fragment, history_manifest_sha256,
+        };
+        use bbox_git_source_store::{GitSourceStore, StoreLimits, StoreRequestError};
+
+        use super::*;
+
+        const PRODUCER: &str = "producer-a";
+        /// Above the store's 1,000-hash missing-record page, so an upload of
+        /// this history pages through missing records.
+        const PAGINATED_COMMITS: usize = 1_105;
+        const COMMITS: usize = 60;
+        const PREINSTALLED_RECORDS: usize = 40;
+        const _: () = assert!(PAGINATED_COMMITS - PREINSTALLED_RECORDS > 1_000);
+        /// Advertised manifest page size, so the manifest spans three pages.
+        const PAGE_ENTRIES: usize = 25;
+
+        type Interleave = Box<dyn FnOnce(&GitSourceStore, &str) + Send>;
+
+        struct Daemon {
+            store: GitSourceStore,
+            history: RepoHistoryId,
+            namespace: CommitNamespace,
+            begins: AtomicUsize,
+            manifest_puts: AtomicUsize,
+            missing_gets: AtomicUsize,
+            /// A concurrent same-descriptor client that acts once, just
+            /// before the first manifest PUT is served.
+            interleave: Mutex<Option<Interleave>>,
+            /// Every manifest PUT observes a moved upload state.
+            always_moved: bool,
+            page_entries: usize,
+        }
+
+        fn error_response(error: anyhow::Error) -> Response {
+            let (status, code) = match error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<StoreRequestError>())
+            {
+                Some(StoreRequestError::InvalidState) => {
+                    (AxumStatusCode::UNPROCESSABLE_ENTITY, "invalid_upload_state")
+                }
+                Some(StoreRequestError::InvalidInput) => (
+                    AxumStatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_git_source_input",
+                ),
+                Some(StoreRequestError::NotFound) => (AxumStatusCode::NOT_FOUND, "not_found"),
+                Some(StoreRequestError::TooManyOpenUploads) => {
+                    (AxumStatusCode::TOO_MANY_REQUESTS, "upload_limit_reached")
+                }
+                Some(StoreRequestError::LimitExceeded) => {
+                    (AxumStatusCode::PAYLOAD_TOO_LARGE, "limit_exceeded")
+                }
+                None => (AxumStatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    code: code.into(),
+                    message: format!("{error:#}"),
+                }),
+            )
+                .into_response()
+        }
+
+        fn respond<T: serde::Serialize>(status: AxumStatusCode, result: Result<T>) -> Response {
+            match result {
+                Ok(body) => (status, Json(body)).into_response(),
+                Err(error) => error_response(error),
+            }
+        }
+
+        fn status_of(
+            source: bbox_git_source_store::StoredHistorySourceV1,
+        ) -> GitHistorySourceStatusV1 {
+            GitHistorySourceStatusV1 {
+                source_generation_id: source.source_generation_id,
+                state: source.state,
+                commit_count: source.descriptor.commit_count,
+                logical_bytes: source.descriptor.logical_bytes,
+                diagnostic: source.diagnostic,
+            }
+        }
+
+        async fn serve(daemon: Arc<Daemon>) -> (Runtime, tokio::task::JoinHandle<()>) {
+            let app = Router::new()
+                .route(
+                    "/internal/code-source/v1/git-history/probe",
+                    post(
+                        |State(daemon): State<Arc<Daemon>>,
+                         Json(request): Json<GitHistoryProbeRequestV1>| async move {
+                            respond(
+                                AxumStatusCode::OK,
+                                daemon
+                                    .store
+                                    .probe_ready_history(
+                                        PRODUCER,
+                                        &daemon.history,
+                                        &request.repo_head,
+                                        request.object_format,
+                                    )
+                                    .map(|current| GitHistoryProbeResponseV1 {
+                                        current: current.map(status_of),
+                                    }),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads",
+                    post(
+                        |State(daemon): State<Arc<Daemon>>,
+                         Json(request): Json<BeginGitHistoryUploadRequestV1>| async move {
+                            daemon.begins.fetch_add(1, Ordering::SeqCst);
+                            respond(
+                                AxumStatusCode::CREATED,
+                                daemon
+                                    .store
+                                    .begin_history_upload(
+                                        PRODUCER,
+                                        &daemon.history,
+                                        &daemon.namespace,
+                                        request.descriptor,
+                                    )
+                                    .map(|mut begin| {
+                                        begin.max_page_entries = daemon.page_entries;
+                                        begin
+                                    }),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads/{upload_id}/manifest/{page}",
+                    put(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath((upload_id, page)): AxumPath<(String, u32)>,
+                         Json(body): Json<GitHistoryManifestPageV1>| async move {
+                            daemon.manifest_puts.fetch_add(1, Ordering::SeqCst);
+                            let interleave = daemon.interleave.lock().unwrap().take();
+                            if let Some(interleave) = interleave {
+                                interleave(&daemon.store, &upload_id);
+                            }
+                            if daemon.always_moved {
+                                return error_response(anyhow!(StoreRequestError::InvalidState));
+                            }
+                            match daemon
+                                .store
+                                .put_history_manifest_page(PRODUCER, &upload_id, page, &body)
+                            {
+                                Ok(()) => AxumStatusCode::NO_CONTENT.into_response(),
+                                Err(error) => error_response(error),
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads/{upload_id}/manifest/complete",
+                    post(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath(upload_id): AxumPath<String>| async move {
+                            respond(
+                                AxumStatusCode::OK,
+                                daemon.store.complete_history_manifest(PRODUCER, &upload_id),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads/{upload_id}/missing",
+                    get(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath(upload_id): AxumPath<String>,
+                         Query(query): Query<HashMap<String, String>>| async move {
+                            daemon.missing_gets.fetch_add(1, Ordering::SeqCst);
+                            respond(
+                                AxumStatusCode::OK,
+                                daemon.store.missing_history_records(
+                                    PRODUCER,
+                                    &upload_id,
+                                    query.get("cursor").map(String::as_str),
+                                ),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads/{upload_id}/records/{hash}",
+                    put(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath((upload_id, hash)): AxumPath<(String, String)>,
+                         body: Bytes| async move {
+                            match daemon.store.install_history_record(
+                                PRODUCER,
+                                &upload_id,
+                                &hash,
+                                body.len() as u64,
+                                std::io::Cursor::new(body.to_vec()),
+                            ) {
+                                Ok(()) => AxumStatusCode::NO_CONTENT.into_response(),
+                                Err(error) => error_response(error),
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/uploads/{upload_id}/finalize",
+                    post(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath(upload_id): AxumPath<String>| async move {
+                            respond(
+                                AxumStatusCode::ACCEPTED,
+                                daemon.store.finalize_history_upload(PRODUCER, &upload_id),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    "/internal/code-source/v1/git-history/generations/{generation}/status",
+                    get(
+                        |State(daemon): State<Arc<Daemon>>,
+                         AxumPath(generation): AxumPath<String>| async move {
+                            respond(
+                                AxumStatusCode::OK,
+                                daemon.store.history_status(PRODUCER, &generation),
+                            )
+                        },
+                    ),
+                )
+                .with_state(daemon);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let runtime = Runtime {
+                base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+                token: ServiceToken::parse("8".repeat(64)).unwrap(),
+                client: Client::builder().build().unwrap(),
+            };
+            (runtime, server)
+        }
+
+        fn daemon(root: &Path) -> Daemon {
+            Daemon {
+                store: GitSourceStore::open(root.join("git-sources"), StoreLimits::default())
+                    .unwrap(),
+                history: RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap(),
+                namespace: CommitNamespace::parse("repo-a").unwrap(),
+                begins: AtomicUsize::new(0),
+                manifest_puts: AtomicUsize::new(0),
+                missing_gets: AtomicUsize::new(0),
+                interleave: Mutex::new(None),
+                always_moved: false,
+                page_entries: PAGE_ENTRIES,
+            }
+        }
+
+        /// A complete linear history captured into canonical records.
+        fn captured_history(commits: usize) -> CapturedGitHistory {
+            let records = tempfile::tempdir().unwrap();
+            let mut entries = Vec::with_capacity(commits);
+            let mut parent: Option<String> = None;
+            for index in 0..commits {
+                let oid = format!("{:040x}", index + 1);
+                let fragment = GitHistoryCommitFragmentV1 {
+                    commit_oid: oid.clone(),
+                    fragment_index: 0,
+                    fragment_count: 1,
+                    header: Some(GitHistoryCommitHeaderV1 {
+                        parent_oids: parent.iter().cloned().collect(),
+                        author_name: "History Fixture".into(),
+                        author_email: "history@example.invalid".into(),
+                        message: format!("commit {index}"),
+                    }),
+                    changed_paths: vec![format!("src/file{index}.rs")],
+                };
+                let bytes = encode_history_fragment(&fragment);
+                let hash = hex::encode(Sha256::digest(&bytes));
+                fs::write(records.path().join(&hash), &bytes).unwrap();
+                entries.push(GitHistoryManifestEntryV1 {
+                    commit_oid: oid.clone(),
+                    fragment_index: 0,
+                    encoded_bytes: bytes.len() as u64,
+                    content_sha256: hash,
+                });
+                parent = Some(oid);
+            }
+            let descriptor = GitHistoryDescriptorV1 {
+                schema_version: GIT_SCHEMA_VERSION,
+                scope: PublishedScope::try_new("repo-a", ".").unwrap(),
+                repo_head: parent.unwrap(),
+                object_format: GitObjectFormatV1::Sha1,
+                manifest_sha256: history_manifest_sha256(&entries),
+                commit_count: commits as u64,
+                fragment_count: commits as u64,
+                logical_bytes: entries.iter().map(|entry| entry.encoded_bytes).sum(),
+            };
+            CapturedGitHistory {
+                descriptor,
+                entries,
+                records,
+            }
+        }
+
+        fn pages(captured: &CapturedGitHistory, entries: usize) -> Vec<GitHistoryManifestPageV1> {
+            pack_history_manifest_pages(
+                &captured.entries,
+                entries,
+                bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_BYTES,
+            )
+            .unwrap()
+        }
+
+        fn install_records(
+            store: &GitSourceStore,
+            captured: &CapturedGitHistory,
+            upload_id: &str,
+            count: usize,
+        ) {
+            for entry in captured.entries.iter().take(count) {
+                store
+                    .install_history_record(
+                        PRODUCER,
+                        upload_id,
+                        &entry.content_sha256,
+                        entry.encoded_bytes,
+                        std::io::Cursor::new(
+                            read_captured_history_record(captured, entry).unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+
+        async fn assert_current(runtime: &Runtime, captured: &CapturedGitHistory) {
+            let current = probe_git_history(runtime, captured)
+                .await
+                .unwrap()
+                .expect("the published HEAD is current");
+            assert_eq!(current.commit_count, captured.descriptor.commit_count);
+            assert_eq!(current.state, GitHistorySourceStateV1::Ready);
+        }
+
+        #[tokio::test]
+        async fn resumed_receiving_manifest_upload_replays_pages_and_converges() {
+            let directory = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(daemon(&directory.path().canonicalize().unwrap()));
+            let captured = captured_history(COMMITS);
+            // A prior pass stored the first manifest page, then died.
+            let prior = daemon
+                .store
+                .begin_history_upload(
+                    PRODUCER,
+                    &daemon.history,
+                    &daemon.namespace,
+                    captured.descriptor.clone(),
+                )
+                .unwrap();
+            let pages = pages(&captured, PAGE_ENTRIES);
+            assert_eq!(pages.len(), 3);
+            daemon
+                .store
+                .put_history_manifest_page(PRODUCER, &prior.upload_id, 0, &pages[0])
+                .unwrap();
+            let (runtime, server) = serve(daemon.clone()).await;
+
+            publish_git_history(&runtime, captured_history(COMMITS), Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert_eq!(daemon.begins.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                daemon.manifest_puts.load(Ordering::SeqCst),
+                3,
+                "a ReceivingManifest resume replays every page from zero"
+            );
+            assert_eq!(daemon.missing_gets.load(Ordering::SeqCst), 0);
+            assert_current(&runtime, &captured).await;
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn resumed_missing_records_upload_skips_manifest_and_converges() {
+            let directory = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(daemon(&directory.path().canonicalize().unwrap()));
+            let captured = captured_history(PAGINATED_COMMITS);
+            // A prior pass completed the manifest and some records. Page 0
+            // is now refused, so a blind replay would fail every pass.
+            let prior = daemon
+                .store
+                .begin_history_upload(
+                    PRODUCER,
+                    &daemon.history,
+                    &daemon.namespace,
+                    captured.descriptor.clone(),
+                )
+                .unwrap();
+            for (page, body) in pages(&captured, PAGE_ENTRIES).iter().enumerate() {
+                daemon
+                    .store
+                    .put_history_manifest_page(PRODUCER, &prior.upload_id, page as u32, body)
+                    .unwrap();
+            }
+            daemon
+                .store
+                .complete_history_manifest(PRODUCER, &prior.upload_id)
+                .unwrap();
+            install_records(
+                &daemon.store,
+                &captured,
+                &prior.upload_id,
+                PREINSTALLED_RECORDS,
+            );
+            let (runtime, server) = serve(daemon.clone()).await;
+
+            publish_git_history(
+                &runtime,
+                captured_history(PAGINATED_COMMITS),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert_eq!(daemon.begins.load(Ordering::SeqCst), 1);
+            assert_eq!(daemon.manifest_puts.load(Ordering::SeqCst), 0);
+            assert_eq!(daemon.missing_gets.load(Ordering::SeqCst), 1);
+            assert_current(&runtime, &captured).await;
+
+            // The next pass sees the HEAD as current and uploads nothing.
+            publish_git_history(
+                &runtime,
+                captured_history(PAGINATED_COMMITS),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert_eq!(daemon.begins.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn changed_replayed_page_bytes_remain_a_hard_conflict() {
+            let directory = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(daemon(&directory.path().canonicalize().unwrap()));
+            let captured = captured_history(COMMITS);
+            // A prior pass cut its first page at a different boundary.
+            let prior = daemon
+                .store
+                .begin_history_upload(
+                    PRODUCER,
+                    &daemon.history,
+                    &daemon.namespace,
+                    captured.descriptor.clone(),
+                )
+                .unwrap();
+            daemon
+                .store
+                .put_history_manifest_page(
+                    PRODUCER,
+                    &prior.upload_id,
+                    0,
+                    &pages(&captured, PAGE_ENTRIES - 5)[0],
+                )
+                .unwrap();
+            let (runtime, server) = serve(daemon.clone()).await;
+
+            let error =
+                publish_git_history(&runtime, captured_history(COMMITS), Duration::from_secs(10))
+                    .await
+                    .unwrap_err();
+            assert!(
+                has_remote_error_code(&error, "invalid_git_source_input"),
+                "{error:#}"
+            );
+            assert_eq!(
+                daemon.begins.load(Ordering::SeqCst),
+                1,
+                "a content conflict is never re-observed as a state move"
+            );
+            assert!(
+                probe_git_history(&runtime, &captured)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn interleaved_same_descriptor_client_recovers_from_a_stale_begin() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut daemon = daemon(&directory.path().canonicalize().unwrap());
+            let captured = captured_history(COMMITS);
+            let other_pages = pages(&captured, PAGE_ENTRIES);
+            // Between this client's begin and its first page PUT, another
+            // client with the same descriptor stores every page and
+            // completes the manifest, so this client's observation is stale.
+            daemon.interleave = Mutex::new(Some(Box::new(move |store, upload_id| {
+                for (page, body) in other_pages.iter().enumerate() {
+                    store
+                        .put_history_manifest_page(PRODUCER, upload_id, page as u32, body)
+                        .unwrap();
+                }
+                store
+                    .complete_history_manifest(PRODUCER, upload_id)
+                    .unwrap();
+            })));
+            let daemon = Arc::new(daemon);
+            let (runtime, server) = serve(daemon.clone()).await;
+
+            publish_git_history(&runtime, captured_history(COMMITS), Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert_eq!(
+                daemon.begins.load(Ordering::SeqCst),
+                2,
+                "one bounded re-observation resumes from MissingRecords"
+            );
+            assert_eq!(daemon.manifest_puts.load(Ordering::SeqCst), 1);
+            assert_current(&runtime, &captured).await;
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn persistent_state_moves_exhaust_boundedly() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut daemon = daemon(&directory.path().canonicalize().unwrap());
+            daemon.always_moved = true;
+            let daemon = Arc::new(daemon);
+            let (runtime, server) = serve(daemon.clone()).await;
+
+            let error =
+                publish_git_history(&runtime, captured_history(COMMITS), Duration::from_secs(10))
+                    .await
+                    .unwrap_err();
+            assert!(
+                has_remote_error_code(&error, "invalid_upload_state"),
+                "{error:#}"
+            );
+            assert_eq!(
+                daemon.begins.load(Ordering::SeqCst),
+                GIT_HISTORY_STATE_OBSERVATIONS
+            );
+            server.abort();
+        }
+
+        #[test]
+        fn legacy_begin_response_resumes_as_receiving_manifest() {
+            let begin: BeginGitHistoryUploadResponseV1 = serde_json::from_str(
+                r#"{"upload_id":"u","max_page_entries":1,"max_page_bytes":2,"max_record_bytes":3}"#,
+            )
+            .unwrap();
+            assert_eq!(begin.state, GitHistorySourceStateV1::ReceivingManifest);
+            let _: MissingHistoryRecordsPageV1 =
+                serde_json::from_str(r#"{"source_generation_id":"g","hashes":[]}"#).unwrap();
+        }
     }
 }

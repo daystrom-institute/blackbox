@@ -1957,4 +1957,147 @@ mod tests {
             "a retained older source must not reactivate after current-ready advanced"
         );
     }
+
+    #[test]
+    fn head_returning_to_a_retained_source_reactivates_it_over_stale_work() {
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_head_returns_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000003").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    bro_rpc::ServiceToken::parse("7".repeat(64)).unwrap(),
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        let store = state.git_sources.store();
+        let source_state = |source: &str| store.history_status("producer-a", source).unwrap();
+        let selected_source = || {
+            bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir(&state))
+                .unwrap()
+                .values()
+                .map(|overlay| {
+                    overlay
+                        .source
+                        .producer_transport()
+                        .map(|(_, source)| source.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // HEAD A is accepted and activated.
+        let head_a = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_a);
+        let source_a =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head_a);
+        activate_source(&state, &source_a).unwrap();
+        assert_eq!(selected_source(), vec![Some(source_a.clone())]);
+
+        // HEAD moves to B, which activates and retires A.
+        let head_b = "2".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_b);
+        let source_b =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head_b);
+        activate_source(&state, &source_b).unwrap();
+        assert_eq!(
+            source_state(&source_a).state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert_eq!(
+            source_state(&source_b).state,
+            GitHistorySourceStateV1::Active
+        );
+
+        // HEAD returns to A. The fresh upload re-derives A's id, finalizes
+        // against the retained generation, and becomes the accepted source.
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_a);
+        let returned =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head_a);
+        assert_eq!(returned, source_a);
+        assert_eq!(
+            store.current_ready_source_id(&history).unwrap().as_deref(),
+            Some(source_a.as_str())
+        );
+        let reopened = source_state(&source_a);
+        assert_eq!(reopened.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(reopened.diagnostic, None);
+
+        // Stale queued work for B cannot displace the accepted A: it neither
+        // re-plans nor republishes, and B stays last-good until A commits.
+        // (The code lane's move back to HEAD A already withdrew B's overlay,
+        // whose exact head no longer matches.)
+        let selected_before = selected_source();
+        let journal_before = store.read_activation_journal(&history).unwrap().unwrap();
+        activate_source(&state, &source_b).unwrap();
+        assert_eq!(
+            source_state(&source_b).state,
+            GitHistorySourceStateV1::Active
+        );
+        assert_eq!(selected_source(), selected_before);
+        assert_eq!(
+            store.read_activation_journal(&history).unwrap().unwrap(),
+            journal_before
+        );
+        assert_eq!(journal_before.source_generation_id, source_b);
+
+        // Normal activation of A runs against the current code and grant.
+        activate_source(&state, &source_a).unwrap();
+        let journal = store.read_activation_journal(&history).unwrap().unwrap();
+        assert_eq!(journal.stage, HistoryActivationStageV1::Committed);
+        assert_eq!(journal.source_generation_id, source_a);
+        assert_eq!(journal.overlays.len(), 1);
+        assert_eq!(
+            source_state(&source_a).state,
+            GitHistorySourceStateV1::Active
+        );
+        assert_eq!(
+            source_state(&source_b).state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert_eq!(selected_source(), vec![Some(source_a.clone())]);
+        assert!(reconcile_transport_currency(&state, root_project).unwrap());
+
+        // A later stale redrive of B is still retired without effect.
+        activate_source(&state, &source_b).unwrap();
+        assert_eq!(selected_source(), vec![Some(source_a.clone())]);
+        assert_eq!(
+            source_state(&source_b).state,
+            GitHistorySourceStateV1::Superseded
+        );
+    }
 }

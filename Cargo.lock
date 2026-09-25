@@ -352,6 +352,7 @@ dependencies = [
  "bbox-config",
  "bbox-corpus-core",
  "bbox-git-source",
+ "bbox-git-source-store",
  "bbox-knowledge-source",
  "bbox-project-render",
  "bbox-provenance",

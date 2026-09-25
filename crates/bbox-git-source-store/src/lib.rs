@@ -39,6 +39,36 @@ const MAX_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PROVENANCE_RECEIPT_BYTES: usize = 64 * 1024;
 const MISSING_PAGE_SIZE: usize = 1_000;
 const HISTORY_UPLOAD_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
+/// Regular files a repository history root may hold beside its generations.
+const HISTORY_ROOT_FILES: &[&str] = &["current-ready.json", "acceptance-sequence.json"];
+
+#[cfg(test)]
+thread_local! {
+    static FINALIZE_FAILURE_POINT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Simulate a crash immediately after one durable finalize step.
+#[cfg(test)]
+fn inject_finalize_failure(point: &'static str) -> Result<()> {
+    let fail = FINALIZE_FAILURE_POINT.with(|current| {
+        if *current.borrow() == Some(point) {
+            current.replace(None);
+            true
+        } else {
+            false
+        }
+    });
+    if fail {
+        bail!("injected Git-history finalize failure after {point}");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn inject_finalize_failure(_point: &'static str) -> Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -104,6 +134,12 @@ struct HistoryUploadRecordV1 {
     page_digests: BTreeMap<u32, String>,
     source_generation_id: Option<String>,
     updated_unix_secs: u64,
+    /// Durable per-repository acceptance checkpoint for this upload attempt.
+    /// Absent until a verified finalize accepts the upload, and absent on
+    /// every record written before ordered acceptance existed; a completed
+    /// upload without one is a legacy no-op and never gains one by replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -585,6 +621,43 @@ struct ReadyPointerV1 {
     source_generation_id: String,
     producer_id: String,
     repo_head: String,
+    /// Acceptance sequence and upload attempt that published this pointer.
+    /// Both are absent on a legacy pointer, which is only a baseline: any
+    /// acceptance allocated by an upgraded writer is newer than it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_upload_id: Option<String>,
+}
+
+/// Ordering evidence carried by a history ready pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryPointerAcceptance<'a> {
+    Legacy,
+    Accepted { sequence: u64, upload_id: &'a str },
+}
+
+impl ReadyPointerV1 {
+    fn acceptance(&self) -> Result<HistoryPointerAcceptance<'_>> {
+        match (self.accepted_sequence, self.accepted_upload_id.as_deref()) {
+            (None, None) => Ok(HistoryPointerAcceptance::Legacy),
+            (Some(sequence), Some(upload_id)) if sequence > 0 => {
+                validate_upload_id(upload_id).map_err(|_| StoreRequestError::InvalidState)?;
+                Ok(HistoryPointerAcceptance::Accepted {
+                    sequence,
+                    upload_id,
+                })
+            }
+            _ => bail!(StoreRequestError::InvalidState),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HistoryAcceptanceSequenceV1 {
+    version: u32,
+    next_sequence: u64,
 }
 
 pub struct GitSourceStore {
@@ -1657,7 +1730,7 @@ impl GitSourceStore {
                         | GitHistorySourceStateV1::Failed
                 )
             {
-                return Ok(begin_response(record.upload_id));
+                return Ok(begin_response(record.upload_id, record.state));
             }
             if !matches!(
                 record.state,
@@ -1691,9 +1764,13 @@ impl GitSourceStore {
                 page_digests: BTreeMap::new(),
                 source_generation_id: Some(source_generation_id),
                 updated_unix_secs: now_unix_secs(),
+                accepted_sequence: None,
             },
         )?;
-        Ok(begin_response(upload_id))
+        Ok(begin_response(
+            upload_id,
+            GitHistorySourceStateV1::ReceivingManifest,
+        ))
     }
 
     pub fn put_history_manifest_page(
@@ -1869,6 +1946,16 @@ impl GitSourceStore {
         write_json(&upload_directory, "upload.json", &record)
     }
 
+    /// Accept one fully verified upload.
+    ///
+    /// Immutable generation files are content-addressed evidence: an existing
+    /// generation with the same identity, descriptor, and manifest is reused
+    /// with its original creation time and lifecycle state. Each accepted
+    /// upload attempt receives a durable per-repository acceptance sequence,
+    /// checkpointed in its upload record before the ready pointer moves, so a
+    /// retry resumes the same acceptance and an older attempt can finish
+    /// without rewinding a newer pointer. Every step is idempotent, so a
+    /// retry after a crash at any point converges.
     pub fn finalize_history_upload(
         &self,
         producer_id: &str,
@@ -1883,6 +1970,8 @@ impl GitSourceStore {
             .source_generation_id
             .clone()
             .ok_or(StoreRequestError::InvalidState)?;
+        // Replaying a completed upload is a no-op; it never repoints the
+        // repository, so a delayed retry cannot undo a newer acceptance.
         if upload.state == GitHistorySourceStateV1::Ready {
             return Ok(finalize_response(source_generation_id));
         }
@@ -1906,20 +1995,64 @@ impl GitSourceStore {
         let generation_path =
             self.generation_dir(&upload.repo_history_id, &source_generation_id)?;
         let generation_dir = NofollowDirectory::open_or_create(&generation_path)?;
-        let stored = StoredHistorySourceV1 {
-            version: STORE_VERSION,
-            source_generation_id: source_generation_id.clone(),
-            producer_id: producer_id.to_string(),
-            repo_history_id: upload.repo_history_id.clone(),
-            primary_namespace: upload.primary_namespace.clone(),
-            descriptor: upload.descriptor.clone(),
-            state: GitHistorySourceStateV1::Ready,
-            created_unix_secs: now_unix_secs(),
-            diagnostic: None,
+        let existing = read_json::<StoredHistorySourceV1>(
+            &generation_path,
+            "source.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "stored Git-history source",
+        )?;
+        if let Some(existing) = existing.as_ref()
+            && (existing.version != STORE_VERSION
+                || existing.source_generation_id != source_generation_id
+                || existing.producer_id != producer_id
+                || existing.repo_history_id != upload.repo_history_id
+                || existing.primary_namespace != upload.primary_namespace
+                || existing.descriptor != upload.descriptor)
+        {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        let descriptor_present =
+            immutable_json_matches(&generation_dir, "descriptor.json", &upload.descriptor)?;
+        let manifest_present = immutable_json_matches(&generation_dir, "manifest.json", &manifest)?;
+        if !descriptor_present {
+            write_json(&generation_dir, "descriptor.json", &upload.descriptor)?;
+        }
+        if !manifest_present {
+            write_json(&generation_dir, "manifest.json", &manifest)?;
+        }
+        let mut source = match existing {
+            Some(existing) => existing,
+            None => {
+                let stored = StoredHistorySourceV1 {
+                    version: STORE_VERSION,
+                    source_generation_id: source_generation_id.clone(),
+                    producer_id: producer_id.to_string(),
+                    repo_history_id: upload.repo_history_id.clone(),
+                    primary_namespace: upload.primary_namespace.clone(),
+                    descriptor: upload.descriptor.clone(),
+                    state: GitHistorySourceStateV1::Ready,
+                    created_unix_secs: now_unix_secs(),
+                    diagnostic: None,
+                };
+                write_json(&generation_dir, "source.json", &stored)?;
+                stored
+            }
         };
-        install_immutable_json(&generation_dir, "descriptor.json", &upload.descriptor)?;
-        install_immutable_json(&generation_dir, "manifest.json", &manifest)?;
-        install_immutable_json(&generation_dir, "source.json", &stored)?;
+        inject_finalize_failure("immutable-installed")?;
+
+        let accepted_sequence = match upload.accepted_sequence {
+            Some(sequence) => sequence,
+            None => {
+                let sequence =
+                    self.allocate_history_acceptance_sequence(&upload.repo_history_id)?;
+                inject_finalize_failure("acceptance-counter")?;
+                upload.accepted_sequence = Some(sequence);
+                upload.updated_unix_secs = now_unix_secs();
+                write_json(&upload_directory, "upload.json", &upload)?;
+                inject_finalize_failure("acceptance-checkpoint")?;
+                sequence
+            }
+        };
 
         let index_dir = NofollowDirectory::open_existing(&self.root.join("generation-index"))?
             .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))?;
@@ -1933,22 +2066,70 @@ impl GitSourceStore {
                 repo_history_id: upload.repo_history_id.clone(),
             },
         )?;
-        let history_root =
-            NofollowDirectory::open_existing(&self.repo_history_root(&upload.repo_history_id)?)?
-                .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))?;
-        write_json(
-            &history_root,
-            "current-ready.json",
-            &ReadyPointerV1 {
-                version: STORE_VERSION,
-                source_generation_id: source_generation_id.clone(),
-                producer_id: producer_id.to_string(),
-                repo_head: upload.descriptor.repo_head.clone(),
+        inject_finalize_failure("generation-index")?;
+
+        let history_path = self.repo_history_root(&upload.repo_history_id)?;
+        let current = load_history_ready_pointer(&history_path)?;
+        let (wins, publish) = match current.as_ref() {
+            None => (true, true),
+            Some(pointer) => match pointer.acceptance()? {
+                HistoryPointerAcceptance::Legacy => (true, true),
+                HistoryPointerAcceptance::Accepted { sequence, .. }
+                    if sequence < accepted_sequence =>
+                {
+                    (true, true)
+                }
+                HistoryPointerAcceptance::Accepted {
+                    sequence,
+                    upload_id: accepted_upload_id,
+                } if sequence == accepted_sequence => {
+                    if accepted_upload_id != upload_id
+                        || pointer.source_generation_id != source_generation_id
+                        || pointer.producer_id != producer_id
+                    {
+                        bail!(StoreRequestError::InvalidState);
+                    }
+                    (true, false)
+                }
+                HistoryPointerAcceptance::Accepted { .. } => (false, false),
             },
-        )?;
+        };
+        if publish {
+            let history_root = NofollowDirectory::open_existing(&history_path)?
+                .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))?;
+            write_json(
+                &history_root,
+                "current-ready.json",
+                &ReadyPointerV1 {
+                    version: STORE_VERSION,
+                    source_generation_id: source_generation_id.clone(),
+                    producer_id: producer_id.to_string(),
+                    repo_head: upload.descriptor.repo_head.clone(),
+                    accepted_sequence: Some(accepted_sequence),
+                    accepted_upload_id: Some(upload_id.to_string()),
+                },
+            )?;
+            inject_finalize_failure("ready-pointer")?;
+        }
+        // Only the winning acceptance reopens a terminal source; activation
+        // then re-plans against the current catalog, grant, and code state.
+        // In-flight and Active lifecycle states are preserved as they are.
+        if wins
+            && matches!(
+                source.state,
+                GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
+            )
+        {
+            source.state = GitHistorySourceStateV1::Ready;
+            source.diagnostic = None;
+            write_json(&generation_dir, "source.json", &source)?;
+            inject_finalize_failure("source-reopened")?;
+        }
+
         upload.state = GitHistorySourceStateV1::Ready;
         upload.updated_unix_secs = now_unix_secs();
         write_json(&upload_directory, "upload.json", &upload)?;
+        inject_finalize_failure("upload-ready")?;
         Ok(finalize_response(source_generation_id))
     }
 
@@ -1987,13 +2168,7 @@ impl GitSourceStore {
         object_format: bbox_git_source::GitObjectFormatV1,
     ) -> Result<Option<StoredHistorySourceV1>> {
         let history_root = self.repo_history_root(repo_history_id)?;
-        let Some(pointer) = read_json::<ReadyPointerV1>(
-            &history_root,
-            "current-ready.json",
-            MAX_GENERATION_RECORD_BYTES,
-            "Git-history ready pointer",
-        )?
-        else {
+        let Some(pointer) = load_history_ready_pointer(&history_root)? else {
             return Ok(None);
         };
         if pointer.producer_id != producer_id || pointer.repo_head != repo_head {
@@ -2400,12 +2575,7 @@ impl GitSourceStore {
             if NofollowDirectory::open_existing(&history_dir)?.is_none() {
                 continue;
             }
-            if let Some(pointer) = read_json::<ReadyPointerV1>(
-                &history_dir,
-                "current-ready.json",
-                MAX_GENERATION_RECORD_BYTES,
-                "Git-history ready pointer",
-            )? {
+            if let Some(pointer) = load_history_ready_pointer(&history_dir)? {
                 validate_generation_id(&pointer.source_generation_id)?;
                 ids.push(pointer.source_generation_id);
             }
@@ -2420,13 +2590,7 @@ impl GitSourceStore {
         repo_history_id: &RepoHistoryId,
     ) -> Result<Option<String>> {
         let history_dir = self.repo_history_root(repo_history_id)?;
-        let Some(pointer) = read_json::<ReadyPointerV1>(
-            &history_dir,
-            "current-ready.json",
-            MAX_GENERATION_RECORD_BYTES,
-            "Git-history ready pointer",
-        )?
-        else {
+        let Some(pointer) = load_history_ready_pointer(&history_dir)? else {
             return Ok(None);
         };
         validate_generation_id(&pointer.source_generation_id)?;
@@ -2519,7 +2683,7 @@ impl GitSourceStore {
         let _guard = self.lock_mutation()?;
         let history_dir = self.repo_history_root(repo_history_id)?;
         let mut superseded = 0_u64;
-        for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+        for generation_dir in read_child_directories(&history_dir, HISTORY_ROOT_FILES)? {
             let Some(mut source) = read_json::<StoredHistorySourceV1>(
                 &generation_dir,
                 "source.json",
@@ -2970,7 +3134,70 @@ impl GitSourceStore {
         {
             bail!(StoreRequestError::NotFound);
         }
+        validate_upload_acceptance(&record)?;
         Ok(record)
+    }
+
+    /// Allocate the next acceptance sequence for one repository.
+    ///
+    /// The durable counter is the primary high-water mark. The current
+    /// pointer and retained upload checkpoints can only raise it, so a
+    /// missing or lagging counter never re-issues a sequence already used,
+    /// and a counter is never moved backwards.
+    fn allocate_history_acceptance_sequence(&self, repo_history_id: &RepoHistoryId) -> Result<u64> {
+        let history_path = self.repo_history_root(repo_history_id)?;
+        let mut next = match read_json::<HistoryAcceptanceSequenceV1>(
+            &history_path,
+            "acceptance-sequence.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history acceptance sequence",
+        )? {
+            Some(counter) if counter.version == STORE_VERSION && counter.next_sequence > 0 => {
+                counter.next_sequence
+            }
+            Some(_) => bail!(StoreRequestError::InvalidState),
+            None => 1,
+        };
+        let above = |sequence: u64| {
+            sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!(StoreRequestError::LimitExceeded))
+        };
+        if let Some(pointer) = load_history_ready_pointer(&history_path)?
+            && let HistoryPointerAcceptance::Accepted { sequence, .. } = pointer.acceptance()?
+        {
+            next = next.max(above(sequence)?);
+        }
+        for producer_dir in read_directories(&self.root.join("uploads"))? {
+            for upload_dir in read_directories(&producer_dir)? {
+                let Some(upload) = read_json::<HistoryUploadRecordV1>(
+                    &upload_dir,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "Git-history upload record",
+                )?
+                else {
+                    continue;
+                };
+                validate_upload_acceptance(&upload)?;
+                if upload.repo_history_id == *repo_history_id
+                    && let Some(sequence) = upload.accepted_sequence
+                {
+                    next = next.max(above(sequence)?);
+                }
+            }
+        }
+        let directory = NofollowDirectory::open_existing(&history_path)?
+            .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))?;
+        write_json(
+            &directory,
+            "acceptance-sequence.json",
+            &HistoryAcceptanceSequenceV1 {
+                version: STORE_VERSION,
+                next_sequence: above(next)?,
+            },
+        )?;
+        Ok(next)
     }
 
     fn load_manifest(&self, upload_dir: &Path) -> Result<Vec<GitHistoryManifestEntryV1>> {
@@ -3108,14 +3335,9 @@ impl GitSourceStore {
             if NofollowDirectory::open_existing(&history_dir)?.is_none() {
                 continue;
             }
-            let current = read_json::<ReadyPointerV1>(
-                &history_dir,
-                "current-ready.json",
-                MAX_GENERATION_RECORD_BYTES,
-                "Git-history ready pointer",
-            )?;
+            let current = load_history_ready_pointer(&history_dir)?;
             let mut sources = Vec::new();
-            for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+            for generation_dir in read_child_directories(&history_dir, HISTORY_ROOT_FILES)? {
                 let source = read_json::<StoredHistorySourceV1>(
                     &generation_dir,
                     "source.json",
@@ -3326,7 +3548,7 @@ impl GitSourceStore {
             if NofollowDirectory::open_existing(&history_dir)?.is_none() {
                 continue;
             }
-            for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+            for generation_dir in read_child_directories(&history_dir, HISTORY_ROOT_FILES)? {
                 let source = read_json::<StoredHistorySourceV1>(
                     &generation_dir,
                     "source.json",
@@ -3568,12 +3790,16 @@ impl GitSourceStore {
     }
 }
 
-fn begin_response(upload_id: String) -> BeginGitHistoryUploadResponseV1 {
+fn begin_response(
+    upload_id: String,
+    state: GitHistorySourceStateV1,
+) -> BeginGitHistoryUploadResponseV1 {
     BeginGitHistoryUploadResponseV1 {
         upload_id,
         max_page_entries: MAX_HISTORY_MANIFEST_PAGE_ENTRIES,
         max_page_bytes: MAX_HISTORY_MANIFEST_PAGE_BYTES,
         max_record_bytes: MAX_HISTORY_RECORD_BYTES,
+        state,
     }
 }
 
@@ -3790,16 +4016,66 @@ fn install_immutable_json<T: Serialize + DeserializeOwned + PartialEq>(
     name: &str,
     value: &T,
 ) -> Result<()> {
-    if let Some(bytes) =
-        directory.read_regular(name, MAX_MANIFEST_BYTES, "immutable Git-source member")?
-    {
-        let existing: T = serde_json::from_slice(&bytes)?;
-        if &existing != value {
-            bail!(StoreRequestError::InvalidInput);
-        }
+    if immutable_json_matches(directory, name, value)? {
         return Ok(());
     }
     write_json(directory, name, value)
+}
+
+/// `true` when an immutable member already holds exactly `value`, `false`
+/// when it is absent; any other content is a conflict that fails closed.
+fn immutable_json_matches<T: DeserializeOwned + PartialEq>(
+    directory: &NofollowDirectory,
+    name: &str,
+    value: &T,
+) -> Result<bool> {
+    let Some(bytes) =
+        directory.read_regular(name, MAX_MANIFEST_BYTES, "immutable Git-source member")?
+    else {
+        return Ok(false);
+    };
+    let existing: T = serde_json::from_slice(&bytes)?;
+    if &existing != value {
+        bail!(StoreRequestError::InvalidInput);
+    }
+    Ok(true)
+}
+
+fn load_history_ready_pointer(history_dir: &Path) -> Result<Option<ReadyPointerV1>> {
+    let Some(pointer) = read_json::<ReadyPointerV1>(
+        history_dir,
+        "current-ready.json",
+        MAX_GENERATION_RECORD_BYTES,
+        "Git-history ready pointer",
+    )?
+    else {
+        return Ok(None);
+    };
+    if pointer.version != STORE_VERSION {
+        bail!(StoreRequestError::InvalidState);
+    }
+    validate_generation_id(&pointer.source_generation_id)
+        .map_err(|_| StoreRequestError::InvalidState)?;
+    pointer.acceptance()?;
+    Ok(Some(pointer))
+}
+
+/// An acceptance checkpoint exists only on a verified upload, and zero is
+/// never allocated; anything else is malformed and fails closed.
+fn validate_upload_acceptance(upload: &HistoryUploadRecordV1) -> Result<()> {
+    match upload.accepted_sequence {
+        None => Ok(()),
+        Some(0) => bail!(StoreRequestError::InvalidState),
+        Some(_)
+            if matches!(
+                upload.state,
+                GitHistorySourceStateV1::MissingRecords | GitHistorySourceStateV1::Ready
+            ) =>
+        {
+            Ok(())
+        }
+        Some(_) => bail!(StoreRequestError::InvalidState),
+    }
 }
 
 fn validate_upload_id(value: &str) -> Result<()> {
@@ -4323,6 +4599,24 @@ mod tests {
             Vec<Vec<u8>>,
         ),
     ) -> (String, String) {
+        let upload_id = upload_to_missing_records(store, history, namespace, fixture);
+        let finalized = store
+            .finalize_history_upload("producer-a", &upload_id)
+            .unwrap();
+        (upload_id, finalized.source_generation_id)
+    }
+
+    /// Drive one upload to the point where only finalize remains.
+    fn upload_to_missing_records(
+        store: &GitSourceStore,
+        history: &RepoHistoryId,
+        namespace: &CommitNamespace,
+        fixture: (
+            GitHistoryDescriptorV1,
+            Vec<GitHistoryManifestEntryV1>,
+            Vec<Vec<u8>>,
+        ),
+    ) -> String {
         let (descriptor, manifest, records) = fixture;
         let begin = store
             .begin_history_upload("producer-a", history, namespace, descriptor)
@@ -4351,10 +4645,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let finalized = store
-            .finalize_history_upload("producer-a", &begin.upload_id)
-            .unwrap();
-        (begin.upload_id, finalized.source_generation_id)
+        begin.upload_id
     }
 
     fn set_generation_created(
@@ -4821,5 +5112,754 @@ mod tests {
                 .history_status("producer-a", &generation_four)
                 .is_ok()
         );
+    }
+
+    const HISTORY: &str = "rh_00000000000000000000000000000001";
+
+    fn history_store(root: &Path) -> GitSourceStore {
+        GitSourceStore::open(root, StoreLimits::default()).unwrap()
+    }
+
+    fn history_ids() -> (RepoHistoryId, CommitNamespace) {
+        (
+            RepoHistoryId::parse(HISTORY).unwrap(),
+            CommitNamespace::parse("repo-a").unwrap(),
+        )
+    }
+
+    fn request_error(error: &anyhow::Error) -> Option<StoreRequestError> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreRequestError>())
+            .copied()
+    }
+
+    fn rewrite_source(
+        store: &GitSourceStore,
+        history: &RepoHistoryId,
+        generation: &str,
+        edit: impl FnOnce(&mut StoredHistorySourceV1),
+    ) {
+        let path = store.generation_dir(history, generation).unwrap();
+        let mut source = read_json::<StoredHistorySourceV1>(
+            &path,
+            "source.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "test Git-history source",
+        )
+        .unwrap()
+        .unwrap();
+        edit(&mut source);
+        let directory = NofollowDirectory::open_existing(&path).unwrap().unwrap();
+        write_json(&directory, "source.json", &source).unwrap();
+    }
+
+    fn stored_source(
+        store: &GitSourceStore,
+        history: &RepoHistoryId,
+        generation: &str,
+    ) -> StoredHistorySourceV1 {
+        store.load_generation(history, generation).unwrap()
+    }
+
+    fn ready_pointer(store: &GitSourceStore, history: &RepoHistoryId) -> ReadyPointerV1 {
+        load_history_ready_pointer(&store.repo_history_root(history).unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn write_ready_pointer(store: &GitSourceStore, history: &RepoHistoryId, raw: &str) {
+        NofollowDirectory::open_existing(&store.repo_history_root(history).unwrap())
+            .unwrap()
+            .unwrap()
+            .atomic_replace("current-ready.json", raw.as_bytes())
+            .unwrap();
+    }
+
+    fn upload_record(store: &GitSourceStore, upload_id: &str) -> HistoryUploadRecordV1 {
+        let upload_dir = store.upload_dir("producer-a", upload_id).unwrap();
+        store
+            .load_upload(&upload_dir, "producer-a", upload_id)
+            .unwrap()
+    }
+
+    fn rewrite_upload_raw(store: &GitSourceStore, upload_id: &str, raw: &str) {
+        NofollowDirectory::open_existing(&store.upload_dir("producer-a", upload_id).unwrap())
+            .unwrap()
+            .unwrap()
+            .atomic_replace("upload.json", raw.as_bytes())
+            .unwrap();
+    }
+
+    fn acceptance_counter(store: &GitSourceStore, history: &RepoHistoryId) -> Option<u64> {
+        read_json::<HistoryAcceptanceSequenceV1>(
+            &store.repo_history_root(history).unwrap(),
+            "acceptance-sequence.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "test acceptance sequence",
+        )
+        .unwrap()
+        .map(|counter| counter.next_sequence)
+    }
+
+    fn accepted(pointer: &ReadyPointerV1) -> (u64, String) {
+        match pointer.acceptance().unwrap() {
+            HistoryPointerAcceptance::Accepted {
+                sequence,
+                upload_id,
+            } => (sequence, upload_id.to_string()),
+            HistoryPointerAcceptance::Legacy => panic!("pointer carries no acceptance"),
+        }
+    }
+
+    /// Every upload checkpoint for the repository is unique: an acceptance
+    /// sequence is never issued twice.
+    fn assert_unique_acceptances(store: &GitSourceStore) {
+        let mut seen = BTreeSet::new();
+        for producer_dir in read_directories(&store.root.join("uploads")).unwrap() {
+            for upload_dir in read_directories(&producer_dir).unwrap() {
+                let upload = read_json::<HistoryUploadRecordV1>(
+                    &upload_dir,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "test upload record",
+                )
+                .unwrap()
+                .unwrap();
+                if let Some(sequence) = upload.accepted_sequence {
+                    assert!(seen.insert(sequence), "sequence {sequence} issued twice");
+                }
+            }
+        }
+    }
+
+    fn fail_finalize_at(point: &'static str) {
+        FINALIZE_FAILURE_POINT.with(|current| current.replace(Some(point)));
+    }
+
+    fn clear_finalize_failure() {
+        FINALIZE_FAILURE_POINT.with(|current| current.replace(None));
+    }
+
+    #[test]
+    fn begin_reports_the_persisted_state_of_a_resumed_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+        let (descriptor, manifest, records) = fixture();
+        let begin = |descriptor: GitHistoryDescriptorV1| {
+            store
+                .begin_history_upload("producer-a", &history, &namespace, descriptor)
+                .unwrap()
+        };
+        let first = begin(descriptor.clone());
+        assert_eq!(first.state, GitHistorySourceStateV1::ReceivingManifest);
+        store
+            .put_history_manifest_page(
+                "producer-a",
+                &first.upload_id,
+                0,
+                &GitHistoryManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        let resumed = begin(descriptor.clone());
+        assert_eq!(resumed.upload_id, first.upload_id);
+        assert_eq!(resumed.state, GitHistorySourceStateV1::ReceivingManifest);
+        store
+            .complete_history_manifest("producer-a", &first.upload_id)
+            .unwrap();
+        let resumed = begin(descriptor.clone());
+        assert_eq!(resumed.upload_id, first.upload_id);
+        assert_eq!(resumed.state, GitHistorySourceStateV1::MissingRecords);
+        // A page PUT is refused once the manifest is complete; complete
+        // itself stays idempotent, which is what a resumed producer calls.
+        assert_eq!(
+            request_error(
+                &store
+                    .put_history_manifest_page(
+                        "producer-a",
+                        &first.upload_id,
+                        0,
+                        &GitHistoryManifestPageV1 {
+                            entries: manifest.clone(),
+                        },
+                    )
+                    .unwrap_err()
+            ),
+            Some(StoreRequestError::InvalidState)
+        );
+        store
+            .complete_history_manifest("producer-a", &first.upload_id)
+            .unwrap();
+        for (entry, bytes) in manifest.iter().zip(records) {
+            store
+                .install_history_record(
+                    "producer-a",
+                    &first.upload_id,
+                    &entry.content_sha256,
+                    entry.encoded_bytes,
+                    std::io::Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        store
+            .finalize_history_upload("producer-a", &first.upload_id)
+            .unwrap();
+        // A completed upload is never resumed: begin opens a fresh one.
+        let fresh = begin(descriptor);
+        assert_ne!(fresh.upload_id, first.upload_id);
+        assert_eq!(fresh.state, GitHistorySourceStateV1::ReceivingManifest);
+    }
+
+    #[test]
+    fn refinalize_reuses_existing_generation_in_every_lifecycle_state() {
+        for state in [
+            GitHistorySourceStateV1::Ready,
+            GitHistorySourceStateV1::Active,
+            GitHistorySourceStateV1::Materializing,
+            GitHistorySourceStateV1::Publishing,
+            GitHistorySourceStateV1::Superseded,
+            GitHistorySourceStateV1::Failed,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+            let (history, namespace) = history_ids();
+            let (_, generation_a) =
+                ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+            let (_, generation_b) =
+                ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+            let diagnostic = matches!(
+                state,
+                GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
+            )
+            .then(|| "obsolete diagnostic".to_string());
+            rewrite_source(&store, &history, &generation_a, |source| {
+                source.state = state;
+                source.created_unix_secs = 11;
+                source.diagnostic = diagnostic.clone();
+            });
+
+            // HEAD returns to A: a fresh upload of the retained generation.
+            let (upload, generation) =
+                ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+            assert_eq!(generation, generation_a, "{state:?}");
+            let source = stored_source(&store, &history, &generation_a);
+            assert_eq!(source.created_unix_secs, 11, "{state:?}");
+            let reopened = matches!(
+                state,
+                GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
+            );
+            if reopened {
+                assert_eq!(source.state, GitHistorySourceStateV1::Ready, "{state:?}");
+                assert_eq!(source.diagnostic, None, "{state:?}");
+            } else {
+                assert_eq!(source.state, state, "in-flight state must be preserved");
+                assert_eq!(source.diagnostic, None, "{state:?}");
+            }
+            let pointer = ready_pointer(&store, &history);
+            assert_eq!(pointer.source_generation_id, generation_a, "{state:?}");
+            assert_eq!(accepted(&pointer), (3, upload.clone()), "{state:?}");
+            assert_eq!(upload_record(&store, &upload).accepted_sequence, Some(3));
+            assert_eq!(
+                store.current_ready_source_id(&history).unwrap().as_deref(),
+                Some(generation_a.as_str())
+            );
+            assert_eq!(
+                stored_source(&store, &history, &generation_b).state,
+                GitHistorySourceStateV1::Ready
+            );
+            assert_eq!(acceptance_counter(&store, &history), Some(4));
+        }
+    }
+
+    #[test]
+    fn refinalize_refuses_immutable_conflicts() {
+        type Tamper = fn(&GitSourceStore, &RepoHistoryId, &str);
+        let cases: [(&str, Tamper); 4] = [
+            ("source descriptor", |store, history, generation| {
+                rewrite_source(store, history, generation, |source| {
+                    source.descriptor.logical_bytes += 1;
+                });
+            }),
+            ("source namespace", |store, history, generation| {
+                rewrite_source(store, history, generation, |source| {
+                    source.primary_namespace = CommitNamespace::parse("repo-b").unwrap();
+                });
+            }),
+            ("stored descriptor", |store, history, generation| {
+                let path = store.generation_dir(history, generation).unwrap();
+                let directory = NofollowDirectory::open_existing(&path).unwrap().unwrap();
+                let (mut descriptor, _, _) = fixture_for('1', '2');
+                descriptor.commit_count = 3;
+                write_json(&directory, "descriptor.json", &descriptor).unwrap();
+            }),
+            ("stored manifest", |store, history, generation| {
+                let path = store.generation_dir(history, generation).unwrap();
+                let directory = NofollowDirectory::open_existing(&path).unwrap().unwrap();
+                let (_, manifest, _) = fixture_for('1', '3');
+                write_json(&directory, "manifest.json", &manifest).unwrap();
+            }),
+        ];
+        for (label, tamper) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+            let (history, namespace) = history_ids();
+            let (_, generation) =
+                ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+            let pointer = ready_pointer(&store, &history);
+            tamper(&store, &history, &generation);
+            let upload =
+                upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+            let error = store
+                .finalize_history_upload("producer-a", &upload)
+                .unwrap_err();
+            assert_eq!(
+                request_error(&error),
+                Some(StoreRequestError::InvalidInput),
+                "{label}: {error:#}"
+            );
+            assert_eq!(ready_pointer(&store, &history), pointer, "{label}");
+            let record = upload_record(&store, &upload);
+            assert_eq!(record.state, GitHistorySourceStateV1::MissingRecords);
+            assert_eq!(record.accepted_sequence, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn older_acceptance_cannot_rewind_a_newer_pointer_but_a_fresh_upload_can() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+
+        // A completed upload replayed after a newer acceptance is a no-op.
+        let (completed_a, generation_a) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        let (completed_b, generation_b) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        let after_b = ready_pointer(&store, &history);
+        assert_eq!(accepted(&after_b), (2, completed_b.clone()));
+        store
+            .finalize_history_upload("producer-a", &completed_a)
+            .unwrap();
+        assert_eq!(ready_pointer(&store, &history), after_b);
+
+        // Interrupted A finalize after its pointer write, then B wins, then
+        // the A retry finishes without rewinding B or reopening A.
+        let interrupted_a =
+            upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+        fail_finalize_at("ready-pointer");
+        assert!(
+            store
+                .finalize_history_upload("producer-a", &interrupted_a)
+                .is_err()
+        );
+        let pointer = ready_pointer(&store, &history);
+        assert_eq!(pointer.source_generation_id, generation_a);
+        assert_eq!(accepted(&pointer), (3, interrupted_a.clone()));
+        let (newer_b, _) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        let after_newer_b = ready_pointer(&store, &history);
+        assert_eq!(after_newer_b.source_generation_id, generation_b);
+        assert_eq!(accepted(&after_newer_b), (4, newer_b));
+        rewrite_source(&store, &history, &generation_a, |source| {
+            source.state = GitHistorySourceStateV1::Superseded;
+            source.diagnostic = Some("superseded by the repository current-ready source".into());
+        });
+        let retried = store
+            .finalize_history_upload("producer-a", &interrupted_a)
+            .unwrap();
+        assert_eq!(retried.source_generation_id, generation_a);
+        assert_eq!(ready_pointer(&store, &history), after_newer_b);
+        let source_a = stored_source(&store, &history, &generation_a);
+        assert_eq!(source_a.state, GitHistorySourceStateV1::Superseded);
+        assert!(source_a.diagnostic.is_some());
+        let record = upload_record(&store, &interrupted_a);
+        assert_eq!(record.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(record.accepted_sequence, Some(3));
+        store
+            .finalize_history_upload("producer-a", &interrupted_a)
+            .unwrap();
+        assert_eq!(ready_pointer(&store, &history), after_newer_b);
+
+        // A genuinely new upload of A is a newer acceptance and wins.
+        let (fresh_a, generation) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        assert_eq!(generation, generation_a);
+        let pointer = ready_pointer(&store, &history);
+        assert_eq!(pointer.source_generation_id, generation_a);
+        assert_eq!(accepted(&pointer), (5, fresh_a));
+        let source_a = stored_source(&store, &history, &generation_a);
+        assert_eq!(source_a.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(source_a.diagnostic, None);
+        assert_unique_acceptances(&store);
+    }
+
+    #[test]
+    fn conflicting_equal_sequence_identities_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+        let (_, generation_b) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        let upload = upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+        fail_finalize_at("acceptance-checkpoint");
+        assert!(
+            store
+                .finalize_history_upload("producer-a", &upload)
+                .is_err()
+        );
+        assert_eq!(upload_record(&store, &upload).accepted_sequence, Some(2));
+        let generation_a = upload_record(&store, &upload).source_generation_id.unwrap();
+        for (label, generation, upload_id) in [
+            ("foreign upload", generation_a.clone(), "f".repeat(32)),
+            ("foreign generation", generation_b.clone(), upload.clone()),
+        ] {
+            let head = stored_source(&store, &history, &generation)
+                .descriptor
+                .repo_head;
+            write_ready_pointer(
+                &store,
+                &history,
+                &serde_json::to_string(&serde_json::json!({
+                    "version": 1,
+                    "source_generation_id": generation,
+                    "producer_id": "producer-a",
+                    "repo_head": head,
+                    "accepted_sequence": 2,
+                    "accepted_upload_id": upload_id,
+                }))
+                .unwrap(),
+            );
+            let error = store
+                .finalize_history_upload("producer-a", &upload)
+                .unwrap_err();
+            assert_eq!(
+                request_error(&error),
+                Some(StoreRequestError::InvalidState),
+                "{label}: {error:#}"
+            );
+            assert_eq!(
+                upload_record(&store, &upload).state,
+                GitHistorySourceStateV1::MissingRecords,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_recovers_after_a_crash_at_every_durable_step() {
+        for reuse in [false, true] {
+            for point in [
+                "immutable-installed",
+                "acceptance-counter",
+                "acceptance-checkpoint",
+                "generation-index",
+                "ready-pointer",
+                "source-reopened",
+                "upload-ready",
+            ] {
+                if point == "source-reopened" && !reuse {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap().join("git-sources");
+                let store = history_store(&root);
+                let (history, namespace) = history_ids();
+                let mut earlier = 0;
+                if reuse {
+                    let (_, generation_a) =
+                        ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+                    ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+                    rewrite_source(&store, &history, &generation_a, |source| {
+                        source.state = GitHistorySourceStateV1::Superseded;
+                        source.diagnostic = Some("obsolete".into());
+                    });
+                    earlier = 2;
+                } else {
+                    // A crash before the index write leaves no index; the
+                    // retry must repair it rather than trust the generation.
+                    ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+                    earlier = earlier.max(1);
+                }
+                let upload =
+                    upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+                fail_finalize_at(point);
+                let crashed = store.finalize_history_upload("producer-a", &upload);
+                clear_finalize_failure();
+                assert!(crashed.is_err(), "{point}: failpoint was not reached");
+                drop(store);
+
+                let store = history_store(&root);
+                for _ in 0..2 {
+                    store
+                        .finalize_history_upload("producer-a", &upload)
+                        .unwrap_or_else(|error| panic!("{point}: {error:#}"));
+                }
+                let generation = upload_record(&store, &upload).source_generation_id.unwrap();
+                let record = upload_record(&store, &upload);
+                assert_eq!(record.state, GitHistorySourceStateV1::Ready, "{point}");
+                let sequence = record.accepted_sequence.unwrap();
+                assert!(sequence > earlier, "{point}: {sequence}");
+                let pointer = ready_pointer(&store, &history);
+                assert_eq!(pointer.source_generation_id, generation, "{point}");
+                assert_eq!(accepted(&pointer), (sequence, upload.clone()), "{point}");
+                assert_eq!(
+                    store.current_ready_source_id(&history).unwrap().as_deref(),
+                    Some(generation.as_str()),
+                    "{point}"
+                );
+                assert_eq!(
+                    store
+                        .history_status("producer-a", &generation)
+                        .unwrap()
+                        .state,
+                    GitHistorySourceStateV1::Ready,
+                    "{point}: index and reopened source"
+                );
+                assert_eq!(
+                    stored_source(&store, &history, &generation).diagnostic,
+                    None,
+                    "{point}"
+                );
+                assert_eq!(
+                    acceptance_counter(&store, &history),
+                    Some(sequence + 1),
+                    "{point}"
+                );
+                assert_unique_acceptances(&store);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_history_state_upgrades_without_reinterpretation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = history_store(&root);
+        let (history, namespace) = history_ids();
+
+        // Legacy estate: a completed A whose records and pointer predate
+        // ordered acceptance, plus unfinished B and C uploads.
+        let (legacy_a, generation_a) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        let mut legacy_record = serde_json::to_value(upload_record(&store, &legacy_a)).unwrap();
+        legacy_record
+            .as_object_mut()
+            .unwrap()
+            .remove("accepted_sequence")
+            .unwrap();
+        rewrite_upload_raw(&store, &legacy_a, &legacy_record.to_string());
+        let head_a = stored_source(&store, &history, &generation_a)
+            .descriptor
+            .repo_head;
+        let legacy_pointer = serde_json::json!({
+            "version": 1,
+            "source_generation_id": generation_a,
+            "producer_id": "producer-a",
+            "repo_head": head_a,
+        })
+        .to_string();
+        write_ready_pointer(&store, &history, &legacy_pointer);
+        fs::remove_file(
+            store
+                .repo_history_root(&history)
+                .unwrap()
+                .join("acceptance-sequence.json"),
+        )
+        .unwrap();
+        let upload_b =
+            upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '3'));
+        let upload_c =
+            upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '4'));
+        drop(store);
+
+        let store = history_store(&root);
+        assert_eq!(upload_record(&store, &legacy_a).accepted_sequence, None);
+        assert_eq!(
+            ready_pointer(&store, &history).acceptance().unwrap(),
+            HistoryPointerAcceptance::Legacy
+        );
+        assert!(
+            store
+                .probe_ready_history("producer-a", &history, &head_a, GitObjectFormatV1::Sha1)
+                .unwrap()
+                .is_some()
+        );
+
+        // A completed legacy upload stays a no-op and gains no acceptance.
+        store
+            .finalize_history_upload("producer-a", &legacy_a)
+            .unwrap();
+        assert_eq!(upload_record(&store, &legacy_a).accepted_sequence, None);
+        assert_eq!(
+            ready_pointer(&store, &history).acceptance().unwrap(),
+            HistoryPointerAcceptance::Legacy
+        );
+        assert_eq!(acceptance_counter(&store, &history), None);
+
+        // The first verified post-upgrade finalize is an acceptance above
+        // the legacy baseline.
+        store
+            .finalize_history_upload("producer-a", &upload_b)
+            .unwrap();
+        assert_eq!(accepted(&ready_pointer(&store, &history)), (1, upload_b));
+
+        // Restart partway through the next acceptance: the counter moved
+        // but the upload checkpoint did not. The retry allocates above it.
+        fail_finalize_at("acceptance-counter");
+        assert!(
+            store
+                .finalize_history_upload("producer-a", &upload_c)
+                .is_err()
+        );
+        clear_finalize_failure();
+        drop(store);
+        let store = history_store(&root);
+        store
+            .finalize_history_upload("producer-a", &upload_c)
+            .unwrap();
+        assert_eq!(
+            accepted(&ready_pointer(&store, &history)),
+            (3, upload_c.clone())
+        );
+        assert_eq!(acceptance_counter(&store, &history), Some(4));
+
+        // A missing or lagging counter is recovered from the pointer and the
+        // retained upload checkpoints, never reset below them.
+        let history_root = store.repo_history_root(&history).unwrap();
+        fs::remove_file(history_root.join("acceptance-sequence.json")).unwrap();
+        let (upload_d, _) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '5'));
+        assert_eq!(accepted(&ready_pointer(&store, &history)), (4, upload_d));
+        NofollowDirectory::open_existing(&history_root)
+            .unwrap()
+            .unwrap()
+            .atomic_replace(
+                "acceptance-sequence.json",
+                br#"{"version":1,"next_sequence":1}"#,
+            )
+            .unwrap();
+        let (upload_e, _) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '6'));
+        assert_eq!(accepted(&ready_pointer(&store, &history)), (5, upload_e));
+        assert_eq!(acceptance_counter(&store, &history), Some(6));
+        assert_unique_acceptances(&store);
+    }
+
+    #[test]
+    fn malformed_acceptance_state_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let (history, namespace) = history_ids();
+
+        // Malformed pointer acceptance fields.
+        let generation_head = |store: &GitSourceStore, generation: &str| {
+            stored_source(store, &history, generation)
+                .descriptor
+                .repo_head
+        };
+        for (label, fields) in [
+            (
+                "zero sequence",
+                r#""accepted_sequence":0,"accepted_upload_id":"ffffffffffffffffffffffffffffffff""#,
+            ),
+            ("sequence without upload", r#""accepted_sequence":4"#),
+            (
+                "upload without sequence",
+                r#""accepted_upload_id":"ffffffffffffffffffffffffffffffff""#,
+            ),
+            (
+                "invalid upload id",
+                r#""accepted_sequence":4,"accepted_upload_id":"../x""#,
+            ),
+        ] {
+            let _ = fs::remove_dir_all(&root);
+            let store = history_store(&root);
+            let (_, generation) =
+                ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+            let head = generation_head(&store, &generation);
+            write_ready_pointer(
+                &store,
+                &history,
+                &format!(
+                    r#"{{"version":1,"source_generation_id":"{generation}","producer_id":"producer-a","repo_head":"{head}",{fields}}}"#
+                ),
+            );
+            assert!(
+                store
+                    .probe_ready_history("producer-a", &history, &head, GitObjectFormatV1::Sha1)
+                    .is_err(),
+                "{label}"
+            );
+            assert!(store.current_ready_source_id(&history).is_err(), "{label}");
+            let upload =
+                upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '3'));
+            let error = store
+                .finalize_history_upload("producer-a", &upload)
+                .unwrap_err();
+            assert_eq!(
+                request_error(&error),
+                Some(StoreRequestError::InvalidState),
+                "{label}: {error:#}"
+            );
+            assert_eq!(
+                upload_record(&store, &upload).state,
+                GitHistorySourceStateV1::MissingRecords
+            );
+        }
+
+        // Malformed durable counters.
+        for (label, raw) in [
+            ("zero counter", r#"{"version":1,"next_sequence":0}"#),
+            ("future counter", r#"{"version":9,"next_sequence":3}"#),
+            ("string counter", r#"{"version":1,"next_sequence":"3"}"#),
+        ] {
+            let _ = fs::remove_dir_all(&root);
+            let store = history_store(&root);
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+            NofollowDirectory::open_existing(&store.repo_history_root(&history).unwrap())
+                .unwrap()
+                .unwrap()
+                .atomic_replace("acceptance-sequence.json", raw.as_bytes())
+                .unwrap();
+            let upload =
+                upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '3'));
+            assert!(
+                store
+                    .finalize_history_upload("producer-a", &upload)
+                    .is_err(),
+                "{label}"
+            );
+            assert_eq!(upload_record(&store, &upload).accepted_sequence, None);
+        }
+
+        // Malformed upload checkpoints.
+        for (label, state, sequence) in [
+            ("zero checkpoint", "missing_records", 0),
+            ("checkpoint before verification", "receiving_manifest", 2),
+        ] {
+            let _ = fs::remove_dir_all(&root);
+            let store = history_store(&root);
+            let upload =
+                upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+            let mut record = serde_json::to_value(upload_record(&store, &upload)).unwrap();
+            record["state"] = serde_json::json!(state);
+            record["accepted_sequence"] = serde_json::json!(sequence);
+            rewrite_upload_raw(&store, &upload, &record.to_string());
+            let error = store
+                .finalize_history_upload("producer-a", &upload)
+                .unwrap_err();
+            assert_eq!(
+                request_error(&error),
+                Some(StoreRequestError::InvalidState),
+                "{label}: {error:#}"
+            );
+            // The malformed checkpoint also blocks allocation for any other
+            // upload rather than being skipped as unknown.
+            let other =
+                upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '3'));
+            assert!(
+                store.finalize_history_upload("producer-a", &other).is_err(),
+                "{label}"
+            );
+        }
     }
 }

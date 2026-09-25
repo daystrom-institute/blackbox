@@ -21,6 +21,19 @@
   re-probed rather than inferred from the stage label. Journal source ids are
   automatic GC roots, and per-project file commitments are durable snapshot
   receipt SHA-256 values, never disposable transaction tokens.
+- History finalize is idempotent per generation id. Existing immutable
+  evidence with the same identity, descriptor, and exact manifest is reused
+  with its original creation time and lifecycle; mismatches fail closed.
+  Each accepted upload attempt takes a durable per-repository acceptance
+  sequence, checkpointed in its upload record before `current-ready.json`
+  moves. Only a newer sequence repoints the repository and reopens a
+  `Superseded`/`Failed` source; a completed upload replay is a no-op and an
+  equal sequence must name the same upload and source.
+- Upload records and history pointers without acceptance fields are legacy
+  state, never reinterpreted: a legacy pointer is a baseline below every new
+  acceptance and a completed legacy upload never gains one. Allocation
+  recovers its high-water mark from the counter, the pointer, and retained
+  upload checkpoints; it never moves backwards.
 - `current-ready.json` arbitrates competing accepted sources per repository.
   Activation checks it before starting and again at every bounded post-build
   recheck, so an older queued or long-running source cannot commit after a
