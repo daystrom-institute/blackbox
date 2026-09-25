@@ -1065,21 +1065,31 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
     }
 }
 
+/// Producer claims administration. `list` is a lock-free read. `revoke`
+/// writes the store a running daemon holds in memory and persists whole, so
+/// it takes the offline-administration lifetime claim on the configured
+/// projects path before opening the store and holds it through the durable
+/// flush: with a daemon running it refuses with `error.project_catalog_cli_lock`
+/// and writes nothing.
 fn execute_producer_claims(args: ProducerClaimsArgs) -> Result<serde_json::Value, CommandFailure> {
     let config = load_config(args.config)?;
     let path = config.paths.producer_claims_path;
-    let store = Arc::new(parking_lot::RwLock::new(
-        ProducerClaims::open(&path).map_err(|_| {
-            CommandFailure::new(
-                "error.producer_claims_store",
-                "producer claims store is invalid or unreadable",
-            )
-        })?,
-    ));
+    let open_store = || {
+        ProducerClaims::open(&path)
+            .map(|claims| Arc::new(parking_lot::RwLock::new(claims)))
+            .map_err(|_| {
+                CommandFailure::new(
+                    "error.producer_claims_store",
+                    "producer claims store is invalid or unreadable",
+                )
+            })
+    };
     match args.command {
-        ProducerClaimsCommand::List => serialize_result(&store.read().claims().to_vec()),
+        ProducerClaimsCommand::List => serialize_result(&open_store()?.read().claims().to_vec()),
         ProducerClaimsCommand::Revoke(args) => {
             let scope = parse_claim_scope(&args.scope)?;
+            let _claim = acquire_admin_lifetime_claim(&config.paths.projects_path)?;
+            let store = open_store()?;
             let revoked = store.write().revoke(&args.producer, &scope);
             if revoked {
                 StorePersister::spawn("producer-claims-cli", store, path)
@@ -2316,8 +2326,9 @@ mod tests {
         assert_eq!(command_name(&revoke), "producer_claims_revoke");
     }
 
-    #[test]
-    fn producer_claim_commands_list_and_revoke_the_configured_store() {
+    /// A configured state dir holding one durable producer claim. Returns the
+    /// tempdir guard, config path, state dir, and claims path.
+    fn producer_claims_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -2335,11 +2346,17 @@ mod tests {
         let scope = PublishedScope::try_new("repo-a", ".").unwrap();
         store
             .write()
-            .claim("producer-a", scope.clone(), "2026-09-23T00:00:00Z".into())
+            .claim("producer-a", scope, "2026-09-23T00:00:00Z".into())
             .unwrap();
         StorePersister::spawn("producer-claims-cli-test", store, claims_path.clone())
             .flush_blocking()
             .unwrap();
+        (directory, config_path, state_dir, claims_path)
+    }
+
+    #[test]
+    fn producer_claim_commands_list_and_revoke_the_configured_store() {
+        let (_directory, config_path, _state_dir, claims_path) = producer_claims_fixture();
 
         let listed = execute_producer_claims(ProducerClaimsArgs {
             config: Some(config_path.clone()),
@@ -2363,6 +2380,34 @@ mod tests {
                 .claims()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn producer_claim_revoke_refuses_without_writing_while_a_daemon_holds_the_lifetime_lock() {
+        let (_directory, config_path, state_dir, claims_path) = producer_claims_fixture();
+        let before = std::fs::read(&claims_path).unwrap();
+        // A running daemon holds the lifetime lock shared on its projects path.
+        let daemon =
+            ProjectCatalogMigrationLock::acquire_shared(&state_dir.join("projects.json")).unwrap();
+
+        let refused = execute_producer_claims(ProducerClaimsArgs {
+            config: Some(config_path.clone()),
+            command: ProducerClaimsCommand::Revoke(ProducerClaimRevokeArgs {
+                producer: "producer-a".into(),
+                scope: "repo-a/.".into(),
+            }),
+        })
+        .unwrap_err();
+        assert_eq!(refused.code, "error.project_catalog_cli_lock");
+        assert_eq!(std::fs::read(&claims_path).unwrap(), before);
+
+        let listed = execute_producer_claims(ProducerClaimsArgs {
+            config: Some(config_path),
+            command: ProducerClaimsCommand::List,
+        })
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        drop(daemon);
     }
 
     #[test]
