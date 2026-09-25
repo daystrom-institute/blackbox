@@ -773,3 +773,258 @@ fn bridge_mode_keeps_its_local_behavior_and_refuses_the_lane() {
             .contains("error.project_config_lane_catalog_only")
     );
 }
+
+/// A catalog that cannot be read, or a selector the catalog cannot resolve
+/// to exactly one project, is not an unregistered worker context: dispatch
+/// refuses by name instead of silently using global configuration and
+/// dropping the project's MCP restrictions.
+#[test]
+fn selection_failures_refuse_instead_of_selecting_global_configuration() {
+    let scope = CatalogFixture::scope(".");
+    let fixture = CatalogFixture::new();
+    fixture.add_published_project(PROJECT, &scope);
+    let reviewer = brofile("reviewer", "deepseek", "project-reviewer");
+    fixture.install_config_publication(
+        PROJECT,
+        &scope,
+        COMMIT_ONE,
+        Some(&[(BROFILE, reviewer.as_bytes())]),
+    );
+    let twin = "p_config_twin";
+    let twin_scope = PublishedScope::try_new("repo_twin", ".").unwrap();
+    fixture.add_published_project(twin, &twin_scope);
+    // One directory attached to two projects is an ambiguous path selector.
+    let shared = fixture.root().join("shared-checkout");
+    std::fs::create_dir_all(&shared).unwrap();
+    fixture.attach_overlay_checkout(
+        PROJECT,
+        &scope,
+        &shared,
+        "att_33333333333333333333333333333333",
+        "cccccccccccccccccccccccccccccc01",
+        true,
+    );
+    fixture.attach_overlay_checkout(
+        twin,
+        &twin_scope,
+        &shared,
+        "att_44444444444444444444444444444444",
+        "cccccccccccccccccccccccccccccc02",
+        true,
+    );
+    let server = fixture.server();
+    global_brofiles(&server);
+    let ambiguous = shared.to_str().unwrap();
+
+    let error = server
+        .state
+        .resolve_config_brofile("reviewer", Some(ambiguous))
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "error.project_config_selection_failed",
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("error.project_selector_ambiguous"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("No global fallback"), "{error}");
+    assert!(
+        server
+            .state
+            .dispatch_project_mcp_store(Some(ambiguous))
+            .is_err()
+    );
+
+    // A confirmed-unknown selector is still worker context.
+    let global = server
+        .state
+        .resolve_config_brofile("reviewer", Some("/not/a/catalog/project"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(global.source, ProjectConfigSource::Global);
+
+    let store = server
+        .state
+        .project_authority
+        .catalog_store()
+        .unwrap()
+        .clone();
+    let state = store.poison_for_test("simulated unreadable catalog");
+    for selector in [PROJECT, "/not/a/catalog/project"] {
+        let error = server
+            .state
+            .resolve_config_brofile("reviewer", Some(selector))
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_config_selection_failed",
+            "{error}"
+        );
+        assert!(
+            server
+                .state
+                .dispatch_brofile("reviewer", Some(selector))
+                .unwrap_err()
+                .starts_with("error.project_config_selection_failed")
+        );
+        assert!(
+            server
+                .state
+                .dispatch_project_mcp_store(Some(selector))
+                .is_err()
+        );
+    }
+    // No project selected: global configuration needs no catalog.
+    assert!(
+        server
+            .state
+            .resolve_config_brofile("reviewer", None)
+            .is_ok()
+    );
+    if let Some(state) = state {
+        store.unpoison_for_test(state);
+    }
+}
+
+/// Accepted P, applied A, conflicting B, owner publishes its local X,
+/// restart: the next edit is prepared against X's exact hash.
+#[tokio::test]
+async fn conflict_recovery_after_an_applied_prefix_prepares_against_the_owners_publication() {
+    let scope = CatalogFixture::scope(".");
+    let (fixture, server) = accepted_fixture(&scope);
+    let target = ProjectConfigTargetV1::Brofile("reviewer".into());
+    let edit = |server: &BlackboxServer, content: String| {
+        server
+            .state
+            .prepare_project_config_mutation(PROJECT, &target, "test", move |_| {
+                Ok(Some(ProjectConfigEdit::Write(content)))
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let a = edit(&server, brofile("reviewer", "claude", "a"));
+    let b = edit(&server, brofile("reviewer", "claude", "b"));
+    let local = brofile("reviewer", "glm", "owner-local");
+    {
+        let mut queue = server.state.checkout_mutations.write();
+        queue
+            .ack(&a.mutation_id, "applied", None, None, "now")
+            .unwrap();
+        queue
+            .ack_with_observation(
+                &b.mutation_id,
+                "conflicted",
+                Some("local bytes preserved".into()),
+                None,
+                Some(crate::checkout_mutations::content_sha256(&local)),
+                "now",
+            )
+            .unwrap();
+    }
+    let mcp = project_mcp();
+    fixture.install_config_publication(
+        PROJECT,
+        &scope,
+        COMMIT_TWO,
+        Some(&[
+            (".bbox/mcp.json", mcp.as_bytes()),
+            (BROFILE, local.as_bytes()),
+        ]),
+    );
+    server
+        .state
+        .persist_checkout_mutations_durable()
+        .await
+        .unwrap();
+    drop(server);
+    let server = fixture.server();
+    global_brofiles(&server);
+    let status = server
+        .state
+        .project_config_mutation_status(&a.mutation_id)
+        .unwrap();
+    assert_eq!(status.state, CheckoutMutationProgress::Reconciled);
+    let retry = server
+        .state
+        .prepare_project_config_mutation(PROJECT, &target, "test", |base| {
+            assert_eq!(base, Some(local.as_str()));
+            Ok(Some(ProjectConfigEdit::Write(brofile(
+                "reviewer", "claude", "c",
+            ))))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retry.expected_sha256,
+        Some(crate::checkout_mutations::content_sha256(&local))
+    );
+    assert_eq!(retry.predecessor, None);
+}
+
+/// A re-encoding that is JSON-equal to the accepted bytes is its own exact
+/// state: the next edit chains on it rather than on the accepted bytes, and
+/// both deliver in order.
+#[test]
+fn json_equivalent_reencodings_keep_the_exact_byte_chain() {
+    let scope = CatalogFixture::scope(".");
+    let (_fixture, server) = accepted_fixture(&scope);
+    let target = ProjectConfigTargetV1::Brofile("reviewer".into());
+    let accepted = brofile("reviewer", "deepseek", "project-reviewer");
+    let pretty = serde_json::to_string_pretty(
+        &serde_json::from_str::<serde_json::Value>(&accepted).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(pretty, accepted);
+    let first = server
+        .state
+        .prepare_project_config_mutation(PROJECT, &target, "test", |_| {
+            Ok(Some(ProjectConfigEdit::Write(pretty.clone())))
+        })
+        .unwrap()
+        .unwrap();
+    let second = server
+        .state
+        .prepare_project_config_mutation(PROJECT, &target, "test", |base| {
+            assert_eq!(base, Some(pretty.as_str()));
+            Ok(Some(ProjectConfigEdit::Write(brofile(
+                "reviewer", "glm", "next",
+            ))))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.expected_sha256,
+        Some(crate::checkout_mutations::content_sha256(&accepted))
+    );
+    assert_eq!(
+        second.expected_sha256,
+        Some(crate::checkout_mutations::content_sha256(&pretty))
+    );
+    assert_eq!(
+        second.predecessor.as_deref(),
+        Some(first.mutation_id.as_str())
+    );
+    let granted = std::collections::BTreeSet::from([scope.clone()]);
+    for receipt in [&first, &second] {
+        let mut queue = server.state.checkout_mutations.write();
+        assert_eq!(
+            queue.poll(&granted, true).mutations[0].mutation_id,
+            receipt.mutation_id
+        );
+        queue
+            .ack(&receipt.mutation_id, "applied", None, None, "now")
+            .unwrap();
+    }
+    assert_eq!(
+        server
+            .state
+            .project_config_mutation_status(&first.mutation_id)
+            .unwrap()
+            .state,
+        CheckoutMutationProgress::Delivered
+    );
+}

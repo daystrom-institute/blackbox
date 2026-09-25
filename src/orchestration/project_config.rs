@@ -44,6 +44,14 @@ pub enum ProjectConfigError {
     },
     /// The accepted configuration does not parse or exceeds a bound.
     Invalid { project_id: String, detail: String },
+    /// The selector could not be resolved: the catalog was unreadable, or
+    /// the selector was ambiguous or otherwise failed. Only a selector the
+    /// catalog confirms unknown is worker context without a project.
+    SelectionFailed {
+        selector: String,
+        resolver_code: String,
+        detail: String,
+    },
 }
 
 impl ProjectConfigError {
@@ -52,6 +60,7 @@ impl ProjectConfigError {
             Self::PublicationUnavailable { .. } => "error.project_config_publication_unavailable",
             Self::LaneUnsupported { .. } => "error.project_config_lane_unsupported",
             Self::Invalid { .. } => "error.project_config_invalid",
+            Self::SelectionFailed { .. } => "error.project_config_selection_failed",
         }
     }
 }
@@ -77,6 +86,18 @@ impl fmt::Display for ProjectConfigError {
                  Upgrade the checkout-owner collector and publish a commit. No global fallback \
                  was applied",
                 self.code()
+            ),
+            Self::SelectionFailed {
+                selector,
+                resolver_code,
+                detail,
+            } => write!(
+                formatter,
+                "{}: project selector {} could not be resolved ({resolver_code}: {detail}). \
+                 Pass an unambiguous project id or alias, or repair the project catalog. No \
+                 global fallback was applied",
+                self.code(),
+                bounded_path(selector)
             ),
             Self::Invalid { project_id, detail } => write!(
                 formatter,

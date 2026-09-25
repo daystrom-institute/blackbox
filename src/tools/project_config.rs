@@ -151,23 +151,47 @@ impl SharedState {
     /// Selection-class resolution through the catalog resolver (the same
     /// engine and intent `resolve_project_selection` uses). A selector is a
     /// name for a catalog project, never a path the daemon reads.
-    fn catalog_project_for_selector(&self, selector: &str) -> Option<String> {
-        let store = self.project_authority.catalog_store()?.clone();
-        let snapshot = store.snapshot().ok()?;
+    fn catalog_project_for_selector(
+        &self,
+        selector: &str,
+    ) -> Result<Option<String>, ProjectConfigError> {
+        let failed = |resolver_code: &str, detail: String| ProjectConfigError::SelectionFailed {
+            selector: selector.to_string(),
+            resolver_code: resolver_code.to_string(),
+            detail,
+        };
+        let store = self
+            .project_authority
+            .catalog_store()
+            .ok_or_else(|| failed("error.project_catalog_inactive", "no catalog store".into()))?
+            .clone();
+        let snapshot = store
+            .snapshot()
+            .map_err(|error| failed("error.project_catalog_unreadable", error.to_string()))?;
         let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
             snapshot.catalog(),
             snapshot.attachments(),
         );
-        engine
-            .resolve(
-                &bbox_corpus_core::project_selector::ProjectSelectorRequest::selection(
-                    selector,
-                    bbox_corpus_core::project_selector::ResolveIntent::Read,
-                ),
-            )
-            .ok()?
-            .project_id()
-            .map(str::to_owned)
+        match engine.resolve(
+            &bbox_corpus_core::project_selector::ProjectSelectorRequest::selection(
+                selector,
+                bbox_corpus_core::project_selector::ResolveIntent::Read,
+            ),
+        ) {
+            Ok(resolution) => resolution
+                .project_id()
+                .map(|project_id| Some(project_id.to_owned()))
+                .ok_or_else(|| {
+                    failed(
+                        "error.project_selector_unresolved",
+                        "the selection resolved to no project".into(),
+                    )
+                }),
+            // Confirmed absence from the catalog is the one miss that means
+            // "worker context, no project".
+            Err(error) if error.code() == "error.project_selector_unknown" => Ok(None),
+            Err(error) => Err(failed(error.code(), error.detail().to_string())),
+        }
     }
 
     /// Load and parse one catalog project's accepted configuration. Every
@@ -243,8 +267,7 @@ impl SharedState {
         let Some(selector) = project_dir.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(ProjectConfigContext::GlobalOnly);
         };
-        let project_id = self.catalog_project_for_selector(selector);
-        let Some(project_id) = project_id else {
+        let Some(project_id) = self.catalog_project_for_selector(selector)? else {
             return Ok(ProjectConfigContext::GlobalOnly);
         };
         self.load_accepted_project_config(&project_id)
@@ -405,7 +428,7 @@ impl SharedState {
         })?;
         let relative_path = target.relative_path();
         let published = accepted.snapshot.accepted_bytes(target);
-        let base = queue.write_base(&accepted.scope, &relative_path, published)?;
+        let base = queue.guarded_write_base(&accepted.scope, &relative_path, published)?;
         let content = match edit(base.as_deref())? {
             None => return Ok(None),
             Some(ProjectConfigEdit::Write(content))
@@ -472,7 +495,7 @@ impl SharedState {
             && let Ok(accepted) = self.load_accepted_project_config(&project_id)
             && accepted.scope == scope
         {
-            self.checkout_mutations.write().observe_publication(
+            self.checkout_mutations.write().observe_guarded_publication(
                 &scope,
                 &relative_path,
                 accepted.snapshot.accepted_bytes(&target),
@@ -492,6 +515,7 @@ impl SharedState {
             CheckoutMutationProgress::Queued => COMMIT_TO_PUBLISH.to_string(),
             CheckoutMutationProgress::Delivered => "Applied in the owner's checkout but not yet published. Commit and publish the file on the project's publisher ref; reads and dispatch keep the accepted configuration until then".to_string(),
             CheckoutMutationProgress::Published => "Included in the accepted publication; reads and dispatch use it".to_string(),
+            CheckoutMutationProgress::Reconciled => "Applied, then superseded: a later edit on this file did not apply and the owner published other bytes, which reads, dispatch and the next edit now use".to_string(),
             CheckoutMutationProgress::Conflicted => RECONCILE_AND_RETRY.to_string(),
             CheckoutMutationProgress::Blocked => format!(
                 "Not delivered because predecessor {} did not apply. {RECONCILE_AND_RETRY}",
