@@ -807,7 +807,7 @@ impl EdgeIndex {
                 tracing::debug!(path = %path.display(), "skipping non-jsonl edge sidecar file");
                 continue;
             }
-            if !sidecar_project_is_registered(&path, registered_project_ids) {
+            if !sidecar_lane_is_admitted(&path, registered_project_ids) {
                 tracing::info!(path = %path.display(), "skipping unregistered project edge sidecar");
                 continue;
             }
@@ -966,18 +966,15 @@ impl EdgeIndex {
         }
 
         for project_id in &migrated_projects {
-            if !sidecar_project_id_is_registered(project_id, registered_project_ids) {
-                continue;
-            }
             if explicit_lane_projects.contains(project_id) {
                 let path = explicit_dir.join(format!("{project_id}.jsonl"));
-                if path.exists() {
+                if path.exists() && sidecar_lane_is_admitted(&path, registered_project_ids) {
                     self.project_sidecar_edges_file(&path, seen, false);
                 }
             }
             if include_observed && observed_lane_projects.contains(project_id) {
                 let path = observed_dir.join(format!("{project_id}.jsonl"));
-                if path.exists() {
+                if path.exists() && sidecar_lane_is_admitted(&path, registered_project_ids) {
                     self.project_sidecar_edges_file(&path, seen, false);
                 }
             }
@@ -993,7 +990,7 @@ impl EdgeIndex {
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            if !sidecar_project_is_registered(&path, registered_project_ids) {
+            if !sidecar_lane_is_admitted(&path, registered_project_ids) {
                 continue;
             }
             // Migration moves the cut-time rows into split lanes, but legacy
@@ -2885,6 +2882,75 @@ mod tests {
             index.forward_edges(&source).len(),
             1,
             "missing manifest must fall back to legacy loading via load_sidecar_edges"
+        );
+    }
+
+    /// Loads one sidecar directory in both loader modes and returns the lane
+    /// sources each admitted. Every lane file holds one explicit edge whose
+    /// source id names the lane, so the admitted-lane set is the source set.
+    fn admitted_lane_sources(edges_dir: &Path, registered: &HashSet<String>) -> BTreeSet<String> {
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index
+            .load_sidecar_edges(edges_dir, Some(registered), &mut seen, true)
+            .unwrap();
+        index
+            .forward
+            .keys()
+            .filter_map(|source| match source {
+                EntityRef::Knowledge { id } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn manifest_and_legacy_missing_modes_admit_the_same_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let legacy_dir = root.join("legacy");
+        let manifest_dir = root.join("manifest");
+        for edges_dir in [&legacy_dir, &manifest_dir] {
+            for (lane, lane_dir) in [
+                ("top", edges_dir.clone()),
+                ("explicit", edges_dir.join("explicit")),
+                ("observed", edges_dir.join("observed")),
+            ] {
+                for stem in ["p1", "ghost", AGENT_PROVENANCE_LANE] {
+                    let line =
+                        make_explicit_edge_line(&format!("{lane}-{stem}"), "DESCRIBES", "target");
+                    write_jsonl(&lane_dir.join(format!("{stem}.jsonl")), &[&line]);
+                }
+            }
+        }
+        bbox_edge_sidecar::manifest::ManifestIndex::new()
+            .write_atomic(&manifest_dir)
+            .unwrap();
+        assert!(matches!(
+            SidecarManifestAuthority::capture(&legacy_dir).unwrap(),
+            SidecarManifestAuthority::LegacyMissing
+        ));
+        assert!(matches!(
+            SidecarManifestAuthority::capture(&manifest_dir).unwrap(),
+            SidecarManifestAuthority::Manifest(_)
+        ));
+
+        let registered: HashSet<String> = ["p1".to_string()].into();
+        let legacy = admitted_lane_sources(&legacy_dir, &registered);
+        let manifest = admitted_lane_sources(&manifest_dir, &registered);
+
+        let expected: BTreeSet<String> = ["top", "explicit", "observed"]
+            .into_iter()
+            .flat_map(|lane| {
+                ["p1", AGENT_PROVENANCE_LANE]
+                    .into_iter()
+                    .map(move |stem| format!("{lane}-{stem}"))
+            })
+            .collect();
+        assert_eq!(legacy, expected, "legacy-missing mode admitted lanes");
+        assert_eq!(
+            manifest, legacy,
+            "manifest mode must admit exactly the lanes legacy-missing mode admits"
         );
     }
 

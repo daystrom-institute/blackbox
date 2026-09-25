@@ -1344,16 +1344,6 @@ pub fn scan_lane_project_ids(lane_dir: &Path) -> HashSet<String> {
     ids
 }
 
-pub fn sidecar_project_id_is_registered(
-    project_id: &str,
-    registered: Option<&HashSet<String>>,
-) -> bool {
-    let Some(registered) = registered else {
-        return true;
-    };
-    registered.contains(project_id)
-}
-
 pub fn edges_dir_from_bro_store(store_dir: &Path) -> PathBuf {
     store_dir
         .parent()
@@ -1402,20 +1392,25 @@ pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     ids
 }
 
-pub fn sidecar_project_is_registered(
+/// Lane stem that holds agent provenance edges. It is not a project id, so
+/// admission accepts it regardless of the registered-project set.
+pub const AGENT_PROVENANCE_LANE: &str = "agents";
+
+/// The one admission rule for edge sidecar lane files. The rebuild signature
+/// fold and every loader path admit a lane through this predicate, so a lane
+/// that can change the signature is always loaded and a lane the loaders skip
+/// never triggers a rebuild. `None` admits every lane.
+pub fn sidecar_lane_is_admitted(
     path: &Path,
     registered_project_ids: Option<&HashSet<String>>,
 ) -> bool {
     let Some(registered_project_ids) = registered_project_ids else {
         return true;
     };
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+    let Some(stem) = sidecar_file_stem(path) else {
         return false;
     };
-    if matches!(stem, "agents") {
-        return true;
-    }
-    registered_project_ids.contains(stem)
+    stem == AGENT_PROVENANCE_LANE || registered_project_ids.contains(stem)
 }
 
 /// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
