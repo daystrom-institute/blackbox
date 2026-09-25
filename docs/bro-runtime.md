@@ -203,6 +203,31 @@ bro_mcp(action="add", name="blackbox-readonly", url="http://127.0.0.1:7264/mcp?s
 bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")
 ```
 
+`scope` selects exactly one store: `global` (default) or `project` with a
+`project` selector. In catalog mode the selector names a catalog project (id,
+alias, or attached checkout path) and never grants the daemon filesystem
+access. Project `list`, `get`, and `get_filters` read the project's accepted
+publication of `.bbox/mcp.json`, and report enablement from its committed
+`.bbox/config.toml`. Their replies carry `projectId`, `source` (accepted
+generation and commit), and `ownerEdits`: edits that are queued, delivered,
+conflicted, or blocked and not yet reflected, each with its next step. Project
+`add`, `remove`, `allow`, `disallow`, and `clear_filters` queue a guarded edit
+of `.bbox/mcp.json` for the project's checkout owner. They return
+`state="queued"` with a `mutation` receipt (mutation id, landing path,
+exact-byte precondition, predecessor, accepted generation, next step), or
+`state="unchanged"` when the edit base already matches. Edits made before
+publication chain on the queued ones. Reads and dispatch keep the accepted
+configuration until the owner commits and publishes the file. A conflicted edit
+keeps the owner's bytes; reconcile in the owning checkout, then re-issue the
+edit, which is recomputed from the accepted configuration with a fresh
+precondition. Unavailable states refuse by name
+(`error.project_config_publication_unavailable`,
+`error.project_config_lane_unsupported`, `error.project_config_invalid`,
+`error.project_config_project_unknown`, `error.checkout_mutation_conflict`,
+`error.mcp_project_store_too_large`) and never fall back to the global store.
+Bridge mode reads and writes the local project store. The retired `sync` action
+refuses before any project resolution.
+
 The recursion guard is mechanical. Dispatch-capable providers get deny arguments
 at process launch so ordinary dispatched agents cannot recursively spawn more
 agents. `bro_report` stays allowed because it is telemetry.
