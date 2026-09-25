@@ -157,10 +157,9 @@ impl BlackboxServer {
                 }
             });
         }
-        // Phase timing pins multi-minute stalls to their blocked phase
-        // (resolver lease, store write guard, or durable persist). Prod
-        // showed 169-327s calls tracking edge-index rebuild windows exactly;
-        // the per-call total alone could not name the contended resource.
+        // Phase timing names the blocked phase of a slow call (project
+        // resolution, store write guard, or durable persist); the per-call
+        // total alone cannot name the contended resource.
         let slow_phase = |phase: &str, elapsed: std::time::Duration| {
             if elapsed > std::time::Duration::from_secs(5) {
                 tracing::warn!(
@@ -172,22 +171,28 @@ impl BlackboxServer {
                 );
             }
         };
-        let mutation_result: anyhow::Result<_> = {
+        // The synchronous mutation phase (resolver engine, the fair threads
+        // write guard, and the fsynced `.bbox/record/` snapshot) runs on the
+        // blocking pool so a queued write guard or slow disk never parks a
+        // tokio worker. The handler only awaits it, the durable persist, and
+        // the non-blocking index enqueue and rebuild nudge.
+        let server = self.clone();
+        let mut p = p.inner;
+        let mutation_result = tokio::task::spawn_blocking(move || {
             // When the agent passes a managed fleet worktree as `project`, key the
             // thread to its registered base (durable scope) but write the committed
             // `.bbox/record/` snapshot into the worktree so it travels with the
             // agent's branch. Resolution rides the shared engine (phase-2
             // §9.2); the threads store stays registry-free.
             let resolve_started = std::time::Instant::now();
-            let mut p = p.inner.clone();
             let resolved = p
                 .project
                 .as_deref()
-                .and_then(|proj| self.resolve_worktree_scope_and_dir(proj));
-            stamp_host_owned_thread_project(self, &mut p);
+                .and_then(|proj| server.resolve_worktree_scope_and_dir(proj));
+            stamp_host_owned_thread_project(&server, &mut p);
             slow_phase("resolve_project", resolve_started.elapsed());
             let lock_started = std::time::Instant::now();
-            let mut threads = self.state.threads.write();
+            let mut threads = server.state.threads.write();
             slow_phase("store_write_guard", lock_started.elapsed());
             match resolved {
                 Some((base, worktree)) => {
@@ -196,7 +201,10 @@ impl BlackboxServer {
                 }
                 None => threads.thread_mutation(&p, None),
             }
-        };
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
         let mutation = match mutation_result {
             Ok(mutation) => mutation,
             Err(e) => {
@@ -769,6 +777,113 @@ mod tests {
             "{}",
             text_of(&invalid)
         );
+    }
+
+    /// A thread mutation never waits on an in-flight edge-index rebuild.
+    /// Holding a code read view reader parks the rebuild at publish under the
+    /// manifest coordinator (the `rebuild_releases_store_locks_before_taking_edge_index_write`
+    /// technique); open, link, and resolve must each complete within the
+    /// bound while it stays parked. Each call runs as its own task so the
+    /// timeout fires even if the handler were to block its worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // The test thread holds the view guard to park the rebuild; the calls run on worker tasks.
+    async fn thread_mutations_do_not_wait_on_parked_edge_index_rebuild() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let server = BlackboxServer::new(state.clone());
+
+        let held = state.code_read_view.read();
+        let st = state.clone();
+        // lint-concurrency: allow(thread-spawn) - test harness stands in for the rebuild watcher's own std thread
+        let rebuild = std::thread::spawn(move || {
+            crate::server::routes::rebuild_edge_index_from_shared(&st, false)
+        });
+        // Let the rebuild finish its (trivial) projection and park on the
+        // view write; it cannot return while `held` is alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !rebuild.is_finished(),
+            "precondition: rebuild should be parked at publish"
+        );
+
+        let call = |params: ThreadParams| {
+            let server = server.clone();
+            async move {
+                let action = params.action.clone();
+                let task = tokio::spawn(async move {
+                    server
+                        .bbox_thread(Parameters(ThreadToolParams::from(params)))
+                        .await
+                });
+                let result = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("bbox_thread action={action} waited on the parked rebuild")
+                    })
+                    .unwrap();
+                assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+                text_of(&result)
+            }
+        };
+
+        let opened = call(ThreadParams {
+            topic: Some("parked rebuild".into()),
+            project: Some(project.to_string_lossy().into_owned()),
+            ..tp("open")
+        })
+        .await;
+        let id = opened
+            .split_whitespace()
+            .nth(2)
+            .expect("thread id in open message")
+            .trim_end_matches('—')
+            .to_string();
+        call(ThreadParams {
+            id: Some(id.clone()),
+            target: Some("session-parked".into()),
+            target_type: Some("session".into()),
+            edge: Some("relates_to".into()),
+            ..tp("link")
+        })
+        .await;
+        call(ThreadParams {
+            id: Some(id.clone()),
+            note: Some("resolved while the rebuild is parked".into()),
+            ..tp("resolve")
+        })
+        .await;
+
+        assert!(
+            !rebuild.is_finished(),
+            "the rebuild must still be parked when every mutation has returned"
+        );
+        let status = state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .find(|thread| thread.id == id)
+            .map(|thread| thread.status.as_ref().to_owned());
+        assert_eq!(status.as_deref(), Some("resolved"));
+        assert!(
+            project
+                .join(".bbox")
+                .join("record")
+                .join(format!("{id}.json"))
+                .is_file(),
+            "the record snapshot is written while the rebuild is parked"
+        );
+
+        drop(held);
+        rebuild
+            .join()
+            .unwrap()
+            .expect("rebuild completes once the view guard is released");
     }
 }
 
