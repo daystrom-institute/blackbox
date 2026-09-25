@@ -693,9 +693,12 @@ pub(crate) struct BrofileParams {
     /// rejects it. Unknown scopes are refused before any store access.
     #[serde(default)]
     pub(crate) scope: Option<String>,
-    /// Absolute owner-host project directory for scope=project in local bridge
-    /// mode. Catalog mode refuses project brofiles because no remote owner
-    /// transport exists. Global scope rejects a supplied project_dir.
+    /// Absolute owner-host project directory for scope=project. Bridge mode
+    /// reads and writes its local .bro/brofiles. In catalog mode it only
+    /// selects the catalog project attached at that path: list/get read the
+    /// project's accepted publication, and create/delete queue a guarded edit
+    /// for its checkout owner that takes effect once committed and published.
+    /// Global scope rejects a supplied project_dir.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
     /// Exact get/get_account, list_accounts inventory, or provider-default reads:

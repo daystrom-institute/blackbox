@@ -372,10 +372,24 @@ impl BlackboxServer {
         Parameters(p): Parameters<BrofileParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        match tokio::task::spawn_blocking(move || server.bro_brofile_sync(Parameters(p))).await {
-            Ok(result) => result,
-            Err(error) => Self::err_text(&format!("brofile task failed: {error}")),
+        let project_mutation = matches!(p.action.as_str(), "create" | "delete")
+            && p.scope.as_deref() == Some("project")
+            && !self.state.project_authority.is_bridge();
+        let result =
+            match tokio::task::spawn_blocking(move || server.bro_brofile_sync(Parameters(p))).await
+            {
+                Ok(result) => result,
+                Err(error) => return Self::err_text(&format!("brofile task failed: {error}")),
+            };
+        if project_mutation
+            && result.is_error != Some(true)
+            && let Err(error) = self.state.persist_checkout_mutations_durable().await
+        {
+            return Self::err_text(&format!(
+                "Error: the brofile edit was queued, but checkout-queue durability failed: {error:#}"
+            ));
         }
+        result
     }
 
     fn bro_brofile_sync(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
@@ -446,9 +460,10 @@ impl BlackboxServer {
                 return Self::err_text("project_dir must be an absolute owner-host directory");
             }
             if !self.state.project_authority.is_bridge() {
-                return Self::err_text(
-                    "error.brofile_locality_required: project .bro/brofiles have no remote owner transport; use the checkout owner's file tools or scope=global with no project_dir. No project configuration was read or changed",
-                );
+                return match catalog_project_brofile_action(self, &p, project) {
+                    Ok(value) => Self::ok_json(&value),
+                    Err(error) => Self::err_text(&format!("Error: {error:#}")),
+                };
             }
         }
         let account_config = if account_scoped
@@ -1132,6 +1147,185 @@ fn brofile_selection(
     };
     format!("brofile:{scope}:{store}:{name}")
 }
+
+const PROJECT_BROFILE_PUBLICATION: &str = "Project brofiles are read from the project's accepted publication; a brofile queued through create or delete takes effect for reads and dispatch only after the checkout owner commits and publishes it";
+
+/// Catalog-mode project brofile actions. `project_dir` only selects a catalog
+/// project; reads come from its accepted configuration and edits are guarded
+/// mutations for its checkout owner. Exact project scope never includes
+/// global brofiles.
+fn catalog_project_brofile_action(
+    server: &BlackboxServer,
+    p: &BrofileParams,
+    selector: &str,
+) -> anyhow::Result<Value> {
+    use crate::tools::project_config::ProjectConfigEdit;
+    use orchestration::brofile;
+    let provider = match p.provider.as_deref() {
+        None => None,
+        Some(value) => Some(value.parse::<Provider>().map_err(|_| {
+            anyhow::anyhow!(if p.action == "create" {
+                "valid provider is required"
+            } else {
+                "Unknown provider"
+            })
+        })?),
+    };
+    let name = p.name.as_deref();
+    let target = match name {
+        Some(name) if p.action != "list" => Some(project_brofile_target(name)?),
+        _ => None,
+    };
+    let accepted = server.state.select_project_config_scope(selector)?;
+    let snapshot = &accepted.snapshot;
+    let project_id = accepted.project_id.as_str();
+    let source = json!(snapshot.provenance());
+    match p.action.as_str() {
+        "list" => {
+            let list = snapshot
+                .brofiles()
+                .map(|(_, brofile)| brofile.clone())
+                .collect();
+            let mut page = brofile::list_summary_page(
+                list,
+                provider,
+                name,
+                p.offset.unwrap_or(0),
+                p.limit.unwrap_or(20),
+            )
+            .map_err(|error| anyhow::anyhow!("brofile inventory: {error}"))?;
+            page["scope"] = json!("project");
+            page["projectId"] = json!(project_id);
+            page["source"] = source;
+            page["publication"] = json!(PROJECT_BROFILE_PUBLICATION);
+            Ok(page)
+        }
+        "get" => {
+            let name = name.expect("validated brofile name");
+            let found = snapshot.brofile(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Brofile not found in project scope: {name}. Project {project_id}'s accepted brofiles do not include it; use list in the same scope. {PROJECT_BROFILE_PUBLICATION}"
+                )
+            })?;
+            let selection = json!(["brofile", "project", project_id, name]).to_string();
+            let body = super::body_page::json_body_page(
+                &selection,
+                &serde_json::to_value(found)?,
+                p.cursor.as_deref(),
+                p.body_limit,
+            )?;
+            Ok(json!({
+                "name": name,
+                "scope": "project",
+                "projectId": project_id,
+                "source": source,
+                "summary": brofile::summary_row(found),
+                "body": body,
+            }))
+        }
+        "create" => {
+            let name = name.expect("validated brofile name");
+            let provider = provider.ok_or_else(|| anyhow::anyhow!("valid provider is required"))?;
+            let bf = brofile::Brofile {
+                name: name.to_string(),
+                provider,
+                account: p.account.clone(),
+                lens: p.lens.clone(),
+                model: p.model.clone(),
+                effort: p.effort.clone(),
+                tool_defaults: p.tool_defaults.clone(),
+                filters: extra_filters_from_params(
+                    p.allow_tools.as_deref(),
+                    p.disallow_tools.as_deref(),
+                ),
+                surface: p.surface.clone(),
+                coerce_workspace: p.coerce_workspace,
+                runtime: None,
+                context: p.context.clone(),
+                code_mode: p.code_mode,
+                service_tier: p.service_tier.clone(),
+            };
+            // The same bytes a bridge-mode create writes to the checkout.
+            let content = serde_json::to_string_pretty(&bf)?;
+            let mut replaces = false;
+            let receipt = server.state.prepare_project_config_mutation(
+                project_id,
+                target.as_ref().expect("create names its target"),
+                "bro_brofile(action=create, scope=project)",
+                |base| {
+                    replaces = base.is_some();
+                    Ok(Some(ProjectConfigEdit::Write(content)))
+                },
+            )?;
+            let mut value = json!({
+                "created": name,
+                "replaces": replaces,
+                "summary": brofile::summary_row(&bf),
+            });
+            project_brofile_receipt(
+                &mut value,
+                project_id,
+                receipt,
+                "The project's accepted brofile, with its queued edits applied, already has these exact bytes; nothing was queued",
+            );
+            Ok(value)
+        }
+        "delete" => {
+            let name = name.expect("validated brofile name");
+            let mut present = false;
+            let receipt = server.state.prepare_project_config_mutation(
+                project_id,
+                target.as_ref().expect("delete names its target"),
+                "bro_brofile(action=delete, scope=project)",
+                |base| {
+                    present = base.is_some();
+                    Ok(Some(ProjectConfigEdit::Delete))
+                },
+            )?;
+            anyhow::ensure!(
+                present,
+                "Brofile not found: {name}. Neither project {project_id}'s accepted brofiles nor its queued edits hold it; nothing was queued"
+            );
+            let mut value = json!({"deleted": name});
+            project_brofile_receipt(&mut value, project_id, receipt, "");
+            Ok(value)
+        }
+        _ => unreachable!("only project brofile actions reach the catalog lane"),
+    }
+}
+
+fn project_brofile_target(name: &str) -> anyhow::Result<bbox_code_source::ProjectConfigTargetV1> {
+    bbox_code_source::validate_project_config_name(name).map_err(|error| {
+        anyhow::anyhow!("project brofile name cannot be a project configuration file: {error}")
+    })?;
+    Ok(bbox_code_source::ProjectConfigTargetV1::Brofile(
+        name.to_string(),
+    ))
+}
+
+fn project_brofile_receipt(
+    receipt: &mut Value,
+    project_id: &str,
+    mutation: Option<crate::tools::project_config::ProjectConfigMutationReceipt>,
+    unchanged: &str,
+) {
+    receipt["scope"] = json!("project");
+    receipt["projectId"] = json!(project_id);
+    match mutation {
+        Some(mutation) => {
+            receipt["state"] = json!(mutation.state);
+            receipt["mutation"] = json!(mutation);
+        }
+        None => {
+            receipt["state"] = json!("unchanged");
+            receipt["detail"] = json!(unchanged);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "roster_brofile_project_tests.rs"]
+mod brofile_project_tests;
 
 fn require_team_template_locality(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<()> {
     if matches!(
@@ -2149,11 +2343,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_brofile_project_calls_refuse_before_filesystem_access() {
+    fn catalog_brofile_project_calls_select_a_catalog_project_without_filesystem_access() {
         let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
         let server = fixture.server();
+        // A daemon-host directory that names no catalog project is no project
+        // scope: nothing is read from it, and nothing is queued for it.
+        let local = fixture.root().join("synthetic-owner-checkout");
+        std::fs::create_dir_all(local.join(".bro/brofiles")).unwrap();
+        let path = local.join(".bro/brofiles/synthetic.json");
+        std::fs::write(&path, br#"{"name":"synthetic","provider":"brodex"}"#).unwrap();
         for action in ["list", "get", "create", "delete"] {
-            let mut args = json!({"action":action,"scope":"project","project_dir":"/synthetic/owner-checkout"});
+            let mut args = json!({"action":action,"scope":"project","project_dir":local});
             if action != "list" {
                 args["name"] = json!("synthetic");
             }
@@ -2162,8 +2362,19 @@ mod tests {
             }
             let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
             assert_eq!(reply.is_error, Some(true));
-            assert!(extract_text(&reply).contains("brofile_locality_required"));
+            let text = extract_text(&reply);
+            assert!(
+                text.contains("error.project_config_project_unknown"),
+                "{text}"
+            );
+            assert!(!text.contains("brofile_locality_required"), "{text}");
         }
+        assert!(
+            std::fs::read(&path)
+                .unwrap()
+                .starts_with(br#"{"name":"synthetic""#)
+        );
+        assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
     }
 
     #[test]
