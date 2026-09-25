@@ -1,20 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use bbox_chunker::EdgeConfidence;
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_corpus_core::identity::PublishedScope;
 use bbox_stores::store_persister::StoreSnapshot;
 
 use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
@@ -22,8 +20,31 @@ use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_corpus_core::project_selector::project_scope_matches;
 
-mod guidance;
-pub use guidance::{GuidanceTopic, RenderPlacement};
+use bbox_project_render::execute::{
+    ApplyOptions, ProjectEntrypoint, apply_project_render, issue_render_ms,
+};
+pub use bbox_project_render::execute::{
+    CheckoutRenderLock, DEFAULT_RENDER_LOCK_TIMEOUT, execute_project_render_plan,
+    execute_project_render_plan_as, execute_workspace_render_plan, lock_checkout_for_render,
+};
+pub use bbox_project_render::model::{
+    Approval, Category, GuidanceTopic, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry, Priority,
+    RenderPlacement, Scope, Status,
+};
+#[cfg(test)]
+use bbox_project_render::projection::PROJECT_DOC_FILE;
+use bbox_project_render::projection::{
+    Projection, ScopeFilter, project_doc_nonempty, project_target_file,
+    validated_project_render_providers,
+};
+pub use bbox_project_render::transport::{
+    AssembledProjectRenderPlanV1, ExpectedRenderAuthority, MAX_PROJECT_RENDER_PLAN_BYTES,
+    PROJECT_RENDER_PLAN_CHUNK_BYTES, PROJECT_RENDER_TRANSPORT_SCOPE,
+    PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderDispositionV1, ProjectRenderExecutionV1,
+    ProjectRenderLocalityRequestV1, ProjectRenderOutcomeV1, ProjectRenderPlanAssemblerV1,
+    ProjectRenderPlanChunkV1, ProjectRenderPlanV1, ProjectRenderProducerAuthorityV1,
+    ProjectRenderProjectionReceiptV1, ProjectRenderReceiptV1, ProjectRenderViewV1,
+};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -231,6 +252,12 @@ pub struct RenderParams {
     /// Provisional visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
+    /// Recover one earlier checkout-owner project render by its operation id
+    /// (`ro-...`, returned when a render was still pending). Returns the
+    /// recorded receipt and whether it is still current; it never re-applies
+    /// the operation. Requires `project`. Omit for a fresh render.
+    #[serde(default)]
+    pub operation: Option<String>,
     /// Internal, not part of the MCP schema: the project path used to FILTER
     /// project-scoped entries when it differs from `project` (the directory
     /// the rendered files are written into). Set by the daemon adapter when
@@ -259,538 +286,6 @@ pub struct GlobalRenderPlanRequestV1 {
     pub offset: Option<usize>,
     #[serde(default)]
     pub plan_sha256: Option<String>,
-}
-
-pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 2;
-pub const PROJECT_RENDER_TRANSPORT_SCOPE: &str = "project-render-transport-v1";
-const MAX_PROJECT_RENDER_ENTRIES: usize = 4_096;
-pub const MAX_PROJECT_RENDER_PLAN_BYTES: usize = 8 * 1024 * 1024;
-pub const PROJECT_RENDER_PLAN_CHUNK_BYTES: usize = 32 * 1024;
-const MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES: usize = 64 * 1024;
-const MAX_PROJECT_RENDER_GLOBAL_RESULT_BYTES: usize = 16 * 1024;
-const MAX_PROJECT_RENDER_DIAGNOSTICS_BYTES: usize = 64 * 1024;
-
-/// Exact authorized knowledge snapshot sent to the checkout owner for a
-/// project render. No checkout path crosses this boundary: every project row
-/// is rebound to [`PROJECT_RENDER_TRANSPORT_SCOPE`] before transport.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProjectRenderPlanV1 {
-    pub version: u32,
-    pub project_id: String,
-    pub scope: PublishedScope,
-    pub workspace_id: String,
-    pub provider: Option<String>,
-    pub dry_run: bool,
-    pub view: ProjectRenderViewV1,
-    /// Normalized public request scope: `project` or `both`.
-    pub requested_scope: String,
-    pub entries: Vec<KnowledgeEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostics: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectRenderViewV1 {
-    Published,
-    Own,
-    All,
-}
-
-impl ProjectRenderViewV1 {
-    pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("own") {
-            "published" => Ok(Self::Published),
-            "own" => Ok(Self::Own),
-            "all" => Ok(Self::All),
-            value => anyhow::bail!(
-                "invalid project render provisional view {value:?}; expected published, own, or all"
-            ),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Own => "own",
-            Self::All => "all",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case")]
-pub enum ProjectRenderLocalityRequestV1 {
-    Plan {
-        #[serde(default)]
-        offset: usize,
-        #[serde(default)]
-        plan_sha256: Option<String>,
-    },
-    Complete {
-        plan_sha256: String,
-        receipt: ProjectRenderReceiptV1,
-    },
-}
-
-/// One bounded page of the compact serialized project-render plan. The plan
-/// itself remains path-free; base64 lets pages split at arbitrary byte offsets
-/// without requiring knowledge-entry boundaries to fit the MCP response cap.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectRenderPlanChunkV1 {
-    pub version: u32,
-    pub plan_sha256: String,
-    pub plan_bytes: usize,
-    pub offset: usize,
-    pub chunk_base64: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_offset: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub global_result: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AssembledProjectRenderPlanV1 {
-    pub plan: ProjectRenderPlanV1,
-    pub plan_sha256: String,
-    pub global_result: Option<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct ProjectRenderPlanAssemblerV1 {
-    plan_sha256: Option<String>,
-    plan_bytes: Option<usize>,
-    bytes: Vec<u8>,
-    global_result: Option<String>,
-    complete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectRenderReceiptV1 {
-    pub version: u32,
-    pub project_id: String,
-    pub scope: PublishedScope,
-    pub workspace_id: String,
-    pub project_doc_nonempty: bool,
-    pub projections: Vec<ProjectRenderProjectionReceiptV1>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectRenderDispositionV1 {
-    Skipped,
-    DryRun,
-    DryRunRefused,
-    Written,
-    Refused,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectRenderProjectionReceiptV1 {
-    pub provider: String,
-    pub file_name: String,
-    pub disposition: ProjectRenderDispositionV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection_bytes: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectRenderExecutionV1 {
-    pub output: String,
-    pub receipt: ProjectRenderReceiptV1,
-}
-
-impl ProjectRenderPlanV1 {
-    pub fn validate(&self) -> Result<()> {
-        if self.version != PROJECT_RENDER_TRANSPORT_VERSION {
-            anyhow::bail!(
-                "unsupported project render transport version {}",
-                self.version
-            );
-        }
-        if self.project_id.trim().is_empty() || self.workspace_id.trim().is_empty() {
-            anyhow::bail!("project render plan authority is incomplete");
-        }
-        self.scope.validate()?;
-        if !matches!(self.requested_scope.as_str(), "project" | "both") {
-            anyhow::bail!(
-                "invalid project render request scope {:?}",
-                self.requested_scope
-            );
-        }
-        validated_project_render_providers(self.provider.as_deref())?;
-        if self.entries.len() > MAX_PROJECT_RENDER_ENTRIES {
-            anyhow::bail!(
-                "project render plan has {} entries; limit is {}",
-                self.entries.len(),
-                MAX_PROJECT_RENDER_ENTRIES
-            );
-        }
-        for entry in &self.entries {
-            if entry.scope != Scope::Project
-                || entry.project.as_deref() != Some(PROJECT_RENDER_TRANSPORT_SCOPE)
-                || entry.project_id.as_deref() != Some(self.project_id.as_str())
-            {
-                anyhow::bail!(
-                    "project render plan entry {} is outside its normalized project authority",
-                    entry.id
-                );
-            }
-        }
-        if self
-            .diagnostics
-            .as_ref()
-            .is_some_and(|value| value.len() > MAX_PROJECT_RENDER_DIAGNOSTICS_BYTES)
-        {
-            anyhow::bail!("project render diagnostics exceed the transport bound");
-        }
-        if serde_json::to_vec(self)?.len() > MAX_PROJECT_RENDER_PLAN_BYTES {
-            anyhow::bail!("project render plan exceeds the transport byte bound");
-        }
-        Ok(())
-    }
-
-    pub fn validate_authority(
-        &self,
-        expected_scope: &PublishedScope,
-        expected_workspace_id: &str,
-    ) -> Result<()> {
-        self.validate()?;
-        if &self.scope != expected_scope || self.workspace_id != expected_workspace_id {
-            anyhow::bail!("project render plan does not belong to the bound workspace");
-        }
-        Ok(())
-    }
-
-    fn detached_knowledge(&self) -> Knowledge {
-        Knowledge::detached_view(self.entries.clone(), BTreeMap::new())
-    }
-
-    fn expected_projections(
-        &self,
-        project_doc_nonempty: bool,
-    ) -> Result<Vec<ProjectRenderProjectionReceiptV1>> {
-        let view = self.detached_knowledge();
-        let mut receipts: Vec<_> = validated_project_render_providers(self.provider.as_deref())?
-            .into_iter()
-            .map(|provider| {
-                let projection = view.project_projection_with_include(
-                    provider,
-                    PROJECT_RENDER_TRANSPORT_SCOPE,
-                    project_doc_nonempty,
-                )?;
-                Ok(ProjectRenderProjectionReceiptV1 {
-                    provider: provider.to_string(),
-                    file_name: project_target_file(provider)?.to_string(),
-                    disposition: if projection.is_some() {
-                        if self.dry_run {
-                            ProjectRenderDispositionV1::DryRun
-                        } else {
-                            ProjectRenderDispositionV1::Written
-                        }
-                    } else {
-                        ProjectRenderDispositionV1::Skipped
-                    },
-                    projection_sha256: projection
-                        .as_ref()
-                        .map(|content| format!("{:x}", Sha256::digest(content.as_bytes()))),
-                    projection_bytes: projection.as_ref().map(String::len),
-                })
-            })
-            .collect::<Result<_>>()?;
-        for provider in validated_project_render_providers(self.provider.as_deref())? {
-            for file in view.guidance_files(
-                provider,
-                ScopeFilter::Project(PROJECT_RENDER_TRANSPORT_SCOPE),
-            ) {
-                receipts.push(ProjectRenderProjectionReceiptV1 {
-                    provider: provider.into(),
-                    file_name: format!(".bbox/{}", file.path),
-                    disposition: if self.dry_run {
-                        ProjectRenderDispositionV1::DryRun
-                    } else {
-                        ProjectRenderDispositionV1::Written
-                    },
-                    projection_sha256: Some(format!("{:x}", Sha256::digest(file.body.as_bytes()))),
-                    projection_bytes: Some(file.body.len()),
-                });
-            }
-        }
-        Ok(receipts)
-    }
-
-    pub fn transport_bytes_and_sha256(&self) -> Result<(Vec<u8>, String)> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(self)?;
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        Ok((bytes, sha256))
-    }
-
-    pub fn transport_sha256(&self) -> Result<String> {
-        self.transport_bytes_and_sha256().map(|(_, sha256)| sha256)
-    }
-
-    pub fn transport_chunk(
-        &self,
-        offset: usize,
-        expected_plan_sha256: Option<&str>,
-        global_result: Option<String>,
-    ) -> Result<ProjectRenderPlanChunkV1> {
-        let (bytes, plan_sha256) = self.transport_bytes_and_sha256()?;
-        if let Some(expected) = expected_plan_sha256
-            && expected != plan_sha256
-        {
-            anyhow::bail!(
-                "error.render_plan_stale: project render authority changed while its plan was being paged"
-            );
-        }
-        if offset >= bytes.len() {
-            anyhow::bail!(
-                "invalid project render plan offset {offset}; plan has {} bytes",
-                bytes.len()
-            );
-        }
-        if offset != 0 && global_result.is_some() {
-            anyhow::bail!("project render global result is only valid on the first plan chunk");
-        }
-        if global_result
-            .as_ref()
-            .is_some_and(|value| value.len() > MAX_PROJECT_RENDER_GLOBAL_RESULT_BYTES)
-        {
-            anyhow::bail!("project render global result exceeds the transport bound");
-        }
-
-        let end = offset
-            .saturating_add(PROJECT_RENDER_PLAN_CHUNK_BYTES)
-            .min(bytes.len());
-        let chunk = ProjectRenderPlanChunkV1 {
-            version: PROJECT_RENDER_TRANSPORT_VERSION,
-            plan_sha256,
-            plan_bytes: bytes.len(),
-            offset,
-            chunk_base64: BASE64_STANDARD.encode(&bytes[offset..end]),
-            next_offset: (end < bytes.len()).then_some(end),
-            global_result,
-        };
-        if serde_json::to_vec(&chunk)?.len() > MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES {
-            anyhow::bail!("project render plan chunk exceeds the wire bound");
-        }
-        Ok(chunk)
-    }
-}
-
-impl ProjectRenderPlanAssemblerV1 {
-    pub fn push(
-        &mut self,
-        chunk: ProjectRenderPlanChunkV1,
-    ) -> Result<Option<AssembledProjectRenderPlanV1>> {
-        if self.complete {
-            anyhow::bail!("project render plan assembler is already complete");
-        }
-        if chunk.version != PROJECT_RENDER_TRANSPORT_VERSION {
-            anyhow::bail!("unsupported project render chunk version {}", chunk.version);
-        }
-        if chunk.plan_sha256.len() != 64
-            || !chunk
-                .plan_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            anyhow::bail!("project render plan chunk has an invalid SHA-256");
-        }
-        if chunk.plan_bytes == 0 || chunk.plan_bytes > MAX_PROJECT_RENDER_PLAN_BYTES {
-            anyhow::bail!("project render plan chunk declares an invalid byte length");
-        }
-        if chunk.offset != self.bytes.len() {
-            anyhow::bail!(
-                "project render plan chunk offset {} does not continue at {}",
-                chunk.offset,
-                self.bytes.len()
-            );
-        }
-
-        match (&self.plan_sha256, self.plan_bytes) {
-            (None, None) => {
-                if chunk.offset != 0 {
-                    anyhow::bail!("project render plan must begin at offset zero");
-                }
-                self.plan_sha256 = Some(chunk.plan_sha256.clone());
-                self.plan_bytes = Some(chunk.plan_bytes);
-                self.bytes.reserve(chunk.plan_bytes);
-                self.global_result = chunk.global_result.clone();
-            }
-            (Some(plan_sha256), Some(plan_bytes)) => {
-                if plan_sha256 != &chunk.plan_sha256 || plan_bytes != chunk.plan_bytes {
-                    anyhow::bail!("project render plan authority changed between chunks");
-                }
-                if chunk.global_result.is_some() {
-                    anyhow::bail!("project render global result repeated after the first chunk");
-                }
-            }
-            _ => anyhow::bail!("project render plan assembler state is inconsistent"),
-        }
-
-        let decoded = BASE64_STANDARD
-            .decode(&chunk.chunk_base64)
-            .context("decoding project render plan chunk")?;
-        if decoded.is_empty() || decoded.len() > PROJECT_RENDER_PLAN_CHUNK_BYTES {
-            anyhow::bail!("project render plan chunk has an invalid decoded length");
-        }
-        let end = chunk
-            .offset
-            .checked_add(decoded.len())
-            .context("project render plan chunk offset overflow")?;
-        if end > chunk.plan_bytes {
-            anyhow::bail!("project render plan chunk exceeds its declared byte length");
-        }
-        match chunk.next_offset {
-            Some(next) if next == end && end < chunk.plan_bytes => {}
-            None if end == chunk.plan_bytes => {}
-            _ => anyhow::bail!("project render plan chunk has an invalid continuation"),
-        }
-        self.bytes.extend_from_slice(&decoded);
-        if chunk.next_offset.is_some() {
-            return Ok(None);
-        }
-
-        let plan_sha256 = self
-            .plan_sha256
-            .clone()
-            .context("completed project render plan has no SHA-256")?;
-        let actual_sha256 = format!("{:x}", Sha256::digest(&self.bytes));
-        if actual_sha256 != plan_sha256 {
-            anyhow::bail!("project render plan payload does not match its SHA-256");
-        }
-        let plan: ProjectRenderPlanV1 = serde_json::from_slice(&self.bytes)
-            .context("decoding assembled project render plan")?;
-        plan.validate()?;
-        self.complete = true;
-        Ok(Some(AssembledProjectRenderPlanV1 {
-            plan,
-            plan_sha256,
-            global_result: self.global_result.take(),
-        }))
-    }
-}
-
-impl ProjectRenderReceiptV1 {
-    pub fn validate_against(&self, plan: &ProjectRenderPlanV1) -> Result<()> {
-        plan.validate()?;
-        if self.version != PROJECT_RENDER_TRANSPORT_VERSION
-            || self.project_id != plan.project_id
-            || self.scope != plan.scope
-            || self.workspace_id != plan.workspace_id
-        {
-            anyhow::bail!("project render receipt authority does not match its plan");
-        }
-        let expected = plan.expected_projections(self.project_doc_nonempty)?;
-        if self.projections.len() != expected.len() {
-            anyhow::bail!("project render receipt has the wrong provider cardinality");
-        }
-        for (actual, expected) in self.projections.iter().zip(expected) {
-            if actual.provider != expected.provider
-                || actual.file_name != expected.file_name
-                || actual.projection_sha256 != expected.projection_sha256
-                || actual.projection_bytes != expected.projection_bytes
-            {
-                anyhow::bail!(
-                    "project render receipt projection does not match provider {}",
-                    expected.provider
-                );
-            }
-            if expected.file_name.starts_with(".bbox/guidance/")
-                && actual.disposition != expected.disposition
-            {
-                anyhow::bail!(
-                    "project render receipt cannot publish an entrypoint with refused satellites"
-                );
-            }
-            let disposition_valid = match expected.disposition {
-                ProjectRenderDispositionV1::Skipped => {
-                    actual.disposition == ProjectRenderDispositionV1::Skipped
-                }
-                ProjectRenderDispositionV1::DryRun => matches!(
-                    actual.disposition,
-                    ProjectRenderDispositionV1::DryRun | ProjectRenderDispositionV1::DryRunRefused
-                ),
-                ProjectRenderDispositionV1::Written => matches!(
-                    actual.disposition,
-                    ProjectRenderDispositionV1::Written | ProjectRenderDispositionV1::Refused
-                ),
-                ProjectRenderDispositionV1::DryRunRefused | ProjectRenderDispositionV1::Refused => {
-                    false
-                }
-            };
-            if !disposition_valid {
-                anyhow::bail!(
-                    "project render receipt has an invalid disposition for provider {}",
-                    expected.provider
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Execute an authorized project render inside the checkout owner's already
-/// verified root. The shared renderer never receives a daemon path. Its
-/// destinations are fixed provider filenames and content-addressed satellites
-/// derived from validated source entries within `project_root`.
-pub fn execute_project_render_plan(
-    plan: &ProjectRenderPlanV1,
-    project_root: &Path,
-    expected_scope: &PublishedScope,
-    expected_workspace_id: &str,
-) -> Result<ProjectRenderExecutionV1> {
-    plan.validate_authority(expected_scope, expected_workspace_id)?;
-    let canonical_root = project_root
-        .canonicalize()
-        .context("canonicalizing project render root")?;
-    if canonical_root != project_root || !canonical_root.is_dir() {
-        anyhow::bail!("project render root is not the stable bound directory");
-    }
-    let project_doc_nonempty = project_doc_nonempty(&canonical_root);
-    let mut projections = plan.expected_projections(project_doc_nonempty)?;
-    for projection in &mut projections {
-        if projection.projection_sha256.is_none() {
-            continue;
-        }
-        if projection.file_name.starts_with(".bbox/guidance/") {
-            continue;
-        }
-        let target = canonical_root.join(&projection.file_name);
-        let writable = should_write_project_projection(&target)?;
-        projection.disposition = match (plan.dry_run, writable) {
-            (true, true) => ProjectRenderDispositionV1::DryRun,
-            (true, false) => ProjectRenderDispositionV1::DryRunRefused,
-            (false, true) => ProjectRenderDispositionV1::Written,
-            (false, false) => ProjectRenderDispositionV1::Refused,
-        };
-    }
-
-    let view = plan.detached_knowledge();
-    let output = view.render(&RenderParams {
-        provider: plan.provider.clone(),
-        project: Some(canonical_root.to_string_lossy().into_owned()),
-        scope: Some("project".into()),
-        dry_run: Some(plan.dry_run),
-        global_plan: None,
-        provisional: None,
-        scope_project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
-        locality: None,
-    })?;
-    let receipt = ProjectRenderReceiptV1 {
-        version: PROJECT_RENDER_TRANSPORT_VERSION,
-        project_id: plan.project_id.clone(),
-        scope: plan.scope.clone(),
-        workspace_id: plan.workspace_id.clone(),
-        project_doc_nonempty,
-        projections,
-    };
-    receipt.validate_against(plan)?;
-    Ok(ProjectRenderExecutionV1 { output, receipt })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -915,84 +410,6 @@ pub struct KnowledgeLinkParams {
     Clone,
     Copy,
     PartialEq,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-    strum::EnumString,
-    strum::AsRefStr,
-    strum::Display,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Scope {
-    Global,
-    Project,
-}
-
-impl Scope {
-    /// `None` → `Global` (schema default). `Some(invalid)` → error.
-    /// Silent coercion previously masked typos like `scope="projct"` by
-    /// quietly routing them to global memory.
-    fn parse_optional(s: Option<&str>) -> Result<Self> {
-        match s {
-            None => Ok(Self::Global),
-            Some(raw) => raw.parse().map_err(|_| {
-                anyhow::anyhow!("invalid scope: {raw:?} (expected \"global\" or \"project\")")
-            }),
-        }
-    }
-}
-
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Category {
-    Profile,
-    Convention,
-    Steering,
-    Build,
-    Tool,
-    Memory,
-    Workflow,
-    Decision,
-}
-
-impl Category {
-    /// Section heading used when rendering this category into the
-    /// managed CLAUDE.md / AGENTS.md / GEMINI.md block. Distinct from
-    /// the serialized snake_case form — this is human-facing.
-    fn heading(&self) -> &str {
-        match self {
-            Self::Profile => "User Profile",
-            Self::Convention => "Conventions",
-            Self::Steering => "Provider Steering",
-            Self::Build => "Build & Test",
-            Self::Tool => "Tools",
-            Self::Memory => "Memory",
-            Self::Workflow => "Workflow",
-            Self::Decision => "Decisions",
-        }
-    }
-}
-
-#[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema, strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Priority {
-    Critical,
-    Standard,
-    Supplementary,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
     Eq,
     Serialize,
     Deserialize,
@@ -1035,151 +452,6 @@ pub struct KnowledgeWriteResult {
     pub superseded: Option<String>,
 }
 
-impl Priority {
-    /// `None` → `Standard` (schema default). `Some(invalid)` → error.
-    fn parse_optional(s: Option<&str>) -> Result<Self> {
-        match s {
-            None => Ok(Self::Standard),
-            Some(raw) => raw.parse().map_err(|_| {
-                anyhow::anyhow!(
-                    "invalid priority: {raw:?} (expected \"critical\", \"standard\", or \"supplementary\")"
-                )
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Active,
-    Draft,
-    Superseded,
-    Disabled,
-    Deleted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Approval {
-    UserConfirmed,
-    AgentInferred,
-    Imported,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct KnowledgeEntry {
-    pub id: String,
-    pub title: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cluster: Option<String>,
-    #[serde(default)]
-    pub variants: HashMap<String, String>, // provider → alternative content
-    pub category: Category,
-    pub scope: Scope,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-    /// Resolving authority's project id, stamped on write. Absent on rows
-    /// written before the catalog cut: those stay on the path lane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(default)]
-    pub providers: Vec<String>,
-    pub priority: Priority,
-    #[serde(default = "default_weight")]
-    pub weight: u32,
-    pub status: Status,
-    pub approval: Approval,
-    #[serde(default = "default_true")]
-    pub render: bool, // false = indexed only, never rendered into markdown
-    #[serde(default, skip_serializing_if = "RenderPlacement::is_inline")]
-    pub render_placement: RenderPlacement,
-    #[serde(default = "default_true")]
-    pub decay: bool, // false = invariant, never ages out or gets staleness-reviewed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<KnowledgeEdge>,
-    /// For `decision` entries: the rationale behind this commitment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    pub source: String,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default)]
-    pub recall_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_recalled: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeEdge {
-    pub target: String,
-    pub kind: KnowledgeEdgeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_arc: Option<String>,
-    pub confidence: EdgeConfidence,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeEdgeKind {
-    #[serde(alias = "Contradicts", alias = "CONTRADICTS")]
-    Contradicts,
-    #[serde(alias = "RelatesTo", alias = "RELATES_TO")]
-    RelatesTo,
-    #[serde(alias = "TensionWith", alias = "TENSION_WITH")]
-    TensionWith,
-    #[serde(alias = "Supports", alias = "SUPPORTS")]
-    Supports,
-    #[serde(alias = "DependsOn", alias = "DEPENDS_ON")]
-    DependsOn,
-    #[serde(alias = "DerivedFrom", alias = "DERIVED_FROM")]
-    DerivedFrom,
-    #[serde(alias = "SUPERSEDES", alias = "Supersedes")]
-    Supersedes,
-    #[serde(alias = "REFERENCES", alias = "References")]
-    References,
-}
-
-impl KnowledgeEdgeKind {
-    pub fn parse(input: &str) -> Result<Self> {
-        match input {
-            "Contradicts" | "contradicts" | "CONTRADICTS" => Ok(Self::Contradicts),
-            "RelatesTo" | "relates_to" | "RELATES_TO" | "related" => Ok(Self::RelatesTo),
-            "TensionWith" | "tension_with" | "TENSION_WITH" => Ok(Self::TensionWith),
-            "Supports" | "supports" | "SUPPORTS" => Ok(Self::Supports),
-            "DependsOn" | "depends_on" | "DEPENDS_ON" => Ok(Self::DependsOn),
-            "DerivedFrom" | "derived_from" | "DERIVED_FROM" => Ok(Self::DerivedFrom),
-            "SUPERSEDES" | "Supersedes" | "supersedes" => Ok(Self::Supersedes),
-            "REFERENCES" | "References" | "references" => Ok(Self::References),
-            other => anyhow::bail!(
-                "invalid knowledge edge kind '{other}' (expected Contradicts, RelatesTo, TensionWith, Supports, DependsOn, DerivedFrom, SUPERSEDES, REFERENCES)"
-            ),
-        }
-    }
-
-    pub fn edge_kind(self) -> &'static str {
-        match self {
-            Self::Contradicts => "Contradicts",
-            Self::RelatesTo => "RelatesTo",
-            Self::TensionWith => "TensionWith",
-            Self::Supports => "Supports",
-            Self::DependsOn => "DependsOn",
-            Self::DerivedFrom => "DERIVED_FROM",
-            Self::Supersedes => "SUPERSEDES",
-            Self::References => "REFERENCES",
-        }
-    }
-}
-
 fn parse_edge_confidence(input: Option<&str>) -> Result<EdgeConfidence> {
     match input.unwrap_or("heuristic") {
         "exact" | "Exact" | "EXACT" => Ok(EdgeConfidence::Exact),
@@ -1189,14 +461,6 @@ fn parse_edge_confidence(input: Option<&str>) -> Result<EdgeConfidence> {
             "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
         ),
     }
-}
-
-fn default_weight() -> u32 {
-    100
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2965,11 +2229,6 @@ impl Knowledge {
         self.persist_repo_owned_entries()
     }
 
-    /// Active entries that should be rendered into markdown (excludes indexed-only).
-    fn renderable_entries(&self) -> impl Iterator<Item = &KnowledgeEntry> {
-        self.active_entries().filter(|e| e.render)
-    }
-
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
@@ -3919,63 +3178,95 @@ impl Knowledge {
         // ── Project render: project-scope entries + PROJECT.md include only ──
         if do_project {
             let dir = project_dir.unwrap();
+            let root = Path::new(dir);
             // Entries are filtered by `scope_project` when set (managed
             // worktree rendering: entries live under the registered base
             // path while the files land in the worktree checkout).
             let scope_dir = p.scope_project.as_deref().unwrap_or(dir);
+            let _lock = lock_checkout_for_render(root, DEFAULT_RENDER_LOCK_TIMEOUT)?;
+            let projection = self.projection();
             let satellites: Vec<_> = providers
                 .iter()
-                .flat_map(|prov| self.guidance_files(prov, ScopeFilter::Project(scope_dir)))
+                .flat_map(|prov| projection.guidance_files(prov, ScopeFilter::Project(scope_dir)))
                 .collect();
-            bbox_util::guidance::publish_files(
-                &Path::new(dir).join(".bbox"),
+            let doc_nonempty = project_doc_nonempty(root);
+            let entrypoints = providers
+                .iter()
+                .map(|prov| ProjectEntrypoint {
+                    provider: prov.to_string(),
+                    content: projection.project_projection(prov, scope_dir, doc_nonempty),
+                })
+                .collect::<Vec<_>>();
+            // This adapter renders the knowledge current at this instant, so
+            // its issuance is allocated now on the daemon clock.
+            let applied = apply_project_render(
+                root,
                 &satellites,
-                dry_run,
+                &entrypoints,
+                ApplyOptions {
+                    dry_run,
+                    issued_at_ms: Some(issue_render_ms()),
+                    render_id: None,
+                    before_publish: None,
+                },
             )?;
-            for file in &satellites {
+            for (file, disposition) in satellites.iter().zip(&applied.satellites) {
                 results.push(format!(
-                    "{}SATELLITE .bbox/{} ({} bytes)",
+                    "{}SATELLITE .bbox/{} ({} bytes){}",
                     if dry_run { "[DRY-RUN] " } else { "" },
                     file.path,
-                    file.body.len()
+                    file.body.len(),
+                    if *disposition == ProjectRenderDispositionV1::Failed {
+                        " FAILED"
+                    } else {
+                        ""
+                    }
                 ));
             }
-            for prov in &providers {
-                let path = Path::new(dir).join(project_target_file(prov)?);
-                let Some(full) = self.project_projection(prov, dir, scope_dir)? else {
-                    results.push(format!(
+            for (entrypoint, disposition) in entrypoints.iter().zip(&applied.entrypoints) {
+                let path = root.join(project_target_file(&entrypoint.provider)?);
+                let full = entrypoint.content.as_deref().unwrap_or_default();
+                results.push(match disposition {
+                    ProjectRenderDispositionV1::Skipped => format!(
                         "Skipped {} (no project-scope entries and no PROJECT.md include)",
                         path.display()
-                    ));
-                    continue;
-                };
-
-                if dry_run {
-                    let write_label = if should_write_project_projection(&path)? {
-                        "PROJECT"
-                    } else {
-                        "PROJECT REFUSED"
-                    };
-                    results.push(format!(
-                        "[DRY-RUN] {} {} ({} chars)\n{}",
-                        write_label,
+                    ),
+                    ProjectRenderDispositionV1::DryRun => format!(
+                        "[DRY-RUN] PROJECT {} ({} chars)\n{}",
                         path.display(),
                         full.len(),
                         full
-                    ));
-                } else if !should_write_project_projection(&path)? {
-                    results.push(format!(
+                    ),
+                    ProjectRenderDispositionV1::DryRunRefused => format!(
+                        "[DRY-RUN] PROJECT REFUSED {} ({} chars)\n{}",
+                        path.display(),
+                        full.len(),
+                        full
+                    ),
+                    ProjectRenderDispositionV1::Refused => format!(
                         "Refused project {}: existing file is not blackbox-generated; preserve hand-authored content in PROJECT.md on the checkout owner before requesting a managed render",
                         path.display()
-                    ));
-                } else {
-                    atomic_write(&path, &full)?;
-                    results.push(format!(
+                    ),
+                    ProjectRenderDispositionV1::Conflict => format!(
+                        "Conflict on project {}: the file changed while the render was applying; its current bytes were preserved",
+                        path.display()
+                    ),
+                    ProjectRenderDispositionV1::Failed => {
+                        format!("Failed to write project {}", path.display())
+                    }
+                    ProjectRenderDispositionV1::Written => format!(
                         "Wrote project {} ({} chars)",
                         path.display(),
                         full.len()
-                    ));
-                }
+                    ),
+                });
+            }
+            if !applied.errors.is_empty() {
+                anyhow::bail!(
+                    "error.render_partial: the project render was only partly applied: {}\n\n{}",
+                    applied.errors.join("; "),
+                    results.join("\n\n")
+                );
             }
         }
 
@@ -4158,86 +3449,45 @@ impl Knowledge {
         Ok(md)
     }
 
-    /// Body for a project file: project-scope steerage + project-scope memory
-    /// + a PROJECT.md include. No global content (that lives in the global
-    /// render).
-    /// `project_dir` is the checkout the rendered files (and the PROJECT.md
-    /// include check) target; `scope_dir` is the project path entries are
-    /// filtered by. They differ when rendering into a managed worktree whose
-    /// entries live under the registered base path.
-    fn render_project_body(
-        &self,
-        provider: &str,
-        project_dir: &str,
-        scope_dir: &str,
-    ) -> Result<String> {
-        self.render_project_body_with_include(
-            provider,
-            scope_dir,
-            project_doc_nonempty(Path::new(project_dir)),
-        )
+    /// The renderable rows of this value in store order.
+    fn projection(&self) -> Projection<'_> {
+        Projection::new(&self.store.entries)
     }
 
-    fn render_project_body_with_include(
-        &self,
-        provider: &str,
-        scope_dir: &str,
-        project_doc_nonempty: bool,
-    ) -> Result<String> {
-        let mut body = String::new();
-        let filter = ScopeFilter::Project(scope_dir);
-
-        self.render_steerage(provider, filter, &mut body);
-
-        // Gemini deprioritizes content at the bottom, so PROJECT.md goes
-        // between steerage and memory instead of after both.
-        if provider == "gemini" {
-            render_project_include(provider, project_doc_nonempty, &mut body);
-            self.render_memory(provider, filter, &mut body);
-        } else {
-            self.render_memory(provider, filter, &mut body);
-            render_project_include(provider, project_doc_nonempty, &mut body);
-        }
-
-        self.render_guidance_breadcrumbs(provider, filter, Path::new(".bbox"), &mut body);
-        Ok(body)
-    }
-
+    /// The complete generated provider file for one checkout, or `None` when
+    /// it has no body. `project_dir` is the checkout the file (and the
+    /// PROJECT.md breadcrumb check) targets; `scope_dir` selects the entries.
+    /// They differ when rendering into a managed worktree whose entries live
+    /// under the registered base path.
     fn project_projection(
         &self,
         provider: &str,
         project_dir: &str,
         scope_dir: &str,
     ) -> Result<Option<String>> {
-        let body = self.render_project_body(provider, project_dir, scope_dir)?;
-        self.finish_project_projection(body)
+        Ok(self.projection().project_projection(
+            provider,
+            scope_dir,
+            project_doc_nonempty(Path::new(project_dir)),
+        ))
     }
 
-    fn project_projection_with_include(
+    #[cfg(test)]
+    fn render_project_body(
         &self,
         provider: &str,
+        project_dir: &str,
         scope_dir: &str,
-        project_doc_nonempty: bool,
-    ) -> Result<Option<String>> {
-        let body =
-            self.render_project_body_with_include(provider, scope_dir, project_doc_nonempty)?;
-        self.finish_project_projection(body)
-    }
-
-    fn finish_project_projection(&self, body: String) -> Result<Option<String>> {
-        if body.trim().is_empty() {
-            return Ok(None);
-        }
-        let mut full = String::new();
-        full.push_str("<!-- Generated by blackbox. Do not edit directly. -->\n");
-        full.push_str("<!-- Use bbox_learn / bbox_forget to modify. -->\n\n");
-        full.push_str(body.trim_end());
-        full.push('\n');
-        Ok(Some(full))
+    ) -> Result<String> {
+        Ok(self.projection().project_body(
+            provider,
+            scope_dir,
+            project_doc_nonempty(Path::new(project_dir)),
+        ))
     }
 
     fn render_steerage(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
-        self.render_steerage_filtered(provider, filter, md, |e| e.render_placement.is_inline());
+        self.projection().render_steerage(provider, filter, md);
     }
 
     fn render_steerage_filtered<F>(
@@ -4249,31 +3499,12 @@ impl Knowledge {
     ) where
         F: Fn(&KnowledgeEntry) -> bool,
     {
-        let heading = match provider {
-            "claude" => "## Standing Orders",
-            "gemini" => "## Foundational Mandates",
-            _ => "## Critical Instructions",
-        };
-
-        let steerage: Vec<&KnowledgeEntry> = self
-            .renderable_entries()
-            .filter(|e| e.category == Category::Steering)
-            .filter(|e| entry_visible_to(e, provider))
-            .filter(|e| filter.matches(e))
-            .filter(|e| include(e))
-            .collect();
-
-        if !steerage.is_empty() {
-            md.push_str(heading);
-            md.push('\n');
-            md.push('\n');
-            render_entries(&steerage, provider, md);
-            md.push('\n');
-        }
+        self.projection()
+            .render_steerage_filtered(provider, filter, md, include);
     }
 
     fn render_memory(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
-        self.render_memory_filtered(provider, filter, md, |e| e.render_placement.is_inline());
+        self.projection().render_memory(provider, filter, md);
     }
 
     fn render_memory_filtered<F>(
@@ -4285,48 +3516,27 @@ impl Knowledge {
     ) where
         F: Fn(&KnowledgeEntry) -> bool,
     {
-        let memory_categories = [
-            Category::Profile,
-            Category::Convention,
-            Category::Build,
-            Category::Tool,
-            Category::Memory,
-            Category::Workflow,
-        ];
+        self.projection()
+            .render_memory_filtered(provider, filter, md, include);
+    }
 
-        let mut by_category: HashMap<&str, Vec<&KnowledgeEntry>> = HashMap::new();
-        for entry in self.renderable_entries() {
-            if entry.category == Category::Steering {
-                continue;
-            }
-            if !entry_visible_to(entry, provider) {
-                continue;
-            }
-            if !filter.matches(entry) {
-                continue;
-            }
-            if !include(entry) {
-                continue;
-            }
-            let heading = entry.category.heading();
-            by_category.entry(heading).or_default().push(entry);
-        }
+    pub(crate) fn guidance_files(
+        &self,
+        provider: &str,
+        filter: ScopeFilter<'_>,
+    ) -> Vec<bbox_util::guidance::GuidanceFile> {
+        self.projection().guidance_files(provider, filter)
+    }
 
-        for cat in &memory_categories {
-            let heading = cat.heading();
-            if let Some(entries) = by_category.get(heading) {
-                let mut sorted = entries.clone();
-                sorted.sort_by(|a, b| {
-                    a.weight
-                        .cmp(&b.weight)
-                        .then_with(|| a.title.cmp(&b.title))
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-                md.push_str(&format!("## {}\n\n", heading));
-                render_entries_grouped(&sorted, provider, md);
-                md.push('\n');
-            }
-        }
+    fn render_guidance_breadcrumbs(
+        &self,
+        provider: &str,
+        filter: ScopeFilter<'_>,
+        root: &Path,
+        out: &mut String,
+    ) {
+        self.projection()
+            .render_guidance_breadcrumbs(provider, filter, root, out);
     }
 
     // ── Absorb ─────────────────────────────────────────────────────
@@ -4874,140 +4084,9 @@ fn knowledge_excerpt(content: &str, max_bytes: usize) -> String {
     format!("{excerpt}... [{remaining_chars} more chars]")
 }
 
-fn entry_visible_to(entry: &KnowledgeEntry, provider: &str) -> bool {
-    if entry.providers.is_empty() {
-        return true; // visible to all
-    }
-    if provider == "agents" {
-        // AGENTS.md serves codex + vibe
-        return entry.providers.iter().any(|p| p == "codex" || p == "vibe");
-    }
-    entry.providers.iter().any(|p| p == provider)
-}
-
-#[derive(Clone, Copy)]
-enum ScopeFilter<'a> {
-    Global,
-    Project(&'a str),
-}
-
-impl<'a> ScopeFilter<'a> {
-    fn matches(&self, entry: &KnowledgeEntry) -> bool {
-        match (self, &entry.scope) {
-            (ScopeFilter::Global, Scope::Global) => true,
-            (ScopeFilter::Project(selector), Scope::Project) => {
-                entry.project.as_deref() == Some(*selector)
-                    || entry.project_id.as_deref() == Some(*selector)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
-    for entry in entries {
-        let mark = match entry.approval {
-            Approval::AgentInferred => " *(unverified)*",
-            Approval::Imported => " *(imported)*",
-            _ => "",
-        };
-        // Always render title if non-empty — not just for unverified entries
-        if !entry.title.is_empty() {
-            out.push_str(&format!("**{}**{}\n\n", entry.title, mark));
-        }
-        // Use provider-specific variant if available, else default content
-        let content = entry.variants.get(provider).unwrap_or(&entry.content);
-        out.push_str(content);
-        out.push_str("\n\n");
-    }
-}
-
 fn render_global_common_core_rules(out: &mut String) {
     out.push_str("## Critical Instructions\n\n");
     out.push_str("Report Blackbox substrate gaps with gap notes: list with `bbox_gaps` before creating with `bbox_gap`. Read the operations guide when recording or resolving a gap.\n\n");
-}
-
-fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
-    let mut unclustered = Vec::new();
-    let mut clustered: std::collections::BTreeMap<&str, Vec<&KnowledgeEntry>> =
-        std::collections::BTreeMap::new();
-
-    for entry in entries {
-        match entry.cluster.as_deref() {
-            Some(cluster) if !cluster.trim().is_empty() => {
-                clustered.entry(cluster).or_default().push(*entry);
-            }
-            _ => unclustered.push(*entry),
-        }
-    }
-
-    if !unclustered.is_empty() {
-        render_entries(&unclustered, provider, out);
-    }
-
-    for (cluster, grouped) in clustered {
-        out.push_str(&format!("### {}\n\n", cluster));
-        render_entries(&grouped, provider, out);
-        out.push('\n');
-    }
-}
-
-const PROJECT_DOC_FILE: &str = "PROJECT.md";
-
-fn project_include_instruction(_provider: &str) -> &'static str {
-    "For project architecture, implementation, or operational work, read `PROJECT.md`. Skip it for unrelated tasks."
-}
-
-fn validated_project_render_providers(provider: Option<&str>) -> Result<Vec<&str>> {
-    let providers = provider
-        .map(|provider| vec![provider])
-        .unwrap_or_else(|| vec!["claude", "agents", "gemini"]);
-    for provider in &providers {
-        project_target_file(provider)?;
-    }
-    Ok(providers)
-}
-
-fn project_target_file(provider: &str) -> Result<&'static str> {
-    match provider {
-        "claude" => Ok("CLAUDE.md"),
-        "agents" | "codex" | "vibe" => Ok("AGENTS.md"),
-        "gemini" => Ok("GEMINI.md"),
-        other => anyhow::bail!(
-            "unsupported project render provider {other:?}; expected claude, agents, codex, vibe, or gemini"
-        ),
-    }
-}
-
-fn project_doc_nonempty(project_dir: &Path) -> bool {
-    fs::metadata(project_dir.join(PROJECT_DOC_FILE))
-        .map(|metadata| metadata.is_file() && metadata.len() > 0)
-        .unwrap_or(false)
-}
-
-fn render_project_include(provider: &str, project_doc_nonempty: bool, md: &mut String) {
-    if project_doc_nonempty {
-        md.push_str(project_include_instruction(provider));
-        md.push('\n');
-    }
-}
-
-fn should_write_project_projection(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(true);
-    }
-    let existing = fs::read_to_string(path)?;
-    Ok(existing.contains("<!-- Generated by blackbox"))
-}
-
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────
@@ -5235,8 +4314,10 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbox_corpus_core::identity::PublishedScope;
     use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
+    use std::io::Write as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5902,6 +4983,7 @@ mod tests {
                 dry_run: Some(false),
                 global_plan: None,
                 provisional: None,
+                operation: None,
                 scope_project: Some("/registry/base".into()),
                 locality: None,
             })
@@ -5942,6 +5024,7 @@ mod tests {
             project_id: "project-render-locality".into(),
             scope: PublishedScope::try_new("render-locality", ".").unwrap(),
             workspace_id: "workspace-render-locality".into(),
+            producer: None,
             provider: provider.map(str::to_owned),
             dry_run,
             view: ProjectRenderViewV1::Own,

@@ -60,6 +60,7 @@ members = [
     "crates/bbox-config",
     "crates/bbox-artifacts",
     "crates/bbox-knowledge",
+    "crates/bbox-project-render",
     "crates/bbox-threads",
     "crates/bbox-gaps",
     "crates/bbox-inbox",
@@ -231,6 +232,7 @@ bbox-stores = { path = "crates/bbox-stores" }
 bbox-config = { path = "crates/bbox-config" }
 bbox-artifacts = { path = "crates/bbox-artifacts" }
 bbox-knowledge = { path = "crates/bbox-knowledge" }
+bbox-project-render = { path = "crates/bbox-project-render" }
 bbox-threads = { path = "crates/bbox-threads" }
 bbox-gaps = { path = "crates/bbox-gaps" }
 bbox-inbox = { path = "crates/bbox-inbox" }

@@ -70,13 +70,7 @@ pub enum EdgeProvenance {
     Implicit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeConfidence {
-    Exact,
-    Heuristic,
-    Unknown,
-}
+pub use bbox_corpus_core::edge::EdgeConfidence;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {

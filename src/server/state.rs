@@ -113,6 +113,9 @@ pub(crate) struct SharedState {
     /// reload can install a snapshot built from stale claim or config state.
     pub(crate) producer_claim_lock: tokio::sync::Mutex<()>,
     pub(crate) producer_commands: Arc<super::producer_commands::ProducerCommandRuntime>,
+    /// Durable checkout-owner project render operations and render-lane
+    /// presence (`server::render_operations`).
+    pub(crate) render_operations: Arc<super::render_operations::RenderOperationRuntime>,
     /// The runtime project authority selected by the startup store-version
     /// probe (phase-2 §4.1). Consumers never match this directly outside
     /// the defined seams: record enumeration goes through
@@ -822,6 +825,12 @@ impl SharedState {
             producer_claims: producer_claims_store,
             producer_claims_persister,
             producer_claim_lock: tokio::sync::Mutex::new(()),
+            render_operations: Arc::new(
+                super::render_operations::RenderOperationRuntime::open(
+                    &store_dir.join("render-operations"),
+                )
+                .unwrap(),
+            ),
             producer_commands: Arc::new(
                 super::producer_commands::ProducerCommandRuntime::new(),
             ),

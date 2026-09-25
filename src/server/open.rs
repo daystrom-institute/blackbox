@@ -310,6 +310,9 @@ pub(super) fn open_shared_state(
         bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::open(
             store_dir.join("render-locality-observations.json"),
         )?;
+    let render_operations = Arc::new(super::render_operations::RenderOperationRuntime::open(
+        &store_dir.join("render-operations"),
+    )?);
     // Bridge-only handles stay `Option` so catalog mode never constructs a
     // version-1 registry or its persister.
     let mut projects_store: Option<Arc<RwLock<ProjectRegistry>>> = None;
@@ -969,6 +972,7 @@ pub(super) fn open_shared_state(
         producer_claims_persister,
         producer_claim_lock: tokio::sync::Mutex::new(()),
         producer_commands: Arc::new(super::producer_commands::ProducerCommandRuntime::new()),
+        render_operations,
         project_authority,
         accepted_publications,
         records_provider,

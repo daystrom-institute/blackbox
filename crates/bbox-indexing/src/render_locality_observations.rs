@@ -1,5 +1,6 @@
 //! Durable path-free completion evidence for checkout-owned project renders.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
 const MAX_COMPLETIONS: usize = 65_536;
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WORKSPACE_ISSUANCES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +35,10 @@ pub struct RenderLocalityCompletionV1 {
     pub refused_count: u64,
     pub sequence: u64,
     pub observed_at_unix_secs: u64,
+    /// Daemon-clock issuance of the plan this completion applied. A row is
+    /// never replaced by a completion of an older plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +63,10 @@ impl Default for RenderLocalityObservationSnapshotV1 {
 pub struct RenderLocalityObservationsV1 {
     store_path: Option<Arc<PathBuf>>,
     state: Arc<Mutex<RenderLocalityObservationSnapshotV1>>,
+    /// Workspace plans this daemon issued, as `(issued_at_ms, plan_sha256)`.
+    /// In memory and bounded: a completion whose issuance is not held here
+    /// cannot be ordered and is never evidence.
+    workspace_issuances: Arc<Mutex<BTreeSet<(u64, String)>>>,
 }
 
 impl RenderLocalityObservationsV1 {
@@ -66,6 +76,7 @@ impl RenderLocalityObservationsV1 {
         Ok(Self {
             store_path: Some(Arc::new(store_path)),
             state: Arc::new(Mutex::new(snapshot)),
+            workspace_issuances: Arc::default(),
         })
     }
 
@@ -73,6 +84,7 @@ impl RenderLocalityObservationsV1 {
         Self {
             store_path: None,
             state: Arc::new(Mutex::new(Default::default())),
+            workspace_issuances: Arc::default(),
         }
     }
 
@@ -80,16 +92,51 @@ impl RenderLocalityObservationsV1 {
         self.state.lock().clone()
     }
 
+    /// Remember that this daemon issued the workspace plan `plan_sha256` at
+    /// `issued_at_ms`. The issuance leaves the daemon beside the plan bytes
+    /// and comes back with the completion; only a remembered one orders it.
+    pub fn note_workspace_issuance(&self, plan_sha256: &str, issued_at_ms: u64) {
+        let mut issuances = self.workspace_issuances.lock();
+        issuances.insert((issued_at_ms, plan_sha256.to_owned()));
+        while issuances.len() > MAX_WORKSPACE_ISSUANCES {
+            issuances.pop_first();
+        }
+    }
+
+    /// Whether this daemon issued the workspace plan `plan_sha256` at
+    /// `issued_at_ms`.
+    pub fn issued_workspace_plan(&self, plan_sha256: &str, issued_at_ms: u64) -> bool {
+        self.workspace_issuances
+            .lock()
+            .contains(&(issued_at_ms, plan_sha256.to_owned()))
+    }
+
     /// Persist one completion only after the daemon has independently
     /// reconstructed the current plan and validated every projection hash in
     /// the checkout owner's receipt.
+    ///
+    /// An incomplete receipt (an output may have been written but the owner
+    /// could not confirm the application) is never completion evidence,
+    /// whatever its dispositions say, so it is not recorded and returns
+    /// `None`. Both the bound harness and the checkout-owner collector
+    /// complete through this boundary.
+    ///
+    /// `issued_at_ms` is the daemon-clock issuance of the applied plan. A
+    /// completion of a plan issued before the one already recorded for the
+    /// same project and view is historical: it never replaces the newer
+    /// evidence and returns `None`. So is a different receipt at the same
+    /// issuance.
     pub fn record_completed(
         &self,
         plan: &ProjectRenderPlanV1,
         receipt: &ProjectRenderReceiptV1,
-    ) -> Result<u64> {
+        issued_at_ms: u64,
+    ) -> Result<Option<u64>> {
         plan.validate()?;
-        receipt.validate_against(plan)?;
+        receipt.validate_against_issued(plan, Some(issued_at_ms))?;
+        if receipt.incomplete {
+            return Ok(None);
+        }
         let receipt_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(receipt)?));
         let written_count = receipt
             .projections
@@ -107,6 +154,21 @@ impl RenderLocalityObservationsV1 {
             })
             .count() as u64;
         self.mutate(|snapshot| {
+            let key = (plan.project_id.as_str(), plan.view);
+            let position = snapshot
+                .completions
+                .binary_search_by(|current| (current.project_id.as_str(), current.view).cmp(&key));
+            // Issuances are allocated strictly increasing, so an equal one
+            // is the same render reporting again; a different receipt at an
+            // equal issuance cannot be ordered and never replaces the row.
+            if let Ok(index) = position
+                && let Some(recorded) = snapshot.completions[index].issued_at_ms
+                && (recorded > issued_at_ms
+                    || (recorded == issued_at_ms
+                        && snapshot.completions[index].receipt_sha256 != receipt_sha256))
+            {
+                return Ok(None);
+            }
             snapshot.sequence = snapshot
                 .sequence
                 .checked_add(1)
@@ -122,23 +184,20 @@ impl RenderLocalityObservationsV1 {
                 refused_count,
                 sequence: snapshot.sequence,
                 observed_at_unix_secs: now_unix_secs(),
+                issued_at_ms: Some(issued_at_ms),
             };
-            let key = (completion.project_id.as_str(), completion.view);
-            match snapshot
-                .completions
-                .binary_search_by(|current| (current.project_id.as_str(), current.view).cmp(&key))
-            {
+            match position {
                 Ok(index) => snapshot.completions[index] = completion,
                 Err(index) => snapshot.completions.insert(index, completion),
             }
-            Ok(snapshot.sequence)
+            Ok(Some(snapshot.sequence))
         })
     }
 
-    fn mutate(
+    fn mutate<T>(
         &self,
-        mutation: impl FnOnce(&mut RenderLocalityObservationSnapshotV1) -> Result<u64>,
-    ) -> Result<u64> {
+        mutation: impl FnOnce(&mut RenderLocalityObservationSnapshotV1) -> Result<T>,
+    ) -> Result<T> {
         let mut state = self.state.lock();
         let (next, sequence) = if let Some(store_path) = &self.store_path {
             with_store_lock(store_path, || {
@@ -272,6 +331,7 @@ mod tests {
             project_id: "project".into(),
             scope: PublishedScope::try_new("repo", ".").unwrap(),
             workspace_id: "workspace".into(),
+            producer: None,
             provider: None,
             dry_run: false,
             view,
@@ -287,7 +347,9 @@ mod tests {
             project_id: plan.project_id.clone(),
             scope: plan.scope.clone(),
             workspace_id: plan.workspace_id.clone(),
+            producer: None,
             project_doc_nonempty: false,
+            incomplete: false,
             projections: ["claude", "agents", "gemini"]
                 .into_iter()
                 .map(|provider| ProjectRenderProjectionReceiptV1 {
@@ -319,9 +381,21 @@ mod tests {
         ] {
             let plan = plan(view);
             observations
-                .record_completed(&plan, &receipt(&plan))
+                .record_completed(&plan, &receipt(&plan), 100)
                 .unwrap();
         }
+
+        // An incomplete receipt that reports every provider written is not
+        // completion evidence.
+        let plan = plan(ProjectRenderViewV1::Published);
+        let mut incomplete = receipt(&plan);
+        incomplete.incomplete = true;
+        assert_eq!(
+            observations
+                .record_completed(&plan, &incomplete, 300)
+                .unwrap(),
+            None
+        );
 
         let reopened = RenderLocalityObservationsV1::open(&path)
             .unwrap()
@@ -337,5 +411,59 @@ mod tests {
                 .sequence,
             4
         );
+    }
+
+    #[test]
+    fn a_completion_of_an_older_plan_never_replaces_newer_evidence() {
+        let observations = RenderLocalityObservationsV1::in_memory();
+        let plan = plan(ProjectRenderViewV1::Published);
+        let newer = receipt(&plan);
+        observations
+            .record_completed(&plan, &newer, 200)
+            .unwrap()
+            .expect("the newer completion is recorded");
+        let recorded = observations.snapshot();
+        assert_eq!(
+            observations
+                .record_completed(&plan, &receipt(&plan), 150)
+                .unwrap(),
+            None
+        );
+        assert_eq!(observations.snapshot(), recorded);
+        observations
+            .record_completed(&plan, &receipt(&plan), 250)
+            .unwrap()
+            .expect("a later completion replaces the row");
+    }
+
+    /// Two renders cannot share an issuance, so a different receipt at the
+    /// recorded issuance is never ordered after it: a written receipt at an
+    /// equal clock reading never replaces a refusal.
+    #[test]
+    fn a_different_completion_at_an_equal_issuance_never_replaces_evidence() {
+        let observations = RenderLocalityObservationsV1::in_memory();
+        let plan = plan(ProjectRenderViewV1::Published);
+        let mut written = receipt(&plan);
+        written.project_doc_nonempty = true;
+        written.projections = plan.expected_projections(true, Some(200)).unwrap();
+        let mut refused = written.clone();
+        refused.projections[0].disposition = ProjectRenderDispositionV1::Refused;
+        observations
+            .record_completed(&plan, &refused, 200)
+            .unwrap()
+            .expect("the refusal is recorded");
+        let recorded = observations.snapshot();
+        assert_eq!(recorded.completions[0].refused_count, 1);
+        assert_eq!(
+            observations.record_completed(&plan, &written, 200).unwrap(),
+            None
+        );
+        assert_eq!(observations.snapshot(), recorded);
+        // The same render reporting again stays recorded as itself.
+        observations
+            .record_completed(&plan, &refused, 200)
+            .unwrap()
+            .expect("an identical report is accepted");
+        assert_eq!(observations.snapshot().completions[0].refused_count, 1);
     }
 }

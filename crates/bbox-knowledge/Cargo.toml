@@ -17,6 +17,7 @@ anyhow = "1"
 libc = "0.2"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-chunker = { path = "../bbox-chunker" }
+bbox-project-render = { path = "../bbox-project-render" }
 parking_lot = "0.12"
 strum = { version = "0.26", features = ["derive"] }
 tracing = "0.1"

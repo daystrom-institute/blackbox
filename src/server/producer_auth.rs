@@ -720,6 +720,25 @@ impl ProducerAuthRuntime {
             .collect()
     }
 
+    /// Every configured or claimed scope grant as `(scope, project_id,
+    /// producer_id)`, one row per producer entry. Unlike
+    /// [`Self::assignment_map`] this never collapses duplicate scopes, so a
+    /// caller that needs exactly one owner can detect ambiguity.
+    pub(crate) fn scope_grant_rows(&self) -> Vec<(PublishedScope, String, String)> {
+        self.entries
+            .iter()
+            .flat_map(|entry| {
+                entry.grant.projects.iter().map(|(scope, project_id)| {
+                    (
+                        scope.clone(),
+                        project_id.clone(),
+                        entry.grant.producer_id.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn assigned_project_ids(&self) -> BTreeSet<String> {
         self.entries
             .iter()

@@ -17,7 +17,8 @@ use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_knowledge::knowledge::{
     DecideParams, ForgetParams, Knowledge, KnowledgeLinkParams, LearnParams,
     ProjectRenderExecutionV1, ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1,
-    ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams, execute_project_render_plan,
+    ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams,
+    execute_workspace_render_plan,
 };
 use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_knowledge_source_client::{CaptureOutcome, WorkspaceCaptureClient};
@@ -254,20 +255,22 @@ impl Tool for LocalRenderTool {
         let plan = assembled.plan;
         let plan_sha256 = assembled.plan_sha256;
         let global_result = assembled.global_result;
+        let issued_at_ms = assembled.issued_at_ms;
         let runtime = self.runtime.clone();
         let execution_plan = plan.clone();
-        let execution =
-            match tokio::task::spawn_blocking(move || runtime.execute_render_plan(&execution_plan))
-                .await
-            {
-                Ok(Ok(execution)) => execution,
-                Ok(Err(error)) => {
-                    return local_error(format!("local project render failed: {error:#}"));
-                }
-                Err(error) => {
-                    return local_error(format!("local project render task failed: {error}"));
-                }
-            };
+        let execution = match tokio::task::spawn_blocking(move || {
+            runtime.execute_render_plan(&execution_plan, issued_at_ms)
+        })
+        .await
+        {
+            Ok(Ok(execution)) => execution,
+            Ok(Err(error)) => {
+                return local_error(format!("local project render failed: {error:#}"));
+            }
+            Err(error) => {
+                return local_error(format!("local project render task failed: {error}"));
+            }
+        };
 
         let mut complete_input = public;
         complete_input.insert(
@@ -276,6 +279,7 @@ impl Tool for LocalRenderTool {
                 "phase": "complete",
                 "plan_sha256": plan_sha256,
                 "receipt": execution.receipt,
+                "issued_at_ms": issued_at_ms,
             }),
         );
         let diagnostics = match parse_render_completion(
@@ -658,12 +662,17 @@ impl LocalProjectRuntime {
         Ok(BOUND_WORKSPACE_RENDER_SELECTOR.to_string())
     }
 
-    fn execute_render_plan(&self, plan: &ProjectRenderPlanV1) -> Result<ProjectRenderExecutionV1> {
-        execute_project_render_plan(
+    fn execute_render_plan(
+        &self,
+        plan: &ProjectRenderPlanV1,
+        issued_at_ms: Option<u64>,
+    ) -> Result<ProjectRenderExecutionV1> {
+        execute_workspace_render_plan(
             plan,
             &self.project_root,
             &self.scope,
             self.workspace_id.as_str(),
+            issued_at_ms,
         )
     }
 
@@ -1659,6 +1668,7 @@ mod tests {
             project_id: "project-render-locality".into(),
             scope: runtime.scope.clone(),
             workspace_id: runtime.workspace_id.as_str().to_string(),
+            producer: None,
             provider: Some("claude".into()),
             dry_run: false,
             view: bbox_knowledge::knowledge::ProjectRenderViewV1::Own,

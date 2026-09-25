@@ -47,6 +47,8 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod render_lane;
+
 #[derive(Parser)]
 #[command(name = "bbox-code-collector")]
 struct Cli {
@@ -422,7 +424,8 @@ async fn run_loop(runtime: &Runtime, config_path: &Path, config: CollectorConfig
 /// Checkout-mutation delivery lane: poll the daemon for pending repo-owned
 /// file mutations (gap/knowledge writes it validated but cannot apply with
 /// zero checkout authority), write the bytes into the matching configured
-/// checkout, and ack each outcome. Runs independently of source scanning;
+/// checkout, and ack each outcome. The same cadence polls the enroll command
+/// channel and the project render lane. Runs independently of source scanning;
 /// publication still reads only the configured committed ref.
 async fn run_checkout_mutation_lane(
     runtime: &Runtime,
@@ -431,6 +434,7 @@ async fn run_checkout_mutation_lane(
 ) {
     let mut reloader = ConfigReloader::new(config_path, &config.snapshot());
     let mut backoff = Duration::from_secs(config.snapshot().mutation_interval_secs.max(1));
+    let mut render_lane = render_lane::RenderLaneState::default();
     loop {
         reloader.reload_if_changed(&config);
         let snapshot = config.snapshot();
@@ -447,6 +451,16 @@ async fn run_checkout_mutation_lane(
             }
         }
         let snapshot = config.snapshot();
+        match render_lane::apply_render_operations(runtime, &snapshot, &mut render_lane).await {
+            Ok(settled) => {
+                if settled > 0 {
+                    tracing::info!(settled, "project render operations settled");
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "project render lane failed");
+            }
+        }
         match apply_checkout_mutations(runtime, &snapshot).await {
             Ok(applied) => {
                 if applied > 0 {

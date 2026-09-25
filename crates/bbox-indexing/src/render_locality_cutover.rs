@@ -152,6 +152,7 @@ impl RenderLocalityCutoverRuntimeV1 {
             refused_count: 0,
             sequence: index as u64 + 1,
             observed_at_unix_secs: 1,
+            issued_at_ms: None,
         })
         .collect();
         let row = RenderLocalityCutoverRowV1 {
@@ -665,6 +666,14 @@ mod tests {
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
         scope: &PublishedScope,
     ) {
+        record_completions_with(layout, scope, false);
+    }
+
+    fn record_completions_with(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        scope: &PublishedScope,
+        incomplete: bool,
+    ) {
         let observations = RenderLocalityObservationsV1::open(
             layout.bro_home.join("render-locality-observations.json"),
         )
@@ -681,6 +690,7 @@ mod tests {
                 project_id: PROJECT.into(),
                 scope: scope.clone(),
                 workspace_id: "workspace".into(),
+                producer: None,
                 provider: None,
                 dry_run: false,
                 view,
@@ -688,9 +698,16 @@ mod tests {
                 entries: vec![render_entry()],
                 diagnostics: None,
             };
-            let execution = execute_project_render_plan(&plan, &root, scope, "workspace").unwrap();
+            let mut receipt = execute_project_render_plan(&plan, &root, scope, "workspace")
+                .unwrap()
+                .receipt;
+            receipt.incomplete = incomplete;
+            let issued_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
             observations
-                .record_completed(&plan, &execution.receipt)
+                .record_completed(&plan, &receipt, issued_at_ms)
                 .unwrap();
         }
     }
@@ -699,6 +716,65 @@ mod tests {
         let mut report: RenderLocalityCutoverReportV1 = read_json_required(path).unwrap();
         report.generated_at_unix_secs = 0;
         write_json(path, &report).unwrap();
+    }
+
+    /// An applier that wrote every output but could not confirm completion
+    /// returns an incomplete receipt whose dispositions all read written.
+    /// Such receipts must never become positive-control evidence.
+    #[test]
+    fn incomplete_receipts_never_satisfy_the_positive_control_gate() {
+        let _guard = bbox_util::util::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let config = test_config(&root, &scope);
+        let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
+            &root.join("rehearsal"),
+            &config,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&layout.bro_home).unwrap();
+        let store = ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |catalog, _attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::Published(scope.clone()),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "project".into(),
+                        created_at: "unix:1".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        record_completions_with(&layout, &scope, true);
+        let preflight = ProjectCatalogRenderLocalityCutoverFacadeV1::preflight(
+            RenderLocalityCutoverPreflightRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: root.join("render-cutover-report.json"),
+                project_ids: vec![project_id.clone()],
+                min_quiet_secs: MIN_RENDER_LOCALITY_QUIET_SECS,
+                generated_at: "unix:1".into(),
+            },
+        );
+        assert!(preflight.is_err(), "incomplete receipts satisfied the gate");
+        let observations = RenderLocalityObservationsV1::open(
+            layout.bro_home.join("render-locality-observations.json"),
+        )
+        .unwrap()
+        .snapshot();
+        assert!(observations.completions.is_empty());
     }
 
     #[test]

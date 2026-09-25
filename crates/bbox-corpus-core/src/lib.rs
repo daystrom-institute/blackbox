@@ -15,6 +15,7 @@
 pub mod blame_transport;
 pub mod built_from;
 pub mod code_project_identity;
+pub mod edge;
 pub mod edit;
 pub mod entity_ref;
 pub mod git;

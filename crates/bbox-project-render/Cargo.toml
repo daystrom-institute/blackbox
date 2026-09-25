@@ -1,0 +1,25 @@
+[package]
+name = "bbox-project-render"
+version = "0.0.1"
+edition = "2024"
+
+# Dependency-clean project render leaf: the knowledge entry model, provider
+# projections, path-free render plans and receipts, the checkout-owner render
+# lane wire contract, and hardened checkout IO. The corpus daemon, the bound
+# harness, and the checkout-owner collector all link it, so it must never
+# depend on stores, chunkers, indexers, or daemon/runtime crates
+# (scripts/acceptance-code-collector-deps.sh).
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-util = { path = "../bbox-util" }
+chrono = "0.4"
+fs2 = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+strum = { version = "0.26", features = ["derive"] }
+tempfile = "3"

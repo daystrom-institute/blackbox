@@ -353,6 +353,7 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-git-source",
  "bbox-knowledge-source",
+ "bbox-project-render",
  "bbox-provenance",
  "bro-rpc",
  "clap",
@@ -742,6 +743,7 @@ dependencies = [
  "base64 0.22.1",
  "bbox-chunker",
  "bbox-corpus-core",
+ "bbox-project-render",
  "bbox-stores",
  "bbox-util",
  "chrono",
@@ -877,6 +879,24 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "bbox-project-render"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bbox-corpus-core",
+ "bbox-util",
+ "chrono",
+ "fs2",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum 0.26.3",
  "tempfile",
 ]
 
@@ -1274,6 +1294,7 @@ dependencies = [
  "bbox-mcp-tools",
  "bbox-packets",
  "bbox-project-graph",
+ "bbox-project-render",
  "bbox-provenance",
  "bbox-providers",
  "bbox-slack",

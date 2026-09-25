@@ -931,6 +931,22 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             "/internal/code-source/v1/producer-commands/ack",
             post(ack_producer_command).layer(DefaultBodyLimit::max(64 * 1024)),
         )
+        .route(
+            "/internal/code-source/v1/render-operations/poll",
+            post(poll_render_operations).layer(DefaultBodyLimit::max(
+                bbox_project_render::wire::MAX_RENDER_LANE_POLL_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/internal/code-source/v1/render-operations/{operation_id}/plan",
+            get(render_operation_plan_page),
+        )
+        .route(
+            "/internal/code-source/v1/render-operations/{operation_id}/result",
+            post(settle_render_operation).layer(DefaultBodyLimit::max(
+                bbox_project_render::wire::MAX_RENDER_LANE_RESULT_BODY_BYTES,
+            )),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             super::producer_auth::authenticate_code_source_request,
@@ -1527,6 +1543,123 @@ async fn ack_producer_command(
             super::producer_commands::ProducerCommandAckStatus::AlreadySettled => "already_settled",
         }
     })))
+}
+
+/// Checkout-owner render lane: a poll proves the collector executes project
+/// render plans and names the scopes it holds, then returns pending
+/// `render_project` operations for scopes this producer's grant authorizes.
+async fn poll_render_operations(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<bbox_project_render::wire::RenderLanePollRequestV1>,
+) -> Result<Json<bbox_project_render::wire::RenderLanePollResponseV1>, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::unprocessable("invalid_render_poll", error.to_string()))?;
+    let response = blocking(move || {
+        state
+            .render_operations
+            .poll(&grant.producer_id, &request, &grant.projects)
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct RenderPlanPageQuery {
+    #[serde(default)]
+    offset: usize,
+}
+
+fn render_lane_error(error: super::render_operations::RenderLaneError) -> HttpError {
+    use super::render_operations::RenderLaneError;
+    match error {
+        RenderLaneError::UnknownOperation => HttpError::new(
+            StatusCode::NOT_FOUND,
+            "render_operation_not_found",
+            "render operation not found",
+        ),
+        RenderLaneError::WrongProducer => HttpError::new(
+            StatusCode::FORBIDDEN,
+            "render_operation_forbidden",
+            "render operation is not authorized for this producer",
+        ),
+        RenderLaneError::Settled => HttpError::new(
+            StatusCode::CONFLICT,
+            "render_operation_settled",
+            "render operation is no longer pending",
+        ),
+        RenderLaneError::Conflict(message) => {
+            HttpError::new(StatusCode::CONFLICT, "render_operation_conflict", message)
+        }
+        RenderLaneError::Invalid(message) => {
+            HttpError::unprocessable("invalid_render_operation", message)
+        }
+    }
+}
+
+/// One bounded page of a pending operation's persisted plan. Authority is
+/// rechecked on every page, so a revoked grant stops paging mid-plan.
+async fn render_operation_plan_page(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(operation_id): Path<String>,
+    Query(query): Query<RenderPlanPageQuery>,
+) -> Result<Json<bbox_project_render::transport::ProjectRenderPlanChunkV1>, HttpError> {
+    let chunk = tokio::task::spawn_blocking(move || {
+        state.render_operations.plan_page(
+            &grant.producer_id,
+            &operation_id,
+            query.offset,
+            &grant.projects,
+        )
+    })
+    .await
+    .map_err(|_| HttpError::storage(anyhow!("blocking task failed")))?
+    .map_err(render_lane_error)?;
+    Ok(Json(chunk))
+}
+
+/// The owner's terminal result for one operation: an exact receipt, which
+/// must validate against the persisted plan, or a failure that wrote
+/// nothing. A duplicate identical result is `already_settled`.
+async fn settle_render_operation(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(operation_id): Path<String>,
+    Json(request): Json<bbox_project_render::wire::RenderOperationResultRequestV1>,
+) -> Result<Json<bbox_project_render::wire::RenderOperationResultResponseV1>, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::unprocessable("invalid_render_result", error.to_string()))?;
+    if request.operation_id != operation_id {
+        return Err(HttpError::unprocessable(
+            "invalid_render_result",
+            "result names a different operation than its route",
+        ));
+    }
+    let status = tokio::task::spawn_blocking(move || {
+        let result = match (request.receipt, request.error) {
+            (Some(receipt), None) => Ok(receipt),
+            (None, Some(error)) => Err(error),
+            _ => unreachable!("render result payload was validated"),
+        };
+        state.render_operations.settle(
+            &grant.producer_id,
+            &request.operation_id,
+            &request.plan_sha256,
+            &grant.projects,
+            result,
+        )
+    })
+    .await
+    .map_err(|_| HttpError::storage(anyhow!("blocking task failed")))?
+    .map_err(render_lane_error)?;
+    Ok(Json(
+        bbox_project_render::wire::RenderOperationResultResponseV1 {
+            status: status.as_str().to_string(),
+        },
+    ))
 }
 
 /// Terminal outcome for one delivered mutation. The ack's scope must sit
@@ -7661,6 +7794,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn render_lane_routes_page_and_settle_only_for_the_owning_producer() {
+        use bbox_project_render::transport::{
+            ExpectedRenderAuthority, PROJECT_RENDER_TRANSPORT_VERSION,
+            ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1, ProjectRenderPlanV1,
+            ProjectRenderProducerAuthorityV1, ProjectRenderViewV1,
+        };
+        use bbox_project_render::wire::{
+            RENDER_LANE_SCHEMA_VERSION, RenderLanePollRequestV1, RenderLanePollResponseV1,
+            RenderOperationResultRequestV1, RenderOperationResultResponseV1,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, first_token, second_token) = two_producer_http_state(&root);
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let runtime = &state.render_operations;
+        let (operation_id, sequence, _) = runtime.reserve("project-a").unwrap();
+        let plan = ProjectRenderPlanV1 {
+            version: PROJECT_RENDER_TRANSPORT_VERSION,
+            project_id: "project-a".into(),
+            scope: scope.clone(),
+            workspace_id: String::new(),
+            producer: Some(ProjectRenderProducerAuthorityV1 {
+                producer_id: "producer-a".into(),
+                operation_id: operation_id.clone(),
+                sequence,
+                issued_at_ms: 1_000,
+            }),
+            provider: Some("claude".into()),
+            dry_run: false,
+            view: ProjectRenderViewV1::Published,
+            requested_scope: "project".into(),
+            entries: Vec::new(),
+            diagnostics: None,
+        };
+        runtime
+            .create(
+                super::super::render_operations::NewRenderOperation {
+                    producer_id: "producer-a",
+                    project_id: "project-a",
+                    scope: &scope,
+                    provider: Some("claude".into()),
+                    dry_run: false,
+                    view: ProjectRenderViewV1::Published,
+                    requested_scope: "project".into(),
+                },
+                &plan,
+            )
+            .unwrap();
+        let app = router(state.clone()).with_state(state.clone());
+        let poll = |covered: Vec<PublishedScope>| RenderLanePollRequestV1 {
+            schema_version: RENDER_LANE_SCHEMA_VERSION,
+            render_transport_versions: vec![PROJECT_RENDER_TRANSPORT_VERSION],
+            covered_scopes: covered,
+            collector_version: "0.0.1".into(),
+        };
+        let send = |method: &'static str, uri: String, token: String, body: Vec<u8>| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(authenticated_request(method, uri, &token, Body::from(body)))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (
+                    status,
+                    to_bytes(response.into_body(), 256 * 1024).await.unwrap(),
+                )
+            }
+        };
+        let poll_uri = "/internal/code-source/v1/render-operations/poll".to_string();
+        let plan_uri = |offset: usize| {
+            format!(
+                "/internal/code-source/v1/render-operations/{operation_id}/plan?offset={offset}"
+            )
+        };
+        let result_uri =
+            format!("/internal/code-source/v1/render-operations/{operation_id}/result");
+
+        let (status, body) = send(
+            "POST",
+            poll_uri.clone(),
+            second_token.clone(),
+            serde_json::to_vec(&poll(vec![scope.clone()])).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: RenderLanePollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(page.operations.is_empty());
+        let (status, _) = send("GET", plan_uri(0), second_token.clone(), Vec::new()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = send(
+            "POST",
+            poll_uri.clone(),
+            first_token.clone(),
+            serde_json::to_vec(&poll(vec![scope.clone()])).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: RenderLanePollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.operations.len(), 1);
+        let delivery = page.operations[0].clone();
+
+        let mut assembler = ProjectRenderPlanAssemblerV1::default();
+        let mut offset = 0;
+        let assembled = loop {
+            let (status, body) =
+                send("GET", plan_uri(offset), first_token.clone(), Vec::new()).await;
+            assert_eq!(status, StatusCode::OK);
+            let chunk: ProjectRenderPlanChunkV1 = serde_json::from_slice(&body).unwrap();
+            let next = chunk.next_offset;
+            if let Some(assembled) = assembler.push(chunk).unwrap() {
+                break assembled;
+            }
+            offset = next.unwrap();
+        };
+        assert_eq!(assembled.plan_sha256, delivery.plan_sha256);
+        let checkout = root.join("owner-checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let receipt = bbox_project_render::execute::execute_project_render_plan_as(
+            &assembled.plan,
+            &checkout,
+            &scope,
+            ExpectedRenderAuthority::Producer {
+                operation_id: &operation_id,
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+        .receipt;
+        let result = RenderOperationResultRequestV1 {
+            schema_version: RENDER_LANE_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            plan_sha256: delivery.plan_sha256.clone(),
+            outcome: "applied".into(),
+            receipt: Some(receipt),
+            error: None,
+        };
+        let (status, _) = send(
+            "POST",
+            result_uri.clone(),
+            second_token.clone(),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        for expected in ["accepted", "already_settled"] {
+            let (status, body) = send(
+                "POST",
+                result_uri.clone(),
+                first_token.clone(),
+                serde_json::to_vec(&result).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let settled: RenderOperationResultResponseV1 = serde_json::from_slice(&body).unwrap();
+            assert_eq!(settled.status, expected);
+        }
+        let (status, _) = send("GET", plan_uri(0), first_token.clone(), Vec::new()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = send(
+            "POST",
+            "/internal/code-source/v1/render-operations/ro-00000000000000000000000000000000/result"
+                .into(),
+            first_token.clone(),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the route names the operation"
+        );
     }
 
     #[test]
