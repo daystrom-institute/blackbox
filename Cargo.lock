@@ -2467,6 +2467,7 @@ name = "fleetd"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-util",
  "bro-core",
  "bro-protocol",
  "bro-rpc",
