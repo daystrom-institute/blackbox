@@ -364,6 +364,9 @@ GET  /internal/code-source/v1/git-history/generations/{generation}/status
 States: `receiving_manifest`, `missing_records`, `ready`, `materializing`, `publishing`, `active`, `superseded`, `failed`.
 Probe carries scope and observed HEAD. It returns current only for same verified HEAD and schema.
 Manifest pages are bounded, contiguous, digest-bound, and replay-safe. Record install streams and hashes. Finalize reconstructs and validates the graph before `ready`.
+Begin resumes the open upload for an identical descriptor and reports its persisted `state`; a response without `state` decodes as `receiving_manifest`. In `receiving_manifest` the producer replays every page from zero so stored page digests prove identical page boundaries; in `missing_records` it skips manifest PUTs and calls the idempotent complete. Begin state is an observation, not a lease: a typed `invalid_upload_state` from a concurrent same-descriptor client triggers a bounded re-probe and re-begin, and exhaustion falls back to lane backoff. Content conflicts, authority failures, and malformed data are never retried as state moves.
+Finalize is idempotent per generation id. An existing generation with the same identity, descriptor, and exact manifest is reused with its original creation time and lifecycle state; any mismatch fails closed. Each newly accepted upload attempt receives a durable per-repository acceptance sequence, checkpointed in its upload record before `current-ready.json` moves and carried in that pointer with the upload id. The pointer advances only to a newer sequence; an equal sequence must name the same upload and source. Only the winning acceptance reopens a `superseded` or `failed` source to `ready` and clears its diagnostic, durably before the pointer names it, so an interrupted acceptance never leaves a probe-current source that cannot activate; in-flight and `active` sources keep their state. Replaying a completed upload is a no-op, and an older checkpoint may finish its upload without rewinding a newer pointer, while a fresh upload of a retained generation is a new acceptance.
+Additive fields keep old and new components decodable in both directions, but state-aware resume and ordered acceptance need the upgraded daemon and collector together: an older collector ignores `state`, and an older daemon omits it.
 
 ### 6.4 Verified source handoff
 ```text
@@ -447,6 +450,8 @@ git-sources/
   records/sha256/<first-two>/<hash>
   uploads/<producer-hash>/<upload-id>/...
   repos/<repo-history-id>/history/<source-generation-id>/...
+  repos/<repo-history-id>/history/current-ready.json
+  repos/<repo-history-id>/history/acceptance-sequence.json
   provenance-imports/generations/<import-generation-id>/...
   provenance-imports/generation-index/<import-generation-id>.json
   provenance-imports/projects/<project-id>/current-ready.json
@@ -461,6 +466,7 @@ The root is sibling to lexical index and P3 history generations, so schema repla
 History roots: open uploads, ready/in-flight/active/retained source generations, activation journals, and source evidence referenced by retained P3 generations.
 Provenance roots: open imports, the acceptance-sequenced current pointer and configured retained note generations, unfinished journals, latest receipt, the last-good Active generation, and failed/quarantined generations pending acknowledged retirement.
 P3 GC remains sole authority for `RepoHistoryGeneration` and vectors.
+History acceptance format: upload records and the history ready pointer carry optional acceptance fields, and `acceptance-sequence.json` holds the next per-repository sequence. Records written before ordered acceptance decode as legacy state. A legacy pointer is a baseline below every new acceptance; a completed legacy upload stays a no-op and never gains an acceptance; an unfinished legacy upload receives its first acceptance at its first verified finalize. Allocation takes the maximum of the durable counter, the pointer's sequence, and retained upload checkpoints, so a missing or lagging counter is recovered rather than reset, and a restart between counter and checkpoint leaves only an unused gap. Malformed acceptance fields fail closed. The upgrade is forward-only: a daemon without ordered acceptance cannot decode records that carry these fields.
 
 ## 7. Runtime, transaction, lock, and recovery mechanics
 ### 7.1 Producer schedule

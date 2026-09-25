@@ -1435,6 +1435,10 @@ mod tests {
         assert_eq!(begun.status(), StatusCode::CREATED);
         let begun: BeginGitHistoryUploadResponseV1 =
             serde_json::from_slice(&to_bytes(begun.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            begun.state,
+            bbox_git_source::GitHistorySourceStateV1::ReceivingManifest
+        );
 
         let manifest_response = app
             .clone()
@@ -1470,6 +1474,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed.status(), StatusCode::OK);
+
+        // A resumed begin reports the persisted state, so the producer skips
+        // the now-immutable manifest instead of replaying page 0.
+        let resumed = history_route(
+            &app,
+            request(
+                "POST",
+                "/internal/code-source/v1/git-history/uploads",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginGitHistoryUploadRequestV1 {
+                        descriptor: descriptor.clone(),
+                    })
+                    .unwrap(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(resumed.0, StatusCode::CREATED);
+        let resumed: BeginGitHistoryUploadResponseV1 = serde_json::from_slice(&resumed.1).unwrap();
+        assert_eq!(resumed.upload_id, begun.upload_id);
+        assert_eq!(
+            resumed.state,
+            bbox_git_source::GitHistorySourceStateV1::MissingRecords
+        );
+        let replayed_page = history_route(
+            &app,
+            request(
+                "PUT",
+                &format!(
+                    "/internal/code-source/v1/git-history/uploads/{}/manifest/0",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&GitHistoryManifestPageV1 {
+                        entries: manifest.clone(),
+                    })
+                    .unwrap(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(replayed_page.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&replayed_page.1).contains("invalid_upload_state"));
 
         let record = Request::builder()
             .method("PUT")
@@ -1522,14 +1571,15 @@ mod tests {
         );
 
         let probe = app
+            .clone()
             .oneshot(request(
                 "POST",
                 "/internal/code-source/v1/git-history/probe",
                 Some(&token),
                 Body::from(
                     serde_json::to_vec(&GitHistoryProbeRequestV1 {
-                        scope,
-                        repo_head: commit,
+                        scope: scope.clone(),
+                        repo_head: commit.clone(),
                         object_format: GitObjectFormatV1::Sha1,
                     })
                     .unwrap(),
@@ -1544,6 +1594,108 @@ mod tests {
             probe.current.unwrap().source_generation_id,
             finalized.source_generation_id
         );
+
+        // HEAD returns to this generation after activation retired it: a
+        // fresh upload re-derives the same id, finalizes idempotently, and
+        // reopens the retained source instead of failing its immutable
+        // comparison.
+        state
+            .git_sources
+            .store()
+            .set_history_source_state(
+                "git-http-producer",
+                &finalized.source_generation_id,
+                bbox_git_source::GitHistorySourceStateV1::Superseded,
+                Some("superseded by activated source".into()),
+            )
+            .unwrap();
+        let again = history_route(
+            &app,
+            request(
+                "POST",
+                "/internal/code-source/v1/git-history/uploads",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginGitHistoryUploadRequestV1 { descriptor }).unwrap(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(again.0, StatusCode::CREATED);
+        let again: BeginGitHistoryUploadResponseV1 = serde_json::from_slice(&again.1).unwrap();
+        assert_ne!(again.upload_id, begun.upload_id);
+        assert_eq!(
+            again.state,
+            bbox_git_source::GitHistorySourceStateV1::ReceivingManifest
+        );
+        for (method, path, body) in [
+            (
+                "PUT",
+                "manifest/0",
+                Body::from(
+                    serde_json::to_vec(&GitHistoryManifestPageV1 { entries: manifest }).unwrap(),
+                ),
+            ),
+            ("POST", "manifest/complete", Body::empty()),
+        ] {
+            let response = history_route(
+                &app,
+                request(
+                    method,
+                    &format!(
+                        "/internal/code-source/v1/git-history/uploads/{}/{path}",
+                        again.upload_id
+                    ),
+                    Some(&token),
+                    body,
+                ),
+            )
+            .await;
+            assert!(response.0.is_success(), "{path}: {:?}", response);
+        }
+        let refinalized = history_route(
+            &app,
+            request(
+                "POST",
+                &format!(
+                    "/internal/code-source/v1/git-history/uploads/{}/finalize",
+                    again.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(refinalized.0, StatusCode::ACCEPTED, "{:?}", refinalized);
+        let refinalized: bbox_git_source::FinalizeGitHistoryUploadResponseV1 =
+            serde_json::from_slice(&refinalized.1).unwrap();
+        assert_eq!(
+            refinalized.source_generation_id,
+            finalized.source_generation_id
+        );
+        let status = history_route(
+            &app,
+            request("GET", &refinalized.status_url, Some(&token), Body::empty()),
+        )
+        .await;
+        let status: GitHistorySourceStatusV1 = serde_json::from_slice(&status.1).unwrap();
+        assert_eq!(
+            status.state,
+            bbox_git_source::GitHistorySourceStateV1::Ready
+        );
+        assert_eq!(status.diagnostic, None);
+    }
+
+    async fn history_route(
+        app: &Router<()>,
+        request: Request<Body>,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
+        )
     }
 
     #[tokio::test]
