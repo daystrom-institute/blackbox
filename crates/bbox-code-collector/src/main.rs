@@ -6429,7 +6429,7 @@ mod tests {
             &captured.gap_entries,
             &captured.graph_entries,
             &captured.evidence_entries,
-            None,
+            captured.config_entries.as_deref(),
             KnowledgeSourceLimits::default(),
         )
         .unwrap();
