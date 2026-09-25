@@ -45,7 +45,7 @@ impl Tool for RustExtractTrait {
     }
 
     fn description(&self) -> &str {
-        "Extract selected Rust inherent impl methods into a trait and trait impl. Reports object-safety analysis, call-site warnings, and files that require the trait in scope. NEVER writes: returns {changes, creates, findings} for edits.merge/createFile."
+        "Extract selected Rust inherent impl methods into a trait and trait impl. Reports object-safety analysis, call-site warnings, and files that require the trait in scope. NEVER writes: returns {changes, creates, findings} for edits.merge/createFiles."
     }
 
     fn input_schema(&self) -> Value {

@@ -143,7 +143,7 @@ PARAMS
 
 RETURNS { changes, creates, findings, leftovers, counts, provenance }
   changes[]:  SpanChange for edits.merge (source deletions + target insertions).
-  creates[]:  { path, content } for edits.createFile (only when the target file
+  creates[]:  { path, content } for edits.createFiles (only when the target file
               is new/empty; otherwise the target edits are inline).
   findings[]: always [] (reserved for future findings).
   leftovers[]: string descriptions of methods NOT moved.
@@ -151,7 +151,7 @@ RETURNS { changes, creates, findings, leftovers, counts, provenance }
   provenance: "syntax_only"
 
 NEVER WRITES. Feed `changes` into `edits.merge` and `creates` into
-`edits.createFile`, then `edits.apply`. The transform is NOT idempotent over its
+`edits.createFiles`, then `edits.apply`. The transform is NOT idempotent over its
 own output: target-exists refusal during the next extract is the DONE signal.
 "#;
 
@@ -238,14 +238,14 @@ PARAMS
 RETURNS { title, changes, creates, findings, preview_only, mode,
            would_change_files, would_create_files, provenance }
   changes[]:   { span, new_text } for edits.merge (source-side edits)
-  creates[]:   { path, content } for edits.createFile (new target file)
+  creates[]:   { path, content } for edits.createFiles (new target file)
   findings[]:  always-on dependency analysis (local_dependency_closure when
                withLocalDeps, external_references, suggested_clusters) +
                planner notes + moved_item entries
   mode:        "compound" | "with_local_deps" | "section"
 
 NEVER WRITES. Feed `changes` into edits.merge and `creates` into
-edits.createFile, then edits.apply. NOT idempotent over its own output: a
+edits.createFiles, then edits.apply. NOT idempotent over its own output: a
 re-call after a successful apply hits the target-exists refusal - that is
 the DONE signal, not a retry. store() the result if you need it in later
 cells.
@@ -254,9 +254,9 @@ IDIOM
   const r = await rust.extractItems({ source: "src/big.rs",
     target: "src/big/helpers.rs", itemNames: ["Helper", "build"] });
   const es = await edits.begin();
-  await edits.merge({ es, changes: r.changes });
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
-  await edits.apply({ es });
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
+  if (r.changes.length || r.creates.length) await edits.apply({ es });
   // re-run cargo check to verify; rust.fixRound handles follow-up diagnostics.
 "#;
 
@@ -287,7 +287,7 @@ RETURNS { title, changes, creates, findings, preview_only, target,
            would_change_files, would_create_files, provenance }
   target: the resolved target path (useful when auto-derived).
 
-NEVER WRITES. Feed changes -> edits.merge, creates -> edits.createFile.
+NEVER WRITES. Feed changes -> edits.merge, creates -> edits.createFiles.
 NOT idempotent: re-call after apply hits the target-exists refusal (DONE).
 "#;
 
@@ -373,7 +373,7 @@ RETURNS
     would_create_files, provenance:"syntax_only" }
   findings[] includes one `note` entry per preserved/unresolvable wildcard.
 
-NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFile,
+NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFiles,
 then edits.apply. NOT idempotent over its own output: if a re-call reports no
 wildcard imports, the work is DONE (verify with code.items on the source).
 "#;
@@ -413,7 +413,7 @@ RETURNS
   findings[] includes remaining_source_accessors and inherited_generics
   when the planner reports them.
 
-NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFile,
+NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFiles,
 then edits.apply. Follow with rust.updateCallers to rewrite self.field accesses
 through a delegate field.
 "#;
@@ -541,9 +541,9 @@ RECIPE
     itemNames: ["get", "set"]
   });
   const es = await edits.begin();
-  await edits.merge({ es, changes: r.changes });
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
-  await edits.apply({ es });
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
+  if (r.changes.length || r.creates.length) await edits.apply({ es });
 
 NOTES
   NEVER writes. Run a compiler gate after apply. If a selected method calls a
@@ -578,9 +578,9 @@ RECIPE
     itemNames: ["normalize", "parse"]
   });
   const es = await edits.begin();
-  await edits.merge({ es, changes: r.changes });
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
-  await edits.apply({ es });
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
+  if (r.changes.length || r.creates.length) await edits.apply({ es });
 
 LIMITATIONS
   The v1 engine does not rewrite call sites. Run a compiler gate and repair
@@ -682,7 +682,7 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use` decl. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file. moduleWiring - one conservative module-graph edit. setVisibility - rewrite visibility of items, impl methods, or struct fields. extractImplMethods - move named Rust impl methods into another file. organizeImports - minimize wildcard imports. moveStructFields - move named fields between structs with dispatch-side repr authority. updateCallers - conservatively rewrite accesses through a delegate. extractTrait - extract inherent methods into a trait with object-safety and trait-scope reports. liftToFree - lift state-independent inherent methods to free functions with per-method refusal findings. rewriteModuleCallers - rewrite caller prefixes after a module move."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFiles and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use` decl. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file. moduleWiring - one conservative module-graph edit. setVisibility - rewrite visibility of items, impl methods, or struct fields. extractImplMethods - move named Rust impl methods into another file. organizeImports - minimize wildcard imports. moveStructFields - move named fields between structs with dispatch-side repr authority. updateCallers - conservatively rewrite accesses through a delegate. extractTrait - extract inherent methods into a trait with object-safety and trait-scope reports. liftToFree - lift state-independent inherent methods to free functions with per-method refusal findings. rewriteModuleCallers - rewrite caller prefixes after a module move."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
@@ -710,19 +710,19 @@ declare const rust: {
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Classify rustc/clippy build.gate diagnostics into edit proposals + leftovers. Verbatim MachineApplicable suggestions become compiler_suggested changes; add-use/visibility-bump proposals are syntax_only; borrow-checker/trait-bound errors are leftovers. NEVER writes: feed {changes} into edits.merge. */
   fixRound(args: { diagnostics: Record<string, unknown>[]; raw_json?: string; restrict_to_files?: string[]; restrictToFiles?: string[] }): Promise<RustFixRoundResult>;
-  /** Move top-level Rust items into a (new) submodule. Compound mode (default): scaffolded target + `mod <name>;` + visibility bumps + auto-pruned use decl. Knobs select synthesis shape; dependency analysis runs always. Feed {changes, creates} into edits.merge/createFile. NOT idempotent: target-exists refusal after apply is the DONE signal. */
+  /** Move top-level Rust items into a (new) submodule. Compound mode (default): scaffolded target + `mod <name>;` + visibility bumps + auto-pruned use decl. Knobs select synthesis shape; dependency analysis runs always. Feed {changes, creates} into edits.merge/createFiles. NOT idempotent: target-exists refusal after apply is the DONE signal. */
   extractItems(args: { source: string; target: string; itemNames: string[]; itemKinds?: string[]; moduleName?: string; visibility?: string; targetPrelude?: string; withLocalDeps?: boolean; section?: RustSectionBounds; mergeIntoExistingTarget?: boolean; useDeclVisibility?: string; useDeclItems?: string[]; previewOnly?: boolean }): Promise<RustExtractItemsResult>;
-  /** Inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. Target auto-derived (parent.rs -> parent/<name>.rs; lib.rs/main.rs/mod.rs -> flat sibling). Refuses non-empty targets. Feed {changes, creates} into edits.merge/createFile. */
+  /** Inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. Target auto-derived (parent.rs -> parent/<name>.rs; lib.rs/main.rs/mod.rs -> flat sibling). Refuses non-empty targets. Feed {changes, creates} into edits.merge/createFiles. */
   inlineModToFile(args: { source: string; moduleName: string; target?: string; previewOnly?: boolean }): Promise<RustInlineModToFileResult>;
   /** One conservative Rust module-graph edit: add_mod, remove_mod, add_use, or remove_use. Idempotent (rejects duplicates and missing targets). Feed {changes} into edits.merge. */
   moduleWiring(args: { source: string; action: "add_mod" | "remove_mod" | "add_use" | "remove_use"; moduleName?: string; usePath?: string; visibility?: string }): Promise<RustModuleWiringResult>;
   /** Rewrite visibility of top-level items, impl methods, or struct fields. Preserves async/unsafe/const qualifiers (only the visibility prefix is rewritten). targetKind: item (default), method, or field. implName disambiguates methods. Feed {changes} into edits.merge. */
   setVisibility(args: { source: string; visibility: string; itemNames: string[]; targetKind?: "item" | "method" | "field"; implName?: string }): Promise<RustSetVisibilityResult>;
-  /** Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. */
+  /** Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFiles. */
   extractImplMethods(args: { source: string; target: string; item_names: string[]; impl_name?: string; visibility?: string; target_prelude?: string }): Promise<RustExtractImplMethodsResult>;
   /** Minimize Rust wildcard imports (mode="minimize", default): rewrite resolvable `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names. mode="organize" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2). NEVER writes: feed {changes} into edits.merge. */
   organizeImports(args: { source: string; mode?: "minimize" | "organize"; allow_wildcards?: string[]; remove_unused_wildcards?: boolean }): Promise<RustOrganizeImportsResult>;
-  /** Move named fields from one struct to another (RX-S1). The acknowledge_repr operator opt-out (required for non-default #[repr] structs) arrives dispatch-side via ToolArgDefaults lookup, never as cell input. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. Follow with rust.updateCallers. */
+  /** Move named fields from one struct to another (RX-S1). The acknowledge_repr operator opt-out (required for non-default #[repr] structs) arrives dispatch-side via ToolArgDefaults lookup, never as cell input. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFiles. Follow with rust.updateCallers. */
   moveStructFields(args: { source: string; target: string; structName: string; itemNames: string[]; visibility?: string }): Promise<RustMoveStructFieldsResult>;
   /** Rewrite an error type in named function signatures and mapped construction sites. Public-API acknowledgement arrives only dispatch-side through ToolArgDefaults. NEVER writes: feed {changes} into edits.merge. */
   migrateErrorType(args: { source: string; oldText: string; newText: string; itemNames: string[]; errorMapping?: Record<string, string> }): Promise<RustMigrationResult>;
@@ -730,9 +730,9 @@ declare const rust: {
   migrateTypeUsages(args: { source: string; moduleName: string; replacementKind: "bareConcrete" | "boxDyn" | "arcDyn" | "rcDyn" | "implTrait" | "genericParamTBoundedTrait"; newText: string }): Promise<RustMigrationResult>;
   /** Rewrite callers through a delegate field (RX-S2b). Companion to moveStructFields: conservatively rewrites self.field and self.method(args) to go through a delegate field. Unrewriteable accessors surface in findings. NEVER writes: feed {changes} into edits.merge. */
   updateCallers(args: { source: string; structName?: string; delegateField: string; target?: string; delegateType?: string; itemNames: string[] }): Promise<RustUpdateCallersResult>;
-  /** Extract selected inherent impl methods into a trait and trait impl. Reports object safety, call-site warnings, and files that require the trait in scope. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
+  /** Extract selected inherent impl methods into a trait and trait impl. Reports object safety, call-site warnings, and files that require the trait in scope. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFiles. */
   extractTrait(args: { source: string; target: string; implName: string; traitName: string; itemNames: string[] }): Promise<RustExtractTraitResult>;
-  /** Lift selected inherent methods that do not depend on instance state into free functions. Explicit lifetimes are preserved; mixed selections report per-method refusals. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
+  /** Lift selected inherent methods that do not depend on instance state into free functions. Explicit lifetimes are preserved; mixed selections report per-method refusals. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFiles. */
   liftToFree(args: { source: string; target: string; itemNames: string[] }): Promise<RustLiftToFreeResult>;
   /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
   rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name: string; target_prelude: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;

@@ -66,7 +66,7 @@ impl Tool for RustMoveStructFields {
         "rust.moveStructFields"
     }
     fn description(&self) -> &str {
-        "Move named fields from one struct to another (RX-S1). Thin adapter over the v1 move_rust_struct_fields planner. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFile. The acknowledge_repr operator opt-out (required when the source struct has a non-default #[repr]) arrives dispatch-side via ToolArgDefaults, never as cell input."
+        "Move named fields from one struct to another (RX-S1). Thin adapter over the v1 move_rust_struct_fields planner. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFiles. The acknowledge_repr operator opt-out (required when the source struct has a non-default #[repr]) arrives dispatch-side via ToolArgDefaults, never as cell input."
     }
     fn input_schema(&self) -> Value {
         json!({

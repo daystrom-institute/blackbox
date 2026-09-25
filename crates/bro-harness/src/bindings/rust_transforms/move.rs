@@ -223,7 +223,7 @@ impl Tool for RustExtractItems {
         "rust.extractItems"
     }
     fn description(&self) -> &str {
-        "Move top-level Rust items into a (new) submodule. Compound mode (default): scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import. Knobs: withLocalDeps (move exclusive private dependency closure), section (marker/line bounds), mergeIntoExistingTarget, useDeclVisibility, useDeclItems. Dependency analysis runs always and reports in findings. NEVER writes: feed {changes, creates} into edits.merge/createFile."
+        "Move top-level Rust items into a (new) submodule. Compound mode (default): scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import. Knobs: withLocalDeps (move exclusive private dependency closure), section (marker/line bounds), mergeIntoExistingTarget, useDeclVisibility, useDeclItems. Dependency analysis runs always and reports in findings. NEVER writes: feed {changes, creates} into edits.merge/createFiles."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -496,7 +496,7 @@ impl Tool for RustInlineModToFile {
         "rust.inlineModToFile"
     }
     fn description(&self) -> &str {
-        "Inline the body of an inline `mod foo { ... }` into a sibling submodule file and replace the block with `mod foo;`. Outer attributes like #[cfg(test)] stay attached. Target auto-derived (parent.rs -> parent/<name>.rs; lib.rs/main.rs/mod.rs -> flat sibling). Refuses non-empty targets. NEVER writes: feed {changes, creates} into edits.merge/createFile."
+        "Inline the body of an inline `mod foo { ... }` into a sibling submodule file and replace the block with `mod foo;`. Outer attributes like #[cfg(test)] stay attached. Target auto-derived (parent.rs -> parent/<name>.rs; lib.rs/main.rs/mod.rs -> flat sibling). Refuses non-empty targets. NEVER writes: feed {changes, creates} into edits.merge/createFiles."
     }
     fn input_schema(&self) -> Value {
         json!({

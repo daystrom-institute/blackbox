@@ -172,7 +172,7 @@ impl Tool for RustMigrateErrorType {
     }
 
     fn description(&self) -> &str {
-        "Rewrite an error type in named Rust function signatures and mapped construction sites. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFile. The public API acknowledgement arrives only through dispatch-side ToolArgDefaults."
+        "Rewrite an error type in named Rust function signatures and mapped construction sites. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFiles. The public API acknowledgement arrives only through dispatch-side ToolArgDefaults."
     }
 
     fn input_schema(&self) -> Value {
@@ -294,7 +294,7 @@ impl Tool for RustMigrateTypeUsages {
     }
 
     fn description(&self) -> &str {
-        "Migrate supported Rust type usage positions to a new concrete or trait-based replacement. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFile. The public API acknowledgement arrives only through dispatch-side ToolArgDefaults."
+        "Migrate supported Rust type usage positions to a new concrete or trait-based replacement. NEVER writes: returns {changes, creates, findings, operator_opt_outs_used} for edits.merge/createFiles. The public API acknowledgement arrives only through dispatch-side ToolArgDefaults."
     }
 
     fn input_schema(&self) -> Value {
