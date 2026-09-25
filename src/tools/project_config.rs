@@ -274,6 +274,22 @@ impl SharedState {
             .map(|accepted| ProjectConfigContext::Accepted(accepted.snapshot))
     }
 
+    /// The accepted configuration an exact project-scope action reads or
+    /// edits. Unlike [`Self::project_config_context`], a selector that names
+    /// no catalog project is refused: exact project scope never degrades to
+    /// global configuration.
+    pub(crate) fn select_project_config_scope(
+        &self,
+        selector: &str,
+    ) -> Result<AcceptedProjectConfig, ProjectConfigError> {
+        let project_id = self
+            .catalog_project_for_selector(selector.trim())?
+            .ok_or_else(|| ProjectConfigError::ProjectUnknown {
+                selector: selector.to_string(),
+            })?;
+        self.load_accepted_project_config(&project_id)
+    }
+
     /// Dispatch-time brofile resolution: project first, then global only
     /// when the project view proves the override absent.
     pub(crate) fn resolve_config_brofile(

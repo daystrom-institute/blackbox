@@ -152,18 +152,40 @@ Summary pages do not hide full advisor charters, context, or brofile lenses in
 structured content. Malformed stored records report errors instead of disappearing.
 
 `scope` applies only to template actions and accepts `global` (default) or
-`project`. Project template discovery requires an explicit absolute owner-host
-`project_dir` in legacy bridge mode. Catalog mode refuses reads and writes of legacy
-`.bro/teamplates` because it has no remote source lane. Inspect or edit those
-files with the owning checkout's file tools, or use daemon-owned templates with
-`scope="global"` without `project_dir`. No discovery path falls back to the
-daemon's current directory.
+`project`. Each scope reads exactly one store; project discovery never includes
+global templates. Project template actions require `project_dir`. In legacy
+bridge mode it is an explicit absolute owner-host directory whose
+`.bro/teamplates` the daemon reads and writes. No discovery path falls back to
+the daemon's current directory.
 
-In catalog mode, `create` resolves templates and brofiles only from the
-daemon-owned global catalogs. `project_dir` remains the worker/team association;
-it does not select project template or brofile overrides on the daemon. A
-missing global dependency refuses before a team is instantiated. Successful
-creation returns `memberCount`, `templateScope="global"`, and roster/get hints
+In catalog mode `project_dir` selects a catalog project (id, alias, or attached
+checkout path) and never grants the daemon filesystem access. Project
+`list_templates` and `get_template` read only the project's accepted
+publication and report its generation and commit under `source`. Project
+`save_template` and `delete_template` queue a guarded edit of
+`.bro/teamplates/<name>.json` for the project's checkout owner and return
+`state="queued"` with a `mutation` receipt: mutation id, landing path, the
+exact-byte precondition, the predecessor it chains on, the accepted generation,
+and the next step. Consecutive edits before publication chain on the queued
+ones. An edit takes effect for reads, member validation, and `create` only
+after the owner commits and publishes it. A project without an accepted
+publication, a publication without the configuration lane, invalid accepted
+configuration, or a selector that names no catalog project refuse by name
+(`error.project_config_publication_unavailable`,
+`error.project_config_lane_unsupported`, `error.project_config_invalid`,
+`error.project_config_project_unknown`) and never fall back to global
+templates.
+
+In catalog mode, `create` resolves the template and its member brofiles from
+the selected project's accepted configuration first, then from the
+daemon-owned global catalogs only when the accepted view proves the name
+absent. `project_dir` also remains the worker/team association, and roster
+construction and member dispatch resolve brofiles the same way. Template
+member validation in `save_template` uses the same resolution, so a brofile
+that is only queued does not count until it is published. A missing dependency
+refuses before a team is instantiated. Successful
+creation returns `memberCount`, `templateScope` (`project` or `global`), the
+attributed `templateSource` when a project was selected, and roster/get hints
 instead of repeating every member. Creation starts no advisor tasks. Existing
 advisor settings and history remain readable; summaries mark them
 `execution="retired"`, and creation receipts carry `advisorExecution="retired"`

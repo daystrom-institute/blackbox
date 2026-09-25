@@ -755,11 +755,14 @@ pub(crate) struct TeamParams {
     pub(crate) members: Option<Vec<TeamMemberSlot>>,
     #[serde(default)]
     pub(crate) template: Option<String>,
-    /// Create's worker/project association; catalog-mode create resolves only
-    /// daemon-owned global templates/brofiles. Exact stored association filter
-    /// for team list/get/roster. Template actions require scope=project and an explicit
-    /// absolute owner-host directory; catalog mode refuses project template
-    /// reads/writes because no owner transport exists.
+    /// Create's worker/project association: catalog-mode create resolves the
+    /// selected project's accepted templates/brofiles first, then global ones
+    /// only on proven absence. Exact stored association filter for team
+    /// list/get/roster. Project template actions (scope=project) require it:
+    /// in catalog mode it selects a catalog project (id, alias or attached
+    /// checkout path) whose accepted publication serves reads and whose
+    /// checkout owner receives queued edits; bridge mode takes an absolute
+    /// local project directory.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
     /// Template actions only: global (default) or project. Never filters live teams.
