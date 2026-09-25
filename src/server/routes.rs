@@ -1215,66 +1215,124 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             // Nudge channel: async tool handlers whose store mutations change
             // projected edges wake this thread instead of rebuilding inline.
             let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take();
-            // Eager startup already published a graph. Deferred startup did
-            // not: rebuild immediately in the background, and keep graph
-            // consumers fail-closed until this publication succeeds.
-            let mut pending_nudge = !state
-                .edge_index_ready
-                .load(std::sync::atomic::Ordering::Acquire);
-            if !pending_nudge {
-                std::thread::sleep(std::time::Duration::from_secs(20));
-            }
-            let edges_dir = edge_sidecar_dir(&state);
-            let mut cursor = EdgeIndexWatcherCursor::capture(&state, &edges_dir);
-            loop {
-                if !pending_nudge {
-                    pending_nudge = match &nudge_rx {
-                        Some(rx) => match rx.recv_timeout(interval) {
-                            Ok(()) => true,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-                            // All senders dropped — SharedState is gone; exit.
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                        },
-                        None => {
-                            std::thread::sleep(interval);
-                            false
-                        }
-                    };
-                }
-                let nudged = std::mem::take(&mut pending_nudge);
-                match run_edge_index_watcher_pass(
-                    &state,
-                    &edges_dir,
-                    &mut cursor,
-                    nudged,
-                    edge_index_nudge_max_current_edges(),
-                ) {
-                    EdgeIndexWatcherPass::PublicationBusy => {
-                        tracing::debug!(
-                            nudged,
-                            "edge-index watcher deferred while a reindex publication is active"
-                        );
-                        pending_nudge = nudged;
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    EdgeIndexWatcherPass::AuthorityUnavailable
-                    | EdgeIndexWatcherPass::RebuildFailed => {
-                        if !state
-                            .edge_index_ready
-                            .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            pending_nudge = true;
-                            std::thread::sleep(interval);
-                        }
-                    }
-                    EdgeIndexWatcherPass::Rebuilt
-                    | EdgeIndexWatcherPass::StoreRefreshDeferred
-                    | EdgeIndexWatcherPass::SearcherRefreshed
-                    | EdgeIndexWatcherPass::Unchanged => {}
-                }
-            }
+            run_edge_index_rebuild_watcher(&state, interval, nudge_rx, run_edge_index_watcher_pass);
         })
         .expect("failed to spawn edge index rebuild watcher");
+}
+
+/// Delay before retrying a rebuild while no complete graph is published:
+/// 1 second after the first consecutive failure, doubling per further
+/// failure, capped at the watcher interval.
+fn rebuild_retry_delay(
+    consecutive_failures: u32,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(31);
+    std::time::Duration::from_secs(1u64 << doublings).min(interval)
+}
+
+/// Consecutive failed watcher passes while no complete graph is published.
+#[derive(Debug, Default)]
+struct RebuildRetryBackoff {
+    consecutive_failures: u32,
+}
+
+impl RebuildRetryBackoff {
+    /// Records a pass outcome and returns how long to wait before retrying,
+    /// or `None` when the pass needs no retry. A publication or a raised
+    /// fence resets the count; failures only count while the fence is down,
+    /// since a failed rebuild behind a raised fence keeps the prior graph.
+    fn after_pass(
+        &mut self,
+        outcome: EdgeIndexWatcherPass,
+        ready: bool,
+        interval: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        if ready || outcome == EdgeIndexWatcherPass::Rebuilt {
+            self.consecutive_failures = 0;
+            return None;
+        }
+        match outcome {
+            EdgeIndexWatcherPass::AuthorityUnavailable | EdgeIndexWatcherPass::RebuildFailed => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                Some(rebuild_retry_delay(self.consecutive_failures, interval))
+            }
+            EdgeIndexWatcherPass::PublicationBusy
+            | EdgeIndexWatcherPass::Rebuilt
+            | EdgeIndexWatcherPass::StoreRefreshDeferred
+            | EdgeIndexWatcherPass::SearcherRefreshed
+            | EdgeIndexWatcherPass::Unchanged => None,
+        }
+    }
+}
+
+/// Watcher loop body. `pass` runs one watcher pass and releases the sidecar
+/// publication guard before it returns, so no retry sleep holds the guard.
+/// Returns when every nudge sender is gone.
+fn run_edge_index_rebuild_watcher(
+    state: &SharedState,
+    interval: std::time::Duration,
+    nudge_rx: Option<std::sync::mpsc::Receiver<()>>,
+    mut pass: impl FnMut(
+        &SharedState,
+        &std::path::Path,
+        &mut EdgeIndexWatcherCursor,
+        bool,
+        usize,
+    ) -> EdgeIndexWatcherPass,
+) {
+    // Eager startup already published a graph. Deferred startup did
+    // not: rebuild immediately in the background, and keep graph
+    // consumers fail-closed until this publication succeeds.
+    let mut pending_nudge = !state
+        .edge_index_ready
+        .load(std::sync::atomic::Ordering::Acquire);
+    if !pending_nudge {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+    }
+    let edges_dir = edge_sidecar_dir(state);
+    let mut cursor = EdgeIndexWatcherCursor::capture(state, &edges_dir);
+    let mut backoff = RebuildRetryBackoff::default();
+    loop {
+        if !pending_nudge {
+            pending_nudge = match &nudge_rx {
+                Some(rx) => match rx.recv_timeout(interval) {
+                    Ok(()) => true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    // All senders dropped — SharedState is gone; exit.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                },
+                None => {
+                    std::thread::sleep(interval);
+                    false
+                }
+            };
+        }
+        let nudged = std::mem::take(&mut pending_nudge);
+        let outcome = pass(
+            state,
+            &edges_dir,
+            &mut cursor,
+            nudged,
+            edge_index_nudge_max_current_edges(),
+        );
+        let ready = state
+            .edge_index_ready
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(delay) = backoff.after_pass(outcome, ready, interval) {
+            pending_nudge = true;
+            std::thread::sleep(delay);
+            continue;
+        }
+        if outcome == EdgeIndexWatcherPass::PublicationBusy {
+            tracing::debug!(
+                nudged,
+                "edge-index watcher deferred while a reindex publication is active"
+            );
+            pending_nudge = nudged;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 /// What the watcher last observed: the corpus document count and the sidecar
@@ -2932,6 +2990,155 @@ mod tests {
             state.index_writer.try_begin_edge_index_rebuild().is_some(),
             "the rebuild releases the guard when the pass ends"
         );
+    }
+
+    #[test]
+    fn rebuild_retry_delay_doubles_from_one_second_up_to_the_interval() {
+        use std::time::Duration;
+
+        let interval = Duration::from_secs(60);
+        assert_eq!(rebuild_retry_delay(1, interval), Duration::from_secs(1));
+        assert_eq!(rebuild_retry_delay(2, interval), Duration::from_secs(2));
+        assert_eq!(rebuild_retry_delay(3, interval), Duration::from_secs(4));
+        assert_eq!(rebuild_retry_delay(6, interval), Duration::from_secs(32));
+        assert_eq!(rebuild_retry_delay(7, interval), interval);
+        assert_eq!(rebuild_retry_delay(u32::MAX, interval), interval);
+        assert_eq!(
+            rebuild_retry_delay(1, Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+
+        let failed = EdgeIndexWatcherPass::RebuildFailed;
+        let mut backoff = RebuildRetryBackoff::default();
+        let delays: Vec<_> = [failed, EdgeIndexWatcherPass::AuthorityUnavailable, failed]
+            .into_iter()
+            .map(|outcome| backoff.after_pass(outcome, false, interval))
+            .collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4].map(|secs| Some(Duration::from_secs(secs))),
+            "both fence-down failure outcomes back off"
+        );
+        assert_eq!(
+            backoff.after_pass(EdgeIndexWatcherPass::PublicationBusy, false, interval),
+            None
+        );
+        assert_eq!(
+            backoff.after_pass(failed, false, interval),
+            Some(Duration::from_secs(8)),
+            "a busy pass neither retries on backoff nor resets the count"
+        );
+
+        assert_eq!(
+            backoff.after_pass(EdgeIndexWatcherPass::Rebuilt, true, interval),
+            None
+        );
+        assert_eq!(
+            backoff.after_pass(failed, false, interval),
+            Some(Duration::from_secs(1)),
+            "a publication resets the count"
+        );
+
+        assert_eq!(
+            backoff.after_pass(failed, false, interval),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            backoff.after_pass(failed, true, interval),
+            None,
+            "a failed rebuild behind a raised fence keeps the prior graph and waits for the next nudge or interval"
+        );
+        assert_eq!(
+            backoff.after_pass(failed, false, interval),
+            Some(Duration::from_secs(1)),
+            "a raised fence resets the count"
+        );
+    }
+
+    #[test]
+    fn watcher_retries_a_failed_rebuild_on_backoff_while_the_fence_is_down() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const FAILURES: usize = 3;
+        let interval = Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
+        let (_cursor, published) = published_watcher_graph(&state);
+        super::super::code_source::republish_code_read_view(&state).unwrap();
+        assert!(
+            state.complete_code_read_view().is_err(),
+            "precondition: the placeholder republish lowers the fence"
+        );
+
+        let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
+        let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let watcher = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut calls = 0;
+                run_edge_index_rebuild_watcher(
+                    &state,
+                    interval,
+                    Some(nudge_rx),
+                    |state, edges_dir, cursor, nudged, nudge_limit| {
+                        calls += 1;
+                        let outcome = if calls <= FAILURES {
+                            EdgeIndexWatcherPass::RebuildFailed
+                        } else {
+                            run_edge_index_watcher_pass(
+                                state,
+                                edges_dir,
+                                cursor,
+                                nudged,
+                                nudge_limit,
+                            )
+                        };
+                        pass_tx.send((Instant::now(), nudged, outcome)).unwrap();
+                        outcome
+                    },
+                );
+            })
+        };
+
+        let mut passes = Vec::new();
+        loop {
+            let pass = pass_rx
+                .recv_timeout(interval)
+                .expect("the watcher retries before a full interval elapses");
+            passes.push(pass);
+            if pass.2 != EdgeIndexWatcherPass::RebuildFailed {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(passes.len(), FAILURES + 1);
+        assert_eq!(passes[FAILURES].2, EdgeIndexWatcherPass::Rebuilt);
+        assert!(
+            passes.iter().all(|pass| pass.1),
+            "every pass while the fence is down is a nudged retry"
+        );
+        for (failures, pair) in passes.windows(2).enumerate() {
+            let expected = rebuild_retry_delay(failures as u32 + 1, interval);
+            assert!(
+                pair[1].0 - pair[0].0 >= expected,
+                "retry {failures} waited less than {expected:?}"
+            );
+        }
+        let view = state
+            .complete_code_read_view()
+            .expect("the retried rebuild raises the fence");
+        assert_eq!(view.edge_index.edge_count(), published);
+        assert!(
+            elapsed < interval / 4,
+            "the fence rose after {elapsed:?}, not well before the {interval:?} interval"
+        );
+
+        drop(nudge_tx);
+        watcher.join().unwrap();
     }
 
     #[tokio::test]
