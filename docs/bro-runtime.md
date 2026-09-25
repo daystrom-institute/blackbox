@@ -119,6 +119,29 @@ bro_brofile(action="get", name="rust-refactor-persona")
 List before create. Brofiles are often installed through the artifact catalog
 from `system-defaults/brofiles/`.
 
+`scope` accepts `global` (default) or `project`; each scope reads exactly one
+store and project discovery never includes global brofiles. Project scope
+requires `project_dir`, an absolute owner-host directory. In legacy bridge mode
+the daemon reads and writes that directory's `.bro/brofiles`.
+
+In catalog mode `project_dir` selects the catalog project attached at that
+path and never grants the daemon filesystem access. Project `list` and `get`
+read only the project's accepted publication and report its generation and
+commit under `source`. Project `create` (a new name or a replacement) and
+`delete` queue a guarded edit of `.bro/brofiles/<name>.json` for the project's
+checkout owner and return `state="queued"` with a `mutation` receipt: mutation
+id, landing path, the exact-byte precondition (or asserted absence), the
+predecessor it chains on, the accepted generation, and the next step.
+Consecutive edits before publication chain on the queued ones. Reads and
+dispatch keep the accepted configuration until the owner commits and publishes
+the edit. A path that names no catalog project, a project without an accepted
+publication, a publication without the configuration lane, or invalid
+accepted configuration refuse by name (`error.project_config_project_unknown`,
+`error.project_config_publication_unavailable`,
+`error.project_config_lane_unsupported`, `error.project_config_invalid`) and
+never fall back to global brofiles. Accounts and provider defaults stay in the
+daemon-owned global store and reject project scope.
+
 ## Teams
 
 Teams are named sets of brofiles:
