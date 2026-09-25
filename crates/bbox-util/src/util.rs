@@ -156,8 +156,25 @@ fn env_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Like `env_path`, but expands a leading `~` or `~/` against `home`, the same
+/// way config resolution expands these variables.
+fn env_path_expanded(var: &str, home: &Path) -> Option<PathBuf> {
+    std::env::var(var)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|value| match value.strip_prefix('~') {
+            Some("") => home.to_path_buf(),
+            Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+            _ => PathBuf::from(value),
+        })
+}
+
+/// `$BLACKBOX_STATE_DIR` (tilde-expanded), else `<platform state dir>/blackbox`.
+/// The platform state dir is `dirs::state_dir()` (`$XDG_STATE_HOME` when it is
+/// absolute; never on macOS), else `~/.local/state`.
 pub fn blackbox_state_dir(home: &Path) -> PathBuf {
-    env_path("BLACKBOX_STATE_DIR").unwrap_or_else(|| xdg_state_dir(home).join("blackbox"))
+    env_path_expanded("BLACKBOX_STATE_DIR", home)
+        .unwrap_or_else(|| xdg_state_dir(home).join("blackbox"))
 }
 
 pub fn blackbox_knowledge_path(home: &Path) -> PathBuf {
@@ -207,8 +224,10 @@ pub fn blackbox_global_common_md_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".blackbox").join("BLACKBOX.md"))
 }
 
+/// `$BRO_HOME` (tilde-expanded), else `<blackbox_state_dir>/bro`. fleetd's
+/// default state dir (`fleetd::paths::default_state_dir`) follows this rule.
 pub fn bro_home_dir(home: &Path) -> PathBuf {
-    env_path("BRO_HOME").unwrap_or_else(|| blackbox_state_dir(home).join("bro"))
+    env_path_expanded("BRO_HOME", home).unwrap_or_else(|| blackbox_state_dir(home).join("bro"))
 }
 
 /// Managed worktree parent roots recognized by the cockpit-facing daemon

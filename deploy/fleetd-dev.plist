@@ -12,8 +12,14 @@
   so a distinct state dir is a distinct supervisor. That is what stops the
   dev daemon from adopting prod's live sessions, or prod from adopting dev's.
 
-  It matches `state_dir = "~/.local/state/blackbox-dev"` in
-  deploy/config-dev.toml; if you change one, change the other.
+  The daemon dials fleetd in its BRO home (<bro_home>/fleetd.sock):
+  $BRO_HOME, else paths.bro_home, else <state_dir>/bro. fleetd's own default
+  follows only the environment part of that rule (it reads no daemon config
+  file), so a daemon whose paths.state_dir or paths.bro_home is set in its
+  config file needs the matching explicit --state-dir. The dev daemon sets
+  `state_dir = "~/.local/state/blackbox-dev"` in deploy/config-dev.toml, so
+  this unit points --state-dir at that state dir's bro/ subdir; if you change
+  one, change the other.
 
   The binary is the SAME fleetd as prod. fleetd is a supervisor that reads no
   brofile, no credential store, and no provider config, so there is nothing

@@ -5,10 +5,21 @@
 //! fleetd. A shared supervisor would let one daemon adopt the other's
 //! sessions (slice 5 contract).
 //!
-//! The default resolution mirrors `bbox_util::util::blackbox_state_dir`
-//! without depending on it (fleetd links no `bbox-*` crate):
-//! `$BLACKBOX_STATE_DIR`, else `$XDG_STATE_HOME/blackbox`, else
-//! `$HOME/.local/state/blackbox`.
+//! The default is the daemon's BRO home, because that is the dir the daemon
+//! dials fleetd in (`<bro_home>/fleetd.sock`). It mirrors
+//! `bbox_util::util::bro_home_dir` without depending on it (fleetd links no
+//! `bbox-*` crate; a dev-dependency parity test pins the two together):
+//!
+//! 1. `$BRO_HOME`, else
+//! 2. `$BLACKBOX_STATE_DIR/bro`, else
+//! 3. `$XDG_STATE_HOME/blackbox/bro` when `$XDG_STATE_HOME` is absolute (not on
+//!    macOS, where the daemon ignores it), else
+//! 4. `$HOME/.local/state/blackbox/bro`.
+//!
+//! `$BRO_HOME` and `$BLACKBOX_STATE_DIR` expand a leading `~`. fleetd reads no
+//! daemon config file, so a daemon whose `paths.state_dir` or `paths.bro_home`
+//! comes from its config file needs fleetd started with a matching explicit
+//! `--state-dir`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,32 +28,57 @@ pub const SOCKET_FILE: &str = "fleetd.sock";
 /// Shared-secret token file name inside the state dir.
 pub const TOKEN_FILE: &str = "fleetd.token";
 
-/// Resolve the state dir fleetd derives its paths from, honoring the same env
-/// precedence the daemon uses.
+/// Resolve the state dir fleetd derives its paths from when `--state-dir` is
+/// absent: the daemon's BRO home under the same environment.
 pub fn default_state_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = non_empty_env("BLACKBOX_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = non_empty_env("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(dir).join("blackbox"));
-    }
-    let home = non_empty_env("HOME").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot resolve a state dir: none of --state-dir, BLACKBOX_STATE_DIR, \
-             XDG_STATE_HOME, or HOME is set"
-        )
-    })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("blackbox"))
+    default_state_dir_from(|key| std::env::var(key).ok())
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+/// [`default_state_dir`] over an injected environment lookup.
+pub fn default_state_dir_from(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
+    let set = |key: &str| env(key).filter(|value| !value.trim().is_empty());
+    let home = || {
+        env("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot resolve fleetd's state dir: pass --state-dir, or set \
+                     BRO_HOME, BLACKBOX_STATE_DIR, or HOME"
+                )
+            })
+    };
+    let expand = |value: String| -> anyhow::Result<PathBuf> {
+        Ok(match value.strip_prefix('~') {
+            Some("") => home()?,
+            Some(rest) if rest.starts_with('/') => home()?.join(&rest[1..]),
+            _ => PathBuf::from(value),
+        })
+    };
+
+    if let Some(bro_home) = set("BRO_HOME") {
+        return expand(bro_home);
+    }
+    let state_dir = match set("BLACKBOX_STATE_DIR") {
+        Some(dir) => expand(dir)?,
+        None => match platform_state_dir(&set) {
+            Some(dir) => dir,
+            None => home()?.join(".local").join("state"),
+        }
+        .join("blackbox"),
+    };
+    Ok(state_dir.join("bro"))
+}
+
+/// `dirs::state_dir()`'s environment rule: an absolute `$XDG_STATE_HOME`,
+/// honored everywhere except macOS.
+fn platform_state_dir(set: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    set("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 /// The concrete file paths fleetd owns under one state dir.
@@ -76,6 +112,92 @@ mod tests {
         assert_eq!(paths.state_dir, root);
         assert_eq!(paths.socket, root.join("fleetd.sock"));
         assert_eq!(paths.token, root.join("fleetd.token"));
+    }
+
+    fn resolve(pairs: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
+        let env: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        default_state_dir_from(|key| env.get(key).cloned())
+    }
+
+    #[test]
+    fn default_is_the_daemon_bro_home() {
+        assert_eq!(
+            resolve(&[
+                ("HOME", "/h"),
+                ("BRO_HOME", "/bro"),
+                ("BLACKBOX_STATE_DIR", "/s")
+            ])
+            .unwrap(),
+            PathBuf::from("/bro")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("BLACKBOX_STATE_DIR", "/s")]).unwrap(),
+            PathBuf::from("/s/bro")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "/h")]).unwrap(),
+            PathBuf::from("/h/.local/state/blackbox/bro")
+        );
+    }
+
+    #[test]
+    fn blank_variables_are_unset() {
+        assert_eq!(
+            resolve(&[
+                ("HOME", "/h"),
+                ("BRO_HOME", " "),
+                ("BLACKBOX_STATE_DIR", "")
+            ])
+            .unwrap(),
+            PathBuf::from("/h/.local/state/blackbox/bro")
+        );
+    }
+
+    #[test]
+    fn tilde_expands_against_home() {
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("BRO_HOME", "~/b")]).unwrap(),
+            PathBuf::from("/h/b")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("BLACKBOX_STATE_DIR", "~/s")]).unwrap(),
+            PathBuf::from("/h/s/bro")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("BLACKBOX_STATE_DIR", "~")]).unwrap(),
+            PathBuf::from("/h/bro")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("BLACKBOX_STATE_DIR", "~other/s")]).unwrap(),
+            PathBuf::from("~other/s/bro")
+        );
+    }
+
+    #[test]
+    fn xdg_state_home_follows_the_platform_rule() {
+        let resolved = resolve(&[("HOME", "/h"), ("XDG_STATE_HOME", "/x")]).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(resolved, PathBuf::from("/h/.local/state/blackbox/bro"));
+        } else {
+            assert_eq!(resolved, PathBuf::from("/x/blackbox/bro"));
+        }
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("XDG_STATE_HOME", "relative")]).unwrap(),
+            PathBuf::from("/h/.local/state/blackbox/bro")
+        );
+    }
+
+    #[test]
+    fn home_is_needed_only_when_used() {
+        assert_eq!(
+            resolve(&[("BLACKBOX_STATE_DIR", "/s")]).unwrap(),
+            PathBuf::from("/s/bro")
+        );
+        assert!(resolve(&[]).is_err());
+        assert!(resolve(&[("BRO_HOME", "~/b")]).is_err());
     }
 
     /// Two daemons with different state dirs must never share a socket: that

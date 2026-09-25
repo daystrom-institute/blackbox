@@ -12,11 +12,14 @@ ExecStart=%h/.local/bin/fleetd
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=fleetd=info
-# --state-dir defaults to $BLACKBOX_STATE_DIR, else $XDG_STATE_HOME/blackbox,
-# else ~/.local/state/blackbox — the same precedence the daemon uses, which is
-# what keeps the two on the same socket without configuring it twice. The
-# socket (fleetd.sock) and shared-secret token (fleetd.token) both derive from
-# it, so a daemon with a non-default paths.state_dir needs the matching
+# The daemon dials fleetd in its BRO home: <bro_home>/fleetd.sock, with the
+# shared-secret token at <bro_home>/fleetd.token. With no --state-dir, fleetd
+# resolves that same dir from the environment the way the daemon does:
+# $BRO_HOME, else $BLACKBOX_STATE_DIR/bro, else $XDG_STATE_HOME/blackbox/bro
+# (absolute, not on macOS), else ~/.local/state/blackbox/bro. So this unit
+# needs no --state-dir as long as it sees the daemon's environment. fleetd
+# reads no daemon config file: a daemon whose paths.state_dir or
+# paths.bro_home is set in its config file needs the matching explicit
 # --state-dir here (see fleetd-dev.service).
 WorkingDirectory=%h
 StandardOutput=journal

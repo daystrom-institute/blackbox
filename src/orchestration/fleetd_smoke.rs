@@ -698,6 +698,91 @@ mod smoke {
         );
     }
 
+    /// A fleetd started with no `--state-dir`, under the daemon's environment,
+    /// binds the socket and creates the token the daemon's executor dials:
+    /// `FleetdConfig::in_state_dir(cfg.paths.bro_home)`. The environment uses a
+    /// `~`-prefixed `BLACKBOX_STATE_DIR`, so both the `bro` suffix and tilde
+    /// expansion have to agree.
+    #[tokio::test]
+    async fn fleetd_default_state_dir_is_the_socket_the_daemon_dials() {
+        use super::FleetdEndpoint;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let missing_config = root.join("absent-config.toml");
+        let environment = [
+            ("HOME", Some(root.to_string_lossy().into_owned())),
+            ("BLACKBOX_STATE_DIR", Some("~/s".to_string())),
+            ("BRO_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ];
+
+        let bro_home = {
+            let _guard = crate::util::test_env_lock();
+            let saved: Vec<_> = environment
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in &environment {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            let loaded = bbox_config::config::load_with(bbox_config::config::LoadOptions {
+                config_path: Some(missing_config),
+                ..Default::default()
+            });
+            for (key, value) in saved {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            loaded.expect("env-only daemon config").paths.bro_home
+        };
+        assert_eq!(bro_home, root.join("s").join("bro"));
+
+        let config = FleetdConfig::in_state_dir(&bro_home);
+        let FleetdEndpoint::Unix(socket) = &config.endpoint else {
+            panic!("the state-local default is a Unix endpoint");
+        };
+
+        let mut command = std::process::Command::new(fleetd_binary());
+        for (key, value) in &environment {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        let child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start fleetd with no --state-dir");
+        let _fleetd = FleetdProcess {
+            child,
+            state_dir: bro_home.clone(),
+            tcp_address: None,
+        };
+
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while tokio::net::UnixStream::connect(socket).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fleetd did not bind {} within the deadline",
+                socket.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            config.token.is_file(),
+            "fleetd created the token the daemon reads at {}",
+            config.token.display()
+        );
+    }
+
     /// The executor must fail LOUDLY when fleetd is unreachable, never fall back to
     /// spawning the worker as a daemon child. A silent downgrade would reintroduce
     /// exactly the restart-drops-sessions problem this slice removes, invisibly.

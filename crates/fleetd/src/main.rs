@@ -19,8 +19,13 @@ USAGE:
 
 OPTIONS:
     --state-dir <path>  Directory holding fleetd.sock and fleetd.token.
-                        Defaults to $BLACKBOX_STATE_DIR, else
-                        $XDG_STATE_HOME/blackbox, else ~/.local/state/blackbox.
+                        Defaults to the daemon's BRO home under the same
+                        environment: $BRO_HOME, else $BLACKBOX_STATE_DIR/bro,
+                        else $XDG_STATE_HOME/blackbox/bro (absolute, not on
+                        macOS), else ~/.local/state/blackbox/bro. fleetd reads
+                        no daemon config: a daemon whose paths.state_dir or
+                        paths.bro_home is set in its config file needs a
+                        matching --state-dir here.
     --listen-tcp <addr> Optional TCP owner listener. Loopback is allowed for
                         local tunnels. A non-loopback address also requires
                         --allow-nonloopback-tcp and MUST be protected by an
