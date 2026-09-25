@@ -99,6 +99,11 @@ blackbox producer-claims revoke \
 
 Both commands load the daemon configuration to resolve the producer claims
 store path. `--config <path>` selects a non-default daemon configuration.
+`list` is a read and runs while the daemon is up. `revoke` requires the daemon
+to be stopped: a running daemon holds the claims in memory and would write a
+revoked claim back on its next persist, so `revoke` takes the offline
+administration lock on the configured projects path and, while a daemon holds
+it, returns `error.project_catalog_cli_lock` without writing the claims store.
 
 ### Rotating a producer's token without a downtime window
 
