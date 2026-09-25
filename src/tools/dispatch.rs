@@ -3401,6 +3401,138 @@ mod tests {
         }
     }
 
+    /// A catalog project with no checkout on disk: every dispatch and resume
+    /// entry path resolves the project's accepted brofile first, falls back
+    /// to global only for names the accepted view proves absent, and refuses
+    /// by name when the view cannot answer.
+    #[test]
+    fn catalog_dispatch_entry_paths_consume_the_accepted_project_view() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
+        use orchestration::{brofile, team};
+        let fixture = CatalogFixture::new();
+        let project = "p_dispatch_accepted";
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(project, &scope);
+        let reviewer =
+            serde_json::json!({"name":"reviewer","provider":"deepseek","model":"project-model"})
+                .to_string();
+        fixture.install_config_publication(
+            project,
+            &scope,
+            COMMIT_ONE,
+            Some(&[(".bro/brofiles/reviewer.json", reviewer.as_bytes())]),
+        );
+        let unpublished = "p_dispatch_unpublished";
+        fixture.add_published_project(unpublished, &CatalogFixture::scope("other"));
+        let server = fixture.server();
+        for (name, model) in [
+            ("reviewer", "global-model"),
+            ("writer", "global-writer"),
+            ("solo", "global-solo"),
+        ] {
+            let bf = serde_json::from_value(
+                serde_json::json!({"name": name, "provider": "glm", "model": model}),
+            )
+            .unwrap();
+            brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
+        }
+        team::save_team(
+            &team::Team {
+                name: "panel".into(),
+                teamplate: "panel-template".into(),
+                members: vec![
+                    team::TeamMember {
+                        name: "reviewer".into(),
+                        brofile: "reviewer".into(),
+                        session_id: Some("synthetic-session".into()),
+                        task_history: vec![],
+                    },
+                    team::TeamMember {
+                        name: "writer".into(),
+                        brofile: "writer".into(),
+                        session_id: None,
+                        task_history: vec![],
+                    },
+                ],
+                advisor: None,
+                project_dir: Some(project.into()),
+                created_at: 0,
+                diversity_floor: None,
+            },
+            &server.state.store_dir,
+        );
+
+        // bro_exec with a caller cwd naming the project.
+        let (provider, _, opts, _, _, _, _, _, _) = server
+            .resolve_exec_target(Some("reviewer"), None, Some(project))
+            .unwrap();
+        assert_eq!(provider, Provider::Deepseek);
+        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
+        let (_, _, opts, _, _, _, _, _, _) = server
+            .resolve_exec_target(Some("writer"), None, Some(project))
+            .unwrap();
+        assert_eq!(opts.unwrap().model.as_deref(), Some("global-writer"));
+        // Team member exec, resume, retro and allocator selection.
+        let (provider, _, opts, _, cwd, _, _, _, _) = server
+            .resolve_exec_target(Some("panel::reviewer"), None, None)
+            .unwrap();
+        assert_eq!(provider, Provider::Deepseek);
+        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
+        assert_eq!(cwd.as_deref(), Some(project));
+        let (provider, _, _, opts, _, _, _, _, _, _) = server
+            .resolve_resume_target(Some("panel::reviewer"), None, None, None)
+            .unwrap();
+        assert_eq!(provider, Provider::Deepseek);
+        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
+        let (opts, _) = server
+            .resolve_workload_retro_runtime(
+                "missing-task",
+                Provider::Deepseek,
+                "synthetic-session",
+                Some("panel::reviewer"),
+                Some(project),
+            )
+            .unwrap();
+        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
+        let allocator = server
+            .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocator.model.as_deref(), Some("project-model"));
+        // The roster row resolves the same way.
+        let saved = team::load_team("panel", &server.state.store_dir).unwrap();
+        let entry = crate::tools::bro_helpers::build_member_entry(
+            &saved,
+            &saved.members[0],
+            &server.state,
+            &server.state.idx.read().reindex_config(),
+        );
+        assert_eq!(entry.model.as_deref(), Some("project-model"));
+        assert_eq!(entry.provider, "deepseek");
+
+        // An unavailable project view refuses every path by name.
+        for result in [
+            // `solo` is no team member, so the caller cwd selects the project.
+            server
+                .resolve_exec_target(Some("solo"), None, Some(unpublished))
+                .map(|_| ()),
+            server
+                .resolve_exec_brofile_for_allocator("solo", Some(unpublished))
+                .map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error.starts_with("error.project_config_publication_unavailable"),
+                "{error}"
+            );
+        }
+        let error = server
+            .state
+            .dispatch_project_mcp_store(Some(unpublished))
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_config_publication_unavailable");
+    }
+
     #[test]
     fn catalog_team_dispatch_uses_global_brofile_and_preserves_worker_cwd() {
         let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();

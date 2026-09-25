@@ -1563,6 +1563,83 @@ mod tests {
         assert!(receipt["detail_hint"].as_str().unwrap().contains("roster"));
     }
 
+    /// With no checkout on disk, `create` resolves the selected catalog
+    /// project's accepted template and member brofiles first, attributes a
+    /// global fallback, and refuses by name when the view is unavailable.
+    #[tokio::test]
+    async fn catalog_team_create_resolves_accepted_project_templates_first() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
+        use orchestration::{brofile, team};
+        let fixture = CatalogFixture::new();
+        let project = "p_team_accepted";
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(project, &scope);
+        let reviewer = json!({"name":"reviewer","provider":"deepseek"}).to_string();
+        let squad =
+            json!({"name":"squad","members":[{"brofile":"reviewer","count":2}]}).to_string();
+        fixture.install_config_publication(
+            project,
+            &scope,
+            COMMIT_ONE,
+            Some(&[
+                (".bro/brofiles/reviewer.json", reviewer.as_bytes()),
+                (".bro/teamplates/squad.json", squad.as_bytes()),
+            ]),
+        );
+        fixture.add_published_project("p_team_unpublished", &CatalogFixture::scope("other"));
+        let server = fixture.server();
+        let writer: brofile::Brofile =
+            serde_json::from_value(json!({"name":"writer","provider":"glm"})).unwrap();
+        brofile::save_brofile(&writer, "global", &server.state.store_dir, None).unwrap();
+        let global_template = team::Teamplate {
+            name: "writers".into(),
+            members: vec![team::TeamplateMember {
+                brofile: "writer".into(),
+                alias: None,
+                count: 1,
+            }],
+            advisor: None,
+            diversity_floor: None,
+        };
+        team::save_teamplate(&global_template, "global", &server.state.store_dir, None).unwrap();
+
+        let created = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"squad","name":"project-team","project_dir":project
+            }))))
+            .await;
+        assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
+        let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
+        assert_eq!(receipt["templateScope"], "project");
+        assert_eq!(receipt["templateSource"]["source"], "project");
+        assert_eq!(receipt["templateSource"]["project_id"], project);
+        assert_eq!(receipt["memberCount"], 2);
+
+        let fallback = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"writers","name":"global-team","project_dir":project
+            }))))
+            .await;
+        assert_ne!(fallback.is_error, Some(true), "{}", extract_text(&fallback));
+        let receipt: Value = serde_json::from_str(&extract_text(&fallback)).unwrap();
+        assert_eq!(receipt["templateScope"], "global");
+        assert_eq!(receipt["templateSource"]["source"], "global_fallback");
+
+        let refused = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"writers","name":"must-not-exist",
+                "project_dir":"p_team_unpublished"
+            }))))
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(
+            extract_text(&refused).contains("error.project_config_publication_unavailable"),
+            "{}",
+            extract_text(&refused)
+        );
+        assert!(team::load_team("must-not-exist", &server.state.store_dir).is_none());
+    }
+
     #[tokio::test]
     async fn catalog_team_mutations_refuse_project_sources_and_keep_global_worker_context() {
         use orchestration::{brofile, team};

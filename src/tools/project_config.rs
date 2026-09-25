@@ -492,3 +492,7 @@ impl SharedState {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "project_config_tests.rs"]
+mod tests;

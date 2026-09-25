@@ -5002,6 +5002,117 @@ mod tests {
                 .source_generation_id
         }
 
+        /// One Ready candidate carrying a configuration lane of exactly these
+        /// scope-relative files beside one knowledge entry, uploaded the way
+        /// a lane-aware collector uploads it. `None` is a pre-lane producer.
+        fn stage_config_candidate(
+            &self,
+            commit: &str,
+            config: Option<&[(&str, &[u8])]>,
+        ) -> String {
+            use std::io::Cursor;
+
+            use crate::server::state::catalog_fixture::knowledge_entry;
+            use bbox_knowledge_source::{
+                GitObjectFormatV1, PublicationCandidateDescriptorV1, SCHEMA_VERSION,
+                SourceFileManifestEntryV1, SourceLaneV1, SourceManifestDescriptorV1,
+                SourceManifestPageV1, source_file_blob_sha256, source_manifest_sha256,
+            };
+            use bbox_knowledge_source_store::PublicationAuthorityV1;
+
+            let store = self.server.state.knowledge_sources.store();
+            let entry = |path: String, bytes: &[u8]| SourceFileManifestEntryV1 {
+                repository_relative_filename: path,
+                encoded_bytes: bytes.len() as u64,
+                content_sha256: source_file_blob_sha256(bytes),
+            };
+            let manifest = |lane, entries: &[SourceFileManifestEntryV1]| SourceManifestDescriptorV1 {
+                manifest_sha256: source_manifest_sha256(lane, entries),
+                file_count: entries.len() as u64,
+                logical_bytes: entries.iter().map(|entry| entry.encoded_bytes).sum(),
+                page_count: u64::from(!entries.is_empty()),
+            };
+            let knowledge_bytes =
+                serde_json::to_vec(&knowledge_entry("knowledge-a", commit)).unwrap();
+            let knowledge = vec![entry(
+                ".bbox/knowledge/knowledge-a.json".into(),
+                &knowledge_bytes,
+            )];
+            let mut config_files = config
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            config_files.sort();
+            let config_entries = config_files
+                .iter()
+                .map(|(path, bytes)| entry(path.clone(), bytes))
+                .collect::<Vec<_>>();
+            let descriptor = PublicationCandidateDescriptorV1 {
+                schema_version: SCHEMA_VERSION,
+                scope: self.scope.clone(),
+                full_ref: "refs/heads/main".into(),
+                publisher_commit: commit.into(),
+                object_format: GitObjectFormatV1::Sha1,
+                knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
+                gaps: manifest(SourceLaneV1::Gaps, &[]),
+                graphs: manifest(SourceLaneV1::Graphs, &[]),
+                evidence: manifest(SourceLaneV1::Evidence, &[]),
+                config: config.map(|_| manifest(SourceLaneV1::Config, &config_entries)),
+            };
+            let authority = PublicationAuthorityV1 {
+                producer_id: "producer-a".into(),
+                project_id: self.project_id.clone(),
+                scope: self.scope.clone(),
+            };
+            let upload = store
+                .begin_publication_upload(&authority, descriptor)
+                .unwrap();
+            for (lane, entries) in [
+                (SourceLaneV1::Knowledge, knowledge.clone()),
+                (SourceLaneV1::Config, config_entries.clone()),
+            ] {
+                if entries.is_empty() {
+                    continue;
+                }
+                store
+                    .put_publication_manifest_page(
+                        &authority,
+                        &upload.upload_id,
+                        lane,
+                        0,
+                        &SourceManifestPageV1 {
+                            page_index: 0,
+                            entries,
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .missing_publication_blobs(&authority, &upload.upload_id, None)
+                .unwrap();
+            let mut blobs = vec![(knowledge[0].clone(), knowledge_bytes)];
+            for ((_, bytes), manifest_entry) in config_files.iter().zip(&config_entries) {
+                blobs.push((manifest_entry.clone(), bytes.clone()));
+            }
+            for (manifest_entry, bytes) in blobs {
+                let _ = store.install_publication_blob(
+                    &authority,
+                    &upload.upload_id,
+                    &manifest_entry.content_sha256,
+                    manifest_entry.encoded_bytes,
+                    Cursor::new(bytes),
+                );
+            }
+            store
+                .finalize_publication_upload(&authority, &upload.upload_id)
+                .unwrap()
+                .source_generation_id
+        }
+
         /// One Ready candidate carrying a graphs lane beside its knowledge
         /// lane, which is the shape a real checkout producer uploads for a
         /// project with `.bbox/graphs`. The graph bytes are identical
@@ -5386,6 +5497,86 @@ mod tests {
                 .attempt_publisher_auto_advance("p_auto_publish_scope", &candidate),
             crate::server::publisher_auto_advance::AutoAdvanceOutcome::ScopeChanged
         );
+    }
+
+    /// Configuration is parsed in the daemon's configuration domain before
+    /// acceptance: a malformed configuration candidate is refused whole and
+    /// the accepted generation keeps serving; a later pre-lane candidate is
+    /// accepted but leaves configuration reads refusing by name, never
+    /// silently falling back to global configuration.
+    #[tokio::test]
+    async fn configuration_candidates_are_parsed_before_they_can_displace_accepted_content() {
+        use crate::server::state::catalog_fixture::COMMIT_ONE;
+
+        let fixture = AutoAdvanceFixture::new("p_config_publish");
+        let valid = br#"{"name":"reviewer","provider":"deepseek","model":"accepted"}"#;
+        let first = fixture.stage_config_candidate(
+            COMMIT_ONE,
+            Some(&[
+                (".bbox/config.toml", b"[mcp]\nenabled = true\n"),
+                (".bro/brofiles/reviewer.json", valid),
+            ]),
+        );
+        let result = fixture
+            .establish_from(&first, Some(true), "operator establishes")
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let before = fixture.status().await;
+        let state = &fixture.server.state;
+        let accepted = state
+            .resolve_config_brofile("reviewer", Some("p_config_publish"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.value.model.as_deref(), Some("accepted"));
+        assert_eq!(
+            state
+                .load_accepted_project_config("p_config_publish")
+                .unwrap()
+                .snapshot
+                .mcp_enabled(),
+            Some(true)
+        );
+
+        let malformed = fixture.stage_config_candidate(
+            "2222222222222222222222222222222222222222",
+            Some(&[(
+                ".bro/brofiles/reviewer.json",
+                br#"{"name":"reviewer","provider":"not-a-provider"}"#,
+            )]),
+        );
+        let outcome = fixture
+            .server
+            .attempt_publisher_auto_advance("p_config_publish", &malformed);
+        match outcome {
+            crate::server::publisher_auto_advance::AutoAdvanceOutcome::Refused {
+                ref code, ..
+            } => assert_eq!(code, "error.project_config_invalid"),
+            other => panic!("malformed configuration must be refused, got {other:?}"),
+        }
+        let after = fixture.status().await;
+        assert_eq!(after["generation_id"], before["generation_id"]);
+        let still = state
+            .resolve_config_brofile("reviewer", Some("p_config_publish"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.value.model.as_deref(), Some("accepted"));
+
+        let pre_lane =
+            fixture.stage_config_candidate("3333333333333333333333333333333333333333", None);
+        let outcome = fixture
+            .server
+            .attempt_publisher_auto_advance("p_config_publish", &pre_lane);
+        assert!(
+            matches!(
+                outcome,
+                crate::server::publisher_auto_advance::AutoAdvanceOutcome::Accepted { .. }
+            ),
+            "{outcome:?}"
+        );
+        let error = state
+            .resolve_config_brofile("reviewer", Some("p_config_publish"))
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_config_lane_unsupported");
     }
 
     /// Default OFF. A project whose operator never granted the policy sees
