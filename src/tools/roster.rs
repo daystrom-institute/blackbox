@@ -1172,6 +1172,16 @@ fn catalog_project_template_action(
     server: &BlackboxServer,
     p: &TeamParams,
 ) -> anyhow::Result<Value> {
+    catalog_project_template_action_with_hook(server, p, || {})
+}
+
+/// `after_snapshot` runs between the edit preparation's first read of the
+/// accepted configuration and its revalidation under the queue lock.
+fn catalog_project_template_action_with_hook(
+    server: &BlackboxServer,
+    p: &TeamParams,
+    after_snapshot: impl FnMut(),
+) -> anyhow::Result<Value> {
     use orchestration::team;
     let selector = p
         .project_dir
@@ -1239,27 +1249,31 @@ fn catalog_project_template_action(
             };
             team::validate_teamplate_member_count(&template)
                 .map_err(|error| anyhow::anyhow!("Teamplate was not saved: {error}"))?;
-            // Members resolve against the same accepted view dispatch uses:
-            // the project's accepted brofiles, then global ones. A queued,
-            // unpublished brofile does not count.
-            for member in &template.members {
-                anyhow::ensure!(
-                    orchestration::project_config::resolve_brofile(
-                        Some(snapshot),
-                        &member.brofile,
-                        &server.state.store_dir,
-                    )
-                    .is_some(),
-                    "Brofile not found: {}. Members resolve from project {project_id}'s accepted brofiles, then global ones; a brofile queued through the checkout-owner lane counts only after it is committed and published",
-                    member.brofile
-                );
-            }
             let content = String::from_utf8(crate::json_store::to_vec_pretty_newline(&template)?)?;
-            let receipt = server.state.prepare_project_config_mutation(
+            let store_dir = &server.state.store_dir;
+            let receipt = server.state.prepare_project_config_mutation_in_view(
                 project_id,
                 &target,
                 "bro_team(action=save_template, scope=project)",
-                |_| {
+                after_snapshot,
+                |view, _| {
+                    // Members resolve against the accepted generation this
+                    // edit is prepared, preconditioned and reported against:
+                    // its project brofiles, then global ones. A queued,
+                    // unpublished brofile does not count.
+                    for member in &template.members {
+                        anyhow::ensure!(
+                            orchestration::project_config::resolve_brofile(
+                                Some(&view.snapshot),
+                                &member.brofile,
+                                store_dir,
+                            )
+                            .is_some(),
+                            "Brofile not found: {}. Members resolve from project {}'s accepted brofiles, then global ones; a brofile queued through the checkout-owner lane counts only after it is committed and published. Nothing was queued",
+                            member.brofile,
+                            view.project_id
+                        );
+                    }
                     Ok(Some(
                         crate::tools::project_config::ProjectConfigEdit::Write(content),
                     ))

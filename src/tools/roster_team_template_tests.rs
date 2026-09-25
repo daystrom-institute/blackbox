@@ -875,3 +875,82 @@ async fn catalog_global_templates_and_bridge_project_templates_keep_their_stores
     assert!(relative.contains("absolute"), "{relative}");
     assert!(!root.join("relative").exists());
 }
+
+/// Member validation binds to the accepted generation the edit is prepared
+/// against: a publication that lands between the handler's first read and
+/// preparation's revalidation is the one members must resolve in, and the
+/// one the precondition and receipt name.
+#[tokio::test]
+async fn template_member_validation_binds_to_the_generation_the_edit_is_prepared_against() {
+    let fixture = CatalogFixture::new();
+    let scope = CatalogFixture::scope(".");
+    fixture.add_published_project(PROJECT, &scope);
+    let solo = brofile_json("solo", "deepseek", "project-only");
+    publish(
+        &fixture,
+        &scope,
+        COMMIT_ONE,
+        &[
+            (".bro/brofiles/solo.json", &solo),
+            (SQUAD, &template_json("squad", "solo", 2)),
+        ],
+    );
+    let server = fixture.server();
+    global_configuration(&server);
+
+    // Generation B removes the project-only brofile and changes the target.
+    let without_solo = template_json("squad", "writer", 3);
+    let mut advanced = false;
+    let error = catalog_project_template_action_with_hook(
+        &server,
+        &params(save_request("squad", "solo", 1)),
+        || {
+            if !advanced {
+                advanced = true;
+                publish(&fixture, &scope, COMMIT_TWO, &[(SQUAD, &without_solo)]);
+                invalidate(&server);
+            }
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(advanced);
+    assert!(error.contains("Brofile not found: solo"), "{error}");
+    assert_eq!(
+        server.state.checkout_mutations.read().pending_count(),
+        0,
+        "the invalid edit is not queued"
+    );
+
+    // Generation C publishes the brofile again: the edit validates against
+    // C and preconditions on C's template bytes.
+    let restored = template_json("squad", "solo", 4);
+    let mut advanced = false;
+    let receipt = catalog_project_template_action_with_hook(
+        &server,
+        &params(save_request("squad", "solo", 1)),
+        || {
+            if !advanced {
+                advanced = true;
+                publish(
+                    &fixture,
+                    &scope,
+                    &commit_three(),
+                    &[(".bro/brofiles/solo.json", &solo), (SQUAD, &restored)],
+                );
+                invalidate(&server);
+            }
+        },
+    )
+    .unwrap();
+    let accepted = server.state.load_accepted_project_config(PROJECT).unwrap();
+    assert_eq!(accepted.stamp.accepted_commit(), commit_three());
+    assert_eq!(
+        receipt["mutation"]["accepted_generation"],
+        accepted.stamp.generation_id()
+    );
+    assert_eq!(
+        receipt["mutation"]["expected_sha256"],
+        content_sha256(&restored)
+    );
+}
