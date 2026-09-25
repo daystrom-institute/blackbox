@@ -274,6 +274,22 @@ impl SharedState {
             .map(|accepted| ProjectConfigContext::Accepted(accepted.snapshot))
     }
 
+    /// The accepted configuration an exact project-scope action reads or
+    /// edits. Unlike [`Self::project_config_context`], a selector that names
+    /// no catalog project is refused: exact project scope never degrades to
+    /// global configuration.
+    pub(crate) fn select_project_config_scope(
+        &self,
+        selector: &str,
+    ) -> Result<AcceptedProjectConfig, ProjectConfigError> {
+        let project_id = self
+            .catalog_project_for_selector(selector.trim())?
+            .ok_or_else(|| ProjectConfigError::ProjectUnknown {
+                selector: selector.to_string(),
+            })?;
+        self.load_accepted_project_config(&project_id)
+    }
+
     /// Dispatch-time brofile resolution: project first, then global only
     /// when the project view proves the override absent.
     pub(crate) fn resolve_config_brofile(
@@ -491,55 +507,128 @@ impl SharedState {
         };
         let target = ProjectConfigTargetV1::from_relative_path(&relative_path)
             .ok_or_else(|| anyhow::anyhow!("queued configuration target is not recognized"))?;
-        if let Some(project_id) = self.catalog_project_for_scope(&scope)
-            && let Ok(accepted) = self.load_accepted_project_config(&project_id)
-            && accepted.scope == scope
-        {
-            self.checkout_mutations.write().observe_guarded_publication(
-                &scope,
-                &relative_path,
-                accepted.snapshot.accepted_bytes(&target),
-            );
+        if let Some(project_id) = self.catalog_project_for_scope(&scope) {
+            let mut queue = self.checkout_mutations.write();
+            self.observe_current_publication(&mut queue, &project_id, &scope, &target);
         }
         let queue = self.checkout_mutations.read();
         let row = queue.get(mutation_id).ok_or_else(|| {
             anyhow::anyhow!("error.checkout_mutation_unknown: no mutation {mutation_id}")
         })?;
-        let state = queue
-            .progress(mutation_id)
-            .expect("the row was found above");
-        let owner_collector_unsupported =
-            state == CheckoutMutationProgress::Queued && row.owner_unsupported_at.is_some();
-        let next_step = match state {
-            CheckoutMutationProgress::Queued if owner_collector_unsupported => "The checkout owner's collector does not support guarded configuration mutations, so the mutation is withheld rather than delivered unguarded. Upgrade the collector; the mutation stays queued and delivers on its next poll".to_string(),
-            CheckoutMutationProgress::Queued => COMMIT_TO_PUBLISH.to_string(),
-            CheckoutMutationProgress::Delivered => "Applied in the owner's checkout but not yet published. Commit and publish the file on the project's publisher ref; reads and dispatch keep the accepted configuration until then".to_string(),
-            CheckoutMutationProgress::Published => "Included in the accepted publication; reads and dispatch use it".to_string(),
-            CheckoutMutationProgress::Reconciled => "Applied, then superseded: a later edit on this file did not apply and the owner published other bytes, which reads, dispatch and the next edit now use".to_string(),
-            CheckoutMutationProgress::Conflicted => RECONCILE_AND_RETRY.to_string(),
-            CheckoutMutationProgress::Blocked => format!(
-                "Not delivered because predecessor {} did not apply. {RECONCILE_AND_RETRY}",
-                row.blocked_by.as_deref().unwrap_or("unknown")
-            ),
-            CheckoutMutationProgress::Failed => "The owner could not apply it and left its bytes unchanged. Resolve the reported cause in the owning checkout, then re-issue the edit".to_string(),
-        };
-        Ok(ProjectConfigMutationStatus {
-            mutation_id: mutation_id.to_string(),
-            state,
-            mode: row.mutation.mode.clone(),
-            landing: ProjectConfigLanding::new(&scope, &relative_path),
-            observed_sha256: row
-                .conflict
-                .as_ref()
-                .map(|conflict| conflict.observed_sha256.clone()),
-            blocked_by: row.blocked_by.clone(),
-            owner_collector_unsupported,
-            owner_error: row
-                .last_error
-                .clone()
-                .filter(|_| state == CheckoutMutationProgress::Failed),
-            next_step,
-        })
+        Ok(guarded_mutation_status(&queue, row))
+    }
+
+    /// Retire whatever the current accepted publication incorporates on one
+    /// guarded path. The accepted view is re-read while the caller holds the
+    /// queue lock, as edit preparation does, and never taken from a snapshot
+    /// captured before it: a read that raced a newer publication and a newer
+    /// edit must not mark that edit published from bytes it never saw
+    /// published. Returns the accepted bytes it observed, or `None` when no
+    /// current accepted view of `scope` is available (nothing is retired).
+    fn observe_current_publication(
+        &self,
+        queue: &mut crate::checkout_mutations::CheckoutMutations,
+        project_id: &str,
+        scope: &PublishedScope,
+        target: &ProjectConfigTargetV1,
+    ) -> Option<Option<String>> {
+        let current = self.load_accepted_project_config(project_id).ok()?;
+        if &current.scope != scope {
+            return None;
+        }
+        let published = current.snapshot.accepted_bytes(target).map(str::to_owned);
+        if queue.observe_guarded_publication(scope, &target.relative_path(), published.as_deref()) {
+            self.checkout_mutations_persister.request();
+        }
+        Some(published)
+    }
+
+    /// The owner-lane edits of one configuration target that reads do not
+    /// reflect, newest last: queued and delivered edits, and failed edits
+    /// still standing against the current accepted bytes after the last edit
+    /// that applied or is pending. Whatever the current accepted publication
+    /// already incorporates is retired first, under the queue lock.
+    pub(crate) fn project_config_open_edits(
+        &self,
+        accepted: &AcceptedProjectConfig,
+        target: &ProjectConfigTargetV1,
+    ) -> Vec<ProjectConfigMutationStatus> {
+        let relative_path = target.relative_path();
+        let mut queue = self.checkout_mutations.write();
+        let published = self
+            .observe_current_publication(&mut queue, &accepted.project_id, &accepted.scope, target)
+            .unwrap_or_else(|| accepted.snapshot.accepted_bytes(target).map(str::to_owned));
+        let mut open = Vec::new();
+        let mut failures = Vec::new();
+        for row in queue.guarded_rows_for_path(&accepted.scope, &relative_path) {
+            match queue.progress(&row.mutation.mutation_id) {
+                Some(CheckoutMutationProgress::Queued | CheckoutMutationProgress::Delivered) => {
+                    failures.clear();
+                    open.push(row);
+                }
+                Some(
+                    CheckoutMutationProgress::Published | CheckoutMutationProgress::Reconciled,
+                ) => {
+                    failures.clear();
+                }
+                Some(_) => {
+                    let base = row
+                        .publication
+                        .as_ref()
+                        .and_then(|publication| publication.base_content_json.as_deref());
+                    if base == published.as_deref() {
+                        failures.push(row);
+                    }
+                }
+                None => {}
+            }
+        }
+        open.extend(failures);
+        open.into_iter()
+            .map(|row| guarded_mutation_status(&queue, row))
+            .collect()
+    }
+}
+
+fn guarded_mutation_status(
+    queue: &crate::checkout_mutations::CheckoutMutations,
+    row: &crate::checkout_mutations::PendingCheckoutMutation,
+) -> ProjectConfigMutationStatus {
+    let mutation_id = row.mutation.mutation_id.as_str();
+    let state = queue
+        .progress(mutation_id)
+        .expect("the row is in the queue");
+    let owner_collector_unsupported =
+        state == CheckoutMutationProgress::Queued && row.owner_unsupported_at.is_some();
+    let next_step = match state {
+        CheckoutMutationProgress::Queued if owner_collector_unsupported => "The checkout owner's collector does not support guarded configuration mutations, so the mutation is withheld rather than delivered unguarded. Upgrade the collector; the mutation stays queued and delivers on its next poll".to_string(),
+        CheckoutMutationProgress::Queued => COMMIT_TO_PUBLISH.to_string(),
+        CheckoutMutationProgress::Delivered => "Applied in the owner's checkout but not yet published. Commit and publish the file on the project's publisher ref; reads and dispatch keep the accepted configuration until then".to_string(),
+        CheckoutMutationProgress::Published => "Included in the accepted publication; reads and dispatch use it".to_string(),
+        CheckoutMutationProgress::Reconciled => "Applied, then superseded: a later edit on this file did not apply and the owner published other bytes, which reads, dispatch and the next edit now use".to_string(),
+        CheckoutMutationProgress::Conflicted => RECONCILE_AND_RETRY.to_string(),
+        CheckoutMutationProgress::Blocked => format!(
+            "Not delivered because predecessor {} did not apply. {RECONCILE_AND_RETRY}",
+            row.blocked_by.as_deref().unwrap_or("unknown")
+        ),
+        CheckoutMutationProgress::Failed => "The owner could not apply it and left its bytes unchanged. Resolve the reported cause in the owning checkout, then re-issue the edit".to_string(),
+    };
+    ProjectConfigMutationStatus {
+        mutation_id: mutation_id.to_string(),
+        state,
+        mode: row.mutation.mode.clone(),
+        landing: ProjectConfigLanding::new(&row.mutation.scope, &row.mutation.relative_path),
+        observed_sha256: row
+            .conflict
+            .as_ref()
+            .map(|conflict| conflict.observed_sha256.clone()),
+        blocked_by: row.blocked_by.clone(),
+        owner_collector_unsupported,
+        owner_error: row
+            .last_error
+            .clone()
+            .filter(|_| state == CheckoutMutationProgress::Failed),
+        next_step,
     }
 }
 

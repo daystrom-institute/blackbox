@@ -731,6 +731,20 @@ impl CheckoutMutations {
         )
     }
 
+    /// Every guarded mutation of one scope and path, settled or not, in
+    /// queue order.
+    pub fn guarded_rows_for_path<'a>(
+        &'a self,
+        scope: &'a PublishedScope,
+        relative_path: &'a str,
+    ) -> impl Iterator<Item = &'a PendingCheckoutMutation> + 'a {
+        self.store.mutations.iter().filter(move |row| {
+            row.mutation.guard.is_some()
+                && &row.mutation.scope == scope
+                && row.mutation.relative_path == relative_path
+        })
+    }
+
     pub fn get(&self, mutation_id: &str) -> Option<&PendingCheckoutMutation> {
         self.store
             .mutations

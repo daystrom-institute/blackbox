@@ -683,9 +683,13 @@ pub struct McpToolParams {
     /// refused before any store access.
     #[serde(default)]
     pub scope: Option<String>,
-    /// Project selector for scope=project, resolved daemon-side to the
-    /// durable store key in local bridge mode. Catalog mode refuses project
-    /// configuration because no remote owner transport exists. Omit for global scope.
+    /// Project selector for scope=project. Catalog mode: a catalog project
+    /// id, alias or attached checkout path; it never grants the daemon
+    /// filesystem access. Reads answer from the project's accepted
+    /// publication of `.bbox/mcp.json`, and mutations queue guarded edits for
+    /// the project's checkout owner that take effect after the owner commits
+    /// and publishes them. Bridge mode resolves it to the local project
+    /// directory. Omit for global scope.
     #[serde(default)]
     pub project: Option<String>,
     /// Filter pattern for allow/disallow (e.g. `mcp__blackbox__bro_*`).
@@ -831,18 +835,36 @@ fn action_inventory(p: &McpToolParams) -> Result<McpToolReply> {
             .mcp
             .enabled
             == Some(false);
+    Ok(inventory_reply(
+        scope,
+        &store_identity(&path),
+        &store,
+        disabled,
+    ))
+}
+
+fn inventory_reply(
+    scope: &'static str,
+    identity: &str,
+    store: &McpStore,
+    disabled: bool,
+) -> McpToolReply {
     let servers: BTreeMap<_, _> = store
         .servers
         .iter()
         .map(|(name, config)| (name.clone(), config.response_view()))
         .collect();
-    Ok(McpToolReply::Body {
+    McpToolReply::Body {
         scope,
-        selection: format!("mcp_inventory:{scope}:{}", store_identity(&path)),
+        selection: format!("mcp_inventory:{scope}:{identity}"),
         value: serde_json::json!({"servers": servers, "filters": store.filters,
             "contributes_to_dispatch": !disabled}),
-    })
+    }
 }
+
+/// The disabled-project reply for a project store whose committed
+/// `.bbox/config.toml` sets `[mcp] enabled = false`.
+const PROJECT_MCP_DISABLED: &str = "Project MCP is disabled in the project config; the selected project store contributes no servers. Dispatch falls back to the global store, which is a separate scope for bro_mcp list.\n";
 
 fn action_list(p: &McpToolParams) -> Result<String> {
     let scope = validate_selection(p)?;
@@ -855,9 +877,7 @@ fn action_list(p: &McpToolParams) -> Result<String> {
             let pd = p.project.as_deref().expect("validated above");
             let cfg = crate::config::load_project(Path::new(pd))?;
             if cfg.mcp.enabled == Some(false) {
-                return Ok(format!(
-                    "Project MCP is disabled in the project config; the selected project store contributes no servers. Dispatch falls back to the global store, which is a separate scope for bro_mcp list.\n"
-                ));
+                return Ok(PROJECT_MCP_DISABLED.to_string());
             }
             let project = McpStore::load(&project_store_path(Path::new(pd)))?;
             resolve_effective(&project, None, false)
@@ -879,7 +899,7 @@ const FILTER_DISPLAY_LIMIT: usize = 8;
 /// values stay recoverable through the paged detail reads (get, get_filters);
 /// list rows and mutation receipts never carry an unbounded echo.
 const DISPLAY_ECHO_CHARS: usize = 96;
-fn bounded_echo(text: &str) -> String {
+pub(crate) fn bounded_echo(text: &str) -> String {
     let count = text.chars().count();
     if count <= DISPLAY_ECHO_CHARS {
         return text.to_string();
@@ -995,19 +1015,23 @@ fn action_get(p: &McpToolParams) -> Result<McpToolReply> {
     let scope = validate_selection(p)?;
     let path = resolve_scope_path(p)?;
     let store = McpStore::load(&path)?;
+    Ok(get_reply(scope, &store_identity(&path), &store, name))
+}
+
+fn get_reply(scope: &'static str, identity: &str, store: &McpStore, name: &str) -> McpToolReply {
     match store.servers.get(name) {
-        Some(cfg) => Ok(McpToolReply::Body {
+        Some(cfg) => McpToolReply::Body {
             scope,
-            selection: format!("mcp_config:{scope}:{}:{name}", store_identity(&path)),
+            selection: format!("mcp_config:{scope}:{identity}:{name}"),
             value: serde_json::json!({
                 "name": name,
                 "config": cfg.response_view(),
             }),
-        }),
-        None => Ok(McpToolReply::Text(format!(
+        },
+        None => McpToolReply::Text(format!(
             "{}: not registered in the {scope} MCP store. The other scope is a separate store; list it explicitly with scope.",
             bounded_echo(name),
-        ))),
+        )),
     }
 }
 
@@ -1018,21 +1042,143 @@ fn action_get_filters(p: &McpToolParams) -> Result<McpToolReply> {
     let scope = validate_selection(p)?;
     let path = resolve_scope_path(p)?;
     let store = McpStore::load(&path)?;
-    Ok(McpToolReply::Body {
+    Ok(filters_reply(scope, &store_identity(&path), &store))
+}
+
+fn filters_reply(scope: &'static str, identity: &str, store: &McpStore) -> McpToolReply {
+    McpToolReply::Body {
         scope,
-        selection: format!("mcp_filters:{scope}:{}", store_identity(&path)),
+        selection: format!("mcp_filters:{scope}:{identity}"),
         value: serde_json::json!({
             "disallow": store.filters.disallow,
             "allow": store.filters.allow,
         }),
-    })
+    }
 }
 
-fn action_add(p: &McpToolParams) -> Result<String> {
+/// Answer a project-scope read from an accepted project store rather than a
+/// file. `identity` names the store in content-bound cursors; `store` is the
+/// accepted `.bbox/mcp.json` (`None` when the project publishes none, which
+/// is a verified empty store); `enabled` is `[mcp] enabled` from the
+/// committed `.bbox/config.toml`. Replies are the same selected-scope,
+/// bounded and redacted shapes a file-backed project store produces.
+pub(crate) fn read_accepted_project_store(
+    p: &McpToolParams,
+    identity: &str,
+    store: Option<&McpStore>,
+    enabled: Option<bool>,
+) -> Result<McpToolReply> {
+    use McpAction::*;
+    let scope = validate_selection(p)?;
+    anyhow::ensure!(
+        scope == "project",
+        "accepted project stores answer only scope=project"
+    );
+    let empty = McpStore::new();
+    let store = store.unwrap_or(&empty);
+    let disabled = enabled == Some(false);
+    match p.action {
+        List if p.body_limit.is_some() || p.cursor.is_some() => {
+            anyhow::ensure!(
+                p.limit.is_none() && p.offset.is_none(),
+                "exact list inventory uses cursor/body_limit; omit limit and offset"
+            );
+            Ok(inventory_reply(scope, identity, store, disabled))
+        }
+        List if disabled => Ok(McpToolReply::Text(PROJECT_MCP_DISABLED.to_string())),
+        List => Ok(McpToolReply::Text(render_server_list(
+            &resolve_effective(store, None, false),
+            scope,
+            p.project.as_deref(),
+            p.offset.unwrap_or(0),
+            p.limit.unwrap_or(20),
+        ))),
+        Get => Ok(get_reply(
+            scope,
+            identity,
+            store,
+            p.name.as_deref().context("'name' is required")?,
+        )),
+        GetFilters => Ok(filters_reply(scope, identity, store)),
+        other => anyhow::bail!("{other:?} is not a read action"),
+    }
+}
+
+/// One `bro_mcp` store mutation, validated from its parameters before any
+/// store is read. The same transformation serves the daemon-owned stores
+/// (under the store lock) and catalog project stores (over the checkout-owner
+/// lane's private edit base), so both keep one set of transport, secret
+/// representation, normalization and merge rules.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum McpStoreEdit {
+    Add {
+        name: String,
+        config: McpServerConfig,
+    },
+    Remove {
+        name: String,
+    },
+    Filter {
+        pattern: String,
+        disallow: bool,
+    },
+    ClearFilters,
+}
+
+impl McpStoreEdit {
+    pub(crate) fn from_params(p: &McpToolParams) -> Result<Self> {
+        validate_selection(p)?;
+        match p.action {
+            McpAction::Add => {
+                let (name, config) = add_config(p)?;
+                Ok(Self::Add { name, config })
+            }
+            McpAction::Remove => Ok(Self::Remove {
+                name: p.name.clone().context("'name' is required")?,
+            }),
+            McpAction::Allow | McpAction::Disallow => Ok(Self::Filter {
+                pattern: normalize_filter_pattern(
+                    p.pattern.as_deref().context("'pattern' is required")?,
+                ),
+                disallow: p.action == McpAction::Disallow,
+            }),
+            McpAction::ClearFilters => Ok(Self::ClearFilters),
+            other => anyhow::bail!("{other:?} is not a store mutation"),
+        }
+    }
+
+    /// Apply the edit. Returns whether the store changed.
+    pub(crate) fn apply(&self, store: &mut McpStore) -> bool {
+        match self {
+            Self::Add { name, config } => {
+                store.servers.insert(name.clone(), config.clone()).as_ref() != Some(config)
+            }
+            Self::Remove { name } => store.servers.remove(name).is_some(),
+            Self::Filter { pattern, disallow } => {
+                let list = if *disallow {
+                    &mut store.filters.disallow
+                } else {
+                    &mut store.filters.allow
+                };
+                if list.iter().any(|existing| existing == pattern) {
+                    return false;
+                }
+                list.push(pattern.clone());
+                true
+            }
+            Self::ClearFilters => {
+                let had = !store.filters.is_empty();
+                store.filters = McpFilters::default();
+                had
+            }
+        }
+    }
+}
+
+fn add_config(p: &McpToolParams) -> Result<(String, McpServerConfig)> {
     let name = p.name.as_deref().context("'name' is required")?;
     let url = p.url.as_deref().context("'url' is required")?;
     let transport = p.transport.as_deref().unwrap_or("http");
-    let scope = validate_selection(p)?;
     let headers: BTreeMap<String, SecretString> = p
         .headers
         .clone()
@@ -1065,28 +1211,54 @@ fn action_add(p: &McpToolParams) -> Result<String> {
             "Transport '{other}' is not supported by bro_mcp add; supported transports are http and sse. stdio servers have no add lane: the store owner must write them directly."
         ),
     };
+    Ok((name.to_string(), config))
+}
 
+/// Parse MCP store bytes that are not a daemon-owned file (an accepted
+/// project store, or a queued edit of one). Errors carry the failure class
+/// and position only: serde messages can quote values, and a store may hold
+/// credentials.
+pub(crate) fn parse_store_text(text: &str) -> Result<McpStore> {
+    serde_json::from_str(text).map_err(|error| {
+        let class = match error.classify() {
+            serde_json::error::Category::Io => "unreadable",
+            serde_json::error::Category::Syntax => "malformed JSON",
+            serde_json::error::Category::Data => "a value of the wrong shape",
+            serde_json::error::Category::Eof => "truncated JSON",
+        };
+        anyhow::anyhow!(
+            "the project MCP store has {class} at line {}, column {}",
+            error.line(),
+            error.column()
+        )
+    })
+}
+
+fn action_add(p: &McpToolParams) -> Result<String> {
+    let scope = validate_selection(p)?;
+    let edit = McpStoreEdit::from_params(p)?;
     let path = resolve_scope_path(p)?;
     crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
-        store.servers.insert(name.to_string(), config);
+        edit.apply(&mut store);
         store.save(&path)
     })?;
 
     Ok(format!(
         "Saved {} to the {scope} MCP store (daemon-owned; values redacted in replies). Dispatched bros receive it through per-dispatch injection; no provider CLI registration exists.",
-        bounded_echo(name)
+        bounded_echo(p.name.as_deref().expect("validated by the edit"))
     ))
 }
 
 fn action_remove(p: &McpToolParams) -> Result<String> {
-    let name = p.name.as_deref().context("'name' is required")?;
     let scope = validate_selection(p)?;
+    let edit = McpStoreEdit::from_params(p)?;
+    let name = p.name.as_deref().expect("validated by the edit");
 
     let path = resolve_scope_path(p)?;
     let had = crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
-        let had = store.servers.remove(name).is_some();
+        let had = edit.apply(&mut store);
         store.save(&path)?;
         Ok(had)
     })?;
@@ -1105,25 +1277,21 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
 }
 
 fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
-    let pattern = p.pattern.as_deref().context("'pattern' is required")?;
-    let normalized = normalize_filter_pattern(pattern);
     let scope = validate_selection(p)?;
+    let edit = McpStoreEdit::from_params(p)?;
+    let normalized = match &edit {
+        McpStoreEdit::Filter { pattern, .. } => pattern.clone(),
+        _ => unreachable!("allow and disallow build filter edits"),
+    };
     let path = resolve_scope_path(p)?;
     crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
-
-        let list = if disallow {
-            &mut store.filters.disallow
-        } else {
-            &mut store.filters.allow
-        };
-        if list.iter().any(|p| p == &normalized) {
+        if !edit.apply(&mut store) {
             return Ok(format!(
                 "{} pattern {normalized} already present",
                 if disallow { "disallow" } else { "allow" }
             ));
         }
-        list.push(normalized.clone());
         store.save(&path)?;
         Ok(String::new())
     })?;
@@ -1137,11 +1305,11 @@ fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
 
 fn action_clear_filters(p: &McpToolParams) -> Result<String> {
     let scope = validate_selection(p)?;
+    let edit = McpStoreEdit::from_params(p)?;
     let path = resolve_scope_path(p)?;
     let had = crate::json_store::with_store_lock(&path.clone(), || {
         let mut store = McpStore::load(&path)?;
-        let had = !store.filters.is_empty();
-        store.filters = McpFilters::default();
+        let had = edit.apply(&mut store);
         store.save(&path)?;
         Ok(had)
     })?;
