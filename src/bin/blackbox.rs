@@ -1066,48 +1066,68 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
 }
 
 /// Producer claims administration. `list` is a lock-free read. `revoke`
-/// writes the store a running daemon holds in memory and persists whole, so
-/// it takes the offline-administration lifetime claim on the configured
-/// projects path before opening the store and holds it through the durable
-/// flush: with a daemon running it refuses with `error.project_catalog_cli_lock`
-/// and writes nothing.
+/// writes the store a running daemon holds in memory and persists whole; see
+/// `revoke_producer_claim` for its exclusion.
 fn execute_producer_claims(args: ProducerClaimsArgs) -> Result<serde_json::Value, CommandFailure> {
     let config = load_config(args.config)?;
-    let path = config.paths.producer_claims_path;
-    let open_store = || {
-        ProducerClaims::open(&path)
-            .map(|claims| Arc::new(parking_lot::RwLock::new(claims)))
+    match args.command {
+        ProducerClaimsCommand::List => serialize_result(
+            &open_producer_claims(&config.paths.producer_claims_path)?
+                .read()
+                .claims()
+                .to_vec(),
+        ),
+        ProducerClaimsCommand::Revoke(args) => revoke_producer_claim(&config, args, || {}),
+    }
+}
+
+fn open_producer_claims(
+    path: &Path,
+) -> Result<Arc<parking_lot::RwLock<ProducerClaims>>, CommandFailure> {
+    ProducerClaims::open(path)
+        .map(|claims| Arc::new(parking_lot::RwLock::new(claims)))
+        .map_err(|_| {
+            CommandFailure::new(
+                "error.producer_claims_store",
+                "producer claims store is invalid or unreadable",
+            )
+        })
+}
+
+/// Revoke one producer claim offline. The exclusive lifetime lock on the
+/// configured projects path is taken before the claims store is opened and
+/// held, never downgraded, through the durable flush: a running daemon holds
+/// it shared, so revoke refuses with `error.project_catalog_cli_lock` and
+/// writes nothing, and a daemon starting meanwhile blocks on its shared
+/// acquisition (taken before it loads producer claims) until the revocation
+/// is on disk. `before_flush` runs after the in-memory revoke, before the
+/// flush.
+fn revoke_producer_claim(
+    config: &config::Config,
+    args: ProducerClaimRevokeArgs,
+    before_flush: impl FnOnce(),
+) -> Result<serde_json::Value, CommandFailure> {
+    let scope = parse_claim_scope(&args.scope)?;
+    let _claim = acquire_admin_exclusive_claim(&config.paths.projects_path)?;
+    let path = &config.paths.producer_claims_path;
+    let store = open_producer_claims(path)?;
+    let revoked = store.write().revoke(&args.producer, &scope);
+    before_flush();
+    if revoked {
+        StorePersister::spawn("producer-claims-cli", store, path.clone())
+            .flush_blocking()
             .map_err(|_| {
                 CommandFailure::new(
                     "error.producer_claims_store",
-                    "producer claims store is invalid or unreadable",
+                    "producer claims store could not be persisted durably",
                 )
-            })
-    };
-    match args.command {
-        ProducerClaimsCommand::List => serialize_result(&open_store()?.read().claims().to_vec()),
-        ProducerClaimsCommand::Revoke(args) => {
-            let scope = parse_claim_scope(&args.scope)?;
-            let _claim = acquire_admin_lifetime_claim(&config.paths.projects_path)?;
-            let store = open_store()?;
-            let revoked = store.write().revoke(&args.producer, &scope);
-            if revoked {
-                StorePersister::spawn("producer-claims-cli", store, path)
-                    .flush_blocking()
-                    .map_err(|_| {
-                        CommandFailure::new(
-                            "error.producer_claims_store",
-                            "producer claims store could not be persisted durably",
-                        )
-                    })?;
-            }
-            Ok(serde_json::json!({
-                "producer_id": args.producer,
-                "scope": scope,
-                "revoked": revoked,
-            }))
-        }
+            })?;
     }
+    Ok(serde_json::json!({
+        "producer_id": args.producer,
+        "scope": scope,
+        "revoked": revoked,
+    }))
 }
 
 fn parse_claim_scope(value: &str) -> Result<PublishedScope, CommandFailure> {
@@ -2411,6 +2431,48 @@ mod tests {
     }
 
     #[test]
+    fn producer_claim_revoke_excludes_daemon_startup_until_the_revocation_is_flushed() {
+        let (_directory, config_path, state_dir, claims_path) = producer_claims_fixture();
+        let config = load_config(Some(config_path)).unwrap();
+        let projects_path = state_dir.join("projects.json");
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let mut daemon = None;
+        let mut loaded_before_flush = None;
+
+        let revoked = revoke_producer_claim(
+            &config,
+            ProducerClaimRevokeArgs {
+                producer: "producer-a".into(),
+                scope: "repo-a/.".into(),
+            },
+            || {
+                // A daemon starting now takes the lifetime lock shared before
+                // it loads producer claims, as daemon open does.
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                daemon = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let lock = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
+                    let claims = ProducerClaims::open(&claims_path).unwrap().claims().len();
+                    loaded_tx.send(claims).unwrap();
+                    drop(lock);
+                }));
+                started_rx.recv().unwrap();
+                loaded_before_flush = loaded_rx
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .ok();
+            },
+        )
+        .unwrap();
+        assert_eq!(revoked["revoked"], true);
+        assert_eq!(
+            loaded_before_flush, None,
+            "a starting daemon loaded producer claims before the revocation was flushed"
+        );
+        daemon.unwrap().join().unwrap();
+        assert_eq!(loaded_rx.recv().unwrap(), 0);
+    }
+
+    #[test]
     fn durable_publication_delete_is_idempotent_across_resume() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -3184,7 +3246,21 @@ mod tests {
 fn acquire_admin_lifetime_claim(
     projects_path: &Path,
 ) -> Result<ProjectCatalogMigrationLock, CommandFailure> {
-    let exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(projects_path)
+    acquire_admin_exclusive_claim(projects_path)?
+        .downgrade_to_shared()
+        .map_err(|error| {
+            CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
+        })
+}
+
+/// The exclusive lifetime lock on one projects path, for offline writers
+/// that open no project store of their own and so keep it exclusive for
+/// their whole write. Refuses with `error.project_catalog_cli_lock` while a
+/// daemon holds it shared.
+fn acquire_admin_exclusive_claim(
+    projects_path: &Path,
+) -> Result<ProjectCatalogMigrationLock, CommandFailure> {
+    ProjectCatalogMigrationLock::try_acquire_exclusive(projects_path)
         .map_err(|error| {
             CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
         })?
@@ -3194,10 +3270,7 @@ fn acquire_admin_lifetime_claim(
                 "the lifetime migration lock is held; stop the daemon before \
                  offline administration",
             )
-        })?;
-    exclusive.downgrade_to_shared().map_err(|error| {
-        CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
-    })
+        })
 }
 
 /// Open a strict v2 store for offline administration: the exclusive
