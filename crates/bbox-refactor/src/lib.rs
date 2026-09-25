@@ -34,11 +34,11 @@ pub use rust::*;
 mod java;
 use java::*;
 pub use java::{
-    FileJavaMethodRegionsFacts, JavaComponentTreeConsumptionFact, JavaFieldTouchFact,
-    JavaMethodRegionExtractability, JavaMethodRegionFact, JavaMethodRegionRequest,
-    JavaMethodRegionStatementFilterSummary, JavaMethodRegionStatementSummary,
-    JavaMethodRegionsOptions, JavaNonLocalControlFlowFact, JavaRegionVariableFact,
-    JavaWhitespaceRange, UnusedCtorParamsPlan, analyze_java_method_regions,
+    FileJavaMethodRegionsFacts, JAVA_EXTRACT_CALL_SITE_ITEM_KIND, JavaComponentTreeConsumptionFact,
+    JavaFieldTouchFact, JavaMethodRegionExtractability, JavaMethodRegionFact,
+    JavaMethodRegionRequest, JavaMethodRegionStatementFilterSummary,
+    JavaMethodRegionStatementSummary, JavaMethodRegionsOptions, JavaNonLocalControlFlowFact,
+    JavaRegionVariableFact, JavaWhitespaceRange, UnusedCtorParamsPlan, analyze_java_method_regions,
     analyze_java_method_regions_with_options, analyze_unused_constructor_params, java_hygiene_file,
     java_hygiene_file_scoped, normalize_java_whitespace_file,
     normalize_java_whitespace_file_scoped, normalize_java_whitespace_text, organize_java_imports,
