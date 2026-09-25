@@ -2707,14 +2707,14 @@ impl Tool for JavaExtractMethodCodeBlock {
         "java.extractMethodCodeBlock"
     }
     fn description(&self) -> &str {
-        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses mutated captures, unsafe multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
+        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses selections that are not whole sibling statements, mutated captures, unsafe multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge plus the exact call-site {replacement} span — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Workspace-relative Java source file." },
-                "oldText": { "type": "string", "description": "Exact contiguous source text to extract. Must match exactly once." },
+                "oldText": { "type": "string", "description": "Exact contiguous source text to extract: whole sibling statements of one block (surrounding whitespace and comments allowed). Must match exactly once." },
                 "methodName": { "type": "string", "description": "Name of the new helper method." },
                 "className": { "type": "string", "description": "Optional enclosing class name when the file has multiple classes." },
                 "visibility": { "type": "string", "enum": ["private", "package-private", "protected", "public"], "description": "Helper visibility. Default private." },
@@ -2726,7 +2726,7 @@ impl Tool for JavaExtractMethodCodeBlock {
                 "resultRecord": { "type": "boolean", "description": "Opt in to generated nested-record result bundle when the selected block has multiple live-out locals. Default false: multi-live-out blocks still refuse." },
                 "resultRecordName": { "type": "string", "description": "Optional generated record type name when resultRecord is true. Default <MethodName>Result." },
                 "resultRecordVar": { "type": "string", "description": "Optional call-site local name for the helper result record. Default <methodName>Result." },
-                "previewOnly": { "type": "boolean", "description": "Run the planner but omit edit payloads; returns would_change_files and findings." }
+                "previewOnly": { "type": "boolean", "description": "Run the planner but omit edit payloads; returns replacement, would_change_files and findings." }
             },
             "required": ["file", "oldText", "methodName"]
         })
@@ -2829,6 +2829,8 @@ impl Tool for JavaExtractMethodCodeBlock {
                         " — run analysis.methodRegions to see mutated captures before choosing a smaller range"
                     } else if msg.contains("non_local_control_flow") {
                         " — run analysis.methodRegions to locate the return/break/continue gate before mutating"
+                    } else if msg.contains("selection_not_statement_aligned") {
+                        " — run analysis.methodRegions on the enclosing method to see its statement regions, then rebuild oldText with code.readLines({ file, startLine, endLine }) over one of the aligned line ranges named above"
                     } else {
                         ""
                     };
@@ -2851,6 +2853,10 @@ impl Tool for JavaExtractMethodCodeBlock {
                     Ok(converted) => converted,
                     Err(e) => return err(format!("java.extractMethodCodeBlock: {e}")),
                 };
+            let replacement = match extract_method_call_site_replacement(&root, &plan) {
+                Ok(replacement) => replacement,
+                Err(e) => return err(format!("java.extractMethodCodeBlock: {e}")),
+            };
             let preview_only = params.preview_only.unwrap_or(false);
             if preview_only {
                 changes.clear();
@@ -2863,6 +2869,7 @@ impl Tool for JavaExtractMethodCodeBlock {
             ToolResult::Json(json!({
                 "title": plan.title,
                 "changes": changes,
+                "replacement": replacement,
                 "findings": findings,
                 "preview_only": preview_only,
                 "would_change_files": changed_files,
@@ -2872,6 +2879,46 @@ impl Tool for JavaExtractMethodCodeBlock {
         })
         .await
     }
+}
+
+/// The call-site replacement the extract plan makes: the planner's call-site
+/// item joined with the edit whose byte range it names. Present in normal and
+/// preview mode, so a preview states exactly what an apply would replace.
+fn extract_method_call_site_replacement(
+    root: &Path,
+    plan: &bbox_refactor::RefactorPlan,
+) -> Result<Value, String> {
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.kind == bbox_refactor::JAVA_EXTRACT_CALL_SITE_ITEM_KIND)
+        .ok_or("planner did not report the call-site span")?;
+    let (file_edit, edit) = plan
+        .edits
+        .iter()
+        .find_map(|file_edit| {
+            file_edit
+                .edits
+                .iter()
+                .find(|edit| edit.byte_start == item.byte_start && edit.byte_end == item.byte_end)
+                .map(|edit| (file_edit, edit))
+        })
+        .ok_or("planner call-site span matches no emitted edit")?;
+    let statement_count = item
+        .attributes
+        .iter()
+        .find_map(|attr| attr.strip_prefix("statement_count="))
+        .and_then(|count| count.parse::<usize>().ok())
+        .ok_or("planner call-site item has no statement_count")?;
+    Ok(json!({
+        "file": relativize(root, &file_edit.path)?,
+        "byte_start": item.byte_start,
+        "byte_end": item.byte_end,
+        "start_line": item.line_start,
+        "end_line": item.line_end,
+        "statement_count": statement_count,
+        "call_site_text": edit.replacement,
+    }))
 }
 
 /// `java.renameSymbol` — project-wide syntax-backed Java symbol rename.
@@ -11433,7 +11480,11 @@ WHAT IT DOES
 
 PARAMS
   file: string          workspace-relative .java file
-  oldText: string       exact contiguous source text to extract; must match once
+  oldText: string       exact contiguous source text to extract; must match once.
+                        After trimming surrounding whitespace and comments it
+                        must start at a statement's first byte and end at a
+                        statement's last byte, both children of the same block
+                        (or constructor body, or switch group)
   methodName: string    new helper method name
   className?: string    optional enclosing class when the file has multiple classes
   visibility?: "private" | "package-private" | "protected" | "public"
@@ -11456,10 +11507,17 @@ PARAMS
   resultRecordVar?: string
                         call-site local name for the helper result record.
                         Default <methodName>Result.
-  previewOnly?: boolean run the planner but return [] changes and only summaries/findings
+  previewOnly?: boolean run the planner but return [] changes and only
+                        replacement/summaries/findings
 
-RETURNS { title, changes, findings, preview_only, would_change_files, fixme_count, provenance }
+RETURNS { title, changes, replacement, findings, preview_only, would_change_files, fixme_count, provenance }
   changes: hash-anchored {span,new_text}[] for edits.merge
+  replacement: { file, byte_start, byte_end, start_line, end_line,
+                 statement_count, call_site_text }
+                        the source range the call site replaces (lines 1-based,
+                        inclusive) and the text replacing it. Present in both
+                        preview and normal mode; its byte range equals the
+                        call-site change's span in normal mode
   findings: planner notes such as enclosing method/static helper facts
   would_change_files: edit summaries; present in both preview and normal mode
 
@@ -11476,6 +11534,14 @@ REFUSALS
                                     inferred helper parameter has `var`/inferred type;
                                     pass explicit parameters/arguments
   error.non_local_control_flow      return/break/continue would cross the extraction boundary
+  error.selection_not_statement_aligned
+                                    oldText cuts a statement or a brace, or spans
+                                    two blocks; names the line range of the
+                                    smallest aligned run containing it and of
+                                    the largest aligned run inside it. Rebuild
+                                    oldText from one of those ranges: see
+                                    analysis.methodRegions statement regions,
+                                    then code.readLines({ file, startLine, endLine })
   oldText match failures            selected text must match exactly once
 
 RECIPE
@@ -13727,7 +13793,8 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
 type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
 type JavaNestAccessBreakFinding = { finding: "nest_access_break"; referencing_member: string; referenced_member: string; referenced_member_kind: "type" | "constructor" | "method" | "field"; declaring_nested_type: string | null; declaring_type: string; reference_count: number; resolution_hint: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
-type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
+type JavaExtractMethodReplacement = { file: string; byte_start: number; byte_end: number; start_line: number; end_line: number; statement_count: number; call_site_text: string };
+type JavaExtractMethodResult = { title: string; changes: SpanChange[]; replacement: JavaExtractMethodReplacement; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaDelete = { path: string; content_sha256: string };
 type JavaMoveResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: JavaDelete[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count?: number; replacement_bytes?: number }[]; would_create_files: { path: string; bytes?: number }[]; would_delete_files: { path: string }[]; provenance: "lsp_verified" };
 type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; file_rename_advisory: { from: string; to: string }[]; provenance: "syntax_only" };
@@ -13764,7 +13831,7 @@ declare const java: {
   extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; nest_access_breaks: JavaNestAccessBreakFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
-  /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
+  /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge; replacement names the exact span the call site replaces (also in previewOnly). Refuses selections that are not whole sibling statements, mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
   extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; resultRecord?: boolean; resultRecordName?: string; resultRecordVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
   /** Rename one Java simple symbol across declaration/reference sites. Does not rename files; inspect file_rename_advisory for public type renames. */
   renameSymbol(args: { oldName: string; newName: string; file?: string; itemKinds?: string[]; previewOnly?: boolean }): Promise<JavaRenameResult>;
@@ -14908,6 +14975,99 @@ public class OrderService {
                 .any(|file| file["path"] == "src/com/acme/Auto.java"),
             "{result}"
         );
+    }
+
+    const EXTRACT_ALIGN_FIXTURE: &str = "class Align {\n\
+        \x20   void run(int x) {\n\
+        \x20       int a = x + 1;\n\
+        \x20       if (a > 0) {\n\
+        \x20           System.out.println(a);\n\
+        \x20           System.out.println(x);\n\
+        \x20       }\n\
+        \x20   }\n\
+         }\n";
+
+    #[tokio::test]
+    async fn extract_method_code_block_preview_and_apply_report_same_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Align.java"), EXTRACT_ALIGN_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+        let selected = "            System.out.println(a);\n            System.out.println(x);\n";
+        let input = json!({
+            "file": "src/Align.java",
+            "oldText": selected,
+            "methodName": "logBoth"
+        });
+        let mut preview_input = input.clone();
+        preview_input["previewOnly"] = json!(true);
+
+        let normal = json_of(JavaExtractMethodCodeBlock.call(input, &cx).await);
+        let preview = json_of(JavaExtractMethodCodeBlock.call(preview_input, &cx).await);
+
+        let start = EXTRACT_ALIGN_FIXTURE.find(selected).unwrap();
+        let replacement = &normal["replacement"];
+        assert_eq!(replacement["file"], "src/Align.java", "{normal}");
+        assert_eq!(replacement["byte_start"], start, "{normal}");
+        assert_eq!(replacement["byte_end"], start + selected.len(), "{normal}");
+        assert_eq!(replacement["start_line"], 5, "{normal}");
+        assert_eq!(replacement["end_line"], 6, "{normal}");
+        assert_eq!(replacement["statement_count"], 2, "{normal}");
+        assert!(
+            replacement["call_site_text"]
+                .as_str()
+                .unwrap()
+                .contains("logBoth(a, x);"),
+            "{normal}"
+        );
+        assert_eq!(preview["preview_only"], true, "{preview}");
+        assert!(
+            preview["changes"].as_array().unwrap().is_empty(),
+            "{preview}"
+        );
+        assert_eq!(preview["replacement"], normal["replacement"]);
+
+        let call_site = normal["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["new_text"] == replacement["call_site_text"])
+            .expect("call-site change");
+        assert_eq!(call_site["span"]["file"], replacement["file"]);
+        assert_eq!(call_site["span"]["byte_start"], replacement["byte_start"]);
+        assert_eq!(call_site["span"]["byte_end"], replacement["byte_end"]);
+    }
+
+    #[tokio::test]
+    async fn extract_method_code_block_refuses_misaligned_selection_with_repair_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Align.java"), EXTRACT_ALIGN_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        for old_text in ["System.out.println(x)", "System.out.println(x);\n        }"] {
+            let result = JavaExtractMethodCodeBlock
+                .call(
+                    json!({
+                        "file": "src/Align.java",
+                        "oldText": old_text,
+                        "methodName": "logX",
+                        "previewOnly": true
+                    }),
+                    &cx,
+                )
+                .await;
+            match result {
+                ToolResult::Error(e) => {
+                    assert!(e.contains("error.selection_not_statement_aligned"), "{e}");
+                    assert!(e.contains("analysis.methodRegions"), "{e}");
+                    assert!(e.contains("code.readLines"), "{e}");
+                }
+                other => panic!("expected alignment refusal for {old_text:?}, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -10373,6 +10373,185 @@ fn extract_java_code_block_to_method_reindents_deep_nested_helper_body() {
     );
 }
 
+const ALIGN_FIXTURE: &str = "package p;\n\
+     class Align {\n\
+     \x20   void run(int x) {\n\
+     \x20       int a = x + 1;\n\
+     \x20       if (a > 0) {\n\
+     \x20           // log both\n\
+     \x20           System.out.println(a);\n\
+     \x20           System.out.println(x); // tail\n\
+     \x20       }\n\
+     \x20       System.out.println(\"done\");\n\
+     \x20   }\n\
+     }\n";
+
+fn align_extract_params(dir: &Path, source: &str, old_text: &str) -> RefactorPlanParams {
+    let path = dir.join("Align.java");
+    fs::write(&path, source).unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir));
+    params.old_text = Some(old_text.to_string());
+    params.module_name = Some("logBoth".to_string());
+    params
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_selection_short_of_statement_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let params = align_extract_params(&root, ALIGN_FIXTURE, "int a = x + 1");
+
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(err.contains("old_text (line 4)"), "{err}");
+    assert!(
+        err.contains("smallest statement-aligned run containing it: line 4 (1 statement)"),
+        "{err}"
+    );
+    assert!(!err.contains("largest statement-aligned run"), "{err}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_selection_with_dangling_brace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let params = align_extract_params(
+        &root,
+        ALIGN_FIXTURE,
+        "System.out.println(x); // tail\n        }",
+    );
+
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(err.contains("old_text (lines 8-9)"), "{err}");
+    assert!(
+        err.contains("smallest statement-aligned run containing it: lines 5-9 (1 statement)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("largest statement-aligned run inside it: line 8 (1 statement)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_selection_spanning_two_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let params = align_extract_params(
+        &root,
+        ALIGN_FIXTURE,
+        "System.out.println(x); // tail\n        }\n        System.out.println(\"done\");",
+    );
+
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(
+        err.contains("smallest statement-aligned run containing it: lines 5-10 (2 statements)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("largest statement-aligned run inside it: line 10 (1 statement)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_trims_comments_and_reports_call_site_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let selected = "            // log both\n            System.out.println(a);\n            System.out.println(x); // tail\n";
+    let params = align_extract_params(&root, ALIGN_FIXTURE, selected);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+
+    let start = ALIGN_FIXTURE.find(selected).unwrap();
+    let end = start + selected.len();
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.kind == crate::JAVA_EXTRACT_CALL_SITE_ITEM_KIND)
+        .expect("call-site item");
+    assert_eq!((item.byte_start, item.byte_end), (start, end));
+    assert_eq!((item.line_start, item.line_end), (6, 8));
+    assert_eq!(item.attributes, vec!["statement_count=2".to_string()]);
+    let call_site = plan.edits[0]
+        .edits
+        .iter()
+        .find(|edit| edit.byte_start == item.byte_start)
+        .expect("call-site edit");
+    assert_eq!(call_site.byte_end, item.byte_end);
+    assert!(
+        call_site.replacement.contains("logBoth(a, x);"),
+        "{}",
+        call_site.replacement
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_accepts_constructor_and_switch_group_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = "package p;\n\
+         class Align {\n\
+         \x20   Align(int x) {\n\
+         \x20       int y = x;\n\
+         \x20       System.out.println(y);\n\
+         \x20   }\n\
+         \x20   void run(int x) {\n\
+         \x20       switch (x) {\n\
+         \x20           case 1:\n\
+         \x20               System.out.println(\"one\");\n\
+         \x20               System.out.println(\"uno\");\n\
+         \x20               break;\n\
+         \x20           default:\n\
+         \x20               break;\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n";
+
+    let params = align_extract_params(&root, source, "int y = x;\n        System.out.println(y);");
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    assert_eq!(
+        plan.items[0].attributes,
+        vec!["statement_count=2".to_string()]
+    );
+
+    let params = align_extract_params(
+        &root,
+        source,
+        "System.out.println(\"one\");\n                System.out.println(\"uno\");",
+    );
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    assert_eq!(
+        plan.items[0].attributes,
+        vec!["statement_count=2".to_string()]
+    );
+    assert_eq!((plan.items[0].line_start, plan.items[0].line_end), (10, 11));
+}
+
 #[test]
 fn method_regions_reports_live_outs_and_field_touches_for_candidate_range() {
     let dir = tempfile::tempdir().unwrap();
