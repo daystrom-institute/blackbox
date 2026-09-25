@@ -435,23 +435,26 @@ impl FleetdExecutor {
     /// sessions behind it. Only a new connection pays for the round trip; a
     /// live one returns immediately.
     ///
-    /// A connection whose sweep failed is never kept: it is cancelled and
-    /// the slot left empty, so the next caller redials and sweeps again
-    /// instead of taking the live-connection fast path past sessions that
-    /// were never reattached.
+    /// A new connection is installed only after its sweep succeeded. One
+    /// whose sweep failed, or whose attempt was dropped mid-sweep (a caller
+    /// cancelled while `ListSessions` was pending), is cancelled and never
+    /// installed, so the next caller redials and sweeps again instead of
+    /// taking the live-connection fast path past sessions that were never
+    /// reattached.
     async fn lane_locked(&self, connection: &mut Option<Connection>) -> anyhow::Result<Lane> {
         if let Some(live) = connection.as_ref()
             && live.is_alive()
         {
             return Ok(live.lane());
         }
+        *connection = None;
         let fresh = self.dial().await?;
         let lane = fresh.lane();
-        *connection = Some(fresh);
+        // Tears the new connection's actors down unless the sweep completes.
+        let abandoned = lane.cancel.clone().drop_guard();
 
         if let Err(error) = readopt_live_sessions(&self.shared, &lane).await {
-            lane.cancel.cancel();
-            *connection = None;
+            drop(abandoned);
             tracing::warn!(
                 %error,
                 generation = lane.generation,
@@ -459,6 +462,8 @@ impl FleetdExecutor {
             );
             return Err(error.context("fleetd re-adoption failed on a new connection"));
         }
+        abandoned.disarm();
+        *connection = Some(fresh);
         Ok(lane)
     }
 
@@ -2950,6 +2955,111 @@ mod tests {
         assert_eq!(resumed.is_error, Some(true), "{text}");
         assert!(text.contains("no new worker was started"), "{text}");
         assert!(state.task_store.read().all_tasks().is_empty());
+    }
+
+    /// A caller dropped while its new connection's sweep is waiting on
+    /// `ListSessions` (a cancelled request handler) must not leave that
+    /// connection behind: the next caller redials and re-adopts the survivor
+    /// before it gets a lane, instead of taking the fast path onto a
+    /// connection that never reattached anything.
+    #[tokio::test]
+    async fn a_caller_dropped_mid_sweep_leaves_no_unreconciled_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = Arc::new(parking_lot::RwLock::new(
+            crate::orchestration::TaskStore::new(),
+        ));
+        let (tail_tx, _tail_rx) = tokio::sync::broadcast::channel(32);
+        let task = crate::orchestration::spawn_in_process_task(
+            "task-sess-survivor".to_string(),
+            bro_core::Provider::Glm,
+            "sess-survivor".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("task-sess-survivor".to_string(), task.clone())
+            .ok();
+        {
+            let mut inner = task.inner.lock();
+            inner.status = crate::orchestration::TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.harness_ingest_seq = 7;
+        }
+        crate::orchestration::install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store,
+            tail_tx,
+            None,
+            None,
+        );
+        let fake = FakeFleetd::serve_with(
+            &root,
+            vec![summary(
+                "sess-survivor",
+                SessionState::Running,
+                Some(9),
+                None,
+            )],
+            ReplayScript::Silent,
+            Script {
+                lists: ListScript::SilentFirstConnection,
+                ..Script::default()
+            },
+        );
+        let mut config = fast_config(&root);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        // Long enough that only the abort, never the deadline, ends the sweep.
+        config.list_sessions_timeout = Duration::from_secs(30);
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        let pending = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.lane().await.map(|_| ()) }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fake.lists.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(
+            executor.connection.lock().await.is_none(),
+            "an abandoned sweep must not leave its connection installed"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), executor.lane())
+            .await
+            .expect("the next caller is served")
+            .unwrap();
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            2,
+            "the next caller redialed"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running,
+            "the survivor was reattached before the lane was served"
+        );
+        settle().await;
+        assert_eq!(
+            fake.replays.lock().as_slice(),
+            [("sess-survivor".to_string(), 7)]
+        );
     }
 }
 
