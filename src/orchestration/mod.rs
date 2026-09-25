@@ -6,6 +6,7 @@ pub mod brofile;
 pub mod executor;
 pub mod fleetd_client;
 pub mod mcp;
+pub mod project_config;
 pub mod providers;
 pub mod resume_lease;
 pub mod supervision;

@@ -112,6 +112,26 @@ pub(crate) fn publish_from_ready_candidate(
             "current producer grant resolves the candidate to another project",
         ));
     }
+    // Configuration is parsed in the daemon's configuration domain before it
+    // can become accepted: a candidate whose configuration does not parse is
+    // refused whole, so it never displaces a valid accepted generation.
+    if let Some(config) = &candidate.config {
+        crate::orchestration::project_config::ProjectConfigSnapshot::parse(
+            crate::orchestration::project_config::ProjectConfigProvenance {
+                project_id: project_id.as_str().to_string(),
+                accepted_generation: candidate.source_generation_id.clone(),
+                accepted_commit: candidate.descriptor.publisher_commit.clone(),
+            },
+            &candidate.descriptor.scope,
+            config.iter().map(|file| {
+                (
+                    file.manifest.repository_relative_filename.as_str(),
+                    file.source_bytes.as_slice(),
+                )
+            }),
+        )
+        .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+    }
     let expected_generation = candidate.source_generation_id.clone();
     let expected_sha256 = candidate.source_generation_sha256.clone();
     let revalidate_pin = Arc::clone(&pinned);
@@ -167,6 +187,18 @@ pub(crate) fn publish_from_ready_candidate(
                     source_bytes: file.source_bytes.clone(),
                 })
                 .collect(),
+            config: candidate.config.as_ref().map(|files| {
+                files
+                    .iter()
+                    .map(|file| PublishSourceFile {
+                        repository_relative_filename: file
+                            .manifest
+                            .repository_relative_filename
+                            .clone(),
+                        source_bytes: file.source_bytes.clone(),
+                    })
+                    .collect()
+            }),
         },
         revalidate_source: Box::new(move || {
             let candidate = revalidate_pin.candidate();

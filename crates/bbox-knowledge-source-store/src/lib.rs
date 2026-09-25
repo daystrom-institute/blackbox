@@ -152,7 +152,10 @@ fn validate_publication_upload(record: &mut PublicationUploadV1) -> Result<()> {
     )? {
         bail!(StoreRequestError::InvalidState);
     }
-    backfill_absent_page_cursors(&mut record.next_pages, publication_page_cursors());
+    backfill_absent_page_cursors(
+        &mut record.next_pages,
+        publication_page_cursors(&record.descriptor),
+    );
     Ok(())
 }
 
@@ -192,15 +195,24 @@ fn is_open(state: SourceGenerationStateV1) -> bool {
     )
 }
 
-fn publication_page_cursors() -> BTreeMap<String, u64> {
-    [
+/// Page cursors for one publication upload. The configuration lane is
+/// explicitly optional, so its slot exists exactly when the descriptor
+/// carries the lane: a page for an absent lane has no cursor to advance.
+fn publication_page_cursors(
+    descriptor: &PublicationCandidateDescriptorV1,
+) -> BTreeMap<String, u64> {
+    let mut cursors: BTreeMap<String, u64> = [
         (lane_name(SourceLaneV1::Knowledge).to_string(), 0),
         (lane_name(SourceLaneV1::Gaps).to_string(), 0),
         (lane_name(SourceLaneV1::Graphs).to_string(), 0),
         (lane_name(SourceLaneV1::Evidence).to_string(), 0),
     ]
     .into_iter()
-    .collect()
+    .collect();
+    if descriptor.config.is_some() {
+        cursors.insert(lane_name(SourceLaneV1::Config).to_string(), 0);
+    }
+    cursors
 }
 
 fn provisional_page_cursors() -> BTreeMap<String, u64> {
@@ -224,6 +236,7 @@ fn lane_name(lane: SourceLaneV1) -> &'static str {
         SourceLaneV1::Gaps => "gaps",
         SourceLaneV1::Graphs => "graphs",
         SourceLaneV1::Evidence => "evidence",
+        SourceLaneV1::Config => "config",
     }
 }
 
@@ -241,21 +254,25 @@ fn provisional_slot_key(class: SnapshotClassV1, lane: SourceLaneV1) -> String {
 fn publication_manifest_descriptor(
     descriptor: &PublicationCandidateDescriptorV1,
     lane: SourceLaneV1,
-) -> &SourceManifestDescriptorV1 {
-    match lane {
+) -> Result<&SourceManifestDescriptorV1> {
+    Ok(match lane {
         SourceLaneV1::Knowledge => &descriptor.knowledge,
         SourceLaneV1::Gaps => &descriptor.gaps,
         SourceLaneV1::Graphs => &descriptor.graphs,
         SourceLaneV1::Evidence => &descriptor.evidence,
-    }
+        SourceLaneV1::Config => descriptor
+            .config
+            .as_ref()
+            .ok_or(StoreRequestError::InvalidInput)?,
+    })
 }
 
 fn provisional_manifest_descriptor(
     descriptor: &ProvisionalWorkspaceDescriptorV1,
     class: SnapshotClassV1,
     lane: SourceLaneV1,
-) -> &SourceManifestDescriptorV1 {
-    match (class, lane) {
+) -> Result<&SourceManifestDescriptorV1> {
+    Ok(match (class, lane) {
         (SnapshotClassV1::Baseline, SourceLaneV1::Knowledge) => &descriptor.baseline_knowledge,
         (SnapshotClassV1::Baseline, SourceLaneV1::Gaps) => &descriptor.baseline_gaps,
         (SnapshotClassV1::Baseline, SourceLaneV1::Graphs) => &descriptor.baseline_graphs,
@@ -264,7 +281,10 @@ fn provisional_manifest_descriptor(
         (SnapshotClassV1::Working, SourceLaneV1::Gaps) => &descriptor.working_gaps,
         (SnapshotClassV1::Working, SourceLaneV1::Graphs) => &descriptor.working_graphs,
         (SnapshotClassV1::Working, SourceLaneV1::Evidence) => &descriptor.working_evidence,
-    }
+        // Configuration is commit-gated publication state; a workspace
+        // snapshot never carries it.
+        (_, SourceLaneV1::Config) => bail!(StoreRequestError::InvalidInput),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,15 +401,18 @@ fn read_optional_lane_manifest(
     }
 }
 
+type PublicationManifests = (
+    Vec<SourceFileManifestEntryV1>,
+    Vec<SourceFileManifestEntryV1>,
+    Vec<SourceFileManifestEntryV1>,
+    Vec<SourceFileManifestEntryV1>,
+    Option<Vec<SourceFileManifestEntryV1>>,
+);
+
 fn load_publication_manifests(
     path: &Path,
     descriptor: &PublicationCandidateDescriptorV1,
-) -> Result<(
-    Vec<SourceFileManifestEntryV1>,
-    Vec<SourceFileManifestEntryV1>,
-    Vec<SourceFileManifestEntryV1>,
-    Vec<SourceFileManifestEntryV1>,
-)> {
+) -> Result<PublicationManifests> {
     Ok((
         read_required_json(path, "manifest-knowledge.json", "knowledge manifest")?,
         read_required_json(path, "manifest-gaps.json", "gap manifest")?,
@@ -405,6 +428,13 @@ fn load_publication_manifests(
             "evidence manifest",
             &descriptor.evidence,
         )?,
+        // The configuration lane's presence is explicit, so a present lane
+        // with no manifest on disk is malformed rather than legacy.
+        descriptor
+            .config
+            .as_ref()
+            .map(|_| read_required_json(path, "manifest-config.json", "configuration manifest"))
+            .transpose()?,
     ))
 }
 
@@ -467,6 +497,7 @@ fn load_expected_blobs(path: &Path) -> Result<BTreeMap<String, u64>> {
         "manifest-gaps.json",
         "manifest-graphs.json",
         "manifest-evidence.json",
+        "manifest-config.json",
         "manifest-baseline-knowledge.json",
         "manifest-baseline-gaps.json",
         "manifest-baseline-graphs.json",
@@ -547,6 +578,16 @@ fn publication_status(
         gap_files: source.descriptor.gaps.file_count,
         graph_files: source.descriptor.graphs.file_count,
         evidence_files: source.descriptor.evidence.file_count,
+        config_manifest_sha256: source
+            .descriptor
+            .config
+            .as_ref()
+            .map(|config| config.manifest_sha256.clone()),
+        config_files: source
+            .descriptor
+            .config
+            .as_ref()
+            .map(|config| config.file_count),
         logical_bytes: source
             .descriptor
             .knowledge
@@ -554,6 +595,15 @@ fn publication_status(
             .checked_add(source.descriptor.gaps.logical_bytes)
             .and_then(|bytes| bytes.checked_add(source.descriptor.graphs.logical_bytes))
             .and_then(|bytes| bytes.checked_add(source.descriptor.evidence.logical_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    source
+                        .descriptor
+                        .config
+                        .as_ref()
+                        .map_or(0, |config| config.logical_bytes),
+                )
+            })
             .ok_or(StoreRequestError::LimitExceeded)?,
         diagnostic: source.diagnostic.clone(),
     })
@@ -782,6 +832,7 @@ fn remove_upload_directory(path: &Path, provisional: bool) -> Result<()> {
             "manifest-gaps.json",
             "manifest-graphs.json",
             "manifest-evidence.json",
+            "manifest-config.json",
         ] {
             remove_regular_file(&path.join(name))?;
         }
@@ -833,6 +884,7 @@ fn remove_generation_directory(path: &Path, provisional: bool) -> Result<()> {
             "manifest-gaps.json",
             "manifest-graphs.json",
             "manifest-evidence.json",
+            "manifest-config.json",
             "source.json",
         ]
     };
@@ -931,12 +983,20 @@ fn publication_source_generation_sha256(
     gaps: &[SourceFileManifestEntryV1],
     graphs: &[SourceFileManifestEntryV1],
     evidence: &[SourceFileManifestEntryV1],
+    config: Option<&[SourceFileManifestEntryV1]>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"bbox-knowledge-publication-source-evidence-v1\0");
-    hasher.update(serde_json::to_vec(&(
-        source, knowledge, gaps, graphs, evidence,
-    ))?);
+    // A candidate without the configuration lane keeps the exact pre-lane
+    // preimage; a present lane (even empty) extends the tuple.
+    match config {
+        None => hasher.update(serde_json::to_vec(&(
+            source, knowledge, gaps, graphs, evidence,
+        ))?),
+        Some(config) => hasher.update(serde_json::to_vec(&(
+            source, knowledge, gaps, graphs, evidence, config,
+        ))?),
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -1286,6 +1346,10 @@ pub struct ReadyPublicationCandidate {
     pub gaps: Vec<ReadyPublicationFile>,
     pub graphs: Vec<ReadyPublicationFile>,
     pub evidence: Vec<ReadyPublicationFile>,
+    /// `None` exactly when the candidate carries no configuration lane
+    /// (its producer predates the lane); `Some(empty)` is a verified empty
+    /// configuration.
+    pub config: Option<Vec<ReadyPublicationFile>>,
 }
 
 /// Fully detached bytes for the exact live provisional pointer selected under
@@ -1456,9 +1520,13 @@ impl KnowledgeSourceStore {
             SourceLaneV1::Gaps,
             SourceLaneV1::Graphs,
             SourceLaneV1::Evidence,
-        ] {
+        ]
+        .into_iter()
+        .chain(descriptor.config.is_some().then_some(SourceLaneV1::Config))
+        {
             NofollowDirectory::open_or_create(&upload_path.join("pages").join(lane_name(lane)))?;
         }
+        let next_pages = publication_page_cursors(&descriptor);
         write_json(
             &upload_dir,
             "upload.json",
@@ -1470,7 +1538,7 @@ impl KnowledgeSourceStore {
                 descriptor,
                 source_generation_id: generation_id,
                 state: SourceGenerationStateV1::ReceivingManifest,
-                next_pages: publication_page_cursors(),
+                next_pages,
                 page_digests: BTreeMap::new(),
                 updated_unix_secs: now_unix_secs(),
             },
@@ -1520,7 +1588,7 @@ impl KnowledgeSourceStore {
         if record.state != SourceGenerationStateV1::ReceivingManifest {
             bail!(StoreRequestError::InvalidState);
         }
-        let descriptor = publication_manifest_descriptor(&record.descriptor, lane);
+        let descriptor = publication_manifest_descriptor(&record.descriptor, lane)?;
         put_manifest_page_locked(
             &path,
             &mut record.next_pages,
@@ -1685,7 +1753,7 @@ impl KnowledgeSourceStore {
             bail!(StoreRequestError::InvalidState);
         }
         let generation_path = self.publication_generation_path(&index.project_id, generation_id)?;
-        let (knowledge_manifest, gap_manifest, graph_manifest, evidence_manifest) =
+        let (knowledge_manifest, gap_manifest, graph_manifest, evidence_manifest, config_manifest) =
             load_publication_manifests(&generation_path, &source.descriptor)?;
         validate_publication_candidate(
             &source.descriptor,
@@ -1693,18 +1761,24 @@ impl KnowledgeSourceStore {
             &gap_manifest,
             &graph_manifest,
             &evidence_manifest,
+            config_manifest.as_deref(),
             self.current_limits()?.contract,
         )?;
         let knowledge = self.materialize_ready_publication_files(&knowledge_manifest)?;
         let gaps = self.materialize_ready_publication_files(&gap_manifest)?;
         let graphs = self.materialize_ready_publication_files(&graph_manifest)?;
         let evidence = self.materialize_ready_publication_files(&evidence_manifest)?;
+        let config = config_manifest
+            .as_deref()
+            .map(|manifest| self.materialize_ready_publication_files(manifest))
+            .transpose()?;
         let source_generation_sha256 = publication_source_generation_sha256(
             &source,
             &knowledge_manifest,
             &gap_manifest,
             &graph_manifest,
             &evidence_manifest,
+            config_manifest.as_deref(),
         )?;
         let mut pins = self
             .publication_pins
@@ -1724,6 +1798,7 @@ impl KnowledgeSourceStore {
                 gaps,
                 graphs,
                 evidence,
+                config,
             },
             _pin: PublicationPinGuard {
                 generation_id: generation_id.to_string(),
@@ -1740,6 +1815,11 @@ impl KnowledgeSourceStore {
         object_format: bbox_knowledge_source::GitObjectFormatV1,
     ) -> Result<Option<PublicationCandidateStatusV1>> {
         validate_publication_authority(authority)?;
+        // Several Ready candidates can share one commit: a producer upgraded
+        // to capture the configuration lane re-uploads the commit it already
+        // published. The lane-bearing candidate is the current one, so a
+        // lane-less match is only the fallback.
+        let mut lane_less = None;
         for path in read_regular_json_files(&self.root.join("publications/generation-index"))? {
             let index = read_json::<PublicationGenerationIndexV1>(
                 &self.root.join("publications/generation-index"),
@@ -1762,10 +1842,15 @@ impl KnowledgeSourceStore {
                 && source.descriptor.publisher_commit == publisher_commit
                 && source.descriptor.object_format == object_format
             {
-                return publication_status(&source).map(Some);
+                if source.descriptor.config.is_some() {
+                    return publication_status(&source).map(Some);
+                }
+                if lane_less.is_none() {
+                    lane_less = Some(publication_status(&source)?);
+                }
             }
         }
-        Ok(None)
+        Ok(lane_less)
     }
 
     pub fn begin_provisional_upload(
@@ -2008,7 +2093,7 @@ impl KnowledgeSourceStore {
         if record.state != SourceGenerationStateV1::ReceivingManifest {
             bail!(StoreRequestError::InvalidState);
         }
-        let descriptor = provisional_manifest_descriptor(&record.descriptor, class, lane);
+        let descriptor = provisional_manifest_descriptor(&record.descriptor, class, lane)?;
         let key = provisional_slot_key(class, lane);
         put_manifest_page_locked(
             &path,
@@ -2720,12 +2805,29 @@ impl KnowledgeSourceStore {
             record.next_pages[lane_name(SourceLaneV1::Evidence)],
             record.descriptor.evidence.page_count,
         )?;
+        let config = record
+            .descriptor
+            .config
+            .as_ref()
+            .map(|config| {
+                load_manifest_pages(
+                    path,
+                    lane_name(SourceLaneV1::Config),
+                    *record
+                        .next_pages
+                        .get(lane_name(SourceLaneV1::Config))
+                        .ok_or(StoreRequestError::InvalidState)?,
+                    config.page_count,
+                )
+            })
+            .transpose()?;
         validate_publication_candidate(
             &record.descriptor,
             &knowledge,
             &gaps,
             &graphs,
             &evidence,
+            config.as_deref(),
             self.current_limits()?.contract,
         )?;
         let directory = existing_directory(path)?;
@@ -2733,6 +2835,9 @@ impl KnowledgeSourceStore {
         install_immutable_json(&directory, "manifest-gaps.json", &gaps)?;
         install_immutable_json(&directory, "manifest-graphs.json", &graphs)?;
         install_immutable_json(&directory, "manifest-evidence.json", &evidence)?;
+        if let Some(config) = &config {
+            install_immutable_json(&directory, "manifest-config.json", config)?;
+        }
         record.state = SourceGenerationStateV1::MissingBlobs;
         record.updated_unix_secs = now_unix_secs();
         write_json(&directory, "upload.json", record)
@@ -2977,6 +3082,9 @@ impl KnowledgeSourceStore {
         install_immutable_json(&directory, "manifest-gaps.json", &manifests.1)?;
         install_immutable_json(&directory, "manifest-graphs.json", &manifests.2)?;
         install_immutable_json(&directory, "manifest-evidence.json", &manifests.3)?;
+        if let Some(config) = &manifests.4 {
+            install_immutable_json(&directory, "manifest-config.json", config)?;
+        }
         install_immutable_record(&directory, "source.json", &generation)?;
         journal.stage = FinalizeStageV1::GenerationInstalled;
         journal = self.write_finalize_journal(journal)?;
@@ -3243,6 +3351,7 @@ impl KnowledgeSourceStore {
             &manifests.1,
             &manifests.2,
             &manifests.3,
+            manifests.4.as_deref(),
             self.current_limits()?.contract,
         )?;
         self.verify_all_upload_blobs(&generation_path)
@@ -4365,6 +4474,7 @@ mod tests {
             gaps: manifest(SourceLaneV1::Gaps, &gaps),
             graphs: SourceManifestDescriptorV1::default(),
             evidence: SourceManifestDescriptorV1::default(),
+            config: None,
         };
         (descriptor, knowledge, gaps)
     }
@@ -5233,6 +5343,7 @@ mod tests {
             gaps: manifest(SourceLaneV1::Gaps, &[]),
             graphs: SourceManifestDescriptorV1::default(),
             evidence: SourceManifestDescriptorV1::default(),
+            config: None,
         };
         let begin = store
             .begin_publication_upload(&authority, descriptor)
@@ -7531,5 +7642,381 @@ mod tests {
                 .state,
             SourceGenerationStateV1::Ready
         );
+    }
+
+    // ---- configuration lane ----
+    //
+    // The lane is explicitly optional: a producer that predates it sends no
+    // descriptor field and the store writes exactly the records it always
+    // wrote, while a present lane (even an empty one) is its own shape.
+
+    const CONFIG_TOML_BYTES: &[u8] = b"[mcp]\nenabled = true\n";
+    const MCP_STORE_BYTES: &[u8] = br#"{"servers":{}}"#;
+    const BROFILE_BYTES: &[u8] = br#"{"name":"reviewer"}"#;
+
+    fn config_files() -> Vec<(SourceFileManifestEntryV1, &'static [u8])> {
+        let mut files = vec![
+            (
+                entry(".bbox/config.toml", CONFIG_TOML_BYTES),
+                CONFIG_TOML_BYTES,
+            ),
+            (entry(".bbox/mcp.json", MCP_STORE_BYTES), MCP_STORE_BYTES),
+            (
+                entry(".bro/brofiles/reviewer.json", BROFILE_BYTES),
+                BROFILE_BYTES,
+            ),
+        ];
+        files.sort_by(|left, right| {
+            left.0
+                .repository_relative_filename
+                .cmp(&right.0.repository_relative_filename)
+        });
+        files
+    }
+
+    fn with_config_lane(
+        mut descriptor: PublicationCandidateDescriptorV1,
+        entries: &[SourceFileManifestEntryV1],
+    ) -> PublicationCandidateDescriptorV1 {
+        descriptor.config = Some(manifest(SourceLaneV1::Config, entries));
+        descriptor
+    }
+
+    /// Upload, complete and finalize one candidate, returning its generation.
+    fn upload_candidate(
+        store: &KnowledgeSourceStore,
+        descriptor: PublicationCandidateDescriptorV1,
+        config: &[(SourceFileManifestEntryV1, &[u8])],
+    ) -> String {
+        let authority = publication_authority();
+        let (_, knowledge, gaps) = publication_fixture();
+        let begin = store
+            .begin_publication_upload(&authority, descriptor)
+            .unwrap();
+        put_publication_pages(store, &authority, &begin.upload_id, &knowledge, &gaps);
+        if !config.is_empty() {
+            store
+                .put_publication_manifest_page(
+                    &authority,
+                    &begin.upload_id,
+                    SourceLaneV1::Config,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries: config.iter().map(|(entry, _)| entry.clone()).collect(),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .missing_publication_blobs(&authority, &begin.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(store, &authority, &begin.upload_id);
+        for (entry, bytes) in config {
+            store
+                .install_publication_blob(
+                    &authority,
+                    &begin.upload_id,
+                    &entry.content_sha256,
+                    bytes.len() as u64,
+                    Cursor::new(*bytes),
+                )
+                .unwrap();
+        }
+        store
+            .finalize_publication_upload(&authority, &begin.upload_id)
+            .unwrap()
+            .source_generation_id
+    }
+
+    fn config_manifest_entries() -> Vec<SourceFileManifestEntryV1> {
+        config_files().into_iter().map(|(entry, _)| entry).collect()
+    }
+
+    #[test]
+    fn config_bearing_candidate_round_trips_exact_bytes_and_status() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let files = config_files();
+        let descriptor = with_config_lane(publication_fixture().0, &config_manifest_entries());
+        let generation = upload_candidate(&store, descriptor.clone(), &files);
+
+        let status = store
+            .publication_status(&publication_authority().producer_id, &generation)
+            .unwrap();
+        assert_eq!(status.config_files, Some(3));
+        assert_eq!(
+            status.config_manifest_sha256.as_deref(),
+            Some(descriptor.config.as_ref().unwrap().manifest_sha256.as_str())
+        );
+        let config_bytes = files
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        assert_eq!(
+            status.logical_bytes,
+            (KNOWLEDGE_BYTES.len() + GAP_BYTES.len()) as u64 + config_bytes
+        );
+        let generation_path = root
+            .join("publications/generations/project-a")
+            .join(&generation);
+        assert!(generation_path.join("manifest-config.json").is_file());
+
+        let pinned = store.pin_ready_publication_candidate(&generation).unwrap();
+        let config = pinned.candidate().config.as_ref().unwrap();
+        assert_eq!(config.len(), 3);
+        for (file, (entry, bytes)) in config.iter().zip(&files) {
+            assert_eq!(&file.manifest, entry);
+            assert_eq!(file.source_bytes, *bytes);
+        }
+    }
+
+    #[test]
+    fn empty_present_config_lane_is_distinct_from_a_pre_lane_candidate() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let pre_lane = publication_fixture().0;
+        let empty = with_config_lane(publication_fixture().0, &[]);
+        let authority = publication_authority();
+        let pre_lane_generation = upload_candidate(&store, pre_lane.clone(), &[]);
+        assert_eq!(
+            pre_lane_generation,
+            publication_candidate_generation_id(&authority.producer_id, &pre_lane).unwrap(),
+        );
+        // A pre-lane candidate is exactly the record every earlier binary
+        // wrote: no descriptor field, no page slot, no manifest file.
+        let generation_path = root
+            .join("publications/generations/project-a")
+            .join(&pre_lane_generation);
+        let stored_descriptor: serde_json::Value =
+            serde_json::from_slice(&fs::read(generation_path.join("descriptor.json")).unwrap())
+                .unwrap();
+        assert!(stored_descriptor.get("config").is_none());
+        assert!(!generation_path.join("manifest-config.json").exists());
+        let upload_root = root.join("publications/uploads/producer-a");
+        for upload in json_children(&upload_root) {
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(upload.join("upload.json")).unwrap()).unwrap();
+            assert!(record["next_pages"].get("config").is_none());
+            assert!(!upload.join("pages/config").exists());
+        }
+        let pre_lane_status = store
+            .publication_status(&authority.producer_id, &pre_lane_generation)
+            .unwrap();
+        assert_eq!(pre_lane_status.config_files, None);
+        assert_eq!(pre_lane_status.config_manifest_sha256, None);
+        let probed = store
+            .probe_publication(
+                &authority,
+                &pre_lane.full_ref,
+                &pre_lane.publisher_commit,
+                pre_lane.object_format,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(probed.source_generation_id, pre_lane_generation);
+        assert!(
+            store
+                .pin_ready_publication_candidate(&pre_lane_generation)
+                .unwrap()
+                .candidate()
+                .config
+                .is_none()
+        );
+
+        // The upgraded producer re-uploads the same commit with the lane.
+        let empty_generation = upload_candidate(&store, empty.clone(), &[]);
+        assert_ne!(empty_generation, pre_lane_generation);
+        let empty_status = store
+            .publication_status(&authority.producer_id, &empty_generation)
+            .unwrap();
+        assert_eq!(empty_status.config_files, Some(0));
+        assert_eq!(
+            empty_status.config_manifest_sha256.as_deref(),
+            Some(source_manifest_sha256(SourceLaneV1::Config, &[]).as_str())
+        );
+        assert_eq!(
+            store
+                .pin_ready_publication_candidate(&empty_generation)
+                .unwrap()
+                .candidate()
+                .config
+                .as_deref()
+                .map(<[ReadyPublicationFile]>::len),
+            Some(0)
+        );
+        // The lane-bearing candidate at the shared commit is the current one.
+        let probed = store
+            .probe_publication(
+                &authority,
+                &empty.full_ref,
+                &empty.publisher_commit,
+                empty.object_format,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(probed.source_generation_id, empty_generation);
+        assert_eq!(probed.config_files, Some(0));
+    }
+
+    #[test]
+    fn config_page_for_a_lane_less_descriptor_is_refused() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = publication_authority();
+        let begin = store
+            .begin_publication_upload(&authority, publication_fixture().0)
+            .unwrap();
+        assert_store_error(
+            store.put_publication_manifest_page(
+                &authority,
+                &begin.upload_id,
+                SourceLaneV1::Config,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: config_manifest_entries(),
+                },
+            ),
+            StoreRequestError::InvalidInput,
+        );
+    }
+
+    #[test]
+    fn oversized_or_foreign_config_lanes_are_refused_before_a_generation_exists() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = publication_authority();
+
+        let mut too_many = publication_fixture().0;
+        too_many.config = Some(SourceManifestDescriptorV1 {
+            manifest_sha256: "a".repeat(64),
+            file_count: bbox_knowledge_source::MAX_CONFIG_SOURCE_FILES + 1,
+            logical_bytes: bbox_knowledge_source::MAX_CONFIG_SOURCE_FILES + 1,
+            page_count: 2,
+        });
+        let error = store
+            .begin_publication_upload(&authority, too_many)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<bbox_knowledge_source::ContractError>(),
+            Some(&bbox_knowledge_source::ContractError::ConfigLimitExceeded)
+        );
+
+        for (entries, expected) in [
+            (
+                vec![SourceFileManifestEntryV1 {
+                    repository_relative_filename: ".bbox/mcp.json".into(),
+                    encoded_bytes: bbox_knowledge_source::MAX_CONFIG_SOURCE_FILE_BYTES + 1,
+                    content_sha256: "b".repeat(64),
+                }],
+                bbox_knowledge_source::ContractError::ConfigLimitExceeded,
+            ),
+            (
+                vec![entry(".bro/brofiles/nested/reviewer.json", BROFILE_BYTES)],
+                bbox_knowledge_source::ContractError::InvalidConfigSourcePath,
+            ),
+        ] {
+            let mut descriptor = with_config_lane(publication_fixture().0, &entries);
+            // Distinct commits keep each attempt a fresh upload.
+            descriptor.publisher_commit = entries[0].content_sha256[..40].to_string();
+            let begin = store
+                .begin_publication_upload(&authority, descriptor)
+                .unwrap();
+            let (_, knowledge, gaps) = publication_fixture();
+            put_publication_pages(&store, &authority, &begin.upload_id, &knowledge, &gaps);
+            store
+                .put_publication_manifest_page(
+                    &authority,
+                    &begin.upload_id,
+                    SourceLaneV1::Config,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries,
+                    },
+                )
+                .unwrap();
+            let error = store
+                .missing_publication_blobs(&authority, &begin.upload_id, None)
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<bbox_knowledge_source::ContractError>(),
+                Some(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn provisional_uploads_never_carry_the_config_lane() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, ..) = provisional_fixture(1);
+        let begin = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        for class in [SnapshotClassV1::Baseline, SnapshotClassV1::Working] {
+            assert_store_error(
+                store.put_provisional_manifest_page(
+                    &authority,
+                    &begin.upload_id,
+                    class,
+                    SourceLaneV1::Config,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries: config_manifest_entries(),
+                    },
+                ),
+                StoreRequestError::InvalidInput,
+            );
+        }
+    }
+
+    #[test]
+    fn config_blobs_are_roots_while_referenced_and_reclaimed_once_orphaned() {
+        let limits = StoreLimits {
+            retained_publication_generations: 1,
+            unreferenced_blob_grace_secs: 1,
+            ..StoreLimits::default()
+        };
+        let (_temporary, _root, store) = test_store(limits);
+        let files = config_files();
+        let descriptor = with_config_lane(publication_fixture().0, &config_manifest_entries());
+        upload_candidate(&store, descriptor, &files);
+        let held = store.maintain_at(&BTreeSet::new(), u64::MAX).unwrap();
+        assert_eq!(held.deleted_blobs, 0);
+        for (entry, bytes) in &files {
+            assert_eq!(
+                store
+                    .read_blob(&entry.content_sha256, bytes.len())
+                    .unwrap()
+                    .as_deref(),
+                Some(*bytes)
+            );
+        }
+
+        let mut successor = publication_fixture().0;
+        successor.publisher_commit = "2".repeat(40);
+        successor.knowledge = manifest(SourceLaneV1::Knowledge, &[]);
+        successor.gaps = manifest(SourceLaneV1::Gaps, &[]);
+        let successor = with_config_lane(successor, &[]);
+        let authority = publication_authority();
+        let begin = store
+            .begin_publication_upload(&authority, successor)
+            .unwrap();
+        store
+            .missing_publication_blobs(&authority, &begin.upload_id, None)
+            .unwrap();
+        store
+            .finalize_publication_upload(&authority, &begin.upload_id)
+            .unwrap();
+        let reclaimed = store.maintain_at(&BTreeSet::new(), u64::MAX).unwrap();
+        assert_eq!(reclaimed.retired_publication_generations, 1);
+        assert_eq!(reclaimed.deleted_blobs, 2 + files.len() as u64);
+        for (entry, bytes) in &files {
+            assert!(
+                store
+                    .read_blob(&entry.content_sha256, bytes.len())
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

@@ -801,7 +801,6 @@ impl BlackboxServer {
         use orchestration::team;
         let store_dir = &self.state.store_dir;
         let scope = p.scope.as_deref().unwrap_or("global");
-        let source_project_dir = team_source_project_dir(self, p.project_dir.as_deref());
 
         match p.action.as_str() {
             "save_template" => {
@@ -816,16 +815,18 @@ impl BlackboxServer {
                     Some(m) if !m.is_empty() => m,
                     _ => return Self::err_text("members is required"),
                 };
-                // Validate brofile names
+                // Validate brofile names against the same accepted resolver
+                // dispatch uses; a queued, unpublished brofile does not count.
                 for m in members {
-                    if orchestration::brofile::resolve_brofile(
-                        &m.brofile,
-                        store_dir,
-                        source_project_dir,
-                    )
-                    .is_none()
+                    match self
+                        .state
+                        .dispatch_brofile(&m.brofile, p.project_dir.as_deref())
                     {
-                        return Self::err_text(&format!("Brofile not found: {}", m.brofile));
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return Self::err_text(&format!("Brofile not found: {}", m.brofile));
+                        }
+                        Err(error) => return Self::err_text(&error),
                     }
                 }
                 let tp = team::Teamplate {
@@ -872,16 +873,22 @@ impl BlackboxServer {
                     Some(t) => t,
                     None => return Self::err_text("template is required"),
                 };
-                let tp = match team::resolve_teamplate(template, store_dir, source_project_dir) {
-                    Some(tp) => tp,
-                    None => {
+                // Project-first resolution: the selected project's accepted
+                // templates, then global ones only when the project view
+                // proves the name absent. The source is attributed.
+                let resolved = match self
+                    .state
+                    .resolve_config_teamplate(template, p.project_dir.as_deref())
+                {
+                    Ok(Some(resolved)) => resolved,
+                    Ok(None) => {
                         return Self::err_text(&format!(
-                            "Teamplate not found in the available source: {template}. In catalog mode create uses daemon-owned global templates; use bro_team(action=list_templates, scope=global), or inspect a project template through the checkout owner's file tools and save an approved global template. project_dir supplies worker context, not template read authority"
+                            "Teamplate not found: {template}. Resolution checked the selected project's accepted templates (when project_dir names a catalog project), then global templates; a project template queued through the checkout-owner lane counts only after it is committed and published"
                         ));
                     }
+                    Err(error) => return Self::err_text(&error.to_string()),
                 };
-                // Catalog-mode creation uses only global configuration. The
-                // project association is still retained for worker dispatch.
+                let tp = resolved.value;
                 if let Err(error) = validate_team_object_name(&tp.name) {
                     return Self::err_text(&error.to_string());
                 }
@@ -889,14 +896,15 @@ impl BlackboxServer {
                     if let Err(error) = validate_team_object_name(&m.brofile) {
                         return Self::err_text(&error.to_string());
                     }
-                    if orchestration::brofile::resolve_brofile(
-                        &m.brofile,
-                        store_dir,
-                        source_project_dir,
-                    )
-                    .is_none()
+                    match self
+                        .state
+                        .dispatch_brofile(&m.brofile, p.project_dir.as_deref())
                     {
-                        return Self::err_text(&format!("Brofile not found: {}", m.brofile));
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return Self::err_text(&format!("Brofile not found: {}", m.brofile));
+                        }
+                        Err(error) => return Self::err_text(&error),
                     }
                 }
                 let team_name = p
@@ -912,10 +920,7 @@ impl BlackboxServer {
                     Ok(team) => team,
                     Err(error) => return Self::err_text(&format!("Team was not saved: {error}")),
                 };
-                Self::ok_json(&team_create_receipt(
-                    &t,
-                    !self.state.project_authority.is_bridge(),
-                ))
+                Self::ok_json(&team_create_receipt(&t, &resolved.source))
             }
             "dissolve" => {
                 let name = match &p.name {
@@ -1128,17 +1133,6 @@ fn brofile_selection(
     format!("brofile:{scope}:{store}:{name}")
 }
 
-pub(crate) fn team_source_project_dir<'a>(
-    server: &BlackboxServer,
-    project: Option<&'a str>,
-) -> Option<&'a str> {
-    if server.state.project_authority.is_bridge() {
-        project
-    } else {
-        None
-    }
-}
-
 fn require_team_template_locality(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<()> {
     if matches!(
         p.action.as_str(),
@@ -1161,11 +1155,25 @@ fn validate_team_object_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn team_create_receipt(team: &orchestration::team::Team, global_source: bool) -> Value {
+fn team_create_receipt(
+    team: &orchestration::team::Team,
+    source: &orchestration::project_config::ProjectConfigSource,
+) -> Value {
+    use orchestration::project_config::ProjectConfigSource;
     let mut receipt = json!({"created":team.name, "teamplate":team.teamplate, "memberCount":team.members.len(),
         "detail_hint":"bro_team(action=roster, name=<created>) for member pages; action=get for exact stored configuration and history"});
-    if global_source {
-        receipt["templateScope"] = json!("global");
+    match source {
+        // Bridge mode keeps its receipt shape.
+        ProjectConfigSource::Local => {}
+        ProjectConfigSource::Global => receipt["templateScope"] = json!("global"),
+        ProjectConfigSource::GlobalFallback(_) => {
+            receipt["templateScope"] = json!("global");
+            receipt["templateSource"] = json!(source);
+        }
+        ProjectConfigSource::Project(_) => {
+            receipt["templateScope"] = json!("project");
+            receipt["templateSource"] = json!(source);
+        }
     }
     if team.advisor.is_some() {
         receipt["hasAdvisor"] = json!(true);
@@ -1543,13 +1551,93 @@ mod tests {
                 task_history: vec![],
             })
             .collect();
-        let receipt = team_create_receipt(&team, true);
+        let receipt = team_create_receipt(
+            &team,
+            &orchestration::project_config::ProjectConfigSource::Global,
+        );
         assert_eq!(receipt["memberCount"], 10000);
         assert_eq!(receipt["templateScope"], "global");
         assert!(receipt.get("members").is_none());
         assert!(receipt.get("advisorExecution").is_none());
         assert!(serde_json::to_vec(&receipt).unwrap().len() < 1000);
         assert!(receipt["detail_hint"].as_str().unwrap().contains("roster"));
+    }
+
+    /// With no checkout on disk, `create` resolves the selected catalog
+    /// project's accepted template and member brofiles first, attributes a
+    /// global fallback, and refuses by name when the view is unavailable.
+    #[tokio::test]
+    async fn catalog_team_create_resolves_accepted_project_templates_first() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
+        use orchestration::{brofile, team};
+        let fixture = CatalogFixture::new();
+        let project = "p_team_accepted";
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(project, &scope);
+        let reviewer = json!({"name":"reviewer","provider":"deepseek"}).to_string();
+        let squad =
+            json!({"name":"squad","members":[{"brofile":"reviewer","count":2}]}).to_string();
+        fixture.install_config_publication(
+            project,
+            &scope,
+            COMMIT_ONE,
+            Some(&[
+                (".bro/brofiles/reviewer.json", reviewer.as_bytes()),
+                (".bro/teamplates/squad.json", squad.as_bytes()),
+            ]),
+        );
+        fixture.add_published_project("p_team_unpublished", &CatalogFixture::scope("other"));
+        let server = fixture.server();
+        let writer: brofile::Brofile =
+            serde_json::from_value(json!({"name":"writer","provider":"glm"})).unwrap();
+        brofile::save_brofile(&writer, "global", &server.state.store_dir, None).unwrap();
+        let global_template = team::Teamplate {
+            name: "writers".into(),
+            members: vec![team::TeamplateMember {
+                brofile: "writer".into(),
+                alias: None,
+                count: 1,
+            }],
+            advisor: None,
+            diversity_floor: None,
+        };
+        team::save_teamplate(&global_template, "global", &server.state.store_dir, None).unwrap();
+
+        let created = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"squad","name":"project-team","project_dir":project
+            }))))
+            .await;
+        assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
+        let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
+        assert_eq!(receipt["templateScope"], "project");
+        assert_eq!(receipt["templateSource"]["source"], "project");
+        assert_eq!(receipt["templateSource"]["project_id"], project);
+        assert_eq!(receipt["memberCount"], 2);
+
+        let fallback = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"writers","name":"global-team","project_dir":project
+            }))))
+            .await;
+        assert_ne!(fallback.is_error, Some(true), "{}", extract_text(&fallback));
+        let receipt: Value = serde_json::from_str(&extract_text(&fallback)).unwrap();
+        assert_eq!(receipt["templateScope"], "global");
+        assert_eq!(receipt["templateSource"]["source"], "global_fallback");
+
+        let refused = server
+            .bro_team(Parameters(team_params(json!({
+                "action":"create","template":"writers","name":"must-not-exist",
+                "project_dir":"p_team_unpublished"
+            }))))
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(
+            extract_text(&refused).contains("error.project_config_publication_unavailable"),
+            "{}",
+            extract_text(&refused)
+        );
+        assert!(team::load_team("must-not-exist", &server.state.store_dir).is_none());
     }
 
     #[tokio::test]
@@ -1602,7 +1690,11 @@ mod tests {
         let saved = team::load_team("global-team", &server.state.store_dir).unwrap();
         assert_eq!(saved.project_dir.as_deref(), Some(project));
         assert_eq!(saved.members.len(), 2);
-        assert!(team_source_project_dir(&server, Some(project)).is_none());
+        // An unregistered path is worker context, never a project source.
+        assert!(matches!(
+            server.state.project_config_context(Some(project)),
+            Ok(crate::tools::project_config::ProjectConfigContext::GlobalOnly)
+        ));
 
         template.name = "project-only".into();
         team::save_teamplate(&template, "project", &server.state.store_dir, Some(project)).unwrap();

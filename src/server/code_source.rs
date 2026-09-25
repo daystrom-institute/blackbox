@@ -1424,26 +1424,55 @@ async fn claim_scope_for_onboard(
 }
 
 /// Checkout-owner delivery lane: the collector polls pending repo-owned
-/// file mutations for the scopes its producer grant covers. Read-only on
-/// the store; the ack endpoint is the mutation.
+/// file mutations for the scopes its producer grant covers. Delivery never
+/// mutates the store; the ack endpoint is the mutation. The one exception
+/// is observability: guarded mutations withheld from a collector that did
+/// not declare guarded support are stamped so the refusal is visible to the
+/// producer that queued them.
 async fn poll_checkout_mutations(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ProducerGrant>,
+    headers: HeaderMap,
     Json(request): Json<CheckoutMutationPollRequestV1>,
 ) -> Result<impl IntoResponse, HttpError> {
     request
         .validate()
         .map_err(|error| HttpError::unprocessable("invalid_poll_request", error.to_string()))?;
+    let guarded_supported = headers
+        .get_all(bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(bbox_code_source::capabilities_support_guarded);
     let scopes: std::collections::BTreeSet<PublishedScope> =
         grant.projects.keys().cloned().collect();
-    let (mutations, deferred) = blocking(move || {
-        let store = state.checkout_mutations.read();
-        Ok::<_, anyhow::Error>(store.poll(&scopes))
+    let persist_state = state.clone();
+    let producer_id = grant.producer_id.clone();
+    let (poll, noted) = blocking(move || {
+        let poll = state
+            .checkout_mutations
+            .read()
+            .poll(&scopes, guarded_supported);
+        let noted = !poll.withheld_unsupported.is_empty()
+            && state.checkout_mutations.write().note_owner_unsupported(
+                &poll.withheld_unsupported,
+                &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            );
+        Ok::<_, anyhow::Error>((poll, noted))
     })
     .await?;
+    if !poll.withheld_unsupported.is_empty() {
+        tracing::warn!(
+            producer_id = %producer_id,
+            withheld = poll.withheld_unsupported.len(),
+            "guarded checkout mutations withheld: the collector did not declare guarded-v1 support; upgrade it"
+        );
+    }
+    if noted {
+        persist_state.checkout_mutations_persister.request();
+    }
     Ok(Json(CheckoutMutationPollResponseV1 {
-        mutations,
-        deferred,
+        mutations: poll.mutations,
+        deferred: poll.deferred,
     }))
 }
 
@@ -1526,11 +1555,12 @@ async fn ack_checkout_mutation(
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut store = state.checkout_mutations.write();
         let settled = store
-            .ack(
+            .ack_with_observation(
                 &request.mutation_id,
                 &request.outcome,
                 request.error.clone(),
                 request.content_sha256.clone(),
+                request.observed_sha256.clone(),
                 &now,
             )
             .map_err(|error| anyhow!("{error}"))?;
@@ -8229,6 +8259,7 @@ mod tests {
             content_json: Some("{\"id\":\"gap-0123abcd\"}".into()),
             reason: "route test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
+            guard: None,
         }
     }
 
@@ -8275,6 +8306,7 @@ mod tests {
             outcome: outcome.into(),
             error: None,
             content_sha256: Some("a".repeat(64)),
+            observed_sha256: None,
         };
         let response = app
             .clone()
@@ -8325,6 +8357,133 @@ mod tests {
         let page: CheckoutMutationPollResponseV1 = serde_json::from_slice(&body).unwrap();
         assert!(page.mutations.is_empty());
         assert_eq!(page.deferred, 0);
+    }
+
+    /// A collector that never declares guarded support keeps receiving
+    /// legacy mutations while guarded ones are withheld (never downgraded)
+    /// and stamped; a declaring collector receives the guarded chain one
+    /// mutation at a time and a conflicted ack settles its successors.
+    #[tokio::test]
+    async fn guarded_checkout_mutations_route_by_capability_and_settle_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let path = ".bro/brofiles/reviewer.json";
+        let (first, second) = {
+            let mut queue = state.checkout_mutations.write();
+            queue
+                .enqueue(checkout_mutation(&scope, "cm-00000000000000aa"))
+                .unwrap();
+            let mut edit = |content: &str| {
+                let base = queue.write_base(&scope, path, None).unwrap();
+                queue
+                    .enqueue_guarded(
+                        scope.clone(),
+                        path.into(),
+                        Some(content.into()),
+                        base.as_deref(),
+                        None,
+                        "route test".into(),
+                        "2026-09-24T00:00:00Z".into(),
+                    )
+                    .unwrap()
+                    .mutation_id
+            };
+            (edit(r#"{"v":1}"#), edit(r#"{"v":2}"#))
+        };
+        let app = router(state.clone()).with_state(state.clone());
+        let poll = |capabilities: Option<&'static str>| {
+            let mut request = authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/poll",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationPollRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                    })
+                    .unwrap(),
+                ),
+            );
+            if let Some(value) = capabilities {
+                request.headers_mut().insert(
+                    bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER,
+                    value.parse().unwrap(),
+                );
+            }
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                serde_json::from_slice::<CheckoutMutationPollResponseV1>(&body).unwrap()
+            }
+        };
+
+        let legacy = poll(None).await;
+        assert_eq!(
+            legacy
+                .mutations
+                .iter()
+                .map(|mutation| mutation.mutation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cm-00000000000000aa"]
+        );
+        assert_eq!(legacy.deferred, 2);
+        assert!(
+            state
+                .checkout_mutations
+                .read()
+                .get(&first)
+                .unwrap()
+                .owner_unsupported_at
+                .is_some()
+        );
+
+        let guarded = poll(Some("guarded-v1")).await;
+        let ids = guarded
+            .mutations
+            .iter()
+            .map(|mutation| mutation.mutation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["cm-00000000000000aa", first.as_str()]);
+        assert!(guarded.mutations[1].guard.is_some());
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/ack",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationAckRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                        mutation_id: first.clone(),
+                        outcome: bbox_code_source::CHECKOUT_MUTATION_OUTCOME_CONFLICTED.into(),
+                        error: Some("local bytes preserved".into()),
+                        content_sha256: None,
+                        observed_sha256: Some("c".repeat(64)),
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let settled: CheckoutMutationAckResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settled.status, "conflicted");
+        let queue = state.checkout_mutations.read();
+        assert_eq!(
+            queue.progress(&first),
+            Some(crate::checkout_mutations::CheckoutMutationProgress::Conflicted)
+        );
+        assert_eq!(
+            queue.progress(&second),
+            Some(crate::checkout_mutations::CheckoutMutationProgress::Blocked)
+        );
     }
 
     #[tokio::test]
@@ -8401,6 +8560,7 @@ mod tests {
                         outcome: "applied".into(),
                         error: None,
                         content_sha256: None,
+                        observed_sha256: None,
                     })
                     .unwrap(),
                 ),

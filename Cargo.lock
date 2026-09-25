@@ -763,6 +763,7 @@ dependencies = [
 name = "bbox-knowledge-source"
 version = "0.0.1"
 dependencies = [
+ "bbox-code-source",
  "bbox-corpus-core",
  "bro-core",
  "hex",
@@ -984,6 +985,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum 0.26.3",
  "tempfile",
  "tokio",

@@ -19,11 +19,12 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 
 use crate::accepted_publication_store::{
-    AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationBuildSourceV1, AcceptedPublicationGenerationId, AcceptedPublicationLimits,
-    AcceptedPublicationPriorPointerV1, AcceptedPublicationStorePaths, FullPublisherRef,
-    GitObjectId, acquire_accepted_publication_lock, decode_pointer_v1,
-    prepare_accepted_publication_v1, rebind_pointer_attachment_locked,
+    AcceptedConfigSourceV1Input, AcceptedGapSourceV1, AcceptedKnowledgeSourceV1,
+    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+    AcceptedPublicationGenerationId, AcceptedPublicationLimits, AcceptedPublicationPriorPointerV1,
+    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId,
+    acquire_accepted_publication_lock, decode_pointer_v1, prepare_accepted_publication_v1,
+    rebind_pointer_attachment_locked,
 };
 
 /// One committed source file, byte-exact, as the publisher would have read
@@ -60,6 +61,35 @@ pub fn install_accepted_publication_for_test(
     accepted_commit: &str,
     knowledge: Vec<AcceptedPublicationSourceFileForTest>,
     gaps: Vec<AcceptedPublicationSourceFileForTest>,
+) -> anyhow::Result<InstalledAcceptedPublicationForTest> {
+    install_accepted_publication_with_config_for_test(
+        projects_path,
+        project_id,
+        attachment_id,
+        scope,
+        full_ref,
+        accepted_commit,
+        knowledge,
+        gaps,
+        None,
+    )
+}
+
+/// [`install_accepted_publication_for_test`] with a configuration lane:
+/// `None` installs a generation without the lane, `Some` installs the lane
+/// with exactly these files (validated like any accepted generation).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // every argument is one durable pointer field
+pub fn install_accepted_publication_with_config_for_test(
+    projects_path: &Path,
+    project_id: &ProjectId,
+    attachment_id: &AttachmentId,
+    scope: &PublishedScope,
+    full_ref: &str,
+    accepted_commit: &str,
+    knowledge: Vec<AcceptedPublicationSourceFileForTest>,
+    gaps: Vec<AcceptedPublicationSourceFileForTest>,
+    config: Option<Vec<AcceptedPublicationSourceFileForTest>>,
 ) -> anyhow::Result<InstalledAcceptedPublicationForTest> {
     let paths = AcceptedPublicationStorePaths::derive(projects_path)?;
     let limits = AcceptedPublicationLimits::default();
@@ -109,6 +139,15 @@ pub fn install_accepted_publication_for_test(
                 .collect(),
             graphs: Vec::new(),
             evidence: Vec::new(),
+            config: config.map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| AcceptedConfigSourceV1Input {
+                        repository_relative_filename: file.repository_relative_filename,
+                        source_bytes: file.source_bytes,
+                    })
+                    .collect()
+            }),
             auto_advance: inherited_auto_advance,
             prior_pointer,
         },

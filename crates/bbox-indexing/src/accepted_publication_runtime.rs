@@ -23,11 +23,12 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
-    AcceptedEvidenceSourceV1Input, AcceptedGapSourceV1, AcceptedGraphSourceV1Input,
-    AcceptedKnowledgeSourceV1, AcceptedPublicationAutoAdvanceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationBuildSourceV1, AcceptedPublicationFaultInjector,
-    AcceptedPublicationGenerationId, AcceptedPublicationGenerationV1, AcceptedPublicationLimits,
-    AcceptedPublicationLockGuard, AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
+    AcceptedConfigSourceV1Input, AcceptedEvidenceSourceV1Input, AcceptedGapSourceV1,
+    AcceptedGraphSourceV1Input, AcceptedKnowledgeSourceV1, AcceptedPublicationAutoAdvanceV1,
+    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
+    AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
+    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
     AcceptedPublicationSourceBindingV2, AcceptedPublicationStoreError,
     AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
     PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
@@ -43,13 +44,13 @@ use crate::accepted_publication_store::{
 /// crate-external caller imports; the generation and pointer containers that
 /// hold them remain crate-private.
 pub use crate::accepted_publication_store::{
-    AcceptedBlockingLevelV1, AcceptedEdgeConfidenceV1, AcceptedEvidenceSourceV1,
-    AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1, AcceptedGapResolutionV1,
-    AcceptedGraphSourceV1, AcceptedKnowledgeApprovalV1, AcceptedKnowledgeCategoryV1,
-    AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1, AcceptedKnowledgeEntryV1,
-    AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1, AcceptedKnowledgeStatusV1,
-    AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename, PublicationFileManifestEntryV1,
-    PublicationRecordId, PublicationSha256,
+    AcceptedBlockingLevelV1, AcceptedConfigSourceV1, AcceptedEdgeConfidenceV1,
+    AcceptedEvidenceSourceV1, AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1,
+    AcceptedGapResolutionV1, AcceptedGraphSourceV1, AcceptedKnowledgeApprovalV1,
+    AcceptedKnowledgeCategoryV1, AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1,
+    AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1,
+    AcceptedKnowledgeStatusV1, AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename,
+    PublicationFileManifestEntryV1, PublicationRecordId, PublicationSha256,
 };
 
 /// The accepted-publication authority itself could not be opened. This is
@@ -411,6 +412,7 @@ impl VerifiedAcceptedPublication {
             normalized_gaps: Default::default(),
             graph_sources: Default::default(),
             evidence_sources: Default::default(),
+            config_sources: None,
             hashes: AcceptedPublicationHashesV1 {
                 knowledge_file_manifest_sha256: sha(),
                 gap_file_manifest_sha256: sha(),
@@ -418,6 +420,7 @@ impl VerifiedAcceptedPublication {
                 normalized_gaps_sha256: sha(),
                 graph_sources_sha256: None,
                 evidence_sources_sha256: None,
+                config_sources_sha256: None,
             },
             counts: AcceptedPublicationCountsV1 {
                 knowledge_files: 0,
@@ -426,6 +429,7 @@ impl VerifiedAcceptedPublication {
                 gap_entries: 0,
                 graph_files: 0,
                 evidence_files: 0,
+                config_files: None,
             },
             total_encoded_bytes: 0,
         };
@@ -481,6 +485,15 @@ impl VerifiedAcceptedPublication {
         &self,
     ) -> &BTreeMap<NormalizedRepoRelativeFilename, AcceptedEvidenceSourceV1> {
         &self.content.generation.evidence_sources
+    }
+
+    /// The accepted configuration lane, `None` when the accepted generation
+    /// carries none (its producer or the daemon that accepted it predates
+    /// the lane). `Some` of an empty map is a verified empty configuration.
+    pub fn config_sources(
+        &self,
+    ) -> Option<&BTreeMap<NormalizedRepoRelativeFilename, AcceptedConfigSourceV1>> {
+        self.content.generation.config_sources.as_ref()
     }
 
     pub fn counts(&self) -> &AcceptedPublicationCountsV1 {
@@ -709,6 +722,8 @@ pub struct PublishSources {
     pub gaps: Vec<PublishSourceFile>,
     pub graphs: Vec<PublishSourceFile>,
     pub evidence: Vec<PublishSourceFile>,
+    /// `None` when the source carries no configuration lane.
+    pub config: Option<Vec<PublishSourceFile>>,
 }
 
 /// What a publish does to the project's standing auto-advance grant
@@ -1363,6 +1378,15 @@ impl AcceptedPublicationRuntime {
                         source_bytes: file.source_bytes,
                     })
                     .collect(),
+                config: sources.config.map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| AcceptedConfigSourceV1Input {
+                            repository_relative_filename: file.repository_relative_filename,
+                            source_bytes: file.source_bytes,
+                        })
+                        .collect()
+                }),
                 auto_advance,
                 prior_pointer,
             },
@@ -2452,6 +2476,7 @@ mod tests {
             }],
             graphs: Vec::new(),
             evidence: Vec::new(),
+            config: None,
         }
     }
 

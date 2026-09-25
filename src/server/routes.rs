@@ -2106,7 +2106,7 @@ pub(crate) async fn roster_handler(
     for tn in &wanted_teams {
         if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
             for member in &team.members {
-                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let candidate = build_member_entry(&team, member, &state, &config);
                 let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;
@@ -2123,7 +2123,7 @@ pub(crate) async fn roster_handler(
                 if !wanted_bros.iter().any(|b| b == &member.name) {
                     continue;
                 }
-                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let candidate = build_member_entry(&team, member, &state, &config);
                 let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;
@@ -2160,7 +2160,7 @@ pub(crate) async fn roster_handler(
     if no_selectors {
         for team in orchestration::team::load_all_teams(&store_dir) {
             for member in &team.members {
-                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let candidate = build_member_entry(&team, member, &state, &config);
                 let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;

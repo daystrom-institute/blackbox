@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+bbox-code-source = { path = "../bbox-code-source" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bro-core = { path = "../bro-core" }
 hex = "0.4"

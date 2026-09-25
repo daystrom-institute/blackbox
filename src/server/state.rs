@@ -3132,6 +3132,41 @@ pub(crate) mod catalog_fixture {
             .unwrap()
         }
 
+        /// Install an accepted publication carrying a configuration lane of
+        /// exactly these scope-relative files (`None` installs a generation
+        /// without the lane, the shape a pre-lane producer leaves).
+        pub(crate) fn install_config_publication(
+            &self,
+            project_id: &str,
+            scope: &PublishedScope,
+            accepted_commit: &str,
+            config: Option<&[(&str, &[u8])]>,
+        ) -> InstalledAcceptedPublicationForTest {
+            bbox_indexing::accepted_publication_test_support::install_accepted_publication_with_config_for_test(
+                &self.catalog_projects_path,
+                &ProjectId::parse(project_id).unwrap(),
+                &Self::attachment(),
+                scope,
+                "refs/heads/main",
+                accepted_commit,
+                Vec::new(),
+                Vec::new(),
+                config.map(|files| {
+                    files
+                        .iter()
+                        .map(|(path, bytes)| AcceptedPublicationSourceFileForTest {
+                            repository_relative_filename:
+                                bbox_knowledge_source::config_source_repository_relative_filename(
+                                    scope, path,
+                                ),
+                            source_bytes: bytes.to_vec(),
+                        })
+                        .collect()
+                }),
+            )
+            .unwrap()
+        }
+
         /// Move one pointer to another attachment. Accepted content does
         /// not change, so a content-stamp-keyed cache must survive it.
         pub(crate) fn rebind(&self, project_id: &str, new_attachment: &str) {

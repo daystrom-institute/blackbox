@@ -647,11 +647,13 @@ fn validate_command_string(
 //
 // The daemon computes repo-owned file mutations it cannot apply itself (zero
 // checkout authority): a validated gap record, a rewritten knowledge entry, a
-// deletion. The checkout-owner collector polls for pending mutations over the
-// authenticated producer channel, applies them byte-for-byte, and acks. All
-// schema intelligence stays daemon-side; the collector is a dumb writer. The
-// path constraint below is the safety boundary: this lane can only ever touch
-// committed `.bbox/` state, never arbitrary checkout files.
+// project bro configuration file, a deletion. The checkout-owner collector
+// polls for pending mutations over the authenticated producer channel,
+// applies them byte-for-byte, and acks. All schema intelligence stays
+// daemon-side; the collector is a dumb writer. The path constraint below is
+// the safety boundary: unguarded mutations only ever touch committed `.bbox/`
+// state, and guarded mutations only ever touch the closed set of project
+// configuration targets, never arbitrary checkout files.
 // ---------------------------------------------------------------------------
 
 pub const CHECKOUT_MUTATION_SCHEMA_VERSION: u32 = 1;
@@ -659,6 +661,133 @@ pub const MAX_CHECKOUT_MUTATIONS_PER_POLL: usize = 64;
 pub const MAX_CHECKOUT_MUTATION_PATH_BYTES: usize = 1024;
 pub const MAX_CHECKOUT_MUTATION_CONTENT_BYTES: usize = 256 * 1024;
 pub const MAX_CHECKOUT_MUTATION_REASON_BYTES: usize = 2048;
+/// Longest project configuration name (brofile or teamplate stem).
+pub const MAX_PROJECT_CONFIG_NAME_BYTES: usize = 128;
+
+/// Request header a collector sends on the mutation poll to declare which
+/// mutation shapes it can apply. A header rather than a body field because
+/// the poll body denies unknown fields: an older daemon ignores the header
+/// and keeps serving legacy mutations, and an older collector never sends it,
+/// so the daemon withholds guarded mutations instead of delivering a shape
+/// the collector cannot decode.
+pub const CHECKOUT_MUTATION_CAPABILITIES_HEADER: &str = "x-bbox-checkout-mutation-capabilities";
+/// Capability token for [`CheckoutMutationGuardV1`] preconditions.
+pub const CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1: &str = "guarded-v1";
+
+/// Whether a capabilities header value advertises guarded mutations.
+pub fn capabilities_support_guarded(header_value: &str) -> bool {
+    header_value
+        .split(',')
+        .any(|token| token.trim() == CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1)
+}
+
+/// One repo-owned project configuration file the guarded mutation lane may
+/// write or delete. Paths are relative to the published scope root, the same
+/// root the checkout owner joins every mutation path onto.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectConfigTargetV1 {
+    /// `.bro/brofiles/<name>.json`
+    Brofile(String),
+    /// `.bro/teamplates/<name>.json`
+    Teamplate(String),
+    /// `.bbox/mcp.json`
+    McpStore,
+}
+
+pub const PROJECT_MCP_STORE_PATH: &str = ".bbox/mcp.json";
+/// The committed project config. A read dependency of the configuration
+/// view (MCP enablement), never a mutation target.
+pub const PROJECT_CONFIG_TOML_PATH: &str = ".bbox/config.toml";
+const PROJECT_BROFILES_DIR: &str = ".bro/brofiles/";
+const PROJECT_TEAMPLATES_DIR: &str = ".bro/teamplates/";
+
+impl ProjectConfigTargetV1 {
+    /// Scope-root-relative path of this target.
+    pub fn relative_path(&self) -> String {
+        match self {
+            Self::Brofile(name) => format!("{PROJECT_BROFILES_DIR}{name}.json"),
+            Self::Teamplate(name) => format!("{PROJECT_TEAMPLATES_DIR}{name}.json"),
+            Self::McpStore => PROJECT_MCP_STORE_PATH.to_string(),
+        }
+    }
+
+    /// Classify a scope-root-relative path. Only the exact target shapes
+    /// classify: nested directories, other extensions, hidden names and
+    /// arbitrary `.bro/` or `.bbox/` files do not.
+    pub fn from_relative_path(path: &str) -> Option<Self> {
+        if validate_relative_path(path).is_err() {
+            return None;
+        }
+        if path == PROJECT_MCP_STORE_PATH {
+            return Some(Self::McpStore);
+        }
+        let named = |prefix: &str| {
+            let stem = path.strip_prefix(prefix)?.strip_suffix(".json")?;
+            validate_project_config_name(stem).ok()?;
+            Some(stem.to_string())
+        };
+        if let Some(name) = named(PROJECT_BROFILES_DIR) {
+            return Some(Self::Brofile(name));
+        }
+        named(PROJECT_TEAMPLATES_DIR).map(Self::Teamplate)
+    }
+}
+
+/// A project configuration name is one plain path component: non-empty,
+/// bounded, not hidden, and free of separators and controls.
+pub fn validate_project_config_name(name: &str) -> Result<(), ContractError> {
+    if name.is_empty()
+        || name.len() > MAX_PROJECT_CONFIG_NAME_BYTES
+        || name.starts_with('.')
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+        || validate_relative_path(name).is_err()
+    {
+        return Err(ContractError::InvalidCheckoutMutationField(
+            "project configuration name must be one plain, non-hidden path component",
+        ));
+    }
+    Ok(())
+}
+
+/// Exact-byte precondition and delivery fence on a guarded mutation.
+///
+/// `expected_sha256` is the SHA-256 of the bytes the owner must find at the
+/// path before applying, or `None` when the path must be absent. It is derived
+/// from the immediate predecessor in this path's chain (the accepted bytes
+/// when there is none), never from the owner's current file. `predecessor`
+/// names that immediate predecessor so the owner and daemon can refuse to let
+/// a successor bypass it.
+///
+/// Bytes recur (a delete returns a path to absence), so a precondition alone
+/// cannot tell a stale delivery from a fresh one. `epoch` names the daemon
+/// queue that minted the mutation and `sequence` is that queue's durable,
+/// never-reused counter. The owner applies a guarded mutation only above the
+/// highest sequence it applied on the path in the same epoch, and never from
+/// an epoch it has seen superseded, so no delayed delivery can reapply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationGuardV1 {
+    pub expected_sha256: Option<String>,
+    pub predecessor: Option<String>,
+    /// 32 lowercase hex characters.
+    pub epoch: String,
+    /// At least 1; strictly increasing within an epoch.
+    pub sequence: u64,
+}
+
+/// Whether a guard epoch is well formed.
+pub fn validate_guard_epoch(value: &str) -> Result<(), ContractError> {
+    if value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidCheckoutMutationField("guard.epoch"))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -668,7 +797,8 @@ pub struct CheckoutMutationV1 {
     pub mutation_id: String,
     /// The published scope whose checkout receives the write.
     pub scope: PublishedScope,
-    /// Repo-relative path, always below `.bbox/` (the lane's boundary).
+    /// Scope-root-relative path: below `.bbox/` for unguarded mutations, a
+    /// [`ProjectConfigTargetV1`] path for guarded ones.
     pub relative_path: String,
     /// `write` (exact bytes in `content_json`) or `delete`.
     pub mode: String,
@@ -676,6 +806,10 @@ pub struct CheckoutMutationV1 {
     /// Short agent/operator-facing provenance (which tool call enqueued).
     pub reason: String,
     pub enqueued_at: String,
+    /// Present exactly on guarded configuration mutations. Legacy knowledge
+    /// and gap mutations omit it, so their encoding is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<CheckoutMutationGuardV1>,
 }
 
 impl CheckoutMutationV1 {
@@ -684,21 +818,57 @@ impl CheckoutMutationV1 {
             return Err(ContractError::UnsupportedSchema(self.schema_version));
         }
         validate_scope(&self.scope)?;
-        if self.mutation_id.len() != 19
-            || !self.mutation_id.starts_with("cm-")
-            || !self.mutation_id[3..]
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ContractError::InvalidCheckoutMutationField("mutation_id"));
-        }
+        validate_checkout_mutation_id(&self.mutation_id, "mutation_id")?;
         if self.relative_path.len() > MAX_CHECKOUT_MUTATION_PATH_BYTES
             || validate_relative_path(&self.relative_path).is_err()
-            || !self.relative_path.starts_with(".bbox/")
         {
             return Err(ContractError::InvalidCheckoutMutationField(
-                "relative_path must be a clean path below .bbox/",
+                "relative_path must be a clean scope-relative path",
             ));
+        }
+        let target = ProjectConfigTargetV1::from_relative_path(&self.relative_path);
+        match &self.guard {
+            None => {
+                // Configuration targets are guarded-only: an unguarded write
+                // there would be a downgraded, precondition-free overwrite.
+                // The committed project identity is never a lane target.
+                if !self.relative_path.starts_with(".bbox/")
+                    || target.is_some()
+                    || self.relative_path == PROJECT_CONFIG_TOML_PATH
+                {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "relative_path must be a clean path below .bbox/ outside the guarded configuration targets",
+                    ));
+                }
+            }
+            Some(guard) => {
+                if target.is_none() {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "guarded relative_path must be a project configuration target",
+                    ));
+                }
+                if let Some(expected) = &guard.expected_sha256 {
+                    validate_sha256(expected)?;
+                } else if self.mode == "delete" {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "guarded delete requires an expected present file",
+                    ));
+                }
+                validate_guard_epoch(&guard.epoch)?;
+                if guard.sequence == 0 {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "guard.sequence",
+                    ));
+                }
+                if let Some(predecessor) = &guard.predecessor {
+                    validate_checkout_mutation_id(predecessor, "guard.predecessor")?;
+                    if predecessor == &self.mutation_id {
+                        return Err(ContractError::InvalidCheckoutMutationField(
+                            "guard.predecessor",
+                        ));
+                    }
+                }
+            }
         }
         match self.mode.as_str() {
             "write" => match &self.content_json {
@@ -726,6 +896,25 @@ impl CheckoutMutationV1 {
         }
         Ok(())
     }
+
+    /// SHA-256 of the bytes this mutation leaves at its path, or `None` for
+    /// a delete. A guarded owner that already finds this state recognizes a
+    /// redelivered, already-applied mutation.
+    pub fn target_sha256(&self) -> Option<String> {
+        self.content_json
+            .as_deref()
+            .map(|content| format!("{:x}", Sha256::digest(content.as_bytes())))
+    }
+}
+
+fn validate_checkout_mutation_id(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if value.len() != 19
+        || !value.starts_with("cm-")
+        || !value[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ContractError::InvalidCheckoutMutationField(field));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -747,23 +936,36 @@ impl CheckoutMutationPollRequestV1 {
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationPollResponseV1 {
     /// Pending mutations whose scopes the producer grant covers, oldest
-    /// first, capped at MAX_CHECKOUT_MUTATIONS_PER_POLL.
+    /// first, capped at MAX_CHECKOUT_MUTATIONS_PER_POLL. A guarded path
+    /// contributes at most its oldest undelivered mutation.
     pub mutations: Vec<CheckoutMutationV1>,
-    /// Pending mutations behind the cap or outside the grant, for
-    /// observability (the producer re-polls next cycle).
+    /// Pending mutations behind the cap, outside the grant, waiting on a
+    /// predecessor, or needing a capability the collector did not declare,
+    /// for observability (the producer re-polls next cycle).
     pub deferred: u64,
 }
+
+pub const CHECKOUT_MUTATION_OUTCOME_APPLIED: &str = "applied";
+pub const CHECKOUT_MUTATION_OUTCOME_FAILED: &str = "failed";
+/// A guarded mutation whose precondition did not match the owner's current
+/// file. The owner left its bytes untouched.
+pub const CHECKOUT_MUTATION_OUTCOME_CONFLICTED: &str = "conflicted";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationAckRequestV1 {
     pub schema_version: u32,
     pub mutation_id: String,
-    /// `applied` or `failed`.
+    /// `applied`, `failed`, or (guarded mutations only) `conflicted`.
     pub outcome: String,
     pub error: Option<String>,
     /// sha256 of the bytes written, when outcome is `applied` on a write.
     pub content_sha256: Option<String>,
+    /// For `conflicted`: the SHA-256 of the owner's current bytes, or `None`
+    /// when the path was absent. Omitted on every other outcome, so legacy
+    /// acks keep their encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_sha256: Option<String>,
 }
 
 impl CheckoutMutationAckRequestV1 {
@@ -771,7 +973,12 @@ impl CheckoutMutationAckRequestV1 {
         if self.schema_version != CHECKOUT_MUTATION_SCHEMA_VERSION {
             return Err(ContractError::UnsupportedSchema(self.schema_version));
         }
-        if !matches!(self.outcome.as_str(), "applied" | "failed") {
+        if !matches!(
+            self.outcome.as_str(),
+            CHECKOUT_MUTATION_OUTCOME_APPLIED
+                | CHECKOUT_MUTATION_OUTCOME_FAILED
+                | CHECKOUT_MUTATION_OUTCOME_CONFLICTED
+        ) {
             return Err(ContractError::InvalidCheckoutMutationField("outcome"));
         }
         if let Some(error) = &self.error {
@@ -784,6 +991,14 @@ impl CheckoutMutationAckRequestV1 {
                 return Err(ContractError::InvalidDigest);
             }
         }
+        if let Some(digest) = &self.observed_sha256 {
+            if self.outcome != CHECKOUT_MUTATION_OUTCOME_CONFLICTED {
+                return Err(ContractError::InvalidCheckoutMutationField(
+                    "observed_sha256 applies only to conflicted outcomes",
+                ));
+            }
+            validate_sha256(digest)?;
+        }
         Ok(())
     }
 }
@@ -791,8 +1006,8 @@ impl CheckoutMutationAckRequestV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationAckResponseV1 {
-    /// `applied`, `failed`, `already_settled` (duplicate terminal ack), or
-    /// `unknown_mutation`.
+    /// `applied`, `failed`, `conflicted`, `already_settled` (duplicate
+    /// terminal ack), or `unknown_mutation`.
     pub status: String,
 }
 
@@ -1308,6 +1523,22 @@ mod tests {
             content_json: Some("{\"id\":\"gap-0123abcd\"}".into()),
             reason: "bbox_gap(scope=project) via checkout-owner lane".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
+            guard: None,
+        }
+    }
+
+    fn guarded_config_mutation(relative_path: &str) -> CheckoutMutationV1 {
+        CheckoutMutationV1 {
+            relative_path: relative_path.into(),
+            content_json: Some("{\"name\":\"reviewer\"}".into()),
+            reason: "bro_brofile(scope=project) via checkout-owner lane".into(),
+            guard: Some(CheckoutMutationGuardV1 {
+                expected_sha256: None,
+                predecessor: None,
+                epoch: "0123456789abcdef0123456789abcdef".into(),
+                sequence: 1,
+            }),
+            ..valid_checkout_mutation()
         }
     }
 
@@ -1463,6 +1694,197 @@ mod tests {
     }
 
     #[test]
+    fn project_config_targets_classify_exactly_the_three_shapes() {
+        for (path, target) in [
+            (
+                ".bro/brofiles/reviewer.json",
+                ProjectConfigTargetV1::Brofile("reviewer".into()),
+            ),
+            (
+                ".bro/brofiles/code-reviewer_v2.json",
+                ProjectConfigTargetV1::Brofile("code-reviewer_v2".into()),
+            ),
+            (
+                ".bro/teamplates/squad.json",
+                ProjectConfigTargetV1::Teamplate("squad".into()),
+            ),
+            (".bbox/mcp.json", ProjectConfigTargetV1::McpStore),
+        ] {
+            assert_eq!(
+                ProjectConfigTargetV1::from_relative_path(path),
+                Some(target.clone()),
+                "{path}"
+            );
+            assert_eq!(target.relative_path(), path);
+        }
+        for path in [
+            ".bro/brofiles/nested/reviewer.json",
+            ".bro/brofiles/.hidden.json",
+            ".bro/brofiles/.json",
+            ".bro/brofiles/reviewer.toml",
+            ".bro/brofiles/reviewer",
+            ".bro/brofiles/../mcp.json",
+            ".bro/teamplates/a/b.json",
+            ".bro/mcp.json",
+            ".bro/config.json",
+            ".bro/accounts.json",
+            ".bbox/config.toml",
+            ".bbox/knowledge/abc.json",
+            "sub/.bbox/mcp.json",
+            "/abs/.bbox/mcp.json",
+            "../.bbox/mcp.json",
+            ".bbox/mcp.json/",
+            ".bro\\brofiles\\x.json",
+            &format!(
+                ".bro/brofiles/{}.json",
+                "n".repeat(MAX_PROJECT_CONFIG_NAME_BYTES + 1)
+            ),
+        ] {
+            assert_eq!(
+                ProjectConfigTargetV1::from_relative_path(path),
+                None,
+                "{path} must not classify as a configuration target"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_mutations_accept_only_configuration_targets() {
+        for path in [
+            ".bro/brofiles/reviewer.json",
+            ".bro/teamplates/squad.json",
+            ".bbox/mcp.json",
+        ] {
+            guarded_config_mutation(path).validate().unwrap();
+        }
+        for path in [
+            ".bbox/config.toml",
+            ".bbox/gaps/gap-0123abcd.json",
+            ".bro/brofiles/nested/reviewer.json",
+            ".bro/other/reviewer.json",
+            "src/main.rs",
+            "/abs/.bro/brofiles/reviewer.json",
+            ".bro/brofiles/../../escape.json",
+        ] {
+            assert!(
+                guarded_config_mutation(path).validate().is_err(),
+                "guarded {path} must be rejected"
+            );
+        }
+        let mut bad_expected = guarded_config_mutation(".bbox/mcp.json");
+        bad_expected.guard.as_mut().unwrap().expected_sha256 = Some("A".repeat(64));
+        assert!(bad_expected.validate().is_err());
+        let mut absent_delete = guarded_config_mutation(".bbox/mcp.json");
+        absent_delete.mode = "delete".into();
+        absent_delete.content_json = None;
+        assert!(
+            absent_delete.validate().is_err(),
+            "a guarded delete must name the present bytes it removes"
+        );
+        absent_delete.guard.as_mut().unwrap().expected_sha256 = Some("a".repeat(64));
+        absent_delete.validate().unwrap();
+        let mut self_predecessor = guarded_config_mutation(".bbox/mcp.json");
+        self_predecessor.guard.as_mut().unwrap().predecessor =
+            Some(self_predecessor.mutation_id.clone());
+        assert!(self_predecessor.validate().is_err());
+        let mut bad_epoch = guarded_config_mutation(".bbox/mcp.json");
+        bad_epoch.guard.as_mut().unwrap().epoch = "0123".into();
+        assert!(bad_epoch.validate().is_err());
+        let mut zero_sequence = guarded_config_mutation(".bbox/mcp.json");
+        zero_sequence.guard.as_mut().unwrap().sequence = 0;
+        assert!(zero_sequence.validate().is_err());
+        let mut bad_predecessor = guarded_config_mutation(".bbox/mcp.json");
+        bad_predecessor.guard.as_mut().unwrap().predecessor = Some("cm-nothex".into());
+        assert!(bad_predecessor.validate().is_err());
+    }
+
+    #[test]
+    fn unguarded_mutations_never_reach_configuration_targets() {
+        for path in [
+            ".bbox/mcp.json",
+            ".bbox/config.toml",
+            ".bro/brofiles/reviewer.json",
+            ".bro/teamplates/squad.json",
+        ] {
+            let mut mutation = valid_checkout_mutation();
+            mutation.relative_path = path.into();
+            assert!(
+                mutation.validate().is_err(),
+                "unguarded {path} would be a precondition-free overwrite"
+            );
+        }
+        for path in [
+            ".bbox/knowledge/0123456789abcdef.json",
+            ".bbox/gaps/gap-0123abcd.json",
+        ] {
+            let mut mutation = valid_checkout_mutation();
+            mutation.relative_path = path.into();
+            mutation.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_mutation_and_ack_encodings_are_unchanged() {
+        let legacy = serde_json::to_value(valid_checkout_mutation()).unwrap();
+        assert!(legacy.get("guard").is_none());
+        let decoded: CheckoutMutationV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "mutation_id": "cm-0123456789abcdef",
+            "scope": serde_json::to_value(scope()).unwrap(),
+            "relative_path": ".bbox/gaps/gap-0123abcd.json",
+            "mode": "write",
+            "content_json": "{}",
+            "reason": "legacy",
+            "enqueued_at": "2026-08-12T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(decoded.guard, None);
+        decoded.validate().unwrap();
+        let ack = CheckoutMutationAckRequestV1 {
+            schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-0123456789abcdef".into(),
+            outcome: CHECKOUT_MUTATION_OUTCOME_APPLIED.into(),
+            error: None,
+            content_sha256: None,
+            observed_sha256: None,
+        };
+        assert!(
+            serde_json::to_value(&ack)
+                .unwrap()
+                .get("observed_sha256")
+                .is_none()
+        );
+        // A guarded mutation carries its explicit absence assertion as null.
+        let guarded = serde_json::to_value(guarded_config_mutation(".bbox/mcp.json")).unwrap();
+        assert_eq!(guarded["guard"]["expected_sha256"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn capability_header_parsing_is_exact() {
+        assert!(capabilities_support_guarded("guarded-v1"));
+        assert!(capabilities_support_guarded("other, guarded-v1"));
+        assert!(!capabilities_support_guarded(""));
+        assert!(!capabilities_support_guarded("guarded-v2"));
+        assert!(!capabilities_support_guarded("guarded-v1x"));
+    }
+
+    #[test]
+    fn target_sha256_names_the_resulting_state() {
+        let write = guarded_config_mutation(".bbox/mcp.json");
+        assert_eq!(
+            write.target_sha256().unwrap(),
+            format!(
+                "{:x}",
+                Sha256::digest(write.content_json.as_deref().unwrap().as_bytes())
+            )
+        );
+        let mut delete = write.clone();
+        delete.mode = "delete".into();
+        delete.content_json = None;
+        assert_eq!(delete.target_sha256(), None);
+    }
+
+    #[test]
     fn checkout_mutation_rejects_mode_content_mismatches() {
         let mut write_without_content = valid_checkout_mutation();
         write_without_content.content_json = None;
@@ -1489,6 +1911,7 @@ mod tests {
             outcome: "applied".into(),
             error: None,
             content_sha256: Some("a".repeat(64)),
+            observed_sha256: None,
         };
         valid.validate().unwrap();
 
@@ -1502,6 +1925,18 @@ mod tests {
             bad_digest.validate(),
             Err(ContractError::InvalidDigest)
         ));
+
+        let mut conflicted = valid.clone();
+        conflicted.outcome = CHECKOUT_MUTATION_OUTCOME_CONFLICTED.into();
+        conflicted.content_sha256 = None;
+        conflicted.observed_sha256 = Some("b".repeat(64));
+        conflicted.validate().unwrap();
+        conflicted.observed_sha256 = None;
+        conflicted.validate().unwrap();
+
+        let mut observed_on_applied = valid.clone();
+        observed_on_applied.observed_sha256 = Some("b".repeat(64));
+        assert!(observed_on_applied.validate().is_err());
     }
 
     #[test]

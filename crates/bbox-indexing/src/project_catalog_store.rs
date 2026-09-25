@@ -11264,6 +11264,7 @@ mod tests {
                 gaps: Vec::new(),
                 graphs: Vec::new(),
                 evidence: Vec::new(),
+                config: None,
                 auto_advance: None,
                 prior_pointer: None,
             },

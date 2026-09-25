@@ -1355,8 +1355,8 @@ mod tests {
             .state
             .checkout_mutations
             .read()
-            .poll(&std::collections::BTreeSet::from([scope.clone()]))
-            .0[0]
+            .poll(&std::collections::BTreeSet::from([scope.clone()]), false)
+            .mutations[0]
             .mutation_id
             .clone();
         server
