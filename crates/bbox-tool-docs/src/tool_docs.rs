@@ -162,7 +162,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
         summary: "Search typed entities with BM25 and vectors. Returns bounded evidence hits and retrieval status. Use debug for ranking diagnostics.",
-        when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
+        when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all; only `published` has indexed documents today, so `provisional` and `connector` are accepted but return no graph hits until they are indexed) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
         example: Some(
             r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#,
         ),
@@ -171,7 +171,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_discover_seed_entities",
         category: ToolCategory::Graph,
         summary: "Find seeds with notable_edges; inspect before answering; graph vertices: graph_source/graph_ids.",
-        when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`): same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops. Project graph vertices seed under the same parameters: `project` scopes them by stamped project id, `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all), `graph_ids` names graphs (both applied before ranking), and vertex hits carry the `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref` identity fields.",
+        when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`): same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops. Project graph vertices seed under the same parameters: `project` scopes them by stamped project id, `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all; only `published` has indexed documents today, so `provisional` and `connector` are accepted but return no graph hits until they are indexed), `graph_ids` names graphs (both applied before ranking), and vertex hits carry the `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref` identity fields.",
         example: Some(
             r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#,
         ),
@@ -1776,6 +1776,26 @@ mod tests {
             extra.is_empty(),
             "ToolDoc stanzas without a matching #[tool] registration: {extra:?}"
         );
+    }
+
+    /// The search tools name the graph planes that have indexed documents,
+    /// so a caller never reads an empty graph result from an unindexed plane
+    /// as "no match". Drop a plane from the caveat when its indexing lands.
+    #[test]
+    fn search_tool_docs_name_only_indexed_graph_planes() {
+        for name in ["bbox_hybrid_search", "bbox_discover_seed_entities"] {
+            let doc = TOOL_DOCS
+                .iter()
+                .find(|doc| doc.name == name)
+                .unwrap_or_else(|| panic!("missing tool doc for {name}"));
+            assert!(
+                doc.when_to_use.contains(
+                    "only `published` has indexed documents today, so `provisional` and \
+                     `connector` are accepted but return no graph hits until they are indexed"
+                ),
+                "{name} must state which graph_source planes have indexed documents"
+            );
+        }
     }
 
     #[test]

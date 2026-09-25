@@ -46,7 +46,11 @@ pub struct DiscoverSeedParams {
     #[serde(default)]
     pub provisional: Option<String>,
     /// Read-surface plane filter for graph vertex documents, identical
-    /// semantics to `bbox_hybrid_search`'s `graph_source` parameter.
+    /// semantics to `bbox_hybrid_search`'s `graph_source` parameter:
+    /// `published`, `provisional`, or `connector`, repeatable, unset means
+    /// every plane. Only the published plane has indexed documents; the
+    /// other plane names parse but return no graph hits until they are
+    /// indexed.
     #[serde(default)]
     pub graph_source: Option<Vec<String>>,
     /// Named-graph selection for graph vertex documents, identical semantics
@@ -413,5 +417,23 @@ mod tests {
         let text = render_text("main", &[seed]);
 
         assert!(text.contains("project_file:abc:def:0"));
+    }
+
+    #[test]
+    fn graph_source_schema_names_only_the_indexed_plane() {
+        let schema = rmcp::schemars::schema_for!(DiscoverSeedParams);
+        let schema = serde_json::to_value(&schema).unwrap();
+        let description = schema["properties"]["graph_source"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .replace('\n', " ");
+        assert!(
+            description.contains("Only the published plane has indexed documents"),
+            "{description}"
+        );
+        assert!(
+            description.contains("return no graph hits until they are indexed"),
+            "{description}"
+        );
     }
 }
