@@ -793,6 +793,111 @@ fn current_file_sha256(
     Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
+/// Checkout-local record of the guarded mutations this checkout applied,
+/// kept under the gitignored `.bbox/local`. Byte preconditions alone cannot
+/// fence a stale duplicate: a path can return to an earlier state (a delete
+/// after a create), which a delayed copy of the create would match again. An
+/// id recorded here is never applied twice, whatever the bytes now say.
+const APPLIED_LEDGER_DIR: &str = ".bbox/local";
+const APPLIED_LEDGER_NAME: &str = "checkout-mutations-applied.json";
+/// Most recent guarded application ids retained. A duplicate delivery only
+/// arises before the daemon settles the first ack, so the window it has to
+/// cover is a handful of polls, far inside this bound.
+const APPLIED_LEDGER_MAX_ENTRIES: usize = 4096;
+const APPLIED_LEDGER_MAX_BYTES: usize = 1024 * 1024;
+const LOCAL_GITIGNORE: &str = "*\n!.gitignore\n";
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AppliedMutationLedger {
+    version: u32,
+    /// Oldest first.
+    applied: Vec<AppliedMutationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AppliedMutationRecord {
+    mutation_id: String,
+    relative_path: String,
+}
+
+/// The locked ledger directory and its decoded contents. The directory lock
+/// is held for the whole guarded application, so every owner of this
+/// checkout checks, applies and records one guarded mutation at a time.
+struct AppliedLedger {
+    directory: bbox_corpus_core::json_store::NofollowDirectory,
+    ledger: AppliedMutationLedger,
+}
+
+impl AppliedLedger {
+    fn open_locked(root: &Path) -> Result<Self> {
+        let directory = bbox_corpus_core::json_store::NofollowDirectory::open_or_create(
+            &root.join(APPLIED_LEDGER_DIR),
+        )?;
+        directory.lock_exclusive()?;
+        if directory
+            .read_regular(".gitignore", 4096, "local state ignore file")?
+            .is_none()
+        {
+            directory.atomic_replace(".gitignore", LOCAL_GITIGNORE.as_bytes())?;
+        }
+        let ledger = match directory.read_regular(
+            APPLIED_LEDGER_NAME,
+            APPLIED_LEDGER_MAX_BYTES,
+            "applied checkout mutation ledger",
+        )? {
+            None => AppliedMutationLedger {
+                version: 1,
+                applied: Vec::new(),
+            },
+            Some(bytes) => {
+                let ledger: AppliedMutationLedger = serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "{APPLIED_LEDGER_DIR}/{APPLIED_LEDGER_NAME} is unreadable; guarded mutations stay \
+                         undelivered until it is repaired or removed"
+                    )
+                })?;
+                if ledger.version != 1 {
+                    bail!(
+                        "{APPLIED_LEDGER_DIR}/{APPLIED_LEDGER_NAME} has unsupported version {}",
+                        ledger.version
+                    );
+                }
+                ledger
+            }
+        };
+        Ok(Self { directory, ledger })
+    }
+
+    fn contains(&self, mutation_id: &str) -> bool {
+        self.ledger
+            .applied
+            .iter()
+            .any(|record| record.mutation_id == mutation_id)
+    }
+
+    /// Durably record one application before its ack is sent.
+    fn record(&mut self, mutation: &bbox_code_source::CheckoutMutationV1) -> Result<()> {
+        if self.contains(&mutation.mutation_id) {
+            return Ok(());
+        }
+        self.ledger.applied.push(AppliedMutationRecord {
+            mutation_id: mutation.mutation_id.clone(),
+            relative_path: mutation.relative_path.clone(),
+        });
+        let excess = self
+            .ledger
+            .applied
+            .len()
+            .saturating_sub(APPLIED_LEDGER_MAX_ENTRIES);
+        self.ledger.applied.drain(..excess);
+        self.directory
+            .atomic_replace(APPLIED_LEDGER_NAME, &serde_json::to_vec(&self.ledger)?)
+            .context("recording an applied checkout mutation")
+    }
+}
+
 /// Apply one mutation byte-for-byte under the configured checkout root for
 /// its scope. Every path component is opened without following links and the
 /// target's parent directory is locked across check and replacement, so a
@@ -837,16 +942,38 @@ fn apply_checkout_mutation(
         "delete" => false,
         other => bail!("unvalidated mutation mode {other}"),
     };
+    let target_sha256 = mutation.target_sha256();
+    let mut ledger = match &mutation.guard {
+        Some(_) => {
+            let ledger = AppliedLedger::open_locked(&root)?;
+            if ledger.contains(&mutation.mutation_id) {
+                // A duplicate of a mutation this checkout already applied,
+                // possibly delayed past later edits: never apply it again.
+                tracing::info!(
+                    mutation_id = %mutation.mutation_id,
+                    path = %mutation.relative_path,
+                    "guarded checkout mutation already applied by this checkout"
+                );
+                return Ok(MutationApplyOutcome::Applied {
+                    content_sha256: target_sha256,
+                });
+            }
+            Some(ledger)
+        }
+        None => None,
+    };
     let parent = if is_write {
         Some(bbox_corpus_core::json_store::NofollowDirectory::open_or_create(&parent_path)?)
     } else {
         bbox_corpus_core::json_store::NofollowDirectory::open_existing(&parent_path)?
     };
-    let target_sha256 = mutation.target_sha256();
     let Some(parent) = parent else {
         // Delete under a missing parent: the target is absent, which is the
         // delete's own result (a guarded delete always expected presence, so
         // this is a recognized redelivery, never a precondition match).
+        if let Some(ledger) = &mut ledger {
+            ledger.record(mutation)?;
+        }
         return Ok(MutationApplyOutcome::Applied {
             content_sha256: None,
         });
@@ -860,6 +987,9 @@ fn apply_checkout_mutation(
                 path = %mutation.relative_path,
                 "guarded checkout mutation already applied"
             );
+            if let Some(ledger) = &mut ledger {
+                ledger.record(mutation)?;
+            }
             return Ok(MutationApplyOutcome::Applied {
                 content_sha256: target_sha256,
             });
@@ -878,6 +1008,9 @@ fn apply_checkout_mutation(
                 .atomic_replace(name, content.as_bytes())
                 .with_context(|| format!("replacing {}", mutation.relative_path))?;
         }
+        if let Some(ledger) = &mut ledger {
+            ledger.record(mutation)?;
+        }
         tracing::info!(
             mutation_id = %mutation.mutation_id,
             path = %mutation.relative_path,
@@ -890,6 +1023,9 @@ fn apply_checkout_mutation(
         parent
             .remove_regular(name, "checkout mutation target")
             .with_context(|| format!("deleting {}", mutation.relative_path))?;
+        if let Some(ledger) = &mut ledger {
+            ledger.record(mutation)?;
+        }
         tracing::info!(
             mutation_id = %mutation.mutation_id,
             path = %mutation.relative_path,
@@ -4281,6 +4417,143 @@ mod tests {
         );
     }
 
+    /// A byte precondition alone would let a delayed duplicate of a create
+    /// match again after a later delete returned the path to absence. The
+    /// checkout-local ledger fences every duplicate of an applied id, across
+    /// create, delete and recreate, and across a restart (each call reopens
+    /// the durable ledger, exactly as a restarted owner would).
+    #[test]
+    fn delayed_duplicates_never_resurrect_superseded_states() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        let create = guarded(&scope, "cm-00000000000000e1", BROFILE, Some(V1), None);
+        let delete = guarded(
+            &scope,
+            "cm-00000000000000e2",
+            BROFILE,
+            None,
+            Some(V1.as_bytes()),
+        );
+        let recreate = guarded(&scope, "cm-00000000000000e3", BROFILE, Some(V2), None);
+        assert_eq!(
+            apply_checkout_mutation(&config, &create).unwrap(),
+            applied(Some(V1))
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &delete).unwrap(),
+            applied(None)
+        );
+        // The path is absent again, so the create's precondition matches;
+        // its id does not.
+        assert_eq!(
+            apply_checkout_mutation(&config, &create).unwrap(),
+            applied(Some(V1))
+        );
+        assert!(
+            !root.join(BROFILE).exists(),
+            "a delayed create must not undo the delete"
+        );
+        assert_eq!(
+            apply_checkout_mutation(&config, &recreate).unwrap(),
+            applied(Some(V2))
+        );
+        let restarted = mutation_config(&root, scope.clone());
+        for stale in [&create, &delete] {
+            assert!(matches!(
+                apply_checkout_mutation(&restarted, stale).unwrap(),
+                MutationApplyOutcome::Applied { .. }
+            ));
+            assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
+        }
+        let ledger: AppliedMutationLedger = serde_json::from_slice(
+            &fs::read(root.join(APPLIED_LEDGER_DIR).join(APPLIED_LEDGER_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ledger
+                .applied
+                .iter()
+                .map(|record| record.mutation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cm-00000000000000e1",
+                "cm-00000000000000e2",
+                "cm-00000000000000e3"
+            ]
+        );
+        // The ledger stays out of version control.
+        assert_eq!(
+            fs::read_to_string(root.join(APPLIED_LEDGER_DIR).join(".gitignore")).unwrap(),
+            LOCAL_GITIGNORE
+        );
+    }
+
+    #[test]
+    fn conflicts_are_not_recorded_and_a_damaged_ledger_fails_closed() {
+        let (_directory, root, scope, config) = guarded_fixture();
+        fs::create_dir_all(root.join(".bro/brofiles")).unwrap();
+        fs::write(root.join(BROFILE), "{\"local\":true}").unwrap();
+        let replace = guarded(
+            &scope,
+            "cm-00000000000000f1",
+            BROFILE,
+            Some(V2),
+            Some(V1.as_bytes()),
+        );
+        assert!(matches!(
+            apply_checkout_mutation(&config, &replace).unwrap(),
+            MutationApplyOutcome::Conflicted { .. }
+        ));
+        // Once the owner reconciles to the expected bytes the same id still
+        // applies: a conflict is not an application.
+        fs::write(root.join(BROFILE), V1).unwrap();
+        assert_eq!(
+            apply_checkout_mutation(&config, &replace).unwrap(),
+            applied(Some(V2))
+        );
+
+        fs::write(
+            root.join(APPLIED_LEDGER_DIR).join(APPLIED_LEDGER_NAME),
+            b"{not json",
+        )
+        .unwrap();
+        let next = guarded(
+            &scope,
+            "cm-00000000000000f2",
+            BROFILE,
+            Some(V1),
+            Some(V2.as_bytes()),
+        );
+        let error = apply_checkout_mutation(&config, &next).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(APPLIED_LEDGER_NAME),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
+        // Legacy mutations never consult the ledger.
+        let legacy = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{}");
+        assert!(apply_checkout_mutation(&config, &legacy).is_ok());
+    }
+
+    #[test]
+    fn the_applied_ledger_is_bounded_to_its_most_recent_entries() {
+        let (_directory, root, scope, _config) = guarded_fixture();
+        let mut ledger = AppliedLedger::open_locked(&root).unwrap();
+        for index in 0..(APPLIED_LEDGER_MAX_ENTRIES + 3) {
+            let mutation = guarded(&scope, &format!("cm-{index:016x}"), BROFILE, Some(V1), None);
+            ledger.ledger.applied.push(AppliedMutationRecord {
+                mutation_id: mutation.mutation_id.clone(),
+                relative_path: mutation.relative_path.clone(),
+            });
+        }
+        let last = guarded(&scope, "cm-ffffffffffffffff", BROFILE, Some(V1), None);
+        ledger.record(&last).unwrap();
+        drop(ledger);
+        let reopened = AppliedLedger::open_locked(&root).unwrap();
+        assert_eq!(reopened.ledger.applied.len(), APPLIED_LEDGER_MAX_ENTRIES);
+        assert!(reopened.contains("cm-ffffffffffffffff"));
+        assert!(!reopened.contains(&format!("cm-{:016x}", 0)));
+    }
+
     #[test]
     fn guarded_conflicts_preserve_local_bytes() {
         let (_directory, root, scope, config) = guarded_fixture();
@@ -4387,8 +4660,17 @@ mod tests {
         );
         apply_checkout_mutation(&config, &first).unwrap();
         apply_checkout_mutation(&config, &second).unwrap();
-        assert!(matches!(
+        // The replay is recognized by id and changes nothing.
+        assert_eq!(
             apply_checkout_mutation(&config, &first).unwrap(),
+            applied(Some(V1))
+        );
+        assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
+        // A foreign mutation this checkout never applied, carrying the same
+        // stale precondition, conflicts instead of restoring older bytes.
+        let foreign = guarded(&scope, "cm-00000000000000e9", BROFILE, Some(V1), None);
+        assert!(matches!(
+            apply_checkout_mutation(&config, &foreign).unwrap(),
             MutationApplyOutcome::Conflicted { .. }
         ));
         assert_eq!(fs::read_to_string(root.join(BROFILE)).unwrap(), V2);
@@ -4453,6 +4735,8 @@ mod tests {
         // Legacy knowledge/gap mutations now refuse symlinked components too.
         let knowledge_outside = directory.path().join("knowledge-outside");
         fs::create_dir_all(&knowledge_outside).unwrap();
+        // Guarded applications above created the checkout-local ledger.
+        fs::remove_dir_all(root.join(".bbox")).unwrap();
         symlink(&knowledge_outside, root.join(".bbox")).unwrap();
         let legacy = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{}");
         assert!(apply_checkout_mutation(&config, &legacy).is_err());
