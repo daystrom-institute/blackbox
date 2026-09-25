@@ -35,4 +35,4 @@ tempfile = "3"
 axum = "0.8"
 # Test-only: resume tests drive the real collector against the real intake
 # store. The shipped binary's dependency ceiling is unchanged.
-bbox-git-source-store = { path = "../bbox-git-source-store" }
+bbox-git-source-store = { path = "../bbox-git-source-store", features = ["fault-injection"] }

@@ -42,14 +42,23 @@ const HISTORY_UPLOAD_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
 /// Regular files a repository history root may hold beside its generations.
 const HISTORY_ROOT_FILES: &[&str] = &["current-ready.json", "acceptance-sequence.json"];
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     static FINALIZE_FAILURE_POINT: std::cell::RefCell<Option<&'static str>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test-only: make the next history finalize on this thread fail right after
+/// the named durable step, simulating a crash there. Points, in order:
+/// `immutable-installed`, `acceptance-counter`, `acceptance-checkpoint`,
+/// `generation-index`, `source-reopened`, `ready-pointer`, `upload-ready`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn fail_history_finalize_after(point: Option<&'static str>) {
+    FINALIZE_FAILURE_POINT.with(|current| current.replace(point));
+}
+
 /// Simulate a crash immediately after one durable finalize step.
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 fn inject_finalize_failure(point: &'static str) -> Result<()> {
     let fail = FINALIZE_FAILURE_POINT.with(|current| {
         if *current.borrow() == Some(point) {
@@ -65,7 +74,7 @@ fn inject_finalize_failure(point: &'static str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "fault-injection")))]
 fn inject_finalize_failure(_point: &'static str) -> Result<()> {
     Ok(())
 }
@@ -2094,6 +2103,24 @@ impl GitSourceStore {
                 HistoryPointerAcceptance::Accepted { .. } => (false, false),
             },
         };
+        // Only the winning acceptance reopens a terminal source; activation
+        // then re-plans against the current catalog, grant, and code state.
+        // In-flight and Active lifecycle states are preserved as they are.
+        // The reopen is durable before the pointer names the source, so an
+        // interrupted acceptance never publishes a pointer to a source that
+        // probes as current yet cannot activate. A crash in between leaves
+        // the old pointer, so the producer resumes this upload and retries.
+        if wins
+            && matches!(
+                source.state,
+                GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
+            )
+        {
+            source.state = GitHistorySourceStateV1::Ready;
+            source.diagnostic = None;
+            write_json(&generation_dir, "source.json", &source)?;
+            inject_finalize_failure("source-reopened")?;
+        }
         if publish {
             let history_root = NofollowDirectory::open_existing(&history_path)?
                 .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))?;
@@ -2110,20 +2137,6 @@ impl GitSourceStore {
                 },
             )?;
             inject_finalize_failure("ready-pointer")?;
-        }
-        // Only the winning acceptance reopens a terminal source; activation
-        // then re-plans against the current catalog, grant, and code state.
-        // In-flight and Active lifecycle states are preserved as they are.
-        if wins
-            && matches!(
-                source.state,
-                GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
-            )
-        {
-            source.state = GitHistorySourceStateV1::Ready;
-            source.diagnostic = None;
-            write_json(&generation_dir, "source.json", &source)?;
-            inject_finalize_failure("source-reopened")?;
         }
 
         upload.state = GitHistorySourceStateV1::Ready;
@@ -5548,65 +5561,92 @@ mod tests {
 
     #[test]
     fn finalize_recovers_after_a_crash_at_every_durable_step() {
-        for reuse in [false, true] {
+        for retained in [
+            None,
+            Some(GitHistorySourceStateV1::Superseded),
+            Some(GitHistorySourceStateV1::Failed),
+        ] {
             for point in [
                 "immutable-installed",
                 "acceptance-counter",
                 "acceptance-checkpoint",
                 "generation-index",
-                "ready-pointer",
                 "source-reopened",
+                "ready-pointer",
                 "upload-ready",
             ] {
-                if point == "source-reopened" && !reuse {
+                if point == "source-reopened" && retained.is_none() {
                     continue;
                 }
+                let label = format!("{retained:?} {point}");
                 let temp = tempfile::tempdir().unwrap();
                 let root = temp.path().canonicalize().unwrap().join("git-sources");
                 let store = history_store(&root);
                 let (history, namespace) = history_ids();
-                let mut earlier = 0;
-                if reuse {
+                let earlier = if let Some(state) = retained {
                     let (_, generation_a) =
                         ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
                     ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
                     rewrite_source(&store, &history, &generation_a, |source| {
-                        source.state = GitHistorySourceStateV1::Superseded;
+                        source.state = state;
                         source.diagnostic = Some("obsolete".into());
                     });
-                    earlier = 2;
+                    2
                 } else {
                     // A crash before the index write leaves no index; the
                     // retry must repair it rather than trust the generation.
                     ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
-                    earlier = earlier.max(1);
-                }
+                    1
+                };
                 let upload =
                     upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+                let (descriptor, _, _) = fixture_for('1', '2');
                 fail_finalize_at(point);
                 let crashed = store.finalize_history_upload("producer-a", &upload);
                 clear_finalize_failure();
-                assert!(crashed.is_err(), "{point}: failpoint was not reached");
+                assert!(crashed.is_err(), "{label}: failpoint was not reached");
                 drop(store);
 
                 let store = history_store(&root);
+                // Whatever the crash left behind, a source the probe reports
+                // as current is never terminal: a producer that stops at a
+                // current probe leaves an activatable source.
+                if let Some(current) = store
+                    .probe_ready_history(
+                        "producer-a",
+                        &history,
+                        &descriptor.repo_head,
+                        descriptor.object_format,
+                    )
+                    .unwrap()
+                {
+                    assert!(
+                        !matches!(
+                            current.state,
+                            GitHistorySourceStateV1::Superseded | GitHistorySourceStateV1::Failed
+                        ),
+                        "{label}: probe reports terminal {:?} as current",
+                        current.state
+                    );
+                    assert_eq!(current.diagnostic, None, "{label}");
+                }
                 for _ in 0..2 {
                     store
                         .finalize_history_upload("producer-a", &upload)
-                        .unwrap_or_else(|error| panic!("{point}: {error:#}"));
+                        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
                 }
                 let generation = upload_record(&store, &upload).source_generation_id.unwrap();
                 let record = upload_record(&store, &upload);
-                assert_eq!(record.state, GitHistorySourceStateV1::Ready, "{point}");
+                assert_eq!(record.state, GitHistorySourceStateV1::Ready, "{label}");
                 let sequence = record.accepted_sequence.unwrap();
-                assert!(sequence > earlier, "{point}: {sequence}");
+                assert!(sequence > earlier, "{label}: {sequence}");
                 let pointer = ready_pointer(&store, &history);
-                assert_eq!(pointer.source_generation_id, generation, "{point}");
-                assert_eq!(accepted(&pointer), (sequence, upload.clone()), "{point}");
+                assert_eq!(pointer.source_generation_id, generation, "{label}");
+                assert_eq!(accepted(&pointer), (sequence, upload.clone()), "{label}");
                 assert_eq!(
                     store.current_ready_source_id(&history).unwrap().as_deref(),
                     Some(generation.as_str()),
-                    "{point}"
+                    "{label}"
                 );
                 assert_eq!(
                     store
@@ -5614,17 +5654,17 @@ mod tests {
                         .unwrap()
                         .state,
                     GitHistorySourceStateV1::Ready,
-                    "{point}: index and reopened source"
+                    "{label}: index and reopened source"
                 );
                 assert_eq!(
                     stored_source(&store, &history, &generation).diagnostic,
                     None,
-                    "{point}"
+                    "{label}"
                 );
                 assert_eq!(
                     acceptance_counter(&store, &history),
                     Some(sequence + 1),
-                    "{point}"
+                    "{label}"
                 );
                 assert_unique_acceptances(&store);
             }

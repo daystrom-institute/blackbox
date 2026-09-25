@@ -27,8 +27,10 @@
   Each accepted upload attempt takes a durable per-repository acceptance
   sequence, checkpointed in its upload record before `current-ready.json`
   moves. Only a newer sequence repoints the repository and reopens a
-  `Superseded`/`Failed` source; a completed upload replay is a no-op and an
-  equal sequence must name the same upload and source.
+  `Superseded`/`Failed` source, and the reopen is durable before the pointer
+  names it, so a probe never reports a terminal source as current. A
+  completed upload replay is a no-op and an equal sequence must name the same
+  upload and source.
 - Upload records and history pointers without acceptance fields are legacy
   state, never reinterpreted: a legacy pointer is a baseline below every new
   acceptance and a completed legacy upload never gains one. Allocation

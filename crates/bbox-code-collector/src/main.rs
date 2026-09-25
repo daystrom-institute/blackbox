@@ -7715,6 +7715,102 @@ mod tests {
             server.abort();
         }
 
+        /// Accept one complete history directly through the store.
+        fn ingest(daemon: &Daemon, captured: &CapturedGitHistory) -> String {
+            let begin = daemon
+                .store
+                .begin_history_upload(
+                    PRODUCER,
+                    &daemon.history,
+                    &daemon.namespace,
+                    captured.descriptor.clone(),
+                )
+                .unwrap();
+            for (page, body) in pages(captured, PAGE_ENTRIES).iter().enumerate() {
+                daemon
+                    .store
+                    .put_history_manifest_page(PRODUCER, &begin.upload_id, page as u32, body)
+                    .unwrap();
+            }
+            daemon
+                .store
+                .complete_history_manifest(PRODUCER, &begin.upload_id)
+                .unwrap();
+            install_records(
+                &daemon.store,
+                captured,
+                &begin.upload_id,
+                captured.entries.len(),
+            );
+            daemon
+                .store
+                .finalize_history_upload(PRODUCER, &begin.upload_id)
+                .unwrap()
+                .source_generation_id
+        }
+
+        #[tokio::test]
+        async fn interrupted_acceptance_of_a_failed_source_recovers_through_the_collector() {
+            for (point, resumes) in [("source-reopened", true), ("ready-pointer", false)] {
+                let directory = tempfile::tempdir().unwrap();
+                let daemon = Arc::new(daemon(&directory.path().canonicalize().unwrap()));
+                // Retained generation A failed; B is the accepted source.
+                let generation_a = ingest(&daemon, &captured_history(COMMITS));
+                daemon
+                    .store
+                    .set_history_source_state(
+                        PRODUCER,
+                        &generation_a,
+                        GitHistorySourceStateV1::Failed,
+                        Some("activation failed".into()),
+                    )
+                    .unwrap();
+                ingest(&daemon, &captured_history(COMMITS + 1));
+                let (runtime, server) = serve(daemon.clone()).await;
+
+                // HEAD returns to A; the daemon crashes inside finalize.
+                bbox_git_source_store::fail_history_finalize_after(Some(point));
+                let crashed = publish_git_history(
+                    &runtime,
+                    captured_history(COMMITS),
+                    Duration::from_secs(10),
+                )
+                .await;
+                bbox_git_source_store::fail_history_finalize_after(None);
+                assert!(crashed.is_err(), "{point}");
+
+                // The next ordinary pass converges on an activatable A.
+                publish_git_history(&runtime, captured_history(COMMITS), Duration::from_secs(10))
+                    .await
+                    .unwrap_or_else(|error| panic!("{point}: {error:#}"));
+                assert_eq!(
+                    daemon.begins.load(Ordering::SeqCst),
+                    if resumes { 2 } else { 1 },
+                    "{point}: a pointer not yet published resumes the upload"
+                );
+                let status = daemon
+                    .store
+                    .history_status(PRODUCER, &generation_a)
+                    .unwrap();
+                assert_eq!(status.state, GitHistorySourceStateV1::Ready, "{point}");
+                assert_eq!(status.diagnostic, None, "{point}");
+                assert_eq!(
+                    daemon
+                        .store
+                        .current_ready_source_id(&daemon.history)
+                        .unwrap()
+                        .as_deref(),
+                    Some(generation_a.as_str()),
+                    "{point}"
+                );
+                daemon
+                    .store
+                    .verified_history_source(PRODUCER, &generation_a)
+                    .unwrap_or_else(|error| panic!("{point}: A must be activatable: {error:#}"));
+                server.abort();
+            }
+        }
+
         #[test]
         fn legacy_begin_response_resumes_as_receiving_manifest() {
             let begin: BeginGitHistoryUploadResponseV1 = serde_json::from_str(

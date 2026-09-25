@@ -271,6 +271,9 @@ bbox-vectors = { path = "crates/bbox-vectors", features = ["test-support"] }
 # per-test vector store must pin route derivation too, or partition ids
 # drift with the host's real embed.toml.
 bbox-embed = { path = "crates/bbox-embed", features = ["test-support"] }
+# Same pattern for the Git-source store's finalize crash hook, used by the
+# history activation recovery tests.
+bbox-git-source-store = { path = "crates/bbox-git-source-store", features = ["fault-injection"] }
 # Same pattern for bbox-visual-store's install_test_global: visual-chunk
 # tests must pin the payload store to a tempdir, never the real state dir.
 bbox-visual-store = { path = "crates/bbox-visual-store", features = ["test-support"] }

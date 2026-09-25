@@ -1512,6 +1512,16 @@ mod tests {
         scope: bbox_corpus_core::identity::PublishedScope,
         head: &str,
     ) -> String {
+        try_install_history_source(state, history, namespace, scope, head).unwrap()
+    }
+
+    fn try_install_history_source(
+        state: &Arc<SharedState>,
+        history: &RepoHistoryId,
+        namespace: &CommitNamespace,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        head: &str,
+    ) -> Result<String> {
         let fragment = GitHistoryCommitFragmentV1 {
             commit_oid: head.to_string(),
             fragment_index: 0,
@@ -1569,8 +1579,7 @@ mod tests {
             .unwrap();
         store
             .finalize_history_upload("producer-a", &upload.upload_id)
-            .unwrap()
-            .source_generation_id
+            .map(|finalized| finalized.source_generation_id)
     }
 
     #[test]
@@ -1958,13 +1967,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn head_returning_to_a_retained_source_reactivates_it_over_stale_work() {
+    /// One published project whose repository history is transport-granted
+    /// to `producer-a`.
+    fn single_project_repo(
+        root_project: &str,
+        history_id: &str,
+    ) -> (
+        CatalogFixture,
+        Arc<SharedState>,
+        bbox_corpus_core::identity::PublishedScope,
+        RepoHistoryId,
+        CommitNamespace,
+    ) {
         let fixture = CatalogFixture::new();
         let root_scope = CatalogFixture::scope(".");
-        let root_project = "p_head_returns_root";
         fixture.add_published_project(root_project, &root_scope);
-        let history = RepoHistoryId::parse("rh_00000000000000000000000000000003").unwrap();
+        let history = RepoHistoryId::parse(history_id).unwrap();
         let namespace = CommitNamespace::parse("repo_example").unwrap();
         let epoch = fixture.epoch();
         fixture
@@ -2005,6 +2023,14 @@ mod tests {
                 )],
                 catalog.catalog(),
             )));
+        (fixture, state, root_scope, history, namespace)
+    }
+
+    #[test]
+    fn head_returning_to_a_retained_source_reactivates_it_over_stale_work() {
+        let root_project = "p_head_returns_root";
+        let (_fixture, state, root_scope, history, namespace) =
+            single_project_repo(root_project, "rh_00000000000000000000000000000003");
         let store = state.git_sources.store();
         let source_state = |source: &str| store.history_status("producer-a", source).unwrap();
         let selected_source = || {
@@ -2099,5 +2125,65 @@ mod tests {
             source_state(&source_b).state,
             GitHistorySourceStateV1::Superseded
         );
+    }
+
+    #[test]
+    fn interrupted_acceptance_of_a_failed_source_still_activates() {
+        let root_project = "p_failed_returns_root";
+        let (_fixture, state, root_scope, history, namespace) =
+            single_project_repo(root_project, "rh_00000000000000000000000000000004");
+        let store = state.git_sources.store();
+
+        // Generation A was accepted but failed; B is accepted and active.
+        let head_a = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_a);
+        let source_a =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head_a);
+        store
+            .set_history_source_state(
+                "producer-a",
+                &source_a,
+                GitHistorySourceStateV1::Failed,
+                Some("activation failed".into()),
+            )
+            .unwrap();
+        let head_b = "2".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_b);
+        let source_b =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head_b);
+        activate_source(&state, &source_b).unwrap();
+
+        // HEAD returns to A and finalize crashes right after the pointer
+        // write. The producer's next probe sees A as current and stops, so
+        // activation alone must be able to take A from here.
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head_a);
+        bbox_git_source_store::fail_history_finalize_after(Some("ready-pointer"));
+        let crashed = try_install_history_source(&state, &history, &namespace, root_scope, &head_a);
+        bbox_git_source_store::fail_history_finalize_after(None);
+        assert!(crashed.is_err());
+        assert_eq!(
+            store.current_ready_source_id(&history).unwrap().as_deref(),
+            Some(source_a.as_str())
+        );
+        let current = store
+            .probe_ready_history("producer-a", &history, &head_a, GitObjectFormatV1::Sha1)
+            .unwrap()
+            .expect("the interrupted acceptance published its pointer");
+        assert_eq!(current.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(current.diagnostic, None);
+
+        activate_source(&state, &source_a).unwrap();
+        let journal = store.read_activation_journal(&history).unwrap().unwrap();
+        assert_eq!(journal.stage, HistoryActivationStageV1::Committed);
+        assert_eq!(journal.source_generation_id, source_a);
+        assert_eq!(
+            store.history_status("producer-a", &source_a).unwrap().state,
+            GitHistorySourceStateV1::Active
+        );
+        assert_eq!(
+            store.history_status("producer-a", &source_b).unwrap().state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert!(reconcile_transport_currency(&state, root_project).unwrap());
     }
 }
