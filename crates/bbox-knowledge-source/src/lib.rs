@@ -2068,7 +2068,8 @@ mod tests {
             &gaps,
             &[],
             &[],
-            None,            KnowledgeSourceLimits::default(),
+            None,
+            KnowledgeSourceLimits::default(),
         )
         .unwrap();
         assert_eq!(
@@ -3011,7 +3012,10 @@ mod tests {
 
     fn config_entries(prefix: &str) -> Vec<SourceFileManifestEntryV1> {
         let mut entries = vec![
-            entry(&format!("{prefix}.bbox/config.toml"), b"[mcp]\nenabled = true\n"),
+            entry(
+                &format!("{prefix}.bbox/config.toml"),
+                b"[mcp]\nenabled = true\n",
+            ),
             entry(&format!("{prefix}.bbox/mcp.json"), br#"{"servers":{}}"#),
             entry(
                 &format!("{prefix}.bro/brofiles/reviewer.json"),

@@ -23,11 +23,12 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
-    AcceptedConfigSourceV1Input, AcceptedEvidenceSourceV1Input, AcceptedGapSourceV1, AcceptedGraphSourceV1Input,
-    AcceptedKnowledgeSourceV1, AcceptedPublicationAutoAdvanceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationBuildSourceV1, AcceptedPublicationFaultInjector,
-    AcceptedPublicationGenerationId, AcceptedPublicationGenerationV1, AcceptedPublicationLimits,
-    AcceptedPublicationLockGuard, AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
+    AcceptedConfigSourceV1Input, AcceptedEvidenceSourceV1Input, AcceptedGapSourceV1,
+    AcceptedGraphSourceV1Input, AcceptedKnowledgeSourceV1, AcceptedPublicationAutoAdvanceV1,
+    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
+    AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
+    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
     AcceptedPublicationSourceBindingV2, AcceptedPublicationStoreError,
     AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
     PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
@@ -43,13 +44,13 @@ use crate::accepted_publication_store::{
 /// crate-external caller imports; the generation and pointer containers that
 /// hold them remain crate-private.
 pub use crate::accepted_publication_store::{
-    AcceptedBlockingLevelV1, AcceptedConfigSourceV1, AcceptedEdgeConfidenceV1, AcceptedEvidenceSourceV1,
-    AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1, AcceptedGapResolutionV1,
-    AcceptedGraphSourceV1, AcceptedKnowledgeApprovalV1, AcceptedKnowledgeCategoryV1,
-    AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1, AcceptedKnowledgeEntryV1,
-    AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1, AcceptedKnowledgeStatusV1,
-    AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename, PublicationFileManifestEntryV1,
-    PublicationRecordId, PublicationSha256,
+    AcceptedBlockingLevelV1, AcceptedConfigSourceV1, AcceptedEdgeConfidenceV1,
+    AcceptedEvidenceSourceV1, AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1,
+    AcceptedGapResolutionV1, AcceptedGraphSourceV1, AcceptedKnowledgeApprovalV1,
+    AcceptedKnowledgeCategoryV1, AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1,
+    AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1,
+    AcceptedKnowledgeStatusV1, AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename,
+    PublicationFileManifestEntryV1, PublicationRecordId, PublicationSha256,
 };
 
 /// The accepted-publication authority itself could not be opened. This is

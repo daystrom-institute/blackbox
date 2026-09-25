@@ -547,7 +547,8 @@ impl BlackboxServer {
         let extra =
             combine_dispatch_filters(request.brofile_filters.as_ref(), params_extra.as_ref());
         let project_mcp = self
-            .state.dispatch_project_mcp_store(request.cwd.as_deref())
+            .state
+            .dispatch_project_mcp_store(request.cwd.as_deref())
             .map_err(|error| error.to_string())?;
         let dispatch_filters = resolve_dispatch_filters(
             request.provider,
@@ -2005,14 +2006,14 @@ impl BlackboxServer {
                         Some(&dispatch_context),
                         exec_opts.as_ref(),
                     );
-                    let project_mcp = match self.state.dispatch_project_mcp_store(member_cwd.as_deref())
-                    {
-                        Ok(store) => store,
-                        Err(error) => {
-                            launched.push(json!({"bro":member.name,"error":error.to_string()}));
-                            continue;
-                        }
-                    };
+                    let project_mcp =
+                        match self.state.dispatch_project_mcp_store(member_cwd.as_deref()) {
+                            Ok(store) => store,
+                            Err(error) => {
+                                launched.push(json!({"bro":member.name,"error":error.to_string()}));
+                                continue;
+                            }
+                        };
                     let df = match resolve_dispatch_filters(
                         effective_provider,
                         project_mcp.as_ref(),
@@ -2591,10 +2592,8 @@ impl BlackboxServer {
             ) {
                 Ok(Some(bro_match)) => {
                     let member = &bro_match.team.members[bro_match.member_idx];
-                    self.state.dispatch_brofile(
-                        &member.brofile,
-                        bro_match.team.project_dir.as_deref(),
-                    )?
+                    self.state
+                        .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
                 }
                 _ => self.state.dispatch_brofile(label, cwd)?,
             };

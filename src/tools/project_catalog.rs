@@ -5005,11 +5005,7 @@ mod tests {
         /// One Ready candidate carrying a configuration lane of exactly these
         /// scope-relative files beside one knowledge entry, uploaded the way
         /// a lane-aware collector uploads it. `None` is a pre-lane producer.
-        fn stage_config_candidate(
-            &self,
-            commit: &str,
-            config: Option<&[(&str, &[u8])]>,
-        ) -> String {
+        fn stage_config_candidate(&self, commit: &str, config: Option<&[(&str, &[u8])]>) -> String {
             use std::io::Cursor;
 
             use crate::server::state::catalog_fixture::knowledge_entry;
@@ -5026,12 +5022,13 @@ mod tests {
                 encoded_bytes: bytes.len() as u64,
                 content_sha256: source_file_blob_sha256(bytes),
             };
-            let manifest = |lane, entries: &[SourceFileManifestEntryV1]| SourceManifestDescriptorV1 {
-                manifest_sha256: source_manifest_sha256(lane, entries),
-                file_count: entries.len() as u64,
-                logical_bytes: entries.iter().map(|entry| entry.encoded_bytes).sum(),
-                page_count: u64::from(!entries.is_empty()),
-            };
+            let manifest =
+                |lane, entries: &[SourceFileManifestEntryV1]| SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(lane, entries),
+                    file_count: entries.len() as u64,
+                    logical_bytes: entries.iter().map(|entry| entry.encoded_bytes).sum(),
+                    page_count: u64::from(!entries.is_empty()),
+                };
             let knowledge_bytes =
                 serde_json::to_vec(&knowledge_entry("knowledge-a", commit)).unwrap();
             let knowledge = vec![entry(

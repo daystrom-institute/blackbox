@@ -20,11 +20,11 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 
 use crate::accepted_publication_store::{
     AcceptedConfigSourceV1Input, AcceptedGapSourceV1, AcceptedKnowledgeSourceV1,
-    AcceptedPublicationBuildInputV1,
-    AcceptedPublicationBuildSourceV1, AcceptedPublicationGenerationId, AcceptedPublicationLimits,
-    AcceptedPublicationPriorPointerV1, AcceptedPublicationStorePaths, FullPublisherRef,
-    GitObjectId, acquire_accepted_publication_lock, decode_pointer_v1,
-    prepare_accepted_publication_v1, rebind_pointer_attachment_locked,
+    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+    AcceptedPublicationGenerationId, AcceptedPublicationLimits, AcceptedPublicationPriorPointerV1,
+    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId,
+    acquire_accepted_publication_lock, decode_pointer_v1, prepare_accepted_publication_v1,
+    rebind_pointer_attachment_locked,
 };
 
 /// One committed source file, byte-exact, as the publisher would have read

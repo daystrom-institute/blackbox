@@ -3600,10 +3600,9 @@ mod tests {
         assert_ne!(populated.generation_id, empty.generation_id);
         for generation in [&absent, &empty, &populated] {
             validate_generation_v1(&generation.generation, &limits).unwrap();
-            let decoded: AcceptedPublicationGenerationV1 = serde_json::from_value(
-                serde_json::to_value(&generation.generation).unwrap(),
-            )
-            .unwrap();
+            let decoded: AcceptedPublicationGenerationV1 =
+                serde_json::from_value(serde_json::to_value(&generation.generation).unwrap())
+                    .unwrap();
             assert_eq!(decoded, generation.generation);
         }
 

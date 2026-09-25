@@ -1703,7 +1703,10 @@ mod tests {
             "../.bbox/mcp.json",
             ".bbox/mcp.json/",
             ".bro\\brofiles\\x.json",
-            &format!(".bro/brofiles/{}.json", "n".repeat(MAX_PROJECT_CONFIG_NAME_BYTES + 1)),
+            &format!(
+                ".bro/brofiles/{}.json",
+                "n".repeat(MAX_PROJECT_CONFIG_NAME_BYTES + 1)
+            ),
         ] {
             assert_eq!(
                 ProjectConfigTargetV1::from_relative_path(path),
@@ -1807,7 +1810,12 @@ mod tests {
             content_sha256: None,
             observed_sha256: None,
         };
-        assert!(serde_json::to_value(&ack).unwrap().get("observed_sha256").is_none());
+        assert!(
+            serde_json::to_value(&ack)
+                .unwrap()
+                .get("observed_sha256")
+                .is_none()
+        );
         // A guarded mutation carries its explicit absence assertion as null.
         let guarded = serde_json::to_value(guarded_config_mutation(".bbox/mcp.json")).unwrap();
         assert_eq!(guarded["guard"]["expected_sha256"], serde_json::Value::Null);
@@ -1827,7 +1835,10 @@ mod tests {
         let write = guarded_config_mutation(".bbox/mcp.json");
         assert_eq!(
             write.target_sha256().unwrap(),
-            format!("{:x}", Sha256::digest(write.content_json.as_deref().unwrap().as_bytes()))
+            format!(
+                "{:x}",
+                Sha256::digest(write.content_json.as_deref().unwrap().as_bytes())
+            )
         );
         let mut delete = write.clone();
         delete.mode = "delete".into();

@@ -137,13 +137,14 @@ impl ProjectConfigSnapshot {
             accepted_bytes: BTreeMap::new(),
         };
         for (filename, bytes) in sources {
-            let relative = bbox_knowledge_source::config_source_scope_relative_path(scope, filename)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "{} is not a configuration input of the published scope",
-                        bounded_path(filename)
-                    ))
-                })?;
+            let relative =
+                bbox_knowledge_source::config_source_scope_relative_path(scope, filename)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{} is not a configuration input of the published scope",
+                            bounded_path(filename)
+                        ))
+                    })?;
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| invalid(format!("{relative} is not UTF-8 text")))?;
             if relative == PROJECT_CONFIG_TOML_PATH {
@@ -194,7 +195,9 @@ impl ProjectConfigSnapshot {
     }
 
     pub fn brofiles(&self) -> impl Iterator<Item = (&str, &Brofile)> {
-        self.brofiles.iter().map(|(name, value)| (name.as_str(), value))
+        self.brofiles
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
     }
 
     pub fn teamplate(&self, name: &str) -> Option<&Teamplate> {
@@ -348,9 +351,7 @@ mod tests {
         ProjectConfigSnapshot::parse(
             provenance(),
             scope,
-            files
-                .iter()
-                .map(|(path, bytes)| (*path, bytes.as_bytes())),
+            files.iter().map(|(path, bytes)| (*path, bytes.as_bytes())),
         )
     }
 
@@ -360,11 +361,13 @@ mod tests {
         let snapshot = parse(
             &scope("services/api"),
             &[
-                ("services/api/.bbox/config.toml", "[mcp]\nenabled = false\n".into()),
+                (
+                    "services/api/.bbox/config.toml",
+                    "[mcp]\nenabled = false\n".into(),
+                ),
                 (
                     "services/api/.bbox/mcp.json",
-                    r#"{"version":1,"servers":{},"filters":{"allow":[],"disallow":["x"]}}"#
-                        .into(),
+                    r#"{"version":1,"servers":{},"filters":{"allow":[],"disallow":["x"]}}"#.into(),
                 ),
                 ("services/api/.bro/brofiles/reviewer.json", brofile.clone()),
                 (
@@ -375,7 +378,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.mcp_enabled(), Some(false));
-        assert_eq!(snapshot.brofile("reviewer").unwrap().model.as_deref(), Some("opus"));
+        assert_eq!(
+            snapshot.brofile("reviewer").unwrap().model.as_deref(),
+            Some("opus")
+        );
         assert!(snapshot.teamplate("squad").is_some());
         assert_eq!(snapshot.mcp_store().unwrap().filters.disallow, vec!["x"]);
         assert_eq!(
@@ -405,9 +411,18 @@ mod tests {
     #[test]
     fn malformed_inputs_refuse_the_whole_snapshot_without_echoing_bytes() {
         for (path, bytes) in [
-            (".bbox/config.toml", "[mcp]\nenabled = \"sk-secret-value\"\n"),
-            (".bbox/mcp.json", r#"{"version":1,"servers":"sk-secret-value"}"#),
-            (".bro/brofiles/reviewer.json", r#"{"name":"sk-secret-value"}"#),
+            (
+                ".bbox/config.toml",
+                "[mcp]\nenabled = \"sk-secret-value\"\n",
+            ),
+            (
+                ".bbox/mcp.json",
+                r#"{"version":1,"servers":"sk-secret-value"}"#,
+            ),
+            (
+                ".bro/brofiles/reviewer.json",
+                r#"{"name":"sk-secret-value"}"#,
+            ),
             (".bro/teamplates/squad.json", "{not json sk-secret-value"),
         ] {
             let error = parse(&scope("."), &[(path, bytes.into())]).unwrap_err();
@@ -416,8 +431,8 @@ mod tests {
             assert!(text.contains(path), "{text}");
             assert!(!text.contains("sk-secret-value"), "{text}");
         }
-        let error = parse(&scope("."), &[(".bro/brofiles/nested/x.json", "{}".into())])
-            .unwrap_err();
+        let error =
+            parse(&scope("."), &[(".bro/brofiles/nested/x.json", "{}".into())]).unwrap_err();
         assert_eq!(error.code(), "error.project_config_invalid");
         let non_text = ProjectConfigSnapshot::parse(
             provenance(),
@@ -458,7 +473,10 @@ mod tests {
 
         let fallback = resolve_brofile(Some(&snapshot), "writer", &store).unwrap();
         assert_eq!(fallback.value.model.as_deref(), Some("global-writer"));
-        assert_eq!(fallback.source, ProjectConfigSource::GlobalFallback(provenance()));
+        assert_eq!(
+            fallback.source,
+            ProjectConfigSource::GlobalFallback(provenance())
+        );
 
         let global = resolve_brofile(None, "reviewer", &store).unwrap();
         assert_eq!(global.value.model.as_deref(), Some("global-model"));
@@ -479,6 +497,10 @@ mod tests {
             project_id: "p".into(),
             generation_id: "g".into(),
         };
-        assert!(unsupported.to_string().contains("Upgrade the checkout-owner collector"));
+        assert!(
+            unsupported
+                .to_string()
+                .contains("Upgrade the checkout-owner collector")
+        );
     }
 }

@@ -75,7 +75,9 @@ fn invalidate(server: &BlackboxServer, project_id: &str) {
         .accepted_publications
         .as_ref()
         .unwrap()
-        .invalidate_content(&bbox_corpus_core::project_catalog::ProjectId::parse(project_id).unwrap());
+        .invalidate_content(
+            &bbox_corpus_core::project_catalog::ProjectId::parse(project_id).unwrap(),
+        );
 }
 
 fn model(resolved: &Resolved<orchestration::brofile::Brofile>) -> &str {
@@ -91,11 +93,19 @@ fn accepted_view_serves_exact_scope_reads_and_project_first_resolution() {
     let accepted = state.load_accepted_project_config(PROJECT).unwrap();
     // Exact-scope discovery lists only the project's own configuration.
     assert_eq!(
-        accepted.snapshot.brofiles().map(|(name, _)| name).collect::<Vec<_>>(),
+        accepted
+            .snapshot
+            .brofiles()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
         vec!["reviewer"]
     );
     assert_eq!(
-        accepted.snapshot.teamplates().map(|(name, _)| name).collect::<Vec<_>>(),
+        accepted
+            .snapshot
+            .teamplates()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
         vec!["squad"]
     );
     assert_eq!(accepted.snapshot.mcp_enabled(), Some(false));
@@ -125,7 +135,10 @@ fn accepted_view_serves_exact_scope_reads_and_project_first_resolution() {
             .unwrap()
             .is_none()
     );
-    let global = state.resolve_config_brofile("reviewer", None).unwrap().unwrap();
+    let global = state
+        .resolve_config_brofile("reviewer", None)
+        .unwrap()
+        .unwrap();
     assert_eq!(model(&global), "global-reviewer");
     assert_eq!(global.source, ProjectConfigSource::Global);
 
@@ -258,7 +271,10 @@ fn unavailable_unsupported_and_invalid_views_refuse_instead_of_falling_back() {
         invalid,
         &invalid_scope,
         COMMIT_ONE,
-        Some(&[(BROFILE, br#"{"name":"reviewer","provider":"sk-not-a-provider"}"#)]),
+        Some(&[(
+            BROFILE,
+            br#"{"name":"reviewer","provider":"sk-not-a-provider"}"#,
+        )]),
     );
     let empty_scope = CatalogFixture::scope("empty");
     let empty = "p_config_empty";
@@ -284,7 +300,12 @@ fn unavailable_unsupported_and_invalid_views_refuse_instead_of_falling_back() {
         assert!(text.starts_with(code), "{text}");
         assert!(text.contains("No global fallback"), "{text}");
         assert!(!text.contains("sk-not-a-provider"), "{text}");
-        assert!(server.state.dispatch_project_mcp_store(Some(project)).is_err());
+        assert!(
+            server
+                .state
+                .dispatch_project_mcp_store(Some(project))
+                .is_err()
+        );
         assert!(
             server
                 .resolve_exec_target(Some("reviewer"), None, Some(project))
@@ -302,7 +323,13 @@ fn unavailable_unsupported_and_invalid_views_refuse_instead_of_falling_back() {
         fallback.source,
         ProjectConfigSource::GlobalFallback(_)
     ));
-    assert!(server.state.dispatch_project_mcp_store(Some(empty)).unwrap().is_none());
+    assert!(
+        server
+            .state
+            .dispatch_project_mcp_store(Some(empty))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -321,7 +348,11 @@ fn nested_published_scopes_map_landing_paths_consistently() {
             PROJECT,
             &ProjectConfigTargetV1::Brofile("reviewer".into()),
             "test",
-            |_| Ok(Some(ProjectConfigEdit::Write(brofile("reviewer", "claude", "next")))),
+            |_| {
+                Ok(Some(ProjectConfigEdit::Write(brofile(
+                    "reviewer", "claude", "next",
+                ))))
+            },
         )
         .unwrap()
         .unwrap();
@@ -333,7 +364,10 @@ fn nested_published_scopes_map_landing_paths_consistently() {
     assert_eq!(receipt.landing.bbox_root_relpath, "services/api");
     let queued = server.state.checkout_mutations.read();
     let row = queued.get(&receipt.mutation_id).unwrap();
-    assert_eq!(row.mutation.relative_path, BROFILE, "delivery stays scope-relative");
+    assert_eq!(
+        row.mutation.relative_path, BROFILE,
+        "delivery stays scope-relative"
+    );
     assert_eq!(row.mutation.scope, scope);
 }
 
@@ -350,13 +384,18 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
     let mut edit = |next: Option<String>| {
         server
             .state
-            .prepare_project_config_mutation(PROJECT, &target, "bro_brofile(scope=project)", |base| {
-                bases.push(base.map(str::to_owned));
-                Ok(Some(match next {
-                    Some(content) => ProjectConfigEdit::Write(content),
-                    None => ProjectConfigEdit::Delete,
-                }))
-            })
+            .prepare_project_config_mutation(
+                PROJECT,
+                &target,
+                "bro_brofile(scope=project)",
+                |base| {
+                    bases.push(base.map(str::to_owned));
+                    Ok(Some(match next {
+                        Some(content) => ProjectConfigEdit::Write(content),
+                        None => ProjectConfigEdit::Delete,
+                    }))
+                },
+            )
             .unwrap()
             .unwrap()
     };
@@ -378,11 +417,17 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
     assert_eq!(create.expected_sha256, Some(sha(&accepted)));
     assert_eq!(create.predecessor, None);
     assert_eq!(replace.expected_sha256, Some(sha(&first)));
-    assert_eq!(replace.predecessor.as_deref(), Some(create.mutation_id.as_str()));
+    assert_eq!(
+        replace.predecessor.as_deref(),
+        Some(create.mutation_id.as_str())
+    );
     assert_eq!(delete.mode, "delete");
     assert_eq!(delete.expected_sha256, Some(sha(&second)));
     assert_eq!(recreate.expected_sha256, None);
-    assert_eq!(recreate.predecessor.as_deref(), Some(delete.mutation_id.as_str()));
+    assert_eq!(
+        recreate.predecessor.as_deref(),
+        Some(delete.mutation_id.as_str())
+    );
     assert_eq!(create.state, CheckoutMutationProgress::Queued);
     assert!(create.next_step.contains("Commit and publish"));
     assert_eq!(create.landing.repository_relative_path, BROFILE);
@@ -419,7 +464,11 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
     assert_eq!(model(&current), "project-reviewer");
 
     // Restart keeps the chain.
-    server.state.persist_checkout_mutations_durable().await.unwrap();
+    server
+        .state
+        .persist_checkout_mutations_durable()
+        .await
+        .unwrap();
     let server = fixture.server();
     global_brofiles(&server);
     let status = server
@@ -459,7 +508,10 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
         PROJECT,
         &scope,
         COMMIT_TWO,
-        Some(&[(".bbox/mcp.json", mcp.as_bytes()), (BROFILE, first.as_bytes())]),
+        Some(&[
+            (".bbox/mcp.json", mcp.as_bytes()),
+            (BROFILE, first.as_bytes()),
+        ]),
     );
     invalidate(&server, PROJECT);
     let status = server
@@ -526,7 +578,10 @@ fn simultaneous_read_modify_write_edits_serialize_without_losing_either() {
         .collect::<Vec<_>>();
     receipts.sort_by_key(|receipt| receipt.predecessor.is_some());
     let (first, second) = (&receipts[0], &receipts[1]);
-    assert_eq!(second.predecessor.as_deref(), Some(first.mutation_id.as_str()));
+    assert_eq!(
+        second.predecessor.as_deref(),
+        Some(first.mutation_id.as_str())
+    );
     let queue = server.state.checkout_mutations.read();
     let last = queue.get(&second.mutation_id).unwrap();
     let merged: serde_json::Value =
@@ -608,10 +663,11 @@ fn conflicts_blocked_successors_and_unsupported_owners_are_named_states() {
     let first = write("one");
     let second = write("two");
     // An owner without guarded support sees neither; both are stamped.
-    let poll = server.state.checkout_mutations.read().poll(
-        &std::collections::BTreeSet::from([scope.clone()]),
-        false,
-    );
+    let poll = server
+        .state
+        .checkout_mutations
+        .read()
+        .poll(&std::collections::BTreeSet::from([scope.clone()]), false);
     assert!(poll.mutations.is_empty());
     server
         .state
@@ -653,9 +709,15 @@ fn conflicts_blocked_successors_and_unsupported_owners_are_named_states() {
         .project_config_mutation_status(&second.mutation_id)
         .unwrap();
     assert_eq!(blocked.state, CheckoutMutationProgress::Blocked);
-    assert_eq!(blocked.blocked_by.as_deref(), Some(first.mutation_id.as_str()));
+    assert_eq!(
+        blocked.blocked_by.as_deref(),
+        Some(first.mutation_id.as_str())
+    );
     let rendered = serde_json::to_string(&conflicted).unwrap();
-    assert!(!rendered.contains("\"one\""), "no configuration bytes in status: {rendered}");
+    assert!(
+        !rendered.contains("\"one\""),
+        "no configuration bytes in status: {rendered}"
+    );
 
     // Recovery recomputes from the accepted bytes with a precondition.
     let retry = write("three");
@@ -682,7 +744,11 @@ fn bridge_mode_keeps_its_local_behavior_and_refuses_the_lane() {
     ));
     let project = root.join("bridge-project");
     std::fs::create_dir_all(project.join(".bro/brofiles")).unwrap();
-    std::fs::write(project.join(BROFILE), brofile("reviewer", "glm", "bridge-local")).unwrap();
+    std::fs::write(
+        project.join(BROFILE),
+        brofile("reviewer", "glm", "bridge-local"),
+    )
+    .unwrap();
     let selector = project.to_str().unwrap();
     assert!(matches!(
         server.state.project_config_context(Some(selector)),
@@ -697,12 +763,13 @@ fn bridge_mode_keeps_its_local_behavior_and_refuses_the_lane() {
     assert_eq!(resolved.source, ProjectConfigSource::Local);
     let error = server
         .state
-        .prepare_project_config_mutation(
-            PROJECT,
-            &ProjectConfigTargetV1::McpStore,
-            "test",
-            |_| Ok(Some(ProjectConfigEdit::Delete)),
-        )
+        .prepare_project_config_mutation(PROJECT, &ProjectConfigTargetV1::McpStore, "test", |_| {
+            Ok(Some(ProjectConfigEdit::Delete))
+        })
         .unwrap_err();
-    assert!(error.to_string().contains("error.project_config_lane_catalog_only"));
+    assert!(
+        error
+            .to_string()
+            .contains("error.project_config_lane_catalog_only")
+    );
 }

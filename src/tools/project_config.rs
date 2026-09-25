@@ -18,13 +18,13 @@ use bbox_indexing::accepted_publication_runtime::{
 };
 use serde::Serialize;
 
-use crate::server::state::SharedState;
 use crate::checkout_mutations::CheckoutMutationProgress;
 use crate::orchestration;
 use crate::orchestration::project_config::{
     ProjectConfigError, ProjectConfigProvenance, ProjectConfigSnapshot, ProjectConfigSource,
     Resolved,
 };
+use crate::server::state::SharedState;
 
 /// Where project configuration for one call comes from.
 #[derive(Debug, Clone)]
@@ -291,11 +291,12 @@ impl SharedState {
         let store_dir = &self.store_dir;
         Ok(match self.project_config_context(project_dir)? {
             ProjectConfigContext::Local(project_dir) => {
-                orchestration::team::resolve_teamplate(name, store_dir, project_dir.as_deref())
-                    .map(|value| Resolved {
+                orchestration::team::resolve_teamplate(name, store_dir, project_dir.as_deref()).map(
+                    |value| Resolved {
                         value,
                         source: ProjectConfigSource::Local,
-                    })
+                    },
+                )
             }
             ProjectConfigContext::GlobalOnly => {
                 orchestration::project_config::resolve_teamplate(None, name, store_dir)
@@ -384,7 +385,9 @@ impl SharedState {
         let base = queue.write_base(&accepted.scope, &relative_path, published)?;
         let content = match edit(base.as_deref())? {
             None => return Ok(None),
-            Some(ProjectConfigEdit::Write(content)) if base.as_deref() == Some(content.as_str()) => {
+            Some(ProjectConfigEdit::Write(content))
+                if base.as_deref() == Some(content.as_str()) =>
+            {
                 return Ok(None);
             }
             Some(ProjectConfigEdit::Write(content)) => Some(content),
@@ -453,9 +456,9 @@ impl SharedState {
             );
         }
         let queue = self.checkout_mutations.read();
-        let row = queue
-            .get(mutation_id)
-            .ok_or_else(|| anyhow::anyhow!("error.checkout_mutation_unknown: no mutation {mutation_id}"))?;
+        let row = queue.get(mutation_id).ok_or_else(|| {
+            anyhow::anyhow!("error.checkout_mutation_unknown: no mutation {mutation_id}")
+        })?;
         let state = queue
             .progress(mutation_id)
             .expect("the row was found above");

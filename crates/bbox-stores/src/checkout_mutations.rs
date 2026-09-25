@@ -1063,13 +1063,23 @@ mod tests {
         assert_eq!(predecessor(&recreate), Some(delete.mutation_id.clone()));
 
         // Restart keeps the chain, its preconditions and its base.
-        std::fs::write(&path, serde_json::to_vec(&store.snapshot().unwrap()).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&store.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
         let mut store = CheckoutMutations::open(&path).unwrap();
         assert_eq!(
-            store.write_base(&scope(), BROFILE, Some(accepted)).unwrap().as_deref(),
+            store
+                .write_base(&scope(), BROFILE, Some(accepted))
+                .unwrap()
+                .as_deref(),
             Some(first)
         );
-        assert_eq!(store.progress(&create.mutation_id), Some(CheckoutMutationProgress::Queued));
+        assert_eq!(
+            store.progress(&create.mutation_id),
+            Some(CheckoutMutationProgress::Queued)
+        );
 
         // Delivery is strictly ordered: one mutation per path per poll.
         let granted = BTreeSet::from([scope()]);
@@ -1095,19 +1105,28 @@ mod tests {
                 Some(CheckoutMutationProgress::Delivered),
                 "an applied mutation is delivered, never published"
             );
-            assert_eq!(store.poll(&granted, true).mutations[0].mutation_id, next.mutation_id);
+            assert_eq!(
+                store.poll(&granted, true).mutations[0].mutation_id,
+                next.mutation_id
+            );
         }
         store
             .ack(&recreate.mutation_id, "applied", None, None, "now")
             .unwrap();
         // Applied but unpublished intents remain the edit base.
         assert_eq!(
-            store.write_base(&scope(), BROFILE, Some(accepted)).unwrap().as_deref(),
+            store
+                .write_base(&scope(), BROFILE, Some(accepted))
+                .unwrap()
+                .as_deref(),
             Some(first)
         );
         // Publication of the chain's final content retires the whole chain.
         assert_eq!(
-            store.write_base(&scope(), BROFILE, Some(first)).unwrap().as_deref(),
+            store
+                .write_base(&scope(), BROFILE, Some(first))
+                .unwrap()
+                .as_deref(),
             Some(first)
         );
         assert_eq!(
@@ -1126,10 +1145,15 @@ mod tests {
         let two = r#"{"v":2}"#;
         let first = guarded_edit(&mut store, &scope(), Some(accepted), Some(one)).unwrap();
         let second = guarded_edit(&mut store, &scope(), Some(accepted), Some(two)).unwrap();
-        store.ack(&first.mutation_id, "applied", None, None, "now").unwrap();
+        store
+            .ack(&first.mutation_id, "applied", None, None, "now")
+            .unwrap();
         // The owner committed and published only the first edit.
         assert_eq!(
-            store.write_base(&scope(), BROFILE, Some(one)).unwrap().as_deref(),
+            store
+                .write_base(&scope(), BROFILE, Some(one))
+                .unwrap()
+                .as_deref(),
             Some(two)
         );
         assert_eq!(
@@ -1144,10 +1168,18 @@ mod tests {
         assert_eq!(expected(&third), Some(content_sha256(two)));
         // A publication that incorporates neither queued edit is divergent:
         // it never authorizes overwriting either side.
-        let error = guarded_edit(&mut store, &scope(), Some(r#"{"v":"external"}"#), Some("{}"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("error.checkout_mutation_conflict"), "{error}");
+        let error = guarded_edit(
+            &mut store,
+            &scope(),
+            Some(r#"{"v":"external"}"#),
+            Some("{}"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("error.checkout_mutation_conflict"),
+            "{error}"
+        );
         assert!(error.contains(&third.mutation_id), "{error}");
     }
 
@@ -1187,10 +1219,19 @@ mod tests {
             Some(CheckoutMutationProgress::Blocked)
         );
         assert_eq!(
-            store.get(&second.mutation_id).unwrap().blocked_by.as_deref(),
+            store
+                .get(&second.mutation_id)
+                .unwrap()
+                .blocked_by
+                .as_deref(),
             Some(first.mutation_id.as_str())
         );
-        assert!(store.poll(&BTreeSet::from([scope()]), true).mutations.is_empty());
+        assert!(
+            store
+                .poll(&BTreeSet::from([scope()]), true)
+                .mutations
+                .is_empty()
+        );
         // Recovery starts again from the accepted bytes with a precondition;
         // it never drops the precondition.
         let retry = guarded_edit(&mut store, &scope(), Some(accepted), Some(r#"{"v":1}"#)).unwrap();
@@ -1199,7 +1240,13 @@ mod tests {
         // A failed (not conflicted) guarded predecessor blocks the same way.
         let next = guarded_edit(&mut store, &scope(), Some(accepted), Some(r#"{"v":9}"#)).unwrap();
         store
-            .ack(&retry.mutation_id, "failed", Some("disk full".into()), None, "now")
+            .ack(
+                &retry.mutation_id,
+                "failed",
+                Some("disk full".into()),
+                None,
+                "now",
+            )
             .unwrap();
         assert_eq!(
             store.progress(&next.mutation_id),
@@ -1246,7 +1293,11 @@ mod tests {
         assert!(store.note_owner_unsupported(&legacy_owner.withheld_unsupported, "now"));
         assert!(!store.note_owner_unsupported(&legacy_owner.withheld_unsupported, "later"));
         assert_eq!(
-            store.get(&ours.mutation_id).unwrap().owner_unsupported_at.as_deref(),
+            store
+                .get(&ours.mutation_id)
+                .unwrap()
+                .owner_unsupported_at
+                .as_deref(),
             Some("now")
         );
         let upgraded = store.poll(&granted, true);

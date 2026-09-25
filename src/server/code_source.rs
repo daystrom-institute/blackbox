@@ -1448,7 +1448,10 @@ async fn poll_checkout_mutations(
     let persist_state = state.clone();
     let producer_id = grant.producer_id.clone();
     let (poll, noted) = blocking(move || {
-        let poll = state.checkout_mutations.read().poll(&scopes, guarded_supported);
+        let poll = state
+            .checkout_mutations
+            .read()
+            .poll(&scopes, guarded_supported);
         let noted = !poll.withheld_unsupported.is_empty()
             && state.checkout_mutations.write().note_owner_unsupported(
                 &poll.withheld_unsupported,
