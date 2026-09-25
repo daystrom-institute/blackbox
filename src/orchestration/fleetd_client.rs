@@ -31,8 +31,10 @@
 //!
 //! ## Re-adoption
 //!
-//! Losing the connection is not session death on either side. After every
-//! successful connect (first dial or reconnect) the client asks
+//! Losing the connection is not session death on either side. Daemon startup
+//! dials without waiting for a dispatch
+//! ([`FleetdExecutor::spawn_startup_readoption`]), and after every successful
+//! connect (first dial or reconnect) the client asks
 //! `ListSessions` and hands each row fleetd still holds back to
 //! [`super::readopt_harness_session`], which reattaches the live task to fresh
 //! ingest/terminal plumbing and returns the task's durable ingest cursor. The
@@ -40,7 +42,9 @@
 //! every event it had not durably ingested and no event twice. Sessions fleetd
 //! reports that the task store does not know are logged loudly and left
 //! running: killing an orphan the daemon merely forgot would destroy work, and
-//! fleetd GCs terminal sessions on its own once acked.
+//! fleetd GCs terminal sessions on its own once acked. The sweep runs under the
+//! connection lock, so no caller holds a lane on a connection whose live
+//! sessions are not yet reattached.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -392,9 +396,12 @@ impl Shared {
 /// Executes workers as children of fleetd, over its Unix domain socket.
 pub struct FleetdExecutor {
     shared: Arc<Shared>,
-    /// Held across a dial so two concurrent dispatches cannot race two
-    /// connections into existence (the second would fence the first out).
-    connection: tokio::sync::Mutex<Option<Connection>>,
+    /// Held across a dial and its re-adoption sweep, so two concurrent
+    /// dispatches cannot race two connections into existence (the second
+    /// would fence the first out) and no caller gets a lane before the sweep
+    /// has reattached the new connection's live sessions. Shared so the
+    /// startup sweep can claim it before its task is scheduled.
+    connection: Arc<tokio::sync::Mutex<Option<Connection>>>,
 }
 
 impl FleetdExecutor {
@@ -407,7 +414,7 @@ impl FleetdExecutor {
                 workspace_waiters: Mutex::new(HashMap::new()),
                 message_counter: AtomicU64::new(0),
             }),
-            connection: tokio::sync::Mutex::new(None),
+            connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -416,28 +423,80 @@ impl FleetdExecutor {
     /// returning, so a caller that gets a lane is talking to a fleetd whose
     /// live sessions are already reattached.
     async fn lane(&self) -> anyhow::Result<Lane> {
-        let mut guard = self.connection.lock().await;
-        if let Some(connection) = guard.as_ref()
-            && connection.is_alive()
-        {
-            return Ok(connection.lane());
-        }
-        let connection = self.dial().await?;
-        let lane = connection.lane();
-        *guard = Some(connection);
-        drop(guard);
+        let mut connection = self.connection.lock().await;
+        self.lane_locked(&mut connection).await
+    }
 
-        // Re-adoption runs outside the connection lock: it awaits a
-        // ListSessions round trip, and holding the lock across that would
-        // serialize every concurrent dispatch behind it for no reason.
+    /// [`Self::lane`] for a caller already holding the connection lock.
+    ///
+    /// Re-adoption runs under the lock: a concurrent caller that finds the
+    /// fresh connection installed would otherwise get a lane (and could
+    /// spawn onto a supervision key) before the sweep reattached the live
+    /// sessions behind it. Only a new connection pays for the round trip; a
+    /// live one returns immediately.
+    ///
+    /// A new connection is installed only after its sweep succeeded. One
+    /// whose sweep failed, or whose attempt was dropped mid-sweep (a caller
+    /// cancelled while `ListSessions` was pending), is cancelled and never
+    /// installed, so the next caller redials and sweeps again instead of
+    /// taking the live-connection fast path past sessions that were never
+    /// reattached.
+    async fn lane_locked(&self, connection: &mut Option<Connection>) -> anyhow::Result<Lane> {
+        if let Some(live) = connection.as_ref()
+            && live.is_alive()
+        {
+            return Ok(live.lane());
+        }
+        *connection = None;
+        let fresh = self.dial().await?;
+        let lane = fresh.lane();
+        // Tears the new connection's actors down unless the sweep completes.
+        let abandoned = lane.cancel.clone().drop_guard();
+
         if let Err(error) = readopt_live_sessions(&self.shared, &lane).await {
+            drop(abandoned);
             tracing::warn!(
                 %error,
                 generation = lane.generation,
-                "fleetd re-adoption failed; live sessions may not be reattached"
+                "fleetd re-adoption failed; dropped the connection so the next caller redials"
             );
+            return Err(error.context("fleetd re-adoption failed on a new connection"));
         }
+        abandoned.disarm();
+        *connection = Some(fresh);
         Ok(lane)
+    }
+
+    /// Dial fleetd and run the re-adoption sweep at daemon startup, without
+    /// waiting for a dispatch to force the connect.
+    ///
+    /// The connection lock is claimed before the task is spawned, so any
+    /// dispatch or resume that arrives while the sweep is pending waits for
+    /// it instead of dialing its own connection. The returned task never
+    /// fails startup: an unreachable fleetd (local or remote), or a sweep
+    /// that fails on the new connection, is logged and the next
+    /// [`Self::lane`] retries the dial and the sweep.
+    pub fn spawn_startup_readoption(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let claimed = self.connection.clone().try_lock_owned().ok();
+        let executor = self.clone();
+        tokio::spawn(async move {
+            let mut connection = match claimed {
+                Some(connection) => connection,
+                None => executor.connection.clone().lock_owned().await,
+            };
+            match executor.lane_locked(&mut connection).await {
+                Ok(lane) => tracing::info!(
+                    generation = lane.generation,
+                    "fleetd connected at startup; surviving sessions re-adopted"
+                ),
+                Err(error) => tracing::warn!(
+                    endpoint = %executor.shared.config.endpoint.label(),
+                    %error,
+                    "fleetd connection or re-adoption failed at startup; surviving \
+                     sessions will be re-adopted when the next dispatch connects"
+                ),
+            }
+        })
     }
 
     /// Connect, authenticate, and start the connection actor.
@@ -585,6 +644,17 @@ impl HarnessExecutor for FleetdExecutor {
 
     fn worker_locality(&self) -> Option<&WorkerLocality> {
         self.shared.config.worker_locality.as_ref()
+    }
+
+    fn start_readoption(self: Arc<Self>) {
+        self.spawn_startup_readoption();
+    }
+
+    /// A lane is handed out only on a connection whose sweep succeeded, so
+    /// getting one proves re-adoption completed: it waits out a sweep in
+    /// progress and redials after one that failed (at startup or since).
+    async fn ensure_readopted(&self) -> anyhow::Result<()> {
+        self.lane().await.map(|_| ())
     }
 
     /// Inspection is a read-only, idempotent probe, so a failed attempt
@@ -1511,20 +1581,36 @@ mod tests {
         SilentFirstConnection,
     }
 
+    /// How the fake answers `ListSessions`.
+    #[derive(Clone, Copy)]
+    enum ListScript {
+        /// Answer every request.
+        Answer,
+        /// Answer only the first request on each connection (the
+        /// re-adoption sweep), then go silent: the heartbeat starves, the
+        /// shape of a peer that died after connecting.
+        AnswerSweepOnly,
+        /// Never answer on the first accepted connection and answer on every
+        /// later one: a sweep that fails once and succeeds on the redial.
+        SilentFirstConnection,
+    }
+
     /// Per-lane behavior knobs for [`FakeFleetd`].
     #[derive(Clone, Copy)]
     struct Script {
-        /// Answer `ListSessions`? `false` starves re-adoption and the
-        /// heartbeat alike, the shape of a silently dead peer.
-        answer_lists: bool,
+        lists: ListScript,
         inspections: InspectionScript,
+        /// Hold each `ListSessions` answer this long: a slow re-adoption
+        /// sweep, so lane ordering against it is observable.
+        list_delay: Duration,
     }
 
     impl Default for Script {
         fn default() -> Self {
             Self {
-                answer_lists: true,
+                lists: ListScript::Answer,
                 inspections: InspectionScript::Answer,
+                list_delay: Duration::ZERO,
             }
         }
     }
@@ -1611,6 +1697,7 @@ mod tests {
             .await?;
             let binding = io.binding();
             let mut counter = 0u64;
+            let mut lists_on_connection = 0usize;
             let first = io.read_envelope::<DaemonToFleetd>().await?.body;
             let DaemonToFleetd::Authenticate { token: presented } = first else {
                 anyhow::bail!("first message must authenticate");
@@ -1633,9 +1720,16 @@ mod tests {
                 match body {
                     DaemonToFleetd::ListSessions => {
                         self.lists.fetch_add(1, Ordering::SeqCst);
-                        if !self.script.answer_lists {
+                        lists_on_connection += 1;
+                        let answer = match self.script.lists {
+                            ListScript::Answer => true,
+                            ListScript::AnswerSweepOnly => lists_on_connection == 1,
+                            ListScript::SilentFirstConnection => ordinal > 1,
+                        };
+                        if !answer {
                             continue;
                         }
+                        tokio::time::sleep(self.script.list_delay).await;
                         let sessions = self.sessions.lock().clone();
                         reply(
                             &mut io,
@@ -2385,8 +2479,9 @@ mod tests {
             Vec::new(),
             ReplayScript::Silent,
             Script {
-                answer_lists: false,
+                lists: ListScript::AnswerSweepOnly,
                 inspections: InspectionScript::Answer,
+                ..Script::default()
             },
         );
         let executor = FleetdExecutor::new(fast_config(dir.path()));
@@ -2420,8 +2515,8 @@ mod tests {
             Vec::new(),
             ReplayScript::Silent,
             Script {
-                answer_lists: true,
                 inspections: InspectionScript::Silent,
+                ..Script::default()
             },
         );
         let mut config = fast_config(dir.path());
@@ -2469,8 +2564,8 @@ mod tests {
             Vec::new(),
             ReplayScript::Silent,
             Script {
-                answer_lists: true,
                 inspections: InspectionScript::SilentFirstConnection,
+                ..Script::default()
             },
         );
         let mut config = fast_config(dir.path());
@@ -2486,6 +2581,484 @@ mod tests {
             fake.inspections.lock().len(),
             2,
             "first attempt timed out, retry was answered"
+        );
+    }
+
+    /// Startup dials without a dispatch, and a caller arriving while that
+    /// connection's sweep is still waiting on `ListSessions` gets its lane
+    /// only after the sweep finished: the dead slot is already reconciled
+    /// and nobody dialed a second connection.
+    #[tokio::test]
+    async fn startup_sweep_finishes_before_a_concurrent_caller_gets_a_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            vec![],
+            ReplayScript::Silent,
+            Script {
+                list_delay: Duration::from_millis(300),
+                ..Script::default()
+            },
+        );
+        let executor = Arc::new(FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path())));
+        let _outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
+
+        let startup = executor.spawn_startup_readoption();
+        executor.lane().await.unwrap();
+        assert!(
+            !slot_present(&executor, "sess-forgotten"),
+            "the lane was handed out before the startup sweep reconciled its sessions"
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.lists.load(Ordering::SeqCst), 1);
+        startup.await.unwrap();
+    }
+
+    /// The same ordering between two dispatches racing a fresh dial: the one
+    /// that waited on the lock is not served ahead of the sweep.
+    #[tokio::test]
+    async fn concurrent_callers_wait_for_the_new_connections_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            vec![],
+            ReplayScript::Silent,
+            Script {
+                list_delay: Duration::from_millis(300),
+                ..Script::default()
+            },
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
+
+        let observe = async {
+            executor.lane().await.unwrap();
+            slot_present(&executor, "sess-forgotten")
+        };
+        let (first, second) = tokio::join!(observe, async {
+            executor.lane().await.unwrap();
+            slot_present(&executor, "sess-forgotten")
+        });
+        assert!(
+            !first && !second,
+            "a lane was served before the sweep finished"
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+    }
+
+    /// An unreachable fleetd at startup is logged, never fatal, and leaves
+    /// the connection slot empty so the next lane dials again.
+    #[tokio::test]
+    async fn unreachable_fleetd_at_startup_leaves_the_next_lane_to_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetdConfig::in_state_dir(dir.path());
+        config.binary = Some(dir.path().join("definitely-not-a-supervisor"));
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        executor.spawn_startup_readoption().await.unwrap();
+        assert!(executor.connection.lock().await.is_none());
+
+        let fake = FakeFleetd::serve(dir.path(), vec![], ReplayScript::Silent);
+        executor.lane().await.unwrap();
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.lists.load(Ordering::SeqCst),
+            1,
+            "the retry ran the sweep"
+        );
+    }
+
+    /// A remote endpoint that refuses the connection is the same: startup
+    /// completes, nothing is auto-started, and no token is synthesized.
+    #[tokio::test]
+    async fn unreachable_remote_fleetd_at_startup_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let token = root.join("missing-fleetd.token");
+        let config = FleetdConfig::resolve(
+            &root,
+            Some(&format!("tcp://{address}")),
+            Some(&token),
+            Some(&root),
+            Some(&root),
+        )
+        .unwrap();
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        executor.spawn_startup_readoption().await.unwrap();
+        assert!(executor.connection.lock().await.is_none());
+        assert!(!token.exists(), "remote token must never be synthesized");
+        let error = executor.lane().await.err().expect("still unreachable");
+        assert!(
+            error
+                .to_string()
+                .contains("Remote fleetd is never auto-started")
+        );
+    }
+
+    /// A connection whose re-adoption sweep failed is not kept. Here the
+    /// handshake and authentication succeed but the first `ListSessions`
+    /// goes unanswered, so startup reattaches nothing. The next caller must
+    /// redial and sweep again, and only then get a lane, with the surviving
+    /// session back on its task and replaying from the task's cursor.
+    #[tokio::test]
+    async fn a_failed_startup_sweep_is_retried_before_the_next_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = Arc::new(parking_lot::RwLock::new(
+            crate::orchestration::TaskStore::new(),
+        ));
+        let (tail_tx, _tail_rx) = tokio::sync::broadcast::channel(32);
+        let task = crate::orchestration::spawn_in_process_task(
+            "task-sess-survivor".to_string(),
+            bro_core::Provider::Glm,
+            "sess-survivor".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("task-sess-survivor".to_string(), task.clone())
+            .ok();
+        {
+            // What `TaskStore::load` leaves for a task running at shutdown.
+            let mut inner = task.inner.lock();
+            inner.status = crate::orchestration::TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.harness_ingest_seq = 7;
+        }
+        crate::orchestration::install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store,
+            tail_tx,
+            None,
+            None,
+        );
+        let fake = FakeFleetd::serve_with(
+            &root,
+            vec![summary(
+                "sess-survivor",
+                SessionState::Running,
+                Some(9),
+                None,
+            )],
+            ReplayScript::Silent,
+            Script {
+                lists: ListScript::SilentFirstConnection,
+                ..Script::default()
+            },
+        );
+        let mut config = fast_config(&root);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        executor.spawn_startup_readoption().await.unwrap();
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 1);
+        assert!(
+            executor.connection.lock().await.is_none(),
+            "a connection whose sweep failed must not stay installed"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Failed
+        );
+        assert!(fake.replays.lock().is_empty());
+
+        executor.lane().await.unwrap();
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            2,
+            "the next caller redialed"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running,
+            "the surviving session was reattached before the lane was served"
+        );
+        assert!(slot_present(&executor, "sess-survivor"));
+        settle().await;
+        assert_eq!(
+            fake.replays.lock().as_slice(),
+            [("sess-survivor".to_string(), 7)],
+            "replay starts from the task's own cursor"
+        );
+    }
+
+    /// The resume path after a failed startup sweep: a live worker survived
+    /// the restart, the startup sweep failed, and fleetd is reachable again
+    /// by the time `bro_resume` is the first operation. The resume must
+    /// complete re-adoption before it checks liveness, and so return the
+    /// surviving task with wait/cancel guidance instead of admitting a spawn
+    /// that collides with the live supervision key.
+    #[tokio::test]
+    async fn bro_resume_after_a_failed_startup_sweep_returns_the_surviving_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_dir = root.join("bro");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
+        let task = crate::orchestration::spawn_in_process_task(
+            "task-sess-survivor".to_string(),
+            bro_core::Provider::Glm,
+            "sess-survivor".to_string(),
+            None,
+            store_dir.clone(),
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        state
+            .task_store
+            .write()
+            .insert_reserved("task-sess-survivor".to_string(), task.clone())
+            .ok();
+        {
+            // What `TaskStore::load` leaves for a task running at shutdown.
+            let mut inner = task.inner.lock();
+            inner.status = crate::orchestration::TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.harness_ingest_seq = 7;
+        }
+        let fake = FakeFleetd::serve_with(
+            &root,
+            vec![summary(
+                "sess-survivor",
+                SessionState::Running,
+                Some(9),
+                None,
+            )],
+            ReplayScript::Silent,
+            Script {
+                lists: ListScript::SilentFirstConnection,
+                ..Script::default()
+            },
+        );
+        let mut config = fast_config(&root);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        assert!(crate::orchestration::install_harness_executor_with_config(
+            bbox_config::config::ExecutorKind::Fleetd,
+            config,
+            store_dir,
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+        ));
+
+        crate::orchestration::start_harness_readoption();
+        // Let the startup sweep fail outright before the resume arrives: its
+        // one ListSessions was sent and its deadline has passed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fake.lists.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup never swept"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Failed,
+            "the startup sweep failed, so nothing was reattached yet"
+        );
+
+        let server = crate::server::BlackboxServer::new(state.clone());
+        let resumed = server
+            .bro_resume(rmcp::handler::server::wrapper::Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "prompt": "continue",
+                    "session_id": "sess-survivor",
+                    "provider": "glm",
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let text = resumed
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(resumed.is_error, Some(true), "{text}");
+        assert!(
+            text.contains(r#"bro_wait(task_id="task-sess-survivor""#)
+                && text.contains(r#"bro_cancel(task_id="task-sess-survivor")"#),
+            "the caller is pointed at the surviving task: {text}"
+        );
+        assert_eq!(
+            state.task_store.read().all_tasks().len(),
+            1,
+            "no second task was created"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 2);
+        assert!(fake.spawns.lock().is_empty(), "nothing was spawned");
+    }
+
+    /// With fleetd still unreachable, liveness is unknown: the resume is
+    /// refused without creating a task instead of spawning blind.
+    #[tokio::test]
+    async fn bro_resume_with_fleetd_unreachable_creates_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_dir = root.join("bro");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
+        let mut config = FleetdConfig::in_state_dir(root.join("fleetd"));
+        config.binary = Some(root.join("definitely-not-a-supervisor"));
+        assert!(crate::orchestration::install_harness_executor_with_config(
+            bbox_config::config::ExecutorKind::Fleetd,
+            config,
+            store_dir,
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+        ));
+
+        let server = crate::server::BlackboxServer::new(state.clone());
+        let resumed = server
+            .bro_resume(rmcp::handler::server::wrapper::Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "prompt": "continue",
+                    "session_id": "sess-unknown",
+                    "provider": "glm",
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let text = resumed
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(resumed.is_error, Some(true), "{text}");
+        assert!(text.contains("no new worker was started"), "{text}");
+        assert!(state.task_store.read().all_tasks().is_empty());
+    }
+
+    /// A caller dropped while its new connection's sweep is waiting on
+    /// `ListSessions` (a cancelled request handler) must not leave that
+    /// connection behind: the next caller redials and re-adopts the survivor
+    /// before it gets a lane, instead of taking the fast path onto a
+    /// connection that never reattached anything.
+    #[tokio::test]
+    async fn a_caller_dropped_mid_sweep_leaves_no_unreconciled_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = Arc::new(parking_lot::RwLock::new(
+            crate::orchestration::TaskStore::new(),
+        ));
+        let (tail_tx, _tail_rx) = tokio::sync::broadcast::channel(32);
+        let task = crate::orchestration::spawn_in_process_task(
+            "task-sess-survivor".to_string(),
+            bro_core::Provider::Glm,
+            "sess-survivor".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("task-sess-survivor".to_string(), task.clone())
+            .ok();
+        {
+            let mut inner = task.inner.lock();
+            inner.status = crate::orchestration::TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.harness_ingest_seq = 7;
+        }
+        crate::orchestration::install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store,
+            tail_tx,
+            None,
+            None,
+        );
+        let fake = FakeFleetd::serve_with(
+            &root,
+            vec![summary(
+                "sess-survivor",
+                SessionState::Running,
+                Some(9),
+                None,
+            )],
+            ReplayScript::Silent,
+            Script {
+                lists: ListScript::SilentFirstConnection,
+                ..Script::default()
+            },
+        );
+        let mut config = fast_config(&root);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        // Long enough that only the abort, never the deadline, ends the sweep.
+        config.list_sessions_timeout = Duration::from_secs(30);
+        let executor = Arc::new(FleetdExecutor::new(config));
+
+        let pending = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.lane().await.map(|_| ()) }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fake.lists.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(
+            executor.connection.lock().await.is_none(),
+            "an abandoned sweep must not leave its connection installed"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), executor.lane())
+            .await
+            .expect("the next caller is served")
+            .unwrap();
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            2,
+            "the next caller redialed"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running,
+            "the survivor was reattached before the lane was served"
+        );
+        settle().await;
+        assert_eq!(
+            fake.replays.lock().as_slice(),
+            [("sess-survivor".to_string(), 7)]
         );
     }
 }

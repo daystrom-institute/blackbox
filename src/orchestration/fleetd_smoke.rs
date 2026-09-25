@@ -423,8 +423,16 @@ mod smoke {
 
     /// The full re-adoption drill, against a real fleetd and a real task
     /// store: the daemon ingests part of a session, dies, and the replacement
-    /// daemon has to find the still-running child, reattach it to its task, and
-    /// replay exactly the events it missed while it was gone.
+    /// daemon has to find the still-running child at startup, with no
+    /// dispatch to force the connect, reattach it to its task, and replay
+    /// exactly the events it missed while it was gone.
+    ///
+    /// The replacement loads the persisted store the way daemon startup does,
+    /// so the task starts out as the restart left it (failed, advising
+    /// `bro_resume`). Observation goes through the tool surface: `bro_status`
+    /// must read it running, and `bro_resume` on its session must hand back
+    /// the live task instead of spawning onto the live supervision key, with
+    /// the in-memory resume lease free as it is after every restart.
     ///
     /// The stub gates its second batch on a file the test creates only AFTER
     /// the disconnect, so "events produced while no daemon was attached" is
@@ -437,6 +445,8 @@ mod smoke {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonical tempdir");
         let fleetd = FleetdProcess::start(&root.join("state")).await;
+        let store_dir = root.join("bro");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
 
         let log = root.join("drill.events.jsonl");
         let gate = root.join("resume.gate");
@@ -474,8 +484,7 @@ mod smoke {
         }
         let stub = stub_path.to_string_lossy().into_owned();
 
-        // A real task store with a real task, and the re-adoption env armed,
-        // exactly as daemon startup does it.
+        // A real task store with a real task, as the first daemon holds it.
         let store = std::sync::Arc::new(parking_lot::RwLock::new(
             crate::orchestration::TaskStore::new(),
         ));
@@ -485,7 +494,7 @@ mod smoke {
             bro_core::Provider::Glm,
             "drill-session".to_string(),
             None,
-            root.clone(),
+            store_dir.clone(),
             store.clone(),
             tail_tx.clone(),
             None,
@@ -498,14 +507,6 @@ mod smoke {
             .write()
             .insert_reserved("drill-task".to_string(), task.clone())
             .ok();
-        crate::orchestration::install_harness_executor(
-            bbox_config::config::ExecutorKind::Local,
-            root.clone(),
-            store.clone(),
-            tail_tx.clone(),
-            None,
-            None,
-        );
 
         // ---- the first daemon: spawn, wire ingest, get the cursor to 3 ----
         let first = FleetdExecutor::new(fleetd.config());
@@ -524,7 +525,7 @@ mod smoke {
             task.clone(),
             bro_core::Provider::Glm,
             "drill-task".to_string(),
-            root.clone(),
+            store_dir.clone(),
             None,
             tail_tx.clone(),
             None,
@@ -532,24 +533,16 @@ mod smoke {
         );
         await_cursor(&task, 3).await;
 
-        // ---- the daemon dies mid-session ----
+        // ---- the daemon dies mid-session, its store on disk ----
         ingest.abort();
         drop(live.control);
         drop(first);
+        store.read().persist(&store_dir);
+        drop(store);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             process_is_alive(survivor_pid),
             "the child must outlive the daemon: that is the entire point"
-        );
-
-        // Pin the cursor before opening the gate. Without this the final
-        // `await_cursor(5)` could pass vacuously if 4 and 5 had somehow already
-        // been ingested; asserting EXACTLY 3 here is what makes the rest of the
-        // test a genuine proof that replay delivered them.
-        assert_eq!(
-            task.inner.lock().harness_ingest_seq,
-            3,
-            "the dead daemon ingested through seq 3 and no further"
         );
 
         // Only now does the child emit 4 and 5. No daemon is attached, so
@@ -560,53 +553,113 @@ mod smoke {
         // replacement daemon connects. Without this barrier the test is a race:
         // if the child emitted them a moment later, they would arrive over the
         // live relay instead and the test would pass whether or not replay
-        // works at all. (It did exactly that before this wait was added.)
+        // works at all.
         await_log_contains(&log, r#""seq":5"#).await;
 
-        // ---- the replacement daemon ----
-        let second = FleetdExecutor::new(fleetd.config());
-        let nudge_log = root.join("nudge.events.jsonl");
-        let nudge_stub = write_stub(
-            &root,
-            "nudge.sh",
-            &[r#"{"type":"system","seq":1}"#],
-            &nudge_log,
-            "exit 0\n",
+        // ---- the replacement daemon starts ----
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&store_dir));
+        *state.task_store.write() =
+            crate::orchestration::TaskStore::load(&store_dir, 24 * 60 * 60 * 1000);
+        let task = state
+            .task_store
+            .read()
+            .get("drill-task")
+            .expect("the persisted task survives the restart");
+        {
+            // Pin the restart's verdict and the cursor before re-adoption.
+            // Asserting EXACTLY 3 is what makes the final cursor a genuine
+            // proof that replay delivered 4 and 5.
+            let inner = task.inner.lock();
+            assert_eq!(inner.status, crate::orchestration::TaskStatus::Failed);
+            assert!(inner.stderr.contains("server restarted"), "{}", inner.stderr);
+            assert_eq!(
+                inner.harness_ingest_seq, 3,
+                "the dead daemon ingested through seq 3 and no further"
+            );
+        }
+        assert!(
+            crate::orchestration::install_harness_executor_with_config(
+                bbox_config::config::ExecutorKind::Fleetd,
+                fleetd.config(),
+                store_dir.clone(),
+                state.task_store.clone(),
+                state.tail_tx.clone(),
+                None,
+                None,
+            ),
+            "the replacement daemon installs the fleetd executor"
         );
-        // Dispatching forces the connect, and the connect runs the re-adoption
-        // sweep before it hands back a command lane.
-        let mut nudge = second
-            .spawn(spec_for(
-                &nudge_stub,
-                "nudge-session",
-                "nudge-task",
-                &nudge_log,
-                &root,
-            ))
-            .await
-            .expect("the replacement daemon can dispatch");
-        let _ = recv_line(&mut nudge.events).await;
+        // Exactly what daemon startup runs. Nothing dispatches after this.
+        crate::orchestration::start_harness_readoption();
 
         // The replay closed the gap: 4 and 5 were produced while nothing was
         // listening, and the cursor moved only because they were replayed off
-        // the durable log and ingested.
+        // the durable log from the task's own cursor and ingested.
         await_cursor(&task, 5).await;
+        assert_eq!(task.inner.lock().harness_ingest_seq, 5);
 
-        let inner = task.inner.lock();
+        let server = crate::server::BlackboxServer::new(state.clone());
+        let status = server.bro_status(rmcp::handler::server::wrapper::Parameters(
+            serde_json::from_value(serde_json::json!({ "task_id": "drill-task" }))
+                .expect("status params"),
+        ));
+        assert_ne!(status.is_error, Some(true), "{status:?}");
+        let status: serde_json::Value =
+            serde_json::from_str(&tool_text(&status)).expect("bro_status JSON");
         assert_eq!(
-            inner.status,
-            crate::orchestration::TaskStatus::Running,
-            "a reattached session is live, not failed"
+            status["status"], "running",
+            "a reattached session is live, not failed: {status}"
         );
-        drop(inner);
+        assert!(
+            !status.to_string().contains("server restarted"),
+            "the restart notice is gone once the session is back: {status}"
+        );
         assert_eq!(
             *task.child_id.lock(),
             Some(survivor_pid),
             "the reattached task points at the surviving child"
         );
 
-        drop(second);
+        // bro_resume on the live session returns the live task, not a spawn.
+        let resumed = server
+            .bro_resume(rmcp::handler::server::wrapper::Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "prompt": "continue",
+                    "session_id": "drill-session",
+                    "provider": "glm",
+                }))
+                .expect("resume params"),
+            ))
+            .await;
+        let text = tool_text(&resumed);
+        assert_eq!(resumed.is_error, Some(true), "{text}");
+        assert!(
+            text.contains(r#"bro_wait(task_id="drill-task""#)
+                && text.contains(r#"bro_cancel(task_id="drill-task")"#),
+            "the caller is pointed at the live task: {text}"
+        );
+        assert_eq!(
+            state.task_store.read().all_tasks().len(),
+            1,
+            "no resume task was created"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running
+        );
+        assert!(process_is_alive(survivor_pid));
+
+        drop(server);
         drop(fleetd);
+    }
+
+    fn tool_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Poll the durable event log until it contains `needle`. This is the
