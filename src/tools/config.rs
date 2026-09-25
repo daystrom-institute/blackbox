@@ -121,12 +121,13 @@ fn catalog_project_mcp(
                     "\nSource: project {project_id}, accepted generation {}, commit {}. {PROJECT_MCP_PUBLICATION}.\n",
                     provenance.accepted_generation, provenance.accepted_commit
                 ));
-                if edits.total > 0 {
+                if !edits.is_empty() {
                     text.push_str(&format!(
                         "Owner-lane edits not yet reflected here ({}, newest last):\n",
-                        edits.total
+                        edits.len()
                     ));
-                    for status in &edits.shown {
+                    let skipped = edits.len().saturating_sub(OWNER_EDITS_SUMMARY_ROWS);
+                    for status in &edits[skipped..] {
                         text.push_str(&format!(
                             "  {}: {}\n",
                             status.mutation_id,
@@ -142,8 +143,13 @@ fn catalog_project_mcp(
             McpToolReply::Body {
                 scope,
                 selection,
-                value,
+                mut value,
             } => {
+                // The exact inventory pages every open edit in full; the
+                // envelope carries only the byte-budgeted summary.
+                if p.action == McpAction::List {
+                    value["owner_edits"] = serde_json::json!(edits);
+                }
                 let body = super::body_page::json_body_page(
                     &selection,
                     &value,
@@ -154,7 +160,7 @@ fn catalog_project_mcp(
                     "scope": scope,
                     "projectId": project_id,
                     "source": accepted.snapshot.provenance(),
-                    "ownerEdits": edits,
+                    "ownerEdits": owner_edits_summary(&edits),
                     "publication": PROJECT_MCP_PUBLICATION,
                     "body": body,
                 }))?)
@@ -227,10 +233,72 @@ fn catalog_project_mcp(
     // one selected above; report the owner lane against the current one.
     if let Ok(current) = server.state.load_accepted_project_config(project_id) {
         reply["ownerEdits"] =
-            serde_json::json!(server.state.project_config_open_edits(&current, &target));
+            owner_edits_summary(&server.state.project_config_open_edits(&current, &target));
     }
     reply["publication"] = serde_json::json!(PROJECT_MCP_PUBLICATION);
     Ok(serde_json::to_string(&reply)?)
+}
+
+/// The newest open edits a reply envelope summarizes, and the serialized
+/// budget they share. Summary rows carry no landing paths (a published scope
+/// path can be kilobytes once escaped) and bound the owner's error text;
+/// every open edit, with its exact landing path, pages through the exact
+/// inventory under `owner_edits`.
+const OWNER_EDITS_SUMMARY_ROWS: usize = 8;
+const OWNER_EDITS_SUMMARY_BYTES: usize = 8 * 1024;
+const OWNER_ERROR_SUMMARY_CHARS: usize = 200;
+
+fn owner_edits_summary(
+    edits: &[crate::tools::project_config::ProjectConfigMutationStatus],
+) -> serde_json::Value {
+    let mut shown = Vec::new();
+    let mut bytes = 0;
+    for status in edits.iter().rev().take(OWNER_EDITS_SUMMARY_ROWS) {
+        let mut row = serde_json::json!({
+            "mutation_id": status.mutation_id,
+            "state": status.state,
+            "mode": status.mode,
+            "next_step": status.next_step,
+        });
+        if let Some(observed) = &status.observed_sha256 {
+            row["observed_sha256"] = serde_json::json!(observed);
+        }
+        if let Some(blocked_by) = &status.blocked_by {
+            row["blocked_by"] = serde_json::json!(blocked_by);
+        }
+        if status.owner_collector_unsupported {
+            row["owner_collector_unsupported"] = serde_json::json!(true);
+        }
+        if let Some(error) = &status.owner_error {
+            let count = error.chars().count();
+            row["owner_error"] = serde_json::json!(if count <= OWNER_ERROR_SUMMARY_CHARS {
+                error.clone()
+            } else {
+                format!(
+                    "{}...(+{} chars; exact text in the list inventory)",
+                    error
+                        .chars()
+                        .take(OWNER_ERROR_SUMMARY_CHARS)
+                        .collect::<String>(),
+                    count - OWNER_ERROR_SUMMARY_CHARS
+                )
+            });
+        }
+        let size = serde_json::to_vec(&row).map_or(usize::MAX, |encoded| encoded.len());
+        if bytes + size > OWNER_EDITS_SUMMARY_BYTES {
+            break;
+        }
+        bytes += size;
+        shown.push(row);
+    }
+    shown.reverse();
+    serde_json::json!({
+        "total": edits.len(),
+        "omitted": edits.len() - shown.len(),
+        "path": ".bbox/mcp.json",
+        "shown": shown,
+        "exact": "bro_mcp(action=\"list\", body_limit=4096) with the same scope/project pages every open edit, with its landing path, under body owner_edits",
+    })
 }
 
 /// Render a `bro_mcp` reply as the complete serialized tool response. Body

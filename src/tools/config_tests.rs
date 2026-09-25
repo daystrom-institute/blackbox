@@ -52,6 +52,29 @@ fn install(
     fixture.install_config_publication(PROJECT, scope, commit, files);
 }
 
+/// A per-test global MCP store. `BRO_HOME` wins over every other location
+/// `global_store_path` consults, so no test reads or writes the operator's
+/// store or inherits its filters.
+struct IsolatedBroHome {
+    _directory: tempfile::TempDir,
+    _env: crate::util::TestEnvGuard,
+    root: std::path::PathBuf,
+}
+
+fn isolated_bro_home() -> IsolatedBroHome {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let mut env = crate::util::TestEnvGuard::new();
+    env.set("BRO_HOME", root.join("bro"));
+    let store = orchestration::mcp::global_store_path().unwrap();
+    assert!(store.starts_with(&root), "{}", store.display());
+    IsolatedBroHome {
+        _directory: directory,
+        _env: env,
+        root,
+    }
+}
+
 fn fixture_with(config_toml: Option<&str>) -> (CatalogFixture, BlackboxServer) {
     let fixture = CatalogFixture::new();
     let scope = CatalogFixture::scope(".");
@@ -172,6 +195,7 @@ fn dispatch_disallow(server: &BlackboxServer) -> Vec<String> {
 
 #[tokio::test]
 async fn catalog_project_reads_answer_from_the_accepted_store_redacted_and_bounded() {
+    let _home = isolated_bro_home();
     let (fixture, server) = fixture_with(None);
 
     let listing = ok(&server, project(json!({"action": "list"}))).await;
@@ -267,6 +291,12 @@ async fn catalog_project_reads_answer_from_the_accepted_store_redacted_and_bound
 
 #[tokio::test]
 async fn enablement_comes_from_committed_config_without_changing_dispatch_composition() {
+    let _home = isolated_bro_home();
+    let mut global = orchestration::mcp::McpStore::new();
+    global.filters.disallow = vec!["mcp__global__seeded".into()];
+    global
+        .save(&orchestration::mcp::global_store_path().unwrap())
+        .unwrap();
     for (toml, disabled) in [
         (Some("[mcp]\nenabled = false\n"), true),
         (Some("[mcp]\nenabled = true\n"), false),
@@ -291,11 +321,19 @@ async fn enablement_comes_from_committed_config_without_changing_dispatch_compos
         // Dispatch composition is unchanged by the flag: global, then the
         // accepted project filters, then the recursion guard.
         let disallow = dispatch_disallow(&server);
+        let position = |wanted: &dyn Fn(&str) -> bool| {
+            disallow
+                .iter()
+                .position(|pattern| wanted(pattern))
+                .unwrap_or_else(|| panic!("{toml:?}: {disallow:?}"))
+        };
+        let global = position(&|p| p == "mcp__global__seeded");
+        let project = position(&|p| p == "mcp__remote__drop");
+        let guard = position(&|p| p.contains("bro_exec"));
         assert!(
-            disallow.iter().any(|p| p == "mcp__remote__drop"),
-            "{toml:?}"
+            global < project && project < guard,
+            "{toml:?}: {disallow:?}"
         );
-        assert!(disallow.iter().any(|p| p.contains("bro_exec")), "{toml:?}");
     }
 
     // Malformed enablement input refuses every project action by name.
@@ -314,6 +352,7 @@ async fn enablement_comes_from_committed_config_without_changing_dispatch_compos
 
 #[tokio::test]
 async fn every_mutation_action_queues_a_guarded_owner_edit_that_chains_before_publication() {
+    let _home = isolated_bro_home();
     let (fixture, server) = fixture_with(None);
     let accepted = accepted_store();
 
@@ -514,6 +553,7 @@ async fn every_mutation_action_queues_a_guarded_owner_edit_that_chains_before_pu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_compose_and_share_failures_along_the_chain() {
+    let _home = isolated_bro_home();
     let (_fixture, server) = fixture_with(None);
     let requests = [
         json!({"action": "add", "name": "one", "url": "https://one.example"}),
@@ -625,6 +665,7 @@ async fn concurrent_requests_compose_and_share_failures_along_the_chain() {
 
 #[tokio::test]
 async fn divergent_publication_under_a_pending_chain_refuses_without_queuing() {
+    let _home = isolated_bro_home();
     let (fixture, server) = fixture_with(None);
     let queued = ok_json(
         &server,
@@ -661,6 +702,7 @@ async fn divergent_publication_under_a_pending_chain_refuses_without_queuing() {
 
 #[tokio::test]
 async fn empty_unavailable_unsupported_unknown_and_oversized_states_are_named() {
+    let _home = isolated_bro_home();
     let fixture = CatalogFixture::new();
     let scope = CatalogFixture::scope(".");
     fixture.add_published_project(PROJECT, &scope);
@@ -805,10 +847,7 @@ async fn sync_global_and_bridge_keep_their_lanes() {
     }
 
     // Global scope in catalog mode keeps the daemon-owned store.
-    let home = tempfile::tempdir().unwrap();
-    let home = home.path().canonicalize().unwrap();
-    let mut env = crate::util::TestEnvGuard::new();
-    env.set("HOME", &home);
+    let home = isolated_bro_home();
     let saved = ok(
         &server,
         json!({"action": "add", "name": "global-server", "url": "https://global.example"}),
@@ -818,9 +857,9 @@ async fn sync_global_and_bridge_keep_their_lanes() {
         saved.contains("Saved global-server to the global MCP store"),
         "{saved}"
     );
-    let global =
-        orchestration::mcp::McpStore::load(&orchestration::mcp::global_store_path().unwrap())
-            .unwrap();
+    let global_path = orchestration::mcp::global_store_path().unwrap();
+    assert!(global_path.starts_with(&home.root));
+    let global = orchestration::mcp::McpStore::load(&global_path).unwrap();
     assert!(global.servers.contains_key("global-server"));
     let project_listing = ok(&server, project(json!({"action": "list"}))).await;
     assert!(
@@ -853,5 +892,131 @@ async fn sync_global_and_bridge_keep_their_lanes() {
             .unwrap();
     assert!(local.servers.contains_key("local"));
     assert_eq!(bridge.state.checkout_mutations.read().pending_count(), 0);
-    drop(env);
+    drop(home);
+}
+
+#[tokio::test]
+async fn a_read_holding_an_older_snapshot_never_retires_a_newer_pending_edit() {
+    let _home = isolated_bro_home();
+    let (fixture, server) = fixture_with(None);
+    let a = accepted_store();
+    // A read captures accepted configuration A and pauses.
+    let held = server.state.load_accepted_project_config(PROJECT).unwrap();
+    // Publication advances to B, and an edit changes B back to A's bytes.
+    let b = json!({"version": 1, "servers": {}, "filters": {"allow": ["published-b"]}}).to_string();
+    install(
+        &fixture,
+        &CatalogFixture::scope("."),
+        COMMIT_TWO,
+        Some(&[(".bbox/mcp.json", b.as_bytes())]),
+    );
+    invalidate(&server);
+    let back = server
+        .state
+        .prepare_project_config_mutation(
+            PROJECT,
+            &ProjectConfigTargetV1::McpStore,
+            "test",
+            |base| {
+                assert_eq!(base, Some(b.as_str()));
+                Ok(Some(ProjectConfigEdit::Write(a.clone())))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.expected_sha256, Some(content_sha256(&b)));
+    // The paused read resumes with its A snapshot. It must not treat the
+    // pending B -> A edit as published.
+    let open = server
+        .state
+        .project_config_open_edits(&held, &ProjectConfigTargetV1::McpStore);
+    assert_eq!(
+        open.iter()
+            .map(|status| status.mutation_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![back.mutation_id.as_str()]
+    );
+    assert_eq!(open[0].state, CheckoutMutationProgress::Queued);
+    assert_eq!(
+        server
+            .state
+            .project_config_mutation_status(&back.mutation_id)
+            .unwrap()
+            .state,
+        CheckoutMutationProgress::Queued
+    );
+    // The next edit still composes on the pending edit.
+    let next = ok_json(
+        &server,
+        project(json!({"action": "allow", "pattern": "mcp__after__edit"})),
+    )
+    .await;
+    assert_eq!(next["mutation"]["predecessor"], json!(back.mutation_id));
+    assert_eq!(
+        next["mutation"]["expected_sha256"],
+        json!(content_sha256(&a))
+    );
+}
+
+#[tokio::test]
+async fn owner_edit_envelopes_stay_bounded_for_long_escaped_scopes() {
+    let _home = isolated_bro_home();
+    let fixture = CatalogFixture::new();
+    // The longest-escaping valid scope shape: 255-quote components.
+    let relative = vec!["\"".repeat(255); 8].join("/");
+    let scope = CatalogFixture::scope(&relative);
+    fixture.add_published_project(PROJECT, &scope);
+    let store = accepted_store();
+    install(
+        &fixture,
+        &scope,
+        COMMIT_ONE,
+        Some(&[(".bbox/mcp.json", store.as_bytes())]),
+    );
+    let server = fixture.server();
+    let complete = |response: &CallToolResult| {
+        let bytes = serde_json::to_vec(response).unwrap().len();
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        assert!(
+            bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+            "{bytes} bytes"
+        );
+    };
+    for n in 0..10 {
+        let request = project(json!({"action": "allow", "pattern": format!("mcp__edit__{n}")}));
+        complete(
+            &server
+                .bro_mcp(Parameters(serde_json::from_value(request).unwrap()))
+                .await,
+        );
+    }
+    for request in [
+        json!({"action": "list"}),
+        json!({"action": "list", "body_limit": 4096}),
+        json!({"action": "get_filters", "body_limit": 4096}),
+        json!({"action": "get", "name": "remote", "body_limit": 4096}),
+        json!({"action": "disallow", "pattern": "mcp__edit__last"}),
+    ] {
+        complete(
+            &server
+                .bro_mcp(Parameters(
+                    serde_json::from_value(project(request)).unwrap(),
+                ))
+                .await,
+        );
+    }
+    let summary = ok_json(&server, project(json!({"action": "get_filters"}))).await;
+    assert_eq!(summary["ownerEdits"]["total"], 11);
+    assert_eq!(summary["ownerEdits"]["shown"].as_array().unwrap().len(), 8);
+    assert_eq!(summary["ownerEdits"]["omitted"], 3);
+    assert!(summary["ownerEdits"]["shown"][0].get("landing").is_none());
+    // Every open edit, with its exact landing path, pages through the
+    // exact inventory.
+    let (_, inventory) = exact(&server, project(json!({"action": "list"}))).await;
+    let edits = inventory["owner_edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 11);
+    assert_eq!(
+        edits[0]["landing"]["repository_relative_path"],
+        json!(format!("{relative}/.bbox/mcp.json"))
+    );
 }

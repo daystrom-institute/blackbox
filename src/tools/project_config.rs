@@ -507,15 +507,9 @@ impl SharedState {
         };
         let target = ProjectConfigTargetV1::from_relative_path(&relative_path)
             .ok_or_else(|| anyhow::anyhow!("queued configuration target is not recognized"))?;
-        if let Some(project_id) = self.catalog_project_for_scope(&scope)
-            && let Ok(accepted) = self.load_accepted_project_config(&project_id)
-            && accepted.scope == scope
-        {
-            self.checkout_mutations.write().observe_guarded_publication(
-                &scope,
-                &relative_path,
-                accepted.snapshot.accepted_bytes(&target),
-            );
+        if let Some(project_id) = self.catalog_project_for_scope(&scope) {
+            let mut queue = self.checkout_mutations.write();
+            self.observe_current_publication(&mut queue, &project_id, &scope, &target);
         }
         let queue = self.checkout_mutations.read();
         let row = queue.get(mutation_id).ok_or_else(|| {
@@ -524,22 +518,46 @@ impl SharedState {
         Ok(guarded_mutation_status(&queue, row))
     }
 
+    /// Retire whatever the current accepted publication incorporates on one
+    /// guarded path. The accepted view is re-read while the caller holds the
+    /// queue lock, as edit preparation does, and never taken from a snapshot
+    /// captured before it: a read that raced a newer publication and a newer
+    /// edit must not mark that edit published from bytes it never saw
+    /// published. Returns the accepted bytes it observed, or `None` when no
+    /// current accepted view of `scope` is available (nothing is retired).
+    fn observe_current_publication(
+        &self,
+        queue: &mut crate::checkout_mutations::CheckoutMutations,
+        project_id: &str,
+        scope: &PublishedScope,
+        target: &ProjectConfigTargetV1,
+    ) -> Option<Option<String>> {
+        let current = self.load_accepted_project_config(project_id).ok()?;
+        if &current.scope != scope {
+            return None;
+        }
+        let published = current.snapshot.accepted_bytes(target).map(str::to_owned);
+        if queue.observe_guarded_publication(scope, &target.relative_path(), published.as_deref()) {
+            self.checkout_mutations_persister.request();
+        }
+        Some(published)
+    }
+
     /// The owner-lane edits of one configuration target that reads do not
-    /// reflect: queued and delivered edits, and failed edits still standing
-    /// against the current accepted bytes after the last edit that applied
-    /// or is pending. Whatever the accepted publication already incorporates
-    /// is retired first. Newest entries are shown; `total` counts them all.
+    /// reflect, newest last: queued and delivered edits, and failed edits
+    /// still standing against the current accepted bytes after the last edit
+    /// that applied or is pending. Whatever the current accepted publication
+    /// already incorporates is retired first, under the queue lock.
     pub(crate) fn project_config_open_edits(
         &self,
         accepted: &AcceptedProjectConfig,
         target: &ProjectConfigTargetV1,
-    ) -> ProjectConfigOpenEdits {
+    ) -> Vec<ProjectConfigMutationStatus> {
         let relative_path = target.relative_path();
-        let published = accepted.snapshot.accepted_bytes(target);
         let mut queue = self.checkout_mutations.write();
-        if queue.observe_guarded_publication(&accepted.scope, &relative_path, published) {
-            self.checkout_mutations_persister.request();
-        }
+        let published = self
+            .observe_current_publication(&mut queue, &accepted.project_id, &accepted.scope, target)
+            .unwrap_or_else(|| accepted.snapshot.accepted_bytes(target).map(str::to_owned));
         let mut open = Vec::new();
         let mut failures = Vec::new();
         for row in queue.guarded_rows_for_path(&accepted.scope, &relative_path) {
@@ -558,7 +576,7 @@ impl SharedState {
                         .publication
                         .as_ref()
                         .and_then(|publication| publication.base_content_json.as_deref());
-                    if base == published {
+                    if base == published.as_deref() {
                         failures.push(row);
                     }
                 }
@@ -566,24 +584,10 @@ impl SharedState {
             }
         }
         open.extend(failures);
-        let total = open.len();
-        let shown = open
-            .into_iter()
-            .skip(total.saturating_sub(OPEN_EDITS_SHOWN))
+        open.into_iter()
             .map(|row| guarded_mutation_status(&queue, row))
-            .collect();
-        ProjectConfigOpenEdits { total, shown }
+            .collect()
     }
-}
-
-/// At most this many open edits are listed per response.
-const OPEN_EDITS_SHOWN: usize = 8;
-
-/// A configuration target's open owner-lane edits, newest last.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ProjectConfigOpenEdits {
-    pub(crate) total: usize,
-    pub(crate) shown: Vec<ProjectConfigMutationStatus>,
 }
 
 fn guarded_mutation_status(

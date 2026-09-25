@@ -209,8 +209,11 @@ alias, or attached checkout path) and never grants the daemon filesystem
 access. Project `list`, `get`, and `get_filters` read the project's accepted
 publication of `.bbox/mcp.json`, and report enablement from its committed
 `.bbox/config.toml`. Their replies carry `projectId`, `source` (accepted
-generation and commit), and `ownerEdits`: edits that are queued, delivered,
-conflicted, or blocked and not yet reflected, each with its next step. Project
+generation and commit), and `ownerEdits`: a byte-budgeted summary of the edits
+that are queued, delivered, conflicted, or blocked and not yet reflected (the
+total, the number omitted, and the newest ones with state and next step). The
+exact inventory, `list` with `body_limit`, pages every open edit with its
+landing path under `owner_edits`. Project
 `add`, `remove`, `allow`, `disallow`, and `clear_filters` queue a guarded edit
 of `.bbox/mcp.json` for the project's checkout owner. They return
 `state="queued"` with a `mutation` receipt (mutation id, landing path,
