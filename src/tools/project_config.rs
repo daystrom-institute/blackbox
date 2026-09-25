@@ -274,6 +274,22 @@ impl SharedState {
             .map(|accepted| ProjectConfigContext::Accepted(accepted.snapshot))
     }
 
+    /// The accepted configuration an exact project-scope action reads or
+    /// edits. Unlike [`Self::project_config_context`], a selector that names
+    /// no catalog project is refused: exact project scope never degrades to
+    /// global configuration.
+    pub(crate) fn select_project_config_scope(
+        &self,
+        selector: &str,
+    ) -> Result<AcceptedProjectConfig, ProjectConfigError> {
+        let project_id = self
+            .catalog_project_for_selector(selector.trim())?
+            .ok_or_else(|| ProjectConfigError::ProjectUnknown {
+                selector: selector.to_string(),
+            })?;
+        self.load_accepted_project_config(&project_id)
+    }
+
     /// Dispatch-time brofile resolution: project first, then global only
     /// when the project view proves the override absent.
     pub(crate) fn resolve_config_brofile(
@@ -396,8 +412,33 @@ impl SharedState {
         project_id: &str,
         target: &ProjectConfigTargetV1,
         reason: &str,
-        mut after_snapshot: impl FnMut(),
+        after_snapshot: impl FnMut(),
         edit: impl FnOnce(Option<&str>) -> anyhow::Result<Option<ProjectConfigEdit>>,
+    ) -> anyhow::Result<Option<ProjectConfigMutationReceipt>> {
+        self.prepare_project_config_mutation_in_view(
+            project_id,
+            target,
+            reason,
+            after_snapshot,
+            |_, base| edit(base),
+        )
+    }
+
+    /// [`Self::prepare_project_config_mutation_with_snapshot_hook`] whose
+    /// `edit` also receives the accepted configuration the edit base was
+    /// selected from. Checks that must hold against the same generation the
+    /// mutation reports and preconditions on (such as member references)
+    /// run inside `edit`, under the queue lock, against this view.
+    pub(crate) fn prepare_project_config_mutation_in_view(
+        &self,
+        project_id: &str,
+        target: &ProjectConfigTargetV1,
+        reason: &str,
+        mut after_snapshot: impl FnMut(),
+        edit: impl FnOnce(
+            &AcceptedProjectConfig,
+            Option<&str>,
+        ) -> anyhow::Result<Option<ProjectConfigEdit>>,
     ) -> anyhow::Result<Option<ProjectConfigMutationReceipt>> {
         anyhow::ensure!(
             !self.project_authority.is_bridge(),
@@ -429,7 +470,7 @@ impl SharedState {
         let relative_path = target.relative_path();
         let published = accepted.snapshot.accepted_bytes(target);
         let base = queue.guarded_write_base(&accepted.scope, &relative_path, published)?;
-        let content = match edit(base.as_deref())? {
+        let content = match edit(&accepted, base.as_deref())? {
             None => return Ok(None),
             Some(ProjectConfigEdit::Write(content))
                 if base.as_deref() == Some(content.as_str()) =>
