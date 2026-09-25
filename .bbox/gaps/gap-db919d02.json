@@ -16,11 +16,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/fleetd/state-dir-derivation-mismatch",
   "notes": "Triage trace: still live. The launchd plists were corrected to pass .../blackbox/bro and .../blackbox-dev/bro, but deploy/fleetd.service still runs fleetd with no --state-dir (its comment claims the default matches the daemon, which is false), and deploy/fleetd-dev.service passes .../blackbox-dev without the bro suffix. On a systemd host both units bind a socket the daemon never dials.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-7eb3f795",
   "created_at": "2026-07-20T00:31:21Z",
-  "updated_at": "2026-09-24T06:33:03Z",
-  "resolved_at": "2026-09-24T06:33:03Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/63"
+  "updated_at": "2026-09-25T11:51:30Z",
+  "resolved_at": "2026-09-25T11:51:30Z",
+  "resolution_note": "implemented in PR #97, commit 5100f1d6dfbd9a45c2bcbbb743ae3836705255b5"
 }
