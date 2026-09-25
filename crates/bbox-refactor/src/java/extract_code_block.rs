@@ -36,7 +36,7 @@
 //!   into a single return at the end of the range.
 //! - `old_text` doesn't match exactly once.
 //! - The matched range isn't inside any method or constructor body.
-//! - `error.selection_not_statement_aligned` — after trimming leading and
+//! - `error.selection_not_statement_aligned`: after trimming leading and
 //!   trailing whitespace and comments, the range does not start at the
 //!   start of a statement and end at the end of a statement of the same
 //!   block (or constructor body, or switch group). The refusal names the

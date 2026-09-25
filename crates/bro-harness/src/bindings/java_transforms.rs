@@ -2707,7 +2707,7 @@ impl Tool for JavaExtractMethodCodeBlock {
         "java.extractMethodCodeBlock"
     }
     fn description(&self) -> &str {
-        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses selections that are not whole sibling statements, mutated captures, unsafe multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge plus the exact call-site {replacement} span — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
+        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses selections that are not whole sibling statements, mutated captures, unsafe multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge plus the exact call-site {replacement} span; never writes. Run analysis.methodRegions first for contiguity/live-out gates."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -2830,7 +2830,7 @@ impl Tool for JavaExtractMethodCodeBlock {
                     } else if msg.contains("non_local_control_flow") {
                         " — run analysis.methodRegions to locate the return/break/continue gate before mutating"
                     } else if msg.contains("selection_not_statement_aligned") {
-                        " — run analysis.methodRegions on the enclosing method to see its statement regions, then rebuild oldText with code.readLines({ file, startLine, endLine }) over one of the aligned line ranges named above"
+                        "; run analysis.methodRegions on the enclosing method to see its statement regions, then rebuild oldText with code.readLines({ file, startLine, endLine }) over one of the aligned line ranges named above"
                     } else {
                         ""
                     };
