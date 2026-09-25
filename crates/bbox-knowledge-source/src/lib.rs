@@ -39,6 +39,11 @@ pub const MAX_GRAPH_ROWS_PER_FILE: u64 = 1_000_000;
 /// validation leaf; `bbox_project_graph::EVIDENCE_BINDINGS_FILENAME` is the
 /// same string and a contract test pins them together.
 pub const EVIDENCE_BINDINGS_FILENAME: &str = "bindings.json";
+/// The only files a graph directory publishes. The Graphs lane admits exactly
+/// `<lane dir>/<graph-id>/<one of these>`; `schema.json`, `vertices.jsonl` and
+/// `edges.jsonl` are required, `graph.json` is optional.
+pub const GRAPH_SOURCE_FILENAMES: [&str; 4] =
+    ["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"];
 pub const MAX_ANCESTRY_NODES: u64 = 2_000_000;
 pub const MAX_ANCESTRY_EDGES: u64 = 8_000_000;
 pub const MAX_ANCESTRY_PAGE_NODES: u64 = 2_000;
@@ -1495,10 +1500,7 @@ fn validate_source_filename(
             || !graph_id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            || !matches!(
-                graph_file,
-                "graph.json" | "schema.json" | "vertices.jsonl" | "edges.jsonl"
-            )
+            || !GRAPH_SOURCE_FILENAMES.contains(&graph_file)
         {
             return Err(ContractError::InvalidGraphSourcePath);
         }
@@ -1527,6 +1529,32 @@ fn validate_source_filename(
         return Err(ContractError::InvalidSourceFilename);
     }
     Ok(())
+}
+
+/// Whether a repository-relative path is shaped like a graph source file of
+/// this scope's Graphs lane: `<lane dir>/<graph-id>/<graph source filename>`.
+///
+/// Producers select Graphs-lane manifest entries with this, so any other file
+/// under the lane directory (notes, plans, nested subtrees) is left out of the
+/// manifest instead of failing the whole candidate. It checks shape only, not
+/// the graph id: a graph source file under a malformed id is still captured and
+/// still refused by the contract validator, which stays exact.
+pub fn is_graph_source_path(scope: &PublishedScope, repository_relative_filename: &str) -> bool {
+    let prefix = if scope.bbox_root_relpath() == "." {
+        ".bbox/graphs/".to_string()
+    } else {
+        format!("{}/.bbox/graphs/", scope.bbox_root_relpath())
+    };
+    let Some(relative) = repository_relative_filename.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut components = relative.split('/');
+    let (Some(graph_id), Some(graph_file), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    !graph_id.is_empty() && GRAPH_SOURCE_FILENAMES.contains(&graph_file)
 }
 
 fn validate_graph_source_manifest(
@@ -1566,7 +1594,7 @@ fn validate_graph_source_manifest(
         return Err(ContractError::GraphLimitExceeded);
     }
     let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
-    let allowed = BTreeSet::from(["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"]);
+    let allowed = BTreeSet::from(GRAPH_SOURCE_FILENAMES);
     if graphs
         .values()
         .any(|(_, files)| !required.is_subset(files) || !files.is_subset(&allowed))
@@ -2028,6 +2056,68 @@ mod tests {
         assert!(matches!(
             validate_graph_source_manifest(&scope(), &incomplete, KnowledgeSourceLimits::default()),
             Err(ContractError::IncompleteGraphSource)
+        ));
+    }
+
+    #[test]
+    fn publication_candidate_refuses_a_non_graph_path_in_the_graph_manifest() {
+        let (mut descriptor, knowledge, gaps) = publication();
+        let mut graphs = graph_entries("design");
+        graphs.push(entry(".bbox/graphs/design/plans/x.jsonl", b"{}"));
+        graphs.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
+
+        assert!(matches!(
+            validate_publication_candidate(
+                &descriptor,
+                &knowledge,
+                &gaps,
+                &graphs,
+                &[],
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::InvalidGraphSourcePath)
+        ));
+    }
+
+    #[test]
+    fn graph_source_path_selects_only_graph_source_files() {
+        let root = scope();
+        for path in [
+            ".bbox/graphs/design/graph.json",
+            ".bbox/graphs/design/schema.json",
+            ".bbox/graphs/design/vertices.jsonl",
+            ".bbox/graphs/design/edges.jsonl",
+            // Shape only: the validator, not producer selection, refuses a
+            // malformed graph id.
+            ".bbox/graphs/bad:id/schema.json",
+        ] {
+            assert!(is_graph_source_path(&root, path), "{path}");
+        }
+        for path in [
+            ".bbox/graphs/NOTES.md",
+            ".bbox/graphs/schema.json",
+            ".bbox/graphs/design/README.md",
+            ".bbox/graphs/design/plans/x.jsonl",
+            ".bbox/graphs/design/plans/schema.json",
+            ".bbox/graphs//schema.json",
+            ".bbox/knowledge/design/schema.json",
+            "nested/.bbox/graphs/design/schema.json",
+        ] {
+            assert!(!is_graph_source_path(&root, path), "{path}");
+        }
+
+        let nested = PublishedScope::try_new("nested-scope", "nested").unwrap();
+        assert!(is_graph_source_path(
+            &nested,
+            "nested/.bbox/graphs/design/schema.json"
+        ));
+        assert!(!is_graph_source_path(
+            &nested,
+            ".bbox/graphs/design/schema.json"
         ));
     }
 

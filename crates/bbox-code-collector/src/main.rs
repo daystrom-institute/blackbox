@@ -1579,6 +1579,13 @@ fn capture_publication_lane(
     let mut entries = Vec::with_capacity(paths.len());
     let mut logical_bytes = 0_u64;
     for path in paths {
+        // Only a graph's source files publish; any other file under the
+        // Graphs lane is left out unread rather than failing the candidate.
+        if lane == SourceLaneV1::Graphs
+            && !bbox_knowledge_source::is_graph_source_path(scope, &path)
+        {
+            continue;
+        }
         let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
             commit,
             &path,
@@ -4808,6 +4815,83 @@ mod tests {
         assert_eq!(captured.descriptor.knowledge.page_count, 1);
         assert_eq!(captured.descriptor.gaps.page_count, 1);
         assert_eq!(captured.descriptor.full_ref, "refs/heads/main");
+    }
+
+    #[test]
+    fn published_graph_capture_leaves_non_graph_files_out_unread() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.name", "Knowledge Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "knowledge@example.invalid"],
+        );
+        let graph = root.join(".bbox/graphs/design");
+        fs::create_dir_all(graph.join("plans")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"graph-capture-fixture\"\n",
+        )
+        .unwrap();
+        let sources: [(&str, &[u8]); 4] = [
+            ("graph.json", br#"{"graph_id":"design"}"#),
+            ("schema.json", br#"{"version":1}"#),
+            ("vertices.jsonl", br#"{"id":"one"}"#),
+            ("edges.jsonl", b""),
+        ];
+        for (filename, bytes) in sources {
+            fs::write(graph.join(filename), bytes).unwrap();
+        }
+        // Over the per-file byte limit: reading it would fail the capture, so
+        // a successful capture proves the blob was never read.
+        let oversized = vec![b'x'; KnowledgeSourceLimits::default().max_file_bytes as usize + 1];
+        fs::write(graph.join("plans/2026-01-01-plan.jsonl"), &oversized).unwrap();
+        fs::write(graph.join("README.md"), b"# design graph\n").unwrap();
+        fs::write(root.join(".bbox/graphs/NOTES.md"), b"notes\n").unwrap();
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "--quiet", "-m", "graph source"]);
+
+        let captured = capture_publication_candidate(&ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new("graph-capture-fixture", ".").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: Some(PublishedKnowledgeConfig {
+                full_ref: "refs/heads/main".to_string(),
+            }),
+        })
+        .unwrap();
+
+        let mut expected = sources
+            .iter()
+            .map(|(filename, _)| format!(".bbox/graphs/design/{filename}"))
+            .collect::<Vec<_>>();
+        expected.sort();
+        let mut listed = captured
+            .graph_entries
+            .iter()
+            .map(|entry| entry.repository_relative_filename.clone())
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(listed, expected);
+        assert_eq!(captured.descriptor.graphs.file_count, 4);
+        bbox_knowledge_source::validate_publication_candidate(
+            &captured.descriptor,
+            &captured.knowledge_entries,
+            &captured.gap_entries,
+            &captured.graph_entries,
+            &captured.evidence_entries,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            !captured
+                .blobs
+                .path()
+                .join(source_file_blob_sha256(&oversized))
+                .exists()
+        );
     }
 
     #[cfg(unix)]
