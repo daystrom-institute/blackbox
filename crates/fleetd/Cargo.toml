@@ -43,6 +43,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# Parity test only: the default state dir must equal the daemon's
+# `bbox_util::util::bro_home_dir`. Dev edges are outside the dependency ceiling.
+bbox-util = { path = "../bbox-util" }
 serde_json = "1"
 tempfile = "3"
 

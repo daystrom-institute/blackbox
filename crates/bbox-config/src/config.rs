@@ -2906,6 +2906,55 @@ port = 8000
         }
     }
 
+    /// With no config-file path settings, the daemon's `paths.bro_home` (the
+    /// dir it dials fleetd in) is exactly `util::bro_home_dir`, the rule
+    /// fleetd's default state dir mirrors.
+    #[test]
+    fn env_only_bro_home_is_util_bro_home_dir() {
+        let _guard = bbox_util::util::test_env_lock();
+        const KEYS: [&str; 4] = ["HOME", "BRO_HOME", "BLACKBOX_STATE_DIR", "XDG_STATE_HOME"];
+        let saved: Vec<_> = KEYS.iter().map(|key| (*key, env::var_os(key))).collect();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let missing_config = home.join("absent-config.toml");
+        let absolute = |name: &str| home.join(name).to_string_lossy().into_owned();
+        let cases: Vec<Vec<(&str, String)>> = vec![
+            vec![],
+            vec![("BRO_HOME", absolute("bro"))],
+            vec![("BRO_HOME", "~/bro".into())],
+            vec![("BLACKBOX_STATE_DIR", absolute("state"))],
+            vec![("BLACKBOX_STATE_DIR", "~/state".into())],
+            vec![("XDG_STATE_HOME", absolute("xdg"))],
+        ];
+        for case in cases {
+            for key in KEYS {
+                unsafe { env::remove_var(key) };
+            }
+            unsafe { env::set_var("HOME", &home) };
+            for (key, value) in &case {
+                unsafe { env::set_var(key, value) };
+            }
+            let config = load_with(LoadOptions {
+                config_path: Some(missing_config.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                config.paths.bro_home,
+                util::bro_home_dir(&home),
+                "daemon bro_home diverges from util::bro_home_dir for {case:?}"
+            );
+        }
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => unsafe { env::set_var(key, value) },
+                None => unsafe { env::remove_var(key) },
+            }
+        }
+    }
+
     #[test]
     fn bro_store_no_longer_overrides_bro_home() {
         let _guard = bbox_util::util::test_env_lock();

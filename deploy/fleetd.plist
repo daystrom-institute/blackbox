@@ -14,13 +14,16 @@
 
   --state-dir is the ONE thing that must stay in step with the daemon: the
   socket and shared-secret token derive from it, and that derivation is what
-  keeps the prod and dev daemons on separate supervisors. The daemon derives
-  its fleetd paths from its BRO dispatch store dir (state_dir/bro, the same
-  root as harness-sessions/), NOT the plain state dir, so this unit must
-  point --state-dir at .../blackbox/bro. Corrected 2026-07-19 after first
-  rollout: the original unit pointed at the plain state dir and the daemon
-  auto-started a second fleetd at the derived path, orphaning this one
-  (gap filed to align fleetd's built-in default with the daemon derivation).
+  keeps the prod and dev daemons on separate supervisors. The daemon dials
+  fleetd in its BRO home (<bro_home>/fleetd.sock): $BRO_HOME, else
+  paths.bro_home, else <state_dir>/bro, where state_dir is
+  $BLACKBOX_STATE_DIR, else paths.state_dir, else ~/.local/state/blackbox on
+  macOS. With no --state-dir, fleetd resolves the environment part of that
+  rule itself; it reads no daemon config file, so a daemon whose
+  paths.state_dir or paths.bro_home is set in its config file needs the
+  matching explicit --state-dir. launchd passes no BLACKBOX_STATE_DIR or
+  BRO_HOME, so the explicit path below equals the default and also anchors
+  the log paths.
 
   KeepAlive is a plain true rather than blackboxd's
   {SuccessfulExit: false}: a supervisor that exits cleanly (SIGTERM on

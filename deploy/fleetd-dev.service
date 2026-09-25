@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/fleetd --state-dir %h/.local/state/blackbox-dev
+ExecStart=%h/.local/bin/fleetd --state-dir %h/.local/state/blackbox-dev/bro
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=fleetd=debug
@@ -12,9 +12,15 @@ Environment=RUST_LOG=fleetd=debug
 # is the whole point of having two units: fleetd derives its socket and its
 # shared-secret token from the state dir, so a distinct state dir is a
 # distinct supervisor. That is what stops the dev daemon adopting prod's live
-# sessions, or prod adopting dev's. Matches
-# `state_dir = "~/.local/state/blackbox-dev"` in deploy/config-dev.toml; if
-# you change one, change the other.
+# sessions, or prod adopting dev's.
+#
+# The daemon dials fleetd in its BRO home (<bro_home>/fleetd.sock), which is
+# $BRO_HOME, else paths.bro_home, else <state_dir>/bro. fleetd's own default
+# follows only the environment part of that rule (fleetd reads no daemon
+# config file), and the dev daemon sets
+# `state_dir = "~/.local/state/blackbox-dev"` in deploy/config-dev.toml, so
+# this unit passes the explicit --state-dir <that state_dir>/bro. If you change
+# one, change the other.
 #
 # The binary is the SAME fleetd as prod. fleetd reads no brofile, no
 # credential store, and no provider config, so there is nothing for a dev
