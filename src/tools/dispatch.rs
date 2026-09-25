@@ -861,9 +861,16 @@ impl BlackboxServer {
             .map(|a| a.identity.task_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // A worker re-adopted from fleetd is running again only once the
-        // sweep that reattaches it finishes; checking liveness before then
-        // would let this resume spawn onto the live supervision key.
-        orch::harness_readoption_settled().await;
+        // sweep that reattaches it has succeeded; checking liveness before
+        // then would let this resume spawn onto the live supervision key. If
+        // re-adoption cannot complete, liveness is unknown and nothing spawns.
+        if let Err(error) = orch::ensure_harness_readoption().await {
+            return Self::err_text(&format!(
+                "cannot resume session {session_id}: re-adoption of surviving workers did not \
+                 complete ({error:#}). The session may still be live under fleetd, so no new \
+                 worker was started; retry bro_resume once fleetd is reachable."
+            ));
+        }
         let resume_lease = match try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),

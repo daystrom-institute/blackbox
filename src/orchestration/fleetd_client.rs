@@ -645,10 +645,11 @@ impl HarnessExecutor for FleetdExecutor {
         self.spawn_startup_readoption();
     }
 
-    /// A dial and its sweep hold the connection lock, so acquiring it once
-    /// is exactly "no sweep is in progress".
-    async fn readoption_settled(&self) {
-        drop(self.connection.lock().await);
+    /// A lane is handed out only on a connection whose sweep succeeded, so
+    /// getting one proves re-adoption completed: it waits out a sweep in
+    /// progress and redials after one that failed (at startup or since).
+    async fn ensure_readopted(&self) -> anyhow::Result<()> {
+        self.lane().await.map(|_| ())
     }
 
     /// Inspection is a read-only, idempotent probe, so a failed attempt
@@ -2787,6 +2788,168 @@ mod tests {
             [("sess-survivor".to_string(), 7)],
             "replay starts from the task's own cursor"
         );
+    }
+
+    /// The resume path after a failed startup sweep: a live worker survived
+    /// the restart, the startup sweep failed, and fleetd is reachable again
+    /// by the time `bro_resume` is the first operation. The resume must
+    /// complete re-adoption before it checks liveness, and so return the
+    /// surviving task with wait/cancel guidance instead of admitting a spawn
+    /// that collides with the live supervision key.
+    #[tokio::test]
+    async fn bro_resume_after_a_failed_startup_sweep_returns_the_surviving_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_dir = root.join("bro");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
+        let task = crate::orchestration::spawn_in_process_task(
+            "task-sess-survivor".to_string(),
+            bro_core::Provider::Glm,
+            "sess-survivor".to_string(),
+            None,
+            store_dir.clone(),
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        state
+            .task_store
+            .write()
+            .insert_reserved("task-sess-survivor".to_string(), task.clone())
+            .ok();
+        {
+            // What `TaskStore::load` leaves for a task running at shutdown.
+            let mut inner = task.inner.lock();
+            inner.status = crate::orchestration::TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.harness_ingest_seq = 7;
+        }
+        let fake = FakeFleetd::serve_with(
+            &root,
+            vec![summary(
+                "sess-survivor",
+                SessionState::Running,
+                Some(9),
+                None,
+            )],
+            ReplayScript::Silent,
+            Script {
+                lists: ListScript::SilentFirstConnection,
+                ..Script::default()
+            },
+        );
+        let mut config = fast_config(&root);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        assert!(crate::orchestration::install_harness_executor_with_config(
+            bbox_config::config::ExecutorKind::Fleetd,
+            config,
+            store_dir,
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+        ));
+
+        crate::orchestration::start_harness_readoption();
+        // Let the startup sweep fail outright before the resume arrives: its
+        // one ListSessions was sent and its deadline has passed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fake.lists.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup never swept"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Failed,
+            "the startup sweep failed, so nothing was reattached yet"
+        );
+
+        let server = crate::server::BlackboxServer::new(state.clone());
+        let resumed = server
+            .bro_resume(rmcp::handler::server::wrapper::Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "prompt": "continue",
+                    "session_id": "sess-survivor",
+                    "provider": "glm",
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let text = resumed
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(resumed.is_error, Some(true), "{text}");
+        assert!(
+            text.contains(r#"bro_wait(task_id="task-sess-survivor""#)
+                && text.contains(r#"bro_cancel(task_id="task-sess-survivor")"#),
+            "the caller is pointed at the surviving task: {text}"
+        );
+        assert_eq!(
+            state.task_store.read().all_tasks().len(),
+            1,
+            "no second task was created"
+        );
+        assert_eq!(
+            task.inner.lock().status,
+            crate::orchestration::TaskStatus::Running
+        );
+        assert_eq!(fake.authenticated.load(Ordering::SeqCst), 2);
+        assert!(fake.spawns.lock().is_empty(), "nothing was spawned");
+    }
+
+    /// With fleetd still unreachable, liveness is unknown: the resume is
+    /// refused without creating a task instead of spawning blind.
+    #[tokio::test]
+    async fn bro_resume_with_fleetd_unreachable_creates_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_dir = root.join("bro");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
+        let mut config = FleetdConfig::in_state_dir(root.join("fleetd"));
+        config.binary = Some(root.join("definitely-not-a-supervisor"));
+        assert!(crate::orchestration::install_harness_executor_with_config(
+            bbox_config::config::ExecutorKind::Fleetd,
+            config,
+            store_dir,
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            None,
+            None,
+        ));
+
+        let server = crate::server::BlackboxServer::new(state.clone());
+        let resumed = server
+            .bro_resume(rmcp::handler::server::wrapper::Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "prompt": "continue",
+                    "session_id": "sess-unknown",
+                    "provider": "glm",
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let text = resumed
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(resumed.is_error, Some(true), "{text}");
+        assert!(text.contains("no new worker was started"), "{text}");
+        assert!(state.task_store.read().all_tasks().is_empty());
     }
 }
 

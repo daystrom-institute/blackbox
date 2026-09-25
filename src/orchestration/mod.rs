@@ -193,11 +193,11 @@ pub fn start_harness_readoption() {
     harness_executor().clone().start_readoption();
 }
 
-/// Wait out any in-progress re-adoption sweep, so a session-liveness check
-/// against the task store sees tasks the sweep is about to put back to
-/// running.
-pub(crate) async fn harness_readoption_settled() {
-    harness_executor().readoption_settled().await;
+/// Complete re-adoption before a session-liveness check against the task
+/// store, so the check sees tasks the sweep puts back to running. Retries a
+/// sweep that failed at startup; an error means liveness is unknown.
+pub(crate) async fn ensure_harness_readoption() -> anyhow::Result<()> {
+    harness_executor().ensure_readopted().await
 }
 
 fn harness_worker_locality() -> Option<executor::WorkerLocality> {

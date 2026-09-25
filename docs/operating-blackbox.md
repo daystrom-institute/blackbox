@@ -218,7 +218,9 @@ Behaviors worth knowing:
   re-adopted, and that notice is stripped. The child never died; the daemon did.
 - `bro_resume` on a session whose task is running, re-adopted or not, does not
   spawn. It returns the running task id with the `bro_wait` and `bro_cancel`
-  calls to use instead.
+  calls to use instead. It first completes re-adoption, retrying a sweep that
+  failed at startup; if `fleetd` still cannot be reached, it refuses without
+  starting a worker, because the session may still be live.
 - A known task whose live session is **declined** (its workspace binding cannot
   be restored) keeps `Failed`, but the restart notice is replaced by one naming
   the reason and saying the worker is still live under `fleetd`, and the task
