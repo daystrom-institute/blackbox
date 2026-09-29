@@ -343,13 +343,12 @@ the five catalogs:
 
 - **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
   `blackbox://gap/{id}`, `blackbox://note/{id}`, `blackbox://roadmap/{id}`,
-  `blackbox://whiteboard/{id}`, `blackbox://project/{id}`,
-  `blackbox://provider/{name}`.
+  `blackbox://project/{id}`, `blackbox://provider/{name}`.
 - **`blackbox://sm/{id}`** (system memories). Agents fetch `sm-*` runbooks
   constantly via free-text `bbox_knowledge` when they already know the ID;
   direct URI read is cheaper and deterministic. Probably the highest-traffic
   resource we would serve.
-- **Live views with `ttlMs`:** `blackbox://roster`, `blackbox://inbox`,
+- **Live views with `ttlMs`:** `blackbox://roster`,
   `blackbox://dashboard`. `resourceSubscriptions` is a listen opt-in type,
   so subscribing to `blackbox://roster` yields push roster updates
   in-protocol, replacing the bespoke `/control/roster/stream` SSE endpoint

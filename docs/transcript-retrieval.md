@@ -28,13 +28,12 @@ bbox_session(session_id="<session-id>")
 bbox_messages(session_id="<session-id>", from_end=true, limit=40)
 ```
 
-If you need the origin of a standing claim, use cite:
+If you need the origin of a standing claim, search user turns for the quoted
+phrase:
 
 ```text
-bbox_cite(claim="never kill processes by port")
+bbox_search(query="\"never kill processes by port\"", role="user")
 ```
-
-`bbox_cite` returns oldest-first so the origin comes before later repetitions.
 
 ## Search
 
@@ -133,15 +132,6 @@ flow. Tail mode is useful for takeover:
 
 ```text
 bbox_messages(session_id="<session-id>", from_end=true, limit=80)
-```
-
-## Topics
-
-`bbox_topics` is a cheap "what was this session about?" read. It is term
-frequency, not summarization:
-
-```text
-bbox_topics(session_id="<session-id>")
 ```
 
 ## Reindex And Health

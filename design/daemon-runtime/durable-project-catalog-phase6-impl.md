@@ -454,9 +454,8 @@ Each entry names a `historical_path`, `source_store`, `source_row_id`,
 `source_row_id` is the OWNER's own row id, not the inventory's
 `stable_row_id` (amended during the operational-cut repair arc). The
 canonical inventory commits to a one-way hash of the owner id, because an
-owner row id is not a bounded, path-free token by construction (a
-whiteboard board id is chosen by the caller; the task and proposal ids
-come from foreign schemas), so publishing raw ids in canonical bytes could
+owner row id is not a bounded, path-free token by construction (the task
+and proposal ids come from foreign schemas), so publishing raw ids in canonical bytes could
 leak a literal path fragment. The preimage therefore travels host-local in
 the runtime selector binding beside the literal selector, and the ledger
 carries it. The canonical hash is a COMMITMENT to it: a binding whose
@@ -959,8 +958,7 @@ removed. The caller set at this revision, verified by grep at `f22c10b9`:
 3545, 3976, 4141), `tests/project_catalog_migration_facade.rs` (119),
 `tests/phase3_exit_gate.rs` (216, 1266), `tests/history_materializer.rs`
 (139, 323), `tests/path_free_replacement_boundary.rs` (8 sites),
-`src/tools/workspace.rs` (1306),
-`src/system_events_runtime/integration_tests.rs` (28).
+`src/tools/workspace.rs` (1306).
 
 This inventory drifted from 22 sites to 41 between the plan's first
 authoring and this revision, so it WILL drift again: P6-A task 4 begins by

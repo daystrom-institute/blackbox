@@ -85,8 +85,8 @@ Also landed and full-profile verified: init/eject merge-preserve and record
 concrete checkout id and monorepo project directory; publisher refs are pinned;
 and `learn`/`remember`/`decide` register before mutation and recompute an exact
 P/H/B overlay afterward. Session-authoritative `published|own|all` visibility
-now drives list, hybrid search, inspection, render, graph, inbox, discover
-seed, and logical-ref-scoped index replacement.
+now drives list, hybrid search, inspection, render, graph, and
+logical-ref-scoped index replacement.
 
 Mutation coverage and crash consistency are also landed. `forget`, `review`,
 `knowledge_link`, and both sides of a superseding `decide` resolve through the
@@ -110,7 +110,7 @@ The gap-store twin is also landed as a named migration. It shares checkout
 identity, publisher pins, merge-base overlays, content-equality promotion,
 watcher/reconciliation lifecycle, and the crash-consistent transaction claim.
 Checkout gap variants are no longer retained in the host-global store. Gap
-lists and inbox views now read pinned published records plus
+lists now read pinned published records plus
 session-authoritative `published|own|all` overlays.
 
 Response-level `built_from` is also landed for knowledge and gap list, search,
@@ -430,7 +430,7 @@ the resulting `.bbox/` files before that marker can satisfy the cut.
 Knowledge scope keying (§3.1) and the index's doc stamping (already through
 `resolve_base_project_for_scope`) are the first identity consumers. Slice 3.4
 then carries the same resolved view through list, search, inspection, render,
-graph, and inbox surfaces; none may reconstruct scope or visibility
+and graph surfaces; none may reconstruct scope or visibility
 independently.
 
 ## 4. The provisional overlay (slice 3)
@@ -525,7 +525,7 @@ OverlaySnapshot = { stamp, values, status }
 ```
 
 Slice 3.3 computes and inspects this state but does not merge it into list,
-render, graph, inbox, or index consumers. That guarantees the dark slice has
+render, graph, or index consumers. That guarantees the dark slice has
 zero retrieval behavior change and prevents the current global-by-id store
 from collapsing peer variants before slice 3.4 supplies the visibility model.
 
@@ -625,7 +625,7 @@ peer document or drop a shadowing own result below the candidate cutoff.
 Inspection of a compound provisional ref is stable and unambiguous even when
 several checkouts modify the same logical entry.
 
-Static corpus surfaces such as `bbox_search` and `bbox_corpus_search` have no
+Static corpus surfaces such as `bbox_search` have no
 checkout authority and exclude provisional knowledge before TopDocs cutoff.
 Hybrid retrieval removes static indexed knowledge, injects the authorized
 request view as its own candidate lane, and permits a knowledge vector hit only
@@ -804,7 +804,7 @@ from both central and committed records. A restart reconstructs live checkout
 variants from registered checkout bytes. A vanished checkout drops its
 provisional gaps just like provisional knowledge; the daemon does not invent a
 second durability store. Pinned published plus `published|own|all` provisional
-views drive `bbox_gaps` and inbox/closeout checks. Successive mutations seed
+views drive `bbox_gaps` and closeout checks. Successive mutations seed
 from the checkout's own gap file, and multi-file supersession uses the same
 exclusive pending claim, recoverable manifest, and candidate-blob closeout
 proof as knowledge.
@@ -893,7 +893,7 @@ Each slice lands on the monolith and gets the full lane gate.
   recognition set, never the broad read set, or a user worktree's scratch
   leaks in. Two gates stay distinct (`bbox-corpus-core` CLAUDE.md invariant);
   this design consumes them.
-- **Legacy host-local stores.** Notes, pins, roadmaps, and whiteboards continue
+- **Legacy host-local stores.** Notes, pins, and roadmaps continue
   to use their older path resolver, which can normalize a selector to a
   registered monorepo root's canonical path. That behavior is now explicit and
   is not durable published-scope authority. Migrating those stores is a

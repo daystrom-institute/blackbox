@@ -82,7 +82,7 @@ provider-type config pattern, one error taxonomy, one redacted value type, in
 
 | Consumer | Plane | Secrets it needs | Custody |
 |---|---|---|---|
-| Corpus daemon (cage) | corpus | Embedding route API keys, webhook signing secrets, external system-event tokens, producer-grant verification material | Cluster secrets plane, delivered as file-shaped references |
+| Corpus daemon (cage) | corpus | Embedding route API keys, webhook signing secrets, producer-grant verification material | Cluster secrets plane, delivered as file-shaped references |
 | Code collector | producer | Its `ServiceToken` for the corpus transport | Producer host, file-sourced |
 | Connector satellite (proposed) | producer | Its `ServiceToken`, plus per-source OAuth client secrets and rotating refresh tokens | Producer host, file-sourced, with a writable reference for refresh |
 | Harness child | producer-adjacent | Provider transport credentials for its dispatch | Composed centrally today, delivered per child (section 13) |
@@ -194,8 +194,7 @@ over to a central broker, because there is not one. This is what makes the
 connector program deployable on a machine the corpus cannot reach into.
 
 **Corpus plane.** The daemon holds embedding route API keys, webhook signing
-secrets, tokens for external system-event integrations, and producer-grant
-verification material. In the deployed topology these arrive as file-shaped
+secrets, and producer-grant verification material. In the deployed topology these arrive as file-shaped
 references produced by the cluster secrets plane (section 5), so the daemon's
 resolution path is the boring one: read a file, check ownership and mode,
 redact, cache in memory.
@@ -242,11 +241,6 @@ pub trait TokenStore: Send + Sync {
   unsupported, prevented by process ownership rather than locking cleverness.
 - **Rotation is local**: redeem, write back, swap the in-memory value. No
   corpus round trip, no daemon involvement, no manifest entry.
-
-The corpus daemon keeps its own narrow instance of the same contract for
-tokens it generates itself (the existing Forgejo system-events path already
-persists generated API tokens into the managed secrets directory). That is
-corpus-plane custody of a corpus-plane secret and stays where it is.
 
 ## 5. The deployed estate identity and secrets plane
 
@@ -302,7 +296,6 @@ secrets arrive on the platform lane by default:
 |---|---|---|
 | Embedding route API keys | Synced | Long-lived vendor keys; a stale cached value beats an embedding outage. Rotation lands on the config reload that reconstructs embed providers. |
 | Webhook signing secrets | Synced | Verification must keep working during a secrets-plane outage or every inbound event fails closed at once. |
-| External system-event API tokens | Synced | Same reasoning; those integrations already tolerate token replacement at reload. |
 | Producer-grant verification material | Synced | Transport auth must survive an outage; otherwise a sealed vault silently stops all corpus ingestion. |
 | Any future short-TTL dynamic credential | Direct | Dynamic credentials are the whole reason the direct lane exists. |
 

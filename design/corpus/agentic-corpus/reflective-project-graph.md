@@ -481,7 +481,6 @@ The resolved ordering is:
 `bbox_inspect_entity` renders each direction-aware hop with its arrow, label,
 count, and the literal `edge_types` / `direction` arguments to pass back; the
 display cap that bounds the observed tail never truncates an authored hop.
-`bbox_discover_seed_entities` previews a directional hop in that direction only.
 
 Compatibility: `VertexTypeDefinition` is `deny_unknown_fields`, so a daemon
 older than this field REFUSES a schema carrying `hints` at validate and publish

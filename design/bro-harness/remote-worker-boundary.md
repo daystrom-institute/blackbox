@@ -167,9 +167,9 @@ audited at re-entry.**
 | Stays in the daemon | Why it passes |
 |---|---|
 | **The corpus** — tantivy, graph, embeddings, transcripts, blame/provenance | aggregates across projects, sessions, machines; workers query out-box |
-| **Shared stores** — knowledge, decisions, threads, notes, inbox, pins, roadmap, whiteboards | multi-writer state; daemon owns consistency and review lanes |
+| **Shared stores** - knowledge, decisions, threads, notes, pins, roadmap | multi-writer state; daemon owns consistency and review lanes |
 | **The orchestration singleton** — dispatch, teams, workflows, crons, cross-worker promise coordination, the seq-ordered steer/interrupt plane | singleton by definition; a worker cannot own the thing that owns workers |
-| **Ingress** — webhooks, pollers, system events | needs a stable address; ephemeral workers have none |
+| **Ingress** - webhooks, pollers | needs a stable address; ephemeral workers have none |
 | **Credential brokering** | keys are minted/injected per-dispatch, never baked into images (capability = tool + credential + scope) |
 | **The integration boundary** (§4.2) | the re-entry point into every shared store above |
 

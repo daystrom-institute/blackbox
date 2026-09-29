@@ -207,7 +207,7 @@ Steps 1–3 are the minimum that makes Brick 2 measurable; 4–6 deepen it.
 ## Open questions
 
 - **Suite authorship:** hand-author fixtures, or mine real
-  `sm-agentic-opening-sequence` / `bbox_cite` traces for question→answer pairs?
+  `sm-agentic-opening-sequence` / quoted-phrase `bbox_search` traces for question→answer pairs?
 - **Held-out discipline:** who/what guarantees the held-out set stays unconsulted
   during tuning.
 - **Trace generality:** trace a single target per call (simple) vs all expected

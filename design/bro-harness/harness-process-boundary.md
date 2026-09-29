@@ -73,7 +73,7 @@ Two historical direct-capability names remain compatibility aliases:
 
 | Flat harness name | Daemon MCP source |
 |---|---|
-| `corpus_search` | `bbox_corpus_search` |
+| `corpus_search` | `bbox_hybrid_search` |
 | `atom_invoke` | `atom_invoke` |
 
 Aliases share the source tool's backend, schema, and policy. They do not replace

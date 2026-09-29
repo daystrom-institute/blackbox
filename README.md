@@ -7,7 +7,7 @@ shared knowledge, work threads and bro execution across providers.
 Blackbox runs model turns through a standalone harness. Callers compose reviews,
 gates, retries, schedules and integrations in their own code. The daemon keeps
 execution, resume, status, cancellation and waits. Workflow and atom engines,
-Slack/Badgey integration, reactions and whiteboard execution are retired.
+Slack/Badgey integration and reactions are retired.
 Historical records remain readable.
 
 ## Binaries

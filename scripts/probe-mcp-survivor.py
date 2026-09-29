@@ -207,8 +207,6 @@ try:
  call('bbox_artifact_list',{'kind':'agent','body_limit':512,'limit':1},True)
  call('bro_allocator_probe',{'provider':'glm','clear':True,'raw_summary':'contradictory'},True)
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
- measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
- assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
  surface=exact('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024})
  assert {row['name'] for row in surface['visible_tools']}==names
  call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)

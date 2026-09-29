@@ -19,7 +19,7 @@ and edge families.
 
 ```
 1. bbox_describe_schema           # orient — entity types + edge families
-2. bbox_hybrid_search(query, k=5) # seeds — mixed-modal results with notable_edges
+2. bbox_hybrid_search(query, k=5) # seeds - mixed-modal ranked entity refs
 3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call
 4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains
 5. bbox_bundle_evidence(...)      # answer — package refs + path_ids
@@ -29,13 +29,9 @@ and edge families.
 when the question is "who/why does this line exist?" rather than a
 graph walk.
 
-`bbox_discover_seed_entities` is `bbox_hybrid_search` plus emphasis on
-notable_edges for orientation; either tool returns seeds you can hand
-to step 3.
-
 ## Domain orientation (memorize once per session)
 
-**12 entity types** the graph contains:
+**11 entity types** the graph contains:
 
 | Type | Population | Use it for |
 |---|---|---|
@@ -47,7 +43,6 @@ to step 3.
 | `note` | structured side-channel records (dispute/done/etc) | "what's pending review?" |
 | `symbol` | named code symbols (functions, types, modules) | "what calls X?" |
 | `brofile` | persona+model+lens triple | "what brofile dispatched this?" |
-| `whiteboard` | multi-agent deliberation surface | "what did the contradiction-review board decide?" |
 | `commit` | git commits with parent + touched-file edges | "what changed in commit X?" |
 | `task` (virtual) | bro_exec dispatch unit | "what produced this artifact?" |
 | `bash_call` (virtual) | one shell invocation in a transcript | "what did this command emit?" |
@@ -99,9 +94,8 @@ for each family.
 
 6. **Per-file collapse is on by default.** Search and find_paths return
    ONE entity per file by default (the highest-scoring or shortest-
-   path chunk). If you need multiple chunks of the same file, the
-   chunk's notable_edges already point you to siblings via
-   `NEXT_SECTION`.
+   path chunk). If you need multiple chunks of the same file, inspect
+   the chunk: its `NEXT_SECTION` edges point to siblings.
 
 ## Final-answer protocol — verify by question type
 

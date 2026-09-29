@@ -19,7 +19,7 @@ Related:
 - `src/knowledge.rs` — `Knowledge::list`; per-entry excerpt (`KNOWLEDGE_EXCERPT_BYTES`), `limit`.
 - `src/system_memory/catalog.rs` — `format_for_signpost`, `format_for_listing`, in-memory `search`.
 - `src/mcp_tools/hybrid_search.rs` — `HybridSearchResponse.next_steps`, `build_next_steps`; pre-existing Daystrom-derived dedup/diversify passes.
-- `src/mcp_tools/inspect.rs` — `recommended_next_hops`. `src/mcp_tools/discover_seed.rs` — `notable_edges`.
+- `src/mcp_tools/inspect.rs` - `recommended_next_hops`.
 - `src/index/search.rs` — `bbox_search` render + breadcrumb footer.
 - `src/entity_ref.rs` — `EntityType` taxonomy (graph entities); no `SystemMemory` variant today.
 - `src/embed/mod.rs` — `Bucket` enum (embedding routes).
@@ -55,7 +55,7 @@ purpose-built agentic graph-navigation harness with a measured eval loop. It
 isolates three levers plus a measurement discipline.
 
 **1. Tool shape — a typed, linear, self-narrowing funnel.**
-`discover_seed_entities → inspect_entity → find_paths → bundle_evidence`, with
+`hybrid_search → inspect_entity → find_paths → bundle_evidence`, with
 `list_edge_types` as a vocabulary primer. Two shape decisions carry the weight:
 - **Typed refs (`Type:Id`) are the universal currency.** Every tool emits them,
   every tool consumes them, and every description repeats it ("Returns Type:Id
@@ -94,7 +94,7 @@ traversal" as a measured fix — prose treated as a tunable parameter.
 
 | Plane | Members | Reached via | Daystrom levers applied? |
 |---|---|---|---|
-| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search`, `discover_seed_entities`, `bbox_search` | yes — typed refs, breadcrumbs, tiering |
+| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search`, `bbox_search` | yes - typed refs, breadcrumbs, tiering |
 | **In-memory rule stores** | rule-packets, system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no — not indexed, not graph-addressable |
 | **Artifact/agent catalogs** | agents, atoms, workflows, brofiles, artifacts | bespoke `*_list` / `*_search` / `*_describe` | no — each its own shape |
 
@@ -111,8 +111,8 @@ tiering.
 
 The graph plane is itself a faithful Daystrom port: `bbox_inspect_entity`'s
 description mirrors `property_mode summary/smart/full`, and
-`recommended_next_hops` (`inspect.rs`) / `notable_edges` (`discover_seed.rs`)
-are direct analogues of `BuildNotableEdges`. The lessons were already applied to
+`recommended_next_hops` (`inspect.rs`) is a direct analogue of
+`BuildNotableEdges`. The lessons were already applied to
 *one* plane. The coherence path applies them across *all* of them.
 
 ## The coherence path (brick sequence)
@@ -136,7 +136,7 @@ refs:
   seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`; empty
   results yield a broaden-the-query hint.
 - `bbox_search` → footer with the top hit's coordinates for
-  `bbox_context(file, offset)` / `bbox_messages(session)` / `bbox_cite`.
+  `bbox_context(file, offset)` / `bbox_messages(session)`.
 - `bbox_knowledge` → top-level "Next steps" pulling the highest-ranked entry
   into `inspect_entity` + `bundle_evidence`; packets already carried
   `bbox_apply`, memories carry the Brick-0 signpost.

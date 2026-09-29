@@ -185,9 +185,8 @@ and live. The approved expansion, emitted from the same
 `AmbientContext::tool_arg_defaults()` choke point:
 
 - **Retrieval-read project defaults** — `default:mcp.bbox_hybrid_search.project`
-  and `default:mcp.bbox_discover_seed_entities.project` fill the canonicalized
-  dispatch cwd. Safe because `project` on these tools is a pure result
-  *filter*, and worktree/descendant cwds resolve server-side to the registered
+  fills the canonicalized dispatch cwd. Safe because `project` on this tool is a
+  pure result *filter*, and worktree/descendant cwds resolve server-side to the registered
   base project (`resolve_base_project_for_scope`). The model keeps an explicit
   **unscoped escape hatch**: `resolve_project_filter` resolves an
   empty/whitespace `project` (e.g. `project=""`) to None — an agent can still

@@ -105,11 +105,6 @@ The brief asked us to call out ambiguity rather than invent. The following
 items are **observed in real files** and may or may not be official vocabulary;
 treat them as exceptions, not as the rule.
 
-- `kind: correction-plan` is observed **once**, on a single doc in
-  `design/operations/whiteboards/…`, with `corpus: project-refactor` (a
-  different corpus tag than the canonical `blackbox-design`). It is a
-  pathology-tooling artifact, not part of the design leaf vocabulary.
-  *(Observed: 1 file, `lifecycle: proposed`.)*
 - `lifecycle: superseded` is observed on **5 design leaves** (e.g.
   `narf-tool-placement.md`). The corpus map and `list-design-docs.sh` only
   document `proposed` / `partial` / `archived`, and the script refuses
@@ -278,7 +273,7 @@ from sibling roots.
 - `tags`: open-vocabulary list. Observed on **45 design leaves** and **10
   design hubs**. Vocabulary is open (e.g. `refactor-tools`,
   `code-navigation`, `java`, `rust`, `pathology`, `mcp`, `atoms`,
-  `integrations`, `slack`, `obsidian`, `whiteboard`, `lsp`, `jdtls`,
+  `integrations`, `slack`, `obsidian`, `lsp`, `jdtls`,
   `roslyn`, `msbuild`, `beam`, `elixir`, `csharp`, `gap-notes`,
   `implemented-atoms`, …). The contract is *a list of tokens*; the
   vocabulary grows organically. A tag is conventionally a hyphenated

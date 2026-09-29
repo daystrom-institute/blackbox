@@ -1,10 +1,10 @@
 +++
-title = "Transcript retrieval — search, cite, context, session, messages"
-tags = ["transcripts", "search", "cite", "context", "session", "messages", "retrieval", "runbook"]
+title = "Transcript retrieval - search, context, session, messages"
+tags = ["transcripts", "search", "context", "session", "messages", "retrieval", "runbook"]
 order = 19
 template = false
 +++
-# Transcript retrieval — search, cite, context, session, messages
+# Transcript retrieval - search, context, session, messages
 
 The transcript tools are individually simple, but agents often need the same multi-step workflow:
 
@@ -40,15 +40,15 @@ If your question is about stored knowledge rather than transcripts, `bbox_knowle
 
 ### Find provenance for a rule
 
-Use `bbox_cite`.
+Search user turns for the quoted phrase: `bbox_search(query="\"<phrase>\"", role="user")`.
 
-This is better than raw search when the real question is "where did this rule come from?" because it is optimized for origin-finding rather than general recall.
+The quoted phrase keeps the match exact and `role="user"` keeps the hits on the turns where a rule was stated rather than where it was repeated back.
 
 ### Expand around a hit
 
 Use `bbox_context`.
 
-Once search or cite gives you a byte offset, pull the surrounding turns instead of re-querying with looser wording.
+Once search gives you a byte offset, pull the surrounding turns instead of re-querying with looser wording.
 
 ### Read the conversation flow
 
@@ -117,23 +117,21 @@ The search breadcrumb on a slack top hit already fills these in for you:
 
 ### "Who established this rule?"
 
-1. `bbox_cite(claim="...")`
+1. `bbox_search(query="\"...\"", role="user")`
 2. `bbox_context(...)` if you want nearby turns
 3. `bbox_messages(...)` if the origin needs more retained messages
 
 ### "What was this session about?"
 
 1. `bbox_session(...)`
-2. `bbox_topics(...)`
-3. `bbox_messages(...)` only if the summary is still ambiguous
+2. `bbox_messages(...)` for the retained turns
 
 ## Keep hot vs cold
 
 Keep hot in tool docs:
 
-- search vs cite distinction
 - context expands a hit
-- session/messages/topics roles
+- session/messages roles
 
 Keep cold here:
 

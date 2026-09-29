@@ -163,7 +163,7 @@ rust-arch-pathology
                          measurements, posts diagnosis candidates tagged with
                          current authority grade, and requests authority
                          promotion when evidence is weak
-  whiteboard review ... specialists challenge/corroborate candidates, merge
+  panel review ........ specialists challenge/corroborate candidates, merge
                          overlapping claims, reject compiler/lint-shaped
                          findings, and choose remediation slices
                          weak or conflicting evidence loops back to targeted
@@ -719,7 +719,7 @@ they were shipped.
 ## Future work
 
 - Implement a `rust-arch-pathology` workflow artifact with cheap survey,
-  hotspot selection, focused atom runs, whiteboard review, and correction-plan
+  hotspot selection, focused atom runs, panel review, and correction-plan
   emission.
 - Add a Rust pathology brofile/persona that knows the SAST/compiler gate and
   authority-grade vocabulary.

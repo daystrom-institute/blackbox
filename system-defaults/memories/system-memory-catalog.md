@@ -51,7 +51,6 @@ Files in `system-defaults/memories/` use bare slugs such as
   provider-default suppression, and minimal probe/team validation.
 - [sm-workflow-orchestration](workflow-orchestration.md) - caller composition and historical workflow records.
 - [sm-atoms](atoms.md) - retired atom execution and replacements.
-- [sm-whiteboards](whiteboards.md) - historical evidence and preserved visibility.
 
 ## Refactor Mechanization
 

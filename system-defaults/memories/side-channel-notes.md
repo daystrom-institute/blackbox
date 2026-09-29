@@ -51,7 +51,7 @@ workflow actors, atom invocations, and team broadcasts. The done note is the
 orchestrator's fastest acceptance signal for delegated work.
 
 Do not emit `done` merely because you performed a direct operator-side MCP
-lookup, inbox/status probe, cancellation, note resolution, or timing report.
+lookup, status probe, cancellation, note resolution, or timing report.
 Those are controller actions unless they are themselves running inside a
 dispatched executor context.
 

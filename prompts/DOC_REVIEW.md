@@ -24,9 +24,9 @@ workflow, poll for completion, and present the review.
 
 ## What Happens
 
-The `blackbox-review` workflow opens a whiteboard, broadcasts the design
-document to a 5-member review panel plus an independent validator, runs a
-bridgecrew-aligned deliberation (blind → validate → debate → resolve), and
+The `blackbox-review` workflow broadcasts the design document to a 5-member
+review panel plus an independent validator, runs a bridgecrew-aligned
+deliberation (blind → validate → debate → resolve), and
 writes a review document to `design/review/<slug>-review.md`.
 
 The five review lenses:
@@ -60,9 +60,6 @@ bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-res
 bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-cor.json")
 bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-validator.json")
 bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-facilitator.json")
-
-# Gate packet
-bbox_artifact_install(kind="packet", source=".bbox/packets/whiteboard-participation.json")
 
 # Panel teamplate + save
 bbox_artifact_install(kind="team", source=".bbox/teams/blackbox-review-panel.json")
@@ -183,7 +180,6 @@ needed, then act on the verdict.
 ## Reference
 
 - **Workflow orchestration**: `bbox_knowledge(query="sm-workflow-orchestration")`
-- **Whiteboard API**: `bbox_knowledge(query="sm-whiteboards")`
 - **Ensemble generator** (tailoring for other repos):
   `system-defaults/ENSEMBLE_GENERATOR.md`
 - **Generic design-doc exemplar**: `system-defaults/workflows/review/design-doc-review.json`

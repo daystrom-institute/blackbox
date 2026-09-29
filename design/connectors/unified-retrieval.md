@@ -430,7 +430,7 @@ different trust:
   default for labels and annotated properties, but a connector graph is a
   projection of a third-party system and its policy should be reviewed at
   enablement rather than assumed. The operator-facing status surface reports
-  retrieval participation per graph (section 6.5) so this is visible without
+  retrieval participation per graph (section 6.4) so this is visible without
   reading the schema artifact.
 
 Local scratch graphs (`GraphSource::LocalScratch`,
@@ -867,17 +867,7 @@ provisional hit pasteable: the compound ref is a correct identity and a
 poor handle, and `resolve_published_form_vertex` already accepts the logical
 form.
 
-### 6.2 `bbox_discover_seed_entities`
-
-Inherits everything. It reuses `hybrid_search_typed` verbatim and differs
-only in post-processing, and the crate note is explicit that ranking changes
-land in one place. `notable_edges` derives its priority order from the
-provider's `recommended_next_hops`, so making evidence edges and
-schema-declared graph edges outrank structural ones for a graph seed is a
-change to `ProjectGraphVertexProvider::recommended_next_hops` (currently a
-bare edge-kind count) and not a ranking fork.
-
-### 6.3 `bbox_inspect_entity`
+### 6.2 `bbox_inspect_entity`
 
 No argument change. Graph vertices are already inspectable by exact ref,
 which is the v1 capability. Two additions:
@@ -889,7 +879,7 @@ which is the v1 capability. Two additions:
   schema edges ahead of structural ones, matching the semantic-first
   ordering that `project_file.rs` already documents as load-bearing.
 
-### 6.4 `bbox_find_paths` and `bbox_bundle_evidence`
+### 6.3 `bbox_find_paths` and `bbox_bundle_evidence`
 
 `find_paths` gains the graph-selection gate and the per-hop fan-out cap
 (section 5.2), plus per-hop source labeling. `bundle_evidence` already
@@ -897,7 +887,7 @@ accepts graph vertex refs from M3; M9's change is that bundled graph
 vertices render through the annotation lens and carry plane identity, so a
 bundle a caller re-reads later still says which authority asserted what.
 
-### 6.5 Operator surfaces
+### 6.4 Operator surfaces
 
 `bbox_project_graph_describe` reports retrieval participation per graph:
 policy flags, excluded types, indexed vertex count, embedded vertex count,
@@ -1191,7 +1181,7 @@ diagnostic.
 
 **Q10. Does the `visibility` / `provisional` parameter split get fixed
 here?**
-Section 6.5. *Recommendation: align on `provisional` and accept `visibility`
+Section 6.4. *Recommendation: align on `provisional` and accept `visibility`
 as a deprecated alias on the `bbox_project_graph_*` family.* It is a small
 correction, it is cheapest while that family is being touched for
 participation reporting, and a third spelling arriving with M9 would make it
