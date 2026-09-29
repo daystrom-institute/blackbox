@@ -1,4 +1,4 @@
-# src/server — daemon bootstrap, wire MCP head, surfaces
+# src/server: daemon bootstrap, wire MCP head, surfaces
 
 - The wire head extracts `?surface=` AND `?project=` once at `initialize`.
   The surface resolves against the configured surface table

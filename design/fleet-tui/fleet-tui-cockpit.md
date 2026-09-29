@@ -447,7 +447,7 @@ Substrate:
    (Claude/GLM/DeepSeek/Brodex); `build_exec_args` deliberately omits the flag
    (guarded by a unit test) so it isn't doubled.
 3. **Builtin `report` tool, fleet-pinned** (§2.2) — Waiting/summary signal on the
-   stream; `registry.rs` builtin. ✅ **Implemented** —
+   stream; `registry.rs` builtin. ✅ **Implemented**:
    `report.rs` (`ReportTool` holds its own `Emitter`, emits a `report` line);
    registered always, pinned in fleet mode via `PinPolicy::also_pin`.
 4. **Compaction machinery in bro-harness** (§2.4) — summarize older turns →

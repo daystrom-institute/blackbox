@@ -614,7 +614,7 @@ pub(super) fn open_shared_state(
 
     // Gap store mirrors the kb repo-owned model. Load every registered repo's
     // committed `.bbox/gaps/` into the query surface BEFORE any producer
-    // (gap-spool import) can save — a save with the repo's
+    // (gap-spool import) can save; a save with the repo's
     // gaps not yet loaded would treat the in-memory set as authoritative and
     // purge committed `.bbox/gaps/` files for a repo-owned project.
     let gaps_path = cfg.paths.gaps_path.clone();
