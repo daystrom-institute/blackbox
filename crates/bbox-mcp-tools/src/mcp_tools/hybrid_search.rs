@@ -36,7 +36,7 @@ pub struct HybridSearchParams {
     pub include_vectors: Option<bool>,
     /// Include ranking scores, fusion contributions, and vector execution
     /// diagnostics. Default false; evidence identity and degradation are
-    /// always returned. Use bbox_embed_status for fleet-wide indexing health.
+    /// always returned.
     #[serde(default)]
     pub debug: bool,
     /// Weight assigned to vector rank lists during RRF fusion.

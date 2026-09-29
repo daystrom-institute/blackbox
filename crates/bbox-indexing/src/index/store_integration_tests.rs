@@ -91,7 +91,8 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
         })
         .unwrap();
     assert!(
-        hits == "No results found." || hits == "Index is empty. Run blackbox_reindex first.",
+        hits == "No results found."
+            || hits == bbox_corpus_index::index::search::EMPTY_INDEX_MESSAGE,
         "{hits}"
     );
 }

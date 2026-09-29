@@ -125,7 +125,7 @@ pub fn compute_inbox(
                     zero_in_degree_nodes,
                     risk_ratio,
                 } => out.push_str(&format!(
-                    "  {route} — {:.2}% of {active_nodes} active vectors unreachable ({zero_in_degree_nodes} zero-in-degree); daily connectivity maintenance will attempt repair; use bbox_embed_status for current diagnostics\n",
+                    "  {route}: {:.2}% of {active_nodes} active vectors unreachable ({zero_in_degree_nodes} zero-in-degree); daily connectivity maintenance will attempt repair; operators read current diagnostics with `bro mcp call bbox_embed_status '{{}}' --surface ops`\n",
                     risk_ratio * 100.0,
                 )),
                 VectorConnectivityAlert::DiagnosticsUnavailable { route, reason } => {
@@ -317,7 +317,7 @@ pub fn compute_inbox(
     }
 
     if out.trim_end() != "# Inbox" {
-        out.push_str(&format!("Preview: up to {limit} rows per section. Expand with bbox_notes, bbox_gaps, bbox_thread_list, bbox_knowledge, bro_dashboard, or bbox_embed_status.\n"));
+        out.push_str(&format!("Preview: up to {limit} rows per section. Expand with bbox_notes, bbox_gaps, bbox_thread_list, bbox_knowledge, or bro_dashboard.\n"));
     }
     if out.trim_end() == "# Inbox" {
         out.push_str("_nothing needs attention — clean plate._\n");

@@ -17,6 +17,11 @@ use super::{FieldHandles, FileMeta, TranscriptIndex, first_u64};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::query::smart_query_to_tantivy;
 
+/// Reply to a transcript read against an empty index. Reindexing is an
+/// operator tool, so the reply names the operator CLI form.
+pub const EMPTY_INDEX_MESSAGE: &str =
+    "Index is empty. Ask the operator to run `bro mcp call bbox_reindex '{}' --surface ops`.";
+
 #[derive(Debug)]
 struct IndexedTranscriptMessage {
     locator: String,
@@ -997,7 +1002,7 @@ impl TranscriptIndex {
         let include_subagents = p.include_subagents.unwrap_or(true);
 
         if searcher.num_docs() == 0 {
-            return Ok("Index is empty. Run blackbox_reindex first.".to_string());
+            return Ok(EMPTY_INDEX_MESSAGE.to_string());
         }
 
         // Parse the user's text query against content + project fields. The
@@ -1820,7 +1825,7 @@ impl TranscriptIndex {
         let role = p.role.as_deref().unwrap_or("user");
 
         if self.is_empty() {
-            return Ok("Index is empty. Run bbox_reindex first.".to_string());
+            return Ok(EMPTY_INDEX_MESSAGE.to_string());
         }
 
         let claim = p.claim.trim();

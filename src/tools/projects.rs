@@ -1421,7 +1421,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_list",
-        description = "Compatibility attached-root discovery for bridge callers; catalog-mode logical discovery uses bbox_project_catalog_list, including remote-only projects. List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
+        description = "Compatibility attached-root discovery for bridge callers; remote-only catalog projects are not listed. List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this to check whether a path is already registered before asking the operator to register it."
     )]
     pub(crate) fn bbox_project_list(&self) -> CallToolResult {
         Self::ok_json(

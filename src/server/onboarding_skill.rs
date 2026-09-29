@@ -23,9 +23,10 @@ pub(crate) fn render(state: &SharedState) -> String {
     let mut body = format!(
         "---\nname: {ONBOARDING_SKILL_NAME}\ndescription: {ONBOARDING_SKILL_DESCRIPTION}\n---\n\n\
          # Onboard a project\n\n\
-         1. Call `bbox_project_register(path=<absolute path on the checkout host>)`. Pass `producer` only when the call returns `error.project_onboarding_ambiguous`.\n\
+         Registration is an operator operation served on the `ops` MCP surface. Run these commands from a shell with `bro`, or ask the operator to run them.\n\n\
+         1. `bro mcp call bbox_project_register '{{\"path\":\"<absolute path on the checkout host>\"}}' --surface ops`. Add `\"producer\":\"<producer id>\"` only when the call returns `error.project_onboarding_ambiguous`.\n\
          2. If the receipt has `identity_committed: false`, commit exactly the returned `commit_paths` on `published_ref` in that checkout. Do not push unless the user asks. The collector reads the local ref.\n\
-         3. Verify the project with `bbox_project_catalog_list` and `bbox_project_publisher_status`. Publication starts on the collector's next pass after the identity commit.\n\n\
+         3. Verify the project with `bro mcp call bbox_project_catalog_list '{{\"query\":\"<project name>\"}}' --surface ops` and `bro mcp call bbox_project_publisher_status '{{\"project_id\":\"<project_id>\"}}' --surface ops`. Publication starts on the collector's next pass after the identity commit.\n\n\
          ## Checkout hosts\n\n"
     );
 
