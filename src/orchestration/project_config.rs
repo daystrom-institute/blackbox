@@ -52,6 +52,9 @@ pub enum ProjectConfigError {
         resolver_code: String,
         detail: String,
     },
+    /// An exact project-scope action named a selector the catalog confirms
+    /// is no project, so there is no project configuration to read or write.
+    ProjectUnknown { selector: String },
 }
 
 impl ProjectConfigError {
@@ -61,6 +64,7 @@ impl ProjectConfigError {
             Self::LaneUnsupported { .. } => "error.project_config_lane_unsupported",
             Self::Invalid { .. } => "error.project_config_invalid",
             Self::SelectionFailed { .. } => "error.project_config_selection_failed",
+            Self::ProjectUnknown { .. } => "error.project_config_project_unknown",
         }
     }
 }
@@ -96,6 +100,15 @@ impl fmt::Display for ProjectConfigError {
                 "{}: project selector {} could not be resolved ({resolver_code}: {detail}). \
                  Pass an unambiguous project id or alias, or repair the project catalog. No \
                  global fallback was applied",
+                self.code(),
+                bounded_path(selector)
+            ),
+            Self::ProjectUnknown { selector } => write!(
+                formatter,
+                "{}: project selector {} names no catalog project, so it has no project \
+                 configuration scope. Pass the project id, alias or an attached checkout path of \
+                 a registered project (bbox_project_list), or use scope=global. Nothing was read \
+                 or changed",
                 self.code(),
                 bounded_path(selector)
             ),
