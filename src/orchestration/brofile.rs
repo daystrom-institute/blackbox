@@ -36,11 +36,11 @@ pub struct Brofile {
     /// inherits without touching global/project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<McpFilters>,
-    /// Optional tool-surface selector. When set, the daemon evaluates the
-    /// installed surface packet for this surface (the same `evaluate_tool_surface`
-    /// authority the rmcp wire head uses for `?surface=<id>` callers) and folds
-    /// the verdict into the dispatch filter plane, so a child session is
-    /// surface-governed exactly like a wire caller. Unset → no surface fold
+    /// Optional tool-surface selector. When set, the daemon folds this
+    /// surface from the configured surface table (the same table the wire
+    /// head uses for `?surface=<id>` callers) into the dispatch filter plane,
+    /// so a child session is surface-governed exactly like a wire caller. An
+    /// unknown surface denies every tool. Unset → no surface fold
     /// (recursion-guard + `filters` still apply). See
     /// design/bro-harness/harness-process-boundary.md §3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1366,7 +1366,6 @@ mod tests {
             "mcp__blackbox__bbox_thread",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
-            "mcp__blackbox__bbox_blame",
             "Read",
             "Grep",
             "Glob",
@@ -1507,9 +1506,8 @@ mod tests {
     /// Rust + Java refactor personas share a core allow/disallow surface:
     /// exec/wait, code.* facts, analysis.* reductions, lsp.* authority,
     /// edits.* algebra, and the grounding MCP tools. Their extensions mirror
-    /// the live language surfaces. Java adds java.*. Rust adds rust.*,
-    /// build.gate for the compiler repair loop, and bbox_blame for the
-    /// transcript-anchored architecture atom.
+    /// the live language surfaces. Java adds java.*. Rust adds rust.* and
+    /// build.gate for the compiler repair loop.
     #[test]
     fn rust_and_java_refactor_personas_share_tool_surface() {
         let rust_src =
@@ -1530,7 +1528,7 @@ mod tests {
         let j_disallow: std::collections::BTreeSet<&str> =
             j.disallow.iter().map(String::as_str).collect();
         const JAVA_ONLY: &[&str] = &["java.*"];
-        const RUST_ONLY: &[&str] = &["rust.*", "build.gate", "mcp__blackbox__bbox_blame"];
+        const RUST_ONLY: &[&str] = &["rust.*", "build.gate"];
         let r_core: std::collections::BTreeSet<&str> = r_allow
             .iter()
             .copied()

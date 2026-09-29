@@ -82,8 +82,8 @@ bbox_knowledge(query="retry policy", project="/repo/x")
 bbox_knowledge(query="sm-persistence-taxonomy")
 ```
 
-It also surfaces system memories (`sm-*`) and matching packets. For notes, use
-`bbox_notes`; for active threads, use `bbox_thread_list`.
+It also surfaces system memories (`sm-*`). For notes, use `bbox_notes`; for
+active threads, use `bbox_thread_list`.
 
 ## Render
 
@@ -133,7 +133,7 @@ bbox_lint()
 `bbox_absorb` is a compatibility no-op for the old rendered-file import path.
 Rendered files are one-way projections.
 
-## Notes And Inbox
+## Notes
 
 Executor observations belong in notes:
 
@@ -146,11 +146,11 @@ Read them through:
 
 ```text
 bbox_notes(thread_id="thread-abc", full=true)
-bbox_inbox(project="/repo/x")
+bbox_notes(project="/repo/x")
 ```
 
-The inbox aggregates unresolved notes, stale threads, unverified knowledge,
-deferred followups, and failed bro tasks. It is the round-boundary sweep.
+At a round boundary, sweep project notes, `bbox_gaps` and `bro_dashboard` for
+unresolved notes, open gaps, and failed bro tasks.
 
 ## Common Mistakes
 

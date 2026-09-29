@@ -561,10 +561,6 @@ the transaction root as a whole.
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` on the daemon host; `bro render global` on any other operator host (pulls the plan from a remote daemon) |
 
-The observation journal has independent retention. Legacy reaction and delivery
-stores remain inert; their former MCP tools are retired. See the
-[observation journal contract](system-events.md).
-
 ## Key paths
 
 These paths belong to the host running the named component. A remote daemon's
@@ -591,5 +587,4 @@ host with `bro render global`.
 | `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
 | `~/.bro/mcp.json` | Global MCP server config |
 | `<project>/.bro/mcp.json` | Project MCP overlay |
-| `~/.bro/events/journal/current.jsonl` | System-event journal (compacts at 10k events / 7 days) |
 | `~/.bro/events/outbox/current.jsonl` | Reaction outbox (succeeded rows compact at 7 days; all other statuses retained) |

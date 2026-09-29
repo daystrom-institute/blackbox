@@ -21,7 +21,7 @@ human reader. Two species live here:
   brofile that references it.
 
 This is **not** [`system-defaults/`](../system-defaults/system-defaults.md)
-(installable JSON artifacts: brofiles, packets, teams) and it is
+(installable JSON artifacts: brofiles, teams) and it is
 **not** a `.claude` skill (harness-native slash commands). It is plain Markdown
 an agent is told to read.
 

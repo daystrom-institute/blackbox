@@ -42,8 +42,6 @@ pub struct EdgeIndex {
     edges: Vec<Edge>,
     forward: HashMap<EntityRef, Vec<usize>>,
     reverse: HashMap<EntityRef, Vec<usize>>,
-    commit_anchor_index: HashMap<String, Vec<usize>>,
-    session_tool_calls: HashMap<(String, String), Vec<usize>>,
 }
 
 pub struct EdgeStoreRefs<'a> {
@@ -58,9 +56,8 @@ pub struct EdgeStoreRefs<'a> {
     pub edges_dir: PathBuf,
     pub registered_project_ids: Option<HashSet<String>>,
     pub include_tantivy_projection: bool,
-    /// When false, observed lane edges (EDITED_FILE/READ_FILE/RAN_BASH) are
-    /// excluded from the rebuilt index. Default graph queries (describe_schema,
-    /// hybrid search) use Active mode; provenance/blame callers use Historical.
+    /// When false, observed lane edges (RAN_BASH) are excluded from the
+    /// rebuilt index.
     pub include_observed: bool,
 }
 
@@ -391,60 +388,13 @@ impl EdgeIndex {
         self.edges.iter()
     }
 
-    pub fn edges_with_anchor_commit(&self, commit_sha: &str) -> Vec<&Edge> {
-        self.commit_anchor_index
-            .get(commit_sha)
-            .map(|indices| {
-                let mut edges = Vec::with_capacity(indices.len());
-                for edge_id in indices {
-                    edges.push(&self.edges[*edge_id]);
-                }
-                edges
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn session_tool_call_edges(&self, provider: &str, session_id: &str) -> Vec<&Edge> {
-        self.session_tool_calls
-            .get(&(provider.to_string(), session_id.to_string()))
-            .map(|indices| {
-                let mut edges = Vec::with_capacity(indices.len());
-                for edge_id in indices {
-                    edges.push(&self.edges[*edge_id]);
-                }
-                edges
-            })
-            .unwrap_or_default()
-    }
-
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<EdgeKey>) {
-        if edge.kind.starts_with("ROADMAP_") || !seen.insert(edge.dedup_key()) {
+        if edge_kind_is_retired(&edge.kind) || !seen.insert(edge.dedup_key()) {
             return;
         }
         let edge_id = self.edges.len();
         self.edges.push(edge);
         let edge = &self.edges[edge_id];
-        if edge.kind == "EDITED_FILE" {
-            if let Some(commit_sha) = edge.metadata.get("anchor.commit_sha_at_edit") {
-                self.commit_anchor_index
-                    .entry(commit_sha.clone())
-                    .or_default()
-                    .push(edge_id);
-            }
-        }
-        if matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH") {
-            if let EntityRef::Transcript {
-                provider,
-                session_id,
-                ..
-            } = &edge.source
-            {
-                self.session_tool_calls
-                    .entry((provider.clone(), session_id.clone()))
-                    .or_default()
-                    .push(edge_id);
-            }
-        }
         self.reverse
             .entry(edge.target.clone())
             .or_default()
@@ -848,11 +798,7 @@ impl EdgeIndex {
     }
 
     fn insert_sidecar_edge(&mut self, edge: Edge, seen: &mut HashSet<EdgeKey>) {
-        let derived = derived_tool_projection(&edge);
         self.insert(edge, seen);
-        if let Some(edge) = derived {
-            self.insert(edge, seen);
-        }
     }
 
     fn load_manifest_active_paths(
@@ -1196,7 +1142,7 @@ mod tests {
         index.insert(
             exact_edge(
                 transcript.clone(),
-                "EDITED_FILE",
+                "RAN_BASH",
                 file.clone(),
                 EdgeProvenance::Derived,
             ),
@@ -1212,7 +1158,7 @@ mod tests {
         assert!(
             edges
                 .iter()
-                .any(|edge| edge.kind == "EDITED_FILE" && edge.target == file)
+                .any(|edge| edge.kind == "RAN_BASH" && edge.target == file)
         );
         assert!(edges.iter().any(|edge| edge.kind == "IN_SESSION"));
     }
@@ -2101,7 +2047,7 @@ mod tests {
                 line_offset: 42,
                 event_idx: 0,
             },
-            kind: "READ_FILE".into(),
+            kind: "RAN_BASH".into(),
             target: source.clone(),
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
@@ -2122,12 +2068,15 @@ mod tests {
 
         let compacted = fs::read_to_string(dir.path().join("proj1234.jsonl")).unwrap();
         assert_eq!(compacted.lines().count(), 1);
-        assert!(compacted.contains("READ_FILE"));
+        assert!(compacted.contains("RAN_BASH"));
         assert!(!compacted.contains("NEXT_SECTION"));
     }
 
+    /// File-touch rows are retired: a lane that still carries them loads
+    /// every other row and admits none of the retired ones, and no derived
+    /// session projection appears for them.
     #[test]
-    fn edited_file_sidecar_projects_session_edge() {
+    fn retired_file_touch_rows_are_not_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = EntityRef::Transcript {
             provider: "claude".into(),
@@ -2141,36 +2090,43 @@ mod tests {
             chunk_hash: "a".repeat(64),
             occurrence_idx: 0,
         };
-        let edge = Edge {
-            source: transcript,
-            kind: "EDITED_FILE".into(),
+        let row = |kind: &str| Edge {
+            source: transcript.clone(),
+            kind: kind.into(),
             target: file.clone(),
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
             project_id: None,
         };
-        append_edges(dir.path(), "proj1234", &[edge]).unwrap();
+        append_edges(
+            dir.path(),
+            "proj1234",
+            &[row("EDITED_FILE"), row("READ_FILE"), row("RAN_BASH")],
+        )
+        .unwrap();
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
+        let kinds = index
+            .forward_edges(&transcript)
+            .iter()
+            .map(|edge| edge.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["RAN_BASH".to_string()]);
+        assert!(index.forward_edges(&file).is_empty());
         assert!(
             index
-                .forward_edges(&file)
+                .reverse_edges(&file)
                 .iter()
-                .any(|edge| edge.kind == "EDITED_BY_SESSION"
-                    && edge.target
-                        == (EntityRef::Session {
-                            provider: "claude".into(),
-                            session_id: "sess-1".into(),
-                        }))
+                .all(|edge| edge.kind == "RAN_BASH")
         );
     }
 
     #[test]
-    fn append_edges_dedup_skips_reimported_provenance_edges() {
+    fn append_edges_dedup_skips_reimported_edges() {
         let dir = tempfile::tempdir().unwrap();
         let edge = Edge {
             source: EntityRef::Transcript {
@@ -2179,7 +2135,7 @@ mod tests {
                 line_offset: 42,
                 event_idx: 0,
             },
-            kind: "EDITED_FILE".into(),
+            kind: "RAN_BASH".into(),
             target: EntityRef::ProjectFile {
                 project_id: "proj1234".into(),
                 rel_path_hash: "pathhash".into(),
@@ -2188,7 +2144,7 @@ mod tests {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
-            metadata: BTreeMap::from([("anchor.commit_sha_at_edit".into(), "abc123".into())]),
+            metadata: BTreeMap::from([("tool.id".into(), "tool-1".into())]),
             project_id: None,
         };
 
@@ -2313,7 +2269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = Edge {
             source: EntityRef::Knowledge { id: "k1".into() },
-            kind: "READ_FILE".into(),
+            kind: "RAN_BASH".into(),
             target: EntityRef::Knowledge { id: "k2".into() },
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
@@ -2341,7 +2297,7 @@ mod tests {
     #[test]
     fn append_observed_writes_tool_edges() {
         let dir = tempfile::tempdir().unwrap();
-        let e = observed_tool_edge("READ_FILE");
+        let e = observed_tool_edge("RAN_BASH");
         append_observed_edges(dir.path(), "p1", &[e]).unwrap();
         let sidecar = fs::read_to_string(dir.path().join("observed/p1.jsonl")).unwrap();
         assert_eq!(sidecar.lines().count(), 1);
@@ -2356,7 +2312,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let derived = derived_chunker_edge("NEXT_SECTION");
-        let tool = observed_tool_edge("READ_FILE");
+        let tool = observed_tool_edge("RAN_BASH");
         let explicit = explicit_edge("SUPERSEDES");
 
         append_project_edges(dir.path(), "p1", &[derived]).unwrap();
@@ -2401,7 +2357,7 @@ mod tests {
     #[test]
     fn plan_tool_only_legacy_lane_is_extractable_with_managed_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        append_edges(dir.path(), "p1", &[observed_tool_edge("READ_FILE")]).unwrap();
+        append_edges(dir.path(), "p1", &[observed_tool_edge("RAN_BASH")]).unwrap();
         replace_materialized_edges(
             dir.path(),
             "project",
@@ -3597,7 +3553,7 @@ mod tests {
                 line_offset: 0,
                 event_idx: 0,
             },
-            kind: "EDITED_FILE".into(),
+            kind: "RAN_BASH".into(),
             target: EntityRef::ProjectFile {
                 project_id: project_id.into(),
                 rel_path_hash: rel_path_hash.into(),
@@ -3616,7 +3572,7 @@ mod tests {
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
 
-        // Insert a transcript->project_file EDITED_FILE edge
+        // Insert a transcript->project_file RAN_BASH edge
         index.insert(observed_edge("sess-1", "hash1", "proj1"), &mut seen);
         // Insert a bash_call edge
         index.insert(

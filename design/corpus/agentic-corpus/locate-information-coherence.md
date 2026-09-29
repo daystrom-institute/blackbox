@@ -15,12 +15,12 @@ Date: 2026-06-02
 Status: partial — Bricks 0–1 landed on `feat/knowledge-locate-coherence`; Bricks 2–3 proposed.
 
 Related:
-- `src/tools/knowledge.rs` — `bbox_knowledge` adapter; fuses three stores (entries + packets + memories).
+- `src/tools/knowledge.rs`: `bbox_knowledge` adapter; fuses two stores (entries + memories).
 - `src/knowledge.rs` — `Knowledge::list`; per-entry excerpt (`KNOWLEDGE_EXCERPT_BYTES`), `limit`.
 - `src/system_memory/catalog.rs` — `format_for_signpost`, `format_for_listing`, in-memory `search`.
 - `src/mcp_tools/hybrid_search.rs` — `HybridSearchResponse.next_steps`, `build_next_steps`; pre-existing Daystrom-derived dedup/diversify passes.
-- `src/mcp_tools/inspect.rs` — `recommended_next_hops`. `src/mcp_tools/discover_seed.rs` — `notable_edges`.
-- `src/index/search.rs` — `bbox_search` render + breadcrumb footer.
+- `src/mcp_tools/inspect.rs` - `recommended_next_hops`.
+- `src/index/search.rs` - lexical transcript search and conversation hit coordinates for `bbox_hybrid_search`.
 - `src/entity_ref.rs` — `EntityType` taxonomy (graph entities); no `SystemMemory` variant today.
 - `src/embed/mod.rs` — `Bucket` enum (embedding routes).
 - Gap: `af74086b` (mcp_surface / knowledge / broad-query-output-bounding).
@@ -32,8 +32,8 @@ The proximate trigger was gap `af74086b`: a broad smart-mode `bbox_knowledge`
 query returned ~81k chars (twice in one session), overflowing the token budget
 and forcing a harness spill-to-file. The root cause was narrow — system
 memories were the lone unbounded surface (full ~40KB runbook bodies dumped for
-every fuzzy match) while knowledge entries (120-byte excerpts) and rule-packets
-(one-line rows) were already bounded.
+every fuzzy match) while knowledge entries (120-byte excerpts) were already
+bounded.
 
 But the gap exposed a deeper structural issue. Blackbox has **three
 disconnected retrieval planes**, and an agent's mental model of "how do I locate
@@ -44,7 +44,7 @@ exists, so I query for it and follow its signposts" — that is retrieval by
 known id, not discovery by question.
 
 The opposite is the goal: **a question-shaped query should surface the runbook,
-knowledge entry, or packet that answers it**, without the agent knowing the
+or knowledge entry that answers it**, without the agent knowing the
 artifact exists. That is precisely what proper indexing + evidence bundling
 buys, and it is the through-line of this design.
 
@@ -55,7 +55,7 @@ purpose-built agentic graph-navigation harness with a measured eval loop. It
 isolates three levers plus a measurement discipline.
 
 **1. Tool shape — a typed, linear, self-narrowing funnel.**
-`discover_seed_entities → inspect_entity → find_paths → bundle_evidence`, with
+`hybrid_search → inspect_entity → find_paths → bundle_evidence`, with
 `list_edge_types` as a vocabulary primer. Two shape decisions carry the weight:
 - **Typed refs (`Type:Id`) are the universal currency.** Every tool emits them,
   every tool consumes them, and every description repeats it ("Returns Type:Id
@@ -94,25 +94,24 @@ traversal" as a measured fix — prose treated as a tunable parameter.
 
 | Plane | Members | Reached via | Daystrom levers applied? |
 |---|---|---|---|
-| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search`, `discover_seed_entities`, `bbox_search` | yes — typed refs, breadcrumbs, tiering |
-| **In-memory rule stores** | rule-packets, system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no — not indexed, not graph-addressable |
+| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search` | yes - typed refs, breadcrumbs, tiering |
+| **In-memory memory store** | system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no: not indexed, not graph-addressable |
 | **Artifact/agent catalogs** | agents, atoms, workflows, brofiles, artifacts | bespoke `*_list` / `*_search` / `*_describe` | no — each its own shape |
 
-The decisive evidence: `EntityType` (`src/entity_ref.rs`) *includes* `Packet`
-and `Agent` as graph entities, but the search index (`add_text(f.doc_type, …)`
-across `src/index/`) only covers `project_file, thread, commit, knowledge,
-roadmap` (+`transcript`/`note`). So packets/agents are graph nodes you can
-*traverse to* but cannot *retrieve by content* in `hybrid_search`. System
-memories are not even graph entities — they are a parallel file catalog reached
-only through `bbox_knowledge`'s string matcher. That is why rule-packets "feel
-out of place" surfacing under `bbox_knowledge`: it is the only tool that bolts
-the in-memory stores onto a query, and it did so without index, graph, or
+The decisive evidence: `EntityType` (`src/entity_ref.rs`) *includes* `Agent`
+as a graph entity, but the search index (`add_text(f.doc_type, …)` across
+`src/index/`) only covers `project_file, thread, commit, knowledge, roadmap`
+(+`transcript`/`note`). So agents are graph nodes you can *traverse to* but
+cannot *retrieve by content* in `hybrid_search`. System memories are not even
+graph entities: they are a parallel file catalog reached only through
+`bbox_knowledge`'s string matcher. `bbox_knowledge` is the only tool that bolts
+the in-memory store onto a query, and it did so without index, graph, or
 tiering.
 
 The graph plane is itself a faithful Daystrom port: `bbox_inspect_entity`'s
 description mirrors `property_mode summary/smart/full`, and
-`recommended_next_hops` (`inspect.rs`) / `notable_edges` (`discover_seed.rs`)
-are direct analogues of `BuildNotableEdges`. The lessons were already applied to
+`recommended_next_hops` (`inspect.rs`) is a direct analogue of
+`BuildNotableEdges`. The lessons were already applied to
 *one* plane. The coherence path applies them across *all* of them.
 
 ## The coherence path (brick sequence)
@@ -133,13 +132,13 @@ overflow.
 Every locate-information surface now ends by naming the next tool with concrete
 refs:
 - `bbox_hybrid_search` → structured `next_steps` + text footer carrying the top
-  seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`; empty
-  results yield a broaden-the-query hint.
-- `bbox_search` → footer with the top hit's coordinates for
-  `bbox_context(file, offset)` / `bbox_messages(session)` / `bbox_cite`.
+  seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`;
+  conversation hits carry `conversation` coordinates and an `exact_read` for
+  `bbox_context(file, offset)` / `bbox_messages(session)`; empty results yield
+  a broaden-the-query hint.
 - `bbox_knowledge` → top-level "Next steps" pulling the highest-ranked entry
-  into `inspect_entity` + `bundle_evidence`; packets already carried
-  `bbox_apply`, memories carry the Brick-0 signpost.
+  into `inspect_entity` + `bundle_evidence`; memories carry the Brick-0
+  signpost.
 
 The discover → inspect → paths → bundle sequence is now injected at each
 decision point rather than recalled from `sm-agentic-opening-sequence`. This is
@@ -148,13 +147,13 @@ entry points.
 
 ### Brick 2 — index unification *(proposed; the architectural fork)*
 
-Make the in-memory rule stores first-class so a **question-shaped query**
+Make the in-memory memory store first-class so a **question-shaped query**
 surfaces them through the same funnel as everything else, and demote
 `bbox_knowledge` from a parallel string-matcher to a **lens** over the index.
 
 Concretely:
-- New indexed doc types for **system memories** and **rule-packets**
-  (docbuilders alongside `src/index/knowledge_docs.rs` /
+- A new indexed doc type for **system memories**
+  (a docbuilder alongside `src/index/knowledge_docs.rs` /
   `thread_docs.rs`), wired into the reindex pipeline and an embedding
   `Bucket` (reuse `Knowledge` or add dedicated routes; see `src/embed/mod.rs`).
 - New `EntityType::SystemMemory` in `src/entity_ref.rs` (ref grammar
@@ -162,11 +161,11 @@ Concretely:
   runbook can then be an answer entity in an evidence bundle, with edges to the
   atoms/tools it signposts.
 - `bbox_knowledge` becomes `hybrid_search` filtered to
-  `knowledge | packet | system_memory` with the tiered renderer (signpost
-  default, full on exact id). One retrieval path, three filters — not three
-  retrieval paths.
+  `knowledge | system_memory` with the tiered renderer (signpost default,
+  full on exact id). One retrieval path with two filters, not two retrieval
+  paths.
 
-**The fork:** *index* the in-memory stores (this brick) vs. keep them in-memory
+**The fork:** *index* the in-memory store (this brick) vs. keep it in-memory
 and only give `bbox_knowledge` the tiered renderer + breadcrumbs (cheaper,
 preserves the bounded-but-still-a-priori path). The decision is settled by the
 goal in the Problem section: only real indexing delivers question-shaped → memory
@@ -174,7 +173,7 @@ surfaced. Brick 0's tiered renderer is the cheap fallback if Brick 2 is
 deferred; it is not a substitute for it.
 
 **Open questions for Brick 2:**
-- Embedding bucket: reuse `Knowledge` (simplest) vs a `Memories`/`Packets`
+- Embedding bucket: reuse `Knowledge` (simplest) vs a `Memories`
   route (cleaner partition metrics, more config surface).
 - System-memory chunking: whole-body single doc vs per-section chunks (the big
   runbooks are ~40KB; per-section lifts recall, matching the project-file

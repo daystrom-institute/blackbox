@@ -805,8 +805,8 @@ after the project. Path tools require a session-pinned attachment, an explicit
 attachment selector, or exactly one operator-selected default with the needed
 capability. They never choose the first clone.
 
-Route hybrid/discover search, transcript search, knowledge/gaps, threads,
-notes, pins, roadmap, packets, whiteboards, bindings, provenance planning,
+Route hybrid search, transcript search, knowledge/gaps, threads, notes,
+pins, roadmap, packets, bindings, provenance planning,
 tool-edge stamping, and storage surfaces through this resolver. Preserve the
 current asymmetric read and write gates when resolving attachments.
 

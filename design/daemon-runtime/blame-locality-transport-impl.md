@@ -1,7 +1,7 @@
 ---
 title: "Blame locality transport: checkout fact, corpus enrichment"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - daemon-runtime

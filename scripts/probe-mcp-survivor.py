@@ -81,7 +81,7 @@ try:
  print('provider discovery and synthetic dispatch/resume peak advisories PASS',flush=True)
  for name in ['bro_when_any','bro_when_all']:
   call(name,{'task_ids':['00000000-0000-0000-0000-000000000000'],'timeout_seconds':0},True)
- for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'}),('bbox_packet',{'action':'typo'})]:
+ for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'})]:
   if name in names:call(name,args,True)
  print('selector and wait refusals PASS',flush=True)
  # List before each synthetic creation; all writes stay in the isolated bundle.
@@ -156,18 +156,6 @@ try:
  assert all(isinstance(row['peak_usage'],bool) for row in preview['candidates'])
  assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
  print('runtime quota cooldown expiry and authoritative quota refusal PASS',flush=True)
- call('bbox_packet_list',{})
- consequent='Synthetic large consequent: '+('界\n"'*4000)
- compiled=call('bbox_compile',{'domain':'synthetic-result-fixture','scope':'global','rules':[{'id':'always','antecedent':{'op':'True'},'classification':'pass','consequent':consequent}]})
- pid=re.search(r'packet-[0-9a-f]{8}',str(compiled)).group(0)
- result=call('bbox_apply',{'packet_id':pid,'entity':{}}); assert result['match'] is True and result['detail_limited'] is True
- recovered=exact('bbox_apply',{'packet_id':pid,'entity':{},'result_body_limit':1024},'result_cursor')
- assert recovered['prediction']['consequent']==consequent
- report=call('bbox_audit',{'packet_id':pid,'dataset':[{'entity':{'large':consequent},'expected':'different'}],'mismatch_detail':True})
- assert report['fidelity']==0
- recovered=exact('bbox_audit',{'packet_id':pid,'dataset':[{'entity':{},'expected':'different'}],'result_body_limit':1024},'result_cursor')
- assert recovered['fidelity']==0 and len(recovered['mismatches'])==1
- print('packet exact result and audit recovery PASS',flush=True)
  # Reconciled caller-contract fixes, with every mutation isolated above.
  for args in [{'task_ids':[]},{'provider':'synthetic-unknown-provider','dry_run':False}]:
   call('bro_prune',args,True)
@@ -179,7 +167,7 @@ try:
  thread_metadata=exact('bbox_thread',{'action':'get','id':tid,'detail':'metadata','body_limit':512})
  assert tid in json.dumps(thread_metadata)
  orientation=call('bbox_describe_schema',{})
- schema=exact('bbox_describe_schema',{'mode':'full','include_agents':False,'body_limit':4096})
+ schema=exact('bbox_describe_schema',{'mode':'full','body_limit':4096})
  assert [r['entity_type'] for r in orientation['vertex_types']]==[r['entity_type'] for r in schema['vertex_types']]
  assert all('key_fields' not in r for r in orientation['vertex_types'])
  assert all('key_fields' in r for r in schema['vertex_types'])
@@ -198,11 +186,6 @@ try:
  call('bbox_artifact_list',{'kind':'agent','body_limit':512,'limit':1},True)
  call('bro_allocator_probe',{'provider':'glm','clear':True,'raw_summary':'contradictory'},True)
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
- measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
- assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
- surface=exact('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024})
- assert {row['name'] for row in surface['visible_tools']}==names
- call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
  for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:

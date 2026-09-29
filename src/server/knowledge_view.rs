@@ -3479,23 +3479,16 @@ mod catalog_view_tests {
             .state
             .idx
             .read()
-            .search_with_active_selectors_and_searcher(
-                &crate::index::SearchParams {
-                    query: query.into(),
-                    mode: None,
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(5),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
+            .hybrid_word_lane_hits(
+                &crate::index::HybridWordLane {
+                    query,
+                    limit: 5,
+                    ..Default::default()
                 },
                 &view.active_selectors,
                 &view.searcher,
             )
+            .map(|hits| format!("{hits:?}"))
             .unwrap()
     }
 

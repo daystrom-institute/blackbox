@@ -10,7 +10,10 @@ use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
 use bbox_embed::embed::{Bucket, EmbeddingRouter, VisualRouteMeta, query_cache};
-use bbox_indexing::index::{GRAPH_VERTEX_DOC_TYPE, HybridBm25Hit, TranscriptIndex};
+use bbox_indexing::index::{
+    CONVERSATION_DOC_TYPES, ConversationCoordinates, CorpusDocumentFilter, GRAPH_VERTEX_DOC_TYPE,
+    HybridBm25Hit, HybridWordLane, LexicalQueryMode, ProjectFilterInput, TranscriptIndex,
+};
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_providers::entity_loader;
 use bbox_providers::providers::{ProviderContext, ProviderProjectAuthority};
@@ -24,19 +27,55 @@ const VECTOR_WEIGHT: f32 = 0.6;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HybridSearchParams {
+    /// Search query. In the default smart mode adjacent terms broaden recall,
+    /// quoted phrases stay exact and `-term` excludes; `mode=fulltext` takes
+    /// raw Tantivy/Lucene boolean syntax.
     pub query: String,
+    /// Word-lane query mode: `smart` (default) or `fulltext`.
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Maximum returned hits. Defaults to 10; clamped to 1..=50.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Restrict to one document type: `transcript`, `tool_call`,
+    /// `project_file`, `commit`, `knowledge`, `thread`, ...
     #[serde(default)]
     pub doc_type: Option<String>,
+    /// Exact message role or document kind (`user`, `assistant`,
+    /// `tool_result`, `thinking`, ...).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Exact source account label, as shown in conversation hits. Use
+    /// `source` to select a provider lane.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Source lane: `glm`, `claude`, `codex`, `gemini`, `slack`, ...
+    /// Comma-separated for several; a `-` prefix excludes a lane
+    /// (`source="-slack"` searches everything except Slack).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Conversation author identity (a provider user id).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// One conversation channel: a name (leading `#` accepted) or a channel
+    /// id. A name resolves through the current roster to the stable id, so a
+    /// renamed channel still matches its whole history.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Include subagent transcripts (default true).
+    #[serde(default)]
+    pub include_subagents: Option<bool>,
+    /// Drop the caller's own session, detected as the active transcript whose
+    /// recent user message contains this query. Default false.
+    #[serde(default)]
+    pub exclude_self: Option<bool>,
     /// Enable vector retrieval (default true), not raw vector output.
     /// A zero vector_weight also disables vector retrieval.
     #[serde(default)]
     pub include_vectors: Option<bool>,
     /// Include ranking scores, fusion contributions, and vector execution
     /// diagnostics. Default false; evidence identity and degradation are
-    /// always returned. Use bbox_embed_status for fleet-wide indexing health.
+    /// always returned.
     #[serde(default)]
     pub debug: bool,
     /// Weight assigned to vector rank lists during RRF fusion.
@@ -54,8 +93,13 @@ pub struct HybridSearchParams {
     /// repo's `.bbox/config.toml` `[project] aliases`). When set, only
     /// project_file entries from that project, thread entries whose stored
     /// project resolves to that id, and project graph vertices stamped with
-    /// that project id are kept; commits, knowledge, transcripts, and other
-    /// project-agnostic entity types pass through unfiltered. Use this to
+    /// that project id are kept; commits, knowledge, and other
+    /// project-agnostic entity types pass through unfiltered. Transcripts and
+    /// tool calls pass through too, unless the search is narrowed to
+    /// conversations (`doc_type` transcript or tool_call, or any of `role`,
+    /// `account`, `source`, `author`, `channel`, `include_subagents=false`,
+    /// `exclude_self`): then they are scoped by recorded working directory or
+    /// base project. Use this to
     /// your current repo when cross-project keyword pollution would otherwise
     /// dominate the top-N (a common case when multiple registered repos share
     /// vocabulary like "voyage" or "embed").
@@ -224,6 +268,10 @@ pub struct HybridResult {
     pub sources: BTreeMap<String, f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
+    /// Read coordinates for `bbox_context`, `bbox_messages` and
+    /// `bbox_session`. Present only on transcript and tool-call hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationCoordinates>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -344,14 +392,21 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     // single chunk is competitive.
     let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits_full = index.hybrid_bm25_hits_with_graph_authority_and_searcher(
-        query,
-        bm25_fetch,
-        p.doc_type.as_deref(),
-        true,
+    let mode = LexicalQueryMode::parse_optional(p.mode.as_deref())?;
+    let document_filter =
+        Some(document_filter(index, p, query)).filter(|filter| !filter.is_empty());
+    let bm25_hits_full = index.hybrid_word_lane_hits(
+        &HybridWordLane {
+            query,
+            limit: bm25_fetch,
+            doc_type: p.doc_type.as_deref(),
+            exclude_knowledge: true,
+            mode,
+            filter: document_filter.as_ref(),
+            graph_authority: (!graph_authority.is_empty()).then_some(&graph_authority),
+        },
         active_selectors,
         searcher,
-        (!graph_authority.is_empty()).then_some(&graph_authority),
     )?;
     // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
     // tail chunks that rank too low to matter. The full set still feeds
@@ -362,9 +417,17 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
         .as_deref()
         .is_none_or(|doc_type| doc_type == "knowledge")
     {
-        knowledge
-            .search_hits(query, fetch)
-            .into_iter()
+        let mut hits = knowledge.search_hits(query, fetch);
+        if let Some(filter) = &document_filter {
+            let mut admitted = Vec::with_capacity(hits.len());
+            for hit in hits {
+                if index.entity_admitted_by_filter(&hit.entity_id, filter, searcher)? {
+                    admitted.push(hit);
+                }
+            }
+            hits = admitted;
+        }
+        hits.into_iter()
             .enumerate()
             .map(|(rank, hit)| HybridBm25Hit {
                 entity_id: hit.entity_id,
@@ -382,6 +445,7 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                 graph_vertex_type: None,
                 graph_generation: None,
                 logical_ref: None,
+                conversation: None,
             })
             .collect::<Vec<_>>()
     } else {
@@ -465,6 +529,9 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
             retain_authorized_knowledge_vectors(list, knowledge);
             retain_active_code_vectors(list, index, active_selectors, searcher);
             retain_authorized_graph_vectors(list, graph_policy, &graph_authority);
+            if let Some(filter) = &document_filter {
+                retain_filtered_vectors(list, index, filter, searcher)?;
+            }
             list.hits.truncate(fetch);
         }
         vector_status.searched_partitions = vector_lists
@@ -583,6 +650,7 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                 graph_logical_ref,
                 sources: hit.sources,
                 excerpt: bm25.map(|hit| hit.excerpt.clone()),
+                conversation: bm25.and_then(|hit| hit.conversation.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -632,6 +700,18 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     results.truncate(limit);
     for (idx, result) in results.iter_mut().enumerate() {
         result.rank = idx + 1;
+        // Vector-only conversation hits carry no word-lane coordinates;
+        // read them off the stored document so every conversation hit is
+        // directly readable.
+        if result.conversation.is_none()
+            && result
+                .doc_type
+                .as_deref()
+                .is_some_and(|doc_type| CONVERSATION_DOC_TYPES.contains(&doc_type))
+        {
+            result.conversation =
+                index.conversation_coordinates_for_entity(&result.entity_id, searcher)?;
+        }
     }
 
     let vector_search = if !vectors_requested(p.include_vectors, vector_weight) {
@@ -652,6 +732,68 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
         degraded,
         debug: p.debug,
     })
+}
+
+/// Conversation narrowing from the call parameters. The project scope joins
+/// only when the search is already narrowed to conversations, so a plain
+/// project-scoped search keeps every project's transcripts.
+fn document_filter(
+    index: &TranscriptIndex,
+    p: &HybridSearchParams,
+    query: &str,
+) -> CorpusDocumentFilter {
+    let given = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let exclude_self = p.exclude_self.unwrap_or(false);
+    let mut filter = CorpusDocumentFilter {
+        account: given(&p.account),
+        role: given(&p.role),
+        source: given(&p.source),
+        author: given(&p.author),
+        channel: given(&p.channel),
+        exclude_subagents: p.include_subagents == Some(false),
+        exclude_session: exclude_self
+            .then(|| index.caller_session_for_query(query))
+            .flatten(),
+        conversation_project: None,
+    };
+    let conversation_search = exclude_self
+        || filter.narrows_conversation_fields()
+        || p.doc_type
+            .as_deref()
+            .is_some_and(|doc_type| CONVERSATION_DOC_TYPES.contains(&doc_type));
+    if conversation_search {
+        filter.conversation_project = given(&p.project).map(|literal| ProjectFilterInput {
+            project_id: p.resolved_project_id.clone(),
+            literal,
+        });
+    }
+    filter
+}
+
+/// The vector lanes' half of the document filter: each candidate is checked
+/// against its stored document before fusion, mirroring the clause the word
+/// lane composes into its query, so a filtered-out document never takes a
+/// rank position.
+fn retain_filtered_vectors(
+    list: &mut RankedList,
+    index: &TranscriptIndex,
+    filter: &CorpusDocumentFilter,
+    searcher: &tantivy::Searcher,
+) -> Result<()> {
+    let mut admitted = Vec::with_capacity(list.hits.len());
+    for hit in std::mem::take(&mut list.hits) {
+        if index.entity_admitted_by_filter(&hit.entity_id, filter, searcher)? {
+            admitted.push(hit);
+        }
+    }
+    list.hits = admitted;
+    Ok(())
 }
 
 fn retain_authorized_knowledge_vectors(list: &mut RankedList, knowledge: &Knowledge) {
@@ -788,6 +930,9 @@ fn build_next_steps(results: &[HybridResult]) -> Vec<String> {
         return vec![
             "No seeds. Broaden the query, drop the doc_type filter, or raise vector_weight toward 1.0 for paraphrase recall.".to_string(),
         ];
+    }
+    if let Some(conversation) = &results[0].conversation {
+        return conversation.next_steps();
     }
     let top = &results[0].entity_id;
     vec![format!(
@@ -1676,6 +1821,7 @@ mod tests {
             graph_vertex_type: None,
             graph_generation: None,
             logical_ref: None,
+            conversation: None,
         }];
         let properties = BTreeMap::from([(
             "project_file:p:f:h:1".to_string(),
@@ -1810,6 +1956,7 @@ mod tests {
             source_uri: None,
             sources: BTreeMap::new(),
             excerpt: None,
+            conversation: None,
             graph_id: None,
             graph_source: None,
             graph_source_connector: None,
@@ -1858,6 +2005,7 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                conversation: None,
                 graph_id: None,
                 graph_source: None,
                 graph_source_connector: None,
@@ -1977,6 +2125,7 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                conversation: None,
                 graph_id: None,
                 graph_source: None,
                 graph_source_connector: None,
@@ -1998,6 +2147,7 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                conversation: None,
                 graph_id: None,
                 graph_source: None,
                 graph_source_connector: None,
@@ -2663,6 +2813,14 @@ mod graph_word_lane_pipeline {
     fn params(query: &str) -> HybridSearchParams {
         HybridSearchParams {
             query: query.to_string(),
+            mode: None,
+            role: None,
+            account: None,
+            source: None,
+            author: None,
+            channel: None,
+            include_subagents: None,
+            exclude_self: None,
             debug: false,
             limit: Some(10),
             doc_type: None,

@@ -8,7 +8,7 @@ topic:
   - phase-decomposer
 date: 2026-05-10
 status: "implemented; live no-edit smoke coverage has passed for both fit_direct and needs_decompose"
-brief: "Build plan and status ledger for the phase-decompose workflows, scout agent, evidence sizing tool, and recomposition path."
+brief: "Build plan and status ledger for the phase-decompose workflows, scout agent, and recomposition path."
 ---
 
 # Phase Decomposer — Implementation Plan
@@ -19,42 +19,37 @@ coverage passed for both `fit_direct` and `needs_decompose`, including
 measured-byte DAG lint, guarded no-edit foreach, and recompose-time assertions.
 Final hardened live proof: `arc-5a5fd112da724ce7a06ab7d1fe007bd8` reached
 `Done` with `recompose_verdict=satisfied`. Edit/merge mediation is explicitly
-out of v1 rather than a shipped Phase 7 claim.
+out of v1 rather than a shipped Phase 6 claim.
 Companion to: `design/orchestration/phase-decomposer/phase-decomposer.md` (pure design - this is the build plan).
 Depends on: `design/orchestration/supervision/supervision-phased-implementation.md` (supervised atom
-orchestration primitives must exist before Phase 6 foreach implementer
+orchestration primitives must exist before Phase 5 foreach implementer
 dispatch).
 
 ## Implementation Status
 
 | Phase | Status | Notes |
 |---|---|---|
-| 1. `bbox_ref_size` MCP tool | **Done** | Tool handler in `src/tools/graph.rs`; implementation in `src/mcp_tools/ref_size.rs`; project-file full-content lookup in `src/index/mod.rs`; docs in `src/tool_docs.rs`. |
-| 2. Scout agent manifest | **Done** | `system-defaults/agents/corpus-pathfinder.json`; reconciles the reverted Claude subagent prompt with Badgey's scout contract and atom-style grounding discipline. |
-| 3. Inlet agent | **Done** | `phase-decompose-discovery` v9 plus `phase-decomposer-inlet`; scouts feed `bbox_ref_size`, inlet emits `evidence_bundle` + `triage_verdict`, and does not construct a DAG. |
-| 4. Single-implementer path | **Done** | `phase-decompose-supervised-impl` plus `phase-decompose-main` direct branch. Live direct smoke passed after `InitEpoch` hardening (`arc-6381ec7ba9c34201b427897cd40884a5`). |
-| 5. Ensemble decomposition | **Done** | `phase-decompose-ensemble-decompose` v20, `phase-decomposer-panel`, whiteboard packets, facilitator strict-DAG synthesis, mechanical `lint-dag.py` byte/coverage validation, `normalize-dag-measurements.py` derived-byte normalization, degraded-ref carry-through, and explicit terminal-verdict taxonomy handling. |
-| 6. Foreach implementer dispatch | **Done** | `phase-decompose-main` foreaches over `vars.dag.sub_units` into `phase-decompose-supervised-impl` and collects sub-results. |
-| 7. Recomposition council + remediation | **Done** | `phase-decompose-recompose` v6, `phase-recompose-council`, verdict packet, remediation packet back-edge, epoch-ceiling routing, stdin-backed mechanical recompose assertions, and arc-id status observability. Final live decomposed smoke passed (`arc-5a5fd112da724ce7a06ab7d1fe007bd8`). Edit/merge mediation is out of v1. |
+| 1. Scout agent manifest | **Done** | `system-defaults/agents/corpus-pathfinder.json`; reconciles the reverted Claude subagent prompt with Badgey's scout contract and atom-style grounding discipline. |
+| 2. Inlet agent | **Done** | `phase-decompose-discovery` v9 plus `phase-decomposer-inlet`; inlet estimates per-ref bytes from scout evidence, emits `evidence_bundle` + `triage_verdict`, and does not construct a DAG. |
+| 3. Single-implementer path | **Done** | `phase-decompose-supervised-impl` plus `phase-decompose-main` direct branch. Live direct smoke passed after `InitEpoch` hardening (`arc-6381ec7ba9c34201b427897cd40884a5`). |
+| 4. Ensemble decomposition | **Done** | `phase-decompose-ensemble-decompose` v20, `phase-decomposer-panel`, facilitator strict-DAG synthesis, mechanical `lint-dag.py` byte/coverage validation, `normalize-dag-measurements.py` derived-byte normalization, degraded-ref carry-through, and explicit terminal-verdict taxonomy handling. |
+| 5. Foreach implementer dispatch | **Done** | `phase-decompose-main` foreaches over `vars.dag.sub_units` into `phase-decompose-supervised-impl` and collects sub-results. |
+| 6. Recomposition council + remediation | **Done** | `phase-decompose-recompose` v6, `phase-recompose-council`, verdict routing, remediation packet back-edge, epoch-ceiling routing, stdin-backed mechanical recompose assertions, and arc-id status observability. Final live decomposed smoke passed (`arc-5a5fd112da724ce7a06ab7d1fe007bd8`). Edit/merge mediation is out of v1. |
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
-`Branch`, `Fork`, `Wait`, `gate`, and `durable` actors. Whiteboard
-deliberation uses the `whiteboard_*` MCP tool surface
-(`src/whiteboards.rs`), not an engine primitive — workflows call it
-via `mcp_call` hook-ops. The new
-artifacts are: one MCP tool, several agent manifests, brofiles, teamplates,
-packet definitions, and workflow JSON artifacts.
+`Branch`, `Fork`, `Wait`, `gate`, and `durable` actors. The new
+artifacts are: several agent manifests, brofiles, teamplates, and
+workflow JSON artifacts.
 
 ```
-Phase 1 ──┐
-          ├──▶ Phase 3 ──┬──▶ Phase 4 ──┐
-Phase 2 ──┘              │              ├──▶ Phase 6 ──▶ Phase 7
-                         └──▶ Phase 5 ──┘
+Phase 1 ──▶ Phase 2 ──┬──▶ Phase 3 ──┐
+                      │              ├──▶ Phase 5 ──▶ Phase 6
+                      └──▶ Phase 4 ──┘
 
 The reusable supervision primitives in
 `design/orchestration/supervision/supervision-phased-implementation.md` exist and are composed by
-Phase 6 (foreach implementers run inside supervised subworkflows).
+Phase 5 (foreach implementers run inside supervised subworkflows).
 ```
 
 ### Operational note: durable actors tier, never static-pin
@@ -78,45 +73,7 @@ real decomposition errors).
 
 ---
 
-## Phase 1: `bbox_ref_size` MCP tool
-
-> **Status: shipped.** The live tool accepts up to 500 refs, canonicalizes
-> successful refs, reports unresolved/omitted refs under `degraded`, measures
-> full indexed chunk content for `project_file` / `project_file_v2`, and
-> measures provider-properties JSON for other entity refs.
-
-**Prerequisites:** none.
-
-**What shipped:**
-
-1.1 **MCP tool handler.** `bbox_ref_size(refs: [String]) -> {total_bytes:
-   u64, per_ref: [{ref: String, bytes: u64}], degraded: {...}}`. Resolves
-   each entity_ref or project_file_ref to the payload that downstream phase
-   routing will actually receive. For `project_file` and `project_file_v2`
-   refs, it resolves the indexed chunk and measures the full `content` bytes.
-   For non-file entity refs, it resolves through registered entity providers
-   and measures the serialized provider-properties JSON.
-
-1.2 **Resolution.** Reuses `entity_ref::EntityRef::parse`
-   (`entity_ref.rs`). For project-file refs, it uses the index lookup path
-   added for this phase to fetch `EmbeddingSourceDoc.content`; this avoids
-   measuring only `content_preview`. For non-file refs, it uses the entity
-   provider registry directly rather than measuring an expanded neighborhood
-   view.
-
-1.3 **Batching.** Accepts up to 500 refs per call. Returns total +
-   per-ref breakdown, with unresolved refs and over-cap omissions reported
-   under `degraded`.
-
-**Deliverable:** `bbox_ref_size(["project_file:<pid>:<h>:<c>:0",
-"knowledge:<id>"])` returns `{total_bytes: 3035, per_ref: [{ref: ...,
-bytes: 2140}, {ref: ..., bytes: 895}]}`.
-
-**Estimated size:** ~100-150 lines of Rust (handler, resolution, batching).
-
----
-
-## Phase 2: Scout agent manifest
+## Phase 1: Scout agent manifest
 
 > **Status: shipped.** `corpus-pathfinder` is installed as a generic agent
 > manifest in `system-defaults/agents/corpus-pathfinder.json`. It pulls the
@@ -124,11 +81,11 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
 > (`3dbc7e9:.claude/agents/corpus-pathfinder.md`) but does not resurrect that
 > prompt-only enforcement model.
 
-**Prerequisites:** none. Can proceed in parallel with Phase 1.
+**Prerequisites:** none.
 
 **What shipped:**
 
-2.1 **Corpus-pathfinder as JSON agent.** The old
+1.1 **Corpus-pathfinder as JSON agent.** The old
    `.claude/agents/corpus-pathfinder.md` was intentionally removed in
    `ad36da6` because Claude did not reliably honor prompt-enforced search/read
    caps. The shipped artifact preserves its durable intent instead:
@@ -149,7 +106,7 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
      at the conceptual level: one focused investigation, no sub-agent spawn,
      no synthesis beyond evidence. It deliberately differs by returning
      structured JSON directly instead of emitting `bbox_note(kind="done")`,
-     because Phase 3 aggregates `vars.scout_results` mechanically.
+     because Phase 2 aggregates `vars.scout_results` mechanically.
    - It can read grounding atoms (`atom_list`, `atom_get`, `atom_describe`,
      `atom_search`) so scout output can point downstream consumers at existing
      atomized analysis tools rather than inventing manual tool sequences.
@@ -174,7 +131,7 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
    - `composition.fan_out_aggregator: "ensemble-merge"`
    - `cost_class: "cheap"`
 
-2.2 **Provider routing.** Primary provider is Codex (`gpt-5.5`, medium).
+1.2 **Provider routing.** Primary provider is Codex (`gpt-5.5`, medium).
    Claude can be added later as an alternate only if the runner can enforce
    the same read-only graph surface mechanically; prompt-only discipline was
    already tested and removed. The agent manifest declares the brofile inline;
@@ -189,19 +146,19 @@ kind=agent`.
 
 ---
 
-## Phase 3: Inlet agent (discovery subworkflow)
+## Phase 2: Inlet agent (discovery subworkflow)
 
-**Prerequisites:** Phase 1 (`bbox_ref_size` tool), Phase 2 (scout agent).
+**Prerequisites:** Phase 1 (scout agent).
 
 **What gets built:**
 
-3.1 **Inlet brofile.** A brofile for the large-context orchestrator
+2.1 **Inlet brofile.** A brofile for the large-context orchestrator
    (Opus 4.7 [1M] or Codex). Lens: "You are a discovery orchestrator.
    Read the phase doc. Extract question-shapes. Dispatch scouts. Read
-   their results. Aggregate into an evidence manifest. Call
-   `bbox_ref_size`. Produce a triage verdict."
+   their results. Aggregate into an evidence manifest with per-ref byte
+   estimates. Produce a triage verdict."
 
-3.2 **Discovery subworkflow.** A workflow JSON artifact
+2.2 **Discovery subworkflow.** A workflow JSON artifact
    (`system-defaults/workflows/phase-decompose/discovery.json`), installed via
    `bro_workflow_install`. Three nodes:
 
@@ -211,23 +168,23 @@ kind=agent`.
      iteration dispatches `corpus-pathfinder` agent via
      `bro_agent_dispatch`. Results collect into `vars.scout_results`.
    - **Inlet** (durable Executor): reads `vars.scout_results`.
-     Aggregates, deduplicates, calls `bbox_ref_size`, produces
+     Aggregates, deduplicates, estimates per-ref bytes from scout
+     evidence, produces
      `vars.evidence_bundle` and `vars.triage_verdict`. DAG construction
      belongs to the decomposer/ensemble path after discovery.
 
-3.3 **Parent gate packet.** After the discovery subworkflow exports
+2.3 **Parent gate.** After the discovery subworkflow exports
    `triage_verdict` to the parent, the PARENT node carries a `gate`
-   packet (`domain:phase-decompose/triage`). Reads
-   `vars.triage_verdict` and emits `fit_direct` or
+   that reads `vars.triage_verdict` and emits `fit_direct` or
    `needs_decompose`. Subworkflow gate verdicts are not promoted
    (the engine exports vars only) — the parent must have its
    own gate. The parent's `Branch` routes on `last_verdict`.
 
-3.4 **Parent workflow integration.** The parent workflow imports
+2.4 **Parent workflow integration.** The parent workflow imports
    `phase_doc_path` into the discovery subworkflow. On completion,
    exports `evidence_bundle` and `triage_verdict` are promoted back to
    parent vars by the engine's subworkflow export path. The parent's next
-   node carries a gate packet that reads `vars.triage_verdict` and
+   node carries a gate that reads `vars.triage_verdict` and
    emits the classification. `Branch` routes on `last_verdict`.
    **Subworkflow gate verdicts are not promoted** — the parent needs
    its own gate after export.
@@ -237,20 +194,20 @@ produces a measured evidence bundle and a triage verdict. The parent
 branches correctly on `fit_direct` vs `needs_decompose`.
 
 **Estimated size:** 1 brofile (~30 lines), 1 workflow JSON artifact
-(~100-150 lines), 1 gate packet (~30 lines). No new Rust code.
+(~100-150 lines). No new Rust code.
 
 ---
 
-## Phase 4: Single-implementer path (fit_direct)
+## Phase 3: Single-implementer path (fit_direct)
 
-**Prerequisites:** Phase 3 (discovery subworkflow produces evidence
+**Prerequisites:** Phase 2 (discovery subworkflow produces evidence
 bundle + triage verdict). Supervision plan normalization, polling,
 classifier/advisor workflow-backed atom patterns, and typed advisor action
 execution must exist.
 
 **What gets built:**
 
-4.1 **Supervised implementer subworkflow.** A reusable subworkflow
+3.1 **Supervised implementer subworkflow.** A reusable subworkflow
    artifact (`system-defaults/workflows/phase-decompose/supervised-impl.json`).
    Imports: `vars.brofile`, `vars.prompt`, `vars.evidence_manifest`,
    `vars.acceptance_criteria`. Inside:
@@ -259,12 +216,12 @@ execution must exist.
    - Advisor workflow-backed atom at turn end or classifier alert
    - Branch on advisor action
 
-4.2 **Direct-implementer workflow node.** After the discovery
+3.2 **Direct-implementer workflow node.** After the discovery
    subworkflow returns `fit_direct`, a node runs
    `subworkflow_ref: "supervised-impl"` with the inlet's evidence
    bundle as the manifest.
 
-4.3 **End-to-end test.** A small phase doc (e.g., "add dark mode
+3.3 **End-to-end test.** A small phase doc (e.g., "add dark mode
    toggle") → discovery → `fit_direct` → supervised implementer
    → advisor → acceptance gate → done.
 
@@ -277,53 +234,48 @@ Rust code.
 
 ---
 
-## Phase 5: Ensemble decomposition (needs_decompose)
+## Phase 4: Ensemble decomposition (needs_decompose)
 
-**Prerequisites:** Phase 3 (discovery subworkflow). Can proceed in
-parallel with Phase 4.
+**Prerequisites:** Phase 2 (discovery subworkflow). Can proceed in
+parallel with Phase 3.
 
 **What gets built:**
 
-5.1 **Decomposer teamplate.** A teamplate
+4.1 **Decomposer teamplate.** A teamplate
    (`system-defaults/phase-decompose/teamplates/decomposer-panel.json`).
    Members: 2-3 specialist brofiles (e.g., `decomposer-security`,
    `decomposer-architecture`, `decomposer-performance`). The actor
    kind for the node is `Ensemble`, which broadcasts
    to the team.
 
-5.2 **Decomposer brofiles.** One brofile per specialist role. Lens:
+4.2 **Decomposer brofiles.** One brofile per specialist role. Lens:
    "You are a decomposition specialist for <domain>. Read the phase
-   doc and evidence bundle. Post a proposed decomposition to the
-   whiteboard. Use `bbox_ref_size` to measure each proposed sub-unit."
+   doc and evidence bundle. Return a proposed decomposition, sizing each
+   proposed sub-unit from the evidence bundle's per-ref bytes."
 
-5.3 **Decomposer workflow nodes.** Following the `whiteboard-arc.json`
-   pattern (`examples/whiteboard/workflows/whiteboard-arc.json`):
-   - **OpenBoard**: hook-only, creates whiteboard, registers members.
-   - **BlindPost**: Ensemble broadcast. Each member posts a proposed
+4.3 **Decomposer workflow nodes.**
+   - **BlindPost**: Ensemble broadcast. Each member returns a proposed
      decomposition independently.
-   - **Debate**: Ensemble broadcast. Members read each other's posts,
-     annotate, vote.
-   - **TransitionToResolve**: hook-only, transitions board to resolve.
-   - **Synthesize**: Executor (facilitator brofile). Reads
-     `whiteboard_summarize`. Emits the DAG artifact
-     (`vars.dag`). Uses `bbox_ref_size` cluster-by-cluster to
-     validate sub-unit sizes. In v1, `target_context_window` means the
-     per-sub-unit measured evidence payload budget returned by
-     `bbox_ref_size`; it excludes fixed workflow prompt, brofile, ambient
-     scope, and MCP-injection overhead.
+   - **Debate**: Ensemble broadcast. Members receive each other's
+     proposals, challenge and rank them.
+   - **Synthesize**: Executor (facilitator brofile). Reads the collected
+     proposals and critiques. Emits the DAG artifact (`vars.dag`), taking
+     each sub-unit's bytes from `evidence_bundle.refs` bytes. In v1,
+     `target_context_window` means the per-sub-unit evidence payload budget
+     summed from the evidence bundle; it excludes fixed workflow prompt,
+     brofile, ambient scope, and MCP-injection overhead.
 
-5.4 **DAG validation.** A gate packet on the Synthesize node verifies
+4.4 **DAG validation.** A gate on the Synthesize node verifies
    the DAG shape (required fields present, sub_units non-empty,
    merge_order matches sub_unit_ids). **Coverage and measured-byte lint
-   cannot be fully expressed as packet rules today** — `ForAll`
-   quantifies over one array path but cannot correlate an
-   outer `criterion_id` into an inner `Exists` over sibling `sub_units[*]`
-   acceptance subsets, and packet rules cannot call `bbox_ref_size`.
-   `SynthesizeDag/on_exit` therefore extracts DAG refs, calls
-   `bbox_ref_size`, and runs `lint-dag.py`. The lint fails on missing
-   acceptance coverage, degraded ref measurement, declared bytes that differ
-   from measured ref bytes, and measured bytes over `target_context_window`.
-   The packet gate handles structural validation; coverage and byte accuracy
+   are not gate checks**: they correlate an outer `criterion_id` against
+   sibling `sub_units[*]` acceptance subsets and sum ref bytes.
+   `SynthesizeDag/on_exit` therefore extracts DAG refs, runs
+   `normalize-dag-measurements.py` to recompute sub-unit bytes from the
+   evidence bundle, and runs `lint-dag.py`. The lint fails on missing
+   acceptance coverage, missing or unexpected degraded refs, and sub-unit
+   bytes over `target_context_window`.
+   The gate handles structural validation; coverage and byte accuracy
    are mechanical hook validation in v1.
 
 **Deliverable:** A `needs_decompose` verdict routes to the decomposer
@@ -331,20 +283,19 @@ panel. The panel produces a validated DAG with per-sub-unit refs,
 acceptance subsets, and measured byte sizes.
 
 **Estimated size:** 1 teamplate (~30 lines), 2-3 brofiles (~90 lines),
-   workflow nodes in the parent workflow (~150 lines), 1 gate packet
-   (~40 lines). No new Rust code.
+   workflow nodes in the parent workflow (~150 lines). No new Rust code.
 
 ---
 
-## Phase 6: Foreach implementer dispatch
+## Phase 5: Foreach implementer dispatch
 
-**Prerequisites:** Phase 4 (supervised subworkflow template), Phase 5
+**Prerequisites:** Phase 3 (supervised subworkflow template), Phase 4
 (DAG artifact). Supervision S1, S2, S3, S5, S6, S7, and the needed S8 action
 subset must be complete.
 
 **What gets built:**
 
-6.1 **Foreach over DAG.** After the decomposer produces `vars.dag`,
+5.1 **Foreach over DAG.** After the decomposer produces `vars.dag`,
    a `foreach` node iterates over `vars.dag.sub_units`. Each
    iteration runs `subworkflow_ref:
    "phase-decompose-supervised-impl"` with the fixed bounded
@@ -358,12 +309,12 @@ subset must be complete.
    DAG entries must not carry `assigned_brofile`; bounded execution is
    controlled by the supervised-impl workflow and brofiles.
 
-6.2 **Collect outcomes.** `foreach.collect.into_var: sub_results`.
+5.2 **Collect outcomes.** `foreach.collect.into_var: sub_results`.
    Each outcome is a `FanoutChildOutcome` with `{status, exports,
    outputs}`. The sub-unit's advisor verdict and acceptance status
    are in `exports` (declared in `foreach.exports`).
 
-6.3 **Parallelism.** Disjoint sub-units (no symbol overlap in
+5.3 **Parallelism.** Disjoint sub-units (no symbol overlap in
    predicted writes) run concurrently via `foreach.parallelism`.
    Overlapping sub-units serialize. `foreach` does not natively
    support per-item `depends_on` ordering — it dispatches items
@@ -374,7 +325,7 @@ subset must be complete.
    - Split into sequential foreach batches (one per topological
      level of the DAG).
 
-6.4 **Integration test.** A multi-sub-unit phase doc flows through:
+5.4 **Integration test.** A multi-sub-unit phase doc flows through:
    discovery → decompose → foreach implementers → collect outcomes.
 
 **Deliverable:** Multiple sub-units dispatch in parallel via foreach.
@@ -386,20 +337,20 @@ code (foreach exists in the engine).
 
 ---
 
-## Phase 7: Recomposition council + remediation
+## Phase 6: Recomposition council + remediation
 
-**Prerequisites:** Phase 6 (foreach implementer outcomes). Phases 4-5
+**Prerequisites:** Phase 5 (foreach implementer outcomes). Phases 3-4
 for the supervision/adversarial patterns.
 
 **What gets built:**
 
-7.1 **Recomposition council teamplate.** A teamplate separate from
+6.1 **Recomposition council teamplate.** A teamplate separate from
    the decomposer panel. Members: integration-specialist brofiles.
    `durable: true` — session persists across epochs (within the same
    workflow runner, via `Goto` back-edge). **Does not persist across
    fresh arcs or subworkflow boundaries**.
 
-7.2 **Council evaluation node.** After foreach collects, the council
+6.2 **Council evaluation node.** After foreach collects, the council
    (durable Ensemble) reads `vars.sub_results`. It evaluates:
    - Which sub-units passed their advisors + acceptance gates?
    - Which failed?
@@ -414,28 +365,27 @@ for the supervision/adversarial patterns.
    - **Untenable**: repeated failures, budget exhausted → halt with
      escalation note.
 
-7.3 **Remediation packet.** A structured JSON payload describing
+6.3 **Remediation packet.** A structured JSON payload describing
    remaining work: which acceptance criteria are unmet, which
    sub-units need re-dispatch, what conflicts surfaced. The packet
    re-enters the inlet → decomposer → dispatch → advisor gate →
    council loop.
 
-7.4 **Edit/merge mediation is out of v1.** The shipped workflow does not
+6.4 **Edit/merge mediation is out of v1.** The shipped workflow does not
    merge sub-unit branches or dispatch conflict/regression repair agents.
    It has no branch-handle contract from foreach children, so claiming M1-M4
    here would be hollow. Integration failures are represented as
    `work_remains` plus a remediation packet that re-enters the inlet.
 
-7.5 **Epoch ceiling.** `max_epochs` is not a `NodeSpec` field.
+6.5 **Epoch ceiling.** `max_epochs` is not a `NodeSpec` field.
    The shipped workflow initializes
    `vars.epoch`, runs `system-defaults/phase-decompose/scripts/epoch-check.py`
-   to compute `vars.epoch_status`, and routes through the
-   `domain:phase-decompose/epoch-ceiling` packet. The packet reads
+   to compute `vars.epoch_status`, and routes through a gate that reads
    `epoch_status=continue|halt` instead of hardcoding a numeric ceiling,
    so `max_epochs` remains runtime-configurable. The remediation back-edge
    increments `vars.epoch` before re-entering discovery.
 
-7.6 **End-to-end test.** A phase doc requiring decomposition → inlet
+6.6 **End-to-end test.** A phase doc requiring decomposition → inlet
    → decompose → DAG → foreach implementers → council evaluates →
    remediation packet → re-enters inlet → re-dispatches → council
    evaluates again → satisfied → done.
@@ -445,8 +395,8 @@ the council, converted into a remediation packet, and resolved iteratively.
 A phase that truly can't converge halts after the epoch ceiling.
 
 **Estimated size:** 1 teamplate (~30 lines), council brofiles (~60
-lines), parent workflow nodes for council/remediation (~150 lines), 1 gate
-packet for epoch ceiling (~20 lines). No new Rust code.
+lines), parent workflow nodes for council/remediation (~150 lines). No new
+Rust code.
 
 ---
 
@@ -454,19 +404,18 @@ packet for epoch ceiling (~20 lines). No new Rust code.
 
 | Phase | Can start after | New Rust | New artifacts | Test |
 |---|---|---|---|---|
-| 1. bbox_ref_size | — | ~100-150 lines | — | Resolve ref → byte payload |
-| 2. Scout manifest | — | — | 1 agent JSON | bro_agent_dispatch returns structured leads |
-| 3. Inlet agent | 1, 2 | — | 1 brofile, 1 workflow, 1 packet | Phase doc → evidence bundle + triage verdict |
-| 4. Single-implementer | 3, supervision S1, S2, S3, S5, S7, S8 subset | — | 1 workflow | fit_direct -> implementer -> advisor -> done |
-| 5. Ensemble decompose | 3 | — | 1 teamplate, 2-3 brofiles, 1 packet | needs_decompose → whiteboard → validated DAG |
-| 6. Foreach implementers | 4, 5, supervision S6-S8 | — | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
-| 7. Recompose council | 6, supervision S9 | — | 1 teamplate, 2 brofiles, 1 packet | Work remains → remediation packet → converge or halt |
+| 1. Scout manifest | - | - | 1 agent JSON | bro_agent_dispatch returns structured leads |
+| 2. Inlet agent | 1 | - | 1 brofile, 1 workflow | Phase doc → evidence bundle + triage verdict |
+| 3. Single-implementer | 2, supervision S1, S2, S3, S5, S7, S8 subset | - | 1 workflow | fit_direct -> implementer -> advisor -> done |
+| 4. Ensemble decompose | 2 | - | 1 teamplate, 2-3 brofiles | needs_decompose → panel deliberation → validated DAG |
+| 5. Foreach implementers | 3, 4, supervision S6-S8 | - | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
+| 6. Recompose council | 5, supervision S9 | - | 1 teamplate, 2 brofiles | Work remains → remediation packet → converge or halt |
 
-Additional Rust code after Phase 1: `src/dispatch_mcp.rs` now injects the
-`agent-internal` MCP surface for dispatched bros so whiteboard tools are
-visible, and `src/workflow/ops.rs` now makes `parse_json` robust to
-live-agent preambles before inline JSON. The remaining implementation is
-configuration artifacts on top of the existing workflow engine.
+Additional Rust code: `src/dispatch_mcp.rs` now injects the `agent-internal`
+MCP surface for dispatched bros, and `src/workflow/ops.rs` now makes
+`parse_json` robust to live-agent preambles before inline JSON. The remaining
+implementation is configuration artifacts on top of the existing workflow
+engine.
 
 ## Live validation
 
@@ -491,7 +440,7 @@ Current smoke runs:
   `path=decomposed`, `triage_verdict=needs_decompose`,
   `recompose_verdict=satisfied`. This run used `phase-decompose-main` v3,
   `phase-decompose-supervised-impl` v4, and `phase-decompose-recompose` v4.
-  The ensemble DAG lint measured every sub-unit ref via `bbox_ref_size`; all
+  The ensemble DAG lint measured every sub-unit ref; all
   five supervised subflows completed through the no-edit diff guard; recompose
   asserted the `sub_results` field-shape bridge, sub-unit count/key coverage,
   terminal verdict set, empty `files_touched`, and matching parent
@@ -504,7 +453,7 @@ Current smoke runs:
   `phase-decompose-ensemble-decompose` v10,
   `phase-decompose-supervised-impl` v4, and `phase-decompose-recompose` v5.
   The inlet reported `degraded.unresolved_refs=[]`; the v10 debate resolved
-  whiteboard challenges before `ValidateDebate`; the facilitator emitted a
+  panel challenges before `ValidateDebate`; the facilitator emitted a
   three-sub-unit DAG with measured bytes `[8877, 7707, 9666]` against a
   `10000` target, `degraded_refs=[]`, and
   `terminal_verdicts=["satisfied","work_remains","untenable"]` as the allowed
@@ -522,7 +471,7 @@ Current smoke runs:
   `phase-decompose-supervised-impl` v7, and `phase-decompose-recompose` v6.
   The inlet reported `evidence_bundle.total_bytes=72544`,
   `target_context_window=10000`, and no unresolved degraded refs in the final
-  evidence bundle. The ensemble debate converged through the whiteboard, then
+  evidence bundle. The ensemble debate converged, then
   `lint-dag.py` accepted a five-sub-unit DAG with measured bytes
   `[9416, 9559, 9818, 9164, 8122]` against the `10000` target and
   `degraded_refs=[]`. All five supervised no-edit subflows completed with
@@ -543,7 +492,7 @@ Current smoke runs:
   `lint-dag.py` requires all resolved evidence refs to appear in the final DAG,
   rejects unexpected degraded refs, and the workflow runs
   `normalize-dag-measurements.py` before lint so derived `bytes` fields and
-  degraded refs are normalized from `bbox_ref_size` truth rather than copied
+  degraded refs are normalized from measured ref sizes rather than copied
   scout/content-preview numbers. `lint-dag.py` accepted eight sub-units with
   measured bytes `[9388, 9677, 9815, 8751, 9925, 9876, 9690, 9818]` against
   the `10000` target and `degraded_refs=[]`. All eight supervised no-edit
@@ -560,7 +509,7 @@ Current smoke runs:
   DeepSeek review caught fixture-specific prompt/lint behavior. After removing
   the fixture-specific required-ref list, two live attempts failed mechanically
   when the facilitator copied stale scout byte counts and invented degraded refs
-  despite `bbox_ref_size` resolving those refs. v20 keeps those failures useful
+  despite those refs resolving. v20 keeps those failures useful
   by deriving byte fields from measured refs and rejecting unexpected degraded
   refs before any foreach dispatch.
 - Post-run substrate fix: `bro orchestrate status <arc-id>` now resolves the
@@ -598,36 +547,32 @@ Required external review drove the final hardening pass:
 
 | Primitive | Used by Phase | Location |
 |---|---|---|
-| foreach + collect | 3, 6 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
-| subworkflow + imports/exports | 3, 4, 6 | `src/workflow/engine.rs` |
-| Branch (gate verdict routing) | 3, 4, 6, 7 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
-| Fork (fire-and-forget) | 6 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
-| Wait (signal suspension) | 6 | `src/workflow/wait.rs` |
-| Goto (back-edge for loops) | 7 | `src/workflow/schema.rs` |
-| Node gate + gate_mode | 3, 5, 7 | `src/workflow/schema.rs` |
-| Whiteboard (MCP tool surface) | 5, 7 | `src/whiteboards.rs` (store), `whiteboard_*` MCP tools |
-| Durable actor sessions | 3, 5, 7 | `src/workflow/schema.rs` |
-| Agent manifests | 2, 5, 7 | `system-defaults/agents/code-reviewer.json` |
-| bro_agent_dispatch | 2, 3 | `src/tools/agents.rs` |
-| bro_workflow_install | 3, 4 | `src/tools/orchestrate.rs` |
-| bbox_compile / bbox_audit | 3, 5, 7 | `src/tools/packets.rs` |
-| entity_ref::EntityRef | 1 | `src/entity_ref.rs` |
-| entity_loader::load | 1 | `src/entity_loader.rs` |
+| foreach + collect | 2, 5 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
+| subworkflow + imports/exports | 2, 3, 5 | `src/workflow/engine.rs` |
+| Branch (gate verdict routing) | 2, 3, 5, 6 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
+| Fork (fire-and-forget) | 5 | `src/workflow/schema.rs`, `src/workflow/engine.rs` |
+| Wait (signal suspension) | 5 | `src/workflow/wait.rs` |
+| Goto (back-edge for loops) | 6 | `src/workflow/schema.rs` |
+| Node gate + gate_mode | 2, 4, 6 | `src/workflow/schema.rs` |
+| Durable actor sessions | 2, 4, 6 | `src/workflow/schema.rs` |
+| Agent manifests | 1, 4, 6 | `system-defaults/agents/code-reviewer.json` |
+| bro_agent_dispatch | 1, 2 | `src/tools/agents.rs` |
+| bro_workflow_install | 2, 3 | `src/tools/orchestrate.rs` |
 
 ## Dependency on supervision-phased-implementation.md
 
-Phases 4, 6, and 7 require the supervision infrastructure from
+Phases 3, 5, and 6 require the supervision infrastructure from
 `design/orchestration/supervision/supervision-phased-implementation.md`:
 
-- Phase 4 needs advisor-only supervision: S1 normalize-plan, S2 attachment
+- Phase 3 needs advisor-only supervision: S1 normalize-plan, S2 attachment
   model, S3 polling primitive, S5 structured exit, S7 advisor atom, and the S8 action
   subset for `accept`, `steer_primary`, and `bail`.
-- Phase 6 additionally needs S6 classifier support and S8 action execution
+- Phase 5 additionally needs S6 classifier support and S8 action execution
   available inside foreach subworkflows.
-- Phase 7 additionally needs S9 tier-recovery/runtime allocation patterns for
+- Phase 6 additionally needs S9 tier-recovery/runtime allocation patterns for
   remediation re-entry. Edit/merge mediation is a separate future design.
 
 The decomposer implementation plan can begin from the assumption that the
-supervision primitives through S9 have landed. Phase 4 onward should still
+supervision primitives through S9 have landed. Phase 3 onward should still
 exercise the live advisor/classifier paths in its own workflow fixtures, because
 the decomposer composes those primitives rather than owning them.

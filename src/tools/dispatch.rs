@@ -573,7 +573,6 @@ impl BlackboxServer {
                 request.brofile_tool_defaults.as_ref(),
                 request.tool_defaults.as_ref(),
             ),
-            Some(self.state.system_events.clone()),
             request.origin,
         )
         .await;
@@ -953,7 +952,6 @@ impl BlackboxServer {
                 brofile_tool_defaults.as_ref(),
                 p.tool_defaults.as_ref(),
             ),
-            Some(self.state.system_events.clone()),
             // bro_resume is the user-facing MCP tool for resuming an existing
             // session — same source class as bro_exec. The HTTP control plane
             // (`/control/resume`) overrides this to Cockpit, exactly like
@@ -2112,7 +2110,6 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
             Some("workload-retro".to_string()),
-            Some(self.state.system_events.clone()),
             // The workload retro is a self-reflective resume started by
             // bro_prune, so it lands in AgentDispatch like other bro_*
             // MCP tools.
@@ -2367,12 +2364,11 @@ impl BlackboxServer {
                     let cwd = project_dir
                         .map(String::from)
                         .or(bro_match.team.project_dir.clone());
-                    // §6: fold the brofile's surface verdict into its filters so
+                    // §6: fold the brofile's surface into its filters so
                     // every dispatch path inherits the same surface governance.
                     let surface_filters = crate::server::surface::dispatch_surface_filters(
-                        &self.state.packets.read(),
+                        &self.state.config.read().surfaces,
                         bf.surface.as_deref(),
-                        cwd.as_deref(),
                     );
                     let filters = crate::server::progress::combine_dispatch_filters(
                         bf.filters.as_ref(),
@@ -2426,11 +2422,10 @@ impl BlackboxServer {
                 opts,
                 bf.context.as_ref(),
             );
-            // §6: fold the standalone brofile's surface verdict into its filters.
+            // §6: fold the standalone brofile's surface into its filters.
             let surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.packets.read(),
+                &self.state.config.read().surfaces,
                 bf.surface.as_deref(),
-                project_dir,
             );
             let filters = crate::server::progress::combine_dispatch_filters(
                 bf.filters.as_ref(),
@@ -2616,11 +2611,10 @@ impl BlackboxServer {
             let cwd = project_dir
                 .map(String::from)
                 .or(bro_match.team.project_dir.clone());
-            // §6: fold the brofile's surface verdict into its filters on resume too.
+            // §6: fold the brofile's surface into its filters on resume too.
             let surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.packets.read(),
+                &self.state.config.read().surfaces,
                 bf.surface.as_deref(),
-                cwd.as_deref(),
             );
             let filters = crate::server::progress::combine_dispatch_filters(
                 bf.filters.as_ref(),

@@ -79,7 +79,7 @@ The name inventory was extracted from `#[tool(name = "...")]` declarations,
 then checked for uniqueness and grouped by source owner. Router declaration
 count is 190, consistent with the concurrency lint count from the preceding
 implementation checks. This is a source declaration count, not a measurement
-of every possible packet-selected session catalog.
+of every possible surface-selected session catalog.
 
 Re-run the declaration scan after changing the router. Review changed parameter
 schemas and handler projections with their domain DTOs; the same persistence
@@ -112,14 +112,14 @@ Source `481b735df118` addresses the first surviving-surface correctness pass:
 | Gap mutations | Durable admission, project-scoped outstanding edits, publication identity checks, paired supersession validation, and first-publication admission | Concurrent and delivered-but-unpublished edits compose; stale readers cannot retire newer work; conflicting publications refuse |
 | Gap reads | Bounded diagnostic summaries with `debug=true` expansion | Typed degradation remains visible; exact rows preserve scope and publication authority |
 | Storage GC | Compact outcome counts with temporary immutable detail receipts | Partial effects survive later failures; receipt pagination cannot repeat collection; protected storage remains guarded |
-| Inbox | Bounded read-only attention groups | Retired spool and closeout options reject; read-only routing excludes packet-gap writes |
+| Inbox | Bounded read-only attention groups | Retired spool and closeout options reject; routing stays read-only |
 | Tool-call history | Bounded previews with indexed context handles | Instant-based timestamp filtering, explicit truncation, and context drill-down |
 | Installed agents | Callable discovery excludes retired adapters | Historical receipts remain readable and inactive; dispatch refuses with its existing typed error |
 
 The next deployed milestone, `769b1241c326`, adds publication-aware knowledge
-mutations, complete packet property pages, asynchronous and typed MCP surface
-inspection, and actual latest-assistant previews. Older tasks retain truthful
-result availability even without recoverable preview evidence. The response
+mutations, asynchronous and typed MCP surface inspection, and actual
+latest-assistant previews. Older tasks retain truthful result availability
+even without recoverable preview evidence. The response
 audit records full gates and live proofs; these contracts are adjusted.
 
 The surviving-surface audit remains partial. The following priorities describe

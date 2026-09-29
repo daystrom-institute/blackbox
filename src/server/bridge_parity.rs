@@ -129,11 +129,6 @@ mod harness {
         RegisteredAt,
         /// The overlay working fingerprint, derived from filesystem metadata.
         WorkingFingerprint,
-        /// The provenance export plan's `generation`: a SHA-256 over the
-        /// project id, the notes ref, and the document set. The document set
-        /// and the notes ref are pinned, so what varies is the project id -
-        /// the same per-run path hash, one indirection further on.
-        PlanGeneration,
         /// `last_unix_secs` / `last_success_unix_secs` on a checkout
         /// observation: the wall-clock second a counter last moved. The
         /// counter key-space, the exact counts, and the sequences are all
@@ -158,7 +153,6 @@ mod harness {
                 Self::RegistryProjectId => "<REGISTRY_PROJECT_ID>",
                 Self::RegisteredAt => "<REGISTERED_AT>",
                 Self::WorkingFingerprint => "<WORKING_FINGERPRINT>",
-                Self::PlanGeneration => "<PLAN_GENERATION>",
                 Self::ObservationWallClock => "<OBSERVED_AT_UNIX_SECS>",
                 Self::DaemonVersion => "blackboxd <DAEMON_VERSION>",
                 Self::HostStateDir => "<HOST_STATE_DIR>",
@@ -174,7 +168,6 @@ mod harness {
                 Self::RegistryProjectId => "hash of the per-run canonical fixture path",
                 Self::RegisteredAt => "registry stamps wall-clock time",
                 Self::WorkingFingerprint => "derived from filesystem metadata",
-                Self::PlanGeneration => "digest over the per-run registry project id",
                 Self::ObservationWallClock => "wall-clock second a counter last moved",
                 Self::DaemonVersion => "CARGO_PKG_VERSION, moves every release",
                 Self::HostStateDir => "host state directory outside the fixture",
@@ -892,41 +885,6 @@ mod harness {
         rows
     }
 
-    /// File provider: a relative `file:` ref resolved through the checkout
-    /// authority that section 9 assigns `RenderFileProvider`.
-    async fn file_provider_row(fixture: &BridgeFixture) -> Row {
-        let result = fixture
-            .server
-            .bbox_ref_size(Parameters(
-                bbox_mcp_tools::mcp_tools::ref_size::RefSizeParams {
-                    refs: vec!["file:README.md".into(), "file:missing.md".into()],
-                    project_dir: Some(fixture.base.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ))
-            .await;
-        row("file_provider", tool_row(&result), &[])
-    }
-
-    async fn blame_row(fixture: &BridgeFixture) -> Row {
-        let result = fixture
-            .server
-            .bbox_blame(Parameters(bbox_mcp_tools::mcp_tools::blame::BlameParams {
-                file: Some(
-                    fixture
-                        .base
-                        .join("README.md")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                line: Some(1),
-                entity_ref: None,
-                locality: None,
-            }))
-            .await;
-        row("blame", tool_row(&result), &[])
-    }
-
     async fn render_row(fixture: &BridgeFixture) -> Row {
         let result = fixture
             .server
@@ -938,43 +896,6 @@ mod harness {
             }))
             .await;
         row("render", tool_row(&result), &[Normalization::FixtureRoot])
-    }
-
-    async fn provenance_rows(fixture: &BridgeFixture) -> Vec<Row> {
-        let plan = fixture
-            .server
-            .bbox_provenance_export_plan(Parameters(
-                bbox_mcp_tools::mcp_tools::provenance_plan::ProvenanceExportPlanParams::default(),
-            ))
-            .await;
-        let export = fixture
-            .server
-            .bbox_provenance_export(Parameters(
-                bbox_mcp_tools::mcp_tools::provenance::ProvenanceParams {
-                    project_id: Some(fixture.registry_project_id.clone()),
-                },
-            ))
-            .await;
-        let import = fixture
-            .server
-            .bbox_provenance_import(Parameters(
-                bbox_mcp_tools::mcp_tools::provenance::ProvenanceParams {
-                    project_id: Some(fixture.registry_project_id.clone()),
-                },
-            ))
-            .await;
-        vec![
-            row(
-                "provenance_export_plan",
-                tool_row(&plan),
-                &[
-                    Normalization::RegistryProjectId,
-                    Normalization::PlanGeneration,
-                ],
-            ),
-            row("provenance_note_export", tool_row(&export), &[]),
-            row("provenance_note_import", tool_row(&import), &[]),
-        ]
     }
 
     /// Project administration on the bridge: the version-1 registry listing,
@@ -1349,29 +1270,6 @@ mod harness {
         }
     }
 
-    /// The plan generation digest, read out of the captured plan row itself.
-    fn plan_generation_substitutions(rows: &[Row]) -> Vec<Substitution> {
-        let Some(plan) = rows.iter().find(|row| row.name == "provenance_export_plan") else {
-            return Vec::new();
-        };
-        let Some(text) = plan.value.get("text").and_then(Value::as_str) else {
-            return Vec::new();
-        };
-        let Ok(body) = serde_json::from_str::<Value>(text) else {
-            return Vec::new();
-        };
-        body.get("generation")
-            .and_then(Value::as_str)
-            .map(|generation| {
-                vec![substitution(
-                    Normalization::PlanGeneration,
-                    generation,
-                    None,
-                )]
-            })
-            .unwrap_or_default()
-    }
-
     // ---------------------------------------------------------------------------
     // The blocking proof
     // ---------------------------------------------------------------------------
@@ -1409,13 +1307,7 @@ mod harness {
         fixture.cold_authorization();
         rows.extend(view_rows(&fixture).await);
         fixture.cold_authorization();
-        rows.push(file_provider_row(&fixture).await);
-        fixture.cold_authorization();
-        rows.push(blame_row(&fixture).await);
-        fixture.cold_authorization();
         rows.push(render_row(&fixture).await);
-        fixture.cold_authorization();
-        rows.extend(provenance_rows(&fixture).await);
         fixture.cold_authorization();
         rows.push(project_administration_row(&fixture));
         fixture.cold_authorization();
@@ -1428,9 +1320,9 @@ mod harness {
         // above actually took.
         rows.push(checkout_observation_row(&fixture));
 
-        // Section 14.4 names eleven surfaces. Asserting the inventory here is
-        // what stops a future edit from deleting a row and leaving a green
-        // harness that covers less than the plan requires.
+        // Asserting the section 14.4 surface inventory here is what stops a
+        // future edit from deleting a row and leaving a green harness that
+        // covers less than the plan requires.
         let expected: BTreeSet<&str> = [
             "publisher_authorization",
             "published_knowledge",
@@ -1439,12 +1331,7 @@ mod harness {
             "published_gaps",
             "own_gaps",
             "all_gaps",
-            "file_provider",
-            "blame",
             "render",
-            "provenance_export_plan",
-            "provenance_note_export",
-            "provenance_note_import",
             "project_administration",
             "watcher_carriers",
             "catalog_only_tools_refuse",
@@ -1463,7 +1350,6 @@ mod harness {
         // Wall-clock readings come from the captured observation row itself,
         // not from a second health read, so the substituted value is exactly
         // the one in the capture.
-        substitutions.extend(plan_generation_substitutions(&rows));
         substitutions.extend(observation_wall_clock_substitutions(&rows));
         let mut normalized = serde_json::Map::new();
         let mut observed = BTreeMap::new();

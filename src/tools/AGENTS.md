@@ -21,8 +21,8 @@
   pagination, projections, and detail reads; the server does not spill tool
   responses into files or assume the client shares its filesystem.
 - `bbox_knowledge`'s mixed response is deliberately progressive: durable
-  knowledge gets the primary top-N, while rule-packet and system-memory matches
-  are bounded sidecars with explicit expansion breadcrumbs. Do not "fix" recall
+  knowledge gets the primary top-N, while system-memory matches are a
+  bounded sidecar with explicit expansion breadcrumbs. Do not "fix" recall
   spill by changing match/rank semantics unless relevance is actually wrong;
   producer-side shape belongs in limits, signposts, and exact/list follow-ups
   (gap-c1c1b304).

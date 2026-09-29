@@ -17,7 +17,7 @@ Related:
 - [Locate-Information Coherence Path](locate-information-coherence.md) — parent arc; this is its Brick 3.
 - `src/mcp_tools/hybrid_search.rs` — `hybrid_search_typed`; the retrieval pipeline this harness grades.
 - `src/search/rrf.rs` — `fuse_rrf`. `src/search/rerank.rs` — `apply_rerank`.
-- `src/index/search.rs` — BM25 fetch (`hybrid_bm25_hits`); `bbox_search`.
+- `src/index/search.rs` - BM25 fetch (`hybrid_bm25_hits`).
 - `src/mcp_tools/inspect.rs`, `find_paths.rs`, `bundle_evidence.rs` — the traversal/bundling tools graded by Conditioned/EndToEnd modes.
 - `src/server/state.rs` — `SharedState::for_test`; isolated index construction for fixtures.
 - Spike provenance: `../daystrom-mk2/spikes/Daystrom.Spike.McpPoc/EvaluationHarness.cs`.
@@ -26,7 +26,7 @@ Related:
 
 Blackbox tunes retrieval blind. There is no instrument that answers "for a
 question whose answer we *know*, where in the pipeline did the answer get lost?"
-Without it, the coherence path's Brick 2 (indexing system memories/packets,
+Without it, the coherence path's Brick 2 (indexing system memories,
 demoting `bbox_knowledge` to a lens) would be asserted, not measured — and the
 RRF/rerank/dedup/diversify passes already in `hybrid_search_typed` are tuned by
 intuition. This harness is what let the Daystrom spike iterate on tiering and
@@ -71,10 +71,6 @@ entity that did not surface, classify **which stage dropped it**.
 10. **Modal diversification** — `diversify_by_chunk_kind(results, limit)`.
 11. **Truncate to `limit`.**
 
-`bbox_search` (transcript-only) is a simpler subset (BM25 + snippet, no vector
-fusion); the harness grades it with the same funnel minus the vector/fusion
-stages.
-
 ## The stage funnel (blackbox MissStage)
 
 For each expected entity not in the returned top-N, assign the **furthest stage
@@ -82,7 +78,7 @@ it reached**, in precedence order (highest = earliest loss):
 
 | Verdict | Reached as far as | Fix it points to |
 |---|---|---|
-| `NotIndexed` | no tantivy doc for the entity at all | **Brick 2** — the store isn't an indexed doc type (system memories, packets today) |
+| `NotIndexed` | no tantivy doc for the entity at all | **Brick 2**: the store isn't an indexed doc type (system memories today) |
 | `NotRetrieved` | indexed, but absent from both BM25 (even at depth `limit*32`) and vector fetch | lexical vs semantic gap — tokenizer, chunking, or embedding route; sub-tag `bm25_miss` / `vector_miss` |
 | `FusedTooLow` | present in a ranked list, but RRF ranked it below `fetch` | `RRF_K`, list weighting, the file-aggregation blend |
 | `RerankedDown` | survived fusion, but `apply_rerank` pushed it below kept entries | type/recency multipliers over-penalizing the entity's kind |
@@ -207,13 +203,11 @@ Steps 1–3 are the minimum that makes Brick 2 measurable; 4–6 deepen it.
 ## Open questions
 
 - **Suite authorship:** hand-author fixtures, or mine real
-  `sm-agentic-opening-sequence` / `bbox_cite` traces for question→answer pairs?
+  `sm-agentic-opening-sequence` / quoted-phrase `bbox_hybrid_search` traces for question→answer pairs?
 - **Held-out discipline:** who/what guarantees the held-out set stays unconsulted
   during tuning.
 - **Trace generality:** trace a single target per call (simple) vs all expected
   refs for a query in one pass (fewer re-runs, more bookkeeping).
-- **`bbox_search` parity:** one funnel with vector/fusion stages marked N/A for
-  transcript-only search, or a separate reduced funnel.
 
 ## Status
 

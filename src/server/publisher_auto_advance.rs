@@ -423,7 +423,7 @@ impl PublisherAutoAdvanceLedger {
 /// The audit reason a policy acceptance writes.
 ///
 /// It names the policy, the producer, and the source generation, so
-/// `bbox_audit` history distinguishes a policy acceptance from an operator
+/// audit history distinguishes a policy acceptance from an operator
 /// one without inspecting anything else.
 pub(crate) fn policy_audit_reason(producer_id: &str, source_generation_id: &str) -> String {
     let reason =

@@ -52,12 +52,14 @@ Target shape, in daemon configuration:
 ```toml
 [surfaces.interactive]
 disallow = ["bbox_project_*", "bbox_storage_*"]
-instructions = "..."
 
 [surfaces.readonly]
 allow = ["bbox_hybrid_search", "bbox_inspect_entity", "bbox_knowledge"]
-instructions = "..."
 ```
+
+Built-in surfaces live in `crates/bbox-config/src/default_surfaces.toml`;
+config tables override or add surfaces by name. Surface instructions are not
+carried: nothing delivered them to clients.
 
 - Same semantics as today: glob patterns; a non-empty `allow` is an
   allowlist; `disallow` wins over `allow`; an unknown surface is refused at

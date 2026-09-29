@@ -23,7 +23,7 @@ Bounds apply to the complete serialized tool result, including escaping/structur
 
 Write meaningful tests using isolated synthetic fixtures. Canonicalize tempdir roots, use SharedState::for_test, isolate real HOME/XDG, and hold test_env_lock for process-env mutation. Never inject real credentials or probe production mutations. Read-only inspection is fine; fixture tests are not live validation.
 
-Retirement recommendations do not authorize data deletion or broad callable-name removal. Correct misleading no-op outcomes/docs and report consumer-backed disposition; roadmap retirement and delivery/replay gaps remain separate. Preserve bbox_corpus_search's real harness consumer. Never expand work_* beyond workflow-internal tools.
+Retirement recommendations do not authorize data deletion or broad callable-name removal. Correct misleading no-op outcomes/docs and report consumer-backed disposition; roadmap retirement and delivery/replay gaps remain separate. Preserve the real harness consumer of corpus_search. Never expand work_* beyond workflow-internal tools.
 
 Do not restart/deploy shared services, send external messages, create sibling dispatches, prune tasks, or delete worktrees. Do not touch peer changes. Public artifacts must contain no private client identifiers, secrets, em dashes, or AI attribution.
 
@@ -37,10 +37,9 @@ Final report: branch, commit SHA, changed paths, acceptance cases/tests written,
 4. [Bounded graph discovery and exact schema detail](graph-projections.md), A04, A06, A10, A13.
 5. [Useful knowledge summaries and exact diagnostic recovery](knowledge-projections.md), A04, A05, A06, A08, A13.
 6. [Honest brofile and MCP configuration actions](configuration-contracts.md), A03, A04, A06, A08, A09, A10, A11.
-7. [Packet and MCP policy discovery bounds and validation](packet-surface-contracts.md), A03, A05, A06, A10, A13.
-8. [Maintenance selector parity and bounded diagnostic output](maintenance-contracts.md), A03, A06, A09, A10, A13, A14.
-9. [Compact publisher status with retained authority evidence](publisher-projections.md), A05, A06, A09, A10, A13.
-10. [Allocator persistence truth and safe specialist detail](specialist-outcomes.md), A04, A06, A10, A11, A12.
+7. [Maintenance selector parity and bounded diagnostic output](maintenance-contracts.md), A03, A06, A09, A10, A13, A14.
+8. [Compact publisher status with retained authority evidence](publisher-projections.md), A05, A06, A09, A10, A13.
+9. [Allocator persistence truth and safe specialist detail](specialist-outcomes.md), A04, A06, A10, A11, A12.
 
 The units can run concurrently. Each owns different implementation surfaces; the orchestrator resolves small shared documentation hunks during integration. No unit owns the audit record, gap status, or thread lifecycle. Runtime task/session handles are recorded in the existing host-local thread, not this durable prompt.
 

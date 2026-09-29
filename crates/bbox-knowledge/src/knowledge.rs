@@ -1989,9 +1989,8 @@ impl Knowledge {
             .filter(|e| e.status == Status::Active && !Self::is_expired(e))
     }
 
-    /// Immutable slice of all stored entries (any status) — used by
-    /// cross-store aggregators (inbox) that can't go through the MCP
-    /// layer.
+    /// Immutable slice of all stored entries (any status), for in-process
+    /// readers that can't go through the MCP layer.
     pub fn all_entries(&self) -> &[KnowledgeEntry] {
         &self.store.entries
     }

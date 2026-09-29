@@ -25,8 +25,8 @@ source material:
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | EdgeIndex | Graph projection over indexed docs plus live knowledge/thread/note stores |
 | Knowledge store | Durable rules, decisions, memories, notes, and render targets |
-| Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, whiteboards, and councils |
-| Artifact catalog | Installed workflows, atoms, packets, agents, and brofiles from `system-defaults/` |
+| Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, and councils |
+| Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
 
 The important boundary: operators maintain the daemon and its stores;
 agents consume the graph/search/tool surfaces through MCP.
@@ -41,7 +41,7 @@ agents consume the graph/search/tool surfaces through MCP.
 - Rebuildable projections are not durable state. The index, vectors,
   edges, and git metadata can be regenerated.
 - Durable JSON stores are the source of truth for knowledge, notes,
-  threads, projects, packets, artifacts, and bro runtime state.
+  threads, projects, artifacts, and bro runtime state.
 - Embedding routes are independent. A provider/model change on one route
   does not invalidate the other routes.
 

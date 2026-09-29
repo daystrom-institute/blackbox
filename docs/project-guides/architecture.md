@@ -22,8 +22,8 @@ Core MCP namespaces:
   `docs/refactor.md`).
 - `bro_*` - orchestration and dispatch primitives.
 
-Application workflows, atoms, Slack/Badgey integration, reactions and whiteboard
-execution are retired. External callers compose bro operations and use their
+Application workflows, atoms, Slack/Badgey integration and reactions are
+retired. External callers compose bro operations and use their
 harness for file, shell and Git work. `bbox_tool_calls` reads indexed history.
 
 ## Fast Orientation
@@ -45,12 +45,9 @@ Major code ownership boundaries:
   `find_paths`, evidence bundling, provenance).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
-- `threads.rs`, `notes.rs`, `inbox.rs`, `whiteboards.rs` - coordination
-  stores.
+- `threads.rs`, `notes.rs` - coordination stores.
 - `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
   injection and recursion guard.
-- `crates/bbox-system-events/` - observation journal and broadcast, without reactions.
-- `crates/bbox-whiteboards/` - historical records and project ownership adapters.
 - `config.rs` - config loader and env override allowlist.
 
 The `bbox-refactor` and `bbox-lsp` crates survive as libraries linked by the
@@ -98,7 +95,7 @@ Provider MCP registration is no longer implicitly rewritten on daemon startup.
 `BLACKBOX_MCP_NAME` for dispatch-time injection; persistent MCP config changes
 are user-owned or explicit through `bro_mcp`.
 
-Installed packets, brofiles and teams are catalog data. Discover them through
-the artifact list tool. Explicit retired-kind artifact filters expose historical
+Installed brofiles and teams are catalog data. Discover them through the
+artifact list tool. Explicit retired-kind artifact filters expose historical
 receipts without activating them.
 

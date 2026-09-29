@@ -2722,7 +2722,6 @@ mod tests {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store
@@ -2741,7 +2740,6 @@ mod tests {
             root.clone(),
             store,
             tail_tx,
-            None,
             None,
         );
         let fake = FakeFleetd::serve_with(
@@ -2817,7 +2815,6 @@ mod tests {
             state.tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         state
@@ -2854,7 +2851,6 @@ mod tests {
             store_dir,
             state.task_store.clone(),
             state.tail_tx.clone(),
-            None,
             None,
         ));
 
@@ -2930,7 +2926,6 @@ mod tests {
             state.task_store.clone(),
             state.tail_tx.clone(),
             None,
-            None,
         ));
 
         let server = crate::server::BlackboxServer::new(state.clone());
@@ -2978,7 +2973,6 @@ mod tests {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store
@@ -2996,7 +2990,6 @@ mod tests {
             root.clone(),
             store,
             tail_tx,
-            None,
             None,
         );
         let fake = FakeFleetd::serve_with(

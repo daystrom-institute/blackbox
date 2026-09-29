@@ -622,7 +622,7 @@ pub(crate) struct AcceptedPublicationPriorPointerV1 {
 pub(crate) struct AcceptedPublicationAutoAdvanceV1 {
     pub(crate) enabled: bool,
     /// The `audit_reason` of the operator advance that installed this
-    /// grant, retained so `bbox_audit` history can name the human act that
+    /// grant, retained so audit history can name the human act that
     /// authorized every later policy acceptance.
     pub(crate) granted_reason: String,
 }

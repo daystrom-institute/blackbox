@@ -501,8 +501,8 @@ raw image bytes leave the host as base64 data URLs in the
 `content_item`) - the same pixels stored in the local sidecar, sent once
 per unique content hash (dedup at the store layer means a re-chunked or
 duplicated image is not re-sent). No other export path exists: the
-sidecar itself is never served over HTTP, and `bbox_ref_size`/evidence
-bundling never include visual payload bytes. This is the same corpus-
+sidecar itself is never served over HTTP, and evidence bundling never
+includes visual payload bytes. This is the same corpus-
 export-policy posture text buckets already have (§ Design Principles,
 "multimodal makes image/video/PDF pixel export explicit and opt-in"),
 called out explicitly here because it is the first bucket whose export is

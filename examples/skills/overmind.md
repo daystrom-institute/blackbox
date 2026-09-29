@@ -1,6 +1,6 @@
 ---
 description: Meta-orchestration — strategic Advisor layer above crucible. Main-session Claude holds the arc's charter and spine; a dispatched orchestrator runs crucible internally; ensemble + implementer sit under the orchestrator. Survives orchestrator compaction by holding the strategic memory outside its boundary.
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_inbox, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_decide, mcp__blackbox__bbox_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_decide, mcp__blackbox__bbox_hybrid_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <arc goal / task description>
 ---
 
@@ -306,7 +306,7 @@ Maximum timeout — phases can run long. Advisor does not poll. When `bro_wait` 
 
 ```
 bbox_notes(thread_id=<arc_thread_id>, kind="done")
-bbox_inbox(project=<cwd>, limit=5)   // arc-scoped — surfaces anything unresolved
+bbox_notes(project=<cwd>, limit=5)   // project-scoped: surfaces anything unresolved
 ```
 
 **Do NOT** read full phase notes, full diffs, or individual implementer notes. Orchestrator summarized them in the report. Trust the summary.

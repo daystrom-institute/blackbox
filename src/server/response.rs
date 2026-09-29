@@ -42,7 +42,7 @@ impl BlackboxServer {
             Some("bbox_gaps") => {
                 "Use a smaller limit or an exact id; request full detail only for selected gaps."
             }
-            Some("bbox_hybrid_search" | "bbox_discover_seed_entities") => {
+            Some("bbox_hybrid_search") => {
                 "Use a smaller limit and narrower project/doc_type filters; omit debug detail."
             }
             Some("bbox_bundle_evidence") => {

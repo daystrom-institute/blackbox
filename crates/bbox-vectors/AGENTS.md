@@ -56,7 +56,7 @@ explicit design.
   ratios are noise; callers must not bypass it.
 - **Surfaces that must never stall behind a rebuild read
   `metrics_nonblocking()`** (try_read per partition, busy partitions
-  omitted) — the inbox attention layer does. Plain `metrics()` blocks
+  omitted), as hybrid search does. Plain `metrics()` blocks
   behind a write-lock hold for the rebuild's full duration.
 
 ## Rebuild and persistence semantics

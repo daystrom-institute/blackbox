@@ -7,7 +7,7 @@ topic:
   - operations
   - daemon-runtime
 tags: [artifacts, system-defaults, drift, distribution]
-brief: "Replace the manual 'install what you need' artifact stance with startup reconciliation: the daemon's distribution (container image or source checkout) carries system-defaults/, and boot advances the artifact catalog to bundled versions, version-forward, never touching operator-provenanced installs. Kills the artifact-drift class proved by the 2026-08 embed-compaction incident (the daemon ran 2026-05-30 artifacts for months; the nightly compaction arc's stale v1 packet silently no-opped for weeks)."
+brief: "Replace the manual 'install what you need' artifact stance with startup reconciliation: the daemon's distribution (container image or source checkout) carries system-defaults/, and boot advances the artifact catalog to bundled versions, version-forward, never touching operator-provenanced installs. Kills the artifact-drift class proved by the 2026-08 embed-compaction incident (the daemon ran 2026-05-30 artifacts for months; the nightly compaction arc silently no-opped for weeks)."
 ---
 
 # Distribution-synced system defaults
@@ -17,10 +17,10 @@ brief: "Replace the manual 'install what you need' artifact stance with startup 
 `system-defaults/system-defaults.md` stated the stance: "The daemon does not
 auto-install this tree. Install only the defaults you want." In practice the
 install set is frozen at first setup (2026-05-30 on the estate daemon) while
-the repo moves: the embed-compaction arc and its policy packet drifted two
-versions behind, and because v1 lacked the connectivity gate, the nightly
-maintenance cron silently no-opped for weeks while a vector partition
-degraded. With a handful of operators, manual upkeep is not a lane.
+the repo moves: the embed-compaction arc drifted two versions behind, and
+because v1 lacked the connectivity gate, the nightly maintenance cron
+silently no-opped for weeks while a vector partition degraded. With a handful
+of operators, manual upkeep is not a lane.
 
 ## Decision
 
@@ -35,8 +35,8 @@ deployed daemon can never run stale system artifacts.
   `BLACKBOX_SYSTEM_DEFAULTS_DIR`; empty/absent disables the sync.
 - **Reconcile at startup** (`open.rs`, after `ArtifactCatalog::open`, before
   cron/workflow restore so boot restores the corrected set): walk the bundled
-  tree, map leaf directories to artifact kinds (workflows, packets, crons,
-  brofiles, agents, atoms, teams, mcp-surfaces), and for each artifact:
+  tree, map leaf directories to artifact kinds (workflows, crons, brofiles,
+  agents, atoms, teams), and for each artifact:
   - absent from the catalog: install it.
   - installed at a lower version with system provenance (its recorded source
     is a system-defaults path or URL, or it was installed by a prior sync):

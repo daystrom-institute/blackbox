@@ -95,7 +95,7 @@ snapshot caps events at `MAX_PERSISTED_EVENTS = 50`
 (`src/orchestration/mod.rs:513`, applied in `serialize_snapshot` `:584`). So the
 daemon task store is **not** a durable full event log — full deep transcript
 history lives in the provider transcript files, locatable via
-`transcript_location` (the same files `bbox_search`/index read). The cockpit's
+`transcript_location` (the same files the `bbox_hybrid_search` index reads). The cockpit's
 soon-to-be-removed client mirror *did* persist all its mirrored events
 (`crates/bro-fleet-client/src/task.rs:170`); nothing inherits that role, and it
 should not — it was redundant with the provider transcripts.

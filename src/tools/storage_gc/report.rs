@@ -2,7 +2,6 @@ use super::{StorageGcDetail, StorageGcParams};
 use crate::server::state::SharedState;
 use crate::storage_health::GcResult;
 use anyhow::{Result, bail};
-use bbox_packets::PacketGcReport;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -81,9 +80,8 @@ pub(super) fn publish(
     result: GcResult,
     exclusions: Value,
     excluded_count: usize,
-    packets: Option<Result<PacketGcReport>>,
 ) -> Result<String> {
-    let (summary, details) = project(params.dry_run, result, exclusions, excluded_count, packets);
+    let (summary, details) = project(params.dry_run, result, exclusions, excluded_count);
     let receipt = Arc::new(Receipt {
         id: uuid::Uuid::new_v4().to_string(),
         owner: Arc::downgrade(owner),
@@ -101,7 +99,6 @@ fn project(
     result: GcResult,
     exclusions: Value,
     excluded_count: usize,
-    packets: Option<Result<PacketGcReport>>,
 ) -> (Value, Value) {
     let deleted: HashSet<&str> = result
         .deleted
@@ -117,35 +114,7 @@ fn project(
             total.saturating_add(candidate.bytes)
         });
     let delete_error_count = result.delete_errors.as_ref().map_or(0, Vec::len);
-    let (packet_summary, packet_details, packet_error_count) = match packets {
-        None => (json!({"status":"not_requested"}), Value::Null, 0),
-        Some(Err(error)) => (
-            json!({"status":"failed", "error_count":1}),
-            json!({"report":null, "errors":[format!("{error:#}")]}),
-            1,
-        ),
-        Some(Ok(report)) => {
-            let errors = report.errors.len();
-            let summary = json!({
-                "status": outcome(dry_run, errors > 0),
-                "scanned": report.scanned,
-                "duplicate_candidates": report.duplicate_candidates,
-                "deleted_count": if dry_run { 0 } else { report.deleted },
-                "would_delete_count": if dry_run { report.deleted } else { 0 },
-                "protected_by_refs": report.protected_by_refs,
-                "orphan_lock_candidates": report.orphan_lock_candidates,
-                "orphan_locks_removed": report.orphan_locks_removed,
-                "domain_count": report.per_domain.len(),
-                "error_count": errors,
-                "scope": "all",
-            });
-            let mut detail = json!(report);
-            detail.as_object_mut().unwrap().remove("applied");
-            detail["status"] = json!(outcome(dry_run, errors > 0));
-            (summary, json!({"report":detail}), errors)
-        }
-    };
-    let incomplete = delete_error_count > 0 || packet_error_count > 0;
+    let incomplete = delete_error_count > 0;
     let summary = json!({
         "status": outcome(dry_run, incomplete),
         "apply_requested": !dry_run,
@@ -164,7 +133,6 @@ fn project(
                 result.deletable_count.saturating_sub(deleted.len())
             },
         },
-        "packet_gc": packet_summary,
         "catalog_gc_exclusions": {
             "kind": exclusions["kind"],
             "protected_root_count": exclusions["roots"].as_array().map_or(0, Vec::len),
@@ -179,7 +147,6 @@ fn project(
     let details = json!({
         "result": edge_details,
         "catalog_gc_exclusions": exclusions,
-        "packet_gc": packet_details,
     });
     (summary, details)
 }
@@ -214,11 +181,8 @@ fn render(receipt: &Receipt, params: &StorageGcParams) -> Result<String> {
             StorageGcDetail::Deleted => Cow::Borrowed(&receipt.details["result"]["deleted"]),
             StorageGcDetail::Errors => Cow::Owned(json!({
                 "edge":receipt.details["result"]["delete_errors"],
-                "packets":receipt.details["packet_gc"]["report"]["errors"],
-                "packet_stage":receipt.details["packet_gc"]["errors"],
             })),
             StorageGcDetail::Exclusions => Cow::Borrowed(&receipt.details["catalog_gc_exclusions"]),
-            StorageGcDetail::Packets => Cow::Borrowed(&receipt.details["packet_gc"]),
             StorageGcDetail::Full => Cow::Borrowed(&receipt.details),
             StorageGcDetail::Summary => unreachable!(),
         };
@@ -240,7 +204,6 @@ fn render(receipt: &Receipt, params: &StorageGcParams) -> Result<String> {
 mod tests {
     use super::*;
     use crate::storage_health::{FileKind, GcCandidate};
-    use std::collections::BTreeMap;
 
     fn candidate(index: usize, deletable: bool) -> GcCandidate {
         GcCandidate {
@@ -272,21 +235,6 @@ mod tests {
             deletable_count: 2,
             deletable_bytes: 200,
             delete_errors: None,
-        }
-    }
-
-    fn packet_report() -> PacketGcReport {
-        PacketGcReport {
-            apply_requested: true,
-            applied: true,
-            scanned: 100,
-            deleted: 50,
-            protected_by_refs: 3,
-            orphan_locks_removed: 2,
-            orphan_lock_candidates: 2,
-            duplicate_candidates: 50,
-            errors: Vec::new(),
-            per_domain: BTreeMap::from([("fixture".into(), 50)]),
         }
     }
 
@@ -327,18 +275,13 @@ mod tests {
             "named_immutable_assets":2000,
             "roots":roots,
         });
-        let mut packets = packet_report();
-        packets.per_domain = (0..2000)
-            .map(|index| (format!("domain-{index}"), 1))
-            .collect();
-        let (summary, details) = project(false, result, exclusions, 5, Some(Ok(packets)));
+        let (summary, details) = project(false, result, exclusions, 5);
         let receipt = receipt(summary, details);
         let encoded = render(&receipt, &params(json!({}))).unwrap();
         assert!(encoded.len() < 2048, "{}", encoded.len());
         assert!(!encoded.contains("/daemon/"));
         assert!(!encoded.contains("/protected/"));
         assert!(!encoded.contains("large edge error"));
-        assert!(!encoded.contains("domain-1999"));
         let response: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(response["status"], "partial");
         assert!(response.get("applied").is_none());
@@ -358,59 +301,16 @@ mod tests {
             response["catalog_gc_exclusions"]["filtered_candidate_count"],
             5
         );
-        assert_eq!(response["packet_gc"]["domain_count"], 2000);
         assert!(response.get("body").is_none());
     }
 
     #[test]
-    fn packet_failure_does_not_erase_successful_edge_effects() {
-        let (summary, details) = project(
-            false,
-            edge_result(false),
-            json!({"kind":"exempt_fresh_origin"}),
-            0,
-            Some(Err(anyhow::anyhow!("cannot read packets"))),
-        );
-        assert_eq!(summary["status"], "partial");
-        assert!(summary.get("applied").is_none());
-        assert!(details["result"].get("applied").is_none());
-        assert_eq!(summary["apply_requested"], true);
-        assert_eq!(summary["result"]["deleted_count"], 2);
-        assert_eq!(summary["result"]["deleted_bytes_estimate"], 200);
-        assert_eq!(summary["packet_gc"]["status"], "failed");
-        assert_eq!(details["result"]["deleted"].as_array().unwrap().len(), 2);
-        assert_eq!(details["packet_gc"]["errors"][0], "cannot read packets");
-    }
-
-    #[test]
-    fn preview_and_partial_packet_results_are_not_claimed_as_applied() {
-        let (preview, _) = project(true, edge_result(true), Value::Null, 0, None);
+    fn preview_results_are_not_claimed_as_applied() {
+        let (preview, _) = project(true, edge_result(true), Value::Null, 0);
         assert_eq!(preview["status"], "dry_run");
         assert_eq!(preview["apply_requested"], false);
         assert_eq!(preview["result"]["deleted_count"], 0);
-        let (incomplete, _) = project(
-            true,
-            edge_result(true),
-            Value::Null,
-            0,
-            Some(Err(anyhow::anyhow!("preview failed"))),
-        );
-        assert_eq!(incomplete["status"], "incomplete");
-        assert_eq!(incomplete["apply_requested"], false);
-        let mut packets = packet_report();
-        packets.applied = false;
-        packets.errors.push("second deletion failed".into());
-        let (partial, details) =
-            project(false, edge_result(false), Value::Null, 0, Some(Ok(packets)));
-        assert_eq!(partial["status"], "partial");
-        assert_eq!(partial["packet_gc"]["deleted_count"], 50);
-        assert_eq!(partial["packet_gc"]["error_count"], 1);
-        assert!(details["packet_gc"]["report"].get("applied").is_none());
-        assert_eq!(
-            details["packet_gc"]["report"]["errors"][0],
-            "second deletion failed"
-        );
-        let (applied, _) = project(false, edge_result(false), Value::Null, 0, None);
+        let (applied, _) = project(false, edge_result(false), Value::Null, 0);
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["apply_requested"], true);
         assert!(applied.get("applied").is_none());
@@ -420,16 +320,9 @@ mod tests {
     fn detail_pages_recover_exact_json_and_reject_changed_receipt_or_selection() {
         let mut result = edge_result(false);
         result.delete_errors = Some(vec!["\u{0001}🦀\n".repeat(500)]);
-        let (summary, details) = project(false, result, json!({"roots":["protected"]}), 0, None);
+        let (summary, details) = project(false, result, json!({"roots":["protected"]}), 0);
         let receipt = receipt(summary, details);
-        for detail in [
-            "candidates",
-            "deleted",
-            "errors",
-            "exclusions",
-            "packets",
-            "full",
-        ] {
+        for detail in ["candidates", "deleted", "errors", "exclusions", "full"] {
             let mut request =
                 params(json!({"receipt_id":receipt.id, "detail":detail, "limit":usize::MAX}));
             let mut combined = String::new();
@@ -453,11 +346,8 @@ mod tests {
             let expected = match detail {
                 "candidates" => receipt.details["result"]["candidates"].clone(),
                 "deleted" => receipt.details["result"]["deleted"].clone(),
-                "errors" => {
-                    json!({"edge":receipt.details["result"]["delete_errors"],"packets":null,"packet_stage":null})
-                }
+                "errors" => json!({"edge":receipt.details["result"]["delete_errors"]}),
                 "exclusions" => receipt.details["catalog_gc_exclusions"].clone(),
-                "packets" => receipt.details["packet_gc"].clone(),
                 "full" => receipt.details.clone(),
                 _ => unreachable!(),
             };
@@ -478,7 +368,7 @@ mod tests {
     fn first_detail_response_keeps_effect_counts_but_receipt_pages_are_compact() {
         let mut result = edge_result(false);
         result.delete_errors = Some(vec!["failure after deletion".into()]);
-        let (summary, details) = project(false, result, Value::Null, 0, None);
+        let (summary, details) = project(false, result, Value::Null, 0);
         let receipt = receipt(summary, details);
         let first: Value = serde_json::from_str(
             &render(
@@ -546,13 +436,14 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let owner = Arc::new(SharedState::for_test(&root));
         let server = crate::server::BlackboxServer::new(Arc::clone(&owner));
+        let mut result = edge_result(false);
+        result.delete_errors = Some(vec!["original edge failure".into()]);
         let encoded = publish(
             &owner,
             &params(json!({"dry_run":false})),
-            edge_result(false),
+            result,
             json!({"kind":"exempt_non_catalog_store"}),
             0,
-            Some(Err(anyhow::anyhow!("original packet failure"))),
         )
         .unwrap();
         let original: Value = serde_json::from_str(&encoded).unwrap();
@@ -570,7 +461,7 @@ mod tests {
             assert_eq!(page["apply_requested"], true);
             assert!(page.get("result").is_none());
             let body: Value = serde_json::from_str(page["body"]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(body["packet_stage"][0], "original packet failure");
+            assert_eq!(body["edge"][0], "original edge failure");
         }
         let response = server
             .bbox_storage_gc(rmcp::handler::server::wrapper::Parameters(params(

@@ -140,9 +140,10 @@ registry, which MCP surfaces are reachable, which credentials are injected,
 which mounts and network the container gets, which operator-authority flags the
 brief carries. This is "has tools available," upgraded by isolation: **absence
 beats filtering.** No runtime surface evaluator runs inside the worker; the
-surface verdict (`evaluate_tool_surface`) is resolved at dispatch and enforced
-by construction. Policy *authoring* stays central — brofiles, surface packets,
-the artifact catalog — but enforcement ships with the dispatch.
+surface's visible tool set (from the configured surface table) is resolved at
+dispatch and enforced by construction. Policy *authoring* stays central
+(brofiles, daemon surface configuration, the artifact catalog), but
+enforcement ships with the dispatch.
 
 ### 4.2 Integration — what comes back out
 
@@ -167,9 +168,9 @@ audited at re-entry.**
 | Stays in the daemon | Why it passes |
 |---|---|
 | **The corpus** — tantivy, graph, embeddings, transcripts, blame/provenance | aggregates across projects, sessions, machines; workers query out-box |
-| **Shared stores** — knowledge, decisions, threads, notes, inbox, pins, roadmap, whiteboards | multi-writer state; daemon owns consistency and review lanes |
+| **Shared stores** - knowledge, decisions, threads, notes, pins, roadmap | multi-writer state; daemon owns consistency and review lanes |
 | **The orchestration singleton** — dispatch, teams, workflows, crons, cross-worker promise coordination, the seq-ordered steer/interrupt plane | singleton by definition; a worker cannot own the thing that owns workers |
-| **Ingress** — webhooks, pollers, system events | needs a stable address; ephemeral workers have none |
+| **Ingress** - webhooks, pollers | needs a stable address; ephemeral workers have none |
 | **Credential brokering** | keys are minted/injected per-dispatch, never baked into images (capability = tool + credential + scope) |
 | **The integration boundary** (§4.2) | the re-entry point into every shared store above |
 

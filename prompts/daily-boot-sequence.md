@@ -27,8 +27,7 @@ both get surfaced and triaged before new work starts.
    worktrees, reset/rebuild/reinstall the environment. Catches up to current code.
 2. **Survey residuals & net-news.** Run all three stores — they cover different
    things, so check each:
-   - `bbox_inbox` — the attention aggregator (unresolved notes, stale threads,
-     unverified knowledge, failed tasks).
+   - `bbox_notes` and `bro_dashboard`: unresolved notes and failed tasks.
    - `bbox_gaps(include_addressed=false)` — the open gap queue (feeds step 3).
    - `bbox_thread_list` — deferred work items waiting for pickup (each carries a
      cold-resume handoff).

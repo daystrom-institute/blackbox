@@ -15,7 +15,6 @@ use rmcp::{tool, tool_router};
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InstallableArtifactKind {
-    Packet,
     Brofile,
     Team,
 }
@@ -23,7 +22,6 @@ pub(crate) enum InstallableArtifactKind {
 impl From<InstallableArtifactKind> for crate::artifacts::ArtifactKind {
     fn from(kind: InstallableArtifactKind) -> Self {
         match kind {
-            InstallableArtifactKind::Packet => Self::Packet,
             InstallableArtifactKind::Brofile => Self::Brofile,
             InstallableArtifactKind::Team => Self::Team,
         }
@@ -95,8 +93,8 @@ fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> ser
 fn artifact_metadata_view(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
     serde_json::json!({
         "kind": meta.kind, "name": meta.name, "version": meta.version,
-        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
-        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Packet | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Packet | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
         "installed_at": meta.installed_at,
         "content_sha256": meta.content_sha256, "project_id": meta.project_id,
         "local": meta.local, "supersedes": meta.supersedes,
@@ -163,6 +161,7 @@ fn artifact_list_page(
             kind,
             crate::artifacts::ArtifactKind::Workflow
                 | crate::artifacts::ArtifactKind::Agent
+                | crate::artifacts::ArtifactKind::Packet
                 | crate::artifacts::ArtifactKind::Atom
                 | crate::artifacts::ArtifactKind::Cron
         )
@@ -221,7 +220,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a packet, brofile or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, atom and cron installation is retired."
+        description = "Install a brofile or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, packet, atom and cron installation is retired."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
@@ -392,7 +391,6 @@ mod tests {
     use super::*;
     use crate::artifacts;
     use crate::orchestration;
-    use crate::packets;
     use crate::server::routes::{install_artifact_value, restore_runtime_artifacts_from_catalog};
     use crate::server::state::SharedState;
     use serde_json::{Value, json};
@@ -528,6 +526,7 @@ mod tests {
         for kind in [
             artifacts::ArtifactKind::Workflow,
             artifacts::ArtifactKind::Agent,
+            artifacts::ArtifactKind::Packet,
             artifacts::ArtifactKind::Atom,
             artifacts::ArtifactKind::Cron,
         ] {
@@ -1061,127 +1060,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_packet_artifact_restores_runtime_registry_on_boot() {
+    async fn legacy_packet_artifact_is_retired_on_boot_restore_and_listing() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let packet_value: Value = serde_json::from_str(include_str!(
-            "../../system-defaults/agentic-corpus/packets/phase-decompose/dag-structure.json"
-        ))
-        .unwrap();
-
+        let packet = json!({
+            "domain": "legacy/rubric",
+            "version": 1,
+            "scope": "global",
+            "rules": [],
+        });
         server
             .state
             .artifacts
             .write()
             .install_value(
                 artifacts::ArtifactKind::Packet,
-                "system-defaults/agentic-corpus/packets/phase-decompose/dag-structure.json".into(),
-                &packet_value,
+                "legacy".into(),
+                &packet,
                 None,
                 None,
                 None,
             )
             .unwrap();
 
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:phase-decompose/dag-structure")
-                .is_err(),
-            "catalog-only install should not pre-populate the runtime packet registry"
-        );
-
-        let restored = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
-        assert_eq!(restored, 1);
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:phase-decompose/dag-structure")
-                .is_ok(),
-            "active packet artifact must compile into the runtime packet registry"
-        );
-
-        // Boot restore runs on every daemon start: re-running it must not
-        // mint another copy of an unchanged packet (the pre-fix behavior
-        // grew the store by one file per artifact per restart).
-        let count_after_first = server.state.packets.read().list_all().unwrap().len();
-        let restored_again = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
-        assert_eq!(restored_again, 1);
         assert_eq!(
-            server.state.packets.read().list_all().unwrap().len(),
-            count_after_first,
-            "second restore of an unchanged packet artifact must be idempotent"
+            restore_runtime_artifacts_from_catalog(&server.state).unwrap(),
+            0
         );
-    }
-
-    #[tokio::test]
-    async fn shipped_packet_audit_examples_pass() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let packets = [
-            "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json",
-            "system-defaults/agentic-corpus/packets/embed/compaction-policy.json",
-            "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.json",
-            "system-defaults/agentic-corpus/packets/bro-trust/per-brofile.json",
-            "system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.json",
-            "system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json",
-            "system-defaults/agentic-corpus/packets/contradiction/review-synthesis.json",
-            "system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.json",
-            "system-defaults/agentic-corpus/packets/eval/drift-policy.json",
-        ];
-        for rel in packets {
-            let path = root.join(rel);
-            let value: Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            install_artifact_value(
-                &server.state,
-                ArtifactInstallParams {
-                    kind: artifacts::ArtifactKind::Packet,
-                    source: rel.into(),
-                    name: None,
-                    version: None,
-                    supersedes: None,
-                },
-                value,
-            )
-            .await
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&artifacts::ArtifactListParams {
+                kind: None,
+                name: None,
+                include_superseded: false,
+            })
             .unwrap();
-        }
-
-        let audits = [
-            "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/embed/compaction-policy.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/bro-trust/per-brofile.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/auto-digest/entry-quality.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/contradiction/review-synthesis.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.audit_examples.json",
-            "system-defaults/agentic-corpus/packets/eval/drift-policy.audit_examples.json",
-        ];
-        let packet_store = server.state.packets.read();
-        for rel in audits {
-            let spec: Value =
-                serde_json::from_str(&std::fs::read_to_string(root.join(rel)).unwrap()).unwrap();
-            let rendered = packet_store
-                .audit_tool(&packets::AuditParams {
-                    packet_id: spec["packet_id"].as_str().unwrap().into(),
-                    dataset: spec["dataset"].clone(),
-                    mode: None,
-                })
-                .unwrap();
-            let report: Value = serde_json::from_str(&rendered).unwrap();
-            assert_eq!(
-                report["fidelity"].as_f64().unwrap(),
-                1.0,
-                "audit examples failed for {rel}: {rendered}"
-            );
-        }
+        let unfiltered: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
+        let page = artifact_list_page(rows.clone(), &unfiltered).unwrap();
+        assert!(page["artifacts"].as_array().unwrap().is_empty());
+        let filtered: ArtifactCatalogListParams =
+            serde_json::from_value(json!({"kind": "packet"})).unwrap();
+        let page = artifact_list_page(rows, &filtered).unwrap();
+        assert_eq!(page["artifacts"][0]["name"], "legacy/rubric");
+        assert_eq!(page["artifacts"][0]["retired"], true);
+        assert_eq!(page["artifacts"][0]["active"], false);
     }
 
     /// Agent receipts in catalogs written before the kind was retired: boot

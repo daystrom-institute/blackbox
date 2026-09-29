@@ -354,7 +354,6 @@ dependencies = [
  "bbox-git-source",
  "bbox-knowledge-source",
  "bbox-project-render",
- "bbox-provenance",
  "bro-rpc",
  "clap",
  "hex",
@@ -627,7 +626,6 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-corpus-core",
- "bbox-packets",
  "bbox-util",
  "dirs",
  "hex",
@@ -648,7 +646,6 @@ name = "bbox-git-source"
 version = "0.0.1"
 dependencies = [
  "bbox-corpus-core",
- "bbox-provenance",
  "hex",
  "serde",
  "serde_json",
@@ -669,21 +666,6 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "uuid",
-]
-
-[[package]]
-name = "bbox-inbox"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-gaps",
- "bbox-knowledge",
- "bbox-threads",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -709,9 +691,7 @@ dependencies = [
  "bbox-knowledge",
  "bbox-knowledge-source",
  "bbox-knowledge-source-store",
- "bbox-packets",
  "bbox-project-graph",
- "bbox-provenance",
  "bbox-slack",
  "bbox-stores",
  "bbox-threads",
@@ -836,7 +816,6 @@ dependencies = [
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-project-graph",
- "bbox-provenance",
  "bbox-providers",
  "bbox-system-memory",
  "bbox-util",
@@ -851,22 +830,6 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bbox-packets"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "chrono",
- "regex",
- "rmcp",
- "serde",
- "serde_json",
- "strum 0.26.3",
- "tempfile",
  "tracing",
 ]
 
@@ -901,22 +864,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-provenance"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "fs2",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
 name = "bbox-providers"
 version = "0.0.1"
 dependencies = [
@@ -927,10 +874,8 @@ dependencies = [
  "bbox-edge-index",
  "bbox-indexing",
  "bbox-knowledge",
- "bbox-packets",
  "bbox-system-memory",
  "bbox-threads",
- "bbox-whiteboards",
  "parking_lot",
  "serde_json",
  "tantivy",
@@ -979,20 +924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-source-graph"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "bbox-project-graph",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
-]
-
-[[package]]
 name = "bbox-stores"
 version = "0.0.1"
 dependencies = [
@@ -1010,22 +941,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "bbox-system-events"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "bbox-util",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1169,13 +1084,10 @@ dependencies = [
 name = "bbox-whiteboards"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "bbox-corpus-core",
- "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -1285,21 +1197,17 @@ dependencies = [
  "bbox-gaps",
  "bbox-git-source",
  "bbox-git-source-store",
- "bbox-inbox",
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-knowledge-source",
  "bbox-knowledge-source-client",
  "bbox-knowledge-source-store",
  "bbox-mcp-tools",
- "bbox-packets",
  "bbox-project-graph",
  "bbox-project-render",
- "bbox-provenance",
  "bbox-providers",
  "bbox-slack",
  "bbox-stores",
- "bbox-system-events",
  "bbox-system-memory",
  "bbox-threads",
  "bbox-tool-docs",
@@ -1411,7 +1319,6 @@ dependencies = [
  "axum",
  "bbox-corpus-core",
  "bbox-knowledge-source-client",
- "bbox-provenance",
  "bbox-util",
  "bro-core",
  "bro-fleet-client",
@@ -1435,6 +1342,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

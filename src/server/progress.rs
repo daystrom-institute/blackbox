@@ -161,7 +161,7 @@ pub(crate) fn resolve_dispatch_filters(
     // set; allow patterns add to the allow set. Recursion guard still wins
     // because allow doesn't override disallow at provider level.
     //
-    // Surface-packet governance for harness children
+    // Surface governance for harness children
     // (harness-process-boundary.md §3): the rmcp wire head filters
     // list_tools/call_tool by `?surface=`, while this client-side contribution
     // keeps built-ins and compatibility aliases under the same brofile verdict.

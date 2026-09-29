@@ -1146,9 +1146,6 @@ fn team_advisor_summary(advisor: &orchestration::team::TeamAdvisor) -> Value {
     if let Some(session) = &advisor.session_id {
         row["sessionId"] = json!(session);
     }
-    if let Some(packet) = &advisor.config.packet_id {
-        row["packetId"] = json!(packet);
-    }
     if !advisor.task_history.is_empty() {
         row["taskCount"] = json!(advisor.task_history.len());
     }
@@ -1661,7 +1658,6 @@ mod tests {
             context: Some("retained-context".repeat(1000)),
             halt_conditions: vec!["halt".repeat(1000)],
             exit_conditions: vec![],
-            packet_id: None,
             timeout_seconds: None,
             mode: Default::default(),
         };

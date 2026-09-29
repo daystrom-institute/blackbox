@@ -171,9 +171,7 @@ plan):
 - B6 the storage tools (`storage_health`, `storage_gc`,
   `storage_migration`): `ProjectRegistry::resolve` then raw pass-through on
   miss;
-- B7 packet project matching by exact string equality
-  (`bbox-packets/src/lib.rs`);
-- B8 `bbox_mcp_surface` passing `p.project` raw while the `/mcp?project=`
+- B7 `bbox_mcp_surface` passing `p.project` raw while the `/mcp?project=`
   wire head resolves through `resolve_project_context(Read)` and then falls
   back to the literal for parity.
 
@@ -186,8 +184,8 @@ arc already cut the path fallback.
 
 Store keying: coordination and knowledge stores key project scope by absolute
 canonical path strings. `project_ref_counts` and `migrate_project_refs` in
-`src/server/routes.rs` enumerate eleven stores (knowledge, threads, notes,
-pins, packets, slack channel bindings, slack proposal links, teams,
+`src/server/routes.rs` enumerate ten stores (knowledge, threads, notes,
+pins, slack channel bindings, slack proposal links, teams,
 whiteboards, pollers, crons). The Phase 1 inventory vocabulary
 `LegacyPathStoreKindV1` names fourteen logical owners (knowledge, gap,
 thread, note, pin, roadmap, packet, task, proposal, slack binding,
@@ -1277,7 +1275,7 @@ class taxonomy fixed here:
 | gaps | `bbox_gap`, `bbox_gaps`, resolve/update | same as knowledge | |
 | coordination | threads (x2 + roadmap promote), notes, pins, inbox, roadmap, whiteboards | write=Selection, list=Filter | the three direct `fleet_worktree_scope_and_dir` call sites route through the engine's worktree arm. |
 | graph/provenance | `bbox_ref_size`, `bbox_blame`, provenance export/import, `bbox_edge_compact` | Selection | B3 folded into the engine id arm. `bbox_edge_compact` keeps raw-id behavior on the v1 arm (tagged) and fails closed on unknown ids on the v2 arm. |
-| admin/storage | lifecycle tools (9.1), storage tools, `bbox_mcp_surface` | Selection (storage: Filter) | B6 raw pass-through preserved on v1 as documented compatibility, tagged; B8 aligned with H1: both resolve, both fall back to the literal on the v1 arm only. |
+| admin/storage | lifecycle tools (9.1), storage tools | Selection (storage: Filter) | B6 raw pass-through preserved on v1 as documented compatibility, tagged. |
 | slack/orchestration config | `bro_slack_bind`, `bro_mcp` project scope | Selection | B4/B5 route through the engine; unregistered-path storage behavior preserved on v1, tagged. |
 | HTTP | `/mcp?project=` | Filter | resolves via the engine; literal fallback v1-only, tagged. |
 | dispatch plane | `bro_*`/`work_*`/control-plane `cwd`/`project_dir` | none | out of scope: execution targets (section 3); only the existing ambient-pin resolution moves onto the engine wrapper it already uses. |
@@ -1290,10 +1288,11 @@ the observations the Phase 6 cut will consume.
 
 ### 9.3 Bespoke resolver retirement
 
-B1-B8 as listed in section 2.2 are each either reimplemented on the engine
-(B2, B3, B4, B5, B8), moved above the crate boundary (B1), or preserved as
+B1-B7 as listed in section 2.2 are each either reimplemented on the engine
+(B2, B3, B4, B5), moved above the crate boundary (B1), or preserved as
 tagged v1 compatibility semantics behind the engine (B6, the hash arm of
-B2). No bespoke selector code path survives outside the engine after P2-E;
+B2). B7 has no counterpart: MCP surfaces are daemon configuration and do not
+read a project selector. No bespoke selector code path survives outside the engine after P2-E;
 `resolve_project_context` and its helpers survive only as the internals of
 the v1 backend.
 

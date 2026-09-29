@@ -2248,90 +2248,6 @@ pub fn build_project_file_doc_for_source(
     doc
 }
 
-/// Resolve one absolute path inside an already-validated root to the entity
-/// ref of the chunk currently covering `byte_range`.
-///
-/// Identity is the durable project id alone (plan section 4.15): the
-/// resolution needs no path-bearing record, and taking one would let a
-/// caller's stale `canonical_path` reach a lower crate that must never
-/// discover a checkout for itself.
-pub fn resolve_current_chunk_entity(
-    project_id: &str,
-    root: &Path,
-    absolute_path: &Path,
-    byte_range: Option<(u64, u64)>,
-) -> Result<Option<EntityRef>> {
-    let relative_path = absolute_path.strip_prefix(root).unwrap_or(absolute_path);
-    let bytes = match read_regular_file_confined(root, relative_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-    resolve_chunk_entity_from_bytes(project_id, relative_path, &bytes, None, byte_range)
-}
-
-/// Resolve bytes from an exact collected generation to the current V2 chunk
-/// covering `byte_range`. The caller verifies the immutable blob and supplies
-/// its activation snapshot, so this path never needs a checkout root.
-pub fn resolve_collected_chunk_entity(
-    project_id: &str,
-    relative_path: &Path,
-    bytes: &[u8],
-    snapshot_id: &str,
-    byte_range: Option<(u64, u64)>,
-) -> Result<Option<EntityRef>> {
-    resolve_chunk_entity_from_bytes(
-        project_id,
-        relative_path,
-        bytes,
-        Some(snapshot_id),
-        byte_range,
-    )
-}
-
-fn resolve_chunk_entity_from_bytes(
-    project_id: &str,
-    relative_path: &Path,
-    bytes: &[u8],
-    snapshot_id: Option<&str>,
-    byte_range: Option<(u64, u64)>,
-) -> Result<Option<EntityRef>> {
-    if is_binary(relative_path, bytes) {
-        return Ok(None);
-    }
-    let registry = chunker::default_registry();
-    let sniff_len = bytes.len().min(4096);
-    let Some(format) = registry
-        .iter()
-        .find(|chunker| chunker.claims(relative_path, &bytes[..sniff_len]))
-    else {
-        return Ok(None);
-    };
-    let (chunks, _edges) = format.chunk(relative_path, bytes)?;
-    let chunks = bound_chunks(&finalize_chunks(project_id, relative_path, chunks));
-    let selected = byte_range
-        .and_then(|(start, _end)| {
-            chunks
-                .iter()
-                .find(|chunk| chunk.byte_start <= start && start <= chunk.byte_end)
-        })
-        .or_else(|| chunks.first());
-    Ok(selected.map(|chunk| match snapshot_id {
-        Some(snapshot_id) => EntityRef::ProjectFileV2 {
-            project_id: chunk.project_id.clone(),
-            snapshot_id: snapshot_id.to_string(),
-            rel_path_hash: chunk.rel_path_hash.clone(),
-            chunk_hash: chunk.chunk_hash.clone(),
-            occurrence_idx: chunk.occurrence_idx,
-        },
-        None => EntityRef::ProjectFile {
-            project_id: chunk.project_id.clone(),
-            rel_path_hash: chunk.rel_path_hash.clone(),
-            chunk_hash: chunk.chunk_hash.clone(),
-            occurrence_idx: chunk.occurrence_idx,
-        },
-    }))
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum ProjectFileAction {
     /// mtime+size+materialization version all match — leave as-is.
@@ -4194,8 +4110,8 @@ mod tests {
         // (verified live: `ts_language_for_name("html")` resolves via
         // tree-sitter-language-pack). `HtmlChunker` MUST be registered
         // before `CodeChunker` in `chunker::default_registry()` for the
-        // registry's first-match `find()` (see `index_project` /
-        // `resolve_current_chunk_entity` above) to route .html/.htm/.xhtml
+        // registry's first-match `find()` (see `index_project` above) to
+        // route .html/.htm/.xhtml
         // through prose sectioning rather than code-symbol extraction. This
         // guards that ordering at the registry-integration level, not just
         // inside bbox-chunker's own unit tests.

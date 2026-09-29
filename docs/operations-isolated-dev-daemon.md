@@ -53,7 +53,7 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Legacy pin rows read by the project catalog migration |
 | `BLACKBOX_PROJECTS_PATH` | `<state_dir>/projects.json` | Project registry |
 | `BLACKBOX_GAPS_PATH` | `<state_dir>/blackbox-gaps.json` | Gap notes store |
-| `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Compiled rule packets |
+| `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Packet records the project catalog inventories; nothing else reads them |
 | `BLACKBOX_ARTIFACTS_DIR` | `<state_dir>/artifacts` | Artifact catalog |
 | `BRO_HOME` | `<state_dir>/bro` | Bro orchestration state |
 | `BLACKBOX_VECTORS_PATH` | platform state dir `blackbox/vectors` (NOT below `state_dir`) | Vector store |

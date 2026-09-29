@@ -13,14 +13,13 @@ use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
-use crate::packets::Packets;
 use crate::producer_claims::ProducerClaims;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, config, edge_index, index, orchestration, path_cache, slack_channel_bindings,
-    slack_proposal_links, system_events, system_memory, tool_docs, vectors, whiteboards,
+    slack_proposal_links, system_memory, tool_docs, vectors,
 };
 
 pub(super) struct OpenedServer {
@@ -258,11 +257,6 @@ pub(super) fn open_shared_state(
     // open the platform default while the migration inventory and the
     // retirement discharge read the configured root.
     vectors::install_global_root(cfg.paths.vectors_path.clone());
-    // Push the config-resolved git-notes namespace into the corpus-core
-    // foundation crate (dependency inversion: corpus-core must not reach up into
-    // blackbox::config). Absent this, git::notes_namespace falls back to the
-    // BBOX_GIT_NOTES_NAMESPACE env var, then "bbox".
-    crate::git::set_notes_namespace(cfg.provenance.git_notes_namespace.clone())?;
     let cfg_arc = Arc::new(RwLock::new(cfg.clone()));
 
     let roots = discover_transcript_roots(&cfg, home);
@@ -300,10 +294,6 @@ pub(super) fn open_shared_state(
     let knowledge_transport_observations =
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
-        )?;
-    let blame_locality_observations =
-        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::open(
-            store_dir.join("blame-locality-observations.json"),
         )?;
     let render_locality_observations =
         bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::open(
@@ -343,19 +333,6 @@ pub(super) fn open_shared_state(
         } else {
             bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(
             )
-        },
-    );
-    let blame_locality_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| anyhow::anyhow!("blame locality cutover startup gate: {error}"))?
-        } else {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default()
         },
     );
     let render_locality_cutover = Arc::new(
@@ -637,7 +614,7 @@ pub(super) fn open_shared_state(
 
     // Gap store mirrors the kb repo-owned model. Load every registered repo's
     // committed `.bbox/gaps/` into the query surface BEFORE any producer
-    // (bbox_packet_gap, gap-spool import) can save — a save with the repo's
+    // (gap-spool import) can save — a save with the repo's
     // gaps not yet loaded would treat the in-memory set as authoritative and
     // purge committed `.bbox/gaps/` files for a repo-owned project.
     let gaps_path = cfg.paths.gaps_path.clone();
@@ -730,10 +707,6 @@ pub(super) fn open_shared_state(
         _ => unreachable!("the store probe selects exactly one project authority"),
     };
 
-    let packets_dir = cfg.paths.packets_dir.clone();
-    let packets_store = Packets::open(&packets_dir)?;
-    tracing::info!("Packets store: {}", packets_dir.display());
-
     let artifacts_dir = cfg.paths.artifacts_dir.clone();
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
@@ -819,6 +792,11 @@ pub(super) fn open_shared_state(
             tracing::info!(%message, "legacy edge migration recovery completed");
         }
     }
+
+    // Retired transcript file-touch rows leave the durable lanes once, before
+    // graph authority is captured. The store-level marker makes every later
+    // start a single stat.
+    purge_file_touch_edges_at_startup(&edges_dir)?;
 
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,
@@ -975,7 +953,6 @@ pub(super) fn open_shared_state(
         ),
         checkout_access,
         knowledge_transport_observations,
-        blame_locality_observations,
         render_locality_observations,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
@@ -995,8 +972,6 @@ pub(super) fn open_shared_state(
         catalog_gap_published_cache: RwLock::new(Default::default()),
         project_graph_views: RwLock::new(Default::default()),
         publisher_authorization_cache: RwLock::new(Default::default()),
-        packets: RwLock::new(packets_store),
-        surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
@@ -1009,7 +984,6 @@ pub(super) fn open_shared_state(
         knowledge_sources,
         git_transport_cutover,
         knowledge_transport_cutover,
-        blame_locality_cutover,
         render_locality_cutover,
         code_source_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
@@ -1024,8 +998,6 @@ pub(super) fn open_shared_state(
         roster_tx,
         roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: store_dir.clone(),
-
-        whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
 
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         drain: super::drain::DrainState::open(&store_dir),
@@ -1044,9 +1016,6 @@ pub(super) fn open_shared_state(
             vectors::VectorStore::open_unloaded(cfg.paths.vectors_path.clone())
                 .expect("default vector store placeholder should open"),
         ),
-        system_events: Arc::new(system_events::EventHub::new(
-            system_events::EventStore::new(&store_dir),
-        )),
     });
     shared.install_code_read_view_commit_hook();
 
@@ -1124,6 +1093,24 @@ pub(super) fn open_shared_state(
         bind_host,
         bind_is_loopback,
     })
+}
+
+/// Pre-bind purge of retired file-touch rows from the durable edge lanes.
+fn purge_file_touch_edges_at_startup(
+    edges_dir: &Path,
+) -> anyhow::Result<bbox_edge_sidecar::file_touch_purge::FileTouchPurgeStats> {
+    let stats = bbox_edge_sidecar::file_touch_purge::purge_retired_file_touch_edges(edges_dir)
+        .context("pre-bind file-touch edge purge failed")?;
+    if stats.lanes_scanned > 0 {
+        tracing::info!(
+            lanes_scanned = stats.lanes_scanned,
+            lanes_rewritten = stats.lanes_rewritten,
+            rows_removed = stats.rows_removed,
+            bytes_removed = stats.bytes_removed,
+            "retired file-touch edge rows purged"
+        );
+    }
+    Ok(stats)
 }
 
 fn sync_tool_docs(kb: &mut Knowledge) -> bool {
@@ -1299,6 +1286,30 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// The startup purge is the daemon's pass over a real edge root: a
+    /// store carrying file-touch rows loses them and is marked, and the
+    /// next start opens no lane.
+    #[test]
+    fn startup_purges_file_touch_rows_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let edges_dir = temp.path().canonicalize().unwrap().join("edges");
+        let lane = edges_dir
+            .join("observed")
+            .join("p_00000000000000000000000000000001.jsonl");
+        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        let bash = r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact"}"#;
+        let read = r#"{"source":{"type":"task","task_id":"one"},"kind":"READ_FILE","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"heuristic"}"#;
+        std::fs::write(&lane, format!("{read}\n{bash}\n")).unwrap();
+
+        let first = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert_eq!(first.rows_removed, 1);
+        assert_eq!(std::fs::read_to_string(&lane).unwrap(), format!("{bash}\n"));
+
+        let second = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert!(second.already_complete);
+        assert_eq!(second.lanes_scanned, 0);
+    }
+
     #[test]
     fn bridge_mode_never_opens_the_accepted_publication_runtime() {
         let temp = tempfile::tempdir().unwrap();
@@ -1390,6 +1401,88 @@ mod tests {
                 .project_id,
             record.project_id
         );
+    }
+
+    /// A state directory holding a packet tree (records, their lock files,
+    /// the event log) and packet artifacts opens and restores cleanly. No
+    /// store opens the tree, boot restore skips the retired artifact kind,
+    /// and both project-catalog owner captures still parse the legacy rows.
+    #[test]
+    fn a_state_dir_holding_a_legacy_packet_store_opens() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotStateV1,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let packets = root.join("packets");
+        std::fs::create_dir_all(packets.join("global")).unwrap();
+        std::fs::create_dir_all(packets.join("project")).unwrap();
+        std::fs::write(
+            packets.join("global/packet-0000000a.json"),
+            br#"{"id":"packet-0000000a","domain":"legacy/rubric","scope":"global","rules":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(packets.join("global/packet-0000000a.json.lock"), b"").unwrap();
+        std::fs::write(
+            packets.join("project/packet-0000000b.json"),
+            br#"{"id":"packet-0000000b","domain":"legacy/triage","scope":"project","project":"/legacy/repo","rules":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            packets.join("events.jsonl"),
+            b"{\"op\":\"compile\",\"outcome\":\"ok\"}\n",
+        )
+        .unwrap();
+        let tree_before = std::fs::read(packets.join("project/packet-0000000b.json")).unwrap();
+        crate::artifacts::ArtifactCatalog::open(&root)
+            .unwrap()
+            .install_value(
+                crate::artifacts::ArtifactKind::Packet,
+                "legacy".into(),
+                &serde_json::json!({"domain":"legacy/rubric","version":1,"scope":"global","rules":[]}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let state = Arc::new(SharedState::for_test(&root));
+        assert_eq!(
+            crate::server::routes::restore_runtime_artifacts_from_catalog(&state).unwrap(),
+            0
+        );
+
+        let limits = OwnerSnapshotLimitsV1::default();
+        let artifacts =
+            crate::artifacts::capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+        assert!(
+            matches!(artifacts.state, OwnerSnapshotStateV1::Present { .. }),
+            "{:?}",
+            artifacts.state
+        );
+        let tree =
+            bbox_indexing::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(
+                &packets, limits,
+            )
+            .unwrap();
+        assert!(
+            matches!(tree.state, OwnerSnapshotStateV1::Present { .. }),
+            "{:?}",
+            tree.state
+        );
+        assert!(
+            tree.rows
+                .iter()
+                .any(|row| row.stable_row_id == "packet-0000000b"),
+            "{:?}",
+            tree.rows
+        );
+        assert_eq!(
+            std::fs::read(packets.join("project/packet-0000000b.json")).unwrap(),
+            tree_before
+        );
+        assert!(packets.join("events.jsonl").is_file());
     }
 
     #[test]

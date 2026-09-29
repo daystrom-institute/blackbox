@@ -112,10 +112,7 @@ pub fn extract_legacy_sidecar(edges_dir: &Path, project_id: &str) -> Result<Extr
                     }
                 }
                 EdgeProvenance::Explicit => {
-                    let is_tool = edge.kind == "READ_FILE"
-                        || edge.kind == "EDITED_FILE"
-                        || edge.kind == "RAN_BASH";
-                    if is_tool {
+                    if edge.kind == "RAN_BASH" {
                         result.observed_edges.push(edge);
                     } else {
                         result.explicit_edges.push(edge);
@@ -186,13 +183,7 @@ fn stage_legacy_sidecar(
                         result.derived_dropped += 1;
                         continue;
                     }
-                    EdgeProvenance::Explicit
-                        if edge.kind == "READ_FILE"
-                            || edge.kind == "EDITED_FILE"
-                            || edge.kind == "RAN_BASH" =>
-                    {
-                        true
-                    }
+                    EdgeProvenance::Explicit if edge.kind == "RAN_BASH" => true,
                     _ => false,
                 };
                 let (destination, name) = if observed_lane {
@@ -878,7 +869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
-        let obs = serde_json::to_string(&observed_edge("k_obs", "READ_FILE", "k_target")).unwrap();
+        let obs = serde_json::to_string(&observed_edge("k_obs", "RAN_BASH", "k_target")).unwrap();
         write_legacy(edges_dir, "p1", &[&obs]);
 
         let result = extract_legacy_sidecar(edges_dir, "p1").unwrap();
@@ -934,8 +925,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let exp = serde_json::to_string(&explicit_edge("k_exp", "SUPERSEDES", "k_old")).unwrap();
-        let obs =
-            serde_json::to_string(&observed_edge("k_obs", "EDITED_FILE", "k_target")).unwrap();
+        let obs = serde_json::to_string(&observed_edge("k_obs", "RAN_BASH", "k_target")).unwrap();
         let der = serde_json::to_string(&derived_edge("k_der", "DESCRIBES", "k_target")).unwrap();
         write_legacy(edges_dir, "p1", &[&exp, &obs, &der, "bad json"]);
         write_managed_replacement(edges_dir, "p1");

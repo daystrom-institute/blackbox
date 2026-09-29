@@ -389,7 +389,7 @@ fn census_owner_stores(
         ),
         (
             "packet-rows",
-            bbox_packets::capture_project_catalog_owner_snapshot(
+            crate::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(
                 &owners.packet_root,
                 limits.durable_owners,
             ),

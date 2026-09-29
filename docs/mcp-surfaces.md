@@ -2,13 +2,12 @@
 
 A **surface** is a named view of the daemon's MCP tools.
 
-Use surfaces when different callers should connect to the same daemon but see
-different tool catalogs: a read-only reviewer, an executor with write tools, an
-audit-only observer, or an internal workflow actor.
+Use surfaces when different callers connect to the same daemon but should see
+different tool catalogs: a read-only reviewer, a dispatched bro, an interactive
+coding session, or an operator.
 
 Surfaces are not roles, not permissions, not per-user ACLs. They are named
-configurations that filter the tool list and optionally inject surface-scoped
-instructions into the caller's context.
+filters over the tool list.
 
 ---
 
@@ -18,148 +17,66 @@ Surface selection is a URL parameter:
 
 ```
 http://127.0.0.1:7264/mcp?surface=readonly
-http://127.0.0.1:7264/mcp?surface=reviewer
-http://127.0.0.1:7264/mcp?surface=executor
+http://127.0.0.1:7264/mcp?surface=ops
 ```
 
-`/mcp` with no parameter is equivalent to `?surface=default`. The `default` surface
-passes every tool through unchanged.
+`/mcp` with no parameter is equivalent to `?surface=default`.
 
-The daemon reads the surface once during the MCP `initialize` handshake and binds it
-for the lifetime of the session. All subsequent `list_tools`, `call_tool`, and
-`get_tool` frames in that session use the bound surface.
+The daemon reads the surface once during the MCP `initialize` handshake,
+computes the session's visible tool set, and binds it for the lifetime of the
+session. All subsequent `list_tools`, `call_tool`, and `get_tool` frames in
+that session use it.
 
-### Provider alias registration
+## Built-in surfaces
 
-Rather than asking every agent to remember the URL parameter, register named surface
-aliases as separate MCP server entries via `bro_mcp`:
+The built-in table lives in `crates/bbox-config/src/default_surfaces.toml`:
 
-```
-bro_mcp(action="add", name="blackbox-readonly",
-        url="http://127.0.0.1:7264/mcp?surface=readonly",
-        scope="global")
-```
+| Surface | Caller |
+| --- | --- |
+| `default` | External clients (Claude Code, Codex CLI) and ordinary dispatches |
+| `interactive` | Fleet cockpit sessions |
+| `agent-internal` | Workflow-owned dispatches |
+| `readonly` | Reviewers, evaluators and observers (allowlist) |
+| `ops` | Operators: the full catalog |
 
-The broker then dispatches with `--mcp blackbox-readonly` (or equivalent per provider)
-instead of the full URL. Brofiles and workflow steps can reference the alias by name.
+## Configuring surfaces
 
----
+A `[surfaces.<name>]` table in the daemon config file overrides the built-in
+surface of the same name or adds a new one:
 
-## Defining surfaces with packets
+```toml
+[surfaces.default]
+disallow = ["bbox_project_*", "bbox_storage_*"]
 
-Surfaces are evaluated by the same packet routing machinery used for webhooks, pollers,
-and workflow gates. The packet domain is `mcp-surface/routing`.
-
-A surface packet receives an entity describing the incoming `initialize` call
-(the `surface` id, the client's `user_agent`, and the `project` from context). It
-returns a verdict from the lattice `["tool_surface", "deny"]`:
-
-| Verdict | Effect |
-|---|---|
-| `tool_surface` | Session proceeds; surfaces contains `allow`, `disallow`, and `instructions` |
-| `deny` | MCP `initialize` fails with the verdict's `reason`. The client is rejected outright, not given an empty catalog. |
-
-### Verdict shape
-
-```json
-{
-  "kind": "tool_surface",
-  "allow": ["bbox_hybrid_search", "bbox_inspect_entity", "bbox_knowledge"],
-  "disallow": ["bro_exec", "bro_resume", "bbox_learn", "bbox_decide"],
-  "instructions": "You are operating in read-only mode. Do not propose writes."
-}
+[surfaces.reviewer]
+allow = ["bbox_hybrid_search", "bbox_inspect_entity", "bbox_knowledge"]
 ```
 
-`allow` and `disallow` support glob patterns. An empty `allow` list passes all tools;
-a non-empty `allow` list is an explicit allowlist - only listed tools are visible.
-`disallow` always takes precedence over `allow`.
-
-### Example packet
-
-```json
-{
-  "id": "surface-readonly",
-  "domain": "mcp-surface/routing",
-  "description": "Read-only surface: search and inspect, no writes",
-  "rules": [
-    {
-      "when": { "surface": "readonly" },
-      "verdict": {
-        "kind": "tool_surface",
-        "disallow": [
-          "bbox_learn", "bbox_remember", "bbox_decide",
-          "bbox_note", "bbox_note_resolve", "bbox_forget",
-          "bbox_thread", "bbox_render", "bbox_absorb",
-          "bro_exec", "bro_resume",
-          "bro_orchestrate_run", "bro_orchestrate_author",
-          "bbox_artifact_install"
-        ],
-        "instructions": "Read-only surface. Inspect and search freely; do not propose writes."
-      }
-    }
-  ]
-}
-```
-
-Install the packet:
-
-```
-bbox_artifact_install(kind="packet", source=".bbox/packets/surface-readonly.json")
-```
-
----
+- Patterns are globs over tool names. Bare names (`bbox_learn`), prefixed
+  names (`mcp__blackbox__bbox_learn`) and provider spellings
+  (`blackbox(bbox_learn)`) all match.
+- A non-empty `allow` is an allowlist; an empty `allow` passes every tool not
+  disallowed.
+- `disallow` always wins over `allow`.
+- Surfaces load with daemon configuration; a change applies on restart.
 
 ## Enforcement
 
-Enforcement is layered so filtering can't be bypassed:
+- **`initialize`** refuses a surface missing from the table
+  (`tool surface denied: unknown MCP surface: <name>`). The session is not
+  established.
+- **`list_tools`** returns only the surface's visible tools.
+- **`call_tool`** rejects calls to hidden tools, even when the caller knows the
+  tool name.
+- **Dispatch**: a brofile's `surface` selector folds the same surface into the
+  dispatched child's tool filters, so a child session is governed exactly like
+  a wire caller. An unknown surface denies every tool. The recursion guard
+  applies on top.
 
-- **`list_tools`** - returns only the tools the surface allows. Hidden tools are
-  invisible to the caller.
-- **`call_tool`** - rejects calls to hidden tools with a clear error, even if the
-  caller somehow knows the tool name. The filter is not advisory.
-- **`deny` verdict** - causes `initialize` to fail immediately. The session is not
-  established; the caller receives the denial reason. Use `deny` for surfaces that
-  should never be reachable except from an authorized dispatch path.
+## Operator tools
 
----
-
-## Debug and replay
-
-```
-bbox_mcp_surface(action="replay", surface="readonly")
-```
-
-Returns the packet evaluation result without establishing a session:
-
-- **entity** - the synthesized `initialize` entity the packet received
-- **verdict** - the raw verdict from the winning rule (or the default pass-through)
-- **visible_tools** - the filtered tool list after applying the verdict
-
-Use `replay` to validate a surface packet before deploying it, or to diagnose why
-a specific tool is or isn't visible to a given surface.
-
----
-
-## Surface-scoped brofile dispatch
-
-When dispatching a brofile into a surface-restricted context, pass the surface alias
-as the MCP server reference rather than the default `blackbox` entry:
+Tools hidden from agent-facing surfaces stay reachable on `ops`:
 
 ```
-bro_exec(brofile="reviewer", mcp_servers=["blackbox-readonly", ...])
+bro mcp call <tool> '<json>' --surface ops
 ```
-
-The executor sees only the readonly tool catalog for its entire session. Combined with
-the `disallow` filter on `bro_*` tools in the default recursion guard, this creates
-a layered defense: the surface filter is a packet-configured control plane, while the
-recursion guard is a mechanical invariant applied at argument construction.
-
----
-
-## Status
-
-MCP surfaces are designed and the packet machinery is in place, but the surface
-binding at `initialize` and the `call_tool` enforcement layer are still in progress.
-
-The `bbox_mcp_surface(action="replay")` debug tool is available now and will correctly
-simulate the packet evaluation as the enforcement layer lands.

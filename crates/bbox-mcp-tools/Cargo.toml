@@ -46,7 +46,6 @@ bbox-indexing = { path = "../bbox-indexing" }
 bbox-project-graph = { path = "../bbox-project-graph" }
 bbox-providers = { path = "../bbox-providers" }
 bbox-embed = { path = "../bbox-embed" }
-bbox-provenance = { path = "../bbox-provenance" }
 
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }

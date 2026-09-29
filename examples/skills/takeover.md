@@ -1,6 +1,6 @@
 ---
 description: Take over driving an existing agent session — composed of thread init (ensure a bbox work-item thread exists with full scope) and thread run (drive the agent against that scope). Threads persist across sessions and accumulate context from each takeover.
-allowed-tools: mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_session, mcp__blackbox__bbox_messages, mcp__blackbox__bbox_search, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_dashboard, Agent, Read, Glob, Grep, Bash, AskUserQuestion
+allowed-tools: mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_session, mcp__blackbox__bbox_messages, mcp__blackbox__bbox_hybrid_search, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_dashboard, Agent, Read, Glob, Grep, Bash, AskUserQuestion
 argument-hint: <session name | session UUID | thread- prefix>
 ---
 

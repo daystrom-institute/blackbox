@@ -8,8 +8,8 @@ Plain Markdown map for navigating the system memory runbooks from Obsidian.
 This note is not loaded as a runtime `sm-*` system memory.
 
 Files in `system-defaults/memories/` use bare slugs such as
-`rule-packets.md`; runtime IDs use the `sm-` prefix, such as
-`sm-rule-packets`.
+`gap-notes.md`; runtime IDs use the `sm-` prefix, such as
+`sm-gap-notes`.
 
 ## Retrieval And Corpus Navigation
 
@@ -31,17 +31,6 @@ Files in `system-defaults/memories/` use bare slugs such as
   discipline.
 - [sm-gap-notes](gap-notes.md) - reporting missing substrate capabilities.
 
-## Packets And Deterministic Judges
-
-- [sm-rule-packets](rule-packets.md) - compile reusable mechanisms from
-  examples or rules.
-- [sm-review-packets](review-packets.md) - code review and PR triage packet
-  patterns.
-- [sm-auth-packets](auth-packets.md) - authorization and access-table packet
-  patterns.
-- [sm-design-packets](design-packets.md) - design proposal ranking and
-  iteration packets.
-
 ## Bro execution and historical records
 
 - [sm-bro-dispatch-patterns](bro-dispatch-patterns.md) - exec, resume, wait,
@@ -50,7 +39,6 @@ Files in `system-defaults/memories/` use bare slugs such as
   provider-default suppression, and minimal probe/team validation.
 - [sm-workflow-orchestration](workflow-orchestration.md) - caller composition and historical workflow records.
 - [sm-atoms](atoms.md) - retired atom execution and replacements.
-- [sm-whiteboards](whiteboards.md) - historical evidence and preserved visibility.
 
 ## Refactor Mechanization
 

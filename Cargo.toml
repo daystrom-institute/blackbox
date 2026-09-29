@@ -29,7 +29,6 @@ members = [
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
     "crates/bbox-project-graph",
-    "crates/bbox-source-graph",
     "crates/bbox-code-source",
     "crates/bbox-code-source-store",
     "crates/bbox-code-collector",
@@ -46,13 +45,11 @@ members = [
     "crates/bbox-knowledge-source",
     "crates/bbox-knowledge-source-client",
     "crates/bbox-knowledge-source-store",
-    "crates/bbox-provenance",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
     "crates/bbox-chunker",
     "crates/bbox-lsp",
     "crates/bbox-refactor",
-    "crates/bbox-packets",
     "crates/bbox-system-memory",
     "crates/bbox-whiteboards",
     "crates/bbox-util",
@@ -63,11 +60,9 @@ members = [
     "crates/bbox-project-render",
     "crates/bbox-threads",
     "crates/bbox-gaps",
-    "crates/bbox-inbox",
     "crates/bbox-slack",
     "crates/bbox-edge-index",
     "crates/bbox-tool-docs",
-    "crates/bbox-system-events",
     "crates/bbox-indexing",
     "crates/bbox-providers",
     "crates/bbox-embed",
@@ -129,12 +124,10 @@ bbox-git-source = { path = "crates/bbox-git-source" }
 bbox-git-source-store = { path = "crates/bbox-git-source-store" }
 bbox-knowledge-source = { path = "crates/bbox-knowledge-source" }
 bbox-knowledge-source-store = { path = "crates/bbox-knowledge-source-store" }
-bbox-provenance = { path = "crates/bbox-provenance", default-features = false }
 bbox-corpus-index = { path = "crates/bbox-corpus-index" }
 bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
 bbox-chunker = { path = "crates/bbox-chunker" }
-bbox-packets = { path = "crates/bbox-packets" }
 bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
@@ -235,11 +228,9 @@ bbox-knowledge = { path = "crates/bbox-knowledge" }
 bbox-project-render = { path = "crates/bbox-project-render" }
 bbox-threads = { path = "crates/bbox-threads" }
 bbox-gaps = { path = "crates/bbox-gaps" }
-bbox-inbox = { path = "crates/bbox-inbox" }
 bbox-slack = { path = "crates/bbox-slack" }
 bbox-edge-index = { path = "crates/bbox-edge-index" }
 bbox-tool-docs = { path = "crates/bbox-tool-docs" }
-bbox-system-events = { path = "crates/bbox-system-events" }
 bbox-indexing = { path = "crates/bbox-indexing" }
 bbox-providers = { path = "crates/bbox-providers" }
 bbox-embed = { path = "crates/bbox-embed" }

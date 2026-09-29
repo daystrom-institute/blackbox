@@ -85,7 +85,7 @@ superseded_by: "<filename>.md — <rationale>"  # optional
 | `corpus` | `blackbox-design` | `blackbox-design` | required; matches the directory. Outlier: `corpus: project-refactor` (1 file) |
 | `lifecycle` | — | required | one of `proposed`, `partial`, `archived`. Observed extension: `superseded` (5 files), typically paired with `superseded_by:` — see the shared chassis doc for the disposition |
 | `topic` | required | required | list, mirrors the directory path minus the corpus root; see the shared chassis doc for the convention |
-| `tags` | optional (10 hubs) | optional (45 leaves) | open-vocabulary list of hyphenated lowercase tokens (`refactor-tools`, `java`, `rust`, `pathology`, `mcp`, `atoms`, `integrations`, `slack`, `obsidian`, `lsp`, `jdtls`, `roslyn`, `beam`, `elixir`, `csharp`, `gap-notes`, `whiteboard`, `chunker`, `implemented-atoms`, …) |
+| `tags` | optional (10 hubs) | optional (45 leaves) | open-vocabulary list of hyphenated lowercase tokens (`refactor-tools`, `java`, `rust`, `pathology`, `mcp`, `atoms`, `integrations`, `slack`, `obsidian`, `lsp`, `jdtls`, `roslyn`, `beam`, `elixir`, `csharp`, `gap-notes`, `chunker`, `implemented-atoms`, …) |
 | `brief` | recommended | recommended | one-line human summary; what the Obsidian graph previews |
 | `date` / `updated` / `revision` | — | optional | ISO-8601 date / human revision note; observed on a minority of leaves |
 | `supersedes` / `superseded_by` | — | optional | free-text pointer to a successor or predecessor doc; `superseded_by` is the more common direction |

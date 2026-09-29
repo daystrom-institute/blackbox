@@ -1,6 +1,6 @@
 # Retired Slack integration
 
-Blackbox no longer ships a Slack bridge, Slack collector or Slack writing tools. Already indexed conversation evidence remains available through bbox_search, bbox_context and bbox_messages. Retirement preserves historical source ownership; it does not enroll new conversation producers.
+Blackbox no longer ships a Slack bridge, Slack collector or Slack writing tools. Already indexed conversation evidence remains available through bbox_hybrid_search, bbox_context and bbox_messages. Retirement preserves historical source ownership; it does not enroll new conversation producers.
 
 Blackbox retains bro execution, resume, cancellation, status and waits. The
 caller owns sequencing, gates, retries, schedules and integrations, using its

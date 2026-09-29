@@ -42,7 +42,7 @@ controls stay outside the template as provider launch policy.
 
 There is no new context workflow runtime, context graph, hook registry, or
 session context object in v1. When turn construction needs dynamic work, it
-uses existing atom and rule-packet machinery as an explicit context producer
+uses existing atom machinery as an explicit context producer
 (workflow-backed producers ship later — see Context Producers).
 
 ## Goals
@@ -66,8 +66,8 @@ uses existing atom and rule-packet machinery as an explicit context producer
   only gets heavier when an actor node or brofile explicitly names one.
 - Do not store provider transcript content in blackbox for continuity. Provider
   sessions already own conversation continuity.
-- Do not replace MCP tool filtering or `bbox_mcp_surface`; tool policy remains a
-  separate dispatch concern.
+- Do not replace MCP tool filtering or configured MCP surfaces; tool policy
+  remains a separate dispatch concern.
 
 ## Brofile Schema
 
@@ -135,8 +135,8 @@ Resolution rules:
 `template_ref` resolves through the installed artifact catalog during brofile
 validation or dry-run. v1 adds a new `Prompt` variant to `ArtifactKind` in
 `src/artifacts.rs` so prompt templates participate in the same install / list /
-supersede / remove lifecycle as workflows, packets, brofiles, agents, atoms,
-teams, and crons. Missing refs fail closed. Runtime dispatch may use a cached
+supersede / remove lifecycle as workflows, brofiles, agents, atoms, teams,
+and crons. Missing refs fail closed. Runtime dispatch may use a cached
 resolved template body/hash from validation, but dry-run must still show the
 ref, source path, trust scope, and content hash.
 
@@ -368,7 +368,7 @@ Producer failure policy is **per-turn opt-in**, default render-without:
   failure on `bro_exec` returns `error.context_producer_failed` and
   leaves the task store, lease table, and system-event log unchanged.
   Suitable for governance producers whose output is load-bearing (e.g.
-  a packet-derived completion contract a reviewer brofile depends on).
+  a completion contract a reviewer brofile depends on).
 
 `fail` is a v1 flag, not a future knob. Brofile authors choose the mode
 that matches the producer's role; the default protects long-lived bros
@@ -387,9 +387,6 @@ Context producers reuse the existing atom machinery:
 - v1 producers are **deterministic atoms** or **adapter atoms** only.
   Workflow-backed atoms are excluded from `context_producer` in v1 — see
   the "Workflow producers deferred" subsection below.
-- Rule packets remain deterministic classifiers/gates inside the atom.
-  They select, validate, or stop context population; they do not fetch
-  data by themselves.
 
 Bro dispatch invokes a producer through the atom runtime and consumes only
 its declared output contract. It does not interpret atom internals or MCP
@@ -434,7 +431,7 @@ re-check; registry-time enforcement is the single source of truth.
 
 For atom signposting, the reusable producer can be an atom such as
 `atom:context/atom-signposts@v1`. Internally, that atom can call `atom_search`,
-optionally call `atom_describe`, apply a packet to cap/filter results, and
+optionally call `atom_describe`, cap/filter results, and
 return `template_inputs.atom_signposts`.
 
 The matching template can decide how much of that material to expose:
@@ -708,18 +705,10 @@ Producer section depends on the `producers` argument on `bro_context`:
 Dry-run is non-dispatching and non-mutating end-to-end under
 `producers: "run"`:
 
-- The producer **must not** emit system events, write to the task store,
-  the resume-lease table, the knowledge store, threads, notes,
-  roadmap, or whiteboards, and **must not** call agent-dispatching tools.
-  System events are durable in current code (`EventHub::emit` at
-  `src/system_events/hub.rs:319` appends to the journal,
-  `src/system_events/store.rs:74` writes and `sync_all`s it, and
-  `src/system_events/hub.rs:324,359` enqueues matching reactions). The
-  producer effect model already forbids agent-dispatching tools and all
-  durable-write tools at registry time; the dry-run runtime adds a
-  blanket "suppress system event emission for this producer invocation"
-  guard at the dispatch layer so even legitimate read-only event reads
-  do not turn into writes through reaction side effects.
+- The producer **must not** write to the task store, the resume-lease
+  table, the knowledge store, threads, notes, or roadmap, and **must not**
+  call agent-dispatching tools. The producer effect model already forbids
+  agent-dispatching tools and all durable-write tools at registry time.
 - The producer input carries `dry_run: true` so atoms with optional
   internal bookkeeping (telemetry counters, etc.) can branch if they
   choose. v1 producers are expected to behave identically in either
@@ -751,7 +740,8 @@ user refs resolve only within configured user prompt roots. Do not make prompt
 templates a new agent/atom execution surface. They are text renderers.
 
 v1 adds a `Prompt` variant to the `ArtifactKind` enum in `src/artifacts.rs`
-(currently `Workflow`, `Packet`, `Brofile`, `Agent`, `Atom`, `Team`, `Cron`).
+(currently `Workflow`, `Packet`, `Brofile`, `Agent`, `Atom`, `Team`, `Cron`;
+`Packet` is retired and never installs).
 Prompt templates participate in the same install / list / supersede / remove
 lifecycle as other artifacts so `template_ref` has a real backing catalog
 entry; resolution does not depend on filesystem layout alone.

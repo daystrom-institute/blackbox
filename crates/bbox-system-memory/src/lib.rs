@@ -58,8 +58,8 @@ pub fn init_for_tests() {
     init_for_tests_from(&defaults);
 }
 
-/// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
-/// bare slug (`rule-packets`) for ergonomics.
+/// Lookup by exact ID. Accepts either canonical form (`sm-gap-notes`) or
+/// bare slug (`gap-notes`) for ergonomics.
 pub fn get(id: &str) -> Option<&'static SystemMemory> {
     catalog().get(id)
 }

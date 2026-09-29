@@ -10,7 +10,6 @@
 // cfg(test) too, and scripts/lint-concurrency.sh is the syntactic backstop.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 pub mod artifacts;
-pub mod attention;
 mod body_page;
 pub mod bro_helpers;
 pub mod bro_params;
@@ -21,9 +20,7 @@ pub mod doctor;
 pub mod gaps;
 pub mod graph;
 pub mod knowledge;
-pub mod mcp_surface;
 pub mod notes;
-pub mod packets;
 pub mod project_catalog;
 pub mod project_config;
 pub mod projects;

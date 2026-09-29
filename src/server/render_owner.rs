@@ -163,7 +163,7 @@ pub(crate) fn select_render_owner(
 /// would let an owner complete the render.
 pub(crate) fn owner_required_message(project_id: &str, detail: Option<&str>) -> String {
     let mut message = format!(
-        "error.render_locality_required: no checkout owner covers project {project_id}, so its project render has nowhere to apply. Enroll the checkout with the code collector on the host that holds it (bbox-code-collector add <path> there, or bbox_project_register with that producer); once its collector polls the project render lane, retry this call. Onboarding guide: {ONBOARDING_RESOURCE}"
+        "error.render_locality_required: no checkout owner covers project {project_id}, so its project render has nowhere to apply. Enroll the checkout with the code collector on the host that holds it (bbox-code-collector add <path> there, or ask the operator to run `bro mcp call bbox_project_register '{{\"path\":\"<path>\",\"producer\":\"<producer>\"}}' --surface ops`); once its collector polls the project render lane, retry this call. Onboarding guide: {ONBOARDING_RESOURCE}"
     );
     if let Some(detail) = detail {
         message.push_str(&format!(" (daemon checkout access: {detail})"));

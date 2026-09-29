@@ -22,10 +22,7 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > thread, allocator/cooldown off-path, /tail decoration caches, harness
 > session persist via spawn_blocking) and the §4.5 RosterView. Wave 7 added
 > bro_dashboard on RosterView, the poll-time histogram builder opt-in, and
-> atomic harness session writes. Wave 8 (2026-06-10) closed the MCP wire-head
-> tax: SurfaceDecisionCache (generation-validated, packet-store scans off the
-> request path) + idempotent packet-artifact boot restore + duplicate-packet
-> GC. Wave 9 landed **Phase 2**: the §4.3 IndexWriterActor
+> atomic harness session writes. Wave 9 landed **Phase 2**: the §4.3 IndexWriterActor
 > (src/index/writer_actor.rs) — all in-process tantivy writes serialize
 > through one actor thread; the reindex pass executes inside the actor with
 > phase-boundary drains; bbox_reindex unified onto the same pass; the
@@ -52,8 +49,8 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > measured before/after and the revisit trigger). Status-snapshot publication
 > is dropped (roster/status stayed ~1ms under every load test). REMAINING:
 > Phase 4 enforcement (lint design delivered, unimplemented) and the audit's
-> next-tier I2 instances (apply_patch, enter/exit_worktree, whiteboards,
-> bro_mcp, gaps persister).
+> next-tier I2 instances (apply_patch, enter/exit_worktree, bro_mcp, gaps
+> persister).
 > File:line citations are point-in-time from the original survey at commit
 > 9cb5228; verify against code.
 
@@ -104,8 +101,8 @@ tasks.json; this doc generalizes it.
 | Generation | Stores | Idiom | Pathology |
 |---|---|---|---|
 | 1: lock-everything | notes, threads, kb (central), pins, roadmap, projects | full-store pretty-print JSON + `sync_all` + rename, executed **under the `SharedState` RwLock write guard AND a blocking flock, on a tokio worker** (e.g. src/tools/notes.rs:19 → src/notes.rs:281 → src/json_store.rs:38) | every reader of that store stalls behind an fsync; worker thread blocked; flock has no timeout |
-| 2: per-file | knowledge (repo-owned), gaps, packets, badgey proposals/journal, whiteboards, councils | per-item file + atomic rename, narrower locks | better isolation; still fsync on tokio workers |
-| 3: journal/actor | task_store (`TaskPersister`), system_events (append-only JSONL + outbox worker) | in-memory mutate under brief lock; coalesced off-thread persist | **the correct pattern** — the only stores with no read-stall-behind-fsync |
+| 2: per-file | knowledge (repo-owned), gaps, badgey proposals/journal, councils | per-item file + atomic rename, narrower locks | better isolation; still fsync on tokio workers |
+| 3: journal/actor | task_store (`TaskPersister`) | in-memory mutate under brief lock; coalesced off-thread persist | **the correct pattern** - the only store with no read-stall-behind-fsync |
 
 ### 1.3 Indexing plane
 
@@ -124,7 +121,7 @@ tasks.json; this doc generalizes it.
 ### 1.4 Dispatch/harness hot path (per stream event)
 
 Per event: `task.inner` Mutex (parse, supervision, sink updates — bounded,
-correct) → roster broadcast → tail broadcast → fire-and-forget system event.
+correct) → roster broadcast → tail broadcast.
 But also: **`inner.events.push(evt.clone())` with no in-memory cap** (the
 50-event cap is persist-only); synchronous tee-file `writeln!` on the tokio
 worker per line (src/orchestration/mod.rs:2644); allocator lease lookup +
@@ -138,9 +135,6 @@ locked/unlocked once (inconsistent double-read).
 - `/control/roster` locks **every task's `inner` Mutex in a loop** per poll.
 - `/tail` does **filesystem team-history lookups per streamed event**
   (src/server/tail.rs:151).
-- `bbox_inbox` holds **five store read guards in parallel** — any single store
-  writer (i.e. any note/thread/kb mutation mid-fsync) stalls the whole
-  attention surface.
 - The MCP 80KB response cap byte-truncates JSON into invalid JSON
   (src/server/response.rs:45) — the original fleet "poller stall" root cause,
   still latent for any large `ok_json` producer.
@@ -156,8 +150,7 @@ of one of six anti-patterns:
   (gen-1 stores); `inner` Mutex across event-tail serialization (`bro_status`).
 - **P3. Competing writers for a single-writer resource.** Fresh tantivy
   writers vs. the reindex pass; LockBusy as a *normal* outcome.
-- **P4. Stacked guards on read fan-in.** inbox (5 guards), edge rebuild
-  (6 guards), roster (N inner Mutexes per poll).
+- **P4. Stacked guards on read fan-in.** edge rebuild (6 guards), roster (N inner Mutexes per poll).
 - **P5. Unbounded growth / clone-heavy hot paths.** `inner.events` Vec;
   full-event clones per ingest.
 - **P6. Transport-layer truncation of structured data.** The 80KB cap
@@ -180,16 +173,16 @@ These are the rules new code must satisfy and migration drives old code toward:
   by convention.
 - **I4 — Mutate fast, persist async, ack by class.** In-memory mutation under
   a brief lock; persistence requested from the owner actor. Two durability
-  classes: **telemetry** (tasks, system-event fanout, slack continuity) acks
+  classes: **telemetry** (tasks, slack continuity) acks
   immediately, write-behind + coalescing; **operator-durable** (knowledge,
-  threads, notes, gaps, roadmap, pins, projects, packets, artifacts) acks only
+  threads, notes, gaps, roadmap, pins, projects, artifacts) acks only
   after the actor reports durable — callers await off-worker completion, so a
   `bbox_learn` that returned ok survives a crash.
 - **I5 — Bounded memory, defined overflow.** Per-task in-memory event ring
   (the transcript file is the source of truth for full history); every channel
   bounded or budgeted with an explicit overflow policy.
 - **I6 — The control plane reads snapshots, never contends.** Status, roster,
-  tail decoration, and inbox are served from materialized views or
+  and tail decoration are served from materialized views or
   sequentially-taken short reads — never stacked guards, never the ingest-path
   Mutex, never another plane's writer lock.
 - **I7 — Size at the producer; the transport never corrupts.** Responses are
@@ -270,10 +263,9 @@ Per-event ingest keeps the per-task `inner` Mutex (it is brief and correct) but:
 
 ### 4.5 Control plane
 
-`bbox_inbox` takes sequential short reads (an attention surface needs no
-cross-store consistency point). `/tail` decoration reads a cached team-ref map
+`/tail` decoration reads a cached team-ref map
 maintained on dispatch events instead of per-event file I/O. Heavy sync tools
-(`bbox_search`, `bbox_code_*`, `bbox_refactor_plan`, `bbox_reindex`) become
+(`bbox_hybrid_search`, `bbox_code_*`, `bbox_refactor_plan`, `bbox_reindex`) become
 async handlers wrapping `spawn_blocking`. `cap_response_text` gains the I7
 JSON-aware envelope.
 
@@ -345,7 +337,7 @@ fleet load, and Phases 0–2 remove the amplifiers first.
 - **In-memory event ring size** and whether `recentEvents` semantics change
   visibly for `bro_status tail=N` consumers (fleet client expects the current
   shape; budget already truncates, so a ring ≥ budget is shape-compatible).
-- **Whether gen-2 per-file stores (gaps, packets, badgey) also route through
+- **Whether gen-2 per-file stores (gaps, badgey) also route through
   the persister** or keep direct per-file writes behind `spawn_blocking` —
   their isolation is already decent; I2 compliance may be all they need.
 
@@ -357,5 +349,5 @@ fleet load, and Phases 0–2 remove the amplifiers first.
 - The harness–daemon boundary doc (design/bro-harness/harness-daemon-boundary.md)
   is upstream context: in-process consolidation is *why* harness load now
   shares the daemon runtime, which is what makes I1/I2 load-bearing.
-- `TaskPersister` + the system-events journal/outbox are prior art for the
+- `TaskPersister` is prior art for the
   owner-actor pattern; this doc generalizes rather than invents.

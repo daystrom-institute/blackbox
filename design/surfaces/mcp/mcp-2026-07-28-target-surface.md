@@ -144,7 +144,7 @@ fleetd task ownership, auth) and collected in the Decisions section.
    (tasks, resources) are projections that accelerate capable clients, not
    replacements that fork the contract.
 3. **Resources are the browse plane.** Catalogs with durable IDs and JSON
-   bodies (brofiles, teams, artifacts, atoms, packets, live tasks) get
+   bodies (brofiles, teams, artifacts, atoms, live tasks) get
    URI-addressable read projections with protocol cursor pagination. Writes
    stay tools; MCP resources are read-only, which matches our mutation
    tools' existing audit/gating shape.
@@ -187,9 +187,10 @@ Scope channels, ranked by client reach:
 
 ### Consequences
 
-- The `SurfaceDecisionCache` is already shared and generation-keyed; the
-  per-request hit path is two lock reads. Surface evaluation cost is
-  unchanged in practice.
+- Surfaces are a static configuration map fixed for the daemon's lifetime;
+  per-request resolution is a map lookup, and each surface's visible tool
+  set can be computed once. Surface resolution cost is unchanged in
+  practice.
 - The OnceLock session-pinning footgun class is deleted: no pinned pair to
   forget to pass (gap-310c36b6), no half-initialized session answering tool
   lists.
@@ -201,13 +202,13 @@ Scope channels, ranked by client reach:
   keys off the project registry, identity stores, and the provisional lane,
   never daemon-local fs/git walks. That makes the required shared cache
   (keyed by raw selector) trivially remote-safe. Invalidation: generation-
-  keyed like `SurfaceDecisionCache` with a short TTL backstop; this is a
+  keyed with a short TTL backstop; this is a
   write-authority decision, so staleness has a security flavor. (Open
   question Q4.)
-- Deny semantics change: with no `initialize` to abort, a denied surface
-  fails per-method. Recommended: deny at `server/discover` AND per-method
-  (defense in depth), so misconfiguration is loud, not a silent empty tool
-  list. (Open question Q5.)
+- Deny semantics change: with no `initialize` to abort, an unknown surface
+  fails per-method. Recommended: refuse it at `server/discover` AND
+  per-method (defense in depth), so misconfiguration is loud, not a silent
+  empty tool list. (Open question Q5.)
 - Stateless is a **deployment prerequisite**, not just cleanup: a remote
   corpus daemon wants restarts, an LB, maybe replicas, and stateful MCP
   sessions pin clients to one process. 2026-07-28 stateless plus
@@ -315,10 +316,11 @@ connections (bro_wait long-polls, progress ticks) die to LB idle timeouts
 and NAT reaping; polling `tasks/get` and a client-owned listen stream
 tolerate intermediaries far better.
 
-`toolsListChanged` rides the same stream: today a surface-packet mutation
-silently changes what `list_tools` returns while clients cache the old list
-forever. Emit `toolsListChanged` on surface/packet mutation and set `ttlMs`
-on `ListToolsResult`; the incoherence window closes.
+`toolsListChanged` rides the same stream. Surfaces are daemon
+configuration, so a surface's tool list changes only across a daemon
+restart, while clients may cache the old list indefinitely. Emit
+`toolsListChanged` when the served catalog changes and set `ttlMs` on
+`ListToolsResult`; the incoherence window closes.
 
 ## Resource projection
 
@@ -329,26 +331,24 @@ as tools:
 blackbox://brofile/{name}
 blackbox://team/{name}
 blackbox://artifact/{kind}/{name}
-blackbox://packet/{id}
 blackbox://atom/{id}
-blackbox://task/{id}                     (live task state)
-blackbox://project/{project}/packet/{id} (explicit project encoding)
+blackbox://task/{id}                                (live task state)
+blackbox://project/{project}/artifact/{kind}/{name} (explicit project encoding)
 blackbox://skills/onboard-project/SKILL.md
 ```
 
 The classification rule for resource candidacy: a durable ID plus a JSON
 body that clients currently enumerate through a bounded list tool. Beyond
-the five catalogs:
+the four catalogs:
 
 - **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
   `blackbox://gap/{id}`, `blackbox://note/{id}`, `blackbox://roadmap/{id}`,
-  `blackbox://whiteboard/{id}`, `blackbox://project/{id}`,
-  `blackbox://provider/{name}`.
+  `blackbox://project/{id}`, `blackbox://provider/{name}`.
 - **`blackbox://sm/{id}`** (system memories). Agents fetch `sm-*` runbooks
   constantly via free-text `bbox_knowledge` when they already know the ID;
   direct URI read is cheaper and deterministic. Probably the highest-traffic
   resource we would serve.
-- **Live views with `ttlMs`:** `blackbox://roster`, `blackbox://inbox`,
+- **Live views with `ttlMs`:** `blackbox://roster`,
   `blackbox://dashboard`. `resourceSubscriptions` is a listen opt-in type,
   so subscribing to `blackbox://roster` yields push roster updates
   in-protocol, replacing the bespoke `/control/roster/stream` SSE endpoint
@@ -364,18 +364,18 @@ the five catalogs:
 What stays a tool: search/query surfaces (ephemeral result sets are not
 durable objects), all mutations, anything parameterized ad hoc.
 
-- Catalog boundary: the five catalogs plus live tasks. Threads are
+- Catalog boundary: the four catalogs plus live tasks. Threads are
   borderline (cheap read projection, composes with subscriptions).
   Transcripts and sessions are searchable corpora, not enumerable catalogs;
   they stay tool-served.
 - Project scoping is explicit in the URI for project-owned objects, not
   resolved against the session's `?project=`: a client scoped to project A
-  may legitimately read project B's packets, and URI-addressability beats
+  may legitimately read project B's artifacts, and URI-addressability beats
   scope-channel switching.
-- Governance: extend surface packets with a `resources:` dimension (same
-  packet, not a separate packet type; operators think in surfaces, not
-  planes). `list_resources` / `read_resource` consult the same
-  per-request scope extraction and `SurfaceDecisionCache`.
+- Governance: add a `resources` key to the same `[surfaces.<name>]`
+  configuration table (not a separate table; operators think in surfaces,
+  not planes). `list_resources` / `read_resource` consult the same
+  per-request surface resolution.
 - Pagination: `resources/list` and `resources/templates/list` carry protocol
   cursors, descriptor-only listing (progressive disclosure; `resources/read`
   fetches one full body), plus `ttlMs`/`cacheScope`. This relieves the
@@ -383,7 +383,7 @@ durable objects), all mutations, anything parameterized ad hoc.
   `bbox_describe_schema(mode="full")`) that the 80KB cap's bytes
   telemetry exists to flag.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
-  packet compile, brofile upsert).
+  brofile upsert).
 
 ### Spill becomes a resource
 
@@ -405,7 +405,7 @@ cap.
   ever added.
 - Tool-result pagination stays app-level: protocol cursors exist only on
   list/read endpoints, not `tools/call`. For the large-response tools
-  (`bro_dashboard`, `bbox_search`, `bbox_hybrid_search`), converge on a
+  (`bro_dashboard`, `bbox_hybrid_search`), converge on a
   uniform `{items, next_cursor, total_estimate}` envelope instead of per-tool
   bespoke limit params. The 80KB cap + spill envelope stays regardless.
 - structuredContent going forward: 2026-07-28 allows any JSON value, so new
@@ -477,8 +477,8 @@ Recommendations stated; operator red-lines here.
   Recommend bro first, workflow runs fast-follow or `blackbox://run/{id}`.
 - **Q4 (checkout authority cache)**: invalidation for the per-request
   write-authority cache. Recommend generation-keyed + TTL backstop.
-- **Q5 (deny semantics)**: discover-deny + per-method deny, or per-method
-  only. Recommend both.
+- **Q5 (deny semantics)**: the only deny case is an unknown surface.
+  Refuse it at discover + per-method, or per-method only. Recommend both.
 - **Q6 (notification payload)**: thin status vs full task state in
   `notifications/tasks`. Recommend thin (decided above unless red-lined).
 - **Q7 (conformance gates)**: wire the official MCP conformance suite into

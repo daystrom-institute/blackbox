@@ -908,7 +908,6 @@ mod tests {
             state.tail_tx.clone(),
             Some(state.roster_events()),
             Some("roster-test".to_string()),
-            Some(state.system_events.clone()),
             bro_core::Origin::Workflow,
         );
 
@@ -963,7 +962,6 @@ mod tests {
             &state.task_store,
             &state.store_dir,
             &state.tail_tx,
-            Some(state.system_events.clone()),
         );
         let terminal_update = timeout(Duration::from_secs(1), rx.recv())
             .await

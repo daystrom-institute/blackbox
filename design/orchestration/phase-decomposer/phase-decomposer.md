@@ -7,7 +7,7 @@ topic:
   - orchestration
   - phase-decomposer
 date: 2026-05-10
-status: "implemented as system-defaults/phase-decompose workflows, packets, brofiles, teamplates, fixtures, and the corpus-pathfinder agent manifest"
+status: "implemented as system-defaults/phase-decompose workflows, brofiles, teamplates, fixtures, and the corpus-pathfinder agent manifest"
 brief: "Routes oversized phase docs through scouting, evidence sizing, optional decomposition, parallel implementation, and recomposition."
 ---
 
@@ -15,8 +15,8 @@ brief: "Routes oversized phase docs through scouting, evidence sizing, optional 
 
 Date: 2026-05-10
 Status: implemented after live no-edit validation on 2026-05-16. The shipped
-surface is `system-defaults/phase-decompose` workflows, packets, brofiles,
-teamplates, fixtures, and the `corpus-pathfinder` agent manifest. Final
+surface is `system-defaults/phase-decompose` workflows, brofiles, teamplates,
+fixtures, and the `corpus-pathfinder` agent manifest. Final
 hardened live proof: `arc-5a5fd112da724ce7a06ab7d1fe007bd8` reached `Done`
 with `recompose_verdict=satisfied` after measured DAG lint, eight supervised
 no-edit subflows, and mechanical recomposition assertions. Edit/merge mediation
@@ -56,8 +56,8 @@ measuring it mechanically, and routing accordingly.
   │ 3. Dispatch scouts (foreach)     │
   │ 4. Aggregate scout results      │
   │ 5. Build evidence manifest      │
-  │ 6. Measure manifest via         │
-  │    bbox_ref_size MCP tool       │
+  │ 6. Estimate per-ref bytes into  │
+  │    the evidence manifest        │
   │ 7. Emit triage verdict +        │
   │    evidence bundle              │
   └───────────────┬─────────────────┘
@@ -69,16 +69,16 @@ measuring it mechanically, and routing accordingly.
         ▼                   ▼
   ┌──────────┐      ┌──────────────┐
   │ Impl-    │      │ ENSEMBLE     │
-  │ ementer  │      │ (whiteboard) │
+  │ ementer  │      │ (panel)      │
   │ (seeded  │      │              │
   │ with     │      │ Panel delib- │
   │ exact    │      │ erates on    │
   │ manifest)│      │ sub-unit     │
   └──────────┘      │ boundaries.  │
                     │ Produces DAG │
-                    │ using same   │
-                    │ ref→size     │
-                    │ tool deep.   │
+                    │ sized from   │
+                    │ evidence     │
+                    │ bundle refs. │
                     └──────┬───────┘
                            │
                      ┌──────▼───────┐
@@ -161,22 +161,20 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
    assembles an **evidence manifest**: the exact set of file:line refs,
    entity_refs, and path_ids the implementer must load.
 
-4. **Measure the manifest.** Calls `bbox_ref_size(refs=[...])` — a
-   mechanical MCP tool that resolves refs to their byte payload and
-   returns the aggregate size. No LLM estimation. No eyeball compaction
+4. **Measure the manifest.** The inlet estimates each ref's byte size from
+   scout evidence, records it in the evidence bundle and sums them. No eyeball compaction
    factors. A number.
 
    In v1, `target_context_window` means the **measured evidence payload**
-   budget. It is compared against bytes returned by `bbox_ref_size` for
+   budget. It is compared against the evidence bundle's byte sum for
    the refs a downstream actor must load. It deliberately does not include
    fixed workflow prompt text, brofile text, ambient scope blocks, or MCP
    tool-injection overhead; those require a separate full-envelope
    measurement field if we decide to enforce them later.
 
-   Acceptance-coverage lint is not a pure packet gate today. The packet AST can
-   quantify over one array path, but cannot correlate `acceptance_criteria[*]`
-   against `sub_units[*].acceptance_subset[*]`; use a mechanical hook/tool for
-   that coverage check.
+   Acceptance-coverage lint is not a pure gate check: it must correlate
+   `acceptance_criteria[*]` against `sub_units[*].acceptance_subset[*]`, so a
+   mechanical hook/tool performs that coverage check.
 
 5. **Produce the triage verdict.** If the measured evidence payload fits
    under `target_context_window` → `fit_direct`. If it exceeds →
@@ -190,8 +188,8 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
 The predecessor got this backwards. The inlet cannot know whether the work
 fits until scouts have found the actual files, symbols, and paths the
 implementer will touch. An LLM guessing "estimated read load" from phase
-doc prose is confabulation. Scouts find the ground truth. The `ref→size`
-tool measures it. The inlet routes on the measurement.
+doc prose is confabulation. Scouts find the ground truth. The evidence
+bundle records its size. The inlet routes on the measurement.
 
 Scouts may reveal the work is trivial (few files, small payload). Or they
 may reveal scope was massively underestimated (deep call graphs, many
@@ -217,9 +215,8 @@ The inlet's output to downstream:
 }
 ```
 
-The `bytes` per ref come from the `bbox_ref_size` tool — the tool resolves
-each ref and returns its resolved byte size. The inlet sums them and
-compares to the v1 evidence-payload budget (`target_context_window`).
+The `bytes` per ref are the inlet's estimates from scout evidence. The inlet
+sums them and compares to the v1 evidence-payload budget (`target_context_window`).
 
 ### 3.4 Subworkflow boundary
 
@@ -229,14 +226,14 @@ subworkflow imports `phase_doc_path` from the parent and exports
 (`engine.rs:2464-2570`). DAG artifacts are produced later by the
 decomposer/ensemble path, not by discovery.
 
-The discovery subworkflow node carries a `gate` packet
-(`schema.rs:120-127`). The gate's entity includes the subworkflow's exported
-vars. The gate packet reads `vars.triage_verdict` and emits the verdict
-(`fit_direct` or `needs_decompose`) as its classification. The parent's
-`Branch` transition (`schema.rs:389-395`) routes on `last_verdict` (the gate
-verdict, per `BranchSelector::GateVerdict`). This is the standard gate →
-branch routing pattern — no new mechanism needed, just an explicit gate
-packet on the discovery node.
+The discovery subworkflow node carries a `gate` (`schema.rs:120-127`). The
+gate's entity includes the subworkflow's exported vars. The gate reads
+`vars.triage_verdict` and emits the verdict (`fit_direct` or
+`needs_decompose`) as its classification. The parent's `Branch` transition
+(`schema.rs:389-395`) routes on `last_verdict` (the gate verdict, per
+`BranchSelector::GateVerdict`). This is the standard gate → branch routing
+pattern: no new mechanism is needed, just an explicit gate on the discovery
+node.
 
 ## 4. Stage 2: Ensemble decomposition
 
@@ -247,24 +244,24 @@ Only when `triage_verdict == needs_decompose`. The parent workflow's
 
 ### 4.2 What it does
 
-A whiteboard deliberation following the `whiteboard-arc.json` pattern
-(`examples/whiteboard/workflows/whiteboard-arc.json`):
+A caller-owned panel deliberation: the caller fans proposals out with
+`bro_broadcast` and collects them with `bro_when_all`:
 
-- **Blind post:** Each panel member posts a proposed decomposition
-  independently. Posts are typed structured proposals with target
+- **Blind proposal:** Each panel member proposes a decomposition
+  independently. Proposals are typed structured JSON with target
   files/symbols.
-- **Debate:** Members read each other's posts, annotate, vote.
-- **Resolve:** Facilitator reads final state, emits the DAG.
+- **Debate:** Members receive each other's proposals, challenge and rank them.
+- **Resolve:** Facilitator reads the collected proposals and critiques,
+  emits the DAG.
 
-The ensemble uses the **same** `bbox_ref_size` MCP tool — but deeply,
-cluster-by-cluster. Each proposed sub-unit's file/symbol refs are batched
-through the tool to measure the per-cluster payload. After synthesis,
-`SynthesizeDag/on_exit` mechanically extracts all DAG refs, calls
-`bbox_ref_size`, and runs `lint-dag.py` with the measured output. The lint
-fails if any sub-unit's declared `bytes` differs from the measured ref sum,
-if measured bytes exceed `target_context_window`, or if ref measurement is
+The ensemble sizes each proposed sub-unit from the **same** evidence bundle,
+cluster-by-cluster: a sub-unit's payload is the sum of its refs' bytes in
+the bundle. After synthesis, `SynthesizeDag/on_exit` mechanically extracts
+all DAG refs, recomputes sub-unit bytes from the evidence bundle with
+`normalize-dag-measurements.py`, and runs `lint-dag.py`. The lint fails if
+measured bytes exceed `target_context_window` or if ref measurement is
 degraded. This closes the under-reporting hole: the facilitator's declared
-bytes are checked, not trusted.
+bytes are recomputed, not trusted.
 
 ### 4.3 DAG output
 
@@ -404,16 +401,14 @@ repair, and live mutating validation.
 | Signal dispatch | `src/server/routes.rs` | implemented |
 | cancel_task (SIGTERM) | `src/orchestration/mod.rs` | implemented |
 | Per-event hook seam | `src/orchestration/mod.rs`, `src/orchestration/supervision.rs` | implemented |
-| Whiteboard deliberation | `src/whiteboards.rs`, `examples/whiteboard/` | implemented |
-| Policy packet (arc-level gate) | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
+| Arc-level policy gate | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Compaction anchor (rolling summary) | `src/workflow/engine.rs` | implemented |
 | Durable actor sessions | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
-| Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
+| Advisor checkpoint/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
 | Classifier workflow-backed atom pattern | `system-defaults/atoms/supervision/classifier.json`, `system-defaults/workflows/supervision/classifier.json`, `src/tools/atoms.rs` | implemented |
 | Advisor workflow-backed atom pattern | `system-defaults/atoms/supervision/advisor.json`, `system-defaults/workflows/supervision/advisor.json`, `src/tools/atoms.rs` | implemented |
-| `bbox_ref_size` MCP tool (ref→bytes measurement) | `src/tools/graph.rs`, `src/mcp_tools/ref_size.rs`, `src/index/mod.rs` | implemented |
 | Typed advisor action executor | `src/tools/atoms.rs` | implemented |
 | Edit/merge mediation | — | not part of v1; deferred to a separate design |
 
@@ -441,21 +436,19 @@ repair, and live mutating validation.
 
 ## 9. Build sequence
 
-1. **`bbox_ref_size` MCP tool.** Resolves entity_refs/project_file_refs to
-   byte payloads. The shared measurement primitive both stages depend on.
-2. **Scout agent manifest.** Corpus-pathfinder as installed JSON agent
+1. **Scout agent manifest.** Corpus-pathfinder as installed JSON agent
    (`system-defaults/agents/corpus-pathfinder.json`). Strict-typed structured
    output. Parallel-safe.
-3. **Inlet agent.** The discovery subworkflow that orchestrates scouts,
-   aggregates results, calls `bbox_ref_size`, and produces the triage
+2. **Inlet agent.** The discovery subworkflow that orchestrates scouts,
+   aggregates results, estimates per-ref bytes, and produces the triage
    verdict + evidence bundle.
-4. **Single-implementer path** (fit_direct). Seeded with exact manifest
+3. **Single-implementer path** (fit_direct). Seeded with exact manifest
    from inlet. Smallest viable pipeline end-to-end.
-5. **Ensemble decomposition** (needs_decompose). Whiteboard deliberation
-   producing DAG, using `bbox_ref_size` cluster-by-cluster.
-6. **Implementer foreach** over DAG sub-units, each in a supervised subworkflow.
-7. **Recompose council** — durable ensemble evaluating collected results, producing remediation packets, iterating until satisfied or untenable.
-8. **Edit/merge mediation** — explicitly out of v1; requires a separate
+4. **Ensemble decomposition** (needs_decompose). Panel deliberation
+   producing DAG, sized cluster-by-cluster from the evidence bundle.
+5. **Implementer foreach** over DAG sub-units, each in a supervised subworkflow.
+6. **Recompose council** - durable ensemble evaluating collected results, producing remediation packets, iterating until satisfied or untenable.
+7. **Edit/merge mediation** - explicitly out of v1; requires a separate
    design and live mutating validation before it can be claimed.
 
 Each step is independently testable. Current live fixtures:

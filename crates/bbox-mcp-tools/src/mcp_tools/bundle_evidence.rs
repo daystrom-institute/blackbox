@@ -348,8 +348,6 @@ fn intra_bundle_edges(
 
 /// Surfaces 2-hop convergences: pairs of bundled entities (A, B) that share
 /// a common neighbor C via outgoing or incoming edges. Examples:
-/// - two project_files both EDITED_BY_SESSION the same session ("touched in
-///   the same conversation")
 /// - two project_files both COMMIT_TOUCHED_FILE the same commit ("changed
 ///   together")
 /// - a knowledge entry and a session it was KNOWLEDGE_FROM_SESSION'd from
@@ -497,8 +495,8 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec![
                 "knowledge:a".into(),
-                "packet:domain:phase-decompose/triage".into(),
-                "artifact:packet/phase-decompose/triage@1".into(),
+                "bash_call:session123:7".into(),
+                "artifact:team/example@1".into(),
                 "knowledge:b".into(),
                 "knowledge:c".into(),
                 "not-a-ref".into(),
@@ -525,14 +523,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entity| entity["entity_ref"] == "packet:domain:phase-decompose/triage")
+                .any(|entity| entity["entity_ref"] == "bash_call:session123:7")
         );
         assert!(
             value["entities"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entity| entity["entity_ref"] == "artifact:packet/phase-decompose/triage@1")
+                .any(|entity| entity["entity_ref"] == "artifact:team/example@1")
         );
         assert_eq!(
             value["degraded"]["unresolved_entity_refs"]

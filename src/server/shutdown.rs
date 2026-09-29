@@ -353,18 +353,10 @@ mod tests {
                 source_generation_id: "source-one".to_string(),
                 p3_generation_id: p3_generation_id.clone(),
                 history_parity_commitment: Sha256ValueV1::digest(b"history"),
-                provenance_import_generations: BTreeMap::from([(
-                    project_id.clone(),
-                    "import-one".to_string(),
-                )]),
-                provenance_export_generations: BTreeMap::from([(
-                    project_id.clone(),
-                    "export-one".to_string(),
-                )]),
-                provenance_parity_commitments: BTreeMap::from([(
-                    project_id.clone(),
-                    Sha256ValueV1::digest(b"provenance"),
-                )]),
+                members: std::collections::BTreeSet::from([project_id.clone()]),
+                provenance_import_generations: BTreeMap::new(),
+                provenance_export_generations: BTreeMap::new(),
+                provenance_parity_commitments: BTreeMap::new(),
                 capability_baselines: Vec::new(),
             }],
             checksum_sha256: Sha256ValueV1::digest(b"checksum"),

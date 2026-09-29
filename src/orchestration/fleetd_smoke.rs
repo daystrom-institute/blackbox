@@ -499,7 +499,6 @@ mod smoke {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store
@@ -527,7 +526,6 @@ mod smoke {
             store_dir.clone(),
             None,
             tail_tx.clone(),
-            None,
             live.events,
         );
         await_cursor(&task, 3).await;
@@ -583,7 +581,6 @@ mod smoke {
                 store_dir.clone(),
                 state.task_store.clone(),
                 state.tail_tx.clone(),
-                None,
                 None,
             ),
             "the replacement daemon installs the fleetd executor"

@@ -7,12 +7,8 @@
 //! on downward.
 //!
 //! Invariant: this crate must NOT depend on `blackbox` (that would be a
-//! workspace cycle). The one former upward reach — `git::notes_namespace`
-//! loading `blackbox::config` — is inverted to a startup injection via
-//! [`git::set_notes_namespace`], which the daemon calls once after it loads
-//! config.
+//! workspace cycle).
 
-pub mod blame_transport;
 pub mod built_from;
 pub mod code_project_identity;
 pub mod edge;

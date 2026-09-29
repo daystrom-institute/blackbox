@@ -47,7 +47,6 @@ nav:
   - Toolbelt:
     - Workflow Engine: workflows.md
     - Atoms: atoms.md
-    - Rule Packets: rule-packets.md
     - Refactor Tools And Atoms: refactor.md
     - Bro Runtime: bro-runtime.md
     - Knowledge Store: knowledge-store.md
@@ -55,7 +54,6 @@ nav:
     - Projects And Code Indexing: projects-code-indexing.md
     - Artifact Catalog: artifact-catalog.md
     - Badgey: badgey.md
-    - Councils & Whiteboards: councils-whiteboards.md
     - MCP Surfaces: mcp-surfaces.md
   - Integrations:
     - Ingress Paths: ingress-paths.md

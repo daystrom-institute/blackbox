@@ -37,8 +37,8 @@ activation. Counts describe this snapshot, not a permanent product budget.
   Image digest: `sha256:fcc38786110223005443e35305b589cef94207aadeafc8c23d9faf74975a3ff6`.
   Cage commit `249c9fd` pins the deployment. Admission is open.
 - Live ops catalog equality passed: 109 survivors, all 82 planned retirements
-  absent. Workflow/atom execution, trigger routes, reaction delivery, custom
-  agent adapters and whiteboard mutation are removed. Historical artifact
+  absent. Workflow/atom execution, trigger routes, reaction delivery and custom
+  agent adapters are removed. Historical artifact
   receipts remain readable and are explicitly inactive/retired. Stored
   conversation context and messages matched their pre-retirement evidence.
 - E1 live Astra probes completed ordinary exec and resume turns. Repeating
@@ -49,8 +49,8 @@ activation. Counts describe this snapshot, not a permanent product budget.
   execution.
 - E4 maintenance lives in `bbox-vectors`; all 51 focused vector checks passed.
   Connectivity repair builds outside the partition lock and defers stale
-  publication. Storage GC, embedding residue and observation-journal retention
-  run independently of workflow artifacts.
+  publication. Storage GC and embedding residue run independently of workflow
+  artifacts.
 - Native bro and bro-harness builds passed, were stablesigned and installed.
   Fleet remains; the orchestrate command and atom compatibility alias are gone.
   Retired executable defaults were removed. Live replacement runbooks describe
@@ -99,7 +99,7 @@ review. `retire` removes the whole tool from callable surfaces.
 | Workflows, arcs, signals, crons, pollers and webhooks | 22 | Retire after maintenance extraction | S3 |
 | Restricted workflow workspace wrappers | 8 | Retire; retain harness tools and indexed recall | S3 |
 | General event/reaction/identity automation | 12 | Retire; extract necessary execution observation | S4 |
-| Whiteboard phase/vote machinery | 10 | Retire; preserve historical evidence | S4 |
+| Whiteboard phase/vote machinery | 10 | Retire | S4 |
 | Artifact installation/lifecycle | 4 | Slim to surviving kinds | S4 |
 | Deterministic policy packets | 6 | Slim to retained permission/policy consumers | S4 |
 | Cross-cutting corpus/admin tools | 47 | Remove obsolete hooks, catalog rows and guidance | S4 |
@@ -139,10 +139,10 @@ replace compiled-router and deployed-catalog verification.
 | `src/orchestration/atoms`, `src/tools/atoms*` | Remove atom registry, composition, invocation, delegation and automatic supervision | Inventory actual runner operations. Preserve meaningful refactor/file/process operations in existing harness modules. External orchestration can reuse prompts as files without keeping the atom runtime. |
 | `src/tools/workspace.rs` and workflow workspace dispatch | Remove `work_*` adapters | Host-owned file/git execution remains in harness tools. Indexed tool-call recall must remain reachable through corpus retrieval with precise provenance. Do not restore daemon-local checkout execution. |
 | `src/crons.rs`, `pollers.rs`, `webhooks.rs` and adapters | Remove configurable application triggers | Move schedule ownership outside Blackbox; preserve required service maintenance as narrow operations. Remove inbound webhook routes, replay stores and autonomous restore. |
-| `crates/bbox-system-events`, `src/system_events_runtime`, `src/tools/system_events.rs` | Remove programmable reaction engine and its MCP management surface | Separate journal/observation from matching, outbox creation and execution; preserve needed bro status/tail/transcript evidence. Archive general events and identity mappings. Forgejo integration recipes move to external owners. |
+| `crates/bbox-system-events`, `src/system_events_runtime`, `src/tools/system_events.rs` | Remove programmable reaction engine, event journal and its MCP management surface | Bro status/tail/transcript evidence comes from task records and roster/tail projection. Forgejo integration recipes move to external owners. |
 | `src/orchestration/supervision.rs` | Keep useful execution measurements | Distinguish from `src/tools/atoms/supervision.rs`, which launches higher-order work. Preserve honest last-request context measurements without compaction alarm semantics. |
-| Whiteboard runtime/tools and `crates/bbox-whiteboards` | Remove board lifecycle/voting orchestration | Detach inbox/attention, corpus providers and schema consumers. Preserve existing posts, votes and decisions as historical evidence with their visibility constraints. |
-| `crates/bbox-packets`, `src/server/surface.rs`, artifact support | Keep minimal deterministic permission/policy machinery initially | Remove workflow routing, phase and auto-advisor packet consumers. Ordinary bro tool filtering currently depends on packet evaluation; missing policy must never silently widen access. Reassess generic packet authoring after consumers are reduced. |
+| Whiteboard runtime/tools and `crates/bbox-whiteboards` | Remove board lifecycle/voting orchestration and board storage | Detach attention, corpus providers, the `whiteboard:` entity type, schema consumers and project-catalog owner rows. |
+| `src/server/surface.rs`, artifact support | Keep deterministic permission/policy machinery | Ordinary bro tool filtering uses the surface policy in daemon configuration; missing policy must never silently widen access. |
 | `src/embed_runtime.rs` | Keep embeddings and contradiction observations | Replace `contradiction-review-arc` launch with the existing note/evidence fallback. An indexing event must not start a new planning process. |
 | `src/server/{open,state,background,restore}.rs` | Keep corpus and bro service initialization | Remove automation hooks individually. Shared startup also owns indexing, publication, provenance, vector maintenance and artifact restoration for retained kinds. |
 
@@ -189,7 +189,7 @@ owners while preserving migration journal and ownership-digest interpretation.
 Apply the same rule to artifact kinds in durable install receipts. Startup with
 old data must keep surviving records and must not reanimate retired work.
 
-### E3: retained Slack and whiteboard evidence stays readable
+### E3: retained Slack evidence stays readable
 
 Slack collector shutdown is separate from history deletion. Current conversation
 read enrollment is derived from producer grants in `src/server/open.rs`;
@@ -200,10 +200,9 @@ explicit frozen-source read enrollment. Verify search/context/messages before
 and after disabling writes and restarting the daemon.
 
 Archive inactive automation records under an explicit legacy read boundary, not
-by keeping executable registries loaded. Whiteboard evidence keeps its access
-and blind-phase constraints; converting it to unrestricted generic notes would
-change visibility. A read-only export/reader is sufficient if old exact entity
-refs remain meaningful or explicitly describe their migration.
+by keeping executable registries loaded. A read-only export/reader is
+sufficient if old exact entity refs remain meaningful or explicitly describe
+their migration.
 
 Preserving history is not permission to bypass a real access revocation. A
 collector retirement should preserve the same authorized read scope; an
@@ -232,22 +231,19 @@ blocked until the maintenance replacement has a documented owner and cadence.
 
 ### E5: observation survives without the reaction executor
 
-Direct bro tasks already have roster/tail projection separate from optional
-system-event emission. `EventHub` combines journal append with reaction matching
-and outbox creation; split those before deleting the outbox worker. Preserve
-only necessary task/session evidence and external observation. Do not carry the
-whole programmable journal-management surface forward solely to retain a status
-stream. No task completion, embedding change, or observation read should trigger
+Direct bro tasks have roster/tail projection, which carries task observation
+without an event journal or reaction executor. Preserve only necessary
+task/session evidence. No task completion, embedding change, or observation read should trigger
 an atom, workflow, advisor, or Slack action after retirement.
 
-### E6: permissions survive packet and artifact reduction
+### E6: permissions survive artifact reduction
 
 Keep shared MCP filtering, scoped instructions, code-mode filtering and worker
-policy composition. Ordinary bro dispatch uses packet-backed surface policy;
-missing packet behavior currently permits passthrough. Keep the required policy
-subset or replace it with explicit equivalent enforcement before deleting any
-policy artifact. Probe flat, qualified MCP and nested code-mode aliases so a
-removed restriction cannot survive as a bypass.
+policy composition. Ordinary bro dispatch uses the surface policy in daemon
+configuration. Keep the required policy subset or replace it with explicit
+equivalent enforcement before deleting any policy artifact. Probe flat,
+qualified MCP and nested code-mode aliases so a removed restriction cannot
+survive as a bypass.
 
 ## Deployed consumer snapshot
 
@@ -308,7 +304,7 @@ deployment authority applies; gates below are technical prerequisites.
 
 - Capture exact installed dependencies and inactive records; stop their admission
   before deleting handlers. Remove Badgey scheduled jobs and application agents,
-  workflows, packets, brofiles and auto-install defaults coherently.
+  workflows, brofiles and auto-install defaults coherently.
 - Remove the 22 Badgey/consultant/Slack tools, bot bridge, consultant runtime,
   linkage stores and startup recovery. Apply E2 to catalog/receipt migration.
 - Implement E3 before removing Slack collector enrollment/configuration. Stop
@@ -339,9 +335,9 @@ deployment authority applies; gates below are technical prerequisites.
 
 - Complete E5, remove general reaction execution, outbox/retry machinery, Forgejo
   automation adapters and their 12 MCP tools. Keep only demonstrated execution
-  observations and historical identity/event interpretation.
-- Remove whiteboard runtime and its ten tools after preserving E3 evidence.
-- Restrict artifact kinds and packet consumers; update attention, graph/schema,
+  observations.
+- Remove whiteboard runtime, its ten tools and its storage.
+- Restrict artifact kinds; update attention, graph/schema,
   doctor, storage inventory, project migration and knowledge signposts.
 - Remove retired jobs from shared startup individually. Indexing, publication,
   embeddings, native transcripts and source freshness continue operating.
@@ -394,16 +390,16 @@ caller without retaining their old executable manifest.
 | Source-owned footprint | Required disposition |
 | --- | --- |
 | `system-defaults/{atoms,workflows,badgey}/`, `system-defaults/agents/badgey.json` | Stop installation and remove executable definitions for retiring runtimes. |
-| `system-defaults/agents/{workflows,crons,packets}/` | Remove nightly evaluation and application composition; preserve independently useful simple roles and their prompt/output contracts. |
+| `system-defaults/agents/{workflows,crons}/` | Remove nightly evaluation and application composition; preserve independently useful simple roles and their prompt/output contracts. |
 | `system-defaults/{maintenance,agentic-corpus}/` | Extract E4 operations; remove graph-based schedules, auto-edge/digest and review automation. Preserve direct corpus APIs and required health behavior. |
 | `.bbox/workflows/{gap-processing,blackbox-review}.json`, `.bbox/atoms/gap-cluster-validator.json` | Retire repo-owned execution manifests. Inspect associated brofiles independently. |
 | `schema/{atom,workflow}.schema.json` | Remove new-write/execution schemas after preserving legacy record readers separately. |
-| `examples/{workflows,slack,keystone,sastquatch}/`, workflow portions of `examples/whiteboard/`, reactions in `examples/{forgejo,system-events}/` | Remove runnable retired examples from installation indexes; archive useful historical explanation. |
-| `crates/bbox-tool-docs/src/tool_docs.rs`, `system-defaults/mcp-surfaces/routing.json`, `src/server/mod.rs` | Change docs, surface policy and routers together. Do not expose retired operations through a specialist surface. |
+| `examples/{workflows,slack,keystone,sastquatch,whiteboard,system-events}/`, reactions in `examples/forgejo/` | Remove runnable retired examples from installation indexes; archive useful historical explanation. |
+| `crates/bbox-tool-docs/src/tool_docs.rs`, `crates/bbox-config/src/default_surfaces.toml`, `src/server/mod.rs` | Change docs, surface policy and routers together. Do not expose retired operations through a specialist surface. |
 | `system-defaults/memories/{atoms,workflow-orchestration}.md` | Retire operative instructions and their catalog entries. Update the `sm-atoms` ordering fixture in `crates/bbox-system-memory/src/catalog.rs`. |
 | `system-defaults/memories/{bro-dispatch-patterns,create-etiquette,side-channel-notes,system-memory-catalog}.md` and refactor memories | Preserve useful invariants; remove retired discovery/execution prescriptions and point to direct harness capabilities. |
 | `prompts/gap-processing.md`, `prompts/agents/gap-processing-orchestrator.md`, prompt indexes, closeout/daily-cleaning prompts | Remove instructions to start daemon workflows; retain applicable inspection/cleanup guidance. |
-| `PROJECT.md`, `docs/{atoms,workflows,badgey,slack-bridge,system-events,ingress-paths}.md`, documentation indexes | State the shipped boundary when removal lands; avoid claiming planned removal already happened. |
+| `PROJECT.md`, `docs/{atoms,workflows,badgey,slack-bridge,ingress-paths}.md`, documentation indexes | State the shipped boundary when removal lands; avoid claiming planned removal already happened. |
 | `.bbox/knowledge/{5fa26d26,8b2ff028,5cd8a294,7276b5c6,c46b67e8,998a7834}.json` | Review operative generated-rule sources. Preserve operator-authority and harness-boundary rules while revising obsolete workflow/atom references through the owning memory path. |
 | `scripts/converge-gate`, `scripts/lint-concurrency.sh`, `scripts/catalog-ownership-baseline.txt` | Remove retired checks/owners while preserving live-task protection and retained-owner coverage. |
 | `src/mcp_client.rs`, `src/orchestration/http_fetch.rs` | Verify remaining callers after retirement; delete if only workflow/reaction/poller consumers remain. Generic naming does not justify retention. |
@@ -420,7 +416,7 @@ Do not delete similarly named Rust `atomic` primitives, harness hooks, refactor
 | Routing and safety | Explicit and implicit provider/account behavior, Astra selection, worker cwd, global templates, scoped tool defaults and deny filters remain correct. |
 | Transport | fleetd reconnect, child survival, fenced owners, replay acknowledgement and bounded retention remain correct; keep `scripts/acceptance-fleetd-deps.sh`. |
 | Legacy data | Mixed current/legacy task records retain current tasks and ownership; old artifact/catalog receipts load without executing retired kinds; interrupted migration resumes safely. |
-| Historical corpus | Slack and native search/context/messages and retained board evidence survive removal/restart with unchanged visibility constraints. |
+| Historical corpus | Slack and native search/context/messages survive removal/restart with unchanged visibility constraints. |
 | Maintenance | Isolated vector/storage maintenance succeeds, failures retain readers/leases/state, and the replacement schedule has an owner. No test depends on production deletion. |
 | No hidden admission | Startup, task completion, embedding changes, waits, artifact watches and tool aliases cannot start a retired runtime. |
 | Surface closure | Exact retirement map passes; HTTP/CLI routes and default installers agree; retained action schemas/docs are reviewed and response budgets remain bounded. |
@@ -458,8 +454,6 @@ remain independent gaps; they are not a replacement for the MCP surface audit.
   preview/apply semantics, now also part of E4 maintenance extraction.
 - Queued gap mutation lost updates remain a correctness priority for the core
   knowledge/publication path. Retirement does not address them.
-- Sustained `edge_index_warming` for provenance export remains an availability
-  investigation. No orchestration dependency has been established as its cause.
 - Native collection is restored, verified with stablesign and a successful
   background cycle. It remains in the retained execution/corpus baseline.
 

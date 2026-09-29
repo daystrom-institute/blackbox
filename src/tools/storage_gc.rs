@@ -102,12 +102,6 @@ pub(crate) struct StorageGcParams {
     /// reported as operator-review only; it is not auto-deleted.
     #[serde(default)]
     pub max_observed_bytes_per_project: Option<u64>,
-    /// Prune duplicate rule-packets: among byte-identical copies for the same
-    /// domain/scope/project, keep only the newest (boot-restore used to mint
-    /// one copy per daemon restart). Copies referenced by another packet's
-    /// Apply antecedent are protected. Honors dry_run. Default false.
-    #[serde(default)]
-    pub prune_duplicate_packets: bool,
 }
 
 #[derive(
@@ -121,7 +115,6 @@ pub(crate) enum StorageGcDetail {
     Deleted,
     Errors,
     Exclusions,
-    Packets,
     Full,
 }
 
@@ -328,20 +321,7 @@ impl BlackboxServer {
                 delete_errors,
             };
 
-            let packet_gc = if p.prune_duplicate_packets {
-                Some(server.state.packets.read().gc_duplicate_packets(!p.dry_run))
-            } else {
-                None
-            };
-
-            report::publish(
-                &server.state,
-                &p,
-                result,
-                exclusions,
-                excluded_count,
-                packet_gc,
-            )
+            report::publish(&server.state, &p, result, exclusions, excluded_count)
         })
         .await
     }

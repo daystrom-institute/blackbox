@@ -1,6 +1,6 @@
 # Historical application examples
 
-Keystone, Sastquatch, Slack and whiteboard applications depended on the retired workflow and reaction engines. Their runnable manifests and installers have been removed. Prior revisions preserve their design history; they are not current installation recipes.
+Keystone, Sastquatch and Slack applications depended on the retired workflow and reaction engines. Their runnable manifests and installers have been removed. Prior revisions preserve their design history; they are not current installation recipes.
 
 Blackbox retains bro execution, resume, cancellation, status and waits. The
 caller owns sequencing, gates, retries, schedules and integrations, using its

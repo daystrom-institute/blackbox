@@ -2280,30 +2280,30 @@ mod tests {
     fn intersect_allow_self_empty_adopt_other() {
         let mut a = McpFilters::default();
         let b = McpFilters {
-            allow: vec!["mcp__blackbox__bbox_search".into()],
+            allow: vec!["mcp__blackbox__bbox_context".into()],
             disallow: vec![],
         };
-        let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bbox_stats"];
+        let universe = &["mcp__blackbox__bbox_context", "mcp__blackbox__bbox_stats"];
         a.intersect_allow_from(&b, universe);
-        assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+        assert_eq!(a.allow, vec!["mcp__blackbox__bbox_context"]);
     }
 
     #[test]
     fn intersect_allow_other_empty_unchanged() {
         let mut a = McpFilters {
-            allow: vec!["mcp__blackbox__bbox_search".into()],
+            allow: vec!["mcp__blackbox__bbox_context".into()],
             disallow: vec![],
         };
         let b = McpFilters::default();
         a.intersect_allow_from(&b, &[]);
-        assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+        assert_eq!(a.allow, vec!["mcp__blackbox__bbox_context"]);
     }
 
     #[test]
     fn intersect_allow_both_nonempty_takes_intersection() {
         let mut a = McpFilters {
             allow: vec![
-                "mcp__blackbox__bbox_search".into(),
+                "mcp__blackbox__bbox_context".into(),
                 "mcp__blackbox__bbox_stats".into(),
                 "mcp__blackbox__bbox_forget".into(),
             ],
@@ -2318,7 +2318,7 @@ mod tests {
             disallow: vec![],
         };
         let universe = &[
-            "mcp__blackbox__bbox_search",
+            "mcp__blackbox__bbox_context",
             "mcp__blackbox__bbox_stats",
             "mcp__blackbox__bbox_forget",
             "mcp__blackbox__bro_exec",
@@ -2335,14 +2335,14 @@ mod tests {
     #[test]
     fn intersect_allow_empty_intersection_denies_all() {
         let mut a = McpFilters {
-            allow: vec!["mcp__blackbox__bbox_search".into()],
+            allow: vec!["mcp__blackbox__bbox_context".into()],
             disallow: vec![],
         };
         let b = McpFilters {
             allow: vec!["mcp__blackbox__bro_exec".into()],
             disallow: vec![],
         };
-        let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bro_exec"];
+        let universe = &["mcp__blackbox__bbox_context", "mcp__blackbox__bro_exec"];
         a.intersect_allow_from(&b, universe);
         assert!(a.allow.is_empty(), "empty intersection should deny all");
     }
@@ -2677,9 +2677,9 @@ mod tests {
         ));
         assert!(!glob_match(
             "mcp__blackbox__bro_*",
-            "mcp__blackbox__bbox_search"
+            "mcp__blackbox__bbox_context"
         ));
-        assert!(glob_match("*bbox*", "mcp__blackbox__bbox_search"));
+        assert!(glob_match("*bbox*", "mcp__blackbox__bbox_context"));
         assert!(glob_match("a*b*c", "axxbyyc"));
         assert!(!glob_match("a*b*c", "axxbyy"));
         assert!(glob_match("Bash(git push *)", "Bash(git push origin)"));

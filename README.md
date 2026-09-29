@@ -7,7 +7,7 @@ shared knowledge, work threads and bro execution across providers.
 Blackbox runs model turns through a standalone harness. Callers compose reviews,
 gates, retries, schedules and integrations in their own code. The daemon keeps
 execution, resume, status, cancellation and waits. Workflow and atom engines,
-Slack/Badgey integration, reactions and whiteboard execution are retired.
+Slack/Badgey integration and reactions are retired.
 Historical records remain readable.
 
 ## Binaries
@@ -56,7 +56,9 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
 
 - Retrieve evidence with `bbox_hybrid_search`, inspect exact entity refs with
   `bbox_inspect_entity`, and package supporting refs with `bbox_bundle_evidence`.
-- Read conversations with `bbox_search`, `bbox_context` and `bbox_messages`.
+- Read conversations by narrowing `bbox_hybrid_search` with `doc_type` or a
+  conversation filter (`role`, `source`, `channel`, ...), then follow hits with
+  `bbox_context` and `bbox_messages`.
   `bbox_tool_calls` pages through indexed historical tool calls.
 - Query durable conventions with `bbox_knowledge`. Track active investigation
   state with `bbox_thread`; durable memory changes require operator authority.
@@ -65,7 +67,7 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
   `bro_status` before replacing apparently stalled work.
 - Discover providers with `bro_providers`; select a provider to list its models.
   `bro_brofile(action="list")` returns compact summaries; select a persona for detail.
-- Install packets, brofiles and teams using inline artifact JSON
+- Install brofiles and teams using inline artifact JSON
   or an HTTP(S) URL. Local caller paths are rejected. List before installing.
 
 Responses default to bounded summaries. Follow returned cursors and request

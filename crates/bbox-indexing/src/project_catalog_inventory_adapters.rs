@@ -2577,7 +2577,8 @@ fn authorize_owner_paths(
             .provenance_notes_ref
             .bytes()
             .any(|byte| byte == 0 || byte.is_ascii_control())
-        || bbox_provenance::validate_notes_ref(&paths.provenance_notes_ref).is_err()
+        || crate::project_catalog_notes_owner::validate_notes_ref(&paths.provenance_notes_ref)
+            .is_err()
     {
         return Err(invalid_input("provenance notes ref is invalid"));
     }
@@ -2991,7 +2992,7 @@ fn capture_durable_owner_snapshots(
         bbox_stores::pins::capture_project_catalog_owner_snapshot(path, limits)
     })?;
     let packet = capture_owner_snapshot_path(&paths.packet_root, |path| {
-        bbox_packets::capture_project_catalog_owner_snapshot(path, limits)
+        crate::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(path, limits)
     })?;
     let task = capture_owner_snapshot_path(&paths.task_store_path, |path| {
         capture_legacy_task_owner_snapshot(path, limits)
@@ -3017,7 +3018,7 @@ fn capture_durable_owner_snapshots(
     let mut provenance = Vec::new();
     for (project_id, repository) in &legacy.repositories {
         provenance.push(
-            bbox_provenance::capture_project_catalog_owner_snapshot_stable(
+            crate::project_catalog_notes_owner::capture_owner_snapshot(
                 repository,
                 &paths.provenance_notes_ref,
                 project_id.as_str(),

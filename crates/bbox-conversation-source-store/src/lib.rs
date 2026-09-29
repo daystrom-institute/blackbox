@@ -42,8 +42,7 @@
 //! There is exactly ONE durable authority per channel: `journal.ndjson`, an
 //! append-only NDJSON log of message, revision, and tombstone entries in
 //! arrival order. `checkpoint.json` is a DERIVED cache of the cursor plus the
-//! journal length it was derived at. Nothing else is authoritative, which is
-//! the `bbox-source-graph` single-authority house style applied to this lane.
+//! journal length it was derived at. Nothing else is authoritative.
 //!
 //! Every accepted write is two steps, in this literal order:
 //!
