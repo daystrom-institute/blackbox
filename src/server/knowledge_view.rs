@@ -1520,7 +1520,9 @@ impl BlackboxServer {
     /// after its accepted content moved (plan section 7.3 step 19).
     ///
     /// The convergence is bounded: one scope replacement built from the
-    /// project's own view, enqueued on the single index writer. Failure is
+    /// project's published view, enqueued on the single index writer. It
+    /// reads accepted content only; peer provisional snapshots are served
+    /// by the views that request them, never folded into the index here. Failure is
     /// degradation, not corruption, so it warns rather than propagating:
     /// the pointer and the projected caches are already correct, and the
     /// next reindex pass reconciles the search index.
@@ -1548,7 +1550,9 @@ impl BlackboxServer {
                 return false;
             }
         };
-        if let Err(error) = self.sync_knowledge_scope_to_index(&scope, project_id.as_str()) {
+        if let Err(error) =
+            self.sync_published_knowledge_scope_to_index(&scope, project_id.as_str())
+        {
             tracing::warn!(
                 project_id = %project_id,
                 error = %error,

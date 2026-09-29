@@ -6095,6 +6095,63 @@ mod tests {
         );
     }
 
+    /// Accepted-publication convergence indexes the published view only.
+    /// It never reads peer provisional snapshots, so a project whose peers
+    /// are unavailable does not record a degraded `all` read every time its
+    /// index converges. The positive control proves the fixture does reach
+    /// the degraded `all` path when a reader asks for it.
+    #[tokio::test]
+    async fn published_index_convergence_never_reads_the_all_view() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
+        use bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1;
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_converge_published", &scope);
+        fixture.install_publication(
+            "p_converge_published",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published only content")],
+            &[],
+        );
+        let mut server = fixture.server();
+        cover_knowledge_transport_project(&mut server, "p_converge_published", scope);
+        server.state.install_code_read_view_commit_hook();
+        let all_reads = |server: &BlackboxServer| {
+            server
+                .state
+                .knowledge_transport_observations
+                .snapshot()
+                .counters
+                .iter()
+                .filter(|counter| {
+                    counter.operation == KnowledgeTransportOperationV1::ProvisionalAllKnowledge
+                })
+                .map(|counter| counter.count)
+                .sum::<u64>()
+        };
+
+        let project_id = ProjectId::parse("p_converge_published").unwrap();
+        assert!(server.converge_published_knowledge_index(&project_id));
+        server.state.index_writer.flush_blocking().unwrap();
+        server.state.idx.write().reader_reload_for_test();
+        assert!(index_search(&server, "published").contains("knowledge-a"));
+        assert_eq!(
+            all_reads(&server),
+            0,
+            "convergence must not read the all view"
+        );
+
+        server
+            .session_knowledge_view(Some("p_converge_published"), Some("all"))
+            .unwrap();
+        assert!(
+            all_reads(&server) > 0,
+            "the fixture reaches the degraded all path"
+        );
+    }
+
     #[test]
     fn project_catalog_probe_rejects_relative_and_missing_paths() {
         assert!(probe_checkout("relative/path").is_err());

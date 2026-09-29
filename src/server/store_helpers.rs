@@ -5,6 +5,12 @@ use crate::server::BlackboxServer;
 #[cfg(test)]
 use crate::server::routes::rebuild_edge_index_from_shared;
 
+/// The view checkout-overlay index reconciliation reads: accepted content
+/// plus every checkout overlay the daemon itself observes.
+const INDEX_VIEW_WITH_OVERLAYS: &str = "all";
+/// The view accepted-publication index convergence reads.
+const INDEX_VIEW_PUBLISHED: &str = "published";
+
 impl BlackboxServer {
     pub(crate) fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {
         let logical_ref = crate::index::knowledge_entity_id(entry_id);
@@ -78,9 +84,30 @@ impl BlackboxServer {
         scope: &bbox_corpus_core::identity::PublishedScope,
         project: &str,
     ) -> anyhow::Result<()> {
+        self.replace_knowledge_scope_in_index(scope, project, INDEX_VIEW_WITH_OVERLAYS)
+    }
+
+    /// Reconcile one catalog project's scope from its accepted content
+    /// alone. Accepted-publication convergence uses this: it indexes what
+    /// every reader is served, and never reads peer provisional snapshots,
+    /// whose leases may have expired long before the next convergence.
+    pub(crate) fn sync_published_knowledge_scope_to_index(
+        &self,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+        project: &str,
+    ) -> anyhow::Result<()> {
+        self.replace_knowledge_scope_in_index(scope, project, INDEX_VIEW_PUBLISHED)
+    }
+
+    fn replace_knowledge_scope_in_index(
+        &self,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+        project: &str,
+        view: &str,
+    ) -> anyhow::Result<()> {
         let scope_hash = bbox_knowledge::overlay::published_scope_hash(scope);
         let documents = self
-            .knowledge_documents_for_project(project, None)?
+            .knowledge_documents_for_view(project, None, view)?
             .into_iter()
             .filter(|document| document.scope_hash.as_deref() == Some(scope_hash.as_str()))
             .collect::<Vec<_>>();
@@ -111,8 +138,17 @@ impl BlackboxServer {
         project: &str,
         logical_ref: Option<&str>,
     ) -> anyhow::Result<Vec<crate::index::KnowledgeIndexDocument>> {
+        self.knowledge_documents_for_view(project, logical_ref, INDEX_VIEW_WITH_OVERLAYS)
+    }
+
+    fn knowledge_documents_for_view(
+        &self,
+        project: &str,
+        logical_ref: Option<&str>,
+        view: &str,
+    ) -> anyhow::Result<Vec<crate::index::KnowledgeIndexDocument>> {
         Ok(self
-            .session_knowledge_view(Some(project), Some("all"))?
+            .session_knowledge_view(Some(project), Some(view))?
             .items
             .into_iter()
             .filter(|item| {
