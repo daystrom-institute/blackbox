@@ -81,8 +81,8 @@ Today the artifact catalog manages only:
 - crons
 
 That list is still narrower than the shipped default surface. Cron support has
-started moving into the catalog, but pollers, webhooks, bundles, and MCP surface
-routing are not yet managed through the same lifecycle. The runtime already has
+started moving into the catalog, but pollers, webhooks, and bundles are not
+yet managed through the same lifecycle. The runtime already has
 install/list tools for crons, pollers, and webhooks. Those objects are
 operational artifacts: they are versioned JSON specs, daemon-owned, installed
 into runtime registries, and need upgrade/uninstall semantics. Any remaining
@@ -180,9 +180,9 @@ System defaults:
   `system-defaults/agents/crons/*.json` are therefore shipped defaults that
   can be installed through the partial cron artifact path but still lack bundle
   membership and neutral runtime-store semantics.
-- `system-defaults/mcp-surfaces/routing.json` is also shipped default
-  machinery, but it is installed through `bbox_compile`, not the artifact
-  catalog.
+- MCP surfaces are daemon configuration, not shipped `system-defaults/`
+  specs: the built-in table is `crates/bbox-config/src/default_surfaces.toml`
+  and `[surfaces.<name>]` tables in the daemon config file override it.
 - Runtime serde ignores extra top-level fields in inlet JSON specs, while the
   artifact catalog requires a version to install. Shipped cron specs already
   carry top-level `version` fields. Future shipped poller/webhook defaults must
@@ -357,23 +357,10 @@ Notes on the kind table:
 - `identity` (`identity_get`/`identity_list`) is read-only and is **not** a
   managed kind.
 
-MCP surfaces should be managed as `packet` artifacts with an artifact role, not
-as a separate `ArtifactKind`. `system-defaults/mcp-surfaces/routing.json` is
-already a packet-shaped compile spec (`domain`, `version`, `scope`,
-`classification_lattice`, `rules`). A separate `mcp_surface` enum variant would
-add future churn without changing activation semantics. Use:
-
-```jsonc
-{
-  "kind": "packet",
-  "role": "mcp_surface",
-  "source": "system-defaults/mcp-surfaces/routing.json",
-  "name": "mcp-surface/routing"
-}
-```
-
-Doctor can still report missing MCP surface routing by querying packet metadata
-for `role == "mcp_surface"` or by checking the known domain.
+MCP surfaces are not managed artifacts. They are daemon configuration (a
+built-in table overridden by `[surfaces.<name>]` config tables) and apply on
+daemon restart, so bundles, upgrade and doctor apply-mode never install or
+compile them.
 
 ### Bundle
 
@@ -384,7 +371,7 @@ their desired lifecycle state.
 {
   "name": "blackbox-system-defaults",
   "version": 1,
-  "description": "Default Blackbox agents, atoms, inlets, packets, workflows, and MCP surfaces.",
+  "description": "Default Blackbox agents, atoms, inlets, packets, and workflows.",
   "members": [
     {
       "kind": "packet",
@@ -655,9 +642,9 @@ Extend `kind` to include:
 - `bundle`
 
 Keep the existing artifact install shape: `source`, optional `name`, optional
-`version`, and optional `supersedes`, and add optional `role` for artifacts such
-as MCP-surface packets whose activation kind stays `packet` but whose ops role
-matters to doctor and bundle planning. New kinds use that same shape so
+`version`, and optional `supersedes`, and add optional `role` for artifacts
+whose activation kind stays generic but whose ops role matters to doctor and
+bundle planning. New kinds use that same shape so
 operators learn one lifecycle command instead of one command family per runtime
 object.
 
@@ -782,8 +769,7 @@ about generations and bundle ownership, not only individual artifacts.
 Keep the single-artifact tool, but make removal adapter-backed for every managed
 kind. For `cron` and `poller`, removal must abort the running handle. For
 `webhook`, removal must remove the endpoint from the registry and delete the
-persisted spec. MCP surface removal is packet removal for the
-`mcp-surface/routing` domain or another packet marked `role="mcp_surface"`.
+persisted spec.
 
 The current hard-remove sequence has the right safety shape:
 
@@ -846,7 +832,6 @@ The desired end state removes kind-specific ops lifecycle tools from MCP:
 | `bro_workflow_list` | `bbox_artifact_list(kind="workflow")` |
 | `install-teams.sh` shell script | `bbox_artifact_install(kind="team"/"teamplate", source=...)` via the agentic-corpus bundle |
 | `bro_cron_upcoming` | `bbox_cron_upcoming` |
-| direct `bbox_compile` for shipped MCP surfaces | `bbox_artifact_install(kind="packet", role="mcp_surface", source=...)` |
 | `include_str!` builtin macros | `bbox_artifact_install(kind="macro", source=...)` via the refactor bundle |
 
 `macro_register`/`macro_unregister` are **not** removed: they remain the
@@ -886,11 +871,9 @@ dependency edges:
 - agents with `brofile_ref` need the brofile active.
 - teamplate members reference brofiles; brofiles activate before teamplates.
 - teamplate-backed teams need their teamplate (and its member brofiles) active.
-- MCP surfaces compile as packets and should be available before provider sync
-  steps that reference the surface.
 
 Activation order for the system-default surface therefore settles to roughly:
-packets/mcp-surface → brofiles → macros/agents/atoms → teamplates → teams →
+packets → brofiles → macros/agents/atoms → teamplates → teams →
 workflows → inlets (cron/poller/webhook). The bundle planner enforces
 the edges it can detect; explicit bundle order covers the rest until Phase 7
 auto-ordering lands.
@@ -915,7 +898,6 @@ into cohesive directory groups, several of which v1 omitted entirely
 ```text
 system-defaults/bundles/
   blackbox-system-defaults.json   # top-level meta-bundle → child bundles
-  mcp-surfaces.json               # routing.json as packet role=mcp_surface
   agentic-corpus.json             # auto-digest/auto-edge/contradiction/eval/embed packets+workflows+brofiles+crons, contradiction-specialists team
   maintenance.json                # daily-compaction cron+packet+workflow (own tree, NOT agentic-corpus)
   agents.json                     # default agents + agent-eval cron/packets/workflows
@@ -928,8 +910,6 @@ system-defaults/bundles/
 Suggested ownership, grounded in the directory groups:
 
 - `blackbox-system-defaults`: shallow meta-bundle that references the children.
-- `mcp-surfaces`: `system-defaults/mcp-surfaces/routing.json` installed as a
-  `packet` with `role="mcp_surface"`.
 - `agentic-corpus`: `system-defaults/agentic-corpus/**` packets, workflows,
   brofiles, and crons, plus the promoted `contradiction-specialists` team
   (retiring `install-teams.sh`). **Excludes `nightly-eval-arc`** — it runs the
@@ -1019,7 +999,6 @@ Apply-mode actions:
 - trigger `bbox_reindex(full=false)` for ordinary freshness catch-up
 - enqueue `bbox_reembed(route=...)` only for routes whose provider/model/dim
   changed or whose partition is missing
-- compile shipped MCP surface packets if the managed surface bundle changed
 
 Apply-mode should not:
 
@@ -1165,7 +1144,7 @@ pub struct ArtifactMetadata {
     pub bundle_generation: Option<String>,
     pub managed_by: Option<String>, // e.g. "bundle:blackbox-system-defaults"
     pub runtime_ref: Option<String>, // e.g. "cron:embed-compaction-nightly"
-    pub role: Option<String>, // e.g. "mcp_surface"
+    pub role: Option<String>,
 }
 ```
 

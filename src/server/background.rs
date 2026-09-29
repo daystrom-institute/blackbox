@@ -17,7 +17,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     super::code_source::spawn_commit_observer(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     super::history_activation::spawn_worker(&shared)?;
-    super::provenance_import::spawn_worker(&shared)?;
     // Operator-minted workspace bindings are durable: re-arm the ones
     // persisted under the knowledge-source store before anything can capture.
     super::knowledge_source::restore_operator_workspace_bindings(&shared);

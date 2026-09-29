@@ -5,7 +5,6 @@
     "<FIXTURE_ROOT>": "per-run temporary directory",
     "<HOST_STATE_DIR>": "host state directory outside the fixture",
     "<OBSERVED_AT_UNIX_SECS>": "wall-clock second a counter last moved",
-    "<PLAN_GENERATION>": "digest over the per-run registry project id",
     "<REGISTERED_AT>": "registry stamps wall-clock time",
     "<REGISTRY_PROJECT_ID>": "hash of the per-run canonical fixture path",
     "<WORKING_FINGERPRINT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01>": "derived from filesystem metadata",
@@ -20,10 +19,6 @@
     "all_knowledge": {
       "is_error": false,
       "text": "4 entries:\n\n[bp-deleted] Convention/project | all | entry bp-deleted [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_DELETED\n\n[bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_1\n  content_bytes=11\n  OWN_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_2\n  content_bytes=12\n  PEER_CONTENT\n\n── System memories ──────────────────────────\n[system] sm-bridge-parity-alpha: Bridge parity fixture memory alpha\n  ref: system_memory:sm-bridge-parity-alpha\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory alpha\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-alpha\"); bundle ref: system_memory:sm-bridge-parity-alpha\n\n[system] sm-bridge-parity-beta: Bridge parity fixture memory beta\n  ref: system_memory:sm-bridge-parity-beta\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory beta\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-beta\"); bundle ref: system_memory:sm-bridge-parity-beta\n\n  (signposts only; query an exact sm-* id for bounded full-body pages)\n\n── Next steps ───────────────────────────────\n  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"knowledge:bp-deleted\")\n  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"knowledge:bp-deleted\"])\n[knowledge visibility: 1 diagnostics (other=1); compact previews and exact recovery are in structuredContent.diagnostics]\n\n\nbuilt_from:\n- built_from_0 published scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. ref=refs/heads/main commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1\n- built_from_1 checkout_overlay scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. checkout=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01 publisher_commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1 checkout_head=da9971af82c4bcd459bb2dae63f0f3c45755eef1 merge_base=da9971af82c4bcd459bb2dae63f0f3c45755eef1 working_fingerprint=1101b6a4141a8f77370d926dcb4b4d7390be810ab3d3593d06922cf58e9d3a33\n- built_from_2 checkout_overlay scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. checkout=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02 publisher_commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1 checkout_head=da9971af82c4bcd459bb2dae63f0f3c45755eef1 merge_base=da9971af82c4bcd459bb2dae63f0f3c45755eef1 working_fingerprint=b9191c067f94698085fb0a0a699067cc13a7029cccec0d35da8c761fa6644774\n"
-    },
-    "blame": {
-      "is_error": false,
-      "text": "{\n  \"bbox_anchor\": null,\n  \"brofiles\": [],\n  \"file\": \"README.md\",\n  \"git_blame\": {\n    \"author\": \"Bridge Parity\",\n    \"author_time\": \"2026-01-01T00:00:00+00:00\",\n    \"commit_sha\": \"ad6d311991239fa1ea5a9cbdd91eae19f82b61e8\",\n    \"rel_path\": \"README.md\"\n  },\n  \"line\": 1,\n  \"prior_reads\": [],\n  \"status\": \"ok\",\n  \"text\": \"README.md:1 was last edited by:\\n  commit ad6d311 (2026-01-01T00:00:00+00:00)  by Bridge Parity\\n  [no bbox-tracked tool call matches this commit]\\n\",\n  \"threads\": []\n}"
     },
     "catalog_only_tools_refuse": {
       "bbox_project_publisher_advance": {
@@ -60,27 +55,11 @@
         },
         {
           "count": 1,
-          "kind": "blame",
-          "last_sequence": "<TIMING_DEPENDENT_D041>",
-          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
-          "outcome": "granted",
-          "source_lane": "legacy_checkout_registry"
-        },
-        {
-          "count": 1,
           "kind": "render_file_provider",
           "last_sequence": "<TIMING_DEPENDENT_D041>",
           "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
           "outcome": "granted",
           "source_lane": "legacy_checkout_registry"
-        },
-        {
-          "count": 2,
-          "kind": "provenance_note_io",
-          "last_sequence": "<TIMING_DEPENDENT_D041>",
-          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
-          "outcome": "granted",
-          "source_lane": "legacy_project_record"
         },
         {
           "count": 1,
@@ -116,9 +95,8 @@
         },
         {
           "denied": 0,
-          "granted": 1,
-          "kind": "blame",
-          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
+          "granted": 0,
+          "kind": "blame"
         },
         {
           "denied": 0,
@@ -128,9 +106,8 @@
         },
         {
           "denied": 0,
-          "granted": 2,
-          "kind": "provenance_note_io",
-          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
+          "granted": 0,
+          "kind": "provenance_note_io"
         },
         {
           "denied": 0,
@@ -148,7 +125,7 @@
     },
     "doctor_report": {
       "is_error": false,
-      "text": "{\n  \"checkout_access\": {\n    \"active_compatibility_lanes\": [\n      \"legacy_project_record\",\n      \"legacy_checkout_registry\",\n      \"legacy_path_resolver\"\n    ],\n    \"counters\": [\n      {\n        \"count\": \"<TIMING_DEPENDENT_D041>\",\n        \"kind\": \"publisher_config_tree_read\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_project_record\"\n      },\n      {\n        \"count\": 4,\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_checkout_registry\"\n      },\n      {\n        \"count\": 1,\n        \"kind\": \"blame\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_checkout_registry\"\n      },\n      {\n        \"count\": 1,\n        \"kind\": \"render_file_provider\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_checkout_registry\"\n      },\n      {\n        \"count\": 2,\n        \"kind\": \"provenance_note_io\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_project_record\"\n      },\n      {\n        \"count\": 1,\n        \"kind\": \"repository_mutation\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_path_resolver\"\n      }\n    ],\n    \"operations\": [\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"local_project_walk\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"git_history\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": \"<TIMING_DEPENDENT_D041>\",\n        \"kind\": \"publisher_config_tree_read\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 4,\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 1,\n        \"kind\": \"blame\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 1,\n        \"kind\": \"render_file_provider\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 2,\n        \"kind\": \"provenance_note_io\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"artifact_watch_discovery\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 1,\n        \"kind\": \"repository_mutation\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      }\n    ],\n    \"sequence\": \"<TIMING_DEPENDENT_D041>\"\n  },\n  \"sections\": [\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"blackboxd <DAEMON_VERSION> on 127.0.0.1:7264 (mcp `blackbox`); state <HOST_STATE_DIR>, runtime store <FIXTURE_ROOT>/state\"\n        }\n      ],\n      \"section\": \"daemon\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"4 indexed documents\"\n        }\n      ],\n      \"section\": \"index\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"code collection disabled; project sources are local\"\n        }\n      ],\n      \"section\": \"code_sources\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no embedding routes active yet\"\n        }\n      ],\n      \"section\": \"vectors\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"agentic graph has no entities yet (populated by indexing)\"\n        }\n      ],\n      \"section\": \"graph\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"1 registered project(s), all present\"\n        }\n      ],\n      \"section\": \"projects\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"publisher_config_tree_read: <TIMING_DEPENDENT_D041> granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"knowledge_gap_overlay_read: 4 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"blame: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"render_file_provider: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"provenance_note_io: 2 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"repository_mutation: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"active checkout compatibility lanes: legacy_project_record, legacy_checkout_registry, legacy_path_resolver\"\n        }\n      ],\n      \"section\": \"checkout_access\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no resolver compatibility lane has fired yet\"\n        }\n      ],\n      \"section\": \"resolver_compat\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"2 system memories loaded\"\n        }\n      ],\n      \"section\": \"memories\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"knowledge lint clean\"\n        }\n      ],\n      \"section\": \"knowledge\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"no unresolved attention items\"\n        }\n      ],\n      \"section\": \"attention\"\n    }\n  ],\n  \"status\": \"info\"\n}"
+      "text": "{\n  \"checkout_access\": {\n    \"active_compatibility_lanes\": [\n      \"legacy_project_record\",\n      \"legacy_checkout_registry\",\n      \"legacy_path_resolver\"\n    ],\n    \"counters\": [\n      {\n        \"count\": \"<TIMING_DEPENDENT_D041>\",\n        \"kind\": \"publisher_config_tree_read\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_project_record\"\n      },\n      {\n        \"count\": 4,\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_checkout_registry\"\n      },\n      {\n        \"count\": 1,\n        \"kind\": \"render_file_provider\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_checkout_registry\"\n      },\n      {\n        \"count\": 1,\n        \"kind\": \"repository_mutation\",\n        \"last_sequence\": \"<TIMING_DEPENDENT_D041>\",\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>,\n        \"outcome\": \"granted\",\n        \"source_lane\": \"legacy_path_resolver\"\n      }\n    ],\n    \"operations\": [\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"local_project_walk\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"git_history\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": \"<TIMING_DEPENDENT_D041>\",\n        \"kind\": \"publisher_config_tree_read\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 4,\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"blame\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 1,\n        \"kind\": \"render_file_provider\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"provenance_note_io\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 0,\n        \"kind\": \"artifact_watch_discovery\"\n      },\n      {\n        \"denied\": 0,\n        \"granted\": 1,\n        \"kind\": \"repository_mutation\",\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      }\n    ],\n    \"sequence\": \"<TIMING_DEPENDENT_D041>\"\n  },\n  \"sections\": [\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"blackboxd <DAEMON_VERSION> on 127.0.0.1:7264 (mcp `blackbox`); state <HOST_STATE_DIR>, runtime store <FIXTURE_ROOT>/state\"\n        }\n      ],\n      \"section\": \"daemon\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"4 indexed documents\"\n        }\n      ],\n      \"section\": \"index\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"code collection disabled; project sources are local\"\n        }\n      ],\n      \"section\": \"code_sources\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no embedding routes active yet\"\n        }\n      ],\n      \"section\": \"vectors\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"agentic graph has no entities yet (populated by indexing)\"\n        }\n      ],\n      \"section\": \"graph\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"1 registered project(s), all present\"\n        }\n      ],\n      \"section\": \"projects\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"publisher_config_tree_read: <TIMING_DEPENDENT_D041> granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"knowledge_gap_overlay_read: 4 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"render_file_provider: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"repository_mutation: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"active checkout compatibility lanes: legacy_project_record, legacy_checkout_registry, legacy_path_resolver\"\n        }\n      ],\n      \"section\": \"checkout_access\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no resolver compatibility lane has fired yet\"\n        }\n      ],\n      \"section\": \"resolver_compat\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"2 system memories loaded\"\n        }\n      ],\n      \"section\": \"memories\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"knowledge lint clean\"\n        }\n      ],\n      \"section\": \"knowledge\"\n    },\n    {\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"no unresolved attention items\"\n        }\n      ],\n      \"section\": \"attention\"\n    }\n  ],\n  \"status\": \"info\"\n}"
     },
     "own_gaps": {
       "is_error": false,
@@ -161,18 +138,6 @@
     "project_administration": {
       "is_error": false,
       "text": "{\"projects\":[{\"aliases\":[],\"canonical_path\":\"<FIXTURE_ROOT>/base\",\"is_git_repo\":true,\"languages\":[],\"project_id\":\"<REGISTRY_PROJECT_ID>\",\"registered_at\":\"<REGISTERED_AT>\",\"repo_id\":\"522e5d38\"}]}"
-    },
-    "provenance_export_plan": {
-      "is_error": false,
-      "text": "{\"scope\":{\"repo_id\":\"ad6d311991239fa1ea5a9cbdd91eae19f82b61e8\",\"bbox_root_relpath\":\".\"},\"project_id\":\"<REGISTRY_PROJECT_ID>\",\"notes_ref\":\"refs/notes/bbox/provenance\",\"generation\":\"<PLAN_GENERATION>\",\"documents\":[]}"
-    },
-    "provenance_note_export": {
-      "is_error": false,
-      "text": "{\n  \"completed_targets\": 0,\n  \"notes_ref\": \"refs/notes/bbox/provenance\",\n  \"notes_written\": 0,\n  \"status\": \"ok\",\n  \"total_targets\": 0\n}"
-    },
-    "provenance_note_import": {
-      "is_error": false,
-      "text": "{\n  \"edges_imported\": 0,\n  \"notes_ref\": \"refs/notes/bbox/provenance\",\n  \"status\": \"ok\"\n}"
     },
     "published_gaps": {
       "is_error": false,

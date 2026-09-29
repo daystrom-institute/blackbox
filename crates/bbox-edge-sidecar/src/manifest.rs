@@ -4,13 +4,13 @@
 //
 // Observed retention gate (phase_3_policy_gate):
 //   DECISION: retain observed history indefinitely. Observed lanes (tool
-//   edges, provenance) are append-only and do not participate in
-//   snapshot/branch mechanics. Storage health reports observed bytes per
+//   edges) are append-only and do not participate in snapshot/branch
+//   mechanics. Storage health reports observed bytes per
 //   project and warns when policy caps are exceeded; deletion is explicit.
 //
 // P1 observed backfill consideration:
 //   `bbox_project_register` post-step will retroactively walk transcripts
-//   and emit EDITED_FILE/READ_FILE/RAN_BASH edges for the newly registered
+//   and emit RAN_BASH edges for the newly registered
 //   project (see design/archive/agentic-corpus-followups.md §P1). This
 //   will grow observed history for every project that gets registered after
 //   initial transcript indexing. Storage health surfaces observed bytes per

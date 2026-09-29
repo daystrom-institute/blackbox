@@ -1,5 +1,4 @@
 mod background;
-pub(crate) mod blame_authority;
 mod bridge_parity;
 mod built_from;
 /// Phase 5 plan section 14.4: the bridge parity proof. Test-only.
@@ -35,8 +34,6 @@ mod open;
 pub(crate) mod producer_auth;
 pub(crate) mod producer_commands;
 pub mod progress;
-pub(crate) mod provenance_authority;
-pub(crate) mod provenance_import;
 pub(crate) mod publisher_auto_advance;
 pub(crate) mod render_operations;
 pub(crate) mod render_owner;
@@ -93,7 +90,6 @@ impl BlackboxServer {
                 + crate::tools::roster::router()
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()
-                + crate::tools::mcp_surface::router()
                 + crate::tools::doctor::router()
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
@@ -101,11 +97,10 @@ impl BlackboxServer {
                 + crate::tools::tool_calls::router(),
             embed_status_snapshots: Default::default(),
             surface: std::sync::OnceLock::new(),
+            surface_tools: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),
             session_workspace_binding: std::sync::OnceLock::new(),
-            session_operator_blame_binding: std::sync::OnceLock::new(),
-            session_operator_provenance_binding: std::sync::OnceLock::new(),
         }
     }
 

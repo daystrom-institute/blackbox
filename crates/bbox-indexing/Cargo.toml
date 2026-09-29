@@ -29,7 +29,6 @@ bbox-corpus-index = { path = "../bbox-corpus-index" }
 bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
 bbox-artifacts = { path = "../bbox-artifacts" }
 bbox-packets = { path = "../bbox-packets" }
-bbox-provenance = { path = "../bbox-provenance" }
 bbox-slack = { path = "../bbox-slack" }
 bbox-whiteboards = { path = "../bbox-whiteboards" }
 bro-core = { path = "../bro-core" }

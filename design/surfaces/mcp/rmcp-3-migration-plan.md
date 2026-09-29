@@ -17,7 +17,7 @@ the HOW: the concrete breaking-change inventory for our codebase, the phase
 mechanics, and per-phase validation.
 
 Prerequisite: the [MCP Surface and Internals Shedding Plan](mcp-shedding-plan.md)
-lands before Phase 0. Surface routing becomes static configuration, and the
+lands before Phase 0. Surface routing is static daemon configuration, and the
 tool and store inventory this plan migrates is the surviving set from that
 plan.
 
@@ -74,7 +74,7 @@ plan.
 | Coupling | Where | 3.0 impact |
 | --- | --- | --- |
 | `StreamableHttpService` + `LocalSessionManager`, `with_stateful_mode(true)`, keepalive from `BBOX_MCP_SESSION_KEEPALIVE_SECS` | `src/server/mcp.rs` (`build_http_app`) | `with_stateful_mode` renamed to `with_legacy_session_mode`; `NeverSessionManager` available for stateless |
-| Per-session OnceLocks (`surface`, `surface_project`, `session_checkout`) pinned at `initialize` | `src/server/handler.rs`, `src/server/state.rs` | The one hard collision. No `initialize` in 2026-07-28; fresh handler per request. Phase 1 rework |
+| Per-session OnceLocks (`surface`, `surface_tools`, `surface_project`, `session_checkout`) pinned at `initialize` | `src/server/handler.rs`, `src/server/state.rs` | The one hard collision. No `initialize` in 2026-07-28; fresh handler per request. Phase 1 rework |
 | Manual `ServerHandler` impl (`call_tool` -> `tool_router.call`, surface-filtered `list_tools`/`get_tool`) | `src/server/handler.rs` | Return types widen to `CallToolResponse` etc. (`.into()`); surface filtering logic itself is version-agnostic |
 | 177 `#[tool]` macros across `src/tools/*.rs` | `src/tools/` | Free: macro users need no MRTR changes |
 | Progress notifications (`context.meta.get_progress_token()`, `peer.send_notification(ProgressNotification)`) | `src/server/progress.rs`, `src/tools/dispatch.rs`, `src/tools/workspace.rs` | Survives (request-scoped progress stays on the response stream). `Meta` -> `RequestMetaObject` rename |
@@ -152,8 +152,10 @@ path for current clients. No tasks/resources yet.
 1. Move surface/project resolution from `initialize` to per-request:
    extract `?surface=`/`?project=` from the `http::request::Parts` extension
    on every `get_tool`/`list_tools`/`call_tool` (and later
-   `list_resources`/`read_resource`). The `SurfaceDecisionCache` already
-   keys `(surface, project, generation)`; hit path is two lock reads.
+   `list_resources`/`read_resource`). The surface resolves from the static
+   configured surface map, independent of `?project`; each surface's
+   visible set is fixed for the daemon's lifetime, so no generation-keyed
+   decision cache is needed.
 2. Move checkout authority + dark overlay registration behind a shared cache
    keyed by raw selector (Q4 invalidation: generation + TTL backstop).
    Resolution must consult corpus-plane state only (project registry,
@@ -166,9 +168,9 @@ path for current clients. No tasks/resources yet.
 3. Delete the OnceLock session pins from `BlackboxServer`; handler instances
    become stateless carriers of `Arc<SharedState>` (cheap to construct per
    request).
-4. Deny semantics (Q5): evaluate the surface verdict on `server/discover`
-   and per-method; keep the legacy initialize-time abort for legacy
-   sessions.
+4. Deny semantics (Q5) reduce to "unknown surface": refuse it on
+   `server/discover` and per-method; keep the legacy initialize-time abort
+   for legacy sessions.
 5. Override `supported_protocol_versions()`; advertise both
    `V_2025_11_25` and `V_2026_07_28` behind a config gate (Q2). The SDK
    default `supported_protocol_versions()` is `KNOWN_VERSIONS`, which
@@ -186,7 +188,7 @@ path for current clients. No tasks/resources yet.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the
-handler level (surface packets + `?project=` matrix, including the
+handler level (configured surfaces + `?project=` matrix, including the
 gap-310c36b6 regression shape); a stateless rmcp 3.0 client fixture in
 tests (client in `Discover` lifecycle mode) against an in-process server;
 lane gates. Live probe: harness child dispatch round-trip in `Auto` mode.
@@ -243,7 +245,7 @@ slice independently of Phase 2, not task notifications.
 - `ServerHandler::listen` + `SubscriptionSink`; emit
   `notifications/tasks` on task transitions (thin payloads), driven off the
   per-task `Notify` the waiters already use.
-- `toolsListChanged` on surface/packet mutation.
+- `toolsListChanged` when the served tool catalog changes.
 - `resourcesListChanged` if Phase 4 has landed.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
@@ -259,9 +261,9 @@ slice independently of Phase 2, not task notifications.
 ## Phase 4: resource projection
 
 - `blackbox://` URI scheme + resource templates per the target-surface doc.
-- Surface packets gain a `resources:` dimension; `list_resources` /
-  `read_resource` consult the same per-request scope extraction and
-  `SurfaceDecisionCache`.
+- `[surfaces.<name>]` configuration tables gain a `resources` key;
+  `list_resources` / `read_resource` consult the same per-request surface
+  resolution.
 - Protocol cursor pagination + `ttl_ms`/`cache_scope` on list/read.
 - Catalogs: brofiles, teams, artifacts, atoms, packets, live tasks;
   threads optional.

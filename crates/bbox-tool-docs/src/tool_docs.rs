@@ -65,10 +65,14 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
-            Self::ProjectGraphs => "Read project-owned reflective graph generations.",
-            Self::Projects => "Register project roots for later file indexing.",
+            Self::ProjectGraphs => {
+                "Read project-owned reflective graph generations. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
+            }
+            Self::Projects => {
+                "Resolve registered project roots with `bbox_project_list`. Registration and the other project administration tools are operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
+            }
             Self::ProjectCatalog => {
-                "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead."
+                "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for operator-approved rendered rules, `bbox_remember` for approved cold recall, `bbox_decide` for approved durable commitments, and `bbox_pin` for scoped active context."
@@ -83,7 +87,7 @@ impl ToolCategory {
                 "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
             }
             Self::Artifacts => {
-                "Versioned catalog for packets, brofiles, simple agents and teams. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts."
+                "Versioned catalog for packets, brofiles, simple agents and teams. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Packets => {
                 "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
@@ -91,12 +95,14 @@ impl ToolCategory {
             Self::Orchestration => {
                 "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
-            Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
+            Self::StorageHealth => {
+                "Read-only storage inventory for edge sidecar hygiene. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
+            }
             Self::Workspace => {
                 "Search indexed historical tool calls with bbox_tool_calls. Execute file, shell and Git operations in the caller harness."
             }
             Self::Operations => {
-                "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands."
+                "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
         }
     }
@@ -273,34 +279,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use when legacy edge sidecars have grown from repeated full reindex replay. Call first with `apply=false` (default) for exactly one project_id, inspect removed/retained counts, then call with `apply=true` for that same project if the dry-run scope is acceptable. Leave `rebuild=false` while compacting multiple projects; after the last project, call with `apply=true,rebuild=true` once to reload graph state. If a requested rebuild fails after compaction, status=partial preserves the compaction stats and backup receipt. Retry apply=true,rebuild=true to rebuild the current compacted sidecar.",
         example: Some(r#"bbox_edge_compact(project_id="d723917f", apply=false)"#),
     },
-    ToolDoc {
-        name: "bbox_blame",
-        category: ToolCategory::Graph,
-        summary: "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it.",
-        when_to_use: "Use for WHY-this-line-exists questions; check anchor-matched vs git-only. When the daemon cannot run blame against the project's checkout itself (a workspace-bound or operator-bound session, a project whose blame authority is checkout-local, or a catalog checkout that is not on the daemon host), the call refuses with `error.blame_locality_required`. Run `bro blame --token-file <FILE> --entity-ref <REF>` or `bro blame --token-file <FILE> --file <PATH> --line <N>` on the checkout host instead.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_export",
-        category: ToolCategory::Graph,
-        summary: "Legacy overlap adapter that writes bbox provenance Git notes from blackboxd. Prefer bro provenance export for checkout-local application; retain this tool when one call must cover all registered projects.",
-        when_to_use: "Use only when the legacy all-registered-project export is required. For one checkout, run `bro provenance export` from that checkout instead. Prepares all serialized note documents before writes. A later write failure returns status=partial with known notes_written, completed_targets, unattempted_targets and failed-target uncertainty. The failed current target may have written; retries use deduplication.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_export_plan",
-        category: ToolCategory::Graph,
-        summary: "Return one deterministic, generation-bound provenance-note page for this MCP session's authoritative checkout. Project selection comes only from session context; callers may pass only cursor and generation pagination controls. Used by bro provenance export so Git-note writes stay checkout-local.",
-        when_to_use: "Used by `bro provenance export`. The project is fixed by MCP session context; callers may supply only the returned cursor and generation for later pages.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_import",
-        category: ToolCategory::Graph,
-        summary: "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar.",
-        when_to_use: "Use after fetching or cloning bbox git notes from another machine.",
-        example: None,
-    },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_project_register",
@@ -335,7 +313,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_list",
         category: ToolCategory::Projects,
-        summary: "Compatibility attached-root discovery for bridge callers; catalog-mode logical discovery uses bbox_project_catalog_list, including remote-only projects. List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",
+        summary: "Compatibility attached-root discovery for bridge callers; remote-only catalog projects are not listed. List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this to check whether a path is already registered before asking the operator to register it.",
         when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
     },
@@ -678,21 +656,12 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
         ),
     },
-    ToolDoc {
-        name: "bbox_mcp_surface",
-        category: ToolCategory::Packets,
-        summary: "Inspect MCP routing: replay pages visible tools, describe pages rules, list pages surface packets. detail=policy expands allow/disallow patterns. body_limit/cursor without limit/offset recovers complete projected JSON; changed policy or selection refuses continuation.",
-        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. All inventories are paged live views. Replay/describe accept detail=policy for exact pattern pages; action=list rejects replay/describe selectors. Packet body pages are the complete packet reader. body_limit/cursor without limit/offset recovers complete projected JSON for the same action/surface/project/detail. Changed result or selection refuses continuation. Ordinary offset pages remain live. Complex predicates have matches_surface=null and surface_match_kind=requires_predicate_evaluation; routing still evaluates the actual predicate.",
-        example: Some(
-            r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
-        ),
-    },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch a fresh agent task/session and return {taskId, sessionId}. Optional request_key prevents duplicate launch after a lost reply. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`.",
-        when_to_use: "Use to start a fresh agent session only. Supply request_key before dispatch when an uncertain reply may need retry: repeat the same key and inputs in the same bound workspace. Keys never expire automatically. Changed inputs refuse reuse. admission_incomplete means execution_unknown: inspect the returned taskId; the same key never relaunches. Without a key, another call can start another task. A dispatch selector is required: pass exactly one selector family — `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Set the session's working directory with `cwd` (canonical name; `project_dir` is accepted as a deprecated alias). Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. For providers with a known schedule, peak_usage reports whether the attempt started during peak hours; it is advisory, not a quota measurement or rate guarantee. Request-key replays retain the original attempt time. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. Without an account pin, allocation uses only that provider's declared default or native credentials; unrelated global accounts are not candidates. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
+        when_to_use: "Use to start a fresh agent session only. Supply request_key before dispatch when an uncertain reply may need retry: repeat the same key and inputs in the same bound workspace. Keys never expire automatically. Changed inputs refuse reuse. admission_incomplete means execution_unknown: inspect the returned taskId; the same key never relaunches. Without a key, another call can start another task. A dispatch selector is required: pass exactly one selector family: `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Set the session's working directory with `cwd` (canonical name; `project_dir` is accepted as a deprecated alias). Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. For providers with a known schedule, peak_usage reports whether the attempt started during peak hours; it is advisory, not a quota measurement or rate guarantee. Request-key replays retain the original attempt time. Record `taskId`, `sessionId`, and any `selectionTraceId`; operators inspect allocation decisions with `bro mcp call bro_allocator_trace '{\"selection_trace_id\":\"<id>\"}' --surface ops`. Without an account pin, allocation uses only that provider's declared default or native credentials; unrelated global accounts are not candidates. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
         example: Some(
             r#"bro_exec(prompt="review this patch", cwd="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
         ),
@@ -807,7 +776,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_retro",
         category: ToolCategory::Orchestration,
         summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task.",
-        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
+        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself (missing/awkward bbox_/bro_ tools, stale guidance or memories, clumsy workflow/dispatch steps) and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; the operator's bulk path at cleanup time is `bro mcp call bro_prune '{\"retro\":true}' --surface ops`.",
         example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {
@@ -981,8 +950,9 @@ rate limiting, or failure; status/tail is the evidence.
 hand-roll sequential wait/poll loops when the coordination primitive exists.
 - After external orchestration, clean up only what you created — but only after \
 explicit operator confirmation: terminal status is not the same as done, so ask \
-before pruning terminal tasks with `bro_prune` (offer `retro=true`) or dissolving \
-ad hoc teams. Cleanup is operator-gated, not automatic.
+before dissolving ad hoc teams, and ask the operator to prune terminal tasks \
+(`bro mcp call bro_prune '{\"task_ids\":[\"<id>\"]}' --surface ops`; offer \
+`retro=true`). Cleanup is operator-gated, not automatic.
 - Memory lanes: `bbox_thread` (investigation state), \
 `bbox_learn`/`bbox_decide` (operator-approved standing rules / commitments), \
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
@@ -1089,7 +1059,7 @@ fn render_retrieval_workflow(out: &mut String) {
     out.push_str("## Retrieval workflow\n\n");
     out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
     out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, and `bbox_hybrid_search` for conversation history, indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
-    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package. Use `bbox_blame` for line-level provenance.\n\n");
+    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package.\n\n");
     out.push_str("Use tool-returned canonical entity refs and suggested fixes. Scope edge types and direction to the question. Retrieve `sm-agentic-opening-sequence` only for a graph investigation that needs its detailed recipes.\n\n");
 }
 
@@ -1718,8 +1688,7 @@ mod tests {
         // `#[tool(description = ...)]` (src/**/*.rs) must equal the
         // managed-layer `ToolDoc.summary` (this file). They're the same
         // text to the agent — let them drift and the agent gets
-        // contradictory guidance at the two surfaces. See the
-        // `bb846aad` decision entry for the four-surface policy.
+        // contradictory guidance at the two surfaces.
         let registered = parse_registered_tools();
         let summaries: std::collections::HashMap<&str, &str> =
             TOOL_DOCS.iter().map(|d| (d.name, d.summary)).collect();

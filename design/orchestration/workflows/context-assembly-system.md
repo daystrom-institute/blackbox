@@ -68,8 +68,8 @@ uses existing atom and rule-packet machinery as an explicit context producer
   only gets heavier when an actor node or brofile explicitly names one.
 - Do not store provider transcript content in blackbox for continuity. Provider
   sessions already own conversation continuity.
-- Do not replace MCP tool filtering or `bbox_mcp_surface`; tool policy remains a
-  separate dispatch concern.
+- Do not replace MCP tool filtering or configured MCP surfaces; tool policy
+  remains a separate dispatch concern.
 
 ## Brofile Schema
 

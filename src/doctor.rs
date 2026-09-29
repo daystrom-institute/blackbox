@@ -93,6 +93,19 @@ impl Finding {
     }
 }
 
+/// Operator CLI form of an ops-surface tool call. Doctor's next steps name
+/// operator tools, which agent-facing MCP surfaces do not serve.
+fn ops_call(tool: &str, args: &str) -> String {
+    format!("bro mcp call {tool} '{args}' --surface ops")
+}
+
+fn publisher_status_call(project: &str) -> String {
+    ops_call(
+        "bbox_project_publisher_status",
+        &format!("{{\"project_id\":\"{project}\"}}"),
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SectionReport {
     pub(crate) section: &'static str,
@@ -386,7 +399,7 @@ fn accepted_publication_section(
                     "project {project} could not be read from the catalog pair; \
                      its catalog-derived status is unavailable, not denied"
                 ),
-                "bbox_doctor",
+                ops_call("bbox_doctor", "{}"),
             ));
             findings.push(match status.accepted.state {
                 "current" if status.accepted.serves_published_content => Finding::info(format!(
@@ -400,7 +413,7 @@ fn accepted_publication_section(
                          of the catalog and fell back to its PRIOR generation; reads \
                          continue and every mutation refuses until repair"
                     ),
-                    "bbox_project_publisher_status",
+                    publisher_status_call(project),
                 ),
                 "missing" => Finding::info(format!(
                     "project {project} has no accepted publication pointer; that is \
@@ -412,7 +425,7 @@ fn accepted_publication_section(
                          of the unreadable catalog pair; published reads are unavailable \
                          for it"
                     ),
-                    "bbox_project_publisher_status",
+                    publisher_status_call(project),
                 ),
                 other => Finding::warn(format!(
                     "project {project} accepted publication state is {other} and could \
@@ -438,7 +451,7 @@ fn accepted_publication_section(
                     "project {project} serves accepted content at a scope the catalog has since \
                      migrated; publishing at the current scope clears the bridge"
                 ),
-                "bbox_project_publisher_advance",
+                ops_call("bbox_project_publisher_advance", "<json>"),
             ),
             // Reads continue off the prior arm; every mutation refuses.
             "prior" => Finding::action(
@@ -446,7 +459,7 @@ fn accepted_publication_section(
                     "project {project} fell back to its PRIOR accepted generation; reads continue \
                      and establish, bind, and advance all refuse until repair"
                 ),
-                "bbox_project_publisher_status",
+                publisher_status_call(project),
             ),
             "missing" => Finding::info(format!(
                 "project {project} has no accepted publication pointer; an explicit establish \
@@ -496,7 +509,7 @@ fn publisher_binding_section(
                     "project {project} pointer names a DETACHED attachment; published reads \
                      continue and advance is unavailable until an explicit bind repairs it"
                 ),
-                "bbox_project_publisher_bind",
+                ops_call("bbox_project_publisher_bind", "<json>"),
             )),
             "unknown_attachment" => Some(Finding::warn(format!(
                 "project {project} pointer names an attachment the catalog no longer carries"
@@ -990,7 +1003,13 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                             "project `{}` local scan returned zero entries and the purge was refused: {}",
                             record.project_id, record.diagnostic
                         ),
-                        "restore the checkout, or acknowledge the empty root with `bbox_reindex accept_empty_projects`",
+                        format!(
+                            "restore the checkout, or acknowledge the empty root with `{}`",
+                            ops_call(
+                                "bbox_reindex",
+                                &format!("{{\"accept_empty_projects\":[\"{}\"]}}", record.project_id),
+                            )
+                        ),
                     ),
                     // P3-F history states. `unavailable_no_attachment` is the
                     // remote-only STEADY STATE, so it is informational: the
@@ -1206,33 +1225,6 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
         ))),
     }
     findings.extend(repo_history_findings(state));
-    match state.git_sources.store().provenance_export_receipts() {
-        Ok(receipts) => {
-            for stored in receipts {
-                findings.push(Finding::ok(format!(
-                    "project `{}` provenance export receipted ({} documents, generation {})",
-                    stored.project_id,
-                    stored.receipt.document_count,
-                    &stored.receipt.generation[..12],
-                )));
-            }
-        }
-        Err(error) => findings.push(Finding::blocked(format!(
-            "provenance export receipts are unreadable: {error:#}"
-        ))),
-    }
-    let provenance = state.git_sources.provenance_export_metrics();
-    if provenance.pages_served > 0
-        || provenance.stale_restarts > 0
-        || provenance.receipts_accepted > 0
-    {
-        findings.push(Finding::info(format!(
-            "provenance transport served {} page(s), accepted {} receipt(s), and requested {} stale restart(s) since daemon start",
-            provenance.pages_served,
-            provenance.receipts_accepted,
-            provenance.stale_restarts,
-        )));
-    }
     if findings.is_empty() {
         findings.push(if state.config.read().code_collection.enabled {
             Finding::info("code collection enabled with no active collected generations")
@@ -1453,7 +1445,10 @@ fn index_section(state: &crate::server::state::SharedState) -> SectionReport {
     let finding = if num_docs == 0 {
         Finding::action(
             "search index is empty",
-            "bbox_reindex() to build it (first build can take a while)",
+            format!(
+                "{} to build it (first build can take a while)",
+                ops_call("bbox_reindex", "{}")
+            ),
         )
     } else {
         Finding::ok(format!("{num_docs} indexed documents"))
@@ -1513,7 +1508,10 @@ fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport 
                                     metrics.route,
                                     hnsw.connectivity_risk_ratio() * 100.0
                                 ),
-                                "daily connectivity maintenance will attempt repair; inspect bbox_embed_status for current diagnostics",
+                                format!(
+                                    "daily connectivity maintenance will attempt repair; inspect {} for current diagnostics",
+                                    ops_call("bbox_embed_status", "{}")
+                                ),
                             ));
                         }
                     }
@@ -1573,9 +1571,18 @@ fn projects_section(state: &crate::server::state::SharedState) -> SectionReport 
                     record.project_id, record.canonical_path
                 ))
                 .with_next(format!(
-                    "bbox_project_rename(project=\"{}\", new_path=...) if it moved, or \
-                     bbox_project_unregister(project=\"{}\")",
-                    record.project_id, record.project_id
+                    "{} if it moved, or {}",
+                    ops_call(
+                        "bbox_project_rename",
+                        &format!(
+                            "{{\"project\":\"{}\",\"new_path\":\"<new path>\"}}",
+                            record.project_id
+                        ),
+                    ),
+                    ops_call(
+                        "bbox_project_unregister",
+                        &format!("{{\"project\":\"{}\"}}", record.project_id),
+                    ),
                 )),
             );
         }
@@ -1727,7 +1734,8 @@ pub(crate) fn classify_embed_route(
             ))
             .with_next(format!(
                 "add `[embed.routes.visual] {kind} = \"voyage_visual\"` to \
-                 embed.toml, then bbox_reembed"
+                 embed.toml, then {}",
+                ops_call("bbox_reembed", &format!("{{\"route\":\"{route}\"}}"))
             ));
         }
     }
@@ -1742,14 +1750,18 @@ pub(crate) fn classify_embed_route(
                 ))
                 .with_next(format!(
                     "add `[embed.routes.visual] {kind} = \"voyage_visual\"` to \
-                     embed.toml, then bbox_reembed"
+                     embed.toml, then {}",
+                    ops_call("bbox_reembed", &format!("{{\"route\":\"{route}\"}}"))
                 ));
             }
         }
         return match reason {
             "credential_missing" => Finding::action(
                 format!("route `{route}` is missing provider credentials: {detail}"),
-                format!("set the provider API key env, then bbox_reembed(route=\"{route}\")"),
+                format!(
+                    "set the provider API key env, then {}",
+                    ops_call("bbox_reembed", &format!("{{\"route\":\"{route}\"}}"))
+                ),
             ),
             "queue_full" => Finding::warn(format!(
                 "route `{route}` queue is full ({} pending, {} bytes)",
@@ -1757,7 +1769,10 @@ pub(crate) fn classify_embed_route(
             )),
             _ => Finding::action(
                 format!("route `{route}` is unavailable: {detail}"),
-                format!("fix the route config/provider, then bbox_reembed(route=\"{route}\")"),
+                format!(
+                    "fix the route config/provider, then {}",
+                    ops_call("bbox_reembed", &format!("{{\"route\":\"{route}\"}}"))
+                ),
             ),
         };
     }

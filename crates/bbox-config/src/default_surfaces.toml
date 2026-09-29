@@ -1,0 +1,133 @@
+# Built-in MCP tool surfaces. Daemon configuration overrides or adds surfaces
+# with `[surfaces.<name>]` tables of the same shape. Patterns are globs over
+# bare tool names; a non-empty `allow` is an allowlist and `disallow` wins
+# over `allow`. A session naming a surface missing from the merged table is
+# refused at initialize.
+#
+# Agent-facing surfaces (default, interactive, agent-internal, readonly) hide
+# the operator tools; `ops` serves the full catalog. Operators reach an
+# operator tool with `bro mcp call <tool> '<json>' --surface ops`.
+
+[surfaces.default]
+disallow = [
+    "bbox_stats",
+    "bro_prune",
+    "bro_allocator_*",
+    "bro_mcp",
+    "bbox_project_register",
+    "bbox_project_init",
+    "bbox_project_rename",
+    "bbox_project_unregister",
+    "bbox_project_eject",
+    "bbox_project_catalog_*",
+    "bbox_project_attach",
+    "bbox_project_detach",
+    "bbox_project_default_attachment",
+    "bbox_project_promote",
+    "bbox_project_publisher_*",
+    "bbox_project_graph_*",
+    "bbox_reindex",
+    "bbox_reembed",
+    "bbox_embed_*",
+    "bbox_storage_*",
+    "bbox_edge_compact",
+    "bbox_doctor",
+    "bbox_artifact_*",
+    "bro_broadcast",
+    "bbox_absorb",
+    "bbox_bootstrap",
+    "bbox_lint",
+    "bbox_review",
+]
+
+[surfaces.interactive]
+disallow = [
+    "bbox_stats",
+    "bro_prune",
+    "bro_allocator_*",
+    "bro_mcp",
+    "bbox_project_register",
+    "bbox_project_init",
+    "bbox_project_rename",
+    "bbox_project_unregister",
+    "bbox_project_eject",
+    "bbox_project_catalog_*",
+    "bbox_project_attach",
+    "bbox_project_detach",
+    "bbox_project_default_attachment",
+    "bbox_project_promote",
+    "bbox_project_publisher_*",
+    "bbox_project_graph_*",
+    "bbox_reindex",
+    "bbox_reembed",
+    "bbox_embed_*",
+    "bbox_storage_*",
+    "bbox_edge_compact",
+    "bbox_doctor",
+    "bbox_artifact_*",
+    "bro_agent_*",
+]
+
+# Workflow-owned dispatches: no further dispatch, as a backstop to the
+# mechanical recursion guard.
+[surfaces.agent-internal]
+disallow = [
+    "bro_exec",
+    "bro_resume",
+    "bro_cancel",
+    "bbox_stats",
+    "bro_prune",
+    "bro_allocator_*",
+    "bro_mcp",
+    "bbox_project_register",
+    "bbox_project_init",
+    "bbox_project_rename",
+    "bbox_project_unregister",
+    "bbox_project_eject",
+    "bbox_project_catalog_*",
+    "bbox_project_attach",
+    "bbox_project_detach",
+    "bbox_project_default_attachment",
+    "bbox_project_promote",
+    "bbox_project_publisher_*",
+    "bbox_project_graph_*",
+    "bbox_reindex",
+    "bbox_reembed",
+    "bbox_embed_*",
+    "bbox_storage_*",
+    "bbox_edge_compact",
+    "bbox_doctor",
+    "bbox_artifact_*",
+    "bbox_absorb",
+    "bbox_bootstrap",
+    "bbox_lint",
+    "bbox_review",
+]
+
+[surfaces.readonly]
+allow = [
+    "bbox_context",
+    "bbox_messages",
+    "bbox_session",
+    "bbox_sessions_list",
+    "bbox_hybrid_search",
+    "bbox_inspect_entity",
+    "bbox_describe_schema",
+    "bbox_find_paths",
+    "bbox_bundle_evidence",
+    "bbox_knowledge",
+    "bbox_thread_list",
+    "bbox_notes",
+    "bbox_packet_list",
+    "bbox_packet_events",
+    "bbox_project_list",
+    "bro_status",
+    "bro_dashboard",
+    "bro_agent_list",
+    "bro_agent_get",
+    "bro_agent_describe",
+    "bro_agent_search",
+    "bbox_tool_calls",
+]
+
+[surfaces.ops]

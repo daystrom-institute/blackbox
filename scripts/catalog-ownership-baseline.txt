@@ -55,8 +55,6 @@ canonical_path_read	src/server/repo_io.rs	fn gap_base_carriers	1	delete with Pro
 canonical_path_read	src/server/repo_io.rs	fn knowledge_base_carriers	1	delete with ProjectRecord
 canonical_path_read	src/server/routes.rs	fn enqueue_project_knowledge_embeds	1	delete with ProjectRecord
 canonical_path_read	src/server/store_helpers.rs	fn sync_knowledge_entry_to_index	1	delete with ProjectRecord
-canonical_path_read	src/tools/graph.rs	fn acquire_bridge_project_file	1	delete with ProjectRecord
-canonical_path_read	src/tools/graph.rs	fn lexical_absolute_selection	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn prepare_knowledge_write	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_eject	1	delete with ProjectRecord
@@ -76,7 +74,7 @@ checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn select_scop
 checkout_root_path	crates/bbox-indexing/src/checkout_access_v2.rs	fn resolve_candidate	2	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/checkout_access_v2.rs	fn verify_live_checkout	2	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/checkout_registry.rs	fn reconcile	1	collapse into the lease confined readers
-checkout_root_path	crates/bbox-indexing/src/index/reindex.rs	fn execute_reindex_pass	6	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/index/reindex.rs	fn execute_reindex_pass	5	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/index/writer_actor.rs	fn classify_effective_source	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/index/writer_actor.rs	fn run_git_current_overlay	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/index/writer_actor.rs	fn run_local_stage	2	collapse into the lease confined readers
@@ -122,11 +120,6 @@ checkout_root_path	src/server/repo_io.rs	fn with_access	1	collapse into the leas
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_resolve	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_update	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn acquire_blame_target	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn acquire_file_selection	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn acquire_provenance_projects	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn checkout_blame	3	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn lexical_absolute_selection	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
@@ -140,7 +133,7 @@ checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	5	collap
 checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_eject	2	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_init	1	collapse into the lease confined readers
-checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	7	collapse into the lease confined readers
+checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	5	collapse into the lease confined readers
 checkout_root_path	src/tools/render.rs	fn bbox_render	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope	1	collapse into the lease confined readers
@@ -152,7 +145,6 @@ direct_git_process	crates/bbox-corpus-core/src/git.rs	fn resolve_stable_reposito
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_hardened_repository_path_query	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_stable_repository_stdout_bounded_with_timeout	1	route through the stable-repository exact-read wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn spawn	1	route through the verified-commit git wrapper
-direct_git_process	crates/bbox-corpus-core/src/git.rs	fn write_note	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-gaps/src/gap_closeout.rs	fn scan_git_trailers	1	route through the verified-commit git wrapper
 direct_git_process	src/server/knowledge_merge_gate.rs	fn target_contains_bbox	1	route through the verified-commit git wrapper
 legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn publish	1	delete the legacy publisher store outright
@@ -200,7 +192,6 @@ project_record_import	src/server/knowledge_lifecycle.rs	<file scope>	1	delete wi
 project_record_import	src/server/knowledge_view.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/producer_auth.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/repo_io.rs	<file scope>	1	delete with the v1 record type
-project_record_import	src/tools/graph.rs	<file scope>	1	delete with the v1 record type
 repo_io_selected_target	src/server/repo_io.rs	fn base_carrier_target	1	delete Selected/Checkout; Attachment remains
 repo_io_selected_target	src/server/repo_io.rs	fn gap_checkout_carrier_for_ids	1	delete Selected/Checkout; Attachment remains
 repo_io_selected_target	src/server/repo_io.rs	fn knowledge_checkout_carrier	1	delete Selected/Checkout; Attachment remains

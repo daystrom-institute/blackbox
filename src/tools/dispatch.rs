@@ -1939,13 +1939,12 @@ impl BlackboxServer {
                 effective_context,
             );
             // Per-member combined extra: brofile.filters + broadcast-level
-            // params overlay + the member brofile's surface verdict (§6).
+            // params overlay + the member brofile's surface (§6).
             // Recursion guard is added inside resolve_dispatch_filters; all
             // layers above merge on top (disallow-wins).
             let member_surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.packets.read(),
+                &self.state.config.read().surfaces,
                 brofile.surface.as_deref(),
-                team.project_dir.as_deref(),
             );
             let extra = combine_dispatch_filters(brofile.filters.as_ref(), params_extra.as_ref());
             let extra = combine_dispatch_filters(extra.as_ref(), member_surface_filters.as_ref());
@@ -2815,12 +2814,11 @@ impl BlackboxServer {
                     let cwd = project_dir
                         .map(String::from)
                         .or(bro_match.team.project_dir.clone());
-                    // §6: fold the brofile's surface verdict into its filters so
+                    // §6: fold the brofile's surface into its filters so
                     // every dispatch path inherits the same surface governance.
                     let surface_filters = crate::server::surface::dispatch_surface_filters(
-                        &self.state.packets.read(),
+                        &self.state.config.read().surfaces,
                         bf.surface.as_deref(),
-                        cwd.as_deref(),
                     );
                     let filters = crate::server::progress::combine_dispatch_filters(
                         bf.filters.as_ref(),
@@ -2874,11 +2872,10 @@ impl BlackboxServer {
                 opts,
                 bf.context.as_ref(),
             );
-            // §6: fold the standalone brofile's surface verdict into its filters.
+            // §6: fold the standalone brofile's surface into its filters.
             let surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.packets.read(),
+                &self.state.config.read().surfaces,
                 bf.surface.as_deref(),
-                project_dir,
             );
             let filters = crate::server::progress::combine_dispatch_filters(
                 bf.filters.as_ref(),
@@ -3064,11 +3061,10 @@ impl BlackboxServer {
             let cwd = project_dir
                 .map(String::from)
                 .or(bro_match.team.project_dir.clone());
-            // §6: fold the brofile's surface verdict into its filters on resume too.
+            // §6: fold the brofile's surface into its filters on resume too.
             let surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.packets.read(),
+                &self.state.config.read().surfaces,
                 bf.surface.as_deref(),
-                cwd.as_deref(),
             );
             let filters = crate::server::progress::combine_dispatch_filters(
                 bf.filters.as_ref(),

@@ -2883,12 +2883,3 @@ pub use search::{
     SessionsListParams, graph_lane_boolean_query, graph_lane_stats_for_searcher,
     graph_lanes_for_project_searcher,
 };
-
-pub fn resolve_current_project_chunk_entity(
-    project_id: &str,
-    root: &Path,
-    absolute_path: &Path,
-    byte_range: Option<(u64, u64)>,
-) -> Result<Option<bbox_corpus_core::entity_ref::EntityRef>> {
-    project_files::resolve_current_chunk_entity(project_id, root, absolute_path, byte_range)
-}

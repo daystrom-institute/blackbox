@@ -149,7 +149,7 @@ Edges are directional and typed.
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
-| Tool-call | `EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH` |
+| Tool-call | `RAN_BASH` |
 
 `bbox_describe_schema`'s edge catalog is currently narrower than this
 table (Knowledge limited to `SUPERSEDES`,

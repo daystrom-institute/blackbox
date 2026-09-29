@@ -107,12 +107,6 @@ pub async fn install_project_mutation_routes(
                     kind,
                 }) as Arc<dyn Tool>;
             }
-            if upstream.name() == format!("mcp__{capability_server}__bbox_blame") {
-                return Arc::new(LocalBlameTool {
-                    upstream,
-                    runtime: runtime.clone(),
-                }) as Arc<dyn Tool>;
-            }
             if upstream.name() == format!("mcp__{capability_server}__bbox_render") {
                 return Arc::new(LocalRenderTool {
                     upstream,
@@ -138,11 +132,6 @@ struct ProjectMutationTool {
     upstream: Arc<dyn Tool>,
     runtime: Arc<LocalProjectRuntime>,
     kind: MutationKind,
-}
-
-struct LocalBlameTool {
-    upstream: Arc<dyn Tool>,
-    runtime: Arc<LocalProjectRuntime>,
 }
 
 struct LocalRenderTool {
@@ -392,96 +381,6 @@ fn local_error(message: String) -> ToolResult {
 }
 
 #[async_trait]
-impl Tool for LocalBlameTool {
-    fn name(&self) -> &str {
-        self.upstream.name()
-    }
-
-    fn description(&self) -> &str {
-        self.upstream.description()
-    }
-
-    fn input_schema(&self) -> Value {
-        self.upstream.input_schema()
-    }
-
-    fn output_schema(&self) -> Option<Value> {
-        self.upstream.output_schema()
-    }
-
-    fn uncertain_outcome(&self) -> Option<String> {
-        self.upstream.uncertain_outcome()
-    }
-
-    fn freeform_grammar(&self) -> Option<FreeformGrammar> {
-        self.upstream.freeform_grammar()
-    }
-
-    fn annotations(&self) -> ToolAnnotations {
-        self.upstream.annotations()
-    }
-
-    fn namespace_binding(&self) -> Option<(String, String)> {
-        self.upstream.namespace_binding()
-    }
-
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let mut public = match input {
-            Value::Object(object) => object,
-            _ => serde_json::Map::new(),
-        };
-        // The model never owns the internal transport arm, even if it guesses
-        // the skipped field name and supplies arbitrary JSON.
-        public.remove("_blame_locality");
-
-        let mut plan_input = public.clone();
-        plan_input.insert("_blame_locality".into(), json!({ "phase": "plan" }));
-        let plan_result = self.upstream.call(Value::Object(plan_input), cx).await;
-        let plan = match parse_blame_plan(plan_result) {
-            Ok(plan) => plan,
-            Err(result) => return result,
-        };
-
-        let runtime = self.runtime.clone();
-        let execution_plan = plan.clone();
-        let fact =
-            match tokio::task::spawn_blocking(move || runtime.execute_blame_plan(&execution_plan))
-                .await
-            {
-                Ok(Ok(fact)) => fact,
-                Ok(Err(error)) => {
-                    return local_error(format!("local blame execution failed: {error:#}"));
-                }
-                Err(error) => {
-                    return local_error(format!("local blame task failed: {error}"));
-                }
-            };
-
-        public.insert(
-            "_blame_locality".into(),
-            json!({
-                "phase": "resolve",
-                "plan": plan,
-                "fact": fact,
-            }),
-        );
-        self.upstream.call(Value::Object(public), cx).await
-    }
-}
-
-fn parse_blame_plan(
-    result: ToolResult,
-) -> std::result::Result<bbox_corpus_core::blame_transport::BlameExecutionPlanV1, ToolResult> {
-    let value = parse_json_tool_result(result, "blame plan")?;
-    let plan = value
-        .get("plan")
-        .cloned()
-        .ok_or_else(|| local_error("daemon blame plan response omitted plan".into()))?;
-    serde_json::from_value(plan)
-        .map_err(|error| local_error(format!("daemon returned an invalid blame plan: {error}")))
-}
-
-#[async_trait]
 impl Tool for ProjectMutationTool {
     fn name(&self) -> &str {
         self.upstream.name()
@@ -618,19 +517,6 @@ impl LocalProjectRuntime {
             sync_lock: tokio::sync::Mutex::new(()),
             retry_active: AtomicBool::new(false),
         })
-    }
-
-    fn execute_blame_plan(
-        &self,
-        plan: &bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
-    ) -> Result<bbox_corpus_core::blame_transport::BlameFactV1> {
-        bbox_corpus_core::blame_transport::execute_plan_in_workspace(
-            plan,
-            &self.workspace_root,
-            &self.project_root,
-            &self.scope,
-            self.workspace_id.as_str(),
-        )
     }
 
     fn render_selector(&self, requested: &str) -> Result<String> {
@@ -1306,11 +1192,7 @@ mod tests {
             upstream: upstream.clone(),
             runtime: runtime.clone(),
         };
-        let blame = LocalBlameTool {
-            upstream: upstream.clone(),
-            runtime: runtime.clone(),
-        };
-        for tool in [&mutation as &dyn Tool, &render, &blame] {
+        for tool in [&mutation as &dyn Tool, &render] {
             assert_eq!(tool.input_schema(), upstream.input_schema());
             assert_eq!(tool.output_schema(), upstream.output_schema());
             assert_eq!(tool.uncertain_outcome(), upstream.uncertain_outcome());
@@ -1424,179 +1306,6 @@ mod tests {
             .expect("cross-checkout mutation must fail");
         assert!(format!("{error:#}").contains("does not match the bound workspace"));
         assert!(knowledge_files(&runtime.project_root).is_empty());
-    }
-
-    #[test]
-    fn blame_executes_current_and_snapshot_plans_inside_the_bound_checkout() {
-        use bbox_corpus_core::blame_transport::{
-            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlameExecutionV1, BlamePlanTargetV1,
-        };
-
-        let (_directory, root, runtime) = runtime();
-        let base = bbox_corpus_core::git::current_head(&root).unwrap();
-        let authority = |target| BlameExecutionPlanV1 {
-            version: BLAME_TRANSPORT_VERSION,
-            project_id: "project-locality".into(),
-            scope: runtime.scope.clone(),
-            workspace_id: runtime.workspace_id.as_str().to_string(),
-            target,
-        };
-
-        let current = authority(BlamePlanTargetV1::WorkspacePath {
-            input_path: "README.md".into(),
-            line: 1,
-        });
-        let current_fact = runtime.execute_blame_plan(&current).unwrap();
-        assert!(matches!(
-            current_fact.execution,
-            BlameExecutionV1::WorkspaceCurrent { .. }
-        ));
-        assert_eq!(current_fact.attribution.as_ref().unwrap().commit_sha, base);
-
-        // Snapshot mode remains bound to the old commit after the working
-        // file changes and then disappears entirely.
-        fs::write(root.join("README.md"), "dirty replacement\n").unwrap();
-        let dirty_fact = runtime.execute_blame_plan(&current).unwrap();
-        assert_eq!(
-            dirty_fact.attribution.as_ref().unwrap().commit_sha,
-            "0".repeat(40),
-            "path mode must report uncommitted working-tree attribution"
-        );
-        fs::remove_file(root.join("README.md")).unwrap();
-        let snapshot = authority(BlamePlanTargetV1::ProjectSnapshot {
-            project_relative_path: "README.md".into(),
-            display_path: "README.md".into(),
-            line: None,
-            byte_offset: 2,
-            commit: base.clone(),
-        });
-        let snapshot_fact = runtime.execute_blame_plan(&snapshot).unwrap();
-        assert_eq!(snapshot_fact.line, 1);
-        assert_eq!(
-            snapshot_fact.execution,
-            BlameExecutionV1::Snapshot {
-                commit: base.clone()
-            }
-        );
-        assert_eq!(snapshot_fact.attribution.as_ref().unwrap().commit_sha, base);
-    }
-
-    #[test]
-    fn blame_refuses_a_path_outside_the_bound_project() {
-        use bbox_corpus_core::blame_transport::{
-            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
-        };
-
-        let (_directory, _root, runtime) = runtime();
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        let plan = BlameExecutionPlanV1 {
-            version: BLAME_TRANSPORT_VERSION,
-            project_id: "project-locality".into(),
-            scope: runtime.scope.clone(),
-            workspace_id: runtime.workspace_id.as_str().to_string(),
-            target: BlamePlanTargetV1::WorkspacePath {
-                input_path: outside.path().to_string_lossy().into_owned(),
-                line: 1,
-            },
-        };
-        let error = runtime.execute_blame_plan(&plan).unwrap_err();
-        assert!(format!("{error:#}").contains("outside the bound project"));
-    }
-
-    #[tokio::test]
-    async fn blame_wrapper_strips_caller_transport_and_returns_only_the_joined_result() {
-        struct FakeDaemonBlame {
-            plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
-            calls: Arc<Mutex<Vec<Value>>>,
-        }
-
-        #[async_trait]
-        impl Tool for FakeDaemonBlame {
-            fn name(&self) -> &str {
-                "mcp__blackbox__bbox_blame"
-            }
-
-            fn description(&self) -> &str {
-                "fake blame"
-            }
-
-            fn input_schema(&self) -> Value {
-                json!({ "type": "object" })
-            }
-
-            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-                self.calls.lock().unwrap().push(input.clone());
-                match input["_blame_locality"]["phase"].as_str() {
-                    Some("plan") => crate::mcp::result::from_native_result(ToolResult::Text(
-                        json!({"status":"blame_locality_plan", "plan":self.plan}).to_string(),
-                    )),
-                    Some("resolve") => ToolResult::Json(json!({
-                        "content":[{"type":"text","text":"joined-result"}],
-                        "structuredContent":{"source":"remote"}, "isError":false,
-                    })),
-                    other => ToolResult::Error(format!("unexpected phase {other:?}")),
-                }
-            }
-        }
-
-        use bbox_corpus_core::blame_transport::{
-            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
-        };
-        let (_directory, root, runtime) = runtime();
-        let plan = BlameExecutionPlanV1 {
-            version: BLAME_TRANSPORT_VERSION,
-            project_id: "project-locality".into(),
-            scope: runtime.scope.clone(),
-            workspace_id: runtime.workspace_id.as_str().to_string(),
-            target: BlamePlanTargetV1::WorkspacePath {
-                input_path: "README.md".into(),
-                line: 1,
-            },
-        };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let tool = LocalBlameTool {
-            upstream: Arc::new(FakeDaemonBlame {
-                plan,
-                calls: calls.clone(),
-            }),
-            runtime,
-        };
-        let response = tool
-            .call(
-                json!({
-                    "file": "README.md",
-                    "line": 1,
-                    "_blame_locality": {
-                        "phase": "resolve",
-                        "plan": "caller-forged",
-                        "fact": "caller-forged"
-                    }
-                }),
-                &tool_cx(&root),
-            )
-            .await;
-        assert_eq!(
-            response.into_content().0,
-            json!({
-                "content":[{"type":"text","text":"joined-result"}],
-                "structuredContent":{"source":"remote"}, "isError":false,
-            })
-            .to_string()
-        );
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0]["_blame_locality"]["phase"], "plan");
-        assert_eq!(calls[1]["_blame_locality"]["phase"], "resolve");
-        assert!(calls[1]["_blame_locality"]["plan"].is_object());
-        assert!(calls[1]["_blame_locality"]["fact"].is_object());
-        assert_ne!(calls[1]["_blame_locality"]["plan"], "caller-forged");
-        assert!(
-            !serde_json::to_string(&*calls)
-                .unwrap()
-                .contains(root.to_str().unwrap()),
-            "locality transport must not expose the absolute checkout root"
-        );
     }
 
     #[tokio::test]

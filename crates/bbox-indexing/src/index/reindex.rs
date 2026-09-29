@@ -156,29 +156,11 @@ impl Drop for DirtyRestore<'_> {
 }
 
 fn tool_edge_project_access(
-    config: &ReindexConfig,
     records_provider: &Arc<dyn ProjectRecordsProvider>,
     plans: &[super::writer_actor::ProjectSourcePlan],
     transcript_namespaces: &std::collections::BTreeMap<String, String>,
     mut projects: Vec<ToolEdgeProjectAccess>,
 ) -> Result<Vec<ToolEdgeProjectAccess>> {
-    let needs_collected = plans.iter().any(|plan| {
-        records_provider.code_source_locality_governed(&plan.project_id)
-            && matches!(
-                plan.effective,
-                super::writer_actor::EffectiveSource::Collected { .. }
-            )
-    });
-    let collected_store = needs_collected
-        .then(|| {
-            bbox_code_source_store::CodeSourceStore::open_with_mode(
-                &config.code_source_store_path,
-                bbox_code_source_store::StoreLimits::default(),
-                bbox_code_source_store::RuntimeRecordMode::CatalogV2,
-            )
-            .map(Arc::new)
-        })
-        .transpose()?;
     for plan in plans {
         let governed = records_provider.code_source_locality_governed(&plan.project_id);
         if !governed {
@@ -193,50 +175,22 @@ fn tool_edge_project_access(
                 plan.project_id
             );
         }
-        let super::writer_actor::EffectiveSource::Collected { generation } = &plan.effective else {
+        if !matches!(
+            plan.effective,
+            super::writer_actor::EffectiveSource::Collected { .. }
+        ) {
             anyhow::bail!(
                 "governed code-source project {} has no active collected generation",
                 plan.project_id
             );
-        };
-        let store = collected_store
-            .as_ref()
-            .expect("governed collected plans opened the code-source store");
-        let activation = store
-            .load_activation_mixed(&plan.project_id)?
-            .with_context(|| {
-                format!(
-                    "governed code-source project {} has no activation",
-                    plan.project_id
-                )
-            })?;
-        let bbox_code_source_store::MixedActivationRecord::CurrentV2(activation) = activation
-        else {
-            anyhow::bail!("governed code-source project has a legacy activation");
-        };
-        if activation.generation_id != *generation {
-            anyhow::bail!("governed code-source plan and activation generation disagree");
         }
-        let stored = store.find_generation_mixed(generation)?;
-        let bbox_code_source_store::MixedStoredGeneration::CurrentV2(stored) = stored else {
-            anyhow::bail!("governed code-source project has a legacy generation");
-        };
-        activation.validate_against_generation(&stored)?;
-        if stored.state != bbox_code_source::GenerationState::Active {
-            anyhow::bail!("governed code-source generation is not active");
-        }
-        let entries = store.load_generation_entries(&activation.published_scope, generation)?;
         let transcript_namespace = transcript_namespaces
             .get(&plan.project_id)
             .context("governed attached project has no transcript namespace")?;
         projects.push(ToolEdgeProjectAccess::collected(
             &plan.project_id,
             std::path::PathBuf::from(transcript_namespace),
-            activation.snapshot_id,
-            stored.descriptor.head_commit,
-            entries,
-            Arc::clone(store),
-        )?);
+        ));
     }
     Ok(projects)
 }
@@ -568,17 +522,12 @@ pub(super) fn execute_reindex_pass(
                 ToolEdgeProjectAccess::local(
                     &access.project.project_id,
                     local.project_root().to_path_buf(),
-                    access
-                        .git
-                        .as_ref()
-                        .map(|git| git.checkout_root().to_path_buf()),
                 )
             })
         })
         .collect();
     let tool_edges = ToolEdgeContext::with_project_access(
         tool_edge_project_access(
-            config,
             records_provider,
             &plans,
             &unavailable_record_project_paths,
@@ -1195,7 +1144,7 @@ pub fn spawn_reindex_thread(
 }
 
 /// Walk all indexed transcripts and retroactively emit observed tool-call edges
-/// (EDITED_FILE / READ_FILE / RAN_BASH) for a newly registered project.
+/// (RAN_BASH) for a newly registered project.
 ///
 /// Idempotent: uses `append_edges_dedup` so re-running produces no duplicates.
 /// Returns the number of new edges written.
@@ -1203,17 +1152,12 @@ pub fn backfill_tool_edges_for_project<G>(
     config: &ReindexConfig,
     project_id: &str,
     local_root: &std::path::Path,
-    git_root: Option<&std::path::Path>,
     publication_guard: impl FnOnce() -> Result<G>,
 ) -> Result<usize> {
     let edges_dir =
         bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project_access(
-        ToolEdgeProjectAccess::local(
-            project_id,
-            local_root.to_path_buf(),
-            git_root.map(std::path::Path::to_path_buf),
-        ),
+        ToolEdgeProjectAccess::local(project_id, local_root.to_path_buf()),
         edges_dir.clone(),
     );
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);

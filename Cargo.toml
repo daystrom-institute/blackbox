@@ -45,7 +45,6 @@ members = [
     "crates/bbox-knowledge-source",
     "crates/bbox-knowledge-source-client",
     "crates/bbox-knowledge-source-store",
-    "crates/bbox-provenance",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
     "crates/bbox-chunker",
@@ -126,7 +125,6 @@ bbox-git-source = { path = "crates/bbox-git-source" }
 bbox-git-source-store = { path = "crates/bbox-git-source-store" }
 bbox-knowledge-source = { path = "crates/bbox-knowledge-source" }
 bbox-knowledge-source-store = { path = "crates/bbox-knowledge-source-store" }
-bbox-provenance = { path = "crates/bbox-provenance", default-features = false }
 bbox-corpus-index = { path = "crates/bbox-corpus-index" }
 bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).

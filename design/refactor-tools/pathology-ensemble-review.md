@@ -162,7 +162,7 @@ borrow/conversion outcome that is the compiler's call (recorded as uncertainty).
 **`PRD-COR-J` — Java Transcript-Anchored Pressure.** Confirm/down-rank against
 operator/agent history + churn/fix-revert; merge overlapping atom signals.
 Authorities: `bbox_hybrid_search`/`bbox_notes`/`bbox_thread_list`,
-git log, `bbox_blame`. Reject: history alone, unconfirmed by current code.
+git log. Reject: history alone, unconfirmed by current code.
 
 **`PRD-COR-R` — Rust Transcript-Anchored Pressure.** Same, with Rust signals:
 public-API opt-out debates, compile-fix churn, abandoned module-split/bin-to-lib

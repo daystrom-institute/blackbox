@@ -354,7 +354,6 @@ dependencies = [
  "bbox-git-source",
  "bbox-knowledge-source",
  "bbox-project-render",
- "bbox-provenance",
  "bro-rpc",
  "clap",
  "hex",
@@ -648,7 +647,6 @@ name = "bbox-git-source"
 version = "0.0.1"
 dependencies = [
  "bbox-corpus-core",
- "bbox-provenance",
  "hex",
  "serde",
  "serde_json",
@@ -696,7 +694,6 @@ dependencies = [
  "bbox-knowledge-source-store",
  "bbox-packets",
  "bbox-project-graph",
- "bbox-provenance",
  "bbox-slack",
  "bbox-stores",
  "bbox-threads",
@@ -821,7 +818,6 @@ dependencies = [
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-project-graph",
- "bbox-provenance",
  "bbox-providers",
  "bbox-system-memory",
  "bbox-util",
@@ -883,22 +879,6 @@ dependencies = [
  "sha2 0.10.9",
  "strum 0.26.3",
  "tempfile",
-]
-
-[[package]]
-name = "bbox-provenance"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "fs2",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
 ]
 
 [[package]]
@@ -1245,7 +1225,6 @@ dependencies = [
  "bbox-packets",
  "bbox-project-graph",
  "bbox-project-render",
- "bbox-provenance",
  "bbox-providers",
  "bbox-slack",
  "bbox-stores",
@@ -1360,7 +1339,6 @@ dependencies = [
  "axum",
  "bbox-corpus-core",
  "bbox-knowledge-source-client",
- "bbox-provenance",
  "bbox-util",
  "bro-core",
  "bro-fleet-client",
@@ -1384,6 +1362,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

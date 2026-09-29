@@ -50,128 +50,97 @@ converged on 2025-05-08 after two rounds. Key resolved findings:
    names, but surface packet examples use `mcp__blackbox__*` prefixes. The
    evaluator must normalize both directions — patterns to bare names for matching.
 
-## Phase 1 — Verdict types, pure evaluator, project-aware lookup
+## Phase 1 - Surface table and visible-set computation
 
-**Goal:** Introduce `ToolSurfaceVerdict`, a pure evaluator, and project-scoped
-packet resolution. No changes to the MCP handler or HTTP stack.
+**Goal:** Introduce the surface configuration type and a pure visible-set
+function. No changes to the MCP handler or HTTP stack.
 
 **Scope:**
 
-- Add `ToolSurfaceVerdict` enum in `src/server/surface.rs` (new file):
+- Add `SurfaceConfig` in `crates/bbox-config/src/config.rs`:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "route", rename_all = "snake_case")]
-pub(crate) enum ToolSurfaceVerdict {
-    ToolSurface {
-        #[serde(default)]
-        allow: Vec<String>,
-        #[serde(default)]
-        disallow: Vec<String>,
-        #[serde(default)]
-        instructions: Option<String>,
-    },
-    Deny {
-        #[serde(default)]
-        reason: Option<String>,
-    },
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub disallow: Vec<String>,
 }
 ```
 
-- Add `ToolSurfaceDecision` wrapping the verdict + resolved `McpFilters`:
+- Add `visible_tool_set(surface: &SurfaceConfig, universe: &[String]) -> HashSet<String>`
+  in `src/server/surface.rs`: normalize each pattern with
+  `normalize_filter_pattern`, strip the blackbox MCP prefix, and match bare
+  tool names with `glob_match`, disallow winning over a non-empty allow.
 
-```rust
-pub(crate) struct ToolSurfaceDecision {
-    pub verdict: ToolSurfaceVerdict,
-    pub filters: orchestration::mcp::McpFilters,
-}
-```
+- Add `unknown_surface_message(surface)` so the wire head and dispatch paths
+  report the same refusal text.
 
-- Add `evaluate_tool_surface(state, surface_entity, project: Option<&str>) -> ToolSurfaceDecision`:
-  1. Call `packets.load_latest_by_domain("mcp-surface/routing", project)`.
-  2. If `Ok(None)`, return passthrough `ToolSurfaceVerdict::ToolSurface { allow: [], disallow: [], instructions: None }`.
-  3. If load error (corrupted/unreadable), return `Deny { reason: "surface packet load error" }` (fail closed).
-  4. If packet found, `apply_packet_with` against the entity.
-  5. If `apply` returns `None` (no rule matched), return `Deny { reason: "no matching surface rule" }`.
-  6. Parse consequent JSON as `ToolSurfaceVerdict`. Parse failure → `Deny`.
-  7. Convert allow/disallow into `McpFilters` via `normalize_filter_pattern`.
-
-- Add `load_latest_by_domain(domain, project: Option<&str>) -> Result<Option<Packet>>`
-  on `Packets` in `src/packets/mod.rs`:
-  1. Iterate newest-first.
-  2. If `project` present: first match where `domain` matches AND `scope == "project"` AND `project` matches. Else fall back to newest global packet with same domain.
-  3. If no project passed: use global only.
-
-- Add `tool_visible(tool_name, decision, universe) -> bool`:
-  - Deny verdict → false.
-  - ToolSurface: normalize `tool_name` to bare form, expand allow/disallow
-    patterns against the full tool universe, apply disallow-wins-over-allow.
-
-- Add `filter_tools(tools: &[Tool], decision, universe) -> Vec<Tool>`.
-
-- Extract tool universe to `SharedState::tool_universe: Vec<String>` (populated
-  at daemon startup from `bbox_tools + bro_tools` router catalogs). Reuse in
-  both surface evaluation and dispatch filter expansion.
+- The tool universe is the combined `bbox_tools + bro_tools` router catalog.
+  Reuse it in both surface computation and dispatch filter expansion.
 
 - Wire `mod surface;` into `src/server/mod.rs`.
 
 **Tests (in `src/server/surface.rs`):**
 
-- default surface with no installed packet → empty filters (passthrough).
-- `readonly` verdict with non-empty allow hides non-matching tools.
+- an empty surface shows the whole catalog.
+- a non-empty allow hides non-matching tools.
 - disallow wins over allow.
-- unparseable consequent → Deny fallback.
-- no-match (all rules miss) → Deny fallback.
-- corrupted packet load → Deny (not passthrough).
 - canonical `mcp__blackbox__bbox_search`, dotted `mcp__blackbox__.bbox_search`,
   Copilot `blackbox(bbox_search)`, and bare `bbox_search` all match the same
   tool after normalization.
-- project-scoped packet overrides global for matching project, global used for
-  non-matching project.
 
 **Does not touch:** `BlackboxServer`, `ServerHandler`, HTTP routing, `StreamableHttpService`.
 
-## Phase 1b — Pure evaluator replay
+## Phase 1b - Built-in surfaces and config merge
 
-**Goal:** Surface the evaluator as an MCP tool for packet authoring iteration
-without needing live MCP sessions.
+**Goal:** Ship the built-in surface table and let daemon configuration
+override or extend it.
 
 **Scope:**
 
-- Add `bbox_mcp_surface` tool (or extend `bbox_artifact_list` — prefer a dedicated
-  tool since the action set is specific):
+- Add `crates/bbox-config/src/default_surfaces.toml` with the `default`,
+  `interactive`, `agent-internal`, `readonly` and `ops` surfaces, loaded by
+  `default_surfaces()`.
 
-| Action | Purpose |
-|--------|---------|
-| `replay` | Accept `{surface, client?, project?}`, build entity, evaluate packet, return `{entity, verdict_classification, verdict_consequent, visible_tools}` |
+- `Config::surfaces: BTreeMap<String, SurfaceConfig>` holds the built-in table
+  merged with `[surfaces.<name>]` tables from the daemon config file: a config
+  table replaces the built-in surface of the same name or adds a new one.
 
-- `replay` is pure evaluation, no side effects. Mirrors `bro_webhook_replay`.
-
-- Add `tool_docs.rs` stanza.
+- Validate at config load: surface names are non-empty without surrounding
+  whitespace, patterns are non-empty, unknown keys are rejected.
 
 **Tests:**
 
-- `replay` with `surface=readonly` → returns expected verdict + visible tool list.
-- `replay` with unknown surface → returns `deny` verdict.
-- `replay` with project → uses project-scoped packet when available.
+- config tables override a built-in surface by name and add new surfaces;
+  untouched built-ins survive the merge.
+- empty patterns and unknown keys fail config load.
+- the built-in agent-facing surfaces and `ops` partition the served catalog as
+  intended.
 
 ## Phase 2a — rmcp handler seam with hardcoded surface
 
 **Goal:** Override `list_tools`, `call_tool`, and `get_tool` in the existing
-`#[tool_handler]` impl to enforce surface decisions. Surface is hardcoded to
-`"default"` — no session binding yet.
+`#[tool_handler]` impl to enforce the session's visible set. Surface is
+hardcoded to `"default"`, with no session binding yet.
 
 **Scope:**
 
-- Add `surface: OnceLock<Arc<str>>` to `BlackboxServer` in `src/server/state.rs` (set during `initialize`):
+- Add `surface: OnceLock<Arc<str>>` and `surface_tools: OnceLock<Arc<HashSet<String>>>`
+  to `BlackboxServer` in `src/server/state.rs` (both set during `initialize`):
   ```rust
   pub(crate) struct BlackboxServer {
       pub(crate) state: Arc<SharedState>,
       pub(crate) tool_router: ToolRouter<Self>,
       pub(crate) surface: OnceLock<Arc<str>>,
+      pub(crate) surface_tools: OnceLock<Arc<HashSet<String>>>,
   }
   ```
-  Default to `"default"` in `new()`.
+  `surface` defaults to `"default"`. `surface_tools_for(name)` looks the name
+  up in `config.surfaces` and returns `visible_tool_set` over the tool
+  universe, or `None` for an unknown surface.
 
 - **Keep** `#[tool_handler(router = self.tool_router)]` on the impl block.
   Override three methods:
@@ -187,10 +156,15 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         // Read ?surface from request URI in context extensions.
-        // Store in self.surface (OnceLock — set once per session).
-        // If surface evaluates to Deny, fail initialize with McpError.
+        // Look it up in config.surfaces; an unknown name fails initialize.
+        // Store the name and its visible set (OnceLock, set once per session).
         // For 2a: hardcode "default" (no URI parsing yet).
+        let Some(tools) = self.surface_tools_for("default") else {
+            return Err(McpError::invalid_request(
+                "tool surface denied: unknown MCP surface: default", None));
+        };
         let _ = self.surface.set(Arc::from("default"));
+        let _ = self.surface_tools.set(tools);
         // Delegate to default behavior
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
@@ -199,25 +173,21 @@ impl ServerHandler for BlackboxServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-        let entity = serde_json::json!({ "surface": surface });
-        let decision = surface::evaluate_tool_surface(&self.state, entity, None::<&str>);
-        if !surface::tool_visible(name, &decision, &self.state.tool_universe) {
+        if !self.session_tools().contains(name) {
             return None;
         }
-        self.tool_router.get_tool(name)
+        self.tool_router.get(name).cloned()
     }
 
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, McpError> {
-        let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-        let entity = serde_json::json!({ "surface": surface });
-        let decision = surface::evaluate_tool_surface(&self.state, entity, None::<&str>);
-        let all = self.tool_router.list_all();
-        let filtered = surface::filter_tools(&all, &decision, &self.state.tool_universe);
-        Ok(ListToolsResult { tools: filtered, ..Default::default() })
+        let visible = self.session_tools();
+        let tools = self.tool_router.list_all().into_iter()
+            .filter(|t| visible.contains(t.name.as_ref()))
+            .collect();
+        Ok(ListToolsResult { tools, ..Default::default() })
     }
 
     async fn call_tool(
@@ -225,12 +195,10 @@ impl ServerHandler for BlackboxServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-        let entity = serde_json::json!({ "surface": surface });
-        let decision = surface::evaluate_tool_surface(&self.state, entity, None::<&str>);
-        if !surface::tool_visible(&request.name, &decision, &self.state.tool_universe) {
+        if !self.session_tools().contains(request.name.as_ref()) {
             return Err(McpError::method_not_found(
-                format!("tool not available on surface '{}': {}", surface, request.name)
+                format!("tool not available on surface '{}': {}",
+                    self.session_surface(), request.name)
             ));
         }
         self.tool_router.call_tool(request, context).await
@@ -244,17 +212,16 @@ impl ServerHandler for BlackboxServer {
 
 **Tests:**
 
-- Integration test: `BlackboxServer` with default surface and no packet → full
-  catalog (behavior unchanged).
-- Integration test: install surface packet, verify `list_tools` returns filtered
+- Integration test: `BlackboxServer` on the default surface → the `default`
+  table's visible set.
+- Integration test: a configured surface makes `list_tools` return the filtered
   set.
 - Integration test: `call_tool` for hidden tool returns MCP error.
 - Integration test: `get_tool` for hidden tool returns `None`.
-- Integration test: `deny` verdict fails `initialize` (not empty catalog).
+- Integration test: an unknown surface fails `initialize` (not empty catalog).
 - All existing `cargo test` passes (backward compatibility gate).
 
-**Merge gate:** all existing tests pass. Surface defaults to `"default"` with
-no packet installed, so behavior is identical to pre-surface code.
+**Merge gate:** all existing tests pass.
 
 ## Phase 2b — Session binding from RequestContext
 
@@ -267,9 +234,12 @@ no packet installed, so behavior is identical to pre-surface code.
   1. Extract `http::request::Parts` from `context.extensions`.
   2. Parse `parts.uri.query()` for `surface` parameter.
   3. Default to `"default"` if absent.
-  4. Evaluate the surface decision immediately. If `Deny`, fail `initialize`
-     with `McpError::internal_error("tool surface denied: <reason>")`.
-  5. Set `self.surface` via `OnceLock`.
+  4. Look the surface up in `config.surfaces`. If it is missing, fail
+     `initialize` with `tool surface denied: unknown MCP surface: <name>`.
+  5. Set `self.surface` and `self.surface_tools` via `OnceLock`.
+
+- `?project` is read separately into the session project context; it does
+  not affect surface selection.
 
 - Optionally add `SurfaceId` newtype for type-safe extraction from the URI
   query, but since we're reading from `http::request::Parts` directly (not axum),
@@ -278,7 +248,7 @@ no packet installed, so behavior is identical to pre-surface code.
 **Tests:**
 
 - Initialize with `?surface=readonly` → session sees filtered `list_tools`.
-- Initialize without `?surface` → `"default"` surface, full catalog.
+- Initialize without `?surface` → `"default"` surface.
 - Initialize with unknown surface → `initialize` returns MCP error.
 - Subsequent requests on the same session ignore a different `?surface` in the
   URI (OnceLock already set).
@@ -287,14 +257,19 @@ no packet installed, so behavior is identical to pre-surface code.
 
 ## Phase 3 — Dispatch integration and provider registration
 
-**Goal:** Surface decisions compose into `resolve_dispatch_filters` so spawned
+**Goal:** Configured surfaces compose into `resolve_dispatch_filters` so spawned
 bros inherit the correct tool boundary. Provider configs gain surface aliases.
 
 **Scope:**
 
+- Add `dispatch_surface_filters(&config.surfaces, surface: Option<&str>) -> Option<McpFilters>`:
+  `None` when no surface is named or the surface is unrestricted, the
+  surface's `allow`/`disallow` otherwise, and a deny-all filter
+  (`disallow: ["*"]`) for an unknown surface.
+
 - Extend `resolve_dispatch_filters` in `src/server/progress.rs` to accept `surface: Option<&str>`:
-  - When present, evaluate the surface packet and merge the resulting
-    `McpFilters` into the effective filter set.
+  - When present, merge the `dispatch_surface_filters` result into the
+    effective filter set.
   - **Allow-intersection fix:** `McpFilters::merge_from` currently appends
     allows (union). For the surface layer, allow patterns must intersect with
     the existing allow set (if any). Add `intersect_from(&mut self, other)` or
@@ -307,6 +282,7 @@ bros inherit the correct tool boundary. Provider configs gain surface aliases.
 - Update all call sites of `resolve_dispatch_filters`:
   - `bro_exec`, `bro_resume`: accept optional `surface` from params.
   - Workflow / orchestration dispatch paths: surface from workflow spec or arc.
+  - Brofile `surface` selectors fold into the child's filters the same way.
   - Default: `None` (preserves current behavior).
 
 - Add `surface` field to `ExecParams` / `ResumeParams` (optional string).
@@ -319,6 +295,7 @@ bros inherit the correct tool boundary. Provider configs gain surface aliases.
 - Dispatch with `surface="readonly"` → resolved filters include readonly
   disallow set + recursion guard.
 - Dispatch without surface → identical to current behavior.
+- Dispatch with an unknown surface → every tool denied.
 - Allow-intersection: global allow `[A, B, C]` + surface allow `[B, C, D]` →
   effective allow `[B, C]`.
 - Disallow-additive: surface disallow `[X]` + brofile disallow `[Y]` → both
@@ -326,72 +303,61 @@ bros inherit the correct tool boundary. Provider configs gain surface aliases.
 - Claude, Codex, Copilot, Gemini filter args all reflect merged surface filters.
 - Provider alias registration preserves query string in stored URL.
 
-## Phase 4 — Debug tooling, docs, and example packet
+## Phase 4 - Docs and operator path
 
-**Goal:** Operational visibility. Packet authors can iterate on surface rules
-without restarting providers.
+**Goal:** Operational visibility. Operators can read and change surfaces and
+reach hidden tools.
 
 **Scope:**
 
-- Extend the Phase 1b replay tool with additional actions:
+- Document the built-in surfaces, the `[surfaces.<name>]` config shape and the
+  restart-to-apply rule in `docs/mcp-surfaces.md`.
 
-| Action | Purpose |
-|--------|---------|
-| `list` | List installed surface packets and their domains |
-| `describe` | Show the effective rules for a given surface name |
-| `replay` | Pure evaluation (from Phase 1b) |
-
-- Add example packet at `examples/packets/mcp-surface-routing.json` with the
-  three rules from the design doc (readonly, ops, default + catchall deny).
+- Operators reach tools hidden from agent-facing surfaces with
+  `bro mcp call <tool> '<json>' --surface ops`.
 
 - Update `AGENTS.md` project section to mention MCP surfaces.
 
 **Tests:**
 
-- Example packet compiles via `bbox_compile` and audits cleanly.
-- `describe` returns human-readable rule summary.
+- An ops-only tool round-trips through `bro mcp call --surface ops`.
+- `tools/list` on each built-in surface returns the configured visible set.
 
 ## Cross-cutting concerns
 
-### Packet store changes
+### Configuration
 
-- No schema changes. Surface packets use domain `mcp-surface/routing`, stored via
-  `bbox_compile`. New `load_latest_by_domain` method adds project-aware lookup.
+- Surfaces are part of daemon configuration: built-in defaults in
+  `default_surfaces.toml` merged with `[surfaces.<name>]` tables by name. A
+  change applies on daemon restart. There is no runtime install path, no
+  surface versioning and no project-scoped surface.
 
 ### Tool universe
 
-- Populated at daemon startup: `tool_universe: Vec<String>` on `SharedState`.
-  Bare tool names extracted from `ToolRouter::list_all()`. Reused for pattern
-  expansion in surface evaluation and dispatch filters.
+- Bare tool names extracted from the combined `ToolRouter::list_all()`. Reused
+  for pattern expansion in surface computation and dispatch filters.
 
 ### Error posture
 
 | Condition | Behavior |
 |-----------|----------|
-| No surface packet installed | Passthrough (all tools visible) |
-| Packet load error (corrupt) | Deny (fail closed) |
-| No rule matches entity | Deny (fail closed) |
-| Consequent parse error | Deny (fail closed) |
-| Unknown surface name | Deny via catchall rule |
-| Deny verdict on initialize | MCP error (not empty catalog) |
+| Surface table with no patterns | Passthrough (all tools visible) |
+| Invalid surface config (empty pattern, unknown key) | Config load fails |
+| Unknown surface name on initialize | MCP error (not empty catalog) |
+| Unknown surface name on dispatch | Deny-all child filter |
 
 ### Performance
 
-- Surface evaluation on every `list_tools`/`call_tool`. Packet store read-locked
-  briefly. Pattern expansion O(patterns × universe), both small (< 200 tools).
-  No caching for v1.
-
-### Tracing
-
-- `tracing::debug!` on surface evaluation: surface name, verdict, matched rule
-  id, visible tool count. `tracing::warn!` on deny verdicts and parse failures.
+- The visible set is computed once per session at `initialize`. Pattern
+  matching is O(patterns × universe), both small. `list_tools`, `call_tool`
+  and `get_tool` are set lookups.
 
 ## Dependency graph
 
 ```
-Phase 1  (verdict types, evaluator, project-aware lookup)
+Phase 1  (surface type, visible-set computation)
     │
-    ├── Phase 1b (pure replay tool)
+    ├── Phase 1b (built-in table, config merge)
     │
     ├── Phase 2a (rmcp handler seam, hardcoded default)
     │       │
@@ -399,12 +365,12 @@ Phase 1  (verdict types, evaluator, project-aware lookup)
     │               │
     │               └── Phase 3 (dispatch integration, allow-intersection)
     │                       │
-    │                       └── Phase 4 (docs, example packet, describe)
+    │                       └── Phase 4 (docs, operator path)
     │
     └── Phase 1b can parallel Phase 2a
 ```
 
-Phase 1 is prerequisite for everything. Phase 1b (replay) is cheap and should
-land before 2b to validate packet semantics without rmcp plumbing. Phase 2a
+Phase 1 is prerequisite for everything. Phase 1b (config merge) is cheap and
+should land before 2b so the session binding reads the real surface table. Phase 2a
 validates the handler seam with zero session-binding risk. Phase 2b adds the
 real URL binding. Phase 3 depends on 2b being stable. Phase 4 is polish.

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -96,13 +96,24 @@ fn retired_endpoint_id_field(endpoint: &serde_json::Value) -> Option<&'static st
         .map(|(_, id_field)| *id_field)
 }
 
+/// Transcript file-touch edge kinds. Rows of these kinds are retired: the
+/// indexer never emits them, loaders skip them, and the file-touch purge
+/// removes them from the durable lanes.
+pub const RETIRED_FILE_TOUCH_EDGE_KINDS: [&str; 2] = ["READ_FILE", "EDITED_FILE"];
+
+/// Whether rows of this edge kind are retired. Retired rows stay inert on
+/// disk until a purge or rewrite drops them; no reader admits them.
+pub fn edge_kind_is_retired(kind: &str) -> bool {
+    kind.starts_with("ROADMAP_") || RETIRED_FILE_TOUCH_EDGE_KINDS.contains(&kind)
+}
+
 /// Decode surviving edges while allowing retired rows to remain inert on disk.
 /// Provenance is retained only for the overlay deletion guard.
 pub fn decode_live_edge_row(bytes: &[u8]) -> Result<(Option<Edge>, EdgeProvenance)> {
     match serde_json::from_slice::<Edge>(bytes) {
         Ok(edge) => {
             let provenance = edge.provenance;
-            if edge.kind.starts_with("ROADMAP_") {
+            if edge_kind_is_retired(&edge.kind) {
                 return Ok((None, provenance));
             }
             Ok((Some(edge), provenance))
@@ -129,301 +140,6 @@ pub fn decode_live_edge_row(bytes: &[u8]) -> Result<(Option<Edge>, EdgeProvenanc
             Ok((None, edge.provenance))
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedEdgeLaneSnapshotV1 {
-    /// Cheap identity used to invalidate an in-memory export plan. It binds
-    /// the opened inode and mutation timestamps, while `content_sha256` binds
-    /// the exact bytes that were parsed.
-    pub version_token: String,
-    pub content_sha256: String,
-    pub source_bytes: u64,
-    pub lines_seen: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedEdgeLaneVersionV1 {
-    pub version_token: String,
-    pub source_bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplicitEdgeLaneSnapshotV1 {
-    pub version_token: String,
-    pub content_sha256: String,
-    pub source_bytes: u64,
-    pub lines_seen: u64,
-}
-
-pub fn explicit_edge_lane_version(
-    edges_dir: &Path,
-    project_id: &str,
-) -> Result<ObservedEdgeLaneVersionV1> {
-    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
-        .context("validating explicit edge lane project id")?;
-    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("explicit"))? else {
-        return Ok(absent_observed_lane_version());
-    };
-    let Some(file) =
-        directory.open_regular(&format!("{project_id}.jsonl"), "explicit edge lane")?
-    else {
-        return Ok(absent_observed_lane_version());
-    };
-    observed_version_from_metadata(&file.metadata()?)
-}
-
-/// Stream one project's explicit edge lane through a bounded, no-follow
-/// reader. Cutover preflight uses this to compare legacy and authenticated
-/// provenance keys without loading a potentially large sidecar into memory.
-pub fn visit_explicit_edge_lane(
-    edges_dir: &Path,
-    project_id: &str,
-    max_source_bytes: u64,
-    max_line_bytes: usize,
-    mut visitor: impl FnMut(Edge) -> Result<()>,
-) -> Result<ExplicitEdgeLaneSnapshotV1> {
-    use std::io::Read as _;
-
-    if max_source_bytes == 0 || max_line_bytes == 0 {
-        anyhow::bail!("explicit edge lane limits must be nonzero");
-    }
-    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
-        .context("validating explicit edge lane project id")?;
-    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("explicit"))? else {
-        return Ok(ExplicitEdgeLaneSnapshotV1 {
-            version_token: absent_observed_lane_version().version_token,
-            content_sha256: hex::encode(Sha256::digest([])),
-            source_bytes: 0,
-            lines_seen: 0,
-        });
-    };
-    let Some(mut file) =
-        directory.open_regular(&format!("{project_id}.jsonl"), "explicit edge lane")?
-    else {
-        return Ok(ExplicitEdgeLaneSnapshotV1 {
-            version_token: absent_observed_lane_version().version_token,
-            content_sha256: hex::encode(Sha256::digest([])),
-            source_bytes: 0,
-            lines_seen: 0,
-        });
-    };
-    let initial = observed_version_from_metadata(&file.metadata()?)?;
-    let source_bytes = initial.source_bytes;
-    if source_bytes > max_source_bytes {
-        anyhow::bail!(
-            "explicit edge lane is {source_bytes} bytes, exceeding the {max_source_bytes}-byte cutover scan limit"
-        );
-    }
-
-    let mut remaining = source_bytes;
-    let mut hasher = Sha256::new();
-    let mut chunk = vec![0_u8; STREAMED_CHUNK_BYTES];
-    let mut splitter = StreamedLineSplitterV1::new(max_line_bytes);
-    let mut lines_seen = 0_u64;
-    let mut callback_error = None;
-    let mut on_line = |content: &[u8], _terminator: &[u8]| {
-        lines_seen = lines_seen.saturating_add(1);
-        let parsed = decode_live_edge_row(content)
-            .context("decoding explicit edge lane row")
-            .and_then(|(edge, _)| match edge {
-                Some(edge) => visitor(edge),
-                None => Ok(()),
-            });
-        if let Err(error) = parsed {
-            callback_error = Some(error);
-            return Err("explicit_edge_lane_row_invalid");
-        }
-        Ok(())
-    };
-    while remaining > 0 {
-        let wanted = usize::try_from(remaining.min(STREAMED_CHUNK_BYTES as u64))
-            .expect("streamed chunk bound fits usize");
-        let read = match file.read(&mut chunk[..wanted]) {
-            Ok(0) => anyhow::bail!("explicit edge lane became shorter while it was read"),
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).context("reading explicit edge lane"),
-        };
-        remaining -= read as u64;
-        hasher.update(&chunk[..read]);
-        if let Err(code) = splitter.push_chunk(&chunk[..read], &mut on_line) {
-            if let Some(error) = callback_error.take() {
-                return Err(error);
-            }
-            anyhow::bail!("{code}");
-        }
-    }
-    if let Err(code) = splitter.finish(&mut on_line) {
-        if let Some(error) = callback_error.take() {
-            return Err(error);
-        }
-        anyhow::bail!("{code}");
-    }
-
-    let current = explicit_edge_lane_version(edges_dir, project_id.as_str())?;
-    if current != initial {
-        anyhow::bail!("explicit edge lane changed during cutover scan");
-    }
-    Ok(ExplicitEdgeLaneSnapshotV1 {
-        version_token: initial.version_token,
-        content_sha256: hex::encode(hasher.finalize()),
-        source_bytes,
-        lines_seen,
-    })
-}
-
-/// Probe the current observed lane without reading its contents. This is the
-/// continuation/receipt fast path: an unchanged token lets the daemon reuse a
-/// bounded cached plan instead of re-scanning a potentially large lane.
-pub fn observed_edge_lane_version(
-    edges_dir: &Path,
-    project_id: &str,
-) -> Result<ObservedEdgeLaneVersionV1> {
-    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
-        .context("validating observed edge lane project id")?;
-    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("observed"))? else {
-        return Ok(absent_observed_lane_version());
-    };
-    let Some(file) =
-        directory.open_regular(&format!("{project_id}.jsonl"), "observed edge lane")?
-    else {
-        return Ok(absent_observed_lane_version());
-    };
-    observed_version_from_metadata(&file.metadata()?)
-}
-
-/// Stream the exact direct-observation lane through `visitor` with bounded
-/// resident memory. A source-size check happens before the first read, which
-/// is deliberately what makes a pathological multi-gigabyte sidecar a fast,
-/// explicit refusal instead of a daemon-sized allocation.
-pub fn visit_observed_edge_lane(
-    edges_dir: &Path,
-    project_id: &str,
-    max_source_bytes: u64,
-    max_line_bytes: usize,
-    mut visitor: impl FnMut(Edge) -> Result<()>,
-) -> Result<ObservedEdgeLaneSnapshotV1> {
-    use std::io::Read as _;
-
-    if max_source_bytes == 0 || max_line_bytes == 0 {
-        anyhow::bail!("observed edge lane limits must be nonzero");
-    }
-    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
-        .context("validating observed edge lane project id")?;
-    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("observed"))? else {
-        return Ok(empty_observed_lane_snapshot());
-    };
-    let name = format!("{project_id}.jsonl");
-    let Some(mut file) = directory.open_regular(&name, "observed edge lane")? else {
-        return Ok(empty_observed_lane_snapshot());
-    };
-    let initial = observed_version_from_metadata(&file.metadata()?)?;
-    if initial.source_bytes > max_source_bytes {
-        anyhow::bail!(
-            "observed edge lane is {} bytes, exceeding the {}-byte export scan limit",
-            initial.source_bytes,
-            max_source_bytes
-        );
-    }
-
-    let mut remaining = initial.source_bytes;
-    let mut hasher = Sha256::new();
-    let mut chunk = vec![0_u8; STREAMED_CHUNK_BYTES];
-    let mut splitter = StreamedLineSplitterV1::new(max_line_bytes);
-    let mut lines_seen = 0_u64;
-    let mut callback_error = None;
-    let mut on_line = |content: &[u8], _terminator: &[u8]| {
-        lines_seen = lines_seen.saturating_add(1);
-        let parsed = decode_live_edge_row(content)
-            .context("decoding observed edge lane row")
-            .and_then(|(edge, _)| match edge {
-                Some(edge) => visitor(edge),
-                None => Ok(()),
-            });
-        if let Err(error) = parsed {
-            callback_error = Some(error);
-            return Err("observed_edge_lane_row_invalid");
-        }
-        Ok(())
-    };
-    while remaining > 0 {
-        let wanted = usize::try_from(remaining.min(STREAMED_CHUNK_BYTES as u64))
-            .expect("streamed chunk bound fits usize");
-        let read = match file.read(&mut chunk[..wanted]) {
-            Ok(0) => anyhow::bail!("observed edge lane became shorter while it was read"),
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).context("reading observed edge lane"),
-        };
-        remaining -= read as u64;
-        hasher.update(&chunk[..read]);
-        if let Err(code) = splitter.push_chunk(&chunk[..read], &mut on_line) {
-            if let Some(error) = callback_error.take() {
-                return Err(error);
-            }
-            anyhow::bail!("{code}");
-        }
-    }
-    if let Err(code) = splitter.finish(&mut on_line) {
-        if let Some(error) = callback_error.take() {
-            return Err(error);
-        }
-        anyhow::bail!("{code}");
-    }
-
-    let current = observed_edge_lane_version(edges_dir, project_id.as_str())?;
-    if current != initial {
-        anyhow::bail!("observed edge lane changed while the export plan was built");
-    }
-    Ok(ObservedEdgeLaneSnapshotV1 {
-        version_token: initial.version_token,
-        content_sha256: hex::encode(hasher.finalize()),
-        source_bytes: initial.source_bytes,
-        lines_seen,
-    })
-}
-
-fn empty_observed_lane_snapshot() -> ObservedEdgeLaneSnapshotV1 {
-    ObservedEdgeLaneSnapshotV1 {
-        version_token: absent_observed_lane_version().version_token,
-        content_sha256: hex::encode(Sha256::digest([])),
-        source_bytes: 0,
-        lines_seen: 0,
-    }
-}
-
-fn absent_observed_lane_version() -> ObservedEdgeLaneVersionV1 {
-    ObservedEdgeLaneVersionV1 {
-        version_token: hex::encode(Sha256::digest(b"bbox-observed-edge-lane-absent-v1")),
-        source_bytes: 0,
-    }
-}
-
-fn observed_version_from_metadata(metadata: &fs::Metadata) -> Result<ObservedEdgeLaneVersionV1> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"bbox-observed-edge-lane-version-v1");
-    hasher.update(metadata.len().to_be_bytes());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        hasher.update(metadata.dev().to_be_bytes());
-        hasher.update(metadata.ino().to_be_bytes());
-        hasher.update(metadata.mtime().to_be_bytes());
-        hasher.update(metadata.mtime_nsec().to_be_bytes());
-        hasher.update(metadata.ctime().to_be_bytes());
-        hasher.update(metadata.ctime_nsec().to_be_bytes());
-    }
-    #[cfg(not(unix))]
-    {
-        let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
-        hasher.update(modified.as_secs().to_be_bytes());
-        hasher.update(modified.subsec_nanos().to_be_bytes());
-    }
-    Ok(ObservedEdgeLaneVersionV1 {
-        version_token: hex::encode(hasher.finalize()),
-        source_bytes: metadata.len(),
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1467,7 +1183,7 @@ static WRITER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub(crate) const MANAGED_EDGE_SET_VERSION: &str = "edge-set-v2-deduplicated";
 const MAX_MANAGED_EDGE_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-fn writer_temp_sequence() -> u64 {
+pub(crate) fn writer_temp_sequence() -> u64 {
     WRITER_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1904,36 +1620,7 @@ pub fn edge_import_key(edge: &Edge) -> String {
     hasher.update(b"\0");
     hasher.update(edge.target.to_string());
     hasher.update(b"\0");
-    if let Some(commit) = edge.metadata.get("anchor.commit_sha_at_edit") {
-        hasher.update(commit);
-    }
     hex::encode(hasher.finalize())
-}
-
-pub fn derived_tool_projection(edge: &Edge) -> Option<Edge> {
-    if edge.kind != "EDITED_FILE" {
-        return None;
-    }
-    let EntityRef::Transcript {
-        provider,
-        session_id,
-        ..
-    } = &edge.source
-    else {
-        return None;
-    };
-    Some(Edge {
-        source: edge.target.clone(),
-        kind: "EDITED_BY_SESSION".to_string(),
-        target: EntityRef::Session {
-            provider: provider.clone(),
-            session_id: session_id.clone(),
-        },
-        provenance: EdgeProvenance::Derived,
-        confidence: EdgeConfidence::Exact,
-        metadata: edge.metadata.clone(),
-        project_id: edge.project_id.clone(),
-    })
 }
 
 pub fn exact_edge(
@@ -1993,7 +1680,6 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
 //   project_files.rs  → replace_materialized_edges_incremental ("project")
 //   git_history.rs    → replace_materialized_edges (full) or merge_materialized_edges (incremental) ("git")
 //   tool_edges.rs     → append_observed_edges
-//   provenance.rs     → append_explicit_edges
 //   routes.rs         → append_explicit_edges (global agents.jsonl)
 //   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
@@ -2009,129 +1695,6 @@ pub fn append_explicit_edges(edges_dir: &Path, project_id: &str, edges: &[Edge])
     }
     let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
     append_edges_dedup(&edges_dir.join("explicit"), project_id, edges)
-}
-
-/// Merge one bounded explicit-edge generation through a single atomic lane
-/// replacement.
-///
-/// Memory is proportional to the caller-bounded incoming generation, never
-/// the existing lane. Existing rows are streamed byte-for-byte; their import
-/// keys remove matching incoming rows before the remaining additions are
-/// written to the replacement. A reader therefore sees either the complete
-/// old lane or the complete merged lane, never a partially appended import.
-pub fn append_explicit_edges_atomic(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-) -> Result<usize> {
-    append_explicit_edges_atomic_bounded(edges_dir, project_id, edges, u64::MAX)
-}
-
-pub fn append_explicit_edges_atomic_bounded(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-    max_existing_lane_bytes: u64,
-) -> Result<usize> {
-    if edges.is_empty() {
-        return Ok(0);
-    }
-    for edge in edges {
-        if edge.provenance == EdgeProvenance::Derived {
-            anyhow::bail!("explicit edge import contains a derived edge");
-        }
-    }
-    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
-    let explicit_dir = edges_dir.join("explicit");
-    fs::create_dir_all(&explicit_dir)?;
-    let path = explicit_dir.join(format!("{project_id}.jsonl"));
-    let nonce = COMPACTION_NONCE.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = explicit_dir.join(format!(
-        ".{project_id}.explicit-import-{}-{nonce}.tmp",
-        std::process::id()
-    ));
-    let mut incoming = BTreeMap::<String, &Edge>::new();
-    for edge in edges {
-        incoming.entry(edge_import_key(edge)).or_insert(edge);
-    }
-    let result = (|| -> Result<usize> {
-        let existing = match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    anyhow::bail!("refusing unsafe explicit edge lane");
-                }
-                if metadata.len() > max_existing_lane_bytes {
-                    anyhow::bail!(
-                        "explicit edge lane is {} bytes (limit {})",
-                        metadata.len(),
-                        max_existing_lane_bytes
-                    );
-                }
-                let mut reader = BufReader::new(fs::File::open(&path)?);
-                let mut line = Vec::new();
-                loop {
-                    line.clear();
-                    if reader.read_until(b'\n', &mut line)? == 0 {
-                        break;
-                    }
-                    let mut body = line.as_slice();
-                    if body.last() == Some(&b'\n') {
-                        body = &body[..body.len() - 1];
-                    }
-                    if body.last() == Some(&b'\r') {
-                        body = &body[..body.len() - 1];
-                    }
-                    if let Ok(edge) = serde_json::from_slice::<Edge>(body) {
-                        incoming.remove(&edge_import_key(&edge));
-                    }
-                }
-                true
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.into()),
-        };
-        if incoming.is_empty() {
-            return Ok(0);
-        }
-        let tmp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)?;
-        let mut writer = BufWriter::new(tmp);
-        let mut existing_ended_with_newline = true;
-        let mut had_existing_bytes = false;
-        if existing {
-            let mut reader = BufReader::new(fs::File::open(&path)?);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                if reader.read_until(b'\n', &mut line)? == 0 {
-                    break;
-                }
-                had_existing_bytes = true;
-                existing_ended_with_newline = line.last() == Some(&b'\n');
-                writer.write_all(&line)?;
-            }
-        }
-        if had_existing_bytes && !existing_ended_with_newline {
-            writer.write_all(b"\n")?;
-        }
-        let written = incoming.len();
-        for edge in incoming.into_values() {
-            serde_json::to_writer(&mut writer, edge)?;
-            writer.write_all(b"\n")?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-        fs::rename(&tmp_path, &path)?;
-        fs::File::open(&explicit_dir)?.sync_all()?;
-        Ok(written)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
 }
 
 pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
@@ -2464,10 +2027,7 @@ pub fn plan_legacy_edge_extraction(
             Ok(edge) => match edge.provenance {
                 EdgeProvenance::Derived => plan.derived_lines += 1,
                 EdgeProvenance::Explicit => {
-                    let is_tool = edge.kind == "READ_FILE"
-                        || edge.kind == "EDITED_FILE"
-                        || edge.kind == "RAN_BASH";
-                    if is_tool {
+                    if edge.kind == "RAN_BASH" {
                         plan.tool_lines += 1;
                     } else {
                         plan.explicit_lines += 1;
@@ -2493,7 +2053,7 @@ mod project_catalog_snapshot_tests {
     fn explicit_edge(target: &str) -> Edge {
         Edge {
             source: EntityRef::parse("transcript:test:session:1:0").unwrap(),
-            kind: "READ_FILE".into(),
+            kind: "RAN_BASH".into(),
             target: EntityRef::parse(target).unwrap(),
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
@@ -2503,41 +2063,28 @@ mod project_catalog_snapshot_tests {
     }
 
     #[test]
-    fn retired_edge_rows_do_not_block_surviving_lane_reads_or_change_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let project = "p_00000000000000000000000000000001";
+    fn retired_edge_rows_decode_as_inert_and_survivors_decode_whole() {
         let live = explicit_edge("task:surviving");
+        let (decoded, _) =
+            decode_live_edge_row(serde_json::to_string(&live).unwrap().as_bytes()).unwrap();
+        assert_eq!(decoded, Some(live.clone()));
+
         let mut retired = serde_json::to_value(&live).unwrap();
         retired["source"] = serde_json::json!({"type": "roadmap_item", "id": "stale"});
         retired["kind"] = serde_json::json!("ROADMAP_RELATED_TO");
-        let bytes = format!("{}\n{}\n", retired, serde_json::to_string(&live).unwrap());
-        for lane in ["explicit", "observed"] {
-            let path = root.join(lane).join(format!("{project}.jsonl"));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
-            let mut seen = Vec::new();
-            if lane == "explicit" {
-                let snapshot = visit_explicit_edge_lane(&root, project, 4096, 4096, |edge| {
-                    seen.push(edge);
-                    Ok(())
-                })
-                .unwrap();
-                assert_eq!(snapshot.lines_seen, 2);
-            } else {
-                let snapshot = visit_observed_edge_lane(&root, project, 4096, 4096, |edge| {
-                    seen.push(edge);
-                    Ok(())
-                })
-                .unwrap();
-                assert_eq!(snapshot.lines_seen, 2);
-            }
-            assert_eq!(seen, vec![live.clone()]);
-            assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
-        }
         let (edge, provenance) = decode_live_edge_row(retired.to_string().as_bytes()).unwrap();
         assert!(edge.is_none());
         assert_eq!(provenance, EdgeProvenance::Explicit);
+        for kind in RETIRED_FILE_TOUCH_EDGE_KINDS {
+            let mut file_touch = live.clone();
+            file_touch.kind = kind.to_string();
+            let (edge, provenance) =
+                decode_live_edge_row(serde_json::to_string(&file_touch).unwrap().as_bytes())
+                    .unwrap();
+            assert!(edge.is_none(), "{kind} rows must decode as retired");
+            assert_eq!(provenance, EdgeProvenance::Explicit);
+        }
+
         let mut walk = TranscriptEdgeLaneWalk::new();
         assert!(walk.accept(&retired.to_string()).unwrap().is_none());
         let mut surviving = live.clone();
@@ -2558,151 +2105,6 @@ mod project_catalog_snapshot_tests {
         retired["provenance"] = serde_json::json!("invalid");
         assert!(decode_live_edge_row(retired.to_string().as_bytes()).is_err());
         assert!(decode_live_edge_row(b"{broken").is_err());
-    }
-
-    #[test]
-    fn atomic_explicit_import_dedups_without_partial_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("edges");
-        let project_id = "p_00000000000000000000000000000001";
-        let first = explicit_edge("task:first");
-        let second = explicit_edge("task:second");
-        assert_eq!(
-            append_explicit_edges_atomic(&root, project_id, std::slice::from_ref(&first)).unwrap(),
-            1
-        );
-        let before =
-            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap();
-        assert_eq!(
-            append_explicit_edges_atomic(
-                &root,
-                project_id,
-                &[first.clone(), second.clone(), second]
-            )
-            .unwrap(),
-            1
-        );
-        let after =
-            std::fs::read_to_string(root.join("explicit").join(format!("{project_id}.jsonl")))
-                .unwrap();
-        assert_eq!(after.lines().count(), 2);
-        assert!(after.as_bytes().starts_with(&before));
-        assert_eq!(
-            append_explicit_edges_atomic(&root, project_id, &[first]).unwrap(),
-            0
-        );
-        let third = explicit_edge("task:third");
-        assert!(append_explicit_edges_atomic_bounded(&root, project_id, &[third], 1).is_err());
-        assert_eq!(
-            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap(),
-            after.as_bytes()
-        );
-        assert!(
-            std::fs::read_dir(root.join("explicit"))
-                .unwrap()
-                .all(|entry| !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp"))
-        );
-    }
-
-    #[test]
-    fn cutover_explicit_reader_is_bounded_and_observational() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("edges");
-        let project_id = "p_00000000000000000000000000000001";
-        let edges = [explicit_edge("task:first"), explicit_edge("task:second")];
-        append_explicit_edges(&root, project_id, &edges).unwrap();
-        let before =
-            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap();
-        let mut seen = Vec::new();
-        let snapshot =
-            visit_explicit_edge_lane(&root, project_id, 1024 * 1024, 1024 * 1024, |edge| {
-                seen.push(edge);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(seen, edges);
-        assert_eq!(snapshot.lines_seen, 2);
-        assert_eq!(snapshot.source_bytes, before.len() as u64);
-        assert_eq!(
-            snapshot.content_sha256,
-            hex::encode(Sha256::digest(&before))
-        );
-        assert!(visit_explicit_edge_lane(&root, project_id, 1, 1024, |_| Ok(())).is_err());
-        let line_error =
-            visit_explicit_edge_lane(&root, project_id, before.len() as u64, 1, |_| Ok(()))
-                .unwrap_err();
-        assert!(line_error.to_string().contains("owner_source_line_limit"));
-        assert_eq!(
-            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl")),).unwrap(),
-            before
-        );
-
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(root.join("explicit").join(format!("{project_id}.jsonl")))
-            .unwrap();
-        file.set_len(94 * 1024 * 1024 * 1024).unwrap();
-        let oversized =
-            visit_explicit_edge_lane(&root, project_id, 4 * 1024 * 1024 * 1024, 1024, |_| Ok(()))
-                .unwrap_err();
-        assert!(oversized.to_string().contains("100931731456 bytes"));
-    }
-
-    #[test]
-    fn observed_lane_reader_streams_exact_rows_and_refuses_oversized_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("edges");
-        let observed = root.join("observed");
-        std::fs::create_dir_all(&observed).unwrap();
-        let project_id = "p_00000000000000000000000000000001";
-        let edge = Edge {
-            source: EntityRef::parse("task:one").unwrap(),
-            kind: "RAN_BASH".into(),
-            target: EntityRef::parse("task:two").unwrap(),
-            provenance: EdgeProvenance::Explicit,
-            confidence: EdgeConfidence::Exact,
-            metadata: BTreeMap::new(),
-            project_id: Some(project_id.into()),
-        };
-        let bytes = format!("{}\n", serde_json::to_string(&edge).unwrap()).into_bytes();
-        std::fs::write(observed.join(format!("{project_id}.jsonl")), &bytes).unwrap();
-
-        let mut rows = Vec::new();
-        let snapshot =
-            visit_observed_edge_lane(&root, project_id, bytes.len() as u64, 1024 * 1024, |edge| {
-                rows.push(edge);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(rows, vec![edge]);
-        assert_eq!(snapshot.source_bytes, bytes.len() as u64);
-        assert_eq!(snapshot.lines_seen, 1);
-        assert_eq!(snapshot.content_sha256, hex::encode(Sha256::digest(&bytes)));
-        assert_eq!(
-            observed_edge_lane_version(&root, project_id)
-                .unwrap()
-                .version_token,
-            snapshot.version_token
-        );
-
-        let error =
-            visit_observed_edge_lane(&root, project_id, bytes.len() as u64 - 1, 1024, |_| Ok(()))
-                .unwrap_err();
-        assert!(error.to_string().contains("export scan limit"));
-
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(observed.join(format!("{project_id}.jsonl")))
-            .unwrap();
-        file.set_len(94 * 1024 * 1024 * 1024).unwrap();
-        let error =
-            visit_observed_edge_lane(&root, project_id, 2 * 1024 * 1024 * 1024, 1024, |_| Ok(()))
-                .unwrap_err();
-        assert!(error.to_string().contains("100931731456 bytes"));
     }
 
     #[test]

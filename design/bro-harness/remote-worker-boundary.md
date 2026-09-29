@@ -140,9 +140,10 @@ registry, which MCP surfaces are reachable, which credentials are injected,
 which mounts and network the container gets, which operator-authority flags the
 brief carries. This is "has tools available," upgraded by isolation: **absence
 beats filtering.** No runtime surface evaluator runs inside the worker; the
-surface verdict (`evaluate_tool_surface`) is resolved at dispatch and enforced
-by construction. Policy *authoring* stays central — brofiles, surface packets,
-the artifact catalog — but enforcement ships with the dispatch.
+surface's visible tool set (from the configured surface table) is resolved at
+dispatch and enforced by construction. Policy *authoring* stays central
+(brofiles, daemon surface configuration, the artifact catalog), but
+enforcement ships with the dispatch.
 
 ### 4.2 Integration — what comes back out
 

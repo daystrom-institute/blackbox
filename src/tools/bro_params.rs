@@ -700,8 +700,8 @@ pub(crate) struct BrofileParams {
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
     /// Optional tool-surface selector embedded in the brofile. When set, the
-    /// daemon evaluates the installed surface packet for this surface and folds
-    /// the verdict into the dispatch filter plane (harness-process-boundary.md §3).
+    /// daemon folds this surface from the configured surface table into the
+    /// dispatch filter plane (harness-process-boundary.md §3).
     #[serde(default)]
     pub(crate) surface: Option<String>,
     /// Retired compatibility flag, not part of the caller schema.

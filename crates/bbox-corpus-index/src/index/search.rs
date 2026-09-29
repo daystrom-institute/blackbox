@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
 use std::path::Path;
 
 use anyhow::Result;
@@ -1803,7 +1804,6 @@ impl TranscriptIndex {
                     Some(crate::index::tool_edges::ToolEdgeProjectAccess::local(
                         access.project_id(),
                         local_root.to_path_buf(),
-                        access.git_root.map(Path::to_path_buf),
                     ))
                 })
                 .collect(),

@@ -259,11 +259,6 @@ pub(super) fn open_shared_state(
     // open the platform default while the migration inventory and the
     // retirement discharge read the configured root.
     vectors::install_global_root(cfg.paths.vectors_path.clone());
-    // Push the config-resolved git-notes namespace into the corpus-core
-    // foundation crate (dependency inversion: corpus-core must not reach up into
-    // blackbox::config). Absent this, git::notes_namespace falls back to the
-    // BBOX_GIT_NOTES_NAMESPACE env var, then "bbox".
-    crate::git::set_notes_namespace(cfg.provenance.git_notes_namespace.clone())?;
     let cfg_arc = Arc::new(RwLock::new(cfg.clone()));
 
     let roots = discover_transcript_roots(&cfg, home);
@@ -301,10 +296,6 @@ pub(super) fn open_shared_state(
     let knowledge_transport_observations =
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
-        )?;
-    let blame_locality_observations =
-        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::open(
-            store_dir.join("blame-locality-observations.json"),
         )?;
     let render_locality_observations =
         bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::open(
@@ -344,19 +335,6 @@ pub(super) fn open_shared_state(
         } else {
             bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(
             )
-        },
-    );
-    let blame_locality_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| anyhow::anyhow!("blame locality cutover startup gate: {error}"))?
-        } else {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default()
         },
     );
     let render_locality_cutover = Arc::new(
@@ -826,6 +804,11 @@ pub(super) fn open_shared_state(
         }
     }
 
+    // Retired transcript file-touch rows leave the durable lanes once, before
+    // graph authority is captured. The store-level marker makes every later
+    // start a single stat.
+    purge_file_touch_edges_at_startup(&edges_dir)?;
+
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,
     // retirement-journal detection, and startup reducer sweep. All run
@@ -983,7 +966,6 @@ pub(super) fn open_shared_state(
         ),
         checkout_access,
         knowledge_transport_observations,
-        blame_locality_observations,
         render_locality_observations,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
@@ -1004,7 +986,6 @@ pub(super) fn open_shared_state(
         project_graph_views: RwLock::new(Default::default()),
         publisher_authorization_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),
-        surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
@@ -1017,7 +998,6 @@ pub(super) fn open_shared_state(
         knowledge_sources,
         git_transport_cutover,
         knowledge_transport_cutover,
-        blame_locality_cutover,
         render_locality_cutover,
         code_source_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
@@ -1127,6 +1107,24 @@ pub(super) fn open_shared_state(
         bind_host,
         bind_is_loopback,
     })
+}
+
+/// Pre-bind purge of retired file-touch rows from the durable edge lanes.
+fn purge_file_touch_edges_at_startup(
+    edges_dir: &Path,
+) -> anyhow::Result<bbox_edge_sidecar::file_touch_purge::FileTouchPurgeStats> {
+    let stats = bbox_edge_sidecar::file_touch_purge::purge_retired_file_touch_edges(edges_dir)
+        .context("pre-bind file-touch edge purge failed")?;
+    if stats.lanes_scanned > 0 {
+        tracing::info!(
+            lanes_scanned = stats.lanes_scanned,
+            lanes_rewritten = stats.lanes_rewritten,
+            rows_removed = stats.rows_removed,
+            bytes_removed = stats.bytes_removed,
+            "retired file-touch edge rows purged"
+        );
+    }
+    Ok(stats)
 }
 
 fn sync_tool_docs(kb: &mut Knowledge) -> bool {
@@ -1301,6 +1299,30 @@ fn refresh_history_reference_manifest(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The startup purge is the daemon's pass over a real edge root: a
+    /// store carrying file-touch rows loses them and is marked, and the
+    /// next start opens no lane.
+    #[test]
+    fn startup_purges_file_touch_rows_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let edges_dir = temp.path().canonicalize().unwrap().join("edges");
+        let lane = edges_dir
+            .join("observed")
+            .join("p_00000000000000000000000000000001.jsonl");
+        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        let bash = r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact"}"#;
+        let read = r#"{"source":{"type":"task","task_id":"one"},"kind":"READ_FILE","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"heuristic"}"#;
+        std::fs::write(&lane, format!("{read}\n{bash}\n")).unwrap();
+
+        let first = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert_eq!(first.rows_removed, 1);
+        assert_eq!(std::fs::read_to_string(&lane).unwrap(), format!("{bash}\n"));
+
+        let second = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert!(second.already_complete);
+        assert_eq!(second.lanes_scanned, 0);
+    }
 
     #[test]
     fn bridge_mode_never_opens_the_accepted_publication_runtime() {

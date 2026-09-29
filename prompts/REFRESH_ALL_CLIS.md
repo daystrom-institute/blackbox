@@ -86,7 +86,7 @@ the convergence-table cell links in every axis doc.
 
 ## Step 7 — cleanup & land
 
-- `bro_prune` the `task_id`s **you** created (terminal only).
+- List the terminal `task_id`s **you** created so the operator can prune them.
 - Commit **scoped to your files by explicit pathspec** (`git commit -- research/ …`)
   — **never `git add -A`** and never a bare `git commit` against the whole index
   in this multi-tenant repo (a peer's staged changes will ride along). `git status`

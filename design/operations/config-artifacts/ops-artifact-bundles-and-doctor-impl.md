@@ -16,8 +16,8 @@ question_shapes:
     scope_hint: src/artifacts.rs src/server/routes.rs src/tools/artifacts.rs
     known_evidence: file:src/server/routes.rs
   - question_shape: impact
-    query: Find integration points and blast radius — daemon startup restore, runtime/inlet path migration, the mcp-surface routing packet, macro include_str! removal, install-teams.sh retirement, watcher .bbox/bundles handling, and the tests/tool-doc coverage that gate each phase.
-    scope_hint: src/server/restore.rs src/macros/registry.rs system-defaults/mcp-surfaces/routing.json system-defaults/agentic-corpus/scripts/install-teams.sh src/watcher.rs src/tool_docs.rs
+    query: Find integration points and blast radius: daemon startup restore, runtime/inlet path migration, the built-in MCP surface table, macro include_str! removal, install-teams.sh retirement, watcher .bbox/bundles handling, and the tests/tool-doc coverage that gate each phase.
+    scope_hint: src/server/restore.rs src/macros/registry.rs crates/bbox-config/src/default_surfaces.toml system-defaults/agentic-corpus/scripts/install-teams.sh src/watcher.rs src/tool_docs.rs
     known_evidence: file:src/server/restore.rs
 ---
 
@@ -286,8 +286,8 @@ Update `src/artifacts.rs`:
 - update/verify `artifact_name()` so `Cron`, `Poller`, `Webhook`,
   `Teamplate`, and `Bundle` read `value["name"]`, and so `Macro` reads
   `value["id"]` (macro identity is `id`, not `name`);
-- extend `ArtifactInstallParams` with optional `role` so MCP-surface packets can
-  stay `kind="packet"` while still carrying role metadata into the catalog;
+- extend `ArtifactInstallParams` with optional `role` so an artifact can keep
+  a generic kind while still carrying role metadata into the catalog;
 - extend `ArtifactMetadata`:
 
 ```rust
@@ -437,7 +437,7 @@ Tests:
   team install materializes a runtime `Team` from a `TeamArtifactSpec` and
   `save_team` round-trips; deactivate removes;
 - old metadata files load with new optional fields absent;
-- `role="mcp_surface"` persists in metadata;
+- `role` persists in metadata;
 - scoped artifact list includes `.bbox/` artifacts when requested;
 - existing kind installs still behave the same through activators;
 - direct cron/poller/webhook install rejects missing `version`;
@@ -513,8 +513,7 @@ Initial dependency checks:
   subworkflows, and MCP hook targets;
 - workflow-backed atoms resolve workflow;
 - profile-backed atoms resolve brofile;
-- agents with `brofile_ref` resolve brofile;
-- MCP surface packets exist before any provider sync step that references them.
+- agents with `brofile_ref` resolve brofile.
 
 ### 3.3 Apply And Generation Records
 
@@ -595,7 +594,6 @@ Add, grounded in the real directory groups (see the companion design's
 ```text
 system-defaults/bundles/
   blackbox-system-defaults.json   # meta → children
-  mcp-surfaces.json
   agentic-corpus.json             # incl. promoted contradiction-specialists team
   maintenance.json                # daily-compaction (own tree)
   agents.json                     # agents + agent-eval cron/packets/workflows
@@ -681,16 +679,14 @@ Retire (non-MCP):
   not change macro resolution; without it applied, the removal is refused/flagged
   by doctor (`action`: missing managed macros)
 
-Update the managed MCP surface packet:
+Update the built-in MCP surface table:
 
-- `system-defaults/mcp-surfaces/routing.json` enumerates tools being deleted
-  here - `bro_workflow_install`,
-  `bro_cron_*`, etc. (`routing.json:12,18,30`). Removing the tools without
-  updating the surface packet leaves the `default`/`readonly`/`ops` surfaces
-  referencing dead tool names. Edit `routing.json` to drop the deleted lifecycle
-  tools and add the artifact-path replacements, recompile it (as the
-  `role="mcp_surface"` packet), and replay the surfaces via `bbox_mcp_surface`.
-  This is a Phase 4 **acceptance item**, not just a docs update.
+- `crates/bbox-config/src/default_surfaces.toml` names tools by pattern.
+  Removing tools without updating it leaves the built-in surfaces referencing
+  dead tool names. Drop the deleted lifecycle tools, place the artifact-path
+  replacements on the intended surfaces, and check `tools/list` on each
+  built-in surface. This is a Phase 4 **acceptance item**, not just a docs
+  update.
 
 Add:
 
@@ -716,8 +712,7 @@ Update:
 - `docs/operating-blackbox.md`
 - `docs/operations.md`
 - `system-defaults/system-defaults.md`
-- any examples that mention direct `bro_cron_install` or `bbox_compile` for
-  shipped MCP surfaces.
+- any examples that mention direct `bro_cron_install`.
 
 Default instructions should use:
 
@@ -872,8 +867,7 @@ With `apply=true`, allow only conservative actions:
 - full reindex only when a schema/chunker marker requires it;
 - incremental reindex for ordinary freshness;
 - targeted re-embed only when provider/model/dim changed or partition is
-  missing;
-- compile managed MCP surface packets when the surface bundle changed.
+  missing.
 
 Never:
 
@@ -927,7 +921,7 @@ Work:
 - extract static dependency refs from workflows;
 - extract refs from atoms and agents;
 - extract `routing_packet` refs from inlets;
-- extract MCP surface/provider-sync refs;
+- extract provider-sync refs;
 - auto-order bundle operations;
 - report cycles before mutation.
 

@@ -21,6 +21,8 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use bbox_corpus_core::identity::PublishedScope;
+
 use crate::mcp_call::default_base_url;
 
 /// Checkout-relative location of the binding environment file. It lives inside
@@ -149,7 +151,7 @@ async fn mint(args: MintArgs) -> anyhow::Result<()> {
         bail!("workspace binding project root is outside its Git checkout");
     }
 
-    let scope = bbox_provenance::resolve_committed_scope(&project_root)
+    let scope = resolve_committed_scope(&project_root, &workspace_root)
         .context("resolving committed workspace binding project scope")?;
     // Read, never mint: the catalog attachment is what records this checkout's
     // durable identity, so writing a fresh marker here would desynchronize the
@@ -361,6 +363,63 @@ const CLI_BUILD_ID: &str = env!("BRO_CLI_BUILD_ID");
 /// two ends were built from different contracts; the response decoders are
 /// tolerant, so this is advisory, but it is the first thing to check when a
 /// capture misbehaves.
+/// The published scope recorded in the committed `.bbox/config.toml` at HEAD.
+///
+/// Only committed identity counts: a working-tree edit to the config cannot
+/// change the scope a binding is minted for. Computed ids and `aka_repo_ids`
+/// never establish the scope on their own.
+fn resolve_committed_scope(project_root: &Path, git_root: &Path) -> anyhow::Result<PublishedScope> {
+    let directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(git_root)?
+        .context("workspace binding repository root disappeared")?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&directory)?
+        .context("workspace binding project is not a stable Git repository")?;
+    let head = bbox_corpus_core::git::current_head(project_root)
+        .context("workspace binding project has no committed HEAD")?;
+    let commit = repository.verify_commit_oid(&head)?;
+    let bbox_root_relpath = bbox_corpus_core::identity::bbox_root_relpath(git_root, project_root)
+        .context("project root is outside its Git repository")?;
+    let config_relpath = if bbox_root_relpath == "." {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{bbox_root_relpath}/.bbox/config.toml")
+    };
+    let source = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+        &commit,
+        &config_relpath,
+        1024 * 1024,
+    )?;
+    let source = std::str::from_utf8(&source).context("committed project config is not UTF-8")?;
+    let project = toml::from_str::<CommittedProjectConfig>(source)
+        .context("parsing committed project identity")?
+        .project;
+    let inputs = bbox_corpus_core::identity::RepoIdInputs {
+        project_key_override: project.project_key_override,
+        recorded: project.repo_id,
+        aka_repo_ids: project.aka_repo_ids,
+        computed: None,
+    };
+    let repo_id = bbox_corpus_core::identity::resolve_recorded_repo_id(&inputs).context(
+        "committed .bbox/config.toml must record project.repo_id or project.project_key_override",
+    )?;
+    Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectConfig {
+    #[serde(default)]
+    project: CommittedProjectIdentity,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectIdentity {
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    project_key_override: Option<String>,
+    #[serde(default)]
+    aka_repo_ids: Vec<String>,
+}
+
 fn build_skew_warning(daemon_build_id: Option<&str>) -> Option<String> {
     build_skew_warning_for(CLI_BUILD_ID, daemon_build_id)
 }
@@ -516,6 +575,50 @@ fn write_binding_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn committed_scope_ignores_working_tree_identity_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".bbox")).unwrap();
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-a\"\n",
+        )
+        .unwrap();
+        git(&root, &["add", ".bbox/config.toml"]);
+        git(&root, &["commit", "-qm", "initial"]);
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-b\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_committed_scope(&root, &root).unwrap(),
+            PublishedScope::try_new("repo-a", ".").unwrap()
+        );
+    }
 
     #[test]
     fn build_skew_warning_names_both_builds_and_is_silent_when_equal() {

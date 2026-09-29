@@ -41,7 +41,6 @@ impl InspectableEntityProvider for ProjectFileProvider {
                 "CALLED_BY",
                 "CONTAINS_SYMBOL",
                 "IN_FILE",
-                "EDITED_BY_SESSION",
                 "EDITED_IN_COMMIT",
                 "NEXT_SECTION",
                 "LINKS_TO_FILE",
@@ -58,9 +57,6 @@ impl InspectableEntityProvider for ProjectFileProvider {
             expected("DEFINED_IN", false),
             expected("CALLS", false),
             expected("CALLED_BY", false),
-            expected("EDITED_FILE", false),
-            expected("READ_FILE", false),
-            expected("EDITED_BY_SESSION", false),
             expected("EDITED_IN_COMMIT", false),
             expected("COMMIT_TOUCHED_FILE", false),
             expected("DESCRIBES", false),
@@ -93,10 +89,7 @@ impl InspectableEntityProvider for ProjectFileProvider {
                 "DEFINED_IN",
                 "CALLS",
                 "CALLED_BY",
-                // Provenance: who touched this chunk and from where
-                "EDITED_FILE",
-                "READ_FILE",
-                "EDITED_BY_SESSION",
+                // History: the commits that touched this chunk
                 "EDITED_IN_COMMIT",
                 "COMMIT_TOUCHED_FILE",
                 // Semantic linking

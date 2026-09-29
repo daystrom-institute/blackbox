@@ -458,10 +458,9 @@ impl ImmutableInventoryOwnerKindV1 {
     /// never-provisioned state rather than broken evidence.
     ///
     /// The Slack stores exist only after the Slack bridge first writes a
-    /// binding, and the provenance notes ref exists only after an explicit
-    /// `bbox_provenance_export`; a host that never used either surface has
-    /// nothing to observe, which is vacuously complete coverage, not a gap
-    /// in it. Every other owner is provisioned by daemon startup or by the
+    /// binding, and a repository carries a provenance notes ref only when
+    /// something wrote one; a host without either has nothing to observe,
+    /// which is vacuously complete coverage, not a gap in it. Every other owner is provisioned by daemon startup or by the
     /// stores the daemon always writes, so absence there stays a hard
     /// refusal. An EMPTY-but-present source was already `Present` with zero
     /// rows for all owners; this only aligns the absent case for the two
