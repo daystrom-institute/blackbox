@@ -115,6 +115,8 @@ struct RawConfig {
     pub lsp: RawLspConfig,
     pub transcripts: RawTranscriptConfig,
     #[serde(default)]
+    pub surfaces: std::collections::BTreeMap<String, SurfaceConfig>,
+    #[serde(default)]
     pub paths: RawPathsConfig,
 }
 
@@ -1032,6 +1034,46 @@ pub struct TranscriptConfig {
     pub codex_root: Option<PathBuf>,
 }
 
+/// One MCP tool surface: glob patterns over bare tool names. A non-empty
+/// `allow` is an allowlist; `disallow` wins over `allow`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub disallow: Vec<String>,
+}
+
+const DEFAULT_SURFACES_TOML: &str = include_str!("default_surfaces.toml");
+
+/// Built-in MCP tool surfaces; daemon configuration overrides or adds
+/// surfaces by name.
+pub fn default_surfaces() -> std::collections::BTreeMap<String, SurfaceConfig> {
+    #[derive(Deserialize)]
+    struct DefaultSurfaces {
+        surfaces: std::collections::BTreeMap<String, SurfaceConfig>,
+    }
+    Figment::from(Toml::string(DEFAULT_SURFACES_TOML))
+        .extract::<DefaultSurfaces>()
+        .expect("built-in surfaces parse")
+        .surfaces
+}
+
+fn validate_surfaces(surfaces: &std::collections::BTreeMap<String, SurfaceConfig>) -> Result<()> {
+    for (name, surface) in surfaces {
+        if name.trim().is_empty() || name.trim() != name {
+            anyhow::bail!("surface name {name:?} must be non-empty without surrounding whitespace");
+        }
+        for pattern in surface.allow.iter().chain(&surface.disallow) {
+            if pattern.trim().is_empty() {
+                anyhow::bail!("surface {name:?} has an empty tool pattern");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Main configuration structure with all resolved values
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -1043,6 +1085,9 @@ pub struct Config {
     pub providers: ProviderConfig,
     pub lsp: LspConfig,
     pub transcripts: TranscriptConfig,
+    /// MCP tool surfaces by name: built-in defaults merged with
+    /// `[surfaces.<name>]` tables from the config file.
+    pub surfaces: std::collections::BTreeMap<String, SurfaceConfig>,
     pub paths: ResolvedPathConfig,
 }
 
@@ -1105,6 +1150,7 @@ impl Config {
                 roots: None,
                 codex_root: None,
             },
+            surfaces: default_surfaces(),
             paths: RawPathsConfig {
                 state_dir: Some(util::blackbox_state_dir(home)),
                 bro_home: None,
@@ -1413,6 +1459,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             .collect::<Result<Vec<_>>>()?,
     };
     validate_source_connectors(&source_connectors)?;
+    validate_surfaces(&raw.surfaces)?;
 
     validate_cutback_retry_config(
         raw.code_collection.cutback_retry_base_secs,
@@ -1507,6 +1554,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             roots: raw.transcripts.roots,
             codex_root: raw.transcripts.codex_root,
         },
+        surfaces: raw.surfaces,
         paths,
     })
 }
@@ -2332,6 +2380,69 @@ bind = "0.0.0.0"
             unsafe { env::set_var("BLACKBOX_CONFIG", v) };
         } else {
             unsafe { env::remove_var("BLACKBOX_CONFIG") };
+        }
+    }
+
+    #[test]
+    fn surfaces_merge_config_tables_over_built_in_defaults() {
+        let _guard = bbox_util::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        let built_in = default_surfaces();
+        for name in [
+            "default",
+            "interactive",
+            "agent-internal",
+            "readonly",
+            "ops",
+        ] {
+            assert!(built_in.contains_key(name), "built-in surface {name}");
+        }
+        assert_eq!(built_in["ops"], SurfaceConfig::default());
+
+        let absent = load_with(LoadOptions {
+            config_path: Some(home.join("absent.toml")),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(absent.surfaces, built_in);
+
+        let config_path = home.join("surfaces.toml");
+        std::fs::write(
+            &config_path,
+            "[surfaces.default]\ndisallow = [\"bbox_render\"]\n\n[surfaces.reviewer]\nallow = [\"bbox_hybrid_search\"]\n",
+        )
+        .unwrap();
+        let merged = load_with(LoadOptions {
+            config_path: Some(config_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(merged.surfaces["default"].disallow, ["bbox_render"]);
+        assert_eq!(merged.surfaces["reviewer"].allow, ["bbox_hybrid_search"]);
+        assert_eq!(merged.surfaces["readonly"], built_in["readonly"]);
+        assert_eq!(merged.surfaces.len(), built_in.len() + 1);
+
+        for invalid in [
+            "[surfaces.default]\ndisallow = [\" \"]\n",
+            "[surfaces.default]\ninstructions = \"x\"\n",
+        ] {
+            std::fs::write(&config_path, invalid).unwrap();
+            assert!(
+                load_with(LoadOptions {
+                    config_path: Some(config_path.clone()),
+                    ..Default::default()
+                })
+                .is_err(),
+                "{invalid}"
+            );
         }
     }
 

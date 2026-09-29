@@ -22,7 +22,6 @@ pub mod doctor;
 pub mod gaps;
 pub mod graph;
 pub mod knowledge;
-pub mod mcp_surface;
 pub mod notes;
 pub mod packets;
 pub mod project_catalog;

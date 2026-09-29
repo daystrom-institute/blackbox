@@ -209,9 +209,6 @@ try:
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
  measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
  assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
- surface=exact('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024})
- assert {row['name'] for row in surface['visible_tools']}==names
- call('bbox_mcp_surface',{'action':'replay','surface':'ops','body_limit':1024,'limit':1},True)
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
  for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:

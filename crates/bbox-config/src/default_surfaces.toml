@@ -1,0 +1,81 @@
+# Built-in MCP tool surfaces. Daemon configuration overrides or adds surfaces
+# with `[surfaces.<name>]` tables of the same shape. Patterns are globs over
+# bare tool names; a non-empty `allow` is an allowlist and `disallow` wins
+# over `allow`. A session naming a surface missing from the merged table is
+# refused at initialize.
+
+[surfaces.default]
+disallow = [
+    "bro_broadcast",
+    "bbox_render",
+    "bbox_absorb",
+    "bbox_bootstrap",
+    "bbox_lint",
+    "bbox_review",
+    "bbox_reindex",
+    "bbox_reembed",
+    "bbox_embed_status",
+    "bbox_provenance_export",
+    "bbox_provenance_import",
+    "bbox_artifact_install",
+    "bbox_artifact_supersede",
+]
+
+[surfaces.interactive]
+disallow = ["bro_allocator_*", "bro_agent_*"]
+
+[surfaces.agent-internal]
+disallow = [
+    "bro_exec",
+    "bro_resume",
+    "bro_cancel",
+    "bro_prune",
+    "bbox_render",
+    "bbox_absorb",
+    "bbox_bootstrap",
+    "bbox_lint",
+    "bbox_review",
+    "bbox_reindex",
+    "bbox_reembed",
+    "bbox_embed_status",
+    "bbox_provenance_export",
+    "bbox_provenance_import",
+    "bbox_artifact_install",
+    "bbox_artifact_supersede",
+]
+
+[surfaces.readonly]
+allow = [
+    "bbox_search",
+    "bbox_cite",
+    "bbox_context",
+    "bbox_messages",
+    "bbox_session",
+    "bbox_sessions_list",
+    "bbox_topics",
+    "bbox_stats",
+    "bbox_blame",
+    "bbox_hybrid_search",
+    "bbox_discover_seed_entities",
+    "bbox_inspect_entity",
+    "bbox_describe_schema",
+    "bbox_find_paths",
+    "bbox_bundle_evidence",
+    "bbox_knowledge",
+    "bbox_thread_list",
+    "bbox_notes",
+    "bbox_inbox",
+    "bbox_packet_list",
+    "bbox_packet_events",
+    "bbox_artifact_list",
+    "bbox_project_list",
+    "bro_status",
+    "bro_dashboard",
+    "bro_agent_list",
+    "bro_agent_get",
+    "bro_agent_describe",
+    "bro_agent_search",
+    "bbox_tool_calls",
+]
+
+[surfaces.ops]

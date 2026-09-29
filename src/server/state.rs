@@ -215,10 +215,6 @@ pub(crate) struct SharedState {
     pub(crate) publisher_authorization_cache:
         RwLock<super::knowledge_lifecycle::PublisherAuthorizationCache>,
     pub(crate) packets: RwLock<Packets>,
-    /// Generation-validated cache of MCP surface decisions; see
-    /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
-    /// re-reading the packet store on every request.
-    pub(crate) surface_decisions: crate::server::surface::SurfaceDecisionCache,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
@@ -871,7 +867,6 @@ impl SharedState {
             project_graph_views: RwLock::new(Default::default()),
             publisher_authorization_cache: RwLock::new(Default::default()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
-            surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2688,11 +2683,13 @@ pub(crate) struct BlackboxServer {
     /// Session-scoped MCP tool surface selector. Set once during
     /// MCP session initialization from the `?surface` query parameter.
     pub(crate) surface: OnceLock<Arc<str>>,
-    /// Session-scoped project context for surface evaluation. Set once
-    /// during MCP session initialization from the `?project` query
-    /// parameter — resolved through the shared project resolver (alias /
-    /// id / path → base canonical path), falling back to the literal value
-    /// for parity with the bbox_mcp_surface tool (gap-310c36b6).
+    /// Tool names visible on the session surface, computed once from the
+    /// configured surface table and the served catalog.
+    pub(crate) surface_tools: OnceLock<Arc<std::collections::HashSet<String>>>,
+    /// Session-scoped project context. Set once during MCP session
+    /// initialization from the `?project` query parameter, resolved through
+    /// the shared project resolver (alias / id / path to base canonical
+    /// path), falling back to the literal value.
     pub(crate) surface_project: OnceLock<Option<Arc<str>>>,
     /// Server-authoritative checkout identity derived from trusted MCP
     /// transport context at initialization. Tool arguments never replace it.

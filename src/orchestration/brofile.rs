@@ -36,11 +36,11 @@ pub struct Brofile {
     /// inherits without touching global/project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<McpFilters>,
-    /// Optional tool-surface selector. When set, the daemon evaluates the
-    /// installed surface packet for this surface (the same `evaluate_tool_surface`
-    /// authority the rmcp wire head uses for `?surface=<id>` callers) and folds
-    /// the verdict into the dispatch filter plane, so a child session is
-    /// surface-governed exactly like a wire caller. Unset → no surface fold
+    /// Optional tool-surface selector. When set, the daemon folds this
+    /// surface from the configured surface table (the same table the wire
+    /// head uses for `?surface=<id>` callers) into the dispatch filter plane,
+    /// so a child session is surface-governed exactly like a wire caller. An
+    /// unknown surface denies every tool. Unset → no surface fold
     /// (recursion-guard + `filters` still apply). See
     /// design/bro-harness/harness-process-boundary.md §3.
     #[serde(default, skip_serializing_if = "Option::is_none")]

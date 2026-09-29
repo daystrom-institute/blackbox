@@ -738,15 +738,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
         ),
     },
-    ToolDoc {
-        name: "bbox_mcp_surface",
-        category: ToolCategory::Packets,
-        summary: "Inspect MCP routing: replay pages visible tools, describe pages rules, list pages surface packets. detail=policy expands allow/disallow patterns. body_limit/cursor without limit/offset recovers complete projected JSON; changed policy or selection refuses continuation.",
-        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. All inventories are paged live views. Replay/describe accept detail=policy for exact pattern pages; action=list rejects replay/describe selectors. Packet body pages are the complete packet reader. body_limit/cursor without limit/offset recovers complete projected JSON for the same action/surface/project/detail. Changed result or selection refuses continuation. Ordinary offset pages remain live. Complex predicates have matches_surface=null and surface_match_kind=requires_predicate_evaluation; routing still evaluates the actual predicate.",
-        example: Some(
-            r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
-        ),
-    },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
         name: "bro_exec",

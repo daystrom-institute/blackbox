@@ -1,16 +1,14 @@
-# src/server — daemon bootstrap, wire MCP head, surface evaluation
+# src/server — daemon bootstrap, wire MCP head, surfaces
 
-- The wire head extracts `?surface=` AND `?project=` once at `initialize`,
-  resolves the project selector through the Read-intent resolver (alias /
-  id / path → base canonical path, literal fallback for parity with
-  bbox_mcp_surface), and pins both in per-session OnceLocks. Every
-  get_tool / list_tools / call_tool surface lookup must pass the pinned
-  pair — the SurfaceDecisionCache keys `(surface, project)`, and a lookup
-  that hardcodes `None` for project silently reverts project-scoped surface
-  packets to dispatch-path-only (gap-310c36b6 was exactly that).
-- Surface evaluation runs BEFORE the session pins are set, and the deny
-  verdict must abort initialize — a denied surface that still pins would
-  leave a half-initialized session answering tool lists.
+- The wire head extracts `?surface=` AND `?project=` once at `initialize`.
+  The surface resolves against the configured surface table
+  (`config.surfaces`); its visible tool set is computed once and pinned in a
+  per-session OnceLock that get_tool / list_tools / call_tool read. The
+  project selector resolves through the Read-intent resolver (alias / id /
+  path → base canonical path, literal fallback) into its own OnceLock.
+- An unknown surface must abort initialize BEFORE any session slot is set:
+  a refused surface that still pins would leave a half-initialized session
+  answering tool lists.
 - Resolution at initialize does blocking fs/git probes → blocking pool, like
   every other resolver call site.
 - Startup ordering in open.rs is load-bearing and documented inline: repo-

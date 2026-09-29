@@ -93,7 +93,6 @@ impl BlackboxServer {
                 + crate::tools::roster::router()
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()
-                + crate::tools::mcp_surface::router()
                 + crate::tools::doctor::router()
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
@@ -101,6 +100,7 @@ impl BlackboxServer {
                 + crate::tools::tool_calls::router(),
             embed_status_snapshots: Default::default(),
             surface: std::sync::OnceLock::new(),
+            surface_tools: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),
             session_workspace_binding: std::sync::OnceLock::new(),

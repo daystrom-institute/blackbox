@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::server::surface::SurfaceCacheEntry;
 use crate::server::{self, BlackboxServer};
 
 use rmcp::handler::server::tool::ToolCallContext;
@@ -50,57 +49,33 @@ impl BlackboxServer {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Session project context for surface evaluation, set at `initialize`
-    /// from the `?project` query parameter (gap-310c36b6). `None` for
-    /// sessions that did not select a project.
+    /// Session project context, set at `initialize` from the `?project`
+    /// query parameter. `None` for sessions that did not select a project.
     pub(crate) fn session_surface_project(&self) -> Option<String> {
         self.surface_project
             .get()
             .and_then(|p| p.as_ref().map(|s| s.as_ref().to_string()))
     }
 
-    /// Surface decision for this session via the generation-validated cache.
-    /// The hit path is two short lock reads; a rebuild (first request after
-    /// a packet mutation) re-reads the packet store, so it runs on the
-    /// blocking pool.
-    async fn surface_entry(&self, surface: &str, project: Option<&str>) -> Arc<SurfaceCacheEntry> {
-        let generation = self.state.packets.read().generation();
-        if let Some(hit) = self
-            .state
-            .surface_decisions
-            .lookup(surface, project, generation)
-        {
-            return hit;
-        }
-        let server = self.clone();
-        let surface_owned = surface.to_string();
-        let project_owned = project.map(str::to_string);
-        match tokio::task::spawn_blocking(move || {
-            let universe = server.tool_universe();
-            server::surface::cached_surface_entry(
-                &server.state,
-                &surface_owned,
-                project_owned.as_deref(),
-                || universe,
-            )
-        })
-        .await
-        {
-            Ok(entry) => entry,
-            Err(e) => {
-                // Only reachable if the rebuild closure panicked; recompute
-                // inline rather than poisoning the session.
-                tracing::warn!(error = %e, "surface decision rebuild panicked; recomputing inline");
-                self.surface_entry_sync(surface, project)
-            }
-        }
+    /// Tool names visible on this session's surface. `initialize` refuses
+    /// unknown surfaces; a session that bypassed it resolves `default`, and a
+    /// surface missing from the table shows nothing.
+    fn session_tools(&self) -> Arc<HashSet<String>> {
+        self.surface_tools
+            .get_or_init(|| {
+                self.surface_tools_for(&self.session_surface())
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 
-    /// Synchronous variant for trait methods that cannot await. The miss
-    /// path blocks on the packet store scan.
-    fn surface_entry_sync(&self, surface: &str, project: Option<&str>) -> Arc<SurfaceCacheEntry> {
-        let universe = self.tool_universe();
-        server::surface::cached_surface_entry(&self.state, surface, project, || universe)
+    pub(super) fn surface_tools_for(&self, surface: &str) -> Option<Arc<HashSet<String>>> {
+        let config = self.state.config.read();
+        let policy = config.surfaces.get(surface)?;
+        Some(Arc::new(server::surface::visible_tool_set(
+            policy,
+            &self.tool_universe(),
+        )))
     }
 }
 
@@ -208,11 +183,20 @@ impl ServerHandler for BlackboxServer {
         } else {
             ("default", None, None, None, None)
         };
+        let Some(surface_tools) = self.surface_tools_for(surface_str) else {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                format!(
+                    "tool surface denied: {}",
+                    server::surface::unknown_surface_message(surface_str)
+                ),
+                None,
+            ));
+        };
         // Resolve the project selector (alias / id / path) through the
         // shared engine (phase-2 §9.2, Filter class) to the base canonical
-        // path packets are scoped by, keeping the literal on a miss for
-        // parity with bbox_mcp_surface. A catalog-mode identity with no
-        // attachment pins the stable project id: identity without a host
+        // path, keeping the literal on a miss. A catalog-mode identity with
+        // no attachment pins the stable project id: identity without a host
         // path. Blocking fs (canonicalize / git probes) → blocking pool.
         let authority_project = workspace_binding
             .as_ref()
@@ -266,18 +250,11 @@ impl ServerHandler for BlackboxServer {
                 None => None,
             },
         };
-        let entry = self.surface_entry(surface_str, project.as_deref()).await;
-        if let server::surface::ToolSurfaceVerdict::Deny { reason } = &entry.decision.verdict {
-            let reason = reason.as_deref().unwrap_or("surface denied");
-            return Err(ErrorData::internal_error(
-                format!("tool surface denied: {}", reason),
-                None,
-            ));
-        }
         // A raw `?project` remains a surface/filter selector only. Managed
         // workspace authority comes exclusively from the private capability
         // header minted for this supervised harness session.
         let _ = self.surface.set(Arc::from(surface_str));
+        let _ = self.surface_tools.set(surface_tools);
         let _ = self.surface_project.set(project.map(Arc::from));
         let _ = self.session_checkout.set(None);
         let _ = self
@@ -296,11 +273,7 @@ impl ServerHandler for BlackboxServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        let entry = self.surface_entry_sync(
-            &self.session_surface(),
-            self.session_surface_project().as_deref(),
-        );
-        if !entry.visible.contains(name) {
+        if !self.session_tools().contains(name) {
             return None;
         }
         self.tool_router.get(name).cloned()
@@ -311,17 +284,12 @@ impl ServerHandler for BlackboxServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let entry = self
-            .surface_entry(
-                &self.session_surface(),
-                self.session_surface_project().as_deref(),
-            )
-            .await;
+        let visible = self.session_tools();
         let tools = self
             .tool_router
             .list_all()
             .into_iter()
-            .filter(|t| entry.visible.contains(t.name.as_ref()))
+            .filter(|t| visible.contains(t.name.as_ref()))
             .collect();
         Ok(ListToolsResult {
             tools,
@@ -445,10 +413,7 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let surface = self.session_surface();
-        let entry = self
-            .surface_entry(&surface, self.session_surface_project().as_deref())
-            .await;
-        if !entry.visible.contains(request.name.as_ref()) {
+        if !self.session_tools().contains(request.name.as_ref()) {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 format!(
