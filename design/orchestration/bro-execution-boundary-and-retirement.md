@@ -399,7 +399,7 @@ caller without retaining their old executable manifest.
 | `.bbox/workflows/{gap-processing,blackbox-review}.json`, `.bbox/atoms/gap-cluster-validator.json` | Retire repo-owned execution manifests. Inspect associated brofiles independently. |
 | `schema/{atom,workflow}.schema.json` | Remove new-write/execution schemas after preserving legacy record readers separately. |
 | `examples/{workflows,slack,keystone,sastquatch}/`, workflow portions of `examples/whiteboard/`, reactions in `examples/{forgejo,system-events}/` | Remove runnable retired examples from installation indexes; archive useful historical explanation. |
-| `crates/bbox-tool-docs/src/tool_docs.rs`, `system-defaults/mcp-surfaces/routing.json`, `src/server/mod.rs` | Change docs, surface policy and routers together. Do not expose retired operations through a specialist surface. |
+| `crates/bbox-tool-docs/src/tool_docs.rs`, `crates/bbox-config/src/default_surfaces.toml`, `src/server/mod.rs` | Change docs, surface policy and routers together. Do not expose retired operations through a specialist surface. |
 | `system-defaults/memories/{atoms,workflow-orchestration}.md` | Retire operative instructions and their catalog entries. Update the `sm-atoms` ordering fixture in `crates/bbox-system-memory/src/catalog.rs`. |
 | `system-defaults/memories/{bro-dispatch-patterns,create-etiquette,side-channel-notes,system-memory-catalog}.md` and refactor memories | Preserve useful invariants; remove retired discovery/execution prescriptions and point to direct harness capabilities. |
 | `prompts/gap-processing.md`, `prompts/agents/gap-processing-orchestrator.md`, prompt indexes, closeout/daily-cleaning prompts | Remove instructions to start daemon workflows; retain applicable inspection/cleanup guidance. |

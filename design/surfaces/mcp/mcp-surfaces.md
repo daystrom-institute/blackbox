@@ -23,8 +23,8 @@ answer "what tools should this MCP caller discover in the first place?"
 
 MCP surfaces make that discovery boundary first class. A surface is a caller
 selected view of the daemon's MCP tool catalog. The view is selected by URL
-context and evaluated by the same packet-style routing machinery used by
-webhooks, pollers, crons, workflow gates, and hook gates.
+context and defined by a named `[surfaces.<name>]` table in daemon
+configuration.
 
 ## Goal
 
@@ -48,51 +48,30 @@ blackbox-readonly -> http://127.0.0.1:7264/mcp?surface=readonly
 blackbox-ops      -> http://127.0.0.1:7264/mcp?surface=ops
 ```
 
-The URL selector is only input. A packet decides what that selector means.
+The URL selector is only input. The configured surface table decides what that
+selector means.
 
 ## Non-Goals
 
 - Do not replace existing `McpFilters`. Surfaces compile down to filters.
-- Do not add another bespoke allow/disallow registry if packets can express the
-  routing decision.
 - Do not treat `list_tools` filtering as sufficient enforcement. `call_tool`
   must reject calls outside the selected surface.
 - Do not make data/project scope implicit in the tool surface. Tool visibility
   and data scoping are related but separate boundaries.
 
-## Existing Pattern To Reuse
+## Resolution Pipeline
 
-The current event inlet pipeline is:
-
-```text
-raw inlet payload
-  -> Extractor
-  -> rule packet
-  -> resolve_entity_template
-  -> typed verdict
-  -> terminal action
-```
-
-Implemented examples:
-
-- webhooks: signed POST -> extractor -> routing packet -> `RoutingVerdict`
-- pollers: HTTP fetch -> extractor -> routing packet -> `RoutingVerdict`
-- crons: schedule tick -> payload entity -> routing packet -> `RoutingVerdict`
-- workflows: node output / flattened context -> gate or policy packet
-- hooks: flattened context -> `when` packet -> run or skip hook
-
-MCP surfaces should follow the same shape:
+Every surface rule matches only the surface name and yields an allow list and a
+disallow list, so a surface is a lookup table rather than a rule program:
 
 ```text
-MCP session/request context
-  -> surface entity
-  -> surface routing packet
-  -> ToolSurfaceVerdict
-  -> McpFilters + call enforcement
+?surface=<name> on initialize
+  -> surfaces[name] from daemon configuration
+  -> visible tool set over the served catalog
+  -> list_tools / call_tool / get_tool enforcement
 ```
 
-This keeps routing rules auditable, replayable, composable, and versioned
-through the existing packet store.
+A name missing from the table is refused at `initialize`.
 
 ## URL Contract
 
@@ -122,163 +101,77 @@ surface = "default"
 ```
 
 That is not "unscoped all tools" as a semantic concept. It is just the default
-surface input. The installed surface packet, or the built-in migration fallback,
-decides what `default` means.
+surface input. The `default` entry in the configured surface table decides what
+`default` means.
 
-## Surface Entity
+Surface selection is independent of `?project`. The project parameter sets the
+session's project context for data scoping; it does not select or modify the
+tool surface.
 
-The packet receives a flat JSON entity. Initial shape:
+## Surface Configuration
 
-```json
-{
-  "surface": "readonly",
-  "path": "/mcp",
-  "mcp_name": "blackbox-readonly",
-  "client": "codex",
-  "provider": "codex",
-  "project": "/home/invidious/repos/transcript-search",
-  "query_surface": "readonly"
-}
+Surfaces are daemon configuration. Built-in surfaces ship in
+`crates/bbox-config/src/default_surfaces.toml`. A `[surfaces.<name>]` table in
+the daemon config file overrides the built-in surface of the same name or adds
+a new one:
+
+```toml
+[surfaces.default]
+disallow = ["bbox_project_*", "bbox_storage_*"]
+
+[surfaces.reviewer]
+allow = ["bbox_hybrid_search", "bbox_inspect_entity", "bbox_knowledge"]
 ```
 
-Fields should be best-effort. The required field is `surface`.
+Each table has two keys, both optional lists of glob patterns over tool names:
 
-Likely sources:
+- `allow`: when non-empty, only matching tools are visible.
+- `disallow`: matching tools are hidden, even when `allow` also matches.
 
-- `surface`: `?surface`, defaulting to `default`
-- `path`: request URI path
-- `query_*`: selected query params promoted to flat fields
-- `mcp_name`: if known from registration or alias config
-- `client` / `provider`: if known from headers, registration metadata, or alias
-- `project`: optional project root if the alias is project-bound
+A table with neither key shows the whole served catalog. Config validation
+rejects empty surface names, names with surrounding whitespace, empty
+patterns, and unknown keys. The surface table loads with daemon configuration,
+so a surface change applies on daemon restart.
 
-Avoid passing arbitrary headers wholesale into the packet entity. Follow the
-webhook precedent: preserve only fields that carry routing signal and are safe
-to expose in replay/debug output.
+Built-in surfaces (the tool lists are in `default_surfaces.toml`):
 
-## Surface Packet
+| Surface | Caller | Shape |
+| --- | --- | --- |
+| `default` | External clients and ordinary dispatches | Disallow list: maintenance, admin, provenance and artifact-install tools, and `bro_broadcast` |
+| `interactive` | Fleet cockpit sessions | Disallow list: `bro_allocator_*`, `bro_agent_*` |
+| `agent-internal` | Workflow-owned dispatches | Disallow list: dispatch lifecycle tools (`bro_exec`, `bro_resume`, `bro_cancel`, `bro_prune`) plus the `default` maintenance and admin set |
+| `readonly` | Reviewers, evaluators and observers | Allowlist of read-only retrieval and status tools |
+| `ops` | Operators | Empty table: the full catalog |
 
-Use normal packet storage. Suggested domain:
+Tools hidden from agent-facing surfaces stay reachable through `ops`; operators
+run them with `bro mcp call <tool> '<json>' --surface ops`.
 
-```text
-mcp-surface/routing
-```
+Surfaces do not automatically merge the dispatch recursion guard. The surface
+table owns direct MCP visibility. If `default` should hide `bro_*` or
+`bbox_refactor_*`, its table says so explicitly. Dispatch-time recursion
+protection for spawned bros remains in `resolve_dispatch_filters`.
 
-Suggested packet id reference:
+Matching reuses `normalize_filter_pattern` and `glob_match` from the dispatch
+filter code.
 
-```text
-domain:mcp-surface/routing
-```
+## Refusal
 
-Surface packet resolution should mirror existing global/project overlay
-semantics. A project-scoped surface packet overrides or supersedes the global
-packet for requests bound to that project; otherwise the global packet applies.
-Do not invent a second precedence model for surfaces.
-
-Suggested lattice:
-
-```json
-["tool_surface", "deny"]
-```
-
-Example:
-
-```json
-{
-  "domain": "mcp-surface/routing",
-  "version": 1,
-  "scope": "global",
-  "classification_lattice": ["tool_surface", "deny"],
-  "prefix_inference": {},
-  "rules": [
-    {
-      "id": "readonly_surface",
-      "classification": "tool_surface",
-      "antecedent": { "op": "Eq", "field": "surface", "value": "readonly" },
-      "consequent": "{\"route\":\"tool_surface\",\"allow\":[\"mcp__blackbox__bbox_search\",\"mcp__blackbox__bbox_context\",\"mcp__blackbox__bbox_messages\",\"mcp__blackbox__bbox_session\",\"mcp__blackbox__bbox_sessions_list\",\"mcp__blackbox__bbox_stats\"],\"disallow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_forget\"]}"
-    },
-    {
-      "id": "ops_surface",
-      "classification": "tool_surface",
-      "antecedent": { "op": "Eq", "field": "surface", "value": "ops" },
-      "consequent": "{\"route\":\"tool_surface\",\"allow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_*\"],\"disallow\":[\"mcp__blackbox__bbox_refactor_apply\"]}"
-    },
-    {
-      "id": "default_surface",
-      "classification": "tool_surface",
-      "antecedent": { "op": "Eq", "field": "surface", "value": "default" },
-      "consequent": "{\"route\":\"tool_surface\",\"disallow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_refactor_*\"]}"
-    },
-    {
-      "id": "deny_unknown_surface",
-      "classification": "deny",
-      "antecedent": { "op": "True" },
-      "consequent": "{\"route\":\"deny\",\"reason\":\"unknown MCP surface\"}"
-    }
-  ]
-}
-```
-
-This is intentionally the same style as `webhook-routing/forgejo` and
-`webhook-routing/slack`: packet classification chooses a typed terminal action.
-
-Surface verdicts do not automatically merge the dispatch recursion guard. The
-packet owns direct MCP visibility. If `default` should hide `bro_*` or
-`bbox_refactor_*`, the default rule should say so explicitly. Dispatch-time
-recursion protection for spawned bros remains in `resolve_dispatch_filters`.
-
-## ToolSurfaceVerdict
-
-Add a small typed verdict family instead of overloading `RoutingVerdict`, because
-the terminal action is not arc dispatch.
-
-```rust
-#[serde(tag = "route", rename_all = "snake_case")]
-enum ToolSurfaceVerdict {
-    ToolSurface {
-        #[serde(default)]
-        allow: Vec<String>,
-        #[serde(default)]
-        disallow: Vec<String>,
-        #[serde(default)]
-        instructions: Option<String>,
-    },
-    Deny {
-        #[serde(default)]
-        reason: Option<String>,
-    },
-}
-```
-
-Evaluation should reuse:
-
-- `packets::apply_packet_with`
-- `routing::resolve_entity_template`
-- the same parse-and-fail-closed posture as routing packets
-- `McpFilters::merge_from`
-- `normalize_filter_pattern`
-- `expand_pattern`
-
-Do not encode `deny` as empty `McpFilters`. Empty filters currently mean
-"unrestricted by filters." Denial is a separate verdict. The target behavior is
-to fail MCP initialization with an error such as `tool surface denied: <reason>`;
-returning an empty `list_tools` response is not enough because clients treat an
-empty tool catalog as a valid but tool-less server.
-
-Unparseable surface verdicts also fail closed: treat them as
-`Deny { reason: "verdict parse error" }` and fail MCP initialization rather
-than falling through to empty filters.
+Do not encode an unknown surface as empty `McpFilters`. Empty filters mean
+"unrestricted by filters." A surface name missing from the configured table
+fails MCP initialization with `tool surface denied: unknown MCP surface:
+<name>`; returning an empty `list_tools` response is not enough because
+clients treat an empty tool catalog as a valid but tool-less server.
 
 ## Enforcement Semantics
 
 For a selected surface:
 
-1. Evaluate the surface packet to a `ToolSurfaceVerdict`.
-2. Merge the verdict filters with baseline daemon filters.
+1. Look up the surface in the configured table at `initialize`.
+2. Compute the visible tool set from its `allow`/`disallow` patterns over the
+   served catalog, and store it on the session.
 3. Filter `list_tools` output.
 4. Reject `call_tool` for hidden tools, even if the client names them directly.
-5. If `rmcp` exposes a per-tool fetch method in the final seam, reject hidden
-   tools there too.
+5. Return nothing from `get_tool` for hidden tools.
 
 Disallow wins over allow, matching `McpFilters`.
 
@@ -292,14 +185,14 @@ before matching. Glob expansion uses the combined `BlackboxServer` tool-router
 universe, not one router half. This keeps canonical, dotted, and Copilot-style
 MCP patterns equivalent to the existing dispatch-time filter behavior.
 
-The surface selector is fixed for the MCP session, but the verdict should be
-re-evaluated for each `list_tools` / `call_tool` against the current packet
-store. That keeps packet edits hot for live sessions without allowing the URL
-selector itself to drift mid-session.
+The visible tool set is computed once at `initialize` and held in a per-session
+`OnceLock`; `list_tools`, `call_tool` and `get_tool` read it without further
+evaluation. Both the selector and the surface table are fixed for the life of
+the session.
 
-Unknown non-default surfaces should fail closed through the packet's catchall
-`deny` rule. During migration, if no surface packet is installed, `/mcp` should
-preserve today's behavior through a built-in `default` fallback.
+Unknown surfaces fail closed at `initialize`. Configuration can override but
+not remove a built-in surface, so a session without a selector always resolves
+to `default`.
 
 ## Implementation Seam
 
@@ -352,29 +245,11 @@ Query param support is preferred because it keeps the URL as routing data. The
 path-per-surface fallback is acceptable for v1 if `rmcp` makes query capture
 too invasive.
 
-## Debugging And Replay
+## Inspection
 
-Mirror webhook tooling eventually:
-
-- `bro_mcp_surface(action="replay", surface="readonly", ...)`
-- `bro_mcp_surface(action="list")`
-- `bro_mcp_surface(action="describe", surface="readonly")`
-
-Replay should return:
-
-```json
-{
-  "entity": { "surface": "readonly" },
-  "verdict_classification": "tool_surface",
-  "verdict_consequent": { "route": "tool_surface", "allow": [], "disallow": [] },
-  "visible_tools": ["bbox_search", "bbox_context"]
-}
-```
-
-This mirrors the unified `dispatch_routed_event` debugging shape more than
-webhooks specifically: entity, packet verdict, typed terminal action, resulting
-effect. Packet authors need to iterate on rules without restarting providers or
-guessing from logs.
+A surface's definition is its configuration table; there is no runtime surface
+tool. Its effect is observable directly: `tools/list` on a session opened with
+`?surface=<name>` returns exactly the visible set.
 
 ## Provider Registration
 
@@ -398,49 +273,48 @@ Later sugar:
 }
 ```
 
-The sugar should only synthesize a URL. The packet still owns behavior.
+The sugar should only synthesize a URL. The surface table still owns behavior.
 
-Dispatch-time filters still matter. When a bro is spawned with a named surface,
-the same evaluated `ToolSurfaceVerdict` can be merged into `resolve_dispatch_filters`
-so provider-level enforcement and daemon-level visibility agree.
+Dispatch-time filters still matter. When a bro is spawned with a named surface
+(a brofile `surface` selector or a dispatch path's surface),
+`dispatch_surface_filters(&config.surfaces, surface)` folds the configured
+surface into the child's tool filters so provider-level enforcement and
+daemon-level visibility read the same table. An unknown surface maps to a
+deny-all filter, matching the wire head's refusal. Disallow-wins composition
+with brofile, project, global, and dispatch filters is preserved.
 
-## Migration Plan
+## Implementation Steps
 
-1. Add `ToolSurfaceVerdict` and a pure evaluator:
-   `evaluate_tool_surface(packet_store, entity) -> ToolSurfaceDecision`.
-2. Add filter helpers:
-   `tool_visible(tool_name, decision)` and `filter_tools(tools, decision)`.
+1. Add `SurfaceConfig { allow, disallow }` and the built-in table to
+   `bbox-config`; merge `[surfaces.<name>]` tables from the daemon config file
+   over it by name.
+2. Add `visible_tool_set(surface, universe)` over the served catalog.
 3. Prove the `rmcp` handler seam: hand-written `ServerHandler` or macro-compatible
-   overrides for `list_tools` and `call_tool`.
+   overrides for `list_tools`, `call_tool` and `get_tool`.
 4. Implement the proven seam around the combined `tool_router`.
-5. Wire URL/query context into the evaluator at MCP session initialization.
-6. Wire named surface evaluation into `resolve_dispatch_filters` so spawned bros
-   can merge the surface decision into the `extra` filter layer. Disallow-wins
-   composition with brofile, project, global, and dispatch filters is preserved.
-7. Add built-in fallback for `surface=default` that preserves current `/mcp`
-   behavior when no surface packet exists.
-8. Add a sample `examples/.../packets/mcp-surface-routing.json`.
-9. Add replay/describe tooling after the core enforcement path is stable.
-10. Extend `bro_mcp` alias ergonomics and self-registration once the URL contract
+5. Read `?surface` at MCP session initialization, refuse unknown names, and
+   store the visible set on the session.
+6. Fold named surfaces into dispatch filters through `dispatch_surface_filters`.
+7. Extend `bro_mcp` alias ergonomics and self-registration once the URL contract
    is proven.
 
 ## Tests
 
 Minimum tests:
 
-- default surface without installed packet preserves current tool count.
-- `readonly` packet with non-empty `allow` hides non-matching tools from
-  `list_tools`.
+- default surface preserves its configured tool count.
+- a surface with non-empty `allow` hides non-matching tools from `list_tools`.
 - direct `call_tool` for a hidden tool returns an MCP error.
 - disallow wins over allow.
-- unknown surface with catchall `deny` fails initialization.
-- replay returns entity, verdict, and visible tool names.
+- unknown surface fails initialization.
+- config tables override built-in surfaces by name and add new ones.
 - provider alias registration preserves query strings in generated MCP config.
-- dispatch-time merge of a surface decision produces expected provider args for
+- dispatch-time merge of a surface produces expected provider args for
   Claude, Codex, Copilot, and Gemini.
 - hidden tools are rejected through direct `call_tool`, not only hidden from
   discovery.
-- `deny` fails MCP initialization instead of returning an empty tool catalog.
+- an unknown surface fails MCP initialization instead of returning an empty
+  tool catalog.
 - canonical, dotted, and Copilot-style allow/disallow patterns normalize to the
   same visibility decision.
 - surface selection is fixed for a session after initialize.
@@ -449,7 +323,7 @@ Minimum tests:
 
 - ~~Confirm the exact `rmcp` seam for getting `?surface` into session state.~~
   **Resolved** — see Addendum below.
-- Should surface decisions include instructions, and if so where can RMCP expose
+- Should surfaces carry instructions, and if so where can RMCP expose
   per-surface instructions cleanly?
 - Should surface aliases be auto-registered by default, or only through explicit
   `bro_mcp` calls?
@@ -504,13 +378,10 @@ dynamic surface registration awkward.
 1. `?surface` is read-once at `initialize`; no mid-session surface changes.
 2. `BlackboxServer` gains a `surface: Arc<str>` field (or equivalent).
 3. `LocalSessionManager` is preserved; no custom session manager.
-4. Surface re-evaluation on each `list_tools`/`call_tool` (hot packet edits)
-   reads `self.surface` against the current packet store — the URL selector is
-   fixed but the packet result is live.
-5. The `deny` verdict fails `initialize` with an MCP protocol error, not an
-   empty tool list. This was the subject of note-90686e66; the doc's
-   Enforcement Semantics and ToolSurfaceVerdict sections already say
-   "fail MCP initialization" — the note was filed against an earlier draft.
+4. The visible tool set is computed once at `initialize` and stored beside
+   `self.surface`; `list_tools`, `call_tool` and `get_tool` read it.
+5. An unknown surface fails `initialize` with an MCP protocol error, not an
+   empty tool list.
 
 **Superseded open question:** The first Open Question above ("Confirm the
 exact `rmcp` seam") is resolved by this decision. The seam is axum middleware

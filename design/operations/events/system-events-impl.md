@@ -103,8 +103,8 @@ Read and record the code anchors:
   for webhooks, pollers, crons, and workflows.
 - `src/json_store.rs` - locked atomic JSON write helper.
 - `src/secrets.rs` - flat secret-name validation.
-- `src/server/surface.rs`, `src/tools/mcp_surface.rs`,
-  `system-defaults/mcp-surfaces/routing.json` - MCP surface model.
+- `src/server/surface.rs`, `crates/bbox-config/src/default_surfaces.toml` -
+  MCP surface model.
 - `AGENTS.md` / rendered project docs - check whether any build/run
   instructions are stale before relying on them. At the time this plan was
   written, the local crate already had a `[lib]` target even though older
@@ -1102,7 +1102,7 @@ principals without hand-written provisioning hooks in every workflow.
 Update:
 
 - `src/tool_docs.rs`
-- `system-defaults/mcp-surfaces/routing.json`
+- `crates/bbox-config/src/default_surfaces.toml`
 - `docs/system-events.md`
 - `docs/operating-blackbox.md` cross-link to the system-events runbook
 

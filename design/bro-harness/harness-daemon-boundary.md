@@ -357,38 +357,40 @@ handle → tiny preview → model`. Out of context **and** off the wire.
 
 ### The MCP surface becomes an in-process filter evaluation
 
-The admission policy is **not** a hand-rolled `ToolFilter` — it is the shipped
-**surface packet evaluator**, whose pure core is already transport-agnostic
+The admission policy is **not** a hand-rolled `ToolFilter`: it is the shipped
+**configured surface table**, whose pure core is already transport-agnostic
 (`src/server/surface.rs`):
 
-- `build_surface_entity(surface, project)` (`:133`)
-- `evaluate_tool_surface(packets, entity, project) -> ToolSurfaceVerdict` (`:145`)
-- `tool_visible(name, decision, universe)` (`:203`), `filter_tools(...)` (`:210`)
+- `config.surfaces`: built-in `default_surfaces.toml` merged with
+  `[surfaces.<name>]` tables from daemon configuration
+- `visible_tool_set(surface, universe) -> HashSet<String>`
+- `dispatch_surface_filters(&config.surfaces, surface) -> Option<McpFilters>`
 
-The rmcp wire head (`src/server/handler.rs` `list_tools`/`call_tool`) and the
-dispatch-filter merge (`resolve_dispatch_filters`) are two existing consumers.
-**The in-process binding is a third consumer of the same pure core**, differing
-only at the edges:
+The rmcp wire head (`src/server/handler.rs` `list_tools`/`call_tool`/`get_tool`)
+and the dispatch-filter merge (`resolve_dispatch_filters`) are two existing
+consumers. **The in-process binding is a third consumer of the same table**,
+differing only at the edges:
 
-1. **Entity from dispatch identity, not URL.** Instead of
-   `extract_surface_from_uri(query)` (`surface.rs:228`), build the surface entity
-   from brofile, `dispatch_origin`, project, recursion-guard state. The agent's
-   selector is *who it is*, not `?surface=`.
-2. **Enforce by what gets bound + a call-time check.** `filter_tools` decides
+1. **Surface from dispatch identity, not URL.** Instead of
+   `extract_surface_from_uri(query)`, take the surface name from the brofile
+   `surface` selector or the dispatch origin. The agent's selector is *who it
+   is*, not `?surface=`.
+2. **Enforce by what gets bound + a call-time check.** The visible set decides
    which `Tool`s land in the bound tool object (Codex's
    `build_tools_object`/`enabled_tools`, `codex-rs/code-mode/src/runtime/globals.rs:46`);
-   `tool_visible` is the in-process `Tool::call` boundary — honoring the surface
+   set membership is the in-process `Tool::call` boundary, honoring the surface
    doc's rule that `list_tools` filtering alone is insufficient and the call path
-   must reject hidden tools by name. `Deny` → refuse to build the session.
+   must reject hidden tools by name. Unknown surface → refuse to build the
+   session.
 
-Payoffs: one **packet** is the single policy authority for wire callers *and*
-in-process agents (auditable/replayable via `bbox_mcp_surface action=replay`,
-versioned, hot-editable); because both heads call `evaluate_tool_surface`, **drift
-is structurally impossible** — `replay` output is exactly what the agent sees.
+Payoffs: one **surface table** is the single policy authority for wire callers
+*and* in-process agents; because every head reads the same `config.surfaces`,
+**drift is structurally impossible**: `tools/list` on a session opened with
+`?surface=<name>` is exactly what an in-process agent on that surface sees.
 And the in-process head is the *cleanest* consumer: it skips the
 `Provider::build_filter_args` per-provider CLI-flag translation entirely
 (subprocess machinery), filtering the Rust registry directly. The two filter
-layers (surface packet + dispatch recursion guard) still compose with
+layers (configured surface + dispatch recursion guard) still compose with
 disallow-wins, just at the binding instead of at `McpFilters`.
 
 ## 7. The singleton fleet system
@@ -598,7 +600,8 @@ The direction above is argued; these forks are not settled:
   session-local helpers, decay-managed reusable functions, capability scout, and
   prepare-before-run script refs.
 - **Extends** [`../surfaces/mcp/mcp-surfaces.md`](../surfaces/mcp/mcp-surfaces.md)
-  with the in-process binding as a third consumer of `evaluate_tool_surface`.
+  with the in-process binding as a third consumer of the configured surface
+  table.
 - **Spins out** [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) —
   OS-level *scope* sandboxing of shell child processes; a threat-model-change
   escape hatch (untrusted / unattended agents), **not** v1. V8 runs in-process; the
@@ -719,13 +722,13 @@ before relying on any line here.
   comment; the non-poisoning-lock half was already satisfied by `parking_lot`.
   (In-process V8 and supervised-shell isolation themselves are NOT built — no V8
   yet; that part of §5 remains target-state.)
-- **§6 surface governance.** The dispatch path is now a third consumer of
-  `evaluate_tool_surface`: brofiles carry a `surface` selector, and
-  `surface::dispatch_surface_filters` folds the verdict into the dispatch filter
+- **§6 surface governance.** The dispatch path is a third consumer of the
+  configured surface table: brofiles carry a `surface` selector, and
+  `surface::dispatch_surface_filters` folds the surface into the dispatch filter
   plane (disallow-wins) for atom + exec + resume + broadcast dispatch. This
   reverses the former "surface is MCP-endpoint-only" orthogonality for the
-  in-process case (the old note in `progress.rs` is updated). No surface packet
-  installed → passthrough → no-op.
+  in-process case (the old note in `progress.rs` is updated). An unrestricted
+  surface is a no-op; an unknown surface denies every tool.
 - **§3 identity env.** Per-session identity (auth token, base URL, account home,
   transport kind, model) flows via a tokio task-local (`transport::with_session_env`
   / `session_var`), NOT process-global env. Transports resolve identity through
