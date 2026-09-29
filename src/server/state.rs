@@ -383,6 +383,43 @@ pub(crate) fn read_git_overlays_for_view(
     }
 }
 
+/// Narrow an edge rebuild's manifest to the Git overlays the read view
+/// admits. The edge loader admits a snapshot's `git-current` member through
+/// the raw selector, so a producer overlay the cutover hides (a non-current
+/// covered row, including one staging re-cutover evidence) is unset here
+/// exactly as `read_git_overlays_for_view` drops it. Bridge authority leaves
+/// the manifest unchanged.
+pub(crate) fn hide_cutover_gated_git_overlays(
+    manifest: &mut bbox_edge_sidecar::manifest::ManifestIndex,
+    authority: &ProjectAuthority,
+    cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
+    code_sources: &super::code_source::CodeSourceRuntime,
+) {
+    let Some(store) = authority.catalog_store() else {
+        return;
+    };
+    let catalog = store.snapshot();
+    let assignments = code_sources.producer_auth().repo_assignment_producers();
+    for (project_id, entry) in &mut manifest.workspaces {
+        let Some(overlay) = entry.git_overlay.as_ref() else {
+            continue;
+        };
+        let visible = match &catalog {
+            Ok(catalog) => git_overlay_visible_under_cutover(
+                catalog.catalog(),
+                &assignments,
+                cutover,
+                project_id,
+                overlay,
+            ),
+            Err(_) => overlay.source.producer_transport().is_none(),
+        };
+        if !visible {
+            entry.git_overlay = None;
+        }
+    }
+}
+
 fn git_overlay_visible_under_cutover(
     catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
     assignments: &BTreeMap<bbox_corpus_core::identity::PublishedScope, String>,
@@ -3126,6 +3163,21 @@ pub(crate) mod catalog_fixture {
         ) -> BlackboxServer {
             let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
             state.records_provider = wrap(state.records_provider.clone());
+            BlackboxServer::new(Arc::new(state))
+        }
+
+        /// The same server with `marker` as the current Git transport
+        /// cutover marker.
+        pub(crate) fn server_with_git_transport_cutover(
+            &self,
+            marker: bbox_indexing::git_transport_cutover::GitTransportCutoverMarkerV1,
+        ) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            state.git_transport_cutover = Arc::new(
+                bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::from_marker(
+                    Some(marker),
+                ),
+            );
             BlackboxServer::new(Arc::new(state))
         }
 

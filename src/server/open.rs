@@ -898,6 +898,9 @@ pub(super) fn open_shared_state(
         &task_store,
         &records_provider.records_snapshot(),
         &pending_first_republish,
+        &project_authority,
+        &git_transport_cutover,
+        &code_sources,
     )?;
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
@@ -1177,6 +1180,7 @@ fn spawn_reindex_thread(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_startup_edge_index(
     cfg: &config::Config,
     idx: &TranscriptIndex,
@@ -1185,22 +1189,38 @@ fn build_startup_edge_index(
     task_store: &TaskStore,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
     pending_first_republish: &BTreeSet<String>,
+    project_authority: &super::state::ProjectAuthority,
+    git_transport_cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
+    code_sources: &super::code_source::CodeSourceRuntime,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
     if cfg.index.edge_index_boot_rebuild {
-        edge_index::EdgeIndex::rebuild_admitting_fully_absent(
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &idx.reindex_config().projects_path,
+        );
+        // The startup edge set admits exactly the Git overlays the startup
+        // read view does.
+        let mut authority = edge_index::SidecarManifestAuthority::capture(&edges_dir)?;
+        if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut authority {
+            super::state::hide_cutover_gated_git_overlays(
+                index,
+                project_authority,
+                git_transport_cutover,
+                code_sources,
+            );
+        }
+        edge_index::EdgeIndex::rebuild_from_authority_admitting_fully_absent(
             &edge_index::EdgeStoreRefs {
                 index: idx,
                 threads: th,
                 notes: notes_store,
                 session_brofile_rows: task_store.session_brofile_rows(),
-                edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-                    &idx.reindex_config().projects_path,
-                ),
+                edges_dir,
                 registered_project_ids: Some(records.registered_project_ids()),
                 include_tantivy_projection: false,
                 include_observed: true,
             },
             pending_first_republish,
+            &authority,
         )
     } else {
         tracing::info!(

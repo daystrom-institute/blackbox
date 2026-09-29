@@ -136,6 +136,16 @@ impl GitTransportRuntimeCoverageV1 {
         matches!(self, Self::Current)
     }
 
+    /// True only for a stale covered row whose repository is currently
+    /// Granted to one producer. Such a repository may commit a history
+    /// activation and keep its producer overlays durable as staged evidence
+    /// for the re-cutover that replaces the row; the row still governs, so
+    /// reads keep hiding those overlays and checkout fallback stays closed.
+    pub fn stages_recutover_evidence(self, grant_state: Option<&RepoTransportGrantState>) -> bool {
+        matches!(self, Self::CoverageStalePendingRecutover)
+            && matches!(grant_state, Some(RepoTransportGrantState::Granted { .. }))
+    }
+
     pub fn observation_category(self) -> Option<GitTransportObservationCategoryV1> {
         match self {
             Self::Uncovered => None,
@@ -1006,6 +1016,22 @@ impl GitTransportCutoverRuntimeV1 {
                 .binary_search_by(|row| row.repo_history_id.cmp(repo_history_id))
                 .is_ok()
         })
+    }
+
+    /// Whether `repo_history_id` may stage re-cutover evidence; see
+    /// [`GitTransportRuntimeCoverageV1::stages_recutover_evidence`].
+    pub fn stages_recutover_evidence(
+        &self,
+        catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+        assignments: &BTreeMap<PublishedScope, String>,
+        repo_history_id: &RepoHistoryId,
+    ) -> bool {
+        self.classify_repo(catalog, assignments, repo_history_id)
+            .stages_recutover_evidence(
+                derive_repo_transport_grants(catalog, assignments)
+                    .grants
+                    .get(repo_history_id),
+            )
     }
 
     pub fn classify_repo(
@@ -4460,6 +4486,23 @@ mod tests {
             fixture.apply().unwrap_err().code,
             "error.git_transport_cutover_apply_refused"
         );
+
+        // Absent: the store exists and another repository is proven, but the
+        // covered one has no committed journal or overlay.
+        let proven = FixtureRepo::new(REPO_B, PROJECT_B, "neutral-beta");
+        let fixture = CeremonyFixture::new(&[&covered, &proven]);
+        fixture.provision_evidence(&proven, HEAD_ONE);
+        fixture.install_predecessor(vec![fixture.stale_row(&covered)]);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Refused);
+        assert_eq!(
+            (
+                receipt.proposed_repo_count,
+                receipt.refused_repo_count,
+                receipt.deferred_repo_count
+            ),
+            (1, 1, 0)
+        );
     }
 
     #[test]
@@ -4711,5 +4754,121 @@ mod tests {
         );
         fixture.apply().unwrap();
         assert_eq!(marker_repo_ids(&fixture.installed_marker()), [REPO_A]);
+    }
+
+    #[test]
+    fn only_a_stale_granted_row_stages_recutover_evidence() {
+        let (catalog, repo_history_id, scope, row) = coverage_fixture();
+        let granted = derive_repo_transport_grants(
+            &catalog,
+            &BTreeMap::from([(scope.clone(), "producer-a".to_string())]),
+        );
+        let blocked = derive_repo_transport_grants(&catalog, &BTreeMap::new());
+        let granted_state = granted.grants.get(&repo_history_id);
+        let blocked_state = blocked.grants.get(&repo_history_id);
+        assert!(matches!(
+            granted_state,
+            Some(RepoTransportGrantState::Granted { .. })
+        ));
+        for coverage in [
+            GitTransportRuntimeCoverageV1::Uncovered,
+            GitTransportRuntimeCoverageV1::Current,
+            GitTransportRuntimeCoverageV1::CoveredProducerRemoved,
+            GitTransportRuntimeCoverageV1::CoveredBlockedPendingRecutover,
+            GitTransportRuntimeCoverageV1::CoverageStalePendingRecutover,
+        ] {
+            assert_eq!(
+                coverage.stages_recutover_evidence(granted_state),
+                coverage == GitTransportRuntimeCoverageV1::CoverageStalePendingRecutover
+            );
+            assert!(!coverage.stages_recutover_evidence(blocked_state));
+            assert!(!coverage.stages_recutover_evidence(None));
+        }
+
+        let mut stale = row;
+        stale.grant_commitment = "0".repeat(64);
+        let runtime = GitTransportCutoverRuntimeV1::from_marker(Some(marker_with_row(stale)));
+        let assigned = BTreeMap::from([(scope.clone(), "producer-a".to_string())]);
+        let reassigned = BTreeMap::from([(scope, "producer-b".to_string())]);
+        assert!(runtime.stages_recutover_evidence(&catalog, &assigned, &repo_history_id));
+        assert!(runtime.stages_recutover_evidence(&catalog, &reassigned, &repo_history_id));
+        assert!(
+            !runtime.stages_recutover_evidence(&catalog, &BTreeMap::new(), &repo_history_id),
+            "a covered repository with no producer is not granted"
+        );
+    }
+
+    #[test]
+    fn recutover_replaces_a_stale_row_whose_staged_evidence_is_current() {
+        let staged = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let untouched = FixtureRepo::new(REPO_B, PROJECT_B, "neutral-beta");
+        let fixture = CeremonyFixture::new(&[&staged, &untouched]);
+        // The untouched repository is covered and current; the staged one
+        // is covered by a row its grant has moved past.
+        fixture.provision_evidence(&untouched, HEAD_ONE);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.proposed_repo_count, 1);
+        fixture.apply().unwrap();
+        let current_row = fixture.installed_marker().rows[0].clone();
+        assert_eq!(current_row.repo_history_id, untouched.repo_history_id);
+        let predecessor =
+            fixture.install_predecessor(vec![fixture.stale_row(&staged), current_row.clone()]);
+        let catalog = fixture.catalog_store().snapshot().unwrap();
+        let assignments = configured_assignments(&fixture.config).unwrap();
+        let runtime = GitTransportCutoverRuntimeV1::from_marker(Some(predecessor.clone()));
+        assert_eq!(
+            runtime.classify_repo(catalog.catalog(), &assignments, &staged.repo_history_id),
+            GitTransportRuntimeCoverageV1::CoverageStalePendingRecutover
+        );
+        assert!(runtime.stages_recutover_evidence(
+            catalog.catalog(),
+            &assignments,
+            &staged.repo_history_id
+        ));
+
+        // The staged activation's committed journal and overlay are exactly
+        // the evidence an ordinary preflight needs.
+        fixture.provision_evidence(&staged, HEAD_ONE);
+        let receipt = fixture.repreflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Clean);
+        assert_eq!(
+            (
+                receipt.proposed_repo_count,
+                receipt.refused_repo_count,
+                receipt.dropped_row_count
+            ),
+            (1, 0, 0)
+        );
+        let report = fixture.report();
+        assert_eq!(
+            repo_status(&report, &staged),
+            GitTransportCutoverCoverageStatusV1::Proposed
+        );
+        assert_eq!(
+            repo_status(&report, &untouched),
+            GitTransportCutoverCoverageStatusV1::CarriedForwardCurrent
+        );
+        assert_eq!(report.carried_forward_rows, vec![current_row.clone()]);
+
+        let applied = fixture.apply().unwrap();
+        assert_eq!(applied.covered_repo_count, 2);
+        assert_eq!(applied.current_repo_count, 2);
+        let marker = fixture.installed_marker();
+        assert_eq!(
+            marker.predecessor_marker_checksum,
+            Some(predecessor.checksum_sha256)
+        );
+        let replaced = marker
+            .rows
+            .iter()
+            .find(|row| row.repo_history_id == staged.repo_history_id)
+            .unwrap();
+        assert_eq!(replaced.grant_commitment, fixture.grant(&staged).commitment);
+        assert!(
+            marker.rows.contains(&current_row),
+            "the untouched row is carried byte for byte"
+        );
+        let verified = fixture.verify();
+        assert_eq!(verified.current_repo_count, 2);
     }
 }

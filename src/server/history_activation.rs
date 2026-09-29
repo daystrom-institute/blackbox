@@ -108,7 +108,12 @@ pub(crate) fn recover_prebind(
     let fields = index.field_handles();
     for repo_history_id in repos {
         let coverage = cutover.classify_repo(catalog.catalog(), &assignments, &repo_history_id);
-        if coverage.transport_governed() && !coverage.current() {
+        // A stale row whose repository is Granted keeps its staged overlays
+        // when they still prove current; reads hide them either way.
+        if coverage.transport_governed()
+            && !coverage.current()
+            && !cutover.stages_recutover_evidence(catalog.catalog(), &assignments, &repo_history_id)
+        {
             tracing::warn!(
                 repo_history = %repo_history_id,
                 ?coverage,
@@ -279,7 +284,7 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
                     &existing.repo_history_id,
                     &existing.source_generation_id,
                 )?;
-                clear_transport_health(state, &grant);
+                clear_transport_health(state, &grant, false);
                 super::code_source::republish_code_read_view(state)?;
             }
             return Ok(());
@@ -628,14 +633,26 @@ fn finish_activation(
                 .code_sources
                 .producer_auth()
                 .repo_assignment_producers();
-            state.git_transport_cutover.classify_repo(
+            let coverage = state.git_transport_cutover.classify_repo(
                 catalog.catalog(),
                 &assignments,
                 &journal.repo_history_id,
-            )
+            );
+            let staged = coverage.transport_governed()
+                && !coverage.current()
+                && state.git_transport_cutover.stages_recutover_evidence(
+                    catalog.catalog(),
+                    &assignments,
+                    &journal.repo_history_id,
+                );
+            (coverage, staged)
         });
-    match coverage {
-        Ok(coverage) if coverage.transport_governed() && !coverage.current() => {
+    // A stale row whose repository is Granted commits the activation as
+    // staged evidence for the re-cutover that replaces the row: the journal
+    // and overlays become durable while the row keeps reads hiding them.
+    // Every other non-current covered state still needs a newer cutover.
+    let staged = match coverage {
+        Ok((coverage, false)) if coverage.transport_governed() && !coverage.current() => {
             return supersede(
                 source_store,
                 journal,
@@ -644,9 +661,9 @@ fn finish_activation(
                 ),
             );
         }
-        Ok(_) => {}
+        Ok((_, staged)) => staged,
         Err(error) => return supersede(source_store, journal, error),
-    }
+    };
     let mut swaps = journal
         .overlays
         .iter()
@@ -687,7 +704,7 @@ fn finish_activation(
         GitHistorySourceStateV1::Active,
         None,
     )?;
-    clear_transport_health(state, grant);
+    clear_transport_health(state, grant, staged);
     source_store.supersede_other_active_history_sources(
         &journal.repo_history_id,
         &journal.source_generation_id,
@@ -698,6 +715,7 @@ fn finish_activation(
         source_generation = %journal.source_generation_id,
         p3_generation = %journal.planned_p3_generation_id,
         overlays = journal.overlays.len(),
+        staged_for_recutover = staged,
         "typed Git-history activation committed"
     );
     Ok(())
@@ -736,15 +754,27 @@ fn record_activation_failure(
     }
 }
 
-fn clear_transport_health(state: &SharedState, grant: &super::producer_auth::RepoTransportGrant) {
-    for member in &grant.members {
-        for code in [
+/// Clear the members' history health failures a committed activation
+/// resolves. A staged activation resolves only the activation failure: its
+/// overlays stay hidden, so history remains unavailable to reads.
+fn clear_transport_health(
+    state: &SharedState,
+    grant: &super::producer_auth::RepoTransportGrant,
+    staged: bool,
+) {
+    let codes: &[&str] = if staged {
+        &[bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE]
+    } else {
+        &[
             bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
             bbox_indexing::index::history_health::HISTORY_REFRESH_FAILED_CODE,
             bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
             bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
             "git_history_unavailable",
-        ] {
+        ]
+    };
+    for member in &grant.members {
+        for code in codes {
             let _ = state
                 .code_sources
                 .store()
@@ -774,12 +804,26 @@ pub(crate) fn reconcile_transport_currency(
     else {
         return Ok(false);
     };
+    // A staged repository keeps overlays that still prove current, but
+    // never reports them as serving: its row keeps reads hiding them.
+    let mut staged = false;
     if let Some(coverage) = state.git_transport_coverage_for_project(project_id)?
         && coverage.transport_governed()
         && !coverage.current()
     {
-        clear_transport_overlays_for_repo(state, repo_history_id)?;
-        return Ok(false);
+        let assignments = state
+            .code_sources
+            .producer_auth()
+            .repo_assignment_producers();
+        if !state.git_transport_cutover.stages_recutover_evidence(
+            pinned.catalog(),
+            &assignments,
+            repo_history_id,
+        ) {
+            clear_transport_overlays_for_repo(state, repo_history_id)?;
+            return Ok(false);
+        }
+        staged = true;
     }
     let source_store = state.git_sources.store();
     let Some(journal) = source_store.read_activation_journal(repo_history_id)? else {
@@ -788,14 +832,15 @@ pub(crate) fn reconcile_transport_currency(
     let auth = state.code_sources.producer_auth();
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir(state))?;
     if activation_metadata_current(&pinned, &auth, &manifest, &journal) {
-        return Ok(journal.overlays.iter().any(|overlay| {
-            overlay.project_id == project_id
-                && manifest
-                    .workspaces
-                    .get(project_id)
-                    .and_then(|entry| entry.git_overlay.as_ref())
-                    == Some(&overlay.selector)
-        }));
+        return Ok(!staged
+            && journal.overlays.iter().any(|overlay| {
+                overlay.project_id == project_id
+                    && manifest
+                        .workspaces
+                        .get(project_id)
+                        .and_then(|entry| entry.git_overlay.as_ref())
+                        == Some(&overlay.selector)
+            }));
     }
     clear_transport_overlays_for_repo(state, repo_history_id)?;
     Ok(false)
@@ -1956,5 +2001,206 @@ mod tests {
                 }),
             "a retained older source must not reactivate after current-ready advanced"
         );
+    }
+
+    #[test]
+    fn stale_granted_covered_repo_stages_hidden_evidence_for_recutover() {
+        use bbox_indexing::git_transport_cutover::{
+            GitTransportCutoverMarkerV1, GitTransportRuntimeCoverageV1,
+            PredictedGitTransportCutoverRowV1,
+        };
+        use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
+
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_staged_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000005").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The predecessor row was cut over under a grant the catalog has
+        // since moved past, so it is stale while the repo stays Granted.
+        let catalog = fixture.store().snapshot().unwrap();
+        let membership_generation =
+            catalog.catalog().repo_histories[&history].membership_generation;
+        let marker = GitTransportCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:1".into(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: catalog.epoch(),
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            aggregate_grant_hash: Sha256ValueV1::digest(b"grants"),
+            zero_prepared_history_journals: true,
+            zero_prepared_provenance_journals: true,
+            rows: vec![PredictedGitTransportCutoverRowV1 {
+                repo_history_id: history.clone(),
+                grant_commitment: "0".repeat(64),
+                membership_generation,
+                source_generation_id: "source-predecessor".into(),
+                p3_generation_id: format!("rhg_{}", "e".repeat(64)),
+                history_parity_commitment: Sha256ValueV1::digest(b"history"),
+                members: BTreeSet::from([ProjectId::parse(root_project).unwrap()]),
+                provenance_import_generations: BTreeMap::new(),
+                provenance_export_generations: BTreeMap::new(),
+                provenance_parity_commitments: BTreeMap::new(),
+                capability_baselines: Vec::new(),
+            }],
+            checksum_sha256: Sha256ValueV1::digest(b"checksum"),
+        };
+        let state = fixture.server_with_git_transport_cutover(marker).state;
+        let token = bro_rpc::ServiceToken::parse("7".repeat(64)).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        assert_eq!(
+            state
+                .git_transport_coverage_for_project(root_project)
+                .unwrap(),
+            Some(GitTransportRuntimeCoverageV1::CoverageStalePendingRecutover)
+        );
+
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head);
+        let source =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head);
+        activate_source(&state, &source).unwrap();
+
+        // The activation commits instead of superseding, and its overlay is
+        // durable in the manifest.
+        let journal = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.stage, HistoryActivationStageV1::Committed);
+        assert_eq!(journal.overlays.len(), 1);
+        let staged_overlays =
+            || bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir(&state)).unwrap();
+        assert_eq!(
+            staged_overlays()[root_project].source.producer_transport(),
+            Some(("producer-a", source.as_str()))
+        );
+        assert_eq!(
+            state
+                .git_sources
+                .store()
+                .history_status("producer-a", &source)
+                .unwrap()
+                .state,
+            GitHistorySourceStateV1::Active
+        );
+
+        // The row still governs: reads hide the overlay and checkout
+        // fallback stays closed.
+        assert!(state.git_transport_governs_project(root_project).unwrap());
+        assert!(state.code_read_view.read().git_overlays.is_empty());
+        let mut manifest =
+            bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir(&state)).unwrap();
+        crate::server::state::hide_cutover_gated_git_overlays(
+            &mut manifest,
+            &state.project_authority,
+            &state.git_transport_cutover,
+            &state.code_sources,
+        );
+        assert!(
+            manifest.workspaces[root_project].git_overlay.is_none(),
+            "the edge loader must not admit the staged git-current member"
+        );
+
+        // Neither clear site discards the staged evidence, and neither
+        // reports it as serving.
+        assert!(!reconcile_transport_currency(&state, root_project).unwrap());
+        assert_eq!(staged_overlays().len(), 1);
+        {
+            let index = state.idx.read();
+            recover_prebind(
+                &state.project_authority,
+                &state.code_sources,
+                &state.git_sources,
+                &state.git_transport_cutover,
+                &index,
+                index.index_path(),
+            )
+            .unwrap();
+        }
+        assert_eq!(staged_overlays().len(), 1);
+
+        // A redrive of the committed staged activation is a no-op.
+        activate_source(&state, &source).unwrap();
+        assert_eq!(
+            state
+                .git_sources
+                .store()
+                .read_activation_journal(&history)
+                .unwrap()
+                .unwrap()
+                .checksum_sha256,
+            journal.checksum_sha256
+        );
+
+        // Once the repository is no longer Granted the row is not staging,
+        // and pre-bind recovery clears the producer overlay as before.
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                Vec::new(),
+                catalog.catalog(),
+            )));
+        assert_eq!(
+            state
+                .git_transport_coverage_for_project(root_project)
+                .unwrap(),
+            Some(GitTransportRuntimeCoverageV1::CoveredProducerRemoved)
+        );
+        {
+            let index = state.idx.read();
+            recover_prebind(
+                &state.project_authority,
+                &state.code_sources,
+                &state.git_sources,
+                &state.git_transport_cutover,
+                &index,
+                index.index_path(),
+            )
+            .unwrap();
+        }
+        assert!(staged_overlays().is_empty());
     }
 }

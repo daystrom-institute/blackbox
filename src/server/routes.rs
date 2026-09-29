@@ -724,12 +724,21 @@ fn build_edge_index_from_shared_at_authority(
         })
         // all store read-guards drop here
     };
+    let mut authority = authority.clone();
+    if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut authority {
+        super::state::hide_cutover_gated_git_overlays(
+            index,
+            &state.project_authority,
+            &state.git_transport_cutover,
+            &state.code_sources,
+        );
+    }
     rebuilt.load_sidecar_edges_from_authority(
         &edges_dir,
         Some(&registered_project_ids),
         &mut seen,
         true,
-        authority,
+        &authority,
     )?;
     rebuilt.log_rebuilt(include_tantivy_projection, started);
     Ok(rebuilt)

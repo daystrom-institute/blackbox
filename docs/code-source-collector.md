@@ -275,6 +275,16 @@ the carried and dropped rows against the current predecessor and catalog and
 refuses a report whose rows differ. Every other predecessor row that the report
 does not replace is carried forward unchanged.
 
+A covered row that goes stale (`coverage_stale_pending_recutover`) while its
+repository is still Granted to one producer keeps accepting history: activation
+commits its journal and writes the producer overlays as staged evidence. The
+row still governs the repository, so reads, the code read view, and the edge
+index hide those overlays and checkout fallback stays closed; startup recovery
+and code activation keep them while they still prove current. The next
+preflight proposes the repository from that evidence and apply replaces its
+row. A covered repository that is not Granted (producer removed or blocked
+assignment) publishes no new history until a new cutover.
+
 Remote plain HTTP is rejected and redirects are disabled. Loopback HTTP is
 accepted for local smoke tests.
 

@@ -89,6 +89,22 @@ impl EdgeIndex {
         stores: &EdgeStoreRefs<'_>,
         admitted_absent_projects: &BTreeSet<String>,
     ) -> Result<Self> {
+        let authority = SidecarManifestAuthority::capture(&stores.edges_dir)?;
+        Self::rebuild_from_authority_admitting_fully_absent(
+            stores,
+            admitted_absent_projects,
+            &authority,
+        )
+    }
+
+    /// [`Self::rebuild_admitting_fully_absent`] over a manifest authority the
+    /// caller captured, so it can narrow what the loader admits (for example,
+    /// Git overlays its read view hides) before the sidecar parse.
+    pub fn rebuild_from_authority_admitting_fully_absent(
+        stores: &EdgeStoreRefs<'_>,
+        admitted_absent_projects: &BTreeSet<String>,
+        authority: &SidecarManifestAuthority,
+    ) -> Result<Self> {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
@@ -97,12 +113,13 @@ impl EdgeIndex {
         // the index commit and must NOT run recovery, which could race new
         // transactions. Recovery here was also unsafe because commit_payload
         // is None, treating every pending journal as uncommitted.
-        index.load_sidecar_edges_admitting_fully_absent(
+        index.load_sidecar_edges_from_authority_admitting_fully_absent(
             &stores.edges_dir,
             stores.registered_project_ids.as_ref(),
             &mut seen,
             stores.include_observed,
             admitted_absent_projects,
+            authority,
         )?;
 
         index.log_rebuilt(stores.include_tantivy_projection, started);
