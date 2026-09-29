@@ -1802,10 +1802,11 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
                 return Err(ProjectCatalogError::new(
                     "error.project_catalog_legacy_evidence_unreconstructable",
                     format!(
-                        "re-run the project-catalog migration from the v1 predecessor after \
-                         discarding this migrated pair: binding {key} names group source {} \
-                         with no member evidence, which only the owner's own walk can supply; \
-                         inventing it would refuse every later stamp forever.",
+                        "restore a catalog and attachment ledger whose bindings carry captured \
+                         member evidence: binding {key} names group source {} with no member \
+                         evidence, which only a capture of the owner's rows can supply and no \
+                         current command performs; inventing it would refuse every later stamp \
+                         forever.",
                         binding.source_store
                     ),
                 ));
@@ -4245,8 +4246,8 @@ mod tests {
     /// backfill's refold would then disagree with it on every future run, and no
     /// fresh preflight could repair a record that is already durable. That is a
     /// dead end, so decode refuses instead, with its own code and a remedy that
-    /// actually works: remigrate from the v1 predecessor, where every owner's
-    /// evidence is captured rather than guessed.
+    /// actually works: restore a ledger whose bindings carry captured evidence
+    /// rather than guessed evidence.
     #[test]
     fn a_pre_evidence_group_shaped_binding_refuses_instead_of_being_invented() {
         let raw = pre_evidence_attachment_snapshot().replace(
@@ -4268,7 +4269,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("re-run the project-catalog migration"),
+                .contains("restore a catalog and attachment ledger whose bindings carry captured"),
             "the refusal must name a repair that works: {error}"
         );
         // And it is NOT the generic invalid-field refusal, which would send the

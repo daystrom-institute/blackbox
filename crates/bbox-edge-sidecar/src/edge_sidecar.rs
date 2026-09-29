@@ -2969,7 +2969,7 @@ mod project_catalog_snapshot_tests {
         assert!(
             error
                 .to_string()
-                .contains("re-run the project-catalog migration"),
+                .contains("restore a catalog and attachment ledger whose bindings carry captured"),
             "the refusal must name a repair that works: {error}"
         );
 
