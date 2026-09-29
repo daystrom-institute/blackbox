@@ -10,30 +10,6 @@ use crate::entity_ref::{EntityRef, EntityType};
 
 pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
     (
-        "exact-symbol-knowledge-store",
-        include_str!("queries/exact-symbol-knowledge-store.json"),
-    ),
-    (
-        "exact-symbol-routing-verdict",
-        include_str!("queries/exact-symbol-routing-verdict.json"),
-    ),
-    (
-        "exact-symbol-wait-store",
-        include_str!("queries/exact-symbol-wait-store.json"),
-    ),
-    (
-        "exact-symbol-mcp-store",
-        include_str!("queries/exact-symbol-mcp-store.json"),
-    ),
-    (
-        "exact-symbol-cron-registry",
-        include_str!("queries/exact-symbol-cron-registry.json"),
-    ),
-    (
-        "exact-symbol-entity-ref",
-        include_str!("queries/exact-symbol-entity-ref.json"),
-    ),
-    (
         "conceptual-recursion-guard",
         include_str!("queries/conceptual-recursion-guard.json"),
     ),
@@ -101,10 +77,6 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         "cross-modal-workflow-engine",
         include_str!("queries/cross-modal-workflow-engine.json"),
     ),
-    (
-        "cross-modal-entity-ref-parser",
-        include_str!("queries/cross-modal-entity-ref-parser.json"),
-    ),
 ];
 
 static CHECKER_MANIFESTS: OnceLock<Result<Vec<EvalQueryManifest>, String>> = OnceLock::new();
@@ -129,7 +101,6 @@ pub struct EvalQueryManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryClass {
-    ExactSymbol,
     ConceptualDesignDoc,
     StaleDecisionLookup,
     TranscriptProvenance,
@@ -180,12 +151,6 @@ pub fn check_pass(collected: &[EntityRef]) -> (bool, Vec<String>) {
 
 pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
     Some(match name {
-        "check_exact_symbol_knowledge_store" => check_exact_symbol_knowledge_store,
-        "check_exact_symbol_routing_verdict" => check_exact_symbol_routing_verdict,
-        "check_exact_symbol_wait_store" => check_exact_symbol_wait_store,
-        "check_exact_symbol_mcp_store" => check_exact_symbol_mcp_store,
-        "check_exact_symbol_cron_registry" => check_exact_symbol_cron_registry,
-        "check_exact_symbol_entity_ref" => check_exact_symbol_entity_ref,
         "check_conceptual_recursion_guard" => check_conceptual_recursion_guard,
         "check_conceptual_entity_ref_stability" => check_conceptual_entity_ref_stability,
         "check_conceptual_embedding_routing" => check_conceptual_embedding_routing,
@@ -213,7 +178,6 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
         "check_cross_modal_knowledge_store" => check_cross_modal_knowledge_store,
         "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
         "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
-        "check_cross_modal_entity_ref_parser" => check_cross_modal_entity_ref_parser,
         _ => return None,
     })
 }
@@ -334,12 +298,6 @@ macro_rules! stub_checker {
     };
 }
 
-stub_checker!(check_exact_symbol_knowledge_store);
-stub_checker!(check_exact_symbol_routing_verdict);
-stub_checker!(check_exact_symbol_wait_store);
-stub_checker!(check_exact_symbol_mcp_store);
-stub_checker!(check_exact_symbol_cron_registry);
-stub_checker!(check_exact_symbol_entity_ref);
 stub_checker!(check_conceptual_recursion_guard);
 stub_checker!(check_conceptual_entity_ref_stability);
 stub_checker!(check_conceptual_embedding_routing);
@@ -357,7 +315,6 @@ stub_checker!(check_transcript_harness_in_process_provider);
 stub_checker!(check_cross_modal_knowledge_store);
 stub_checker!(check_cross_modal_recursion_guard);
 stub_checker!(check_cross_modal_workflow_engine);
-stub_checker!(check_cross_modal_entity_ref_parser);
 
 #[cfg(test)]
 mod tests {
@@ -367,9 +324,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn all_24_manifests_parse_and_round_trip() {
+    fn all_17_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 24);
+        assert_eq!(manifests.len(), 17);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -409,11 +366,10 @@ mod tests {
         }
 
         for (class, count) in [
-            (QueryClass::ExactSymbol, 6),
             (QueryClass::ConceptualDesignDoc, 6),
             (QueryClass::StaleDecisionLookup, 2),
             (QueryClass::TranscriptProvenance, 6),
-            (QueryClass::CrossModalCodeProse, 4),
+            (QueryClass::CrossModalCodeProse, 3),
         ] {
             assert_eq!(class_counts.get(&class).copied(), Some(count), "{class:?}");
         }
@@ -423,7 +379,7 @@ mod tests {
     #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
                 transcript corpus on disk, which is absent in a fresh checkout. Run with \
                 `cargo test -- --ignored` against a real corpus."]
-    fn all_24_manifests_have_resolvable_expected_refs() {
+    fn all_17_manifests_have_resolvable_expected_refs() {
         let manifests = load_manifests().expect("all eval manifests parse");
         for manifest in &manifests {
             for raw in &manifest.expected_entity_refs {
@@ -478,8 +434,11 @@ mod tests {
 
         let cross_modal = manifests
             .iter()
-            .find(|manifest| manifest.query_class == QueryClass::CrossModalCodeProse)
-            .expect("cross-modal manifest exists");
+            .find(|manifest| {
+                manifest.query_class == QueryClass::CrossModalCodeProse
+                    && parsed_expected(manifest).len() > 1
+            })
+            .expect("cross-modal manifest with several expected refs exists");
         assert_eq!(cross_modal.pass_strictness, PassStrictness::All);
         let cross_modal_refs = parsed_expected(cross_modal);
         let checker = checker_by_name(&cross_modal.pass_classifier).unwrap();
@@ -496,22 +455,18 @@ mod tests {
             .find(|manifest| manifest.query_class == QueryClass::TranscriptProvenance)
             .expect("transcript manifest exists");
         assert_eq!(transcript.pass_strictness, PassStrictness::First);
-
-        let exact = manifests
-            .iter()
-            .find(|manifest| manifest.query_class == QueryClass::ExactSymbol)
-            .expect("exact-symbol manifest exists");
-        assert_eq!(exact.pass_strictness, PassStrictness::Any);
     }
 
     #[test]
     fn checker_manifest_lookup_uses_cached_parse_result() {
-        let checker = checker_by_name("check_exact_symbol_knowledge_store").unwrap();
+        let checker = checker_by_name("check_decision_deep_docs_system_memory").unwrap();
         let manifests = load_manifests().unwrap();
         let expected = parsed_expected(
             manifests
                 .iter()
-                .find(|manifest| manifest.pass_classifier == "check_exact_symbol_knowledge_store")
+                .find(|manifest| {
+                    manifest.pass_classifier == "check_decision_deep_docs_system_memory"
+                })
                 .unwrap(),
         );
         for _ in 0..90 {
