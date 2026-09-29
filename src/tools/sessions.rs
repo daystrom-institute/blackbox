@@ -1,7 +1,5 @@
 use crate::embed_runtime::{EmbedPartitionsParams, ReembedParams};
-use crate::index::{
-    MessagesParams, ReindexParams, SessionParams, SessionsListParams, TopicsParams,
-};
+use crate::index::{MessagesParams, ReindexParams, SessionParams, SessionsListParams};
 use crate::server::BlackboxServer;
 
 use crate::embed_runtime::status_snapshot::EmbedStatusParams;
@@ -124,18 +122,6 @@ impl BlackboxServer {
             )
         })
         .await
-    }
-
-    #[tool(
-        name = "bbox_topics",
-        description = "Top terms in a session by frequency."
-    )]
-    pub(crate) async fn bbox_topics(
-        &self,
-        Parameters(p): Parameters<TopicsParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_topics", move || server.state.idx.read().topics(&p)).await
     }
 
     #[tool(

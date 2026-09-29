@@ -20,7 +20,6 @@ use crate::mcp_tools::find_paths::FindPathsParams;
 use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::mcp_tools::provenance::ProvenanceParams;
 use crate::mcp_tools::provenance_plan::ProvenanceExportPlanParams;
-use crate::mcp_tools::ref_size::RefSizeParams;
 use crate::server::BlackboxServer;
 use crate::{edge_index, entity_ref, git};
 
@@ -32,8 +31,6 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-
-const REF_SIZE_CAP: usize = 500;
 
 /// One resolved checkout-file target. The carrier holds logical identity
 /// only: a project id, an attachment selector, and the project-relative path
@@ -1651,91 +1648,6 @@ impl BlackboxServer {
                 p.body_limit,
             )?;
             Ok((bounded.to_string(), bounded))
-        })
-        .await
-    }
-
-    #[tool(
-        name = "bbox_ref_size",
-        description = "Measure entity payload bytes using authoritative indexed or checkout reads. body_limit/cursor recovers exact result JSON; oversized replies start body pages automatically. Each page remeasures the selected refs, and changed evidence refuses continuation."
-    )]
-    pub(crate) async fn bbox_ref_size(
-        &self,
-        Parameters(p): Parameters<RefSizeParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_ref_size", move || {
-            mcp_tools::ref_size::validate_response_params(&p)?;
-            let read_view = server.state.complete_code_read_view()?;
-            let projects = server.state.records_provider.records_snapshot().records;
-            let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
-            let session_checkout = server.authoritative_session_checkout();
-            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
-            let mut acquired_files = Vec::new();
-            let mut validated_files = HashMap::new();
-            for raw in p.refs.iter().take(REF_SIZE_CAP) {
-                let Ok(entity_ref::EntityRef::File { path }) = entity_ref::EntityRef::parse(raw)
-                else {
-                    continue;
-                };
-                if validated_files.contains_key(&path) {
-                    continue;
-                }
-                let resolved = file_selection(
-                    &server,
-                    &broker,
-                    &path,
-                    p.project_dir.as_deref(),
-                    session_checkout.as_deref(),
-                    &projects,
-                    &checkout_rows,
-                )
-                .and_then(|selection| {
-                    acquire_file_selection(
-                        &server,
-                        &broker,
-                        selection,
-                        CheckoutAccessKind::RenderFileProvider,
-                        CheckoutAccessIntent::Read,
-                    )
-                });
-                match resolved {
-                    Ok(mut acquired) => {
-                        let bytes = acquired.content.len() as u64;
-                        validated_files.insert(
-                            path,
-                            mcp_tools::ref_size::FileInputResolution::Validated(
-                                mcp_tools::ref_size::ValidatedFileInput { bytes },
-                            ),
-                        );
-                        acquired.content = Vec::new();
-                        acquired_files.push(acquired);
-                    }
-                    Err(error) => {
-                        validated_files.insert(
-                            path,
-                            mcp_tools::ref_size::FileInputResolution::Rejected(error.to_string()),
-                        );
-                    }
-                }
-            }
-            let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx = server
-                .provider_context()
-                .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher);
-            let output = mcp_tools::ref_size::ref_size_with_validated_files(
-                &p,
-                &provider_ctx,
-                &validated_files,
-            )?;
-            for acquired in &acquired_files {
-                broker
-                    .revalidate(&acquired.lease)
-                    .map_err(checkout_access_error)?;
-            }
-            drop(acquired_files);
-            mcp_tools::ref_size::page_response(&p, &output)
         })
         .await
     }
@@ -5829,16 +5741,6 @@ mod tests {
         let schema = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
         assert_eq!(schema.is_error, Some(true));
         assert!(extract_text(&schema).contains("error.edge_index_warming"));
-
-        let ref_size = server
-            .bbox_ref_size(Parameters(RefSizeParams {
-                refs: Vec::new(),
-                project_dir: None,
-                ..Default::default()
-            }))
-            .await;
-        assert_eq!(ref_size.is_error, Some(true));
-        assert!(extract_text(&ref_size).contains("error.edge_index_warming"));
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
-use crate::index::{CiteParams, ContextParams, ProjectFilterInput, SearchParams};
+use crate::index::{ContextParams, ProjectFilterInput, SearchParams};
 use crate::mcp_tools;
-use crate::mcp_tools::discover_seed::DiscoverSeedParams;
 use crate::mcp_tools::hybrid_search::HybridSearchParams;
 use crate::server::BlackboxServer;
 
@@ -34,109 +33,12 @@ pub(crate) struct ContextToolParams {
     pub body_cursor: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn cite_bounds_the_complete_envelope_and_preserves_ordered_exact_readers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = BlackboxServer::new(std::sync::Arc::new(
-            crate::server::state::SharedState::for_test(&root),
-        ));
-        let escaped = "\u{0001}".repeat(2000);
-        {
-            let index = server.state.idx.read();
-            let fields = index.field_handles();
-            let mut writer = index
-                .index_handle()
-                .writer::<tantivy::TantivyDocument>(15_000_000)
-                .unwrap();
-            for i in 0..20 {
-                let mut doc = tantivy::TantivyDocument::new();
-                doc.add_text(fields.doc_type, "transcript");
-                doc.add_text(fields.content, "citationenvelopefixture");
-                doc.add_text(fields.file_path, format!("native:synthetic/stream{i}"));
-                doc.add_text(fields.session_id, "\u{0001}".repeat(256));
-                doc.add_text(fields.account, &escaped);
-                doc.add_text(fields.project, &escaped);
-                doc.add_text(fields.timestamp, format!("{i:02}{escaped}"));
-                doc.add_text(fields.role, "user");
-                doc.add_u64(fields.byte_offset, i);
-                writer.add_document(doc).unwrap();
-            }
-            writer.commit().unwrap();
-            index.reader_reload_for_test();
-        }
-        let result = server
-            .bbox_cite(Parameters(
-                serde_json::from_value::<CiteParams>(json!({
-                    "claim":"citationenvelopefixture", "limit":20
-                }))
-                .unwrap(),
-            ))
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        let result = serde_json::to_value(result).unwrap();
-        assert!(
-            serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
-        );
-        let out = result["content"][0]["text"].as_str().unwrap();
-        let readers: Vec<serde_json::Value> = out
-            .lines()
-            .filter_map(|line| line.trim_start().strip_prefix("Exact read: "))
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert!(
-            !readers.is_empty() && readers.len() < 20,
-            "fixture must exercise aggregate byte admission"
-        );
-        assert!(
-            out.contains(&format!(
-                "omitted {} of 20 ranked citations",
-                20 - readers.len()
-            )),
-            "{out}"
-        );
-        for (i, reader) in readers.iter().enumerate() {
-            assert_eq!(reader["arguments"]["byte_offset"], i);
-        }
-        let mut arguments = readers[0]["arguments"].clone();
-        let mut recovered = String::new();
-        loop {
-            let result = server
-                .bbox_context(Parameters(
-                    serde_json::from_value::<ContextToolParams>(arguments.clone()).unwrap(),
-                ))
-                .await;
-            assert_ne!(result.is_error, Some(true), "{result:?}");
-            let result = serde_json::to_value(result).unwrap();
-            assert!(
-                serde_json::to_vec(&result).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES
-            );
-            let page: serde_json::Value =
-                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-            recovered.push_str(page["body"]["text"].as_str().unwrap());
-            let Some(cursor) = page["body"]["next_cursor"].as_str() else {
-                break;
-            };
-            arguments["body_cursor"] = json!(cursor);
-        }
-        let recovered: serde_json::Value = serde_json::from_str(&recovered).unwrap();
-        assert_eq!(recovered["account"], escaped);
-        assert_eq!(recovered["project"], escaped);
-        assert_eq!(recovered["content"], "citationenvelopefixture");
-        assert_eq!(server.state.idx.read().searcher().num_docs(), 20);
-    }
-}
-
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
 }
 
 /// Filter-class boundary for the corpus-search family (`bbox_search`,
-/// `bbox_cite`, `bbox_sessions_list`, `bbox_tool_calls`): resolve the raw
+/// `bbox_sessions_list`, `bbox_tool_calls`): resolve the raw
 /// selector once here and hand the index engine a typed filter. The
 /// literal travels unchanged so the substring lane keeps its semantics;
 /// the `base_project_id` term lane fires only when the selector resolved
@@ -287,62 +189,6 @@ impl BlackboxServer {
                     Some(&graph_policy),
                 )?;
             knowledge_view.enrich_json_response(serde_json::to_string(&response)?)
-        })
-        .await
-    }
-
-    #[tool(
-        name = "bbox_discover_seed_entities",
-        description = "Find seeds with notable_edges; inspect before answering; graph vertices: graph_source/graph_ids."
-    )]
-    pub(crate) async fn bbox_discover_seed_entities(
-        &self,
-        Parameters(p): Parameters<DiscoverSeedParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking_with_structured("bbox_discover_seed_entities", move || {
-            let read_view = server.state.complete_code_read_view()?;
-            let mut p = p;
-            p.resolved_project_id = server
-                .resolve_hybrid_project_filter("bbox_discover_seed_entities", p.project.as_deref());
-            if server.state.idx.read().is_empty() {
-                server
-                    .state
-                    .index_writer
-                    .run_reindex_pass(false, true)
-                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
-            }
-            let knowledge_view =
-                server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
-            let provider_ctx = server
-                .provider_context()
-                .with_knowledge_view(&knowledge_view.knowledge)
-                .with_searcher(&read_view.searcher);
-            let graph_policy = server.graph_word_policy_snapshot();
-            let output = mcp_tools::discover_seed::discover_seed_entities(
-                &server.state.idx.read(),
-                &knowledge_view.knowledge,
-                &provider_ctx,
-                read_view.edge_index.as_ref(),
-                &read_view.active_selectors,
-                &read_view.searcher,
-                Some(&graph_policy),
-                &p,
-            )?;
-            knowledge_view.enrich_json_response(output)
-        })
-        .await
-    }
-
-    #[tool(
-        name = "bbox_cite",
-        description = "Trace a claim back to the turn that established it."
-    )]
-    pub(crate) async fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_cite", move || {
-            let project_filter = corpus_project_filter(&server, p.project.as_deref());
-            server.state.idx.read().cite(&p, project_filter.as_ref())
         })
         .await
     }

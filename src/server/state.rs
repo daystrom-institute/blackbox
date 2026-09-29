@@ -1283,14 +1283,12 @@ mod clause_one_exit_proof {
     /// order. Deleting a row therefore fails rather than silently reducing
     /// coverage, which is how this proof came to cover two operations while
     /// claiming twelve.
-    const REQUIRED_OPERATIONS: [&str; 12] = [
+    const REQUIRED_OPERATIONS: [&str; 10] = [
         "lexical search",
         "hybrid search",
         "graph inspect",
         "graph path traversal",
         "evidence bundle",
-        "entity-ref resolution",
-        "project-file provider",
         "storage GC",
         "collected activation and rebuild",
         "published knowledge",
@@ -1503,16 +1501,6 @@ mod clause_one_exit_proof {
                 "entity_refs": ["knowledge:knowledge-a"],
                 "path_ids": [],
             }))))
-            .await);
-        compare!("entity-ref resolution", server => server
-            .bbox_ref_size(Parameters(params(
-                serde_json::json!({"refs": ["knowledge:knowledge-a"]})
-            )))
-            .await);
-        compare!("project-file provider", server => server
-            .bbox_ref_size(Parameters(params(
-                serde_json::json!({"refs": ["file:src/lib.rs"]})
-            )))
             .await);
         let expected_gc = complete_gc_semantics(&populated).await;
         let actual_gc = complete_gc_semantics(&recordless).await;

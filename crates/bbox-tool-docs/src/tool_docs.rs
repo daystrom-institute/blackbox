@@ -168,22 +168,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
-        name: "bbox_discover_seed_entities",
-        category: ToolCategory::Graph,
-        summary: "Find seeds with notable_edges; inspect before answering; graph vertices: graph_source/graph_ids.",
-        when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`): same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops. Project graph vertices seed under the same parameters: `project` scopes them by stamped project id, `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all; only `published` has indexed documents today, so `provisional` and `connector` are accepted but return no graph hits until they are indexed), `graph_ids` names graphs (both applied before ranking), and vertex hits carry the `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref` identity fields.",
-        example: Some(
-            r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_cite",
-        category: ToolCategory::Transcripts,
-        summary: "Trace a claim back to the turn that established it.",
-        when_to_use: "Use when you need provenance for a rule, preference, or standing claim. Returns citations oldest-first so the origin surfaces first. Native citations carry exact_read JSON for bounded bbox_context recovery of stored fields. An aggregate byte budget accounts for escaped metadata; any omitted ranked citations are counted explicitly, with narrower claim/filter recovery. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
-        example: Some(r#"bbox_cite(claim="never kill processes by port")"#),
-    },
-    ToolDoc {
         name: "bbox_context",
         category: ToolCategory::Transcripts,
         summary: "Read surrounding indexed events by opaque locator and offset, or page an exact native stored record using its recovery handle. Native replies disclose projection and freshness limits.",
@@ -233,13 +217,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             "bbox_embed_status(include_diagnostics=true, diagnostic_routes=[\"voyage-1024\"])",
         ),
-    },
-    ToolDoc {
-        name: "bbox_topics",
-        category: ToolCategory::Transcripts,
-        summary: "Top terms in a session by frequency.",
-        when_to_use: "Quick 'what was this session about' without LLM summarization.",
-        example: None,
     },
     ToolDoc {
         name: "bbox_sessions_list",
@@ -310,13 +287,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"], property_mode="summary")"#,
         ),
-    },
-    ToolDoc {
-        name: "bbox_ref_size",
-        category: ToolCategory::Graph,
-        summary: "Measure entity payload bytes using authoritative indexed or checkout reads. body_limit/cursor recovers exact result JSON; oversized replies start body pages automatically. Each page remeasures the selected refs, and changed evidence refuses continuation.",
-        when_to_use: "Use when planning context-budget-sensitive dispatches. Pass the exact entity refs a downstream actor would need to read; the response returns per-ref byte counts, total_bytes, canonicalized successful refs, and unresolved/omitted refs without estimating from prose. body_limit (4..4096) and cursor recover complete JSON, preserving identity and measurement. Oversized replies automatically start body pages. Each page remeasures the current authoritative view; repeat refs/project_dir and concatenate body.text. Changed selectors or measurements refuse continuation.",
-        example: Some(r#"bbox_ref_size(project_dir="/repo/worktree", refs=["file:src/lib.rs"])"#),
     },
     ToolDoc {
         name: "bbox_edge_compact",
@@ -1768,19 +1738,17 @@ mod tests {
     /// as "no match". Drop a plane from the caveat when its indexing lands.
     #[test]
     fn search_tool_docs_name_only_indexed_graph_planes() {
-        for name in ["bbox_hybrid_search", "bbox_discover_seed_entities"] {
-            let doc = TOOL_DOCS
-                .iter()
-                .find(|doc| doc.name == name)
-                .unwrap_or_else(|| panic!("missing tool doc for {name}"));
-            assert!(
-                doc.when_to_use.contains(
-                    "only `published` has indexed documents today, so `provisional` and \
-                     `connector` are accepted but return no graph hits until they are indexed"
-                ),
-                "{name} must state which graph_source planes have indexed documents"
-            );
-        }
+        let doc = TOOL_DOCS
+            .iter()
+            .find(|doc| doc.name == "bbox_hybrid_search")
+            .expect("missing tool doc for bbox_hybrid_search");
+        assert!(
+            doc.when_to_use.contains(
+                "only `published` has indexed documents today, so `provisional` and \
+                 `connector` are accepted but return no graph hits until they are indexed"
+            ),
+            "bbox_hybrid_search must state which graph_source planes have indexed documents"
+        );
     }
 
     #[test]

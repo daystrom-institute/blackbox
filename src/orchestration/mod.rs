@@ -2446,8 +2446,7 @@ pub struct AmbientContext {
 /// to None. Knowledge/note/learn `project` params must NEVER appear here —
 /// absence there means *global write scope*
 /// (design/bro-harness/tool-arg-defaulting.md §3.1).
-const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
-    &["bbox_hybrid_search", "bbox_discover_seed_entities"];
+const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] = &["bbox_hybrid_search"];
 
 /// Gap-store tools whose `project` param is write-TARGETING, not write scope
 /// (gap-b94129ba, operator-approved): the adapter resolves it through
@@ -9261,15 +9260,12 @@ mod tests {
         let defaults = ctx.tool_arg_defaults().expect("retrieval-read defaults");
         assert!(!defaults.contains_key("pin:*.project_dir"));
         assert!(!defaults.contains_key("pin:*.cwd"));
-        for key in [
-            "default:mcp.bbox_hybrid_search.project",
-            "default:mcp.bbox_discover_seed_entities.project",
-        ] {
-            assert_eq!(
-                defaults.get(key).map(String::as_str),
-                Some(cwd_str.as_str())
-            );
-        }
+        assert_eq!(
+            defaults
+                .get("default:mcp.bbox_hybrid_search.project")
+                .map(String::as_str),
+            Some(cwd_str.as_str())
+        );
     }
 
     #[test]

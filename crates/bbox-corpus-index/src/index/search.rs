@@ -759,38 +759,6 @@ pub struct ReindexParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct TopicsParams {
-    /// Exact indexed session id. Provide exactly one selector.
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Opaque stored locator from bbox_search, never opened as a file.
-    #[serde(default)]
-    pub file_path: Option<String>,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct CiteParams {
-    /// The claim, rule, or phrase to trace back to its origin
-    pub claim: String,
-    /// Filter to account
-    #[serde(default)]
-    pub account: Option<String>,
-    /// Filter by project path keywords
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Role to cite (default: "user" — who said it originally)
-    #[serde(default)]
-    pub role: Option<String>,
-    /// Max citations (default: 5, max: 20)
-    #[serde(default)]
-    pub limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionsListParams {
     /// Exact indexed provider source, independent of the account label.
     #[serde(default)]
@@ -1281,17 +1249,8 @@ impl TranscriptIndex {
             out.push_str(&format!("\n\nResponse byte limit: showing {} of {} ranked hits; narrow query or filters to inspect remaining hits.\n", results.len(), top_docs.len()));
         }
         if let Some(recovery) = top_recovery {
-            let transcript_hit = matches!(
-                recovery,
-                SearchRecovery::NativeTranscript { .. } | SearchRecovery::SlackTranscript { .. }
-            );
             out.push_str("\n\nNext steps:\n");
             recovery.append_next_steps(&mut out);
-            if transcript_hit {
-                out.push_str(
-                    "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
-                );
-            }
         }
         Ok(out)
     }
@@ -1800,170 +1759,6 @@ impl TranscriptIndex {
         None
     }
 
-    // ── Cite ────────────────────────────────────────────────────────
-
-    /// Trace a claim back to the transcript turn where it was established.
-    /// Defaults to role=user (the origin of most rules/preferences),
-    /// auto-wraps the claim in quotes for phrase matching unless it
-    /// already contains quoted segments, and returns citation-shaped
-    /// output sorted oldest-first so the earliest mention surfaces first.
-    ///
-    /// `project_filter` carries the caller-resolved project selector;
-    /// `None` keeps the raw selector on the literal substring lane.
-    pub fn cite(
-        &self,
-        p: &CiteParams,
-        project_filter: Option<&ProjectFilterInput>,
-    ) -> Result<String> {
-        let project_filter = effective_project_filter(project_filter, p.project.as_deref());
-        let limit = p.limit.unwrap_or(5).min(20) as usize;
-        let role = p.role.as_deref().unwrap_or("user");
-
-        if self.is_empty() {
-            return Ok("Index is empty. Run bbox_reindex first.".to_string());
-        }
-
-        let claim = p.claim.trim();
-        if claim.is_empty() {
-            anyhow::bail!("'claim' is required");
-        }
-        let query_str = if claim.contains('"') {
-            claim.to_string()
-        } else {
-            format!("\"{claim}\"")
-        };
-
-        let searcher = self.reader.searcher();
-        let mut qp = QueryParser::for_index(&self.index, vec![self.fields.content]);
-        qp.set_conjunction_by_default();
-        let text_query = qp.parse_query(&query_str)?;
-
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
-            (Occur::Must, text_query.box_clone()),
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, role),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-        ];
-
-        if let Some(account) = p.account.as_deref() {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.account, account),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(filter) = project_filter.as_ref() {
-            self.push_project_filter_clause(&mut clauses, filter);
-        }
-
-        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
-        // Pull a generous top-N by score, then resort by timestamp ascending
-        // so the oldest citation (most likely the origin) shows first.
-        let fetch = (limit * 4).max(20);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(fetch))?;
-
-        if top_docs.is_empty() {
-            return Ok(format!(
-                "No citations found for: {}",
-                display_fragment(claim, 256)
-            ));
-        }
-
-        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
-
-        let mut rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            u64,
-            String,
-            Option<String>,
-        )> = Vec::new();
-        for (_score, addr) in &top_docs {
-            let doc: TantivyDocument = searcher.doc(*addr)?;
-            let snippet = snippet_gen.snippet_from_doc(&doc);
-            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
-            let handle = self.native_reader_handle(&searcher, *addr, &doc);
-            let locator = self.doc_text(&doc, self.fields.file_path);
-            let locator = if super::native_reader::compact_locator(&locator) {
-                locator
-            } else {
-                handle.clone().unwrap_or(locator)
-            };
-            rows.push((
-                self.doc_text(&doc, self.fields.timestamp),
-                self.doc_text(&doc, self.fields.account),
-                self.doc_text(&doc, self.fields.project),
-                self.doc_text(&doc, self.fields.session_id),
-                self.doc_text(&doc, self.fields.role),
-                locator,
-                first_u64(&doc, self.fields.byte_offset),
-                excerpt,
-                handle,
-            ));
-        }
-
-        // Oldest first — origin of the claim
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.truncate(limit);
-
-        let mut rendered = Vec::new();
-        let mut bytes = 0;
-        for (ts, account, project, sid, r, locator, offset, excerpt, handle) in &rows {
-            let mut row = format!(
-                "[{}] {}/{}: {}\n  session: {}\n  locator: {locator}\n  byte_offset: {offset}\n  > {}\n",
-                display_fragment(ts, 128),
-                display_fragment(account, 128),
-                display_fragment(r, 128),
-                display_fragment(project, 256),
-                if sid.len() <= 256 {
-                    sid.as_str()
-                } else {
-                    "[omitted; use exact reader]"
-                },
-                display_fragment(excerpt, 600),
-            );
-            if let Some(handle) = handle {
-                row.push_str(&format!(
-                    "  Exact read: {}\n",
-                    serde_json::json!({"tool":"bbox_context","arguments":{
-                        "file_path":handle,"byte_offset":offset,"body_limit":4096
-                    }})
-                ));
-            }
-            let size = serde_json::to_vec(&row)?.len();
-            if bytes + size > 32_000 {
-                anyhow::ensure!(
-                    !rendered.is_empty(),
-                    "citation identity exceeds the response budget"
-                );
-                break;
-            }
-            bytes += size;
-            rendered.push(row);
-        }
-        let mut out = format!(
-            "{} citation(s) for: {}\n\n{}",
-            rendered.len(),
-            display_fragment(claim, 256),
-            rendered.join("\n")
-        );
-        if rendered.len() < rows.len() {
-            out.push_str(&format!("\nResponse byte limit: omitted {} of {} ranked citations; narrow the claim or filters to inspect the remaining hits.\n", rows.len()-rendered.len(),rows.len()));
-        }
-        Ok(out)
-    }
-
     // ── Context ─────────────────────────────────────────────────────
 
     pub fn context(&self, p: &ContextParams) -> Result<String> {
@@ -2421,64 +2216,6 @@ impl TranscriptIndex {
                 ))
         });
         Ok(messages)
-    }
-
-    // ── Topics ──────────────────────────────────────────────────────
-
-    pub fn topics(&self, p: &TopicsParams) -> Result<String> {
-        let top_n = p.limit.unwrap_or(25).clamp(1, 100) as usize;
-        let role_filter = p.role.as_deref();
-        let session_id = p.session_id.as_deref();
-        let file_path = p.file_path.as_deref();
-
-        if session_id.is_none() && file_path.is_none() {
-            anyhow::bail!("Either 'session_id' or 'file_path' is required");
-        }
-
-        let messages =
-            self.indexed_transcript_messages(file_path, session_id, role_filter, true)?;
-        if messages.is_empty() {
-            anyhow::bail!(
-                "error.transcript_not_indexed: no indexed messages match this selector; use bbox_search for retained source coordinates."
-            );
-        }
-        let mut all_content = String::new();
-        for message in messages {
-            if role_filter.is_none() && message.role == "tool_result" {
-                continue;
-            }
-            all_content.push(' ');
-            all_content.push_str(&message.content);
-        }
-
-        if all_content.is_empty() {
-            return Ok("No content found for this session.".to_string());
-        }
-
-        // Tokenize and count
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        for word in all_content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-            let w = word.to_lowercase();
-            if w.len() < 3 || is_stop_word(&w) {
-                continue;
-            }
-            *counts.entry(w).or_insert(0) += 1;
-        }
-
-        let mut sorted: Vec<(String, u32)> = counts.into_iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
-        sorted.truncate(top_n);
-
-        let lines: Vec<String> = sorted
-            .iter()
-            .map(|(word, count)| format!("{:>4}  {}", count, word))
-            .collect();
-
-        Ok(format!(
-            "Top {} terms from indexed projections (source completeness and freshness not established):\n{}",
-            sorted.len(),
-            lines.join("\n")
-        ))
     }
 
     // ── Stats ───────────────────────────────────────────────────────
@@ -4452,15 +4189,6 @@ mod native_drilldown_tests {
         )
         .unwrap();
         assert_eq!(session["indexed_message_count"], 5);
-        let topics = index
-            .topics(&TopicsParams {
-                session_id: None,
-                file_path: Some(locator.to_string()),
-                role: None,
-                limit: Some(5),
-            })
-            .unwrap();
-        assert!(topics.contains("indexed projections"));
     }
 
     #[test]

@@ -2506,7 +2506,7 @@ mod tests {
     }
 
     /// Regression for the 2026-08-25 cage index-plane deadlock:
-    /// `bbox_hybrid_search` / `bbox_discover_seed_entities` hold
+    /// `bbox_hybrid_search` holds
     /// `state.idx.read()` across the whole search call, and provider
     /// property/label lookups re-acquire the same lock on the same thread.
     /// A writer queued between the two acquisitions (history activation's
