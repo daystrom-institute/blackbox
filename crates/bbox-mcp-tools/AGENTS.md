@@ -1,4 +1,4 @@
-# bbox-mcp-tools — graph retrieval pipeline (hybrid search, discover, paths)
+# bbox-mcp-tools - graph retrieval pipeline (hybrid search, inspect, paths)
 
 - Hybrid pipeline order: BM25 field boosts → RRF fusion (k=60, vector weight
   0.6 default) → model rerank (DEFAULT since the measured 2026-07-11
@@ -29,9 +29,6 @@
   nonblocking partition metrics so compaction cannot stall retrieval. Queue
   and indexing telemetry belongs on bbox_embed_status; search returns only
   concise retrieval status and result-affecting degradation by default.
-- `discover_seed` reuses `hybrid_search_typed` verbatim and differs only in
-  post-processing (notable edges). Ranking changes land in one place and
-  affect both; do not fork the ranking for one surface.
 - `vector_ranked_lists` searches TWO route families against the same
   `partitions` map from `vectors::metrics_nonblocking()`: `Bucket`-keyed text routes
   (`route_buckets`) and chunk-kind-keyed visual routes

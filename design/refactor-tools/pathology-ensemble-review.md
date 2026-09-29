@@ -161,7 +161,7 @@ borrow/conversion outcome that is the compiler's call (recorded as uncertainty).
 
 **`PRD-COR-J` — Java Transcript-Anchored Pressure.** Confirm/down-rank against
 operator/agent history + churn/fix-revert; merge overlapping atom signals.
-Authorities: `bbox_search`/`bbox_notes`/`bbox_thread_list`/`bbox_hybrid_search`,
+Authorities: `bbox_hybrid_search`/`bbox_notes`/`bbox_thread_list`,
 git log. Reject: history alone, unconfirmed by current code.
 
 **`PRD-COR-R` — Rust Transcript-Anchored Pressure.** Same, with Rust signals:
@@ -337,7 +337,7 @@ gate). The ensemble is adversarial review of the atom outputs across the five
 orthogonal axes, and the validator is the independent critic that gives refutation
 teeth.
 
-## Gate packet (`pathology-review/whiteboard-participation`, v2)
+## Gate rules (v2)
 
 Lattice `["ready_debate","ready_skip","ready","invalid"]`; first-match evaluation;
 reads `vars.board_check.*` (the `whiteboard_summarize` output). Four rules plus the
@@ -377,7 +377,6 @@ omitted when nothing was refuted). The PD-dispatch handoff
 | validator brofile ×4 | `…/pathology-lens/{arch,perf}-{java,rust}-pathology-validator.json` (brodex / gpt-5.5, read-only) |
 | panel teamplate ×4 | `system-defaults/refactor/pathology/teamplates/{java,rust}-pathology-panel.json` (arch) + `{java,rust}-perf-pathology-panel.json` (perf) |
 | facilitator brofile ×4 | `{java,rust}-architecture-pathologist.json` (v2, `agent_name=facilitator`) + `{java,rust}-performance-pathologist.json` |
-| packet ×1 | `…/packets/pathology-review/whiteboard-participation.json` (v2; shared by all four flows) |
 | workflow ×4 | `system-defaults/workflows/refactor/{arch-pathology-java,arch-pathology-rust,perf-pathology-java,perf-pathology-rust}.json` (v2) |
 
 The language-agnostic `perf-pathology.json` (v1) is superseded by the two

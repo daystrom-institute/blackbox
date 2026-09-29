@@ -39,7 +39,6 @@ The `bro/` subtree in detail:
 | `webhooks/` | Installed webhook extractors + routing refs |
 | `crons/` | Installed cron specs |
 | `councils/` | Council transcripts |
-| `whiteboards/` | Whiteboard state |
 | `slack-channel-bindings.json` | Slack channel → project bindings for Badgey |
 | `slack-proposal-links.json` | Posted Slack message → proposal mappings |
 | `slack-threads.json` | Slack thread metadata |
@@ -202,7 +201,6 @@ old inode until systemd restarts it.
     │   ├── webhooks/
     │   ├── crons/
     │   ├── councils/
-    │   ├── whiteboards/
     │   ├── slack-channel-bindings.json
     │   ├── slack-proposal-links.json
     │   └── tasks.json
@@ -233,12 +231,12 @@ old inode until systemd restarts it.
 
 `bbox_doctor(format="summary")` is the first call for "what needs attention
 right now": it aggregates the old manual smoke checks (`bbox_stats`,
-`bbox_embed_status`, `bbox_project_list`, `bbox_lint`, `bbox_inbox`) into one
+`bbox_embed_status`, `bbox_project_list`, `bbox_lint`) into one
 classified report (ok/info/warn/action/blocked) with suggested next commands.
 
 ```bash
 bbox_doctor(format="summary")            # aggregate health + attention report
-bbox_inbox(project="/your/repo")         # attention sweep
+bbox_notes(project="/your/repo")         # unresolved executor notes
 bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```
@@ -506,7 +504,7 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 3. Copy systemd units and drop-ins (including secrets).
 4. Start the daemon - index rebuilds automatically.
 5. Run `bbox_reembed(route="<route>")` for each embedding route.
-6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_inbox`.
+6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_doctor`.
 
 Multi-machine active setups: the JSON stores are not concurrency-safe
 across machines. Use one canonical host and treat others as read-only

@@ -129,8 +129,8 @@ pub struct ProvisionalProjectGraphOverlay {
 
 /// A connector-managed source graph as the read plane sees it.
 ///
-/// Read-only by construction: these generations are accepted by the source
-/// projection store (`bbox-source-graph`), never by a checkout lane, so the
+/// Read-only by construction: these generations are accepted by a source
+/// projection store, never by a checkout lane, so the
 /// catalog offers no path that mutates one and the visibility policy does not
 /// gate them the way it gates provisional checkout state.
 #[derive(Debug, Clone)]

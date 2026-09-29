@@ -84,7 +84,6 @@ pub fn install_harness_executor(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
 ) -> bool {
     let fleetd_config = fleetd_client::FleetdConfig::in_state_dir(&store_dir);
@@ -94,7 +93,6 @@ pub fn install_harness_executor(
         store_dir,
         task_store,
         tail_tx,
-        system_events,
         workspace_binding_authority,
     )
 }
@@ -112,7 +110,6 @@ pub fn install_configured_harness_executor(
     fleetd_worker_bro_home: Option<&std::path::Path>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
 ) -> anyhow::Result<bool> {
     let fleetd_config = match kind {
@@ -133,7 +130,6 @@ pub fn install_configured_harness_executor(
         store_dir,
         task_store,
         tail_tx,
-        system_events,
         workspace_binding_authority,
     ))
 }
@@ -144,14 +140,12 @@ fn install_harness_executor_with_config(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
 ) -> bool {
     let _ = readoption_env().set(ReadoptionEnv {
         store_dir: store_dir.clone(),
         task_store,
         tail_tx,
-        system_events,
         workspace_binding_authority,
     });
     let executor: Arc<dyn executor::HarnessExecutor> = match kind {
@@ -214,7 +208,6 @@ struct ReadoptionEnv {
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
 }
 
@@ -408,7 +401,6 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                 .join(format!("{session_id}.events.jsonl"))
         }),
         env.tail_tx.clone(),
-        env.system_events.clone(),
         events,
     );
     spawn_harness_terminal_waiter(
@@ -417,7 +409,6 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
         env.store_dir.clone(),
         env.task_store.clone(),
         env.tail_tx.clone(),
-        env.system_events.clone(),
         outcome,
         ingest_join,
     );
@@ -2446,8 +2437,7 @@ pub struct AmbientContext {
 /// to None. Knowledge/note/learn `project` params must NEVER appear here —
 /// absence there means *global write scope*
 /// (design/bro-harness/tool-arg-defaulting.md §3.1).
-const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
-    &["bbox_hybrid_search", "bbox_discover_seed_entities"];
+const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] = &["bbox_hybrid_search"];
 
 /// Gap-store tools whose `project` param is write-TARGETING, not write scope
 /// (gap-b94129ba, operator-approved): the adapter resolves it through
@@ -2712,10 +2702,6 @@ pub struct SpawnTaskParams {
     pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
     pub agent_label: Option<String>,
-    /// System event hub for emitting task lifecycle events. Task events
-    /// are observation-only: emit failures are logged but do not affect
-    /// task dispatch.
-    pub system_events: Option<crate::system_events::SharedEventHub>,
     /// Spawn-time origin classification (Slice 1b). Determines which
     /// roster tab the task lands in. Defaults to `Unknown` at the field
     /// boundary so test helpers that build `SpawnTaskParams` directly
@@ -2813,7 +2799,6 @@ pub fn spawn_in_process_task(
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // Drop the write guard before consulting an existing task on refusal.
@@ -2898,9 +2883,6 @@ pub fn spawn_in_process_task(
     }
     task.emit_roster_added();
     request_persist(&task_store, &store_dir);
-    let task_id_ev = task_id.clone();
-    let bro_ev = task.inner.lock().bro_label.clone();
-    let provider_str = provider.to_string();
     let cursor = task.next_live_cursor();
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
         cursor,
@@ -2908,30 +2890,6 @@ pub fn spawn_in_process_task(
         provider,
         bro_name: None,
     });
-    // Emit task.started system event. Observation-only: failures logged, not propagated.
-    if let Some(hub) = system_events {
-        tokio::spawn(async move {
-            let mut correlation = serde_json::Map::new();
-            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
-            let draft = crate::system_events::SystemEventDraft {
-                kind: crate::system_events::types::SystemEventKind::TaskStarted,
-                producer: "orchestration.dispatch".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation,
-                causation_id: None,
-                payload: serde_json::json!({
-                    "task_id": task_id_ev,
-                    "provider": provider_str,
-                    "bro": bro_ev,
-                }),
-            };
-            if let Err(e) = hub.emit(draft).await {
-                tracing::warn!("task.started system event emit failed: {e:#}");
-            }
-        });
-    }
     task
 }
 
@@ -2971,7 +2929,6 @@ pub fn finish_in_process_task(
     task_store: &RwLock<TaskStore>,
     store_dir: &std::path::Path,
     tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
 ) {
     // Resolve the durable transcript handle (the harness session event log)
     // before the terminal state is persisted, so finished task records carry
@@ -3031,81 +2988,8 @@ pub fn finish_in_process_task(
         }
         TaskStatus::Running => {}
     }
-    // Emit terminal system event. Observation-only: failures logged, not propagated.
-    if let Some(hub) = system_events {
-        let task_id_ev = task_id.clone();
-        let elapsed_ev = elapsed.clone();
-        let (kind, payload) = match status {
-            TaskStatus::Completed => (
-                crate::system_events::types::SystemEventKind::TaskCompleted,
-                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev, "cost_usd": cost}),
-            ),
-            TaskStatus::Failed => (
-                crate::system_events::types::SystemEventKind::TaskFailed,
-                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev, "error": error}),
-            ),
-            TaskStatus::Cancelled => (
-                crate::system_events::types::SystemEventKind::TaskCancelled,
-                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev}),
-            ),
-            TaskStatus::Running => {
-                // No terminal event for running state.
-                request_persist(task_store, store_dir);
-                task.notify.notify_waiters();
-                return;
-            }
-        };
-        let mut correlation = serde_json::Map::new();
-        correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
-        let draft = crate::system_events::SystemEventDraft {
-            kind,
-            producer: "orchestration.dispatch".to_string(),
-            project: None,
-            principal: None,
-            subject: None,
-            correlation,
-            causation_id: None,
-            payload,
-        };
-        tokio::spawn(async move {
-            if let Err(e) = hub.emit(draft).await {
-                tracing::warn!("task terminal system event emit failed: {e:#}");
-            }
-        });
-    }
     request_persist(task_store, store_dir);
     task.notify.notify_waiters();
-}
-
-/// Emit a `task.progress` system event for one deduplicated snippet.
-/// Spawns a background task; observation-only — failures are logged but do not
-/// affect streaming.
-pub(crate) fn emit_task_progress_event(
-    hub: &crate::system_events::SharedEventHub,
-    task_id: String,
-    activity: String,
-) {
-    let hub = hub.clone();
-    tokio::spawn(async move {
-        let mut correlation = serde_json::Map::new();
-        correlation.insert("task_id".into(), serde_json::json!(task_id));
-        let draft = crate::system_events::SystemEventDraft {
-            kind: crate::system_events::types::SystemEventKind::TaskProgress,
-            producer: "orchestration.dispatch".to_string(),
-            project: None,
-            principal: None,
-            subject: None,
-            correlation,
-            causation_id: None,
-            payload: serde_json::json!({
-                "task_id": task_id,
-                "activity": activity,
-            }),
-        };
-        if let Err(e) = hub.emit(draft).await {
-            tracing::warn!("task.progress system event emit failed: {e:#}");
-        }
-    });
 }
 
 /// Spawn a provider CLI process and return a tracked Task.
@@ -3131,7 +3015,6 @@ pub async fn spawn_task(
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     spawn_task_with_tool_placement(
@@ -3149,7 +3032,6 @@ pub async fn spawn_task(
         agent_label,
         None,
         None,
-        system_events,
         origin,
     )
     .await
@@ -3268,7 +3150,6 @@ pub async fn spawn_task_with_tool_placement(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // Reservation happens HERE, ahead of the provider branch, so both entry
@@ -3307,7 +3188,6 @@ pub async fn spawn_task_with_tool_placement(
             roster_events,
             bro_label,
             agent_label,
-            system_events,
             origin,
         },
         tool_placement,
@@ -3345,7 +3225,6 @@ async fn spawn_reserved_dispatch(
         roster_events,
         bro_label,
         agent_label,
-        system_events,
         origin,
     } = params;
     // A session must never inherit the daemon's process cwd ($HOME under
@@ -3409,7 +3288,6 @@ async fn spawn_reserved_dispatch(
             agent_label,
             tool_placement,
             tool_defaults,
-            system_events,
             origin,
         )
         .await;
@@ -3470,7 +3348,6 @@ async fn spawn_harness_child_task(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
@@ -3675,10 +3552,6 @@ async fn spawn_harness_child_task(
         provider,
         bro_name: None,
     });
-    if let Some(ref hub) = system_events {
-        let bro_ev = task.inner.lock().bro_label.clone();
-        emit_task_started_event(hub, bro_ev, task_id.clone(), provider.to_string());
-    }
 
     // Daemon ingest: consume the executor's raw stdout line stream.
     let ingest_join = spawn_harness_ingest_loop(
@@ -3688,7 +3561,6 @@ async fn spawn_harness_child_task(
         store_dir.clone(),
         mirror_event_log_path,
         tail_tx.clone(),
-        system_events.clone(),
         events,
     );
 
@@ -3699,7 +3571,6 @@ async fn spawn_harness_child_task(
         store_dir,
         task_store,
         tail_tx,
-        system_events,
         outcome,
         ingest_join,
     );
@@ -3917,39 +3788,6 @@ fn harness_transcript_location_from_spec(
     })
 }
 
-/// Emit the `task.started` system event. Observation-only: failures are logged,
-/// not propagated. Extracted so the executor-backed harness path shares the
-/// exact shape the inline dispatch path emits.
-fn emit_task_started_event(
-    hub: &crate::system_events::SharedEventHub,
-    bro_ev: Option<String>,
-    task_id_ev: String,
-    provider_str: String,
-) {
-    let hub_clone = hub.clone();
-    tokio::spawn(async move {
-        let mut correlation = serde_json::Map::new();
-        correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
-        let draft = crate::system_events::SystemEventDraft {
-            kind: crate::system_events::types::SystemEventKind::TaskStarted,
-            producer: "orchestration.dispatch".to_string(),
-            project: None,
-            principal: None,
-            subject: None,
-            correlation,
-            causation_id: None,
-            payload: serde_json::json!({
-                "task_id": task_id_ev,
-                "provider": provider_str,
-                "bro": bro_ev,
-            }),
-        };
-        if let Err(e) = hub_clone.emit(draft).await {
-            tracing::warn!("task.started system event emit failed: {e:#}");
-        }
-    });
-}
-
 /// Daemon-side ingest of the executor's raw stdout line stream: parse each
 /// line, record the first provider disruption, and feed harness events into the
 /// task. Mirrors the inline harness branch of the former stdout reader; the
@@ -3963,7 +3801,6 @@ fn spawn_harness_ingest_loop(
     store_dir: std::path::PathBuf,
     mirror_event_log_path: Option<std::path::PathBuf>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     mut events: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -4050,14 +3887,7 @@ fn spawn_harness_ingest_loop(
             // below this has been applied", so advancing early would let a
             // replay skip an event this daemon never actually ingested.
             let seq = evt.get("seq").and_then(Value::as_u64);
-            ingest_harness_event(
-                &task,
-                provider,
-                evt,
-                &tail_tx,
-                &task_id,
-                system_events.clone(),
-            );
+            ingest_harness_event(&task, provider, evt, &tail_tx, &task_id);
             if let Some(seq) = seq {
                 let mut inner = task.inner.lock();
                 inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
@@ -4087,7 +3917,6 @@ fn spawn_harness_terminal_waiter(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    system_events: Option<crate::system_events::SharedEventHub>,
     outcome: tokio::sync::oneshot::Receiver<executor::WorkerOutcome>,
     ingest_join: tokio::task::JoinHandle<()>,
 ) {
@@ -4169,39 +3998,6 @@ fn spawn_harness_terminal_waiter(
                 });
             }
             _ => {}
-        }
-        // Emit terminal system event. Observation-only: failures logged.
-        if let Some(ref hub) = system_events {
-            let mut correlation = serde_json::Map::new();
-            correlation.insert("task_id".into(), serde_json::json!(task_id));
-            let (kind, payload) = match terminal_status {
-                TaskStatus::Completed => (
-                    crate::system_events::types::SystemEventKind::TaskCompleted,
-                    serde_json::json!({"task_id": task_id, "elapsed": elapsed, "cost_usd": cost}),
-                ),
-                TaskStatus::Failed => (
-                    crate::system_events::types::SystemEventKind::TaskFailed,
-                    serde_json::json!({"task_id": task_id, "elapsed": elapsed, "error": error_snippet}),
-                ),
-                TaskStatus::Cancelled => (
-                    crate::system_events::types::SystemEventKind::TaskCancelled,
-                    serde_json::json!({"task_id": task_id, "elapsed": elapsed}),
-                ),
-                TaskStatus::Running => unreachable!("terminal state check above"),
-            };
-            let draft = crate::system_events::SystemEventDraft {
-                kind,
-                producer: "orchestration.dispatch".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation,
-                causation_id: None,
-                payload,
-            };
-            if let Err(e) = hub.emit(draft).await {
-                tracing::warn!("task terminal system event emit failed: {e:#}");
-            }
         }
 
         // Propagate session ID to team members.
@@ -4316,7 +4112,6 @@ fn ingest_harness_event(
     evt: Value,
     tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
     task_id: &str,
-    system_events: Option<crate::system_events::SharedEventHub>,
 ) {
     // Stream deltas arrive at token-chunk rate while a bro streams (50+/s);
     // everything inside the lock below must be O(chunk), never O(message) —
@@ -4455,15 +4250,8 @@ fn ingest_harness_event(
         let _ = tail_tx.send(tail::TailEvent::TaskProgress {
             cursor,
             task_id: task_id.to_string(),
-            activity: snippet.clone(),
+            activity: snippet,
         });
-        // System events journal every emit (fs append + reaction matching);
-        // a task.progress per text DELTA wrote one journal line per token
-        // chunk (20,495 of 20,513 prod journal lines were task.progress).
-        // Step-boundary events still emit at turn cadence.
-        if !is_stream_delta && let Some(ref hub) = system_events {
-            emit_task_progress_event(hub, task_id.to_string(), snippet);
-        }
     }
 }
 
@@ -6689,7 +6477,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         )
         .await;
@@ -6710,7 +6497,6 @@ mod tests {
             store_dir,
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -6777,7 +6563,6 @@ mod tests {
                 roster_events: None,
                 bro_label: None,
                 agent_label: None,
-                system_events: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -6835,7 +6620,6 @@ mod tests {
                 roster_events: None,
                 bro_label: None,
                 agent_label: None,
-                system_events: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -6875,7 +6659,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::Workflow,
         );
 
@@ -6887,7 +6670,6 @@ mod tests {
             root,
             None,
             tail_tx,
-            None,
             events_rx,
         );
 
@@ -6928,7 +6710,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::Workflow,
         );
         let mirror = root.join("daemon-bro/harness-sessions/mirror.events.jsonl");
@@ -6940,7 +6721,6 @@ mod tests {
             root,
             Some(mirror.clone()),
             tail_tx,
-            None,
             events_rx,
         );
         events_tx
@@ -6981,7 +6761,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store
@@ -7009,7 +6788,6 @@ mod tests {
             root.clone(),
             store.clone(),
             tail_tx,
-            None,
             None,
         );
 
@@ -7120,7 +6898,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 bro_core::Origin::AgentDispatch,
             );
             store
@@ -7141,7 +6918,6 @@ mod tests {
             root,
             store,
             tail_tx,
-            None,
             Some(Arc::new(MismatchedWorkspaceBindingAuthority)),
         );
 
@@ -7222,7 +6998,6 @@ mod tests {
             root,
             store,
             tail_tx,
-            None,
             None,
         );
 
@@ -7431,7 +7206,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::Cockpit,
         );
         let managed_string = managed.to_string_lossy().into_owned();
@@ -7448,7 +7222,6 @@ mod tests {
             root.join("store"),
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -7475,7 +7248,6 @@ mod tests {
             tempfile::tempdir().unwrap().path().to_path_buf(),
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -7931,7 +7703,6 @@ mod tests {
                 roster_events: None,
                 bro_label: None,
                 agent_label: None,
-                system_events: None,
                 origin: bro_core::Origin::Cockpit,
             },
         )
@@ -8551,7 +8322,7 @@ mod tests {
             "result": "anthropic messages 400 Bad Request: boom",
             "num_turns": 2,
         });
-        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-err", None);
+        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-err");
         let inner = task.inner.lock();
         assert!(matches!(inner.status, TaskStatus::Failed));
         assert!(inner.stderr.contains("400 Bad Request: boom"));
@@ -8611,14 +8382,7 @@ mod tests {
         evt["seq"] = json!(7);
         let task = mk_ingest_task("instruction-timeout", "fixture-session");
         let (tx, _) = tokio::sync::broadcast::channel(16);
-        ingest_harness_event(
-            &task,
-            Provider::Brodex,
-            evt,
-            &tx,
-            "instruction-timeout",
-            None,
-        );
+        ingest_harness_event(&task, Provider::Brodex, evt, &tx, "instruction-timeout");
         assert_eq!(task.inner.lock().status, TaskStatus::Running);
         let status = mcp_task_status_json(&task, "summary", None, None, 5, false).unwrap();
         let recent = status["recentEvents"].as_array().unwrap();
@@ -8640,7 +8404,7 @@ mod tests {
     fn latest_assistant_preview_tracks_streams_without_replacing_the_result() {
         let task = mk_ingest_task("preview", "session-preview");
         let (tx, _) = tokio::sync::broadcast::channel(16);
-        let feed = |evt| ingest_harness_event(&task, Provider::Brodex, evt, &tx, "preview", None);
+        let feed = |evt| ingest_harness_event(&task, Provider::Brodex, evt, &tx, "preview");
         for text in ["Opening plan", "Latest findings"] {
             feed(
                 json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}),
@@ -8684,7 +8448,6 @@ mod tests {
                 json!({"type":"assistant", "message":{"content":[{"type":"text", "text":text}]}}),
                 &tx,
                 "preview-persist",
-                None,
             );
         }
         task.inner.lock().status = TaskStatus::Completed;
@@ -8730,7 +8493,7 @@ mod tests {
             }
         });
 
-        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-int", None);
+        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-int");
         {
             let inner = task.inner.lock();
             assert_eq!(inner.status, TaskStatus::Running);
@@ -8752,7 +8515,6 @@ mod tests {
             &store,
             tmp.path(),
             &tx,
-            None,
         );
 
         let status = task_status_json(&task, 5);
@@ -8789,35 +8551,14 @@ mod tests {
                 "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
             })
         };
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            delta("hel"),
-            &tx,
-            "task-deltas",
-            None,
-        );
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            delta("lo"),
-            &tx,
-            "task-deltas",
-            None,
-        );
+        ingest_harness_event(&task, Provider::Minimax, delta("hel"), &tx, "task-deltas");
+        ingest_harness_event(&task, Provider::Minimax, delta("lo"), &tx, "task-deltas");
         let assistant = serde_json::json!({
             "type": "assistant",
             "session_id": "sess-d",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
         });
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            assistant,
-            &tx,
-            "task-deltas",
-            None,
-        );
+        ingest_harness_event(&task, Provider::Minimax, assistant, &tx, "task-deltas");
 
         let inner = task.inner.lock();
         assert_eq!(inner.last_assistant_message.as_deref(), Some("hello"));
@@ -8849,7 +8590,6 @@ mod tests {
             }),
             &tx,
             "task-pending-location",
-            None,
         );
 
         let inner = task.inner.lock();
@@ -8876,7 +8616,7 @@ mod tests {
             "session_id": "sess-FORK",
             "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "evil"}},
         });
-        ingest_harness_event(&task, Provider::Minimax, forked, &tx, "task-fork", None);
+        ingest_harness_event(&task, Provider::Minimax, forked, &tx, "task-fork");
 
         let inner = task.inner.lock();
         assert_eq!(inner.last_assistant_message.as_deref(), Some("real text"));
@@ -8980,7 +8720,6 @@ mod tests {
                 roster_events: None,
                 bro_label: None,
                 agent_label: None,
-                system_events: None,
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
                 // value so a regression that drops the origin on
@@ -9261,15 +9000,12 @@ mod tests {
         let defaults = ctx.tool_arg_defaults().expect("retrieval-read defaults");
         assert!(!defaults.contains_key("pin:*.project_dir"));
         assert!(!defaults.contains_key("pin:*.cwd"));
-        for key in [
-            "default:mcp.bbox_hybrid_search.project",
-            "default:mcp.bbox_discover_seed_entities.project",
-        ] {
-            assert_eq!(
-                defaults.get(key).map(String::as_str),
-                Some(cwd_str.as_str())
-            );
-        }
+        assert_eq!(
+            defaults
+                .get("default:mcp.bbox_hybrid_search.project")
+                .map(String::as_str),
+            Some(cwd_str.as_str())
+        );
     }
 
     #[test]

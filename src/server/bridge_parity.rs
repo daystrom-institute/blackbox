@@ -885,22 +885,6 @@ mod harness {
         rows
     }
 
-    /// File provider: a relative `file:` ref resolved through the checkout
-    /// authority that section 9 assigns `RenderFileProvider`.
-    async fn file_provider_row(fixture: &BridgeFixture) -> Row {
-        let result = fixture
-            .server
-            .bbox_ref_size(Parameters(
-                bbox_mcp_tools::mcp_tools::ref_size::RefSizeParams {
-                    refs: vec!["file:README.md".into(), "file:missing.md".into()],
-                    project_dir: Some(fixture.base.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ))
-            .await;
-        row("file_provider", tool_row(&result), &[])
-    }
-
     async fn render_row(fixture: &BridgeFixture) -> Row {
         let result = fixture
             .server
@@ -1323,8 +1307,6 @@ mod harness {
         fixture.cold_authorization();
         rows.extend(view_rows(&fixture).await);
         fixture.cold_authorization();
-        rows.push(file_provider_row(&fixture).await);
-        fixture.cold_authorization();
         rows.push(render_row(&fixture).await);
         fixture.cold_authorization();
         rows.push(project_administration_row(&fixture));
@@ -1349,7 +1331,6 @@ mod harness {
             "published_gaps",
             "own_gaps",
             "all_gaps",
-            "file_provider",
             "render",
             "project_administration",
             "watcher_carriers",

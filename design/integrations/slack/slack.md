@@ -13,7 +13,7 @@ tags:
 # Slack
 
 Slack designs cover the Socket Mode sidecar, Slack-native agent iteration,
-egress, app-home controls, and integration with workflow/system-event surfaces.
+egress, and app-home controls.
 
 ## Docs
 
@@ -23,5 +23,4 @@ egress, app-home controls, and integration with workflow/system-event surfaces.
 ## Crosscuts
 
 - [Integrations](../integrations.md)
-- [Operations Events](../../operations/events/evented-coordination.md)
 - [Surfaces](../../surfaces/surfaces.md)

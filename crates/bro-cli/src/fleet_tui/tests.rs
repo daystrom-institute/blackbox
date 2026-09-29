@@ -160,11 +160,11 @@ fn render_thinking_blocks_as_consistent_quote_lane() {
 fn render_transcript_can_hide_tool_responses() {
     let items = vec![
         TranscriptItem::ToolCall {
-            name: "mcp__blackbox__bbox_search".into(),
+            name: "mcp__blackbox__bbox_hybrid_search".into(),
             args: serde_json::json!({"query": "fleet tui"}).to_string(),
         },
         TranscriptItem::ToolResult {
-            tool: Some("mcp__blackbox__bbox_search".into()),
+            tool: Some("mcp__blackbox__bbox_hybrid_search".into()),
             content: "sensitive result body".into(),
             is_error: false,
             rider: None,
@@ -185,7 +185,11 @@ fn render_transcript_can_hide_tool_responses() {
     .map(line_text)
     .collect();
 
-    assert!(rendered.iter().any(|line| line.contains("bbox_search")));
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("bbox_hybrid_search"))
+    );
     assert!(
         !rendered
             .iter()
@@ -1177,14 +1181,14 @@ fn compact_tool_call_line_summarizes_content_search() {
 #[test]
 fn compact_tool_call_line_renders_mcp_calls_with_leaf_name_and_named_args() {
     let line = compact_tool_call_line(
-        "mcp__blackbox__bbox_search",
+        "mcp__blackbox__bbox_hybrid_search",
         r#"{"query":"fleet tui","project":"/repo","limit":5}"#,
         120,
     )
     .unwrap();
     assert_eq!(
         line,
-        r#"▸ bbox_search(query="fleet tui", limit=5, project=/repo)"#
+        r#"▸ bbox_hybrid_search(query="fleet tui", limit=5, project=/repo)"#
     );
 }
 

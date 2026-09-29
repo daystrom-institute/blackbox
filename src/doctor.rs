@@ -1,8 +1,7 @@
 //! `bbox_doctor` v0: one read-only "what do I need to know right now?"
 //! surface (design/operations/config-artifacts/ops-artifact-bundles-and-doctor.md,
 //! Phase 5 pulled forward). Aggregates existing health signals in-process
-//! and classifies findings; it never mutates stores, enqueues notes, or
-//! emits inbox items.
+//! and classifies findings; it never mutates stores or enqueues notes.
 //!
 //! v0 ships the substrate-independent sections only: daemon, index,
 //! code sources, vectors, graph, projects, checkout access, memories,
@@ -1677,7 +1676,7 @@ fn attention_section(state: &crate::server::state::SharedState) -> SectionReport
         } else {
             Finding::info(format!("unresolved notes: {summary}"))
         };
-        findings.push(finding.with_next("bbox_inbox() to triage".to_string()));
+        findings.push(finding.with_next("bbox_notes() to triage".to_string()));
     }
 
     let failed_tasks = {

@@ -163,7 +163,7 @@ rust-arch-pathology
                          measurements, posts diagnosis candidates tagged with
                          current authority grade, and requests authority
                          promotion when evidence is weak
-  whiteboard review ... specialists challenge/corroborate candidates, merge
+  panel review ........ specialists challenge/corroborate candidates, merge
                          overlapping claims, reject compiler/lint-shaped
                          findings, and choose remediation slices
                          weak or conflicting evidence loops back to targeted
@@ -497,10 +497,10 @@ repeated complaints about a file, failed refactor attempts, public API opt-out
 debates, compile-fix churn, or abandoned module-split plans. Narrative alone is
 insufficient.
 
-Primary measurements: `bbox_search` for operator complaints, `bbox_notes` for
-agent-side pain, `bbox_thread_list` for abandoned work threads,
-`bbox_hybrid_search` for related design docs and decisions, and git log for
-fix/revert density.
+Primary measurements: `bbox_hybrid_search` for operator complaints in
+conversations and for related design docs and decisions, `bbox_notes` for
+agent-side pain, `bbox_thread_list` for abandoned work threads, and git log
+for fix/revert density.
 
 Correction-plan output: transcript anchors, dates, current code state, trend,
 and how history corroborates or reorders other atom diagnoses.
@@ -719,7 +719,7 @@ they were shipped.
 ## Future work
 
 - Implement a `rust-arch-pathology` workflow artifact with cheap survey,
-  hotspot selection, focused atom runs, whiteboard review, and correction-plan
+  hotspot selection, focused atom runs, panel review, and correction-plan
   emission.
 - Add a Rust pathology brofile/persona that knows the SAST/compiler gate and
   authority-grade vocabulary.

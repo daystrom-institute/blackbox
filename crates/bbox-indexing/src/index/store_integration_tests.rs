@@ -5,7 +5,7 @@
 //! boundary.
 
 use super::writer_actor::IndexWriteOp;
-use super::{SearchParams, TranscriptIndex};
+use super::{HybridWordLane, TranscriptIndex};
 
 #[test]
 fn delete_knowledge_entry_removes_tantivy_doc() {
@@ -55,46 +55,32 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
     let actor = super::writer_actor::IndexWriterActor::spawn_for(&index);
     actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
     actor.flush_blocking().unwrap();
-    let hits = index
-        .search(&SearchParams {
-            query: "tombstone searchable".into(),
-            mode: None,
-            account: None,
-            project: None,
-            role: None,
-            include_subagents: None,
-            limit: Some(5),
-            source: None,
-            author: None,
-            channel: None,
-            exclude_self: None,
-        })
-        .unwrap();
+    let hits = format!(
+        "{:?}",
+        index
+            .word_lane_hits(&HybridWordLane {
+                query: "tombstone searchable",
+                limit: 5,
+                ..HybridWordLane::default()
+            })
+            .unwrap()
+    );
     assert!(hits.contains("tombstone"), "{hits}");
     assert!(hits.contains("searchable"), "{hits}");
 
     actor.enqueue(IndexWriteOp::DeleteKnowledge("abc12345".to_string()));
     actor.flush_blocking().unwrap();
-    let hits = index
-        .search(&SearchParams {
-            query: "tombstone searchable".into(),
-            mode: None,
-            account: None,
-            project: None,
-            role: None,
-            include_subagents: None,
-            limit: Some(5),
-            source: None,
-            author: None,
-            channel: None,
-            exclude_self: None,
-        })
-        .unwrap();
-    assert!(
-        hits == "No results found."
-            || hits == bbox_corpus_index::index::search::EMPTY_INDEX_MESSAGE,
-        "{hits}"
+    let hits = format!(
+        "{:?}",
+        index
+            .word_lane_hits(&HybridWordLane {
+                query: "tombstone searchable",
+                limit: 5,
+                ..HybridWordLane::default()
+            })
+            .unwrap()
     );
+    assert_eq!(hits, "[]", "{hits}");
 }
 
 #[test]
@@ -142,21 +128,16 @@ fn knowledge_entries_are_searchable_after_reindex() {
     .unwrap();
     index.build_index(false, &[]).unwrap();
 
-    let hits = index
-        .search(&SearchParams {
-            query: "durable zebra phrase".into(),
-            mode: None,
-            account: None,
-            project: None,
-            role: None,
-            include_subagents: None,
-            limit: Some(5),
-            source: None,
-            author: None,
-            channel: None,
-            exclude_self: None,
-        })
-        .unwrap();
+    let hits = format!(
+        "{:?}",
+        index
+            .word_lane_hits(&HybridWordLane {
+                query: "durable zebra phrase",
+                limit: 5,
+                ..HybridWordLane::default()
+            })
+            .unwrap()
+    );
     assert!(hits.contains("durable"), "{hits}");
     assert!(hits.contains("zebra"), "{hits}");
     assert!(hits.contains("phrase"), "{hits}");

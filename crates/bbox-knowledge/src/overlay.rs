@@ -1,7 +1,7 @@
 //! Dark provisional knowledge overlays.
 //!
 //! This module computes immutable checkout snapshots without merging them into
-//! the live knowledge store, index, render, graph, or inbox. That separation is
+//! the live knowledge store, index, render, or graph. That separation is
 //! the slice-3.3 behavior boundary: diagnostics become available while current
 //! retrieval remains unchanged until the visibility contract lands.
 

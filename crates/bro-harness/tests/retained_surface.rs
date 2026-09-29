@@ -32,7 +32,7 @@ impl McpSurface for CorpusSurface {
         if self.unavailable {
             anyhow::bail!("fixture capability server unavailable");
         }
-        Ok(["bbox_corpus_search", "bbox_reindex"]
+        Ok(["bbox_hybrid_search", "bbox_reindex"]
             .into_iter()
             .map(|name| McpToolSpec {
                 name: name.into(),
@@ -45,7 +45,7 @@ impl McpSurface for CorpusSurface {
 
     async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult> {
         self.calls.lock().unwrap().push((tool.into(), input));
-        if tool != "bbox_corpus_search" {
+        if tool != "bbox_hybrid_search" {
             anyhow::bail!("non-corpus tool must not be dispatched in this fixture");
         }
         Ok(ToolResult::Json(corpus_evidence()))
@@ -145,7 +145,7 @@ async fn corpus_only_catalog_dispatches_without_atom_or_workflow_capabilities() 
     assert_native_read(&registry, &host, &cx).await;
     let input = json!({"query": "retained corpus 語", "limit": 1});
     let expected = json!({"content":[],"structuredContent":corpus_evidence(),"isError":false});
-    for name in ["corpus_search", "mcp__blackbox__bbox_corpus_search"] {
+    for name in ["corpus_search", "mcp__blackbox__bbox_hybrid_search"] {
         match registry.dispatch(name, input.clone(), &cx).await {
             ToolResult::Json(value) => assert_eq!(value, expected),
             other => panic!("corpus flat dispatch failed: {other:?}"),
@@ -166,7 +166,7 @@ async fn corpus_only_catalog_dispatches_without_atom_or_workflow_capabilities() 
     }
     assert_eq!(
         *server.calls.lock().unwrap(),
-        vec![("bbox_corpus_search".into(), input); 4],
+        vec![("bbox_hybrid_search".into(), input); 4],
         "both projected names and call surfaces must preserve server method and arguments"
     );
 }
@@ -194,7 +194,7 @@ async fn denied_or_unavailable_corpus_never_disables_native_tools_or_fabricates_
         assert_native_read(&registry, &host, &cx).await;
         for name in [
             "corpus_search",
-            "mcp__blackbox__bbox_corpus_search",
+            "mcp__blackbox__bbox_hybrid_search",
             "atom_invoke",
         ] {
             assert!(!registry.contains(name));

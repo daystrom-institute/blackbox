@@ -12,7 +12,7 @@
 //! path used to run inline in the daemon (login-shell bin resolution, env
 //! hygiene, stdin control writer, stdout line pump, stderr collection, waiter
 //! ordering); the daemon keeps the *state half* (task store,
-//! roster/tail/system events, `ingest_harness_event` over the line stream,
+//! roster/tail events, `ingest_harness_event` over the line stream,
 //! terminal publication).
 //!
 //! There is no longer a second, inline way to start a harness worker. Every

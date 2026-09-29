@@ -4,7 +4,7 @@
 The facilitator is an LLM emitting a large strict-JSON DAG in one pass, so it
 reliably slips on a few *deterministic* details that do not need a model to fix:
 
-1. sub_unit.bytes that disagree with the measured ref-size sum.
+1. sub_unit.bytes that disagree with the evidence-bundle byte sum.
 2. A ref transcribed wrong (e.g. a spliced 40-char commit SHA) that no longer
    resolves — but whose intended canonical ref is unambiguous in the evidence
    bundle.
@@ -93,7 +93,7 @@ def snap_ref(ref, canonical):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dag", required=True)
-    p.add_argument("--ref-size", required=True)
+    p.add_argument("--ref-size", default="{}")
     p.add_argument("--evidence", default="{}")
     args = p.parse_args()
 
@@ -101,8 +101,8 @@ def main():
     ref_size = load("ref-size", args.ref_size)
     evidence = load("evidence", args.evidence)
 
-    # Byte authority: this turn's ref-size measurement, backed by the
-    # inlet-measured evidence sizes (used for snapped/canonical refs).
+    # Byte authority: the inlet evidence sizes, overridden per ref by an
+    # optional ref-size payload.
     canonical = evidence_ref_sizes(evidence)
     sizes = {**canonical, **ref_size_index(ref_size)}
 
@@ -114,7 +114,7 @@ def main():
             # Repair corrupted refs to their canonical evidence ref.
             repaired = [snap_ref(ref, canonical) if isinstance(ref, str) else ref for ref in refs]
             unit["refs"] = repaired
-            # Recompute bytes from measurement once every ref resolves.
+            # Recompute bytes once every ref has a known size.
             if repaired and all(isinstance(ref, str) and ref in sizes for ref in repaired):
                 unit["bytes"] = sum(sizes[ref] for ref in repaired)
 

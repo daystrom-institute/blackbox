@@ -59,9 +59,8 @@ Two categories are **already auto-loaded** and are NOT manual-install gaps:
   [Macro Management](#macro-management).
 
 New tool families exist that v1 did not account for: `macro_*` (registry-backed
-macro lifecycle), `reaction_*` (event-reaction inlets, `src/system_events/`),
-and `identity_*` (read-only actor identities). Reactions are an inlet-class
-managed kind; identities are read-only and out of scope.
+macro lifecycle) and `identity_*` (read-only actor identities). Identities are
+read-only and out of scope.
 
 The sections below have been updated against this reality. Where a section still
 reflects v1 framing, the regrounded detail is called out inline.
@@ -91,7 +90,7 @@ invisibility is historical, not principled.
 
 The current day-2 runbooks also scatter health and upgrade checks across
 `bbox_stats`, `bbox_embed_status`, `bbox_project_list`, `bbox_describe_schema`,
-`bbox_inbox`, `bbox_lint`, systemd journal inspection, and manual reindex or
+`bbox_lint`, systemd journal inspection, and manual reindex or
 re-embed decisions. There is no single "what do I need to know about Blackbox
 right now?" tool, and no upgrade helper that mechanizes required post-upgrade
 actions.
@@ -224,14 +223,6 @@ Newly surfaced subsystems and gaps (2026-05-30 regrounding):
   `macro_register`/`macro_unregister` (`src/tools/macros.rs:341-405`), not the
   artifact catalog. Macro identity is `id`; specs carry `version` (currently
   "not yet consumed — the registry resolves by id only").
-- **Reactions are an inlet-class kind with a parallel lifecycle tool.**
-  `ReactionSpec` (`src/system_events/types.rs:324-341`) carries `name`,
-  `version: u32`, `event_kinds`, `when`, `action`, `retry`, `on_failure`.
-  `reaction_install` "Validates and persists to disk"
-  (`src/tools/system_events.rs:236`), persisting under a reactions dir, exactly
-  paralleling `bro_cron_install`/`bro_poller_install`/`bro_webhook_install`.
-  There are no shipped reaction defaults yet. `identity_get`/`identity_list` are
-  read-only (no install path) and out of scope.
 - **Workflow activation does not stage assets.** The `Workflow` arm only
   compiles, capability-validates, and writes the spec to `store_dir/workflows`
   (`routes.rs:1027-1041`). But shipped workflows reference sibling assets by
@@ -351,7 +342,6 @@ Initial managed kinds:
 | `cron` | cron registry | `name` | validate schedule + routing packet, persist, spawn loop |
 | `poller` | poller registry | `name` | validate fetch/selector shape + routing packet, persist, spawn loop |
 | `webhook` | webhook registry | `name` | validate signature policy + routing packet, persist endpoint |
-| `reaction` | `EventHub` | `name` | validate `event_kinds`/`action`, persist spec, register in `EventHub` (event-reaction inlet; **not** an HTTP endpoint) |
 
 Notes on the kind table:
 
@@ -364,13 +354,6 @@ Notes on the kind table:
   instantiated roster. Both are owned by `src/orchestration/team.rs`, and both
   retire the `install-teams.sh` shell path — see
   [Team And Teamplate Activation](#team-and-teamplate-activation).
-- `reaction` is added now for surface consistency even though no defaults ship
-  yet: `reaction_install`/`reaction_list` already duplicate the inlet lifecycle
-  the catalog should own. Reactions persist a JSON spec under the reactions dir
-  and register in `EventHub` (`src/system_events/hub.rs`); there is no HTTP
-  endpoint and, critically, **no remove API today** — `EventHub` exposes install
-  + restore but no `remove_reaction`. That teardown method is a prerequisite
-  before `reaction` deactivation/removal can be wired (see impl Phase 1).
 - `identity` (`identity_get`/`identity_list`) is read-only and is **not** a
   managed kind.
 
@@ -653,7 +636,6 @@ Extend `kind` to include:
   completion)
 - `poller`
 - `webhook`
-- `reaction`
 - `macro` (identity field is `id`; replaces the `include_str!` builtins)
 - `teamplate`
 - `team` (gains a real activator; no longer catalog-only)
@@ -848,16 +830,9 @@ The desired end state removes kind-specific ops lifecycle tools from MCP:
 | `bro_webhook_list` | `bbox_artifact_list(kind="webhook")` plus doctor inlet section |
 | `bro_workflow_install` | `bbox_artifact_install(kind="workflow", source=...)` |
 | `bro_workflow_list` | `bbox_artifact_list(kind="workflow")` |
-| `reaction_install` | `bbox_artifact_install(kind="reaction", source=...)` |
-| `reaction_list` | `bbox_artifact_list(kind="reaction")` plus doctor inlet section |
 | `install-teams.sh` shell script | `bbox_artifact_install(kind="team"/"teamplate", source=...)` via the agentic-corpus bundle |
 | `bro_cron_upcoming` | `bbox_cron_upcoming` |
 | `include_str!` builtin macros | `bbox_artifact_install(kind="macro", source=...)` via the refactor bundle |
-
-`reaction_install`/`reaction_list` are removed for the same reason as the other
-inlet lifecycle tools. Keep `reaction_execute`, `reaction_replay`,
-`reaction_retry`, and `reaction_deliveries` — they are diagnostics/actions, the
-reaction analog of `bro_webhook_replay`/`bro_webhook_deliveries`.
 
 `macro_register`/`macro_unregister` are **not** removed: they remain the
 interactive surface for ad-hoc project-scope macros (they require `project_dir`
@@ -885,7 +860,7 @@ place to reason about install/uninstall/provenance/upgrade behavior.
 Bundle order may be explicit, but the installer should still validate obvious
 dependency edges:
 
-- cron/poller/webhook/reaction routing packets must exist before activation.
+- cron/poller/webhook routing packets must exist before activation.
 - workflow references to packets, atoms, brofiles, teams, subworkflows, and MCP
   hook targets must validate before activation.
 - workflow **assets** (scripts/fixtures referenced by repo-relative path, e.g.
@@ -899,7 +874,7 @@ dependency edges:
 
 Activation order for the system-default surface therefore settles to roughly:
 packets → brofiles → macros/agents/atoms → teamplates → teams →
-workflows → inlets (cron/poller/webhook/reaction). The bundle planner enforces
+workflows → inlets (cron/poller/webhook). The bundle planner enforces
 the edges it can detect; explicit bundle order covers the rest until Phase 7
 auto-ordering lands.
 
@@ -1012,7 +987,7 @@ Checks:
 - project registry presence and stale project paths
 - EdgeIndex sidecar compaction pressure
 - knowledge/render hygiene via `bbox_lint` summary
-- inbox unresolved blocked/dispute/surprise count
+- unresolved blocked/dispute/surprise note count (`bbox_notes`)
 - active/pending tasks that may conflict with upgrade operations
 
 Apply-mode actions:
@@ -1104,7 +1079,7 @@ Sections:
   macros that are not yet catalog-managed (i.e. still relying on a stale
   compiled-in builtin); teamplates/teams present in the store but uncataloged
   (e.g. left over from `install-teams.sh`)
-- `inlets`: installed webhooks/pollers/crons/reactions, routing packet
+- `inlets`: installed webhooks/pollers/crons, routing packet
   existence, running tick loops for poller/cron specs
 - `workflows`: installed workflow count, missing referenced packets/atoms/
   brofiles where statically detectable, and **missing workflow assets**
@@ -1113,7 +1088,7 @@ Sections:
   (auto-loaded surface, not catalog-managed)
 - `knowledge`: `bbox_lint` severity summary and rendered-file freshness if
   detectable
-- `attention`: unresolved inbox counts by kind
+- `attention`: unresolved note and gap counts by kind
 
 Doctor output must classify findings:
 
@@ -1156,7 +1131,6 @@ pub enum ArtifactKind {
     Cron,
     Poller,
     Webhook,
-    Reaction,   // event-reaction inlet
     Bundle,
 }
 ```
@@ -1210,7 +1184,7 @@ High-level order:
 - No systemd restart orchestration inside MCP tools.
 - No indefinite compatibility layer for redundant ops lifecycle tools.
 - No new public kind-specific uninstall tools.
-- No inbox or note spam for successful user-directed installs/upgrades. The
+- No note spam for successful user-directed installs/upgrades. The
   user asked for the operation; the result belongs in the tool response and
   operation log, not in the attention queue.
 
@@ -1218,7 +1192,7 @@ High-level order:
 
 Bundle generation records live under the artifact catalog. Doctor and
 `bbox_upgrade_check` can read those records and surface failed/stale operations
-on demand. They must not emit inbox items for normal install history.
+on demand. They must not emit notes for normal install history.
 
 Project-scoped bundles belong under `.bbox/bundles/` so they follow git with
 the rest of a repo's local machinery. Auto-apply is controlled by the bundle
@@ -1274,10 +1248,7 @@ drift and require an explicit operator choice:
   `team` are separate kinds with activators that call `save_teamplate`/
   `save_team`. `contradiction-specialists` is promoted to a shipped JSON owned by
   the agentic-corpus bundle.
-- **Reactions are added as an inlet kind now** for surface consistency, with
-  `reaction_install`/`reaction_list` removed in favor of the artifact path and
-  `reaction_execute`/`replay`/`retry`/`deliveries` kept as diagnostics, even
-  though no reaction defaults ship yet. Identities remain read-only and excluded.
+- Identities remain read-only and excluded.
 - **Workflow assets are first-class.** The real fix is an `${asset_root}`
   executor interpolation that resolves asset paths independent of the run's
   `project_dir` (shell `cwd` resolves to the run project/worktree, so

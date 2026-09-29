@@ -29,7 +29,6 @@ members = [
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
     "crates/bbox-project-graph",
-    "crates/bbox-source-graph",
     "crates/bbox-code-source",
     "crates/bbox-code-source-store",
     "crates/bbox-code-collector",
@@ -62,11 +61,9 @@ members = [
     "crates/bbox-project-render",
     "crates/bbox-threads",
     "crates/bbox-gaps",
-    "crates/bbox-inbox",
     "crates/bbox-slack",
     "crates/bbox-edge-index",
     "crates/bbox-tool-docs",
-    "crates/bbox-system-events",
     "crates/bbox-indexing",
     "crates/bbox-providers",
     "crates/bbox-embed",
@@ -233,11 +230,9 @@ bbox-knowledge = { path = "crates/bbox-knowledge" }
 bbox-project-render = { path = "crates/bbox-project-render" }
 bbox-threads = { path = "crates/bbox-threads" }
 bbox-gaps = { path = "crates/bbox-gaps" }
-bbox-inbox = { path = "crates/bbox-inbox" }
 bbox-slack = { path = "crates/bbox-slack" }
 bbox-edge-index = { path = "crates/bbox-edge-index" }
 bbox-tool-docs = { path = "crates/bbox-tool-docs" }
-bbox-system-events = { path = "crates/bbox-system-events" }
 bbox-indexing = { path = "crates/bbox-indexing" }
 bbox-providers = { path = "crates/bbox-providers" }
 bbox-embed = { path = "crates/bbox-embed" }

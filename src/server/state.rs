@@ -19,10 +19,7 @@ use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
-use crate::{
-    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links, system_events,
-    whiteboards,
-};
+use crate::{artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -278,14 +275,6 @@ pub(crate) struct SharedState {
     pub(crate) roster_view: Arc<orchestration::RosterView>,
     pub(crate) store_dir: PathBuf,
 
-    /// Whiteboards — multi-agent deliberation boards shared between
-    /// in-workflow ensembles, in-workflow facilitators, and external
-    /// agents (operator's Claude, dispatched help, eventually humans
-    /// through slack/ntfy adapters). Phase transitions emit routed
-    /// signals through `dispatch_routed_event` so wait_for_phase
-    /// nodes resume on the same pipeline webhook ingress uses.
-    pub(crate) whiteboards: whiteboards::SharedRegistry,
-
     /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
     /// All resume paths must acquire this before spawning a provider
     /// resume process and hold it until the task reaches a terminal
@@ -307,7 +296,6 @@ pub(crate) struct SharedState {
     // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
-    pub(crate) system_events: system_events::SharedEventHub,
 }
 
 pub(crate) struct CodeReadView {
@@ -654,7 +642,6 @@ impl SharedState {
             },
             packets: &self.packets,
             artifacts: &self.artifacts,
-            whiteboards: self.whiteboards.as_ref(),
             project_graph_views: &self.project_graph_views,
             store_dir: &self.store_dir,
         }
@@ -907,7 +894,6 @@ impl SharedState {
 
 
 
-            whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
 
 
 
@@ -931,9 +917,6 @@ impl SharedState {
                 crate::vectors::VectorStore::open(store_dir.join("vectors"))
                     .expect("test vector store should open"),
             ),
-            system_events: Arc::new(system_events::EventHub::new(
-                system_events::EventStore::new_at(store_dir.join("events").join("journal")),
-            )),
         }
     }
 
@@ -1264,14 +1247,12 @@ mod clause_one_exit_proof {
     /// order. Deleting a row therefore fails rather than silently reducing
     /// coverage, which is how this proof came to cover two operations while
     /// claiming twelve.
-    const REQUIRED_OPERATIONS: [&str; 11] = [
+    const REQUIRED_OPERATIONS: [&str; 9] = [
         "lexical search",
         "hybrid search",
         "graph inspect",
         "graph path traversal",
         "evidence bundle",
-        "entity-ref resolution",
-        "project-file provider",
         "storage GC",
         "collected activation and rebuild",
         "published knowledge",
@@ -1461,7 +1442,9 @@ mod clause_one_exit_proof {
         }
 
         compare!("lexical search", server => server
-            .bbox_search(Parameters(params(serde_json::json!({"query": "published"}))))
+            .bbox_hybrid_search(Parameters(params(serde_json::json!({
+                "query": "published", "mode": "fulltext", "include_vectors": false,
+            }))))
             .await);
         compare!("hybrid search", server => server
             .bbox_hybrid_search(Parameters(params(serde_json::json!({"query": "published"}))))
@@ -1482,16 +1465,6 @@ mod clause_one_exit_proof {
                 "entity_refs": ["knowledge:knowledge-a"],
                 "path_ids": [],
             }))))
-            .await);
-        compare!("entity-ref resolution", server => server
-            .bbox_ref_size(Parameters(params(
-                serde_json::json!({"refs": ["knowledge:knowledge-a"]})
-            )))
-            .await);
-        compare!("project-file provider", server => server
-            .bbox_ref_size(Parameters(params(
-                serde_json::json!({"refs": ["file:src/lib.rs"]})
-            )))
             .await);
         let expected_gc = complete_gc_semantics(&populated).await;
         let actual_gc = complete_gc_semantics(&recordless).await;
@@ -1967,23 +1940,16 @@ mod code_read_view_tests {
         state
             .idx
             .read()
-            .search_with_active_selectors_and_searcher(
-                &crate::index::SearchParams {
-                    query: query.into(),
-                    mode: None,
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(5),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
+            .hybrid_word_lane_hits(
+                &crate::index::HybridWordLane {
+                    query,
+                    limit: 5,
+                    ..Default::default()
                 },
                 &view.active_selectors,
                 &view.searcher,
             )
+            .map(|hits| format!("{hits:?}"))
             .unwrap()
     }
 

@@ -106,15 +106,11 @@ disallow = [
 
 [surfaces.readonly]
 allow = [
-    "bbox_search",
-    "bbox_cite",
     "bbox_context",
     "bbox_messages",
     "bbox_session",
     "bbox_sessions_list",
-    "bbox_topics",
     "bbox_hybrid_search",
-    "bbox_discover_seed_entities",
     "bbox_inspect_entity",
     "bbox_describe_schema",
     "bbox_find_paths",
@@ -122,7 +118,6 @@ allow = [
     "bbox_knowledge",
     "bbox_thread_list",
     "bbox_notes",
-    "bbox_inbox",
     "bbox_packet_list",
     "bbox_packet_events",
     "bbox_project_list",

@@ -1006,7 +1006,6 @@ fn retire_refuses_on_a_producer_assignment() {
     for class in [
         "producer_assignments",
         "artifact_rows",
-        "whiteboard_rows",
         "packet_rows",
         "slack_channel_bindings",
         "slack_proposal_links",

@@ -19,19 +19,15 @@ and edge families.
 
 ```
 1. bbox_describe_schema           # orient — entity types + edge families
-2. bbox_hybrid_search(query, k=5) # seeds — mixed-modal results with notable_edges
+2. bbox_hybrid_search(query, k=5) # seeds - mixed-modal ranked entity refs
 3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call
 4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains
 5. bbox_bundle_evidence(...)      # answer — package refs + path_ids
 ```
 
-`bbox_discover_seed_entities` is `bbox_hybrid_search` plus emphasis on
-notable_edges for orientation; either tool returns seeds you can hand
-to step 3.
-
 ## Domain orientation (memorize once per session)
 
-**12 entity types** the graph contains:
+**11 entity types** the graph contains:
 
 | Type | Population | Use it for |
 |---|---|---|
@@ -43,7 +39,6 @@ to step 3.
 | `note` | structured side-channel records (dispute/done/etc) | "what's pending review?" |
 | `symbol` | named code symbols (functions, types, modules) | "what calls X?" |
 | `brofile` | persona+model+lens triple | "what brofile dispatched this?" |
-| `whiteboard` | multi-agent deliberation surface | "what did the contradiction-review board decide?" |
 | `commit` | git commits with parent + touched-file edges | "what changed in commit X?" |
 | `task` (virtual) | bro_exec dispatch unit | "what produced this artifact?" |
 | `bash_call` (virtual) | one shell invocation in a transcript | "what did this command emit?" |
@@ -95,9 +90,8 @@ for each family.
 
 6. **Per-file collapse is on by default.** Search and find_paths return
    ONE entity per file by default (the highest-scoring or shortest-
-   path chunk). If you need multiple chunks of the same file, the
-   chunk's notable_edges already point you to siblings via
-   `NEXT_SECTION`.
+   path chunk). If you need multiple chunks of the same file, inspect
+   the chunk: its `NEXT_SECTION` edges point to siblings.
 
 ## Final-answer protocol — verify by question type
 
@@ -181,10 +175,10 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 
 - **Single bbox_knowledge call as the entire grounding step.** Knowledge
   is rendered RULES, not corpus. Most questions need search-or-graph too.
-- **Iterating bbox_search 5 different ways.** If 2-3 reformulations
-  don't surface the answer, switch to `bbox_hybrid_search` (vector lane
-  catches paraphrases) or `bbox_describe_schema` (you may be looking at
-  the wrong entity type).
+- **Iterating keyword queries 5 different ways.** If 2-3 reformulations
+  don't surface the answer, drop the narrowing filters on
+  `bbox_hybrid_search` (vector lane catches paraphrases) or switch to
+  `bbox_describe_schema` (you may be looking at the wrong entity type).
 - **Inventing entity refs.** If you didn't read it from a tool response
   this turn, query for it. The bad_input error returns a `suggested_fix`.
 - **Truncating paths in the answer.** When the user asks

@@ -47,7 +47,6 @@ use bbox_gaps::gap_spool;
 use bbox_gaps::gaps;
 // `git` extracted into bbox-corpus-core (stage 0); aliased back to `crate::git`.
 use bbox_corpus_core::git;
-use bbox_inbox::inbox;
 use bbox_indexing::index;
 // `json_store` extracted into bbox-corpus-core; aliased back to
 // `crate::json_store` so existing call sites resolve unchanged.
@@ -85,7 +84,6 @@ use bbox_edge_index::storage_health;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_stores::store_persister;
-use bbox_system_events::system_events;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve
 // unchanged.
@@ -100,7 +98,6 @@ pub use bbox_util::util;
 // call sites resolve unchanged.
 use bbox_artifacts::watcher;
 use bbox_vectors as vectors;
-use bbox_whiteboards::whiteboards;
 
 /// Initialize the process-wide system-memory catalog for tests. The
 /// repo-root `system-defaults/memories` path is owned here (the root crate),

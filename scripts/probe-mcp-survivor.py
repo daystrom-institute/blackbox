@@ -207,8 +207,6 @@ try:
  call('bbox_artifact_list',{'kind':'agent','body_limit':512,'limit':1},True)
  call('bro_allocator_probe',{'provider':'glm','clear':True,'raw_summary':'contradictory'},True)
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
- measured=exact('bbox_ref_size',{'refs':[long_ref],'body_limit':4096})
- assert measured['status']=='degraded' and measured['degraded']['unresolved_refs'][0]['ref']==long_ref
  print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
  for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:

@@ -77,7 +77,7 @@ only covers configured roots.
 
 Source publication and index freshness are separate. A durable publish receipt
 confirms stored source bytes; the index writer subsequently projects them.
-Native `bbox_context`, `bbox_messages`, `bbox_session`, and `bbox_topics` read
+Native `bbox_context`, `bbox_messages`, and `bbox_session` read
 indexed projections and disclose their limitations. Context, messages, and session
 responses include bounded source observations: whether the indexed generation
 matches the published generation, publication time, producer contact time,

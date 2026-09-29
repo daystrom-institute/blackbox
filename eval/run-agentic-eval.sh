@@ -91,12 +91,12 @@ Expected evidence type: {manifest["required_evidence"]}
 Forbidden stale answers: {manifest.get("forbidden_stale_answers", [])}
 """
 if strategy == "search-only":
-    instructions = "Use only bbox_search. Collect canonical entity refs from the search result metadata or snippets when present."
+    instructions = "Use only bbox_hybrid_search with doc_type=\"transcript\". Collect canonical entity refs from the entity_id values of the result rows."
 elif strategy == "static-hybrid":
     instructions = "Call bbox_hybrid_search exactly once. Do not inspect or traverse. Collect entity_id values from the result rows."
 else:
     instructions = """Use the full agentic loop:
-1. bbox_discover_seed_entities for seeds.
+1. bbox_hybrid_search for seeds.
 2. bbox_inspect_entity on the best 1-3 seeds.
 3. bbox_find_paths when the question asks for provenance, a chain, or cross-modal evidence.
 4. bbox_bundle_evidence with the final entity_refs and path_ids.
@@ -177,7 +177,7 @@ refs = payload.get("collected_entity_refs") or []
 if not isinstance(refs, list):
     refs = []
 if not refs:
-    pattern = r"\b(?:knowledge|project_file|symbol|transcript|session|thread|note|brofile|whiteboard|commit|task|bash_call):[A-Za-z0-9_./:@|+~=-]+"
+    pattern = r"\b(?:knowledge|project_file|symbol|transcript|session|thread|note|brofile|commit|task|bash_call):[A-Za-z0-9_./:@|+~=-]+"
     refs = re.findall(pattern, raw)
 refs = list(dict.fromkeys(str(ref).rstrip(".,;)") for ref in refs))
 

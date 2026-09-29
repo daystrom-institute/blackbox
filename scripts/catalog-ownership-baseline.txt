@@ -55,7 +55,6 @@ canonical_path_read	src/server/repo_io.rs	fn gap_base_carriers	1	delete with Pro
 canonical_path_read	src/server/repo_io.rs	fn knowledge_base_carriers	1	delete with ProjectRecord
 canonical_path_read	src/server/routes.rs	fn enqueue_project_knowledge_embeds	1	delete with ProjectRecord
 canonical_path_read	src/server/store_helpers.rs	fn sync_knowledge_entry_to_index	1	delete with ProjectRecord
-canonical_path_read	src/tools/graph.rs	fn lexical_absolute_selection	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn prepare_knowledge_write	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_eject	1	delete with ProjectRecord
@@ -121,8 +120,6 @@ checkout_root_path	src/server/repo_io.rs	fn with_access	1	collapse into the leas
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_resolve	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_update	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn acquire_file_selection	1	collapse into the lease confined readers
-checkout_root_path	src/tools/graph.rs	fn lexical_absolute_selection	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
@@ -195,7 +192,6 @@ project_record_import	src/server/knowledge_lifecycle.rs	<file scope>	1	delete wi
 project_record_import	src/server/knowledge_view.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/producer_auth.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/repo_io.rs	<file scope>	1	delete with the v1 record type
-project_record_import	src/tools/graph.rs	<file scope>	1	delete with the v1 record type
 repo_io_selected_target	src/server/repo_io.rs	fn base_carrier_target	1	delete Selected/Checkout; Attachment remains
 repo_io_selected_target	src/server/repo_io.rs	fn gap_checkout_carrier_for_ids	1	delete Selected/Checkout; Attachment remains
 repo_io_selected_target	src/server/repo_io.rs	fn knowledge_checkout_carrier	1	delete Selected/Checkout; Attachment remains

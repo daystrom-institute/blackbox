@@ -1563,17 +1563,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|team| team.project_dir.as_deref() == Some(project))
         .count();
-    let whiteboards = state
-        .whiteboards
-        .list_ids()
-        .iter()
-        .filter(|id| {
-            state
-                .whiteboards
-                .get(id)
-                .is_some_and(|board| board.read().project == project)
-        })
-        .count();
     let gaps = state
         .gaps
         .read()
@@ -1590,7 +1579,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "whiteboards": whiteboards,
         "gaps": gaps,
     }))
 }
@@ -1848,9 +1836,6 @@ pub(crate) fn migrate_project_refs(
         .rename_project_refs(old_project, new_project)?;
     let teams =
         orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
-    let whiteboards = state
-        .whiteboards
-        .rename_project_refs(old_project, new_project)?;
 
     let gaps = state
         .gaps
@@ -1865,7 +1850,6 @@ pub(crate) fn migrate_project_refs(
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "whiteboards": whiteboards,
         "gaps": gaps,
     }))
 }
@@ -2487,7 +2471,7 @@ mod tests {
     }
 
     /// Regression for the 2026-08-25 cage index-plane deadlock:
-    /// `bbox_hybrid_search` / `bbox_discover_seed_entities` hold
+    /// `bbox_hybrid_search` holds
     /// `state.idx.read()` across the whole search call, and provider
     /// property/label lookups re-acquire the same lock on the same thread.
     /// A writer queued between the two acquisitions (history activation's
