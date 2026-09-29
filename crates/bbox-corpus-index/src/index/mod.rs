@@ -2491,27 +2491,24 @@ mod tests {
             bbox_code_source::local_selector(&project.project_id),
         )]));
 
-        let result = index
-            .search(&SearchParams {
-                query: "Knowledge".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(5),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
+        let hits = index
+            .word_lane_hits(&HybridWordLane {
+                query: "Knowledge",
+                limit: 5,
+                ..HybridWordLane::default()
             })
             .unwrap();
-        // P3-E: the rendered result carries the RELATIVE path and the display
-        // name; no host root appears anywhere in it.
-        assert!(result.contains("src/lib.rs"), "{result}");
+        // P3-E: the hit carries the project-file identity; no host root
+        // appears anywhere in it.
+        assert!(
+            hits.iter()
+                .any(|hit| hit.entity_id.starts_with("project_file")),
+            "{hits:?}"
+        );
+        let result = serde_json::to_string(&hits).unwrap();
         assert!(
             !result.contains("/tmp/repo"),
-            "a rendered project-file result must carry no host root: {result}"
+            "a project-file hit must carry no host root: {result}"
         );
     }
 
@@ -2592,26 +2589,23 @@ mod tests {
         index.reader_reload_for_test();
 
         let probe = |filter: ProjectFilterInput| {
-            index
-                .search_with_project_filter(
-                    &SearchParams {
-                        query: "stamping probe".into(),
-                        mode: None,
-                        account: None,
-                        project: Some(filter.literal.clone()),
-                        role: None,
-                        include_subagents: None,
-                        limit: Some(10),
-                        source: None,
-                        author: None,
-                        channel: None,
-                        exclude_self: None,
-                    },
-                    Some(&filter),
-                    &index.active_code_selectors(),
-                    &index.searcher(),
-                )
-                .unwrap()
+            let filter = CorpusDocumentFilter {
+                conversation_project: Some(filter),
+                ..CorpusDocumentFilter::default()
+            };
+            let hits = index
+                .word_lane_hits(&HybridWordLane {
+                    query: "stamping probe",
+                    limit: 10,
+                    filter: Some(&filter),
+                    ..HybridWordLane::default()
+                })
+                .unwrap();
+            if hits.is_empty() {
+                "No results found".to_string()
+            } else {
+                format!("{hits:?}")
+            }
         };
 
         // Resolved id: both checkouts of the base project, nothing else.
@@ -2865,6 +2859,7 @@ mod tests {
 }
 
 pub mod code_tokenizer;
+pub mod conversation_lane;
 pub mod embed_hook;
 pub mod git_history;
 pub mod helpers;
@@ -2878,10 +2873,13 @@ pub mod search;
 mod session_catalog;
 pub mod tool_edges;
 
+pub use conversation_lane::{
+    CONVERSATION_DOC_TYPES, ConversationCoordinates, CorpusDocumentFilter, LexicalQueryMode,
+};
 pub use helpers::find_session_file;
 pub use search::{
-    ContextParams, GraphLaneIndexStats, GraphWordAuthority, GraphWordPolicySnapshot,
-    HybridBm25Hit, MessagesParams, ProjectFilterInput, ReindexParams, SearchParams, SessionParams,
+    ContextParams, GraphLaneIndexStats, GraphWordAuthority, GraphWordPolicySnapshot, HybridBm25Hit,
+    HybridWordLane, MessagesParams, ProjectFilterInput, ReindexParams, SessionParams,
     SessionsListParams, graph_lane_boolean_query, graph_lane_stats_for_searcher,
     graph_lanes_for_project_searcher,
 };

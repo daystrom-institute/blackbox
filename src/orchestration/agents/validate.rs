@@ -817,8 +817,8 @@ mod tests {
         let ctx = make_ctx();
         let mut v = minimal_valid_agent();
         v["manifest"]["filter_overlay"] = serde_json::json!({
-            "allow": ["mcp__blackbox__bbox_search"],
-            "disallow": ["mcp__blackbox__bbox_search"]
+            "allow": ["mcp__blackbox__bbox_context"],
+            "disallow": ["mcp__blackbox__bbox_context"]
         });
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_filter_overlay");

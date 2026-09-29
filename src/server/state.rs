@@ -19,9 +19,7 @@ use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
-use crate::{
-    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links,
-};
+use crate::{artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -1465,7 +1463,9 @@ mod clause_one_exit_proof {
         }
 
         compare!("lexical search", server => server
-            .bbox_search(Parameters(params(serde_json::json!({"query": "published"}))))
+            .bbox_hybrid_search(Parameters(params(serde_json::json!({
+                "query": "published", "mode": "fulltext", "include_vectors": false,
+            }))))
             .await);
         compare!("hybrid search", server => server
             .bbox_hybrid_search(Parameters(params(serde_json::json!({"query": "published"}))))
@@ -1972,23 +1972,16 @@ mod code_read_view_tests {
         state
             .idx
             .read()
-            .search_with_active_selectors_and_searcher(
-                &crate::index::SearchParams {
-                    query: query.into(),
-                    mode: None,
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(5),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
+            .hybrid_word_lane_hits(
+                &crate::index::HybridWordLane {
+                    query,
+                    limit: 5,
+                    ..Default::default()
                 },
                 &view.active_selectors,
                 &view.searcher,
             )
+            .map(|hits| format!("{hits:?}"))
             .unwrap()
     }
 

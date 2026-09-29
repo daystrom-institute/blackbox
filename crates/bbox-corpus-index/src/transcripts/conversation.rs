@@ -644,7 +644,7 @@ fn store_error(op: &'static str, error: anyhow::Error) -> TranscriptReadError {
 // session id parses to one of those two shapes: they resolve straight
 // against the landing store, render surrounding messages in channel-time
 // order, and refuse with a message that NAMES a working lane
-// (`bbox_search(channel=...)`) when the channel does not resolve, rather
+// (`bbox_hybrid_search(channel=...)`) when the channel does not resolve, rather
 // than letting a filesystem error render inline or bubble as an opaque
 // `Err`.
 
@@ -701,8 +701,8 @@ pub fn message_ts_digits(message_ts: &str) -> Option<u64> {
 fn not_configured_message() -> String {
     "This server has no Slack conversation source configured, so \
      bbox_context/bbox_messages cannot resolve a slack: locator here. \
-     bbox_search still works regardless (source=\"slack\" or channel=\"...\" \
-     filters)."
+     bbox_hybrid_search still works regardless (source=\"slack\" or \
+     channel=\"...\" filters)."
         .to_string()
 }
 
@@ -710,8 +710,8 @@ fn unknown_channel_message(channel_id: &str) -> String {
     format!(
         "Channel {channel_id} is not indexed on this server right now (not \
          enrolled, never onboarded, or the observing identity is no longer a \
-         member). Try bbox_search(channel=\"{channel_id}\") or \
-         bbox_search(source=\"slack\") to find indexed channels."
+         member). Try bbox_hybrid_search(channel=\"{channel_id}\") or \
+         bbox_hybrid_search(source=\"slack\") to find indexed channels."
     )
 }
 

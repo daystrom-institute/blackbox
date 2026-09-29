@@ -1043,25 +1043,32 @@ fn the_remote_only_population_indexes_and_searches_with_zero_checkout_access() {
         "the edge registered set must include every catalog project, attached or not"
     );
 
-    // Lexical search through the real search API (not a raw selector
+    // Lexical search through the real word-lane API (not a raw selector
     // TermQuery) against the pinned active-selector map.
-    let params = bbox_corpus_index::index::search::SearchParams {
-        query: "remote_only".to_string(),
-        mode: Some("fulltext".to_string()),
-        account: None,
-        project: None,
-        role: None,
-        include_subagents: Some(true),
-        limit: Some(20),
-        source: None,
-        author: None,
-        channel: None,
-        exclude_self: Some(false),
-    };
+    let searcher = runtime.index.searcher();
     let rendered = runtime
         .index
-        .search_with_active_selectors(&params, &selectors)
-        .unwrap();
+        .hybrid_word_lane_hits(
+            &bbox_corpus_index::index::HybridWordLane {
+                query: "remote_only",
+                limit: 20,
+                mode: bbox_corpus_index::index::LexicalQueryMode::Fulltext,
+                ..Default::default()
+            },
+            &selectors,
+            &searcher,
+        )
+        .unwrap()
+        .iter()
+        .filter_map(|hit| {
+            runtime
+                .index
+                .entity_properties_with_searcher(&hit.entity_id, &searcher)
+                .unwrap()
+                .and_then(|properties| properties.get("relative_path").cloned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         rendered.contains("src/lib.rs"),
         "the remote-only collected document must be reachable through search: {rendered}"

@@ -660,7 +660,7 @@ mod tests {
                 surface_rule(
                     "readonly",
                     "readonly",
-                    &["bbox_search", "bbox_stats"],
+                    &["bbox_hybrid_search", "bbox_stats"],
                     &[],
                     "tool_surface",
                 ),
@@ -696,7 +696,7 @@ mod tests {
             .iter()
             .map(|v| v["name"].as_str().unwrap())
             .collect();
-        assert!(visible.contains(&"bbox_search"));
+        assert!(visible.contains(&"bbox_hybrid_search"));
         assert!(visible.contains(&"bbox_stats"));
         assert!(!visible.contains(&"bbox_forget"));
     }

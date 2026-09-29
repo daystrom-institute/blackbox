@@ -111,7 +111,7 @@ impl TranscriptIndex {
     ) -> Result<String> {
         anyhow::ensure!(
             p.name.is_none(),
-            "error.session_names_not_indexed: session names are not retained in the corpus; use project, source, account, or bbox_search instead"
+            "error.session_names_not_indexed: session names are not retained in the corpus; use project, source, account, or bbox_hybrid_search instead"
         );
         let searcher = self.reader.searcher();
         let mut cache = self.session_catalog.lock();

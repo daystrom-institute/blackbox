@@ -446,7 +446,7 @@ mod tests {
         assert!(!f.permits("mcp__blackbox__bro_resume"));
         assert!(!f.permits("mcp__blackbox__bro_cancel")); // matched by bro_*
         // Pinned/allowed tools survive.
-        assert!(f.permits("mcp__blackbox__bbox_search"));
+        assert!(f.permits("mcp__blackbox__bbox_context"));
         assert!(f.permits("mcp__blackbox__bbox_stats"));
         // Built-in (non-MCP-qualified) names are never matched by these.
         assert!(f.permits("file_read"));
@@ -474,7 +474,7 @@ mod tests {
                 "tool_placement": {
                     "mcp__blackbox__bbox_knowledge": "in-box",
                     "mcp__blackbox__bbox_hybrid_search": "out-box",
-                    "mcp__blackbox__bbox_search": "both"
+                    "mcp__blackbox__bbox_context": "both"
                 }
             }"#,
         )
@@ -489,7 +489,7 @@ mod tests {
             Some(&ToolPlacement::OutBox)
         );
         assert_eq!(
-            placements.get("mcp__blackbox__bbox_search"),
+            placements.get("mcp__blackbox__bbox_context"),
             Some(&ToolPlacement::Both)
         );
         assert_eq!(placements.get("mcp__blackbox__unlisted"), None);
@@ -497,7 +497,7 @@ mod tests {
         let tools = vec![
             mock_tool("mcp__blackbox__bbox_knowledge"),
             mock_tool("mcp__blackbox__bbox_hybrid_search"),
-            mock_tool("mcp__blackbox__bbox_search"),
+            mock_tool("mcp__blackbox__bbox_context"),
             mock_tool("mcp__blackbox__unlisted"),
         ];
         let (in_box, out_box) = split_mcp_tools_by_placement(&tools, &placements);
@@ -507,14 +507,14 @@ mod tests {
             in_names,
             vec![
                 "mcp__blackbox__bbox_knowledge",
-                "mcp__blackbox__bbox_search"
+                "mcp__blackbox__bbox_context"
             ]
         );
         assert_eq!(
             out_names,
             vec![
                 "mcp__blackbox__bbox_hybrid_search",
-                "mcp__blackbox__bbox_search",
+                "mcp__blackbox__bbox_context",
                 "mcp__blackbox__unlisted"
             ]
         );
@@ -719,7 +719,7 @@ mod tests {
                     ..Default::default()
                 },
                 McpToolSpec {
-                    name: "bbox_search".to_string(),
+                    name: "bbox_context".to_string(),
                     description: "full catalog member".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
                     ..Default::default()
@@ -758,7 +758,7 @@ mod tests {
                 "corpus_search",
                 "mcp__blackbox__bbox_hybrid_search",
                 "mcp__blackbox__external_action",
-                "mcp__blackbox__bbox_search",
+                "mcp__blackbox__bbox_context",
             ]
         );
 

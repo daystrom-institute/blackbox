@@ -1155,8 +1155,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let srv = test_server(&tmp);
         assert!(
-            srv.get_tool("bbox_search").is_some(),
-            "bbox_search should be visible with no surface packet"
+            srv.get_tool("bbox_hybrid_search").is_some(),
+            "bbox_hybrid_search should be visible with no surface packet"
         );
         assert!(
             srv.get_tool("bro_exec").is_some(),
@@ -1190,7 +1190,7 @@ mod tests {
 
         let consequent = serde_json::json!({
             "route": "tool_surface",
-            "allow": ["bbox_search", "bbox_stats"],
+            "allow": ["bbox_hybrid_search", "bbox_stats"],
             "disallow": [],
         });
         let deny_consequent = serde_json::json!({"route": "deny", "reason": "unknown surface"});
@@ -1215,8 +1215,8 @@ mod tests {
         );
 
         assert!(
-            srv.get_tool("bbox_search").is_some(),
-            "bbox_search should be visible on default surface"
+            srv.get_tool("bbox_hybrid_search").is_some(),
+            "bbox_hybrid_search should be visible on default surface"
         );
         assert!(
             srv.get_tool("bbox_stats").is_some(),
@@ -1251,7 +1251,7 @@ mod tests {
         );
 
         assert!(
-            srv.get_tool("bbox_search").is_none(),
+            srv.get_tool("bbox_hybrid_search").is_none(),
             "all tools should be hidden under deny verdict"
         );
     }
