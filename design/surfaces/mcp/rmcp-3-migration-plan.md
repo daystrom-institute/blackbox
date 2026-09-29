@@ -16,6 +16,11 @@ which owns the WHAT (target shapes, decisions, open questions). This doc owns
 the HOW: the concrete breaking-change inventory for our codebase, the phase
 mechanics, and per-phase validation.
 
+Prerequisite: the [MCP Surface and Internals Shedding Plan](mcp-shedding-plan.md)
+lands before Phase 0. Surface routing becomes static configuration, and the
+tool and store inventory this plan migrates is the surviving set from that
+plan.
+
 ## Scope
 
 - From: rmcp 1.4 (workspace-wide; root crate + `bbox-*` library crates +
