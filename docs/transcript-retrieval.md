@@ -172,10 +172,8 @@ throw away incremental assumptions.
 ## When To Use Graph Instead
 
 Use [Internals](internals.md) and the agentic opening sequence when the question
-needs provenance across entities:
+needs relationships across entities:
 
-- why a line exists
-- which decision superseded another
 - what thread/session/note produced a commit
 - which docs and symbols relate to an artifact
 

@@ -16,7 +16,8 @@ The graph holds STATE; the design docs hold STORY.
   contract. Mutations stage, run `check` against the staged graph, and refuse
   to land on any error; `graph.json`'s generation bumps on every landing.
 - **Read**: the blackbox daemon via MCP (`bbox_hybrid_search` graph lane,
-  `bbox_inspect_entity`, `bbox_find_paths`, `bbox_project_graph_*`). Logical
+  `bbox_inspect_entity`, `bbox_find_paths`; the `bbox_project_graph_*`
+  administration tools are on the `ops` surface). Logical
   refs look like `project_graph_vertex:<project>:design:<vertex-id>`.
 - **Renders**: `render-state <doc-id> [--write]` mints the state block into a
   design doc between `<!-- dsg:state -->` markers (or prints it); the block is
@@ -198,7 +199,7 @@ rides the bbox primitives plus the preamble, never these views.
   when no published view is installed). Incremental `bbox_reindex` is NOT the
   trigger; it only preserves existing lanes. Expect minutes of lag between
   push and searchability (collector + accept refresh + writer queue). Diagnose
-  with `bbox_project_graph_describe`'s retrieval block:
+  with the `ops`-surface `bbox_project_graph_describe` retrieval block:
   `indexed_generation` vs `accepted_generation`, `indexed_vertex_count`.
 - Miners (`mine-design-frontmatter`) and transactional `apply` are phase A.
 - The eval suite (30 questions over the seed cluster) is phase A; see the

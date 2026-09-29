@@ -149,8 +149,9 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   checkouts. The wrapper selects the same exact rustfmt on macOS and Linux;
   do not substitute the moving `cargo +stable fmt` alias.
 - **What stays local**: file edits, single-crate checks and tests in a WARM
-  checkout, and the arm64 macOS daemon binary build/deploy (launchd) - the
-  cluster produces Linux artifacts only. Warmth is the discriminator, not
+  checkout, and the arm64 macOS satellite binary builds and installs
+  (collectors, fleetd, bro, bro-harness) - the cluster produces Linux
+  artifacts only. Warmth is the discriminator, not
   task size: a fresh `git worktree add` makes any build cold, and its first
   build/test run is a 20+ minute full-dependency compile plus syspolicyd
   assessment of every fresh binary - that is lane work, not local.

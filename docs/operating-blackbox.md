@@ -14,6 +14,11 @@ Start with the aggregate check:
 bbox_doctor(format="summary")
 ```
 
+`bbox_doctor`, `bbox_stats`, `bbox_embed_status`, `bbox_reindex`,
+`bbox_reembed`, `bbox_edge_compact` and `bbox_project_register` are on the
+`ops` surface: run them from an `ops` MCP session or with
+`bro mcp call <tool> '<json>' --surface ops`.
+
 `bbox_doctor` classifies findings ok/info/warn/action/blocked with suggested
 next commands, so a clean run means the drill-down tools below are optional.
 When something needs a closer look, or you want to eyeball raw signal
@@ -38,32 +43,26 @@ Healthy output usually means:
 | `bbox_describe_schema` | Entity populations are non-zero for transcripts/project files/knowledge | Reindex and watch EdgeIndex rebuild logs |
 | `bbox_hybrid_search` | Results include useful refs and sources; project filter works | Check index freshness, embedding status, and project registration |
 
-Useful shell checks:
-
-```bash
-systemctl --user status blackbox.service
-journalctl --user -u blackbox.service -n 100 --no-pager
-journalctl --user -u blackbox.service -f
-```
+The daemon's own log is the workload's container log stream.
 
 ## After every daemon update
 
-Build and install the binaries you changed:
+The daemon ships as the runtime image (see `deploy/docker/README.md`): build
+and verify the pushed ref, then roll the workload to the verified image
+digest. An update covers every component the change touches: once the daemon
+is healthy, install the changed checkout-host satellites from the same commit:
 
 ```bash
-cargo build --release
+cargo build --release --bin blackbox
+cargo build --release -p bro-cli -p bro-harness -p fleetd \
+  -p bbox-code-collector -p bbox-transcript-collector
 install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro ~/.local/bin/bro
-install -m 755 target/release/fleetd ~/.local/bin/fleetd
-install -d ~/.local/share/blackbox/memories
-cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
-systemctl --user restart blackbox.service
+install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
-Restart `blackbox-dev.service` only if you updated the dev daemon too.
-Prod and dev intentionally use different installed binary paths.
+Kickstart the collectors after installing them. New sessions pick up a new
+`bro-harness` without a restart.
 
 ### Offline project-catalog administration
 
@@ -99,21 +98,15 @@ below); restart it only when you actually changed it, because restarting it
 kills the workers it is supervising.
 
 On macOS, signing and restarting go through `stablesign` and
-`launchctl kickstart` instead. Sign `fleetd` the same way you sign
-`blackboxd`, or the first daemon dial fails a TCC prompt you never see:
+`launchctl kickstart`. Sign `fleetd` like the other satellites, or the first
+daemon dial fails a TCC prompt you never see:
 
 ```bash
 stablesign ~/.local/bin/fleetd
 launchctl kickstart -k gui/$(id -u)/com.daystrom.fleetd
 ```
 
-Then watch the journal:
-
-```bash
-journalctl --user -u blackbox.service -f
-```
-
-Expected after a normal restart:
+Then watch the daemon log. Expected after a normal restart:
 
 - Existing index opens.
 - Background reindex starts after its startup delay.
@@ -138,12 +131,11 @@ bbox_hybrid_search(query="recent changes", project="/abs/path/to/repo", limit=5)
 ## The fleet supervisor (fleetd)
 
 Harness workers are children of `fleetd`, not of `blackboxd`. That is the
-whole point: `blackboxd` gets rebuilt and kickstarted constantly on a dev
-machine, and before this split every restart killed every live session.
-`fleetd` changes a few times a year, so its restarts are rare.
+whole point: a `blackboxd` restart must not kill live sessions. `fleetd`
+changes a few times a year, so its restarts are rare.
 
-**Install.** `fleetd` ships as a workspace binary and installs next to the
-daemon (see "After every daemon update"). It runs as its own service:
+**Install.** `fleetd` ships as a workspace binary and installs on the
+checkout host (see "After every daemon update"). It runs as its own service:
 
 ```bash
 # systemd
@@ -335,10 +327,11 @@ Project file indexing only covers registered repos. Check before adding:
 bbox_project_list()
 ```
 
-Register with an absolute path:
+Register with an absolute path on the checkout host (see
+[Getting Started](getting-started.md) for collector-backed enrollment):
 
-```text
-bbox_project_register(path="/abs/path/to/repo")
+```bash
+bro mcp call bbox_project_register '{"path":"/abs/path/to/repo"}' --surface ops
 ```
 
 Registration records the root in `~/.local/state/blackbox/projects.json`,
@@ -417,37 +410,24 @@ bbox_embed_status()
 `queue_depth` should trend down. A non-zero queue is normal during a
 large reindex; a queue that never drains is an operations issue.
 
-Voyage needs `DAYSTROM_VOYAGE_API_KEY` or `VOYAGE_API_KEY` in the
-systemd environment:
-
-```ini
-# ~/.config/systemd/user/blackbox.service.d/secrets.conf
-[Service]
-Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
-```
-
-Apply changes with:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart blackbox.service
-```
+Voyage needs `DAYSTROM_VOYAGE_API_KEY` or `VOYAGE_API_KEY` in the daemon's
+environment (see [Operations](operations.md#api-keys)). Restart the daemon
+after changing it.
 
 ## Compaction
 
-There are three different things people mean by compaction. They do not
+There are two different things people mean by compaction. They do not
 share the same fix.
 
 | Area | What grows | Normal action |
 |---|---|---|
 | Vector partitions | WAL records under `~/.local/state/blackbox/vectors/` | Automatic background compactor |
 | Edge sidecars | JSONL graph sidecars under `~/.local/state/blackbox/edges/` | `bbox_edge_compact` when sidecars grow from repeated full reindex replay |
-| Workflow context | Rolling `ANCHOR` notes on workflow threads | Read via `bro orchestrate status` or `bbox_notes`; no storage cleanup needed |
 
 ### Vector compaction
 
 Vector WAL compaction is automatic. You should not normally run a tool
-for it. Watch the journal for `vector partition compacted` if disk churn
+for it. Watch the daemon log for `vector partition compacted` if disk churn
 or vector files look suspicious.
 
 If vectors are bad because the provider changed, the operational fix is
@@ -481,7 +461,7 @@ one. On the final project:
 bbox_edge_compact(project_id="d723917f", apply=true, rebuild=true)
 ```
 
-The tool keeps explicit/provenance/malformed lines and removes legacy
+The tool keeps explicit and malformed lines and removes legacy
 derived edges. It writes a backup before replacing the sidecar.
 
 ## Backup and restore boundary
@@ -502,7 +482,7 @@ Protect:
 - `~/.local/state/blackbox/artifacts/`
 - `~/.local/state/blackbox/bro/`
 - customized `~/.config/blackbox/embed.toml`
-- systemd drop-ins containing API keys
+- the deployment's secrets, including API keys
 
 Rebuild:
 
@@ -533,12 +513,12 @@ the transaction root as a whole.
 
 | Symptom | First checks | Likely action |
 |---|---|---|
-| Search misses recent transcripts | `bbox_stats`, journal reindex lines | `bbox_reindex(full=false)` |
+| Search misses recent transcripts | `bbox_stats`, daemon log reindex lines | `bbox_reindex(full=false)` |
 | Search returns deleted files | project registration, index age | `bbox_reindex(full=true)` |
 | Hybrid search is lexical only | `bbox_embed_status` | Fix route/provider, then `bbox_reembed(route="...")` |
-| Code nav cannot see repo | `bbox_project_list` | `bbox_project_register(path="/abs/path")` |
+| Code nav cannot see repo | `bbox_project_list` | `bro mcp call bbox_project_register '{"path":"/abs/path"}' --surface ops` |
 | Graph paths look sparse | `bbox_describe_schema`, EdgeIndex log lines | Reindex, then wait for EdgeIndex rebuild |
-| Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
+| Disk grows under `vectors/` | daemon log compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | rendered files | `bbox_render(scope="global")` on the daemon host; `bro render global` on any other operator host (pulls the plan from a remote daemon) |
 
@@ -552,12 +532,11 @@ host with `bro render global`.
 | Path | Contents |
 |---|---|
 | `~/.local/bin/blackbox` | Offline administration CLI |
-| `~/.local/bin/blackboxd` | Production daemon binary |
-| `~/.local/bin/blackboxd-dev` | Dev daemon binary |
 | `~/.local/bin/bro` | Terminal TUI client |
+| `~/.local/bin/bro-harness` | Model-turn runtime exec'd by `fleetd` |
 | `~/.local/bin/fleetd` | Fleet supervisor binary (shared by prod and dev) |
-| `~/.config/systemd/user/blackbox.service` | Prod systemd unit |
-| `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env and secrets |
+| `~/.local/bin/bbox-code-collector` | Checkout-source collector |
+| `~/.local/bin/bbox-transcript-collector` | Native transcript collector |
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
 | `~/.local/share/blackbox/memories/` | Shipped system memories and runbooks |
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
@@ -566,6 +545,5 @@ host with `bro render global`.
 | `~/.local/state/blackbox/fleetd.sock` | Prod daemon<->fleetd socket |
 | `~/.local/state/blackbox/fleetd.token` | Prod fleetd shared secret (owner-only) |
 | `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
-| `~/.bro/mcp.json` | Global MCP server config |
-| `<project>/.bro/mcp.json` | Project MCP overlay |
-| `~/.bro/events/outbox/current.jsonl` | Reaction outbox (succeeded rows compact at 7 days; all other statuses retained) |
+| `<bro_home>/mcp.json` | Global MCP server config |
+| `<project>/.bbox/mcp.json` | Project MCP overlay |

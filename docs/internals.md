@@ -8,8 +8,8 @@ The internals docs are split by the questions they answer.
 | [Index And Embedding Internals](index-embedding-internals.md) | How Tantivy indexing, embeddings, schema migration, vector storage, and compaction work |
 
 For day-to-day operations, start with the
-[Operating Guide](operating-blackbox.md). It names the actual tools and
-runbooks: `bbox_reindex`, `bbox_reembed`, `bbox_embed_status`,
+[Operating Guide](operating-blackbox.md). It names the actual `ops`-surface
+tools and runbooks: `bbox_reindex`, `bbox_reembed`, `bbox_embed_status`,
 `bbox_edge_compact`, project registration, restore checks, and post-update
 smoke tests.
 
@@ -24,8 +24,8 @@ source material:
 | Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, notes, and threads |
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | EdgeIndex | Graph projection over indexed docs plus live knowledge/thread/note stores |
-| Knowledge store | Durable rules, decisions, memories, notes, and render targets |
-| Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, and councils |
+| Knowledge store | Durable rules, conventions, memories, and render targets |
+| Orchestration runtime | `bro` tasks, teams, waits, and cancellation |
 | Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
 
 The important boundary: operators maintain the daemon and its stores;

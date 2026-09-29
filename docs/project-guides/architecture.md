@@ -16,15 +16,13 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
 Core MCP namespaces:
 
-- `bbox_*` - transcript, knowledge, graph, and project primitives. The
-  refactor/slice/code-nav/macro MCP surface is retired; that tooling is
-  harness-native via the bro-harness isolate bindings (see
-  `docs/refactor.md`).
+- `bbox_*` - transcript, knowledge, graph, and project primitives.
+  Structural refactor tooling is harness-native via the bro-harness isolate
+  bindings (see `docs/refactor.md`).
 - `bro_*` - orchestration and dispatch primitives.
 
-Application workflows, atoms, Slack/Badgey integration and reactions are
-retired. External callers compose bro operations and use their
-harness for file, shell and Git work. `bbox_tool_calls` reads indexed history.
+External callers compose bro operations and use their harness for file,
+shell and Git work. `bbox_tool_calls` reads indexed history.
 
 ## Fast Orientation
 
@@ -42,7 +40,7 @@ Major code ownership boundaries:
 - `index/`, `providers/`, `chunker/`, `vectors/`, `embed/` - corpus indexing,
   entity providers, chunking, vector storage, and embedding routes.
 - `mcp_tools/` - graph retrieval helpers (`hybrid_search`, `inspect`,
-  `find_paths`, evidence bundling, provenance).
+  `find_paths`, evidence bundling).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
 - `threads.rs`, `notes.rs` - coordination stores.
@@ -51,7 +49,7 @@ Major code ownership boundaries:
 - `config.rs` - config loader and env override allowlist.
 
 The `bbox-refactor` and `bbox-lsp` crates survive as libraries linked by the
-bro-harness bindings; the daemon no longer wraps them in MCP tools or keeps a
+bro-harness bindings; the daemon does not wrap them in MCP tools or keep a
 warm LSP pool.
 
 Generated or rendered surfaces are not the authority. Prefer editing their source
@@ -90,12 +88,13 @@ routing facts:
 Dispatch-capable providers apply a mechanical recursion guard for recursive
 `bro_*` orchestration/control tools. `allow_recursion=true` is the explicit bypass.
 
-Provider MCP registration is no longer implicitly rewritten on daemon startup.
+Daemon startup does not rewrite provider MCP registration.
 `configure_dispatch_mcp_env` exports `BLACKBOX_MCP_URL` and
 `BLACKBOX_MCP_NAME` for dispatch-time injection; persistent MCP config changes
-are user-owned or explicit through `bro_mcp`.
+are user-owned or an explicit operator `bro_mcp` call on the `ops` surface.
 
-Installed brofiles and teams are catalog data. Discover them through the
-artifact list tool. Explicit retired-kind artifact filters expose historical
-receipts without activating them.
+Installed brofiles and teams are catalog data. Agents discover them with
+`bro_brofile(action="list")` and `bro_team`; operators administer the catalog
+with the `bbox_artifact_*` tools on the `ops` surface. Explicit retired-kind
+artifact filters expose historical receipts without activating them.
 

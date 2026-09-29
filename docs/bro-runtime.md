@@ -87,7 +87,8 @@ bro_cancel(task_id="<task-id>")
 Do not cancel by port or broad process pattern. If you did not start the task,
 inspect it first.
 
-Prune old terminal task records:
+Prune old terminal task records with the `ops`-surface `bro_prune` (for
+example `bro mcp call bro_prune '{"status":"failed","dry_run":true}' --surface ops`):
 
 ```text
 bro_prune(status="failed", dry_run=true)
@@ -184,7 +185,8 @@ Provider binaries can be overridden with env vars such as `CLAUDE_BIN`,
 
 ## MCP Servers And Filters
 
-`bro_mcp` manages MCP servers and dispatch-time tool filters:
+`bro_mcp`, on the `ops` surface, manages MCP servers and dispatch-time tool
+filters:
 
 ```text
 bro_mcp(action="list")
@@ -203,7 +205,6 @@ other bros.
 
 | Situation | Better tool |
 |---|---|
-| Same prompt/persona repeated across sessions | Brofile or agent |
-| Same capability with schemas and effect limits | Atom |
-| Multi-step state machine with gates or waits | Workflow |
+| Same prompt/persona repeated across sessions | Brofile |
+| Multi-step sequencing with gates or waits | Caller-owned composition of bro calls |
 | Live one-off dispatch, review panel, or provider race | Bro runtime |

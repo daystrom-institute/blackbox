@@ -1,7 +1,7 @@
 # Running an Isolated Throwaway blackboxd
 
 A lightweight dev daemon for live validation (HTTP routes, fleet TUI, dispatch)
-that does **not** touch the production daemon at `127.0.0.1:7264` or its state,
+that does **not** touch the deployed daemon or its state,
 and skips heavy startup indexing/edge-rebuild.
 
 The repo already ships a dev service template (`deploy/blackbox-dev.service`
@@ -50,7 +50,7 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state_dir>/blackbox-knowledge.json` | Knowledge store |
 | `BLACKBOX_THREADS_PATH` | `<state_dir>/blackbox-threads.json` | Thread store |
 | `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Notes store |
-| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Legacy pin rows read by the project catalog migration |
+| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Pin records the project catalog inventories as owner rows; nothing else reads them |
 | `BLACKBOX_PROJECTS_PATH` | `<state_dir>/projects.json` | Project registry |
 | `BLACKBOX_GAPS_PATH` | `<state_dir>/blackbox-gaps.json` | Gap notes store |
 | `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Packet records the project catalog inventories; nothing else reads them |
@@ -62,8 +62,8 @@ The script sets `BLACKBOX_STATE_DIR`, isolated HOME/XDG directories, and the
 corpus paths below. The remaining store paths inherit the default resolution
 under the state root.
 
-Every mutable root serves exactly one daemon. Before it migrates legacy
-state, opens a log file, or opens any store, `blackboxd` claims an advisory
+Every mutable root serves exactly one daemon. Before it opens a log file or
+any store, `blackboxd` claims an advisory
 instance lock on each root its config resolves and holds them for the process
 lifetime. A second daemon reaching any of those roots refuses to start with
 `error.daemon_instance_locked`, naming the contended root, rather than
@@ -100,9 +100,8 @@ One path is deliberately NOT claimed, because it follows the platform home /
 state directory rather than config and macOS moves it only with `$HOME`: the
 rolling log directory. A second daemon shares it unless it isolates `HOME`
 (and `XDG_STATE_HOME` on Linux), so the throwaway launcher below does exactly
-that. The vector store used to sit here too; it is now the config-resolved
-`paths.vectors_path`, claimed like every other root, and its default is still
-the platform directory so an existing deployment keeps the store it has.
+that. The vector store is the config-resolved `paths.vectors_path`, claimed
+like every other root; its default is the platform directory.
 
 ### Skipping heavy startup work
 
@@ -178,7 +177,7 @@ artifact genesis accepts: it is what a bridge daemon that registered nothing
 leaves behind. It is set aside as `projects.json.pre-genesis` beside the new
 catalog rather than deleted.
 
-Options mirror `migrate`: `--config <path>` selects the same configuration file
+Options: `--config <path>` selects the same configuration file
 the daemon reads, `--state-dir <path>` overrides the whole conventional bundle,
 and `--projects-path <path>` overrides only the projects store location. The
 receipt on stdout carries the epoch, both pair hashes, and the full owner

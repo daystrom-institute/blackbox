@@ -3,6 +3,18 @@
 Where things live on disk, what needs protecting, what can be rebuilt
 from scratch, and the maintenance tasks that keep the daemon healthy.
 
+The corpus daemon runs as one containerized workload with one state volume
+(see `deploy/docker/README.md`); the image pins the state, index, vector and
+XDG roots under `/var/lib/blackbox`. Paths below are the defaults for a
+daemon's state root; apply them relative to that volume. Checkout hosts run
+only satellites: `fleetd`, `bro-harness`, `bro`, `bbox-code-collector` and
+`bbox-transcript-collector`.
+
+Maintenance tools named here other than `bbox_notes`, `bbox_thread_list`,
+`bbox_describe_schema`, `bbox_hybrid_search`, `bbox_project_list` and
+`bbox_render` are on the `ops` surface: run them from an `ops` MCP session or
+with `bro mcp call <tool> '<json>' --surface ops`.
+
 ## What to protect vs. what's rebuildable
 
 This is the most important section for disaster recovery and multi-machine
@@ -17,14 +29,13 @@ will run.
 
 | Path | Contents | Size (typical) |
 |---|---|---|
-| `~/.local/state/blackbox/blackbox-knowledge.json` | All knowledge entries, decisions, conventions, rendered rules | ~500KB |
+| `~/.local/state/blackbox/blackbox-knowledge.json` | Knowledge entries not owned by a repo's `.bbox/knowledge/` | ~500KB |
 | `~/.local/state/blackbox/blackbox-notes.json` | All side-channel notes (done/dispute/blocked/etc) | ~6MB |
 | `~/.local/state/blackbox/blackbox-threads.json` | Work threads and their session/edge linkage | ~500KB |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Packet records the project catalog inventories as owner rows; nothing else reads them | varies |
-| `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed workflows, agents, brofiles) | varies |
+| `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed brofiles and teams, plus historical receipts) | varies |
 | `~/.local/state/blackbox/bro/` | **The entire bro directory** - see breakdown below | varies |
-| `~/.bro/slack-identities.json` | Slack user identity mappings | small |
 
 The `bro/` subtree in detail:
 
@@ -34,14 +45,8 @@ The `bro/` subtree in detail:
 | `brofiles/` | All installed brofile persona+model+lens triples |
 | `teamplates/` | Team templates |
 | `teams/` | Instantiated teams |
-| `workflows/` | Installed workflow specs |
-| `webhooks/` | Installed webhook extractors + routing refs |
-| `crons/` | Installed cron specs |
-| `councils/` | Council transcripts |
-| `slack-channel-bindings.json` | Slack channel → project bindings for Badgey |
-| `slack-proposal-links.json` | Posted Slack message → proposal mappings |
-| `slack-threads.json` | Slack thread metadata |
 | `tasks.json` | Task lifecycle records for all dispatched bros |
+| `workflows/`, `webhooks/`, `crons/`, `slack-channel-bindings.json`, `slack-proposal-links.json` | Historical records the project catalog inventories as owner rows |
 
 ### Rebuild - safe to lose
 
@@ -59,24 +64,29 @@ repos. Don't waste backup space on them.
 
 ### Binaries - reinstall, don't back up
 
+The daemon ships in the runtime image (`blackboxd`, `blackbox` and the system
+memories). Checkout hosts install their satellites from source:
+
 ```
 ~/.local/bin/blackbox
-~/.local/bin/blackboxd
-~/.local/bin/blackboxd-dev
 ~/.local/bin/bro
+~/.local/bin/bro-harness
+~/.local/bin/fleetd
+~/.local/bin/bbox-code-collector
+~/.local/bin/bbox-transcript-collector
 ```
 
-Built from source. The workspace declares no `default-members`, so a bare
+The workspace declares no `default-members`, so a bare
 `cargo build --release` builds only the root `blackbox` package (`blackboxd`,
-`blackbox`); the `bro` CLI lives in `crates/bro-cli` and must be selected
-explicitly:
+`blackbox`); satellite crates must be selected explicitly:
 
 ```bash
 cargo build --release                       # blackboxd, blackbox (root package)
-cargo build --release -p bro-cli --bin bro  # bro (crates/bro-cli)
-install -m 755 target/release/{blackbox,blackboxd,bro} ~/.local/bin/
-install -d ~/.local/share/blackbox/memories
-cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
+cargo build --release -p bro-cli -p bro-harness -p fleetd \
+  -p bbox-code-collector -p bbox-transcript-collector
+install -m 755 target/release/blackbox ~/.local/bin/blackbox
+install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
 ## Configuration
@@ -84,40 +94,11 @@ cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 ### API keys
 
 Blackbox uses Voyage AI for embeddings. The daemon needs the key in its
-environment - not in a config file, not hardcoded.
-
-```ini
-# ~/.config/systemd/user/blackbox.service.d/secrets.conf
-[Service]
-Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
-```
-
-The env var name is `DAYSTROM_VOYAGE_API_KEY` (primary) or
-`VOYAGE_API_KEY` (fallback). After editing the drop-in:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart blackbox.service
-```
-
-Same pattern for the dev unit:
-
-```ini
-# ~/.config/systemd/user/blackbox-dev.service.d/secrets.conf
-[Service]
-Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
-```
-
-For provider-credential env vars needed by arc executors (e.g.
-`FORGEJO_TOKEN` for the Keystone example):
-
-```ini
-# ~/.config/systemd/user/blackbox-dev.service.d/keystone.conf
-[Service]
-Environment=FORGEJO_BASE_URL=http://localhost:3000
-Environment=FORGEJO_TOKEN=...
-Environment=FORGEJO_WEBHOOK_SECRET=...
-```
+environment - not in a config file, not hardcoded. The env var name is
+`DAYSTROM_VOYAGE_API_KEY` (primary) or `VOYAGE_API_KEY` (fallback). A
+container deployment supplies it from a Secret in the workload environment;
+a throwaway local daemon takes it from the launching shell. Restart the
+daemon after changing it.
 
 ### Embedding provider config
 
@@ -154,32 +135,25 @@ See `docs/index-embedding-internals.md` (Visual routes) for details.
 ### Port
 
 Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
-`BBOX_PORT` environment variable. Port `7263` is retired (old `bro.service`)
-- avoid it.
+`BBOX_PORT` environment variable.
 
-### Daemon variants
+### Local dev daemon
 
-Prod and dev intentionally run from separate installed binary paths so
-a dev build swap doesn't touch the running prod service:
-
-| Service | Binary | Port |
-|---|---|---|
-| `blackbox.service` | `~/.local/bin/blackboxd` | 7264 |
-| `blackbox-dev.service` | `~/.local/bin/blackboxd-dev` | 7265 (or override) |
-
-Upgrade pattern: build, `install` both binary names atomically (unlink +
-write), restart only the service you changed. Running process keeps the
-old inode until systemd restarts it.
+A local daemon for live validation runs from its own binary path, port and
+state dir so it never touches the deployed daemon's state. See
+[Running an Isolated Throwaway blackboxd](operations-isolated-dev-daemon.md).
 
 ## Full on-disk layout
 
 ```
 ~/.local/
-├── bin/
+├── bin/                        # checkout-host satellites and CLIs
 │   ├── blackbox                # offline administration CLI
-│   ├── blackboxd               # prod daemon binary
-│   ├── blackboxd-dev           # dev daemon binary
-│   └── bro                     # terminal TUI client
+│   ├── bro                     # terminal TUI client
+│   ├── bro-harness             # model-turn runtime, exec'd by fleetd
+│   ├── fleetd                  # fleet supervisor
+│   ├── bbox-code-collector
+│   └── bbox-transcript-collector
 ├── share/blackbox/
 │   ├── index/                  # Tantivy index + schema_version.txt  ← REBUILD
 │   └── memories/               # Shipped system memories and runbooks ← REBUILD
@@ -195,32 +169,16 @@ old inode until systemd restarts it.
     │   ├── brofiles/
     │   ├── teamplates/
     │   ├── teams/
-    │   ├── workflows/
-    │   ├── webhooks/
-    │   ├── crons/
-    │   ├── councils/
-    │   ├── slack-channel-bindings.json
-    │   ├── slack-proposal-links.json
-    │   └── tasks.json
+    │   ├── tasks.json
+    │   └── ...                  # historical records the catalog inventories
     ├── vectors/                 ← REBUILD (bbox_reembed per route)
     ├── edges/                   ← REBUILD (EdgeIndex auto-rebuild)
     ├── git_meta/                ← REBUILD (next reindex)
     ├── backups/                 ← skip
     └── logs/                    ← skip
 
-~/.config/systemd/user/
-├── blackbox.service
-├── blackbox.service.d/
-│   └── secrets.conf            ← PROTECT (API keys)
-├── blackbox-dev.service
-└── blackbox-dev.service.d/
-    └── secrets.conf            ← PROTECT
-
 ~/.config/blackbox/
 └── embed.toml                  ← PROTECT if customized
-
-~/.bro/
-└── slack-identities.json       ← PROTECT
 ```
 
 ## Upkeep checklist
@@ -417,14 +375,12 @@ bro render global --daemon-url https://<daemon-origin>
 ```
 
 The first command previews managed regions. The second applies the daemon's
-current render plan to this host and backs up changed files. Verify that
-removed tools and outdated examples have disappeared from the generated
-common include. A remote daemon restart cannot refresh those host files;
+current render plan to this host and backs up changed files. Verify that the
+generated common include names only tools on the daemon's current surface. A remote daemon restart cannot refresh those host files;
 editing their managed regions manually bypasses the render contract.
 
 Mechanical vector recovery and journal retention are daemon-owned. Application
-schedules and orchestration belong to external callers. Archived workflow or
-cron installers are no longer an upgrade step.
+schedules and orchestration belong to external callers.
 
 Check daemon startup, collector freshness, and representative MCP retrieval.
 If the schema version changed, follow the rebuild checks below.
@@ -432,7 +388,7 @@ If the schema version changed, follow the rebuild checks below.
 ### After a schema version bump
 
 The daemon drops and rebuilds the index automatically on start. You'll
-see `dropping transcript index for schema migration` in the journal.
+see `dropping transcript index for schema migration` in the daemon log.
 Wait for:
 
 1. `auto-reindex: indexed N files (M docs)` - tantivy rebuild done
@@ -450,7 +406,7 @@ bbox_embed_status()            # queue_depth drains as re-embedding runs
 ### After registering a new project
 
 ```bash
-bbox_project_register(path="/abs/path/to/repo")
+bro mcp call bbox_project_register '{"path":"/abs/path/to/repo"}' --surface ops
 ```
 
 This adds the project to the registry, triggers an EdgeIndex rebuild,
@@ -485,8 +441,7 @@ tar -czf blackbox-backup-$(date +%F).tar.gz \
   ~/.local/state/blackbox/projects.json \
   ~/.local/state/blackbox/packets/ \
   ~/.local/state/blackbox/artifacts/ \
-  ~/.local/state/blackbox/bro/ \
-  ~/.bro/slack-identities.json
+  ~/.local/state/blackbox/bro/
 ```
 
 The rebuild data (index, vectors, edges) can be reconstructed after restore
@@ -495,9 +450,9 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 
 ## Migrating to a new machine
 
-1. Restore the protected files to the same paths.
-2. Build and install the daemon binaries.
-3. Copy systemd units and drop-ins (including secrets).
+1. Restore the protected files to the same paths on the new state volume.
+2. Deploy the runtime image and install the checkout-host satellites.
+3. Restore the deployment's configuration and secrets.
 4. Start the daemon - index rebuilds automatically.
 5. Run `bbox_reembed(route="<route>")` for each embedding route.
 6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_doctor`.

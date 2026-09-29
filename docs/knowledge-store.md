@@ -204,7 +204,7 @@ Provider filters and render flags apply to satellites exactly as they do to
 inline entries.
 
 Global provider files contain the inline rules and plain-path breadcrumbs. They
-no longer import `BLACKBOX.md`; it remains an optional complete reference.
+do not import `BLACKBOX.md`; it is an optional complete reference.
 Generated Blackbox tool procedures are split by topic. Local global rendering
 and host-applied `bro render global` share the same complete plan. A provider
 entrypoint over 6,000 bytes reports a diagnostic rather than truncating rules.

@@ -269,7 +269,7 @@ producer and publish again, or perform a deliberate configuration cutback.
 
 ## Health and storage
 
-Run `bbox_doctor` to inspect active generations, staleness, collected versus
+Run `bbox_doctor` on the `ops` surface to inspect active generations, staleness, collected versus
 local Git `HEAD`, missing or corrupt blobs, failed activation, pending cutback,
 and failed retirement. The durable store is under
 `<state_dir>/code-sources/`. Upload sessions expire after 24 idle hours, while

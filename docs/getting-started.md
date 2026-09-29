@@ -1,60 +1,56 @@
 # Getting Started
 
-This gets one host into the normal blackbox shape:
+This gets a deployment into the normal blackbox shape:
 
-- one long-running `blackboxd`
+- one corpus daemon (`blackboxd`) running as a containerized workload with one
+  state volume
+- checkout hosts running only satellites: `fleetd` (which execs `bro-harness`
+  per session), the code and transcript collectors, and the `bro` CLI
 - every agent CLI pointed at the same MCP endpoint
 - one knowledge store rendered back into provider markdown
-- project source indexed into the agentic corpus
+- project source published into the agentic corpus by its checkout host
 
-Do this once per machine, then use the same daemon from Claude, Codex, Gemini,
-Copilot, and Vibe.
+Do this once per deployment and once per checkout host, then use the same
+daemon from Claude, Codex, Gemini, Copilot, and Vibe.
 
-## 1. Build and install the binaries
+## 1. Build the binaries
 
 ```bash
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
-cargo build --release
-install -m 755 target/release/blackbox  ~/.local/bin/blackbox
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro       ~/.local/bin/bro
-install -m 755 target/release/bro-slack ~/.local/bin/bro-slack
-install -m 755 target/release/bro-irc   ~/.local/bin/bro-irc
-install -d ~/.local/share/blackbox/memories
-cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
+cargo build --release    # blackboxd, blackbox
+cargo build --release -p bro-cli -p bro-harness -p fleetd \
+  -p bbox-code-collector -p bbox-transcript-collector
 ```
 
-## 2. Run `blackboxd` as a systemd user service
+## 2. Deploy the daemon and install the checkout-host satellites
+
+The daemon ships as a runtime image containing `blackboxd`, the offline
+`blackbox` CLI and the system memories. Build it and deploy it with one
+writable volume as described in
+[the runtime image README](../deploy/docker/README.md).
+
+One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI. That is
+what makes transcript search, knowledge, threads, notes, and bro tasks shared
+instead of provider-local.
+
+On each checkout host, install the satellites:
 
 ```bash
-cp deploy/blackbox.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now blackbox.service
+install -d ~/.local/bin
+install -m 755 target/release/blackbox ~/.local/bin/blackbox
+install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
-One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on the
-host. That is what makes transcript search, knowledge, threads, notes, and bro
-tasks shared instead of provider-local.
+Run `fleetd` as a service (`deploy/fleetd.plist` for launchd,
+`deploy/fleetd.service` for systemd; see
+[the fleet supervisor](operating-blackbox.md#the-fleet-supervisor-fleetd)),
+then configure the [code source collector](code-source-collector.md) and the
+[native transcript collector](native-transcript-collector.md).
 
-Prod and dev should use separate installed daemon paths even when they come from
-the same built artifact. Dev restarts should never mutate the prod service
-binary in place.
-
-Logs live in journald:
-
-```bash
-journalctl --user -u blackbox -f
-```
-
-### Dev daemon (optional, isolated)
-
-```bash
-cp deploy/blackbox-dev.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now blackbox-dev.service
-```
+For a throwaway local daemon used in development, see
+[Running an Isolated Throwaway blackboxd](operations-isolated-dev-daemon.md).
 
 ## 3. Connect each provider CLI to the daemon
 
@@ -63,6 +59,9 @@ at the `interactive` surface. Switch to `ops` only for setup, lifecycle, or admi
 work; add extra aliases only when you intentionally want a restricted surface
 such as `readonly`.
 
+Replace `<daemon-origin>` below with the deployment's MCP origin and supply the
+credentials that deployment requires.
+
 **Claude Code** - add to each `~/.claude*/.claude.json`:
 
 ```json
@@ -70,7 +69,7 @@ such as `readonly`.
   "mcpServers": {
     "blackbox": {
       "type": "http",
-      "url": "http://127.0.0.1:7264/mcp?surface=interactive"
+      "url": "https://<daemon-origin>/mcp?surface=interactive"
     }
   }
 }
@@ -80,7 +79,7 @@ such as `readonly`.
 
 ```toml
 [mcp_servers.blackbox]
-url = "http://127.0.0.1:7264/mcp?surface=interactive"
+url = "https://<daemon-origin>/mcp?surface=interactive"
 ```
 
 
@@ -89,16 +88,16 @@ url = "http://127.0.0.1:7264/mcp?surface=interactive"
   "mcp": {
     "blackbox": {
       "type": "remote",
-      "url": "http://127.0.0.1:7264/mcp?surface=interactive",
+      "url": "https://<daemon-origin>/mcp?surface=interactive",
       "enabled": true
     }
   }
 }
 ```
 
-**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp?surface=interactive`
+**Gemini CLI** - `gemini mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 
-**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp?surface=interactive`
+**Copilot** - `copilot mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 
 ## 4. Enroll a project from its owning checkout
 
@@ -106,14 +105,14 @@ MCP clients can read the instance-specific onboarding instructions from
 `blackbox://skills/onboard-project/SKILL.md`, use the `onboard-project` prompt,
 or discover the same skill through `skills/list`.
 
-Check `bbox_project_list()` before adding a project. For a remote corpus daemon,
-configure one producer with `claim_scopes = "unclaimed"` and configure the
+Check `bbox_project_list()` before adding a project. Configure one producer
+with `claim_scopes = "unclaimed"` and configure the
 [Code Source Collector](code-source-collector.md) on the checkout host with an
 `enroll_roots` entry that contains the project. These are host-level settings,
-not per-project entries. Then call:
+not per-project entries. Then run, as an operator:
 
-```text
-bbox_project_register(path="/absolute/path/to/repo")
+```bash
+bro mcp call bbox_project_register '{"path":"/absolute/path/to/repo"}' --surface ops
 ```
 
 If the daemon cannot stat the path, it routes enrollment to the fresh
@@ -122,8 +121,8 @@ collector scaffolds `.bbox`, records the project in its enrolled-projects
 sidecar, and onboards it without a per-project config edit. When the response
 reports `identity_committed = false`, commit exactly the returned `commit_paths`
 on `published_ref`. Catalog admission, source publication, and index activation
-are separate steps; use `bbox_project_list()` and `bbox_doctor()` to inspect
-progress.
+are separate steps; use `bbox_project_list()` and the `ops`-surface
+`bbox_doctor` to inspect progress.
 
 See [Projects And Code Indexing](projects-code-indexing.md) for local
 compatibility and catalog administration limits. Native session history has its

@@ -1,19 +1,20 @@
 ## Runtime & State
 
-`blackboxd` is a single long-lived user service, not a per-session stdio child.
-It listens on `127.0.0.1:${BBOX_PORT:-7264}/mcp` by default and also serves
+`blackboxd` is one long-lived containerized workload with one state volume
+(see `deploy/docker/README.md`), not a per-session stdio child. It listens on
+`127.0.0.1:${BBOX_PORT:-7264}/mcp` by default (`BBOX_BIND` exposes it inside
+a pod network) and also serves
 operator HTTP routes such as `/tail`, `/roster`, `/control/*`, and `/admin/*`. `/control/*` is the neutral
 orchestration control plane (thin HTTP adapters over the `bro_*` dispatch/control
 tools) shared by every external driver — the fleet client, future bridges.
 
-Prod and dev services intentionally use different installed daemon paths:
-
-- prod: `~/.local/bin/blackboxd`, `deploy/blackbox.service`
-- dev: `~/.local/bin/blackboxd-dev`, `deploy/blackbox-dev.service`
-
-That isolation lets dev binary swaps/restarts avoid mutating the prod service
-executable. Ask before restarting or mutating shared services unless the user has
-explicitly asked for that operation.
+Checkout hosts run only satellites: `fleetd` (which execs `bro-harness` per
+session), `bbox-code-collector`, `bbox-transcript-collector`, and the `bro`
+CLI. A throwaway local daemon for live validation
+(`docs/operations-isolated-dev-daemon.md`) uses its own binary path and state
+dir so it never touches the deployed daemon's state. Ask before restarting or
+mutating shared services unless the user has explicitly asked for that
+operation.
 
 Config precedence is defaults, config file, explicit env overrides, then flags.
 Default config path is `$XDG_CONFIG_HOME/blackbox/config.toml`; `BLACKBOX_CONFIG`
@@ -38,7 +39,6 @@ Important state/config env vars:
   `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
   `BLACKBOX_REINDEX_INTERVAL_SECS`, `BLACKBOX_EDGE_INDEX_BOOT_REBUILD`
   `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
-- Provenance: `BBOX_GIT_NOTES_NAMESPACE`
 
 Legacy aliases should not be revived unless the code explicitly still accepts
 them.

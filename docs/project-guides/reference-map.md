@@ -20,12 +20,8 @@ or system memories and link/pointer from here.
   `docs/projects-code-indexing.md` - core corpus surfaces.
 - `system-defaults/memories/system-memory-catalog.md` - Obsidian navigation
   map for system memory runbooks; not loaded as a runtime memory.
-- `docs/refactor.md` - retirement pointer for the daemon refactor MCP
-  surface (now harness-native isolate bindings);
+- `docs/refactor.md` - harness-native structural refactor tooling;
   `system-defaults/memories/refactor*.md` - language-specific protocols.
-- `docs/workflows.md`, `docs/ingress-paths.md` - caller composition.
-- `docs/atoms.md`, `docs/badgey.md`, `docs/consultant-runtime.md` -
-  retirement/history contracts.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
 - `research/research-corpus.md` - map for the research corpus: a point-in-time,
   evidence-graded study of the external problem space (reference harnesses,
@@ -44,7 +40,7 @@ or system memories and link/pointer from here.
   (Google Drive, OneDrive/SharePoint, Xero, Slack) publishing into the
   corpus over the collector-style transport.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
-  storage, code navigation, provenance, and Badgey designs.
+  storage, and code navigation designs.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
   supervision, phase decomposition, runtime allocation, and live handoff
   designs.
@@ -64,7 +60,7 @@ or system memories and link/pointer from here.
 - `design/surfaces/` - topic home for MCP surfaces, workspace tools, and
   provider transcript read planes.
 - `design/operations/` - topic home for config/artifact lifecycle, bundles,
-  doctor, and system-event coordination.
+  and doctor.
 - Legacy lifecycle folders such as `design/archive/`, `design/proposed/`, and
   `design/partial/` may appear in old checkouts. Prefer frontmatter
   `lifecycle` over path when determining currentness, and verify against code

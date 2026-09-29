@@ -106,14 +106,13 @@ repo opts into sccache, a Java repo sets `GRADLE_USER_HOME`, most set nothing:
 ```
 
 `env` is resolved **daemon-side at task spawn** for every dispatch path
-(`bro_exec`, agent dispatch, workflows, and the fleet cockpit), keyed by the
+(`bro_exec` and the fleet cockpit), keyed by the
 task cwd with worktree→base-repo mapping, and delivered to harness shell
 children on the dedicated non-secret `shell_env` lane (never the transport
 session env). Reserved `BRO_FLEET_*` vars are never overridden.
 
 `seed_dirs` lists repo-relative directories to copy-on-write clone from the
-base repo into each freshly created worktree (fleet cockpit and workflow
-`WorktreeCreate`). Seeding a warm `target/` turns the dispatched agent's
+base repo into each worktree the fleet cockpit creates. Seeding a warm `target/` turns the dispatched agent's
 first build from a cold full-workspace compile into an incremental one
 (measured: a 56G target clones in ~13s on APFS; `cargo check` drops from
 10+ minutes to ~30s of first-party recompiles). Best-effort: missing dirs,
@@ -146,8 +145,8 @@ nix fmt
 
 ## Run a fully isolated dev-agent world with Nix
 
-The dev systemd unit isolates the daemon, but not the agent harnesses that may
-still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
+An isolated dev daemon isolates its own state, but not the agent harnesses that
+may still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
 `~/.gemini/GEMINI.md`. For contained end-to-end testing, use the flake-backed
 dev harness instead:
 

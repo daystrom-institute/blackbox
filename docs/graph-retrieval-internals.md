@@ -118,7 +118,7 @@ types are:
 
 | Entity type | What it holds | Question it answers |
 |---|---|---|
-| `knowledge` | Rules, decisions, conventions | "what is the policy on X?" |
+| `knowledge` | Rules and conventions | "what is the policy on X?" |
 | `project_file` | Source and doc chunks | "where does X live?" |
 | `project_file_v2` | Snapshot-scoped source and doc chunks | "which snapshot's copy of X is live?" |
 | `transcript` | One content block from a session | "what did this turn say?" |
@@ -145,8 +145,8 @@ Edges are directional and typed.
 |---|---|
 | Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES` |
 | AST | `DEFINED_IN`, `CONTAINS_SYMBOL`, `CALLS`, `USES_TYPE`, `HAS_FIELD`, `IMPLEMENTS_TRAIT` |
-| Knowledge | `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
-| Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
+| Knowledge | `KNOWLEDGE_FROM_SESSION` |
+| Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
 | Tool-call | `RAN_BASH` |

@@ -65,7 +65,7 @@ changes.
 
 `INDEX_SCHEMA_VERSION` in `crates/bbox-corpus-index/src/index/mod.rs`
 gates index compatibility. On daemon startup, the stored marker is
-compared with the binary's version. A mismatch no longer drops the index
+compared with the binary's version. A mismatch does not drop the index
 unconditionally: replacement goes through a fail-closed guard boundary.
 An absent guard refuses the reset, a guard error aborts it leaving the
 last-good lexical and vector views selected, and a commit-carryover
@@ -286,7 +286,7 @@ Important behavior:
 - If vectors are semantically wrong after a provider/model change,
   `bbox_reembed(route="...")` is the fix, not manual compaction.
 
-Watch the journal for:
+Watch the daemon log for:
 
 ```text
 vector partition compacted
@@ -305,7 +305,7 @@ The watcher rebuilds EdgeIndex when Tantivy's document count grows.
 
 Legacy sidecars can accumulate derived edges after repeated full project
 refreshes. `bbox_edge_compact` removes old derived lines while retaining
-explicit/provenance/malformed lines.
+explicit and malformed lines.
 
 Safe sequence:
 

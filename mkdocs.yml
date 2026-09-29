@@ -45,22 +45,13 @@ nav:
     - Operations: operations.md
     - Convergence Drain Gate: converge-gate.md
   - Toolbelt:
-    - Workflow Engine: workflows.md
-    - Atoms: atoms.md
-    - Refactor Tools And Atoms: refactor.md
+    - Refactor Tools: refactor.md
     - Bro Runtime: bro-runtime.md
     - Knowledge Store: knowledge-store.md
     - Transcript Retrieval: transcript-retrieval.md
     - Projects And Code Indexing: projects-code-indexing.md
     - Artifact Catalog: artifact-catalog.md
-    - Badgey: badgey.md
     - MCP Surfaces: mcp-surfaces.md
-  - Integrations:
-    - Ingress Paths: ingress-paths.md
-    - Slack Bridge: slack-bridge.md
-    - IRC Bridge: irc-bridge.md
-  - Reference:
-    - Examples: examples.md
 
 plugins:
   - search

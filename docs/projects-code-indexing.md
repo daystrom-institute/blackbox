@@ -6,6 +6,11 @@ the daemon. Code collectors publish source from explicit owner-host roots.
 Native conversation history uses the separate
 [transcript collector](native-transcript-collector.md).
 
+Project administration tools other than `bbox_project_list`, and the index
+maintenance tools (`bbox_doctor`, `bbox_stats`, `bbox_reindex`, `bbox_reembed`,
+`bbox_embed_*`, `bbox_edge_compact`), are on the `ops` surface: run them from
+an `ops` MCP session or with `bro mcp call <tool> '<json>' --surface ops`.
+
 ## Discover And Enroll
 
 Check existing identity before registering or onboarding:
