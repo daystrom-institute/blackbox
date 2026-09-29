@@ -17,41 +17,11 @@
   materialization follows registry open and must tolerate per-repo failure
   (skip + warn — boot cannot fail closed the way registration does).
 - `run` owns the startup order: load config ONCE, claim the instance-lock set,
-  migrate legacy defaults, initialize file logging, then `open_shared_state`.
+  initialize file logging, then `open_shared_state`.
   Nothing that reads, repairs, moves, or creates durable state may move above
   the claim, and `open_shared_state` takes the loaded config plus the held
   `InstanceLockSet` rather than reloading (a reload could resolve roots the
   claim does not cover). `run` holds the set for the process lifetime.
-- The legacy migration's DESTINATIONS come from that loaded config
-  (`run::legacy_destinations`), never from a second env/`$HOME` derivation:
-  recomputing them ignored the config file, so a config-file-isolated daemon
-  moved shared legacy state into production-default paths it had not claimed.
-  Its SOURCE (`~/.claude-shared`, `~/.bro`) belongs to no daemon, so
-  `migrate_legacy_defaults` takes a non-blocking claim on
-  `<home>/.blackbox-legacy-migration.lock` and SKIPS the migration when it
-  loses; the winner did it or will.
-- Every probe in that migration is fallible: only `NotFound` means absent, and
-  any other inspection error refuses startup BEFORE a destination is created.
-  `Path::exists()`/`is_dir()` collapse `EACCES`/`EIO` into `false`, which made
-  a transient failure look like "already migrated" and permanently stranded
-  the legacy source on the next boot.
-- Each entry moves as a recoverable transaction journaled at
-  `<home>/.blackbox-legacy-migration.journal`, beside the source claim (the
-  one object every daemon shares). Files AND directory trees stage at
-  `<dest>.migrating.tmp` with their contents and directories fsynced, publish
-  by rename, record publication BEFORE the source is deleted, then fsync the
-  source parent. `recover_legacy_migration` runs first under the claim and
-  either rolls back an unpublished stage or finishes a published one, so a
-  crash mid-move cannot leave a committed destination next to a stale source
-  for a differently-rooted daemon to migrate again.
-- Journal updates are atomic durable replacements, never in-place rewrites:
-  a unique `O_EXCL` sibling under `.blackbox-legacy-migration.journal.*.tmp`
-  is written, fsynced, renamed over the journal, then `$HOME` is fsynced. An
-  in-place truncate-and-rewrite could leave the journal EMPTY, and an empty
-  journal read as "nothing in flight" is precisely the duplicate-authority
-  failure. A journal that exists but is empty, oversized, non-regular, or
-  unparseable REFUSES startup with an operator-actionable message; only its
-  absence means no transaction. Recovery sweeps stale staging siblings.
 - The vector store is one config-resolved root (`paths.vectors_path`), not a
   derivation. The runtime store, the background embed lane, the migration
   inventory, the retirement discharge and reprobe, and history materialization
