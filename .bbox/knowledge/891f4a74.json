@@ -14,7 +14,6 @@
   "render": true,
   "render_placement": {"placement": "satellite", "topic": "build"},
   "decay": false,
-  "rationale": "Operator approved verbatim (bbox-build-cluster session, 2026-07-18): agents must reach for cluster-backed tooling by default.",
   "source": "user",
   "created_at": "2026-07-18T05:55:00Z",
   "updated_at": "2026-08-14T19:54:57Z",

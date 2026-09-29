@@ -1,7 +1,7 @@
 {
   "id": "dfb90d6d",
   "title": "Repo-owned vs host-local: remember is durable, not exhaust",
-  "content": "Project-scoped `remember` entries are durable repo-owned knowledge, not operational exhaust — they travel with the repo in `.bbox/knowledge/` alongside `learn`/`decide`. Only live threads, side-channel notes, and pins are host-local exhaust. When deciding where a project-scoped store belongs: durable+reviewable (knowledge, decisions, remembered facts, settled/promoted thread records) → committed `.bbox/`; high-churn session/bro/task-bound activity → host-local. See design/corpus/knowledge/repo-owned-project-state.md.",
+  "content": "Project-scoped knowledge entries (rendered or recall-only) are durable repo-owned knowledge, not operational exhaust: they travel with the repo in `.bbox/knowledge/`. Only live threads and side-channel notes are host-local exhaust. When deciding where a project-scoped store belongs: durable and reviewable (knowledge, settled or promoted thread records) goes to committed `.bbox/`; high-churn session, bro or task-bound activity stays host-local. See design/corpus/knowledge/repo-owned-project-state.md.",
   "variants": {},
   "category": "convention",
   "scope": "project",
