@@ -201,12 +201,23 @@ pub struct BeginGitHistoryUploadRequestV1 {
     pub descriptor: GitHistoryDescriptorV1,
 }
 
+/// Begin either opens a fresh upload or resumes the open upload for the same
+/// descriptor. `state` is the persisted upload state at the time of the
+/// response: an observation, not a lease. Responses from daemons that predate
+/// the field decode as `ReceivingManifest`, the only state such a daemon
+/// reported implicitly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BeginGitHistoryUploadResponseV1 {
     pub upload_id: String,
     pub max_page_entries: usize,
     pub max_page_bytes: usize,
     pub max_record_bytes: u64,
+    #[serde(default = "begin_state_default")]
+    pub state: GitHistorySourceStateV1,
+}
+
+fn begin_state_default() -> GitHistorySourceStateV1 {
+    GitHistorySourceStateV1::ReceivingManifest
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1164,6 +1175,44 @@ mod tests {
             logical_bytes: manifest.iter().map(|entry| entry.encoded_bytes).sum(),
         };
         (descriptor, manifest, fragments)
+    }
+
+    #[test]
+    fn begin_history_response_state_is_additive() {
+        let legacy: BeginGitHistoryUploadResponseV1 = serde_json::from_str(
+            r#"{"upload_id":"u","max_page_entries":1,"max_page_bytes":2,"max_record_bytes":3}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.state, GitHistorySourceStateV1::ReceivingManifest);
+
+        let resumed: BeginGitHistoryUploadResponseV1 = serde_json::from_str(
+            r#"{"upload_id":"u","max_page_entries":1,"max_page_bytes":2,"max_record_bytes":3,"state":"missing_records"}"#,
+        )
+        .unwrap();
+        assert_eq!(resumed.state, GitHistorySourceStateV1::MissingRecords);
+        let encoded = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(encoded["state"], "missing_records");
+
+        // A collector that predates the field still decodes the response,
+        // because the response type never denied unknown fields.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PriorResponse {
+            upload_id: String,
+            max_page_entries: usize,
+            max_page_bytes: usize,
+            max_record_bytes: u64,
+        }
+        let prior: PriorResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(prior.upload_id, "u");
+
+        assert!(
+            serde_json::from_str::<BeginGitHistoryUploadResponseV1>(
+                r#"{"upload_id":"u","max_page_entries":1,"max_page_bytes":2,"max_record_bytes":3,"state":"resumed"}"#,
+            )
+            .is_err(),
+            "an unknown state is malformed, never silently reinterpreted"
+        );
     }
 
     #[test]
