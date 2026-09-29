@@ -8,8 +8,8 @@ Plain Markdown map for navigating the system memory runbooks from Obsidian.
 This note is not loaded as a runtime `sm-*` system memory.
 
 Files in `system-defaults/memories/` use bare slugs such as
-`rule-packets.md`; runtime IDs use the `sm-` prefix, such as
-`sm-rule-packets`.
+`gap-notes.md`; runtime IDs use the `sm-` prefix, such as
+`sm-gap-notes`.
 
 ## Retrieval And Corpus Navigation
 
@@ -22,25 +22,13 @@ Files in `system-defaults/memories/` use bare slugs such as
 ## Knowledge, Persistence, And Render Hygiene
 
 - [sm-persistence-taxonomy](persistence-taxonomy.md) - when to learn
-  (rendered or recall-only), note, or pin.
+  (rendered or recall-only) or note.
 - [sm-render-lifecycle](render-lifecycle.md) - learn and render lifecycle.
-- [sm-scoped-pins](scoped-pins.md) - hot context for one active execution lane.
 - [sm-side-channel-notes](side-channel-notes.md) - executor and orchestrator
   note emission.
 - [sm-create-etiquette](create-etiquette.md) - list-before-create dedupe
   discipline.
 - [sm-gap-notes](gap-notes.md) - reporting missing substrate capabilities.
-
-## Packets And Deterministic Judges
-
-- [sm-rule-packets](rule-packets.md) - compile reusable mechanisms from
-  examples or rules.
-- [sm-review-packets](review-packets.md) - code review and PR triage packet
-  patterns.
-- [sm-auth-packets](auth-packets.md) - authorization and access-table packet
-  patterns.
-- [sm-design-packets](design-packets.md) - design proposal ranking and
-  iteration packets.
 
 ## Bro execution and historical records
 

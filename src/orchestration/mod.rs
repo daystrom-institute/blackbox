@@ -1,6 +1,5 @@
 pub mod account_probes;
 pub(crate) mod admission;
-pub mod agents;
 pub mod allocator;
 pub mod brofile;
 pub mod executor;
@@ -784,11 +783,6 @@ pub struct TaskInner {
     /// first user prompt for fresh dispatches and is independent of bro_label,
     /// which still carries bro/team identity.
     pub name: Option<String>,
-    /// Agent attribution set by bro_agent_dispatch. Format:
-    /// `agent:<name>@v<version>`. Preserved even when record_task_to_bro
-    /// overwrites bro_label for team routing. Surfaced in bro_status /
-    /// bro_dashboard as agentLabel alongside broLabel.
-    pub agent_label: Option<String>,
     /// True when the latest terminal result event represented an operator
     /// interrupt rather than a natural finish. This is a cause marker layered on
     /// top of `status`: finalization maps it to `Cancelled`, and status/roster
@@ -1148,7 +1142,6 @@ mod roster_view_tests {
                 managed_worktree: Some(format!("/wt/{id}")),
                 bro_label: Some(format!("bro-{id}")),
                 name: None,
-                agent_label: Some(format!("agent-{id}")),
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -1195,7 +1188,6 @@ mod roster_view_tests {
             managed_worktree: None,
             workflow_owned: false,
             started_at: Some(42),
-            agent_label: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -1230,7 +1222,6 @@ mod roster_view_tests {
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
-                agent_label: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1354,7 +1345,6 @@ mod roster_view_tests {
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
-                agent_label: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1430,15 +1420,8 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         turns: inner.num_turns,
         cwd: inner.cwd.clone(),
         managed_worktree: inner.managed_worktree.clone(),
-        label: inner
-            .bro_label
-            .clone()
-            .or_else(|| inner.agent_label.clone()),
-        name: inner
-            .name
-            .clone()
-            .or_else(|| inner.bro_label.clone())
-            .or_else(|| inner.agent_label.clone()),
+        label: inner.bro_label.clone(),
+        name: inner.name.clone().or_else(|| inner.bro_label.clone()),
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
         has_last_message: Some(inner.last_assistant_message.is_some()),
@@ -1456,11 +1439,6 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // Set from the same `TaskInner.started_at` that the
         // existing `last_event_at` derivation already reads.
         started_at: Some(inner.started_at),
-        // Wave 7c: dashboard needs `agentLabel` distinct from
-        // `broLabel`; the legacy projection collapsed them into
-        // `label`. Carry both so the dashboard's row projection
-        // can stay off the per-task inner mutex.
-        agent_label: inner.agent_label.clone(),
         interrupted: inner.interrupted,
         // Error teaser for failed/cancelled tasks: the last non-empty line
         // of stderr, trimmed and capped, so the fleet cockpit zoom view can
@@ -1615,7 +1593,6 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -1803,8 +1780,6 @@ struct PersistedTask {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    agent_label: Option<String>,
-    #[serde(default)]
     interrupted: bool,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
@@ -1943,7 +1918,6 @@ impl TaskStore {
                     managed_worktree: inner.managed_worktree.clone(),
                     bro_label: inner.bro_label.clone(),
                     name: inner.name.clone(),
-                    agent_label: inner.agent_label.clone(),
                     interrupted: inner.interrupted,
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
@@ -2130,7 +2104,6 @@ impl TaskStore {
                     managed_worktree: rec.managed_worktree,
                     bro_label: rec.bro_label,
                     name: rec.name,
-                    agent_label: rec.agent_label,
                     interrupted: rec.interrupted,
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
@@ -2159,10 +2132,9 @@ impl TaskStore {
 // ── Dispatch-context layer (typed ingredients, harness-composed) ────
 //
 // The daemon owns CONTENT SELECTION only (dispatch-prompt-slots.md §3):
-// which directives fire for a dispatch, each directive's empirically-
-// calibrated cadence, the persona resolved from the brofile, the
-// pre-bound scoping IDs (task, session, project, bro, thread,
-// work-item), and the resolved pin block. It does NOT compose prompt
+// the persona resolved from the brofile, the completion contract when the
+// dispatch carries one, and the pre-bound scoping IDs (task, session,
+// project, bro, thread, work-item). It does NOT compose prompt
 // text — `AmbientContext::dispatch_context` serializes the typed
 // payload and the harness routes each ingredient to its per-transport
 // slot (`--dispatch-context`, bro-protocol `DispatchContext`). The
@@ -2177,77 +2149,6 @@ impl TaskStore {
 //
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
-
-/// Recall directive. The managed-region CORE RULE reliably triggers
-/// `bbox_knowledge` queries on cold-start but can attention-decay within long
-/// sessions on weaker providers. Keep this as a standing instruction, not a
-/// per-turn reminder: repeated developer-message injection made Codex/Brodex
-/// over-comply during procedural live-state work (especially gap-store work)
-/// where `bbox_gaps`/`bbox_gap` is already the authoritative surface.
-pub const RECALL_DIRECTIVE: &str = "\
-Use `bbox_knowledge` when durable knowledge, prior decisions, conventions, or \
-system runbooks could materially change the answer. It is not the surface for \
-procedural live-state work already using the authoritative store: scoped pins, \
-side-channel notes, active threads, transcripts, gap-store checks/writes \
-(`bbox_gaps`/`bbox_gap*`), or repo-owned state commits. If a recall check is \
-appropriate and the first result is empty or too broad, try one sharper phrase \
-before relying on live filesystem state or prior knowledge.";
-
-/// Ambient nudge for recursive orchestrators (allow_recursion=true).
-/// They're usually fan-out coordinators, and the most common silent
-/// failure mode is writing a prose rubric and pasting it into N
-/// identical sub-agent prompts instead of compiling a packet once and
-/// dispatching the packet_id. Fires in addition to RECALL_DIRECTIVE.
-pub const ORCHESTRATOR_HINT: &str = "\
-Orchestrator note: if your plan involves sending the same rubric / \
-ranking criteria / decision tree / access rules to multiple sub-agents, \
-compile it into a packet first via `bbox_compile` and dispatch the \
-`packet_id` — every sub-agent then produces bit-identical output via \
-`bbox_apply`, and a 4th agent can reproduce the results deterministically \
-without re-reading prose. See `sm-rule-packets` via `bbox_knowledge`.";
-
-/// Ambient task-shape nudge for every dispatch. Addresses a failure
-/// mode observed in E10/S11 where an agent bypassed packets entirely
-/// on a log-triage task ("the primitive was simply absent from my
-/// mental toolkit") because `bbox_compile` wasn't deferred-loaded and
-/// the task's shape read as regex-ish. Naming the packet tools in
-/// the ambient prefix pre-loads their schemas into the agent's option
-/// space and reframes "the AST can't do regex" as a gap-log rather
-/// than a bypass. Fires for every dispatch, orthogonal to
-/// ORCHESTRATOR_HINT.
-///
-/// **Calibration bound (E12 cross-provider data):** the current
-/// wording is at the "works across claude+codex+gemini" joint.
-/// Self-reported force varies by provider — Claude reads it as
-/// "nudge, not decider" ("I'd have compiled regardless"), Codex as
-/// "could have tipped fuzzier tasks", Gemini as "MANDATORY choice,
-/// not nudge". Escalating the language (e.g. imperative verbs,
-/// longer justification, explicit step-by-step) risks:
-///   (a) over-constraint on Claude — it becomes noise it ignores,
-///       or worse, makes the hint feel adversarial in tasks where
-///       packets are clearly wrong (prose/research/synthesis);
-///   (b) compliance theater on Gemini — Gemini already treats this
-///       as mandatory at current wording; turning the dial up could
-///       make it compile packets for tasks where the AST doesn't
-///       fit, defeating the gap-tool signal.
-///
-/// If you change this string, re-run E12 (cross-provider S11 sweep)
-/// to confirm all three providers still read it as intended.
-/// Don't add imperative verbs ("MUST compile", "ALWAYS use") without
-/// that verification.
-pub const TASK_SHAPE_HINT: &str = "\
-Task-shape check: if this task involves repeatedly classifying, \
-ranking, triaging, scoring, or judging entities against stated \
-criteria — try `bbox_compile` first (see `sm-rule-packets` via \
-`bbox_knowledge`). Packets force explicit rule ordering and buy a \
-free audit via `bbox_audit`. Log a gap via `bbox_packet_gap` when \
-the AST can't express what you need — whether mechanically (no \
-operator fires) or conceptually (a composition works but is \
-semantically blunt — e.g., keyword StringContains where you'd \
-have wanted regex or synonym matching, Any{} over a long needle \
-list where you wanted a generalizer). Fidelity 1.0 on training \
-alone doesn't rule out the gap; if the mechanism won't generalize \
-to unseen vocabulary, that's the signal the log wants.";
 
 /// Default per-dispatch contract. Deliberately quiet: `bbox_note` is a
 /// signal channel for *notable* observations, NOT a per-dispatch ritual, so
@@ -2281,9 +2182,9 @@ project path, not prose, not \"pending\">\n\
   session_id=<`session` from the `bbox_scope` block, if present>";
 
 /// The workload-retrospective probe prompt, injected as a fake user turn
-/// when a bro's own session is resumed by `bro_prune(retro=true)` or
-/// `bro_retro`. It invites — but never compels — a `bbox_gap` substrate-gap
-/// report about friction with the *blackbox substrate itself*.
+/// when a bro's own session is resumed by `bro_prune(retro=true)`. It
+/// invites, but never compels, a `bbox_gap` substrate-gap report about
+/// friction with the *blackbox substrate itself*.
 ///
 /// The wording is the policy: there is no rule engine deciding what's
 /// worth filing, so the prompt alone has to calibrate the bro's judgment
@@ -2301,8 +2202,7 @@ project path, not prose, not \"pending\">\n\
 ///
 /// Field names and the `gap_kind` enum are pinned to `gaps.rs` (`GapKind`);
 /// an unknown gap_kind or malformed dedupe_key would fail `bbox_gap`.
-/// Deliberately NOT routed through `apply_ambient` — its recall /
-/// task-shape nudges miscue a reflection turn (see `workload_retro_prompt`).
+/// Deliberately carries no dispatch context (see `workload_retro_prompt`).
 pub const WORKLOAD_RETRO_PROMPT: &str = "\
 Quick retrospective — the task itself is done, nothing more is needed on it.\n\
 \n\
@@ -2383,10 +2283,9 @@ Gaps filed: list dedupe keys, or `none`.";
 
 /// Build the workload-retro probe prompt with a minimal `[scope]` block so
 /// any gap note the bro files carries the session/project correlation keys
-/// and lands in `bbox_inbox` attributed correctly. Deliberately bypasses
-/// `apply_ambient`: the recall directive and task-shape (packet) nudge it
-/// injects would miscue a reflection turn, and the retro prompt already
-/// names the exact `bbox_note` call it wants.
+/// and lands in `bbox_inbox` attributed correctly. Deliberately carries no
+/// dispatch context: the retro prompt is self-contained and already names
+/// the exact `bbox_gap` call it wants.
 pub fn workload_retro_prompt(session_id: &str, project: Option<&str>) -> String {
     let mut scope = format!("[scope] session:{session_id}");
     if let Some(p) = project {
@@ -2412,12 +2311,8 @@ pub struct AmbientContext {
     pub bro_name: Option<String>,
     pub thread_id: Option<String>,
     pub work_item_id: Option<String>,
-    /// Scoped active-arc guidance injected from bbox_pin. Persisted on disk,
-    /// hot only for matching ambient scopes, never rendered into repo memory.
-    pub pin_block: Option<String>,
     /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
     pub completion_contract: Option<String>,
-    pub allow_recursion: bool,
     /// Target provider. When set and the provider supports dispatch-time
     /// tool filtering (Claude/Copilot), the text recursion guard is
     /// omitted in favor of the mechanical filter applied at the CLI arg
@@ -2562,18 +2457,16 @@ pub fn merge_tool_arg_defaults(
 }
 
 impl AmbientContext {
-    /// Serialize this dispatch's typed ingredients — persona (brofile lens),
-    /// the selected directive set with declared cadence, the scope fields,
-    /// and the pin block — into the `--dispatch-context` payload
-    /// (dispatch-prompt-slots.md §4/§6). The harness owns composition;
-    /// nothing here is prompt text.
+    /// Serialize this dispatch's typed ingredients (persona from the brofile
+    /// lens, the completion contract directive, and the scope fields) into
+    /// the `--dispatch-context` payload (dispatch-prompt-slots.md). The
+    /// harness owns composition; nothing here is prompt text.
     ///
     /// Recursion guarding (blocking sub-bro dispatch) stays mechanical via
     /// provider tool-filter args appended to argv outside this function; no
     /// text recursion guard is emitted.
     ///
-    /// Cadence declarations carry the empirical calibration the old glued
-    /// preamble encoded positionally. Directives are standing by default;
+    /// The completion contract is the only directive and is standing;
     /// recurring behavioral nudges belong in the harness HookEngine/NudgeLedger
     /// so they can be triggered and throttled by actual turn state. `contract`
     /// declares `needs_scope`: its text references the `bbox_scope`
@@ -2582,53 +2475,19 @@ impl AmbientContext {
     pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
         use bro_protocol::{DirectiveCadence, DispatchDirective, DispatchScope};
 
-        let directive = |id: &str, cadence: DirectiveCadence, needs_scope: bool, text: &str| {
-            DispatchDirective {
-                id: id.to_string(),
-                cadence,
-                needs_scope,
-                text: text.to_string(),
-            }
-        };
-        let mut directives = vec![
-            directive(
-                "recall",
-                DirectiveCadence::Standing,
-                false,
-                RECALL_DIRECTIVE,
-            ),
-            directive(
-                "task_shape",
-                DirectiveCadence::Standing,
-                false,
-                TASK_SHAPE_HINT,
-            ),
-        ];
-        // allow_recursion ⇒ this agent is a fan-out orchestrator. Surface the
-        // packet primitive — the most common silent miss for these agents is
-        // writing a prose rubric and pasting it into N identical sub-agent
-        // prompts.
-        if self.allow_recursion {
-            directives.push(directive(
-                "orchestrator",
-                DirectiveCadence::Standing,
-                false,
-                ORCHESTRATOR_HINT,
-            ));
-        }
-        if let Some(contract) = self
+        let directives: Vec<DispatchDirective> = self
             .completion_contract
             .as_deref()
             .map(str::trim_end)
             .filter(|c| !c.is_empty())
-        {
-            directives.push(directive(
-                "contract",
-                DirectiveCadence::Standing,
-                true,
-                contract,
-            ));
-        }
+            .map(|contract| DispatchDirective {
+                id: "contract".to_string(),
+                cadence: DirectiveCadence::Standing,
+                needs_scope: true,
+                text: contract.to_string(),
+            })
+            .into_iter()
+            .collect();
 
         let scope = DispatchScope {
             task: self.task_id.clone(),
@@ -2647,12 +2506,6 @@ impl AmbientContext {
                 .map(str::to_string),
             directives,
             scope: (!scope.is_empty()).then_some(scope),
-            pins: self
-                .pin_block
-                .as_deref()
-                .map(str::trim_end)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
         }
     }
 }
@@ -2701,7 +2554,6 @@ pub struct SpawnTaskParams {
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
-    pub agent_label: Option<String>,
     /// Spawn-time origin classification (Slice 1b). Determines which
     /// roster tab the task lands in. Defaults to `Unknown` at the field
     /// boundary so test helpers that build `SpawnTaskParams` directly
@@ -2734,7 +2586,6 @@ fn failed_duplicate_task(
     session_id: String,
     cwd: Option<String>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     message: String,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2761,7 +2612,6 @@ fn failed_duplicate_task(
             cwd,
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -2798,7 +2648,6 @@ pub fn spawn_in_process_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // Drop the write guard before consulting an existing task on refusal.
@@ -2814,7 +2663,6 @@ pub fn spawn_in_process_task(
             session_id,
             cwd,
             bro_label,
-            agent_label,
             err.to_string(),
             origin,
         );
@@ -2845,7 +2693,6 @@ pub fn spawn_in_process_task(
             cwd,
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -2873,7 +2720,6 @@ pub fn spawn_in_process_task(
             provider,
             session_id,
             task.inner.lock().cwd.clone(),
-            None,
             None,
             err.to_string(),
             origin,
@@ -3014,7 +2860,6 @@ pub async fn spawn_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     spawn_task_with_tool_placement(
@@ -3029,7 +2874,6 @@ pub async fn spawn_task(
         tail_tx,
         roster_events,
         bro_label,
-        agent_label,
         None,
         None,
         origin,
@@ -3147,7 +2991,6 @@ pub async fn spawn_task_with_tool_placement(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     origin: bro_core::Origin,
@@ -3168,7 +3011,6 @@ pub async fn spawn_task_with_tool_placement(
             session_id,
             cwd,
             bro_label,
-            agent_label,
             err.to_string(),
             origin,
         );
@@ -3187,7 +3029,6 @@ pub async fn spawn_task_with_tool_placement(
             tail_tx,
             roster_events,
             bro_label,
-            agent_label,
             origin,
         },
         tool_placement,
@@ -3224,7 +3065,6 @@ async fn spawn_reserved_dispatch(
         tail_tx,
         roster_events,
         bro_label,
-        agent_label,
         origin,
     } = params;
     // A session must never inherit the daemon's process cwd ($HOME under
@@ -3285,7 +3125,6 @@ async fn spawn_reserved_dispatch(
             tail_tx,
             roster_events.clone(),
             bro_label,
-            agent_label,
             tool_placement,
             tool_defaults,
             origin,
@@ -3322,7 +3161,6 @@ async fn spawn_reserved_dispatch(
         task_store,
         roster_events,
         bro_label,
-        agent_label,
         anyhow::anyhow!(
             "`{provider}` is not a dispatchable provider: it backs daemon-internal \
              tasks only and has no worker binary. Set a real provider on the brofile."
@@ -3345,7 +3183,6 @@ async fn spawn_harness_child_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     origin: bro_core::Origin,
@@ -3415,7 +3252,6 @@ async fn spawn_harness_child_task(
                 task_store,
                 roster_events,
                 bro_label,
-                agent_label,
                 error,
                 origin,
             );
@@ -3459,7 +3295,6 @@ async fn spawn_harness_child_task(
                 task_store,
                 roster_events,
                 bro_label,
-                agent_label,
                 error,
                 origin,
             );
@@ -3496,7 +3331,6 @@ async fn spawn_harness_child_task(
             managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location,
@@ -3527,7 +3361,6 @@ async fn spawn_harness_child_task(
             provider,
             session_id,
             cwd,
-            None,
             None,
             err.to_string(),
             origin,
@@ -4046,7 +3879,6 @@ fn failed_harness_child_setup(
     task_store: Arc<RwLock<TaskStore>>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     error: anyhow::Error,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -4056,7 +3888,6 @@ fn failed_harness_child_setup(
         session_id,
         cwd,
         bro_label,
-        agent_label,
         format!("harness child setup failed: {error:#}"),
         origin,
     );
@@ -4827,9 +4658,6 @@ fn task_view_json_from_inner(
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
     }
-    if let Some(ref label) = inner.agent_label {
-        obj["agentLabel"] = Value::String(label.clone());
-    }
     if transcript_coordinates {
         if let Some(ref location) = inner.transcript_location {
             obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
@@ -5454,14 +5282,6 @@ const WHEN_SUMMARY_RESERVE_BYTES: usize = 1024;
 pub(crate) const WHEN_ROWS_BUDGET_BYTES: usize =
     ENVELOPE_INNER_BUDGET_BYTES - WHEN_SUMMARY_RESERVE_BYTES;
 
-/// Fixed allowance for the reply keys (`team`, truncation note) outside the
-/// receipt array. Full broadcast receipts are only emitted into whatever
-/// budget remains after every member's minimal compact receipt is reserved,
-/// so the complete envelope stays inside the transport cap.
-const BROADCAST_SUMMARY_RESERVE_BYTES: usize = 1024;
-pub(crate) const BROADCAST_RECEIPTS_BUDGET_BYTES: usize =
-    ENVELOPE_INNER_BUDGET_BYTES - BROADCAST_SUMMARY_RESERVE_BYTES;
-
 /// Serialized length of a JSON value in UTF-8 bytes; unserializable values
 /// count as infinite so they always fall to the compact path.
 fn serialized_len(value: &Value) -> usize {
@@ -5469,11 +5289,6 @@ fn serialized_len(value: &Value) -> usize {
         .map(|encoded| encoded.len())
         .unwrap_or(usize::MAX)
 }
-
-/// Maximum members one `bro_broadcast` call may dispatch. The check runs
-/// before any member launch or team-file write so an oversized (for example
-/// hand-edited) team cannot fan out unbounded effects.
-pub(crate) const BROADCAST_MEMBER_LIMIT: usize = 256;
 
 /// Outcome counts for aggregate waits, classified from the same captured
 /// result rows that are returned to the caller (never by re-reading live
@@ -5609,111 +5424,6 @@ pub(crate) fn truncated_chars(value: &str, max_chars: usize) -> String {
     cut
 }
 
-/// Error-text bounds for broadcast receipts: full receipts keep 512 chars
-/// before compaction; compact receipts keep 64.
-const BROADCAST_FULL_ERROR_CHARS: usize = 512;
-const BROADCAST_COMPACT_ERROR_CHARS: usize = 64;
-
-/// Bound broadcast receipts against the complete shaped reply. Each member
-/// keeps a receipt preserving identity and admission outcome: over-long
-/// error text is truncated with an explicit marker, every row's minimal
-/// compact receipt is reserved up front, and full rows are only emitted
-/// into whatever budget remains, so compaction never appends unaccounted
-/// bytes after the budget is exhausted. Dispatch mechanics are untouched;
-/// only the serialized reply is shaped.
-pub(crate) fn bound_broadcast_receipts(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
-    let truncated: Vec<Value> = rows
-        .into_iter()
-        .map(|mut row| {
-            if let Some(error) = row.get("error").and_then(Value::as_str).map(str::to_string)
-                && error.chars().count() > BROADCAST_FULL_ERROR_CHARS
-                && let Some(map) = row.as_object_mut()
-            {
-                map.insert(
-                    "error".into(),
-                    Value::String(truncated_chars(&error, BROADCAST_FULL_ERROR_CHARS)),
-                );
-                map.insert("errorTruncated".into(), Value::Bool(true));
-            }
-            row
-        })
-        .collect::<Vec<_>>();
-    let minimal: Vec<Value> = truncated
-        .iter()
-        .map(|row| compact_broadcast_receipt(row))
-        .collect();
-    let reserved: usize = minimal.iter().map(serialized_len).sum();
-    let mut used = reserved;
-    let mut compacted = 0usize;
-    let mut bounded = Vec::with_capacity(truncated.len());
-    for (row, compact) in truncated.into_iter().zip(minimal) {
-        let bytes = serialized_len(&row);
-        if used.saturating_add(bytes) > BROADCAST_RECEIPTS_BUDGET_BYTES {
-            compacted += 1;
-            bounded.push(compact);
-        } else {
-            used += bytes;
-            bounded.push(row);
-        }
-    }
-    let truncation = (compacted > 0).then(|| {
-        json!({
-            "compacted_receipts": compacted,
-            "byte_budget": BROADCAST_RECEIPTS_BUDGET_BYTES,
-            "hint": "Every member keeps a receipt; compacted receipts omit session detail. Read admitted task state with bro_status(task_id=...).",
-        })
-    });
-    (bounded, truncation)
-}
-
-/// Compact one broadcast receipt to exact member identity plus either the
-/// admitted taskId or a bounded error, whichever outcome the member got.
-fn compact_broadcast_receipt(row: &Value) -> Value {
-    let mut compact = serde_json::Map::new();
-    if let Some(name) = row.get("bro").filter(|value| !value.is_null()) {
-        compact.insert("bro".into(), name.clone());
-    }
-    if let Some(task_id) = row.get("taskId").filter(|value| !value.is_null()) {
-        compact.insert("taskId".into(), task_id.clone());
-    } else if let Some(error) = row.get("error").and_then(Value::as_str) {
-        compact.insert(
-            "error".into(),
-            Value::String(truncated_chars(error, BROADCAST_COMPACT_ERROR_CHARS)),
-        );
-    }
-    compact.insert("receiptCompacted".into(), Value::Bool(true));
-    Value::Object(compact)
-}
-
-/// Upper bound for one member's guaranteed compact receipt: exact member
-/// name plus the larger of the admitted (bounded taskId) and rejected
-/// (bounded error) forms. The pre-effect fit check uses this so a team
-/// whose receipts cannot fit the envelope rejects before any member
-/// launch or team-file write.
-fn broadcast_minimal_receipt_bytes(member_name: &str) -> usize {
-    let admitted = json!({
-        "bro": member_name,
-        "taskId": "T".repeat(64),
-        "receiptCompacted": true,
-    });
-    let rejected = json!({
-        "bro": member_name,
-        "error": "E".repeat(BROADCAST_COMPACT_ERROR_CHARS + 1),
-        "receiptCompacted": true,
-    });
-    serialized_len(&admitted).max(serialized_len(&rejected))
-}
-
-/// Pre-effect fit check: the sum of every member's minimal receipt plus the
-/// summary reserve must fit the receipt budget.
-pub(crate) fn broadcast_receipts_fit(member_names: &[&str]) -> bool {
-    let minimal: usize = member_names
-        .iter()
-        .map(|name| broadcast_minimal_receipt_bytes(name))
-        .sum();
-    minimal.saturating_add(BROADCAST_SUMMARY_RESERVE_BYTES) <= BROADCAST_RECEIPTS_BUDGET_BYTES
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5790,17 +5500,6 @@ mod tests {
             .collect();
         assert!(when_selection_fits(&tasks));
         assert!(!when_selection_fits(&vec!["x".repeat(64 * 1024)]));
-
-        let names: Vec<String> = (0..BROADCAST_MEMBER_LIMIT)
-            .map(|index| format!("member-{index:03}"))
-            .collect();
-        let sane: Vec<&str> = names.iter().map(String::as_str).collect();
-        assert!(broadcast_receipts_fit(&sane));
-        let long: Vec<String> = (0..BROADCAST_MEMBER_LIMIT)
-            .map(|_| "m".repeat(256))
-            .collect();
-        let oversized: Vec<&str> = long.iter().map(String::as_str).collect();
-        assert!(!broadcast_receipts_fit(&oversized));
     }
 
     #[test]
@@ -5836,69 +5535,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing row {index}"));
             assert_eq!(row["status"], json!("completed"));
         }
-    }
-
-    #[test]
-    fn bound_broadcast_receipts_reserve_minimal_receipts_at_max_fanout() {
-        let hot = "\u{1}\"\\😀\u{2028}\u{7}";
-        let rows: Vec<Value> = (0..BROADCAST_MEMBER_LIMIT)
-            .map(|index| {
-                json!({
-                    "bro": format!("m\u{1}-{index:03}\u{2028}"),
-                    "taskId": format!("task-{index:03}"),
-                    "sessionId": format!("session-{index:03}"),
-                    "error": hot.repeat(128),
-                })
-            })
-            .collect();
-        let (bounded, truncation) = bound_broadcast_receipts(rows);
-        assert_eq!(bounded.len(), BROADCAST_MEMBER_LIMIT);
-        let note = truncation.expect("max fanout must compact receipts");
-        assert!(note["compacted_receipts"].as_u64().unwrap() > 0);
-        let emitted: usize = bounded.iter().map(serialized_len).sum();
-        assert!(
-            emitted <= BROADCAST_RECEIPTS_BUDGET_BYTES,
-            "emitted {emitted} bytes over budget {BROADCAST_RECEIPTS_BUDGET_BYTES}"
-        );
-        for index in 0..BROADCAST_MEMBER_LIMIT {
-            let expected = format!("m\u{1}-{index:03}\u{2028}");
-            assert!(
-                bounded
-                    .iter()
-                    .any(|row| row["bro"] == json!(expected.clone())),
-                "missing identity {expected:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bound_broadcast_receipts_compact_and_truncate_errors() {
-        let long_error = "E".repeat(2048);
-        let rows: Vec<Value> = (0..96)
-            .map(|index| {
-                json!({
-                    "bro": format!("member-{index}"),
-                    "taskId": format!("task-{index}"),
-                    "sessionId": format!("session-{index}"),
-                    "error": long_error,
-                })
-            })
-            .collect();
-        let (bounded, truncation) = bound_broadcast_receipts(rows);
-        assert_eq!(bounded.len(), 96);
-        let note = truncation.expect("budget must compact receipts");
-        assert!(note["compacted_receipts"].as_u64().unwrap() > 0);
-        for (index, row) in bounded.iter().enumerate() {
-            assert_eq!(row["bro"], json!(format!("member-{index}")));
-            if let Some(error) = row["error"].as_str() {
-                assert!(error.chars().count() <= 513, "{error}");
-            }
-        }
-        assert!(
-            bounded
-                .iter()
-                .any(|row| row.get("receiptCompacted") == Some(&json!(true)))
-        );
     }
 
     #[test]
@@ -6476,7 +6112,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         )
         .await;
@@ -6497,7 +6132,6 @@ mod tests {
             store_dir,
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -6562,7 +6196,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -6619,7 +6252,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -6656,7 +6288,6 @@ mod tests {
             root.clone(),
             Arc::new(RwLock::new(TaskStore::new())),
             tail_tx.clone(),
-            None,
             None,
             None,
             bro_core::Origin::Workflow,
@@ -6709,7 +6340,6 @@ mod tests {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::Workflow,
         );
         let mirror = root.join("daemon-bro/harness-sessions/mirror.events.jsonl");
@@ -6758,7 +6388,6 @@ mod tests {
             root.clone(),
             store.clone(),
             tail_tx.clone(),
-            None,
             None,
             None,
             bro_core::Origin::AgentDispatch,
@@ -6895,7 +6524,6 @@ mod tests {
                 root.clone(),
                 store.clone(),
                 tail_tx.clone(),
-                None,
                 None,
                 None,
                 bro_core::Origin::AgentDispatch,
@@ -7205,7 +6833,6 @@ mod tests {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::Cockpit,
         );
         let managed_string = managed.to_string_lossy().into_owned();
@@ -7222,7 +6849,6 @@ mod tests {
             root.join("store"),
             store,
             tail_tx,
-            None,
             None,
             None,
             bro_core::Origin::Cockpit,
@@ -7248,7 +6874,6 @@ mod tests {
             tempfile::tempdir().unwrap().path().to_path_buf(),
             store,
             tail_tx,
-            None,
             None,
             None,
             bro_core::Origin::Workflow,
@@ -7498,7 +7123,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -7702,7 +7326,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 origin: bro_core::Origin::Cockpit,
             },
         )
@@ -7945,6 +7568,46 @@ mod tests {
             bro_core::Origin::Unknown,
             "pre-Slice-1b record (no origin field) must decode to Origin::Unknown"
         );
+    }
+
+    /// Rows persisted with an `agent_label` attribution still load; the
+    /// field is ignored and the bro label keeps driving the roster label.
+    #[test]
+    fn persisted_row_with_agent_label_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().to_path_buf();
+        let legacy = serde_json::json!([{
+            "id": "legacy-agent-task",
+            "provider": "glm",
+            "session_id": "sess-legacy",
+            "events": [],
+            "last_assistant_message": null,
+            "usage": null,
+            "cost_usd": null,
+            "num_turns": 1,
+            "stderr": "",
+            "status": "completed",
+            "started_at": 1_700_000_000_000u64,
+            "completed_at": 1_700_000_000_001u64,
+            "exit_code": 0,
+            "bro_label": "team::member",
+            "agent_label": "agent:reviewer@v1",
+            "origin": "agentdispatch"
+        }]);
+        std::fs::write(
+            store_dir.join("tasks.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let reloaded = TaskStore::load(&store_dir, u64::MAX);
+        let task = reloaded
+            .get("legacy-agent-task")
+            .expect("row with agent_label must load");
+        let summary = roster_summary_from_task(&task);
+        assert_eq!(summary.label.as_deref(), Some("team::member"));
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("agent_label").is_none(), "{wire}");
     }
 
     #[test]
@@ -8199,7 +7862,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8239,7 +7901,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8296,7 +7957,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8352,7 +8012,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8669,7 +8328,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8719,7 +8377,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
                 // value so a regression that drops the origin on
@@ -8762,7 +8419,6 @@ mod tests {
             session_id: Some("sess-abc".into()),
             project_dir: Some("/repo/x".into()),
             bro_name: Some("executor".into()),
-            allow_recursion: false,
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
@@ -9296,14 +8952,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_allow_recursion_keeps_scope_and_recall() {
-        // The payload carries scope + recall for every dispatch regardless of
-        // `allow_recursion`. Recursion guarding is mechanical (tool filter)
-        // not textual; fan-out orchestrators additionally get the packet
-        // nudge as a standing directive.
+    fn dispatch_context_without_contract_keeps_scope_and_no_directives() {
+        // The payload carries scope for every dispatch. Recursion guarding is
+        // mechanical (tool filter), not textual, and recursive dispatches
+        // carry no completion contract.
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
-            allow_recursion: true,
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
@@ -9312,11 +8966,7 @@ mod tests {
             payload.scope.as_ref().unwrap().session.as_deref(),
             Some("sess-orch")
         );
-        let recall = directive(&payload, "recall");
-        assert!(recall.text.contains("bbox_knowledge"));
-        let orch = directive(&payload, "orchestrator");
-        assert!(orch.text.contains("bbox_compile"));
-        assert_eq!(orch.cadence, bro_protocol::DirectiveCadence::Standing);
+        assert!(payload.directives.is_empty());
     }
 
     #[test]
@@ -9348,66 +8998,29 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_carries_pin_block_verbatim() {
-        let ctx = AmbientContext {
-            pin_block: Some(
-                "- [bro:executor] Active arc: validate cuts against canonical doc".into(),
-            ),
-            ..Default::default()
-        };
-        let payload = ctx.dispatch_context(None);
-        assert!(payload.pins.as_deref().unwrap().contains("Active arc"));
-    }
-
-    #[test]
-    fn dispatch_context_recall_directive_is_standing_and_exempts_live_state_surfaces() {
-        let payload = AmbientContext::default().dispatch_context(None);
-        let recall = directive(&payload, "recall");
-        assert_eq!(recall.cadence, bro_protocol::DirectiveCadence::Standing);
-        assert!(!recall.needs_scope);
-        assert!(recall.text.contains("bbox_knowledge"));
-        assert!(recall.text.contains("procedural live-state work"));
-        assert!(recall.text.contains("bbox_gaps"));
-        assert!(recall.text.contains("bbox_gap*"));
-        assert!(recall.text.contains("repo-owned state commits"));
-        assert!(!recall.text.contains("FIRST tool call"));
-    }
-
-    #[test]
-    fn dispatch_context_directive_order_and_conditionals() {
-        // Solo executor: recall → task_shape → contract.
+    fn dispatch_context_contract_is_the_only_directive() {
         let solo = AmbientContext {
-            allow_recursion: false,
             completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
             ..Default::default()
         };
-        let payload = solo.dispatch_context(None);
         assert_eq!(
-            directive_ids(&payload),
-            vec!["recall", "task_shape", "contract"]
+            directive_ids(&solo.dispatch_context(None)),
+            vec!["contract"]
         );
-        let task_shape = directive(&payload, "task_shape");
-        assert!(task_shape.text.contains("bbox_compile"));
-        assert!(task_shape.text.contains("bbox_packet_gap"));
-        assert_eq!(task_shape.cadence, bro_protocol::DirectiveCadence::Standing);
 
-        // A legacy workspace flag must not restore a retired tool directive.
+        // No contract and the legacy workspace flag: no directives.
         let orch = AmbientContext {
-            allow_recursion: true,
             coerce_workspace: true,
             ..Default::default()
         };
-        let payload = orch.dispatch_context(None);
-        assert_eq!(
-            directive_ids(&payload),
-            vec!["recall", "task_shape", "orchestrator"]
-        );
-    }
+        assert!(directive_ids(&orch.dispatch_context(None)).is_empty());
 
-    #[test]
-    fn dispatch_context_orchestrator_absent_without_recursion() {
-        let payload = AmbientContext::default().dispatch_context(None);
-        assert!(!directive_ids(&payload).contains(&"orchestrator"));
+        // A blank contract carries nothing.
+        let blank = AmbientContext {
+            completion_contract: Some("  \n".into()),
+            ..Default::default()
+        };
+        assert!(directive_ids(&blank.dispatch_context(None)).is_empty());
     }
 
     #[test]
@@ -9463,7 +9076,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9723,7 +9335,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9781,7 +9392,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9839,7 +9449,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -9899,7 +9508,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -9974,7 +9582,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10034,7 +9641,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10366,7 +9972,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10412,7 +10017,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10464,7 +10068,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10512,7 +10115,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10572,7 +10174,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10625,7 +10226,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,

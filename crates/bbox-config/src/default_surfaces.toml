@@ -24,6 +24,7 @@ disallow = [
     "bbox_project_detach",
     "bbox_project_default_attachment",
     "bbox_project_promote",
+    "bbox_project_scope_migrate",
     "bbox_project_publisher_*",
     "bbox_project_graph_*",
     "bbox_reindex",
@@ -33,7 +34,6 @@ disallow = [
     "bbox_edge_compact",
     "bbox_doctor",
     "bbox_artifact_*",
-    "bro_broadcast",
 ]
 
 [surfaces.interactive]
@@ -52,6 +52,7 @@ disallow = [
     "bbox_project_detach",
     "bbox_project_default_attachment",
     "bbox_project_promote",
+    "bbox_project_scope_migrate",
     "bbox_project_publisher_*",
     "bbox_project_graph_*",
     "bbox_reindex",
@@ -61,7 +62,6 @@ disallow = [
     "bbox_edge_compact",
     "bbox_doctor",
     "bbox_artifact_*",
-    "bro_agent_*",
 ]
 
 # Workflow-owned dispatches: no further dispatch, as a backstop to the
@@ -85,6 +85,7 @@ disallow = [
     "bbox_project_detach",
     "bbox_project_default_attachment",
     "bbox_project_promote",
+    "bbox_project_scope_migrate",
     "bbox_project_publisher_*",
     "bbox_project_graph_*",
     "bbox_reindex",
@@ -110,15 +111,9 @@ allow = [
     "bbox_knowledge",
     "bbox_thread_list",
     "bbox_notes",
-    "bbox_packet_list",
-    "bbox_packet_events",
     "bbox_project_list",
     "bro_status",
     "bro_dashboard",
-    "bro_agent_list",
-    "bro_agent_get",
-    "bro_agent_describe",
-    "bro_agent_search",
     "bbox_tool_calls",
 ]
 

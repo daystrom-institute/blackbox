@@ -8,17 +8,14 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::state::{BlackboxServer, SharedState};
+use super::state::SharedState;
 use crate::artifacts::{
     self, ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
-use crate::chunker;
 use crate::edge_index;
-use crate::entity_ref;
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
-use crate::packets;
 use crate::projects::ProjectRecord;
 use crate::tools::bro_helpers::{
     build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
@@ -144,32 +141,6 @@ pub(crate) async fn admin_drain_set(
     }
 }
 
-pub(crate) async fn admin_packet_compile(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<Value>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let p: packets::CompileParams = match serde_json::from_value(req) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("compile params parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let result = state.packets.read().compile(&p);
-    match result {
-        Ok(msg) => axum::Json(json!({"status": "ok", "message": msg})).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("compile: {e:#}"),
-        )
-            .into_response(),
-    }
-}
-
 pub(crate) async fn read_artifact_source(source: &str) -> anyhow::Result<Value> {
     const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
     let raw = if source.starts_with("http://") || source.starts_with("https://") {
@@ -229,10 +200,12 @@ pub(crate) async fn install_artifact_from_params(
         !matches!(
             p.kind,
             artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Agent
+                | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
         ),
-        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
     );
     let value = read_artifact_source(&p.source).await?;
     install_artifact_value(state, p, value).await
@@ -285,21 +258,20 @@ pub(crate) async fn install_artifact_value(
         !matches!(
             p.kind,
             artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Agent
+                | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
         ),
-        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
     );
     let mut completed = Vec::new();
     let mut failed = "validation";
     let kind = p.kind;
-    let requested_name = p.name.clone().or_else(|| {
-        value
-            .get("name")
-            .or_else(|| value.get("domain"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
+    let requested_name = p
+        .name
+        .clone()
+        .or_else(|| value.get("name").and_then(Value::as_str).map(str::to_owned));
     let supersedes = p
         .supersedes
         .as_deref()
@@ -310,17 +282,21 @@ pub(crate) async fn install_artifact_value(
     remaining.extend(match kind {
         artifacts::ArtifactKind::Workflow => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
             );
         }
-        artifacts::ArtifactKind::Packet => vec!["packet_compilation"],
+        artifacts::ArtifactKind::Packet => {
+            anyhow::bail!(
+                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+            );
+        }
         artifacts::ArtifactKind::Brofile => vec!["brofile_file", "brofile_verification"],
         artifacts::ArtifactKind::Team => {
             vec!["teamplate_file", "team_instance", "team_verification"]
         }
         artifacts::ArtifactKind::Cron => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
             );
         }
         _ => vec![],
@@ -328,13 +304,6 @@ pub(crate) async fn install_artifact_value(
     remaining.push("catalog_persistence");
     if has_supersession {
         remaining.push("previous_runtime_deactivation");
-    }
-    if kind == artifacts::ArtifactKind::Agent {
-        remaining.extend([
-            "agent_warnings",
-            "agent_embedding_queue",
-            "agent_provenance",
-        ]);
     }
     let result: anyhow::Result<artifacts::ArtifactMetadata> = (|| {
         if !value.is_object() {
@@ -346,20 +315,13 @@ pub(crate) async fn install_artifact_value(
             p.name.as_deref(),
             p.version.as_deref(),
         )?;
-        let identity_field = if kind == artifacts::ArtifactKind::Packet {
-            "domain"
-        } else {
-            "name"
-        };
-        value[identity_field] = Value::String(effective_name);
+        value["name"] = Value::String(effective_name);
         // Preserve version's original JSON type unless an override was requested.
         if p.version.is_some() {
             value["version"] = if value.get("version").is_some_and(Value::is_number)
                 || matches!(
                     kind,
-                    artifacts::ArtifactKind::Workflow
-                        | artifacts::ArtifactKind::Agent
-                        | artifacts::ArtifactKind::Atom
+                    artifacts::ArtifactKind::Workflow | artifacts::ArtifactKind::Atom
                 ) {
                 Value::from(
                     effective_version
@@ -370,23 +332,16 @@ pub(crate) async fn install_artifact_value(
                 Value::String(effective_version)
             };
         }
-        let mut installed_agent: Option<(
-            orchestration::agents::types::AgentRef,
-            orchestration::agents::types::AgentManifest,
-            Vec<String>,
-        )> = None;
         match p.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Packet => {
-                let params: packets::CompileParams = serde_json::from_value(value.clone())?;
-                completed.push("validation");
-                failed = "packet_compilation";
-                state.packets.read().compile(&params)?;
-                completed.push("packet_compilation");
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Brofile => {
                 let brofile: orchestration::brofile::Brofile =
@@ -472,66 +427,17 @@ pub(crate) async fn install_artifact_value(
             }
             artifacts::ArtifactKind::Cron => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Agent => {
-                if !value.is_object() {
-                    anyhow::bail!("agent artifact must be a JSON object");
-                }
-                let catalog = state.artifacts.read();
-                let ctx = orchestration::agents::validate::InstallCtx {
-                    brofile_exists: |name: &str| -> bool {
-                        catalog
-                            .metadata_for(artifacts::ArtifactKind::Brofile, name)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| m.active)
-                    },
-                    agent_exists: |name: &str| -> bool {
-                        catalog
-                            .metadata_for(artifacts::ArtifactKind::Agent, name)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| m.active)
-                    },
-                };
-                orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
-                drop(catalog);
-                let manifest_value = value
-                    .get("manifest")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing manifest"))?;
-                let mut manifest: orchestration::agents::types::AgentManifest =
-                    serde_json::from_value(manifest_value)?;
-                let name = p
-                    .name
-                    .clone()
-                    .or_else(|| {
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing name"))?;
-                let version = p
-                    .version
-                    .clone()
-                    .or_else(|| value.get("version").and_then(artifact_version_string))
-                    .ok_or_else(|| anyhow::anyhow!("agent artifact missing version"))?
-                    .parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
-                let agent_ref = orchestration::agents::types::AgentRef { name, version };
-                manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(
-                    &agent_ref, &manifest,
-                ));
-                value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
-                let install_warnings = agent_install_warnings(state, &manifest);
-                installed_agent = Some((agent_ref, manifest, install_warnings));
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Atom => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
                 );
             }
         }
@@ -539,7 +445,7 @@ pub(crate) async fn install_artifact_value(
             completed.push("validation");
         }
         failed = "catalog_persistence";
-        let mut meta = state.artifacts.write().install_value(
+        let meta = state.artifacts.write().install_value(
             p.kind,
             p.source,
             &value,
@@ -556,23 +462,6 @@ pub(crate) async fn install_artifact_value(
             failed = "previous_runtime_deactivation";
             deactivate_artifact(state, meta.kind, prev)?;
             completed.push("previous_runtime_deactivation");
-        }
-        if let Some((agent_ref, manifest, install_warnings)) = installed_agent {
-            failed = "agent_warnings";
-            if !install_warnings.is_empty() {
-                meta = state.artifacts.write().update_install_warnings(
-                    artifacts::ArtifactKind::Agent,
-                    &agent_ref.name,
-                    install_warnings,
-                )?;
-            }
-            completed.push("agent_warnings");
-            failed = "agent_embedding_queue";
-            crate::embed_runtime::enqueue_agent_manifest(&agent_ref, &manifest);
-            completed.push("agent_embedding_queue");
-            failed = "agent_provenance";
-            persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
-            completed.push("agent_provenance");
         }
         Ok(meta)
     })();
@@ -628,10 +517,7 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
             // (dissolution must stick; re-install is the explicit
             // re-materialization path). Teamplate/team stores are
             // file-backed and survive restarts on their own.
-            matches!(
-                entry.kind,
-                artifacts::ArtifactKind::Packet | artifacts::ArtifactKind::Brofile
-            )
+            entry.kind == artifacts::ArtifactKind::Brofile
         })
     {
         let Some(value) = state
@@ -650,29 +536,8 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
         match entry.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
                 );
-            }
-            artifacts::ArtifactKind::Packet => {
-                let params: packets::CompileParams = serde_json::from_value(value.clone())
-                    .with_context(|| format!("parsing packet artifact '{}'", entry.name))?;
-                // Idempotent on purpose: this runs on every daemon boot, and
-                // the unconditional compile used to mint a new packet file
-                // per restart (33 artifacts × N restarts ≈ 2k duplicates).
-                match state
-                    .packets
-                    .read()
-                    .compile_idempotent(&params)
-                    .with_context(|| format!("compiling packet artifact '{}'", entry.name))?
-                {
-                    packets::CompileOutcome::Created(id) => {
-                        tracing::info!(artifact = %entry.name, packet = %id, "packet artifact compiled");
-                    }
-                    packets::CompileOutcome::UnchangedExisting(id) => {
-                        tracing::debug!(artifact = %entry.name, packet = %id, "packet artifact unchanged; reusing existing packet");
-                    }
-                }
-                restored += 1;
             }
             artifacts::ArtifactKind::Brofile => {
                 let brofile: orchestration::brofile::Brofile =
@@ -702,134 +567,17 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
     Ok(restored)
 }
 
-pub(crate) fn agent_install_warnings(
-    state: &Arc<SharedState>,
-    manifest: &orchestration::agents::types::AgentManifest,
-) -> Vec<String> {
-    let Some(overlay) = manifest.filter_overlay.as_ref() else {
-        return Vec::new();
-    };
-    let (base_allow, base_disallow) = if let Some(brofile_ref) = manifest.brofile_ref.as_ref() {
-        let Some(brofile) =
-            orchestration::brofile::resolve_brofile(brofile_ref, &state.store_dir, None)
-        else {
-            return Vec::new();
-        };
-        match brofile.filters {
-            Some(filters) => (filters.allow, filters.disallow),
-            None => (Vec::new(), Vec::new()),
-        }
-    } else if let Some(inline) = manifest.brofile_inline.as_ref() {
-        BlackboxServer::extract_inline_filters(inline)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    let mut warnings = Vec::new();
-    for allowed in &overlay.allow {
-        if base_disallow.contains(allowed) {
-            warnings.push(format!(
-                "filter_overlay.allow `{allowed}` is also disallowed by the base brofile; deny-wins merge keeps it disallowed"
-            ));
-        }
-    }
-    for disallowed in &overlay.disallow {
-        if base_allow.contains(disallowed) {
-            warnings.push(format!(
-                "filter_overlay.disallow `{disallowed}` overrides a base brofile allow entry"
-            ));
-        }
-    }
-    warnings
-}
-
-pub(crate) fn artifact_version_string(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-pub(crate) fn persist_agent_provenance_edges(
-    state: &Arc<SharedState>,
-    agent_ref: &orchestration::agents::types::AgentRef,
-    manifest: &orchestration::agents::types::AgentManifest,
-) -> anyhow::Result<()> {
-    use orchestration::agents::types::AgentProvenance;
-    let Some(AgentProvenance::Distilled {
-        evidence_session_ids,
-        created_from_threads,
-        ..
-    }) = manifest.provenance.as_ref()
-    else {
-        return Ok(());
-    };
-    let source = entity_ref::EntityRef::Agent {
-        name: agent_ref.name.clone(),
-        version: agent_ref.version,
-    };
-    let mut edges = Vec::new();
-    for session in evidence_session_ids {
-        let target = entity_ref::EntityRef::parse(session)?;
-        if !matches!(target, entity_ref::EntityRef::Session { .. }) {
-            anyhow::bail!("distilled agent evidence ref is not a session: {session}");
-        }
-        edges.push(agent_derived_from_edge(source.clone(), target));
-    }
-    for thread in created_from_threads {
-        let target = entity_ref::EntityRef::parse(thread)?;
-        if !matches!(target, entity_ref::EntityRef::Thread { .. }) {
-            anyhow::bail!("distilled agent thread ref is not a thread: {thread}");
-        }
-        edges.push(agent_derived_from_edge(source.clone(), target));
-    }
-    let edges_dir = edge_sidecar_dir(state);
-    let written = edge_index::append_explicit_edges(
-        &edges_dir,
-        bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE,
-        &edges,
-    )?;
-    if written > 0 {
-        // Persist first and wake the single-flight watcher. An artifact tool
-        // must never synchronously parse the complete project graph merely to
-        // publish a handful of provenance edges.
-        state.nudge_edge_index_rebuild();
-    }
-    Ok(())
-}
-
-pub(crate) fn agent_derived_from_edge(
-    source: entity_ref::EntityRef,
-    target: entity_ref::EntityRef,
-) -> edge_index::Edge {
-    edge_index::Edge {
-        source,
-        kind: "DERIVED_FROM".into(),
-        target,
-        provenance: chunker::EdgeProvenance::Explicit,
-        confidence: chunker::EdgeConfidence::Exact,
-        metadata: Default::default(),
-        project_id: None,
-    }
-}
-
 pub(crate) fn deactivate_artifact(
     state: &Arc<SharedState>,
     kind: artifacts::ArtifactKind,
     name: &str,
 ) -> anyhow::Result<()> {
     match kind {
-        artifacts::ArtifactKind::Workflow => {}
-        artifacts::ArtifactKind::Packet => {
-            state.packets.read().remove_domain(name)?;
-        }
+        artifacts::ArtifactKind::Workflow | artifacts::ArtifactKind::Packet => {}
         artifacts::ArtifactKind::Brofile => {
             orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
         }
-        artifacts::ArtifactKind::Agent => {
-            // No separate registry to deactivate for agents (yet).
-        }
+        artifacts::ArtifactKind::Agent => {}
         artifacts::ArtifactKind::Atom => {}
         artifacts::ArtifactKind::Team => {
             // Teams are stored purely as artifacts; no separate registry to deactivate.
@@ -1547,14 +1295,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|note| note.project.as_deref() == Some(project))
         .count();
-    let pins = state.pins.read().project_ref_count(project);
-    let packets = state
-        .packets
-        .read()
-        .list_all()?
-        .iter()
-        .filter(|packet| packet.project.as_deref() == Some(project))
-        .count();
     let slack_channel_bindings = state.slack_channel_bindings.list(None, Some(project)).len();
     let slack_proposal_links = state.slack_proposal_links.project_ref_count(project);
     let teams = orchestration::team::load_all_teams(&state.store_dir)
@@ -1572,8 +1312,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "knowledge": knowledge,
         "threads": threads,
         "notes": notes,
-        "pins": pins,
-        "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
@@ -1809,18 +1547,6 @@ pub(crate) fn migrate_project_refs(
         // This sync migration helper cannot await; notes persistence is write-behind here.
         state.notes_persister.request();
     }
-    let pins = state
-        .pins
-        .write()
-        .rename_project_refs(old_project, new_project)?;
-    if pins > 0 {
-        // This sync migration helper cannot await; pins persistence is write-behind here.
-        state.pins_persister.request();
-    }
-    let packets = state
-        .packets
-        .read()
-        .rename_project_refs(old_project, new_project)?;
     let slack_channel_bindings = state.slack_channel_bindings.rename_project_refs(
         old_project,
         new_project,
@@ -1840,8 +1566,6 @@ pub(crate) fn migrate_project_refs(
         "knowledge": knowledge,
         "threads": threads,
         "notes": notes,
-        "pins": pins,
-        "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
@@ -2250,6 +1974,8 @@ pub(crate) async fn roster_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_ref;
+    use crate::server::state::BlackboxServer;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
@@ -2599,8 +2325,8 @@ mod tests {
             target: entity_ref::EntityRef::Knowledge {
                 id: "target".into(),
             },
-            provenance: chunker::EdgeProvenance::Derived,
-            confidence: chunker::EdgeConfidence::Exact,
+            provenance: bbox_chunker::EdgeProvenance::Derived,
+            confidence: bbox_chunker::EdgeConfidence::Exact,
             metadata: Default::default(),
             project_id: None,
         }
@@ -2721,83 +2447,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_provenance_edges_publish_in_manifest_mode_without_agents_registered() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let state = Arc::new(SharedState::for_test(&root.join("bro")));
-        let edges_dir = edge_sidecar_dir(&state);
-        std::fs::create_dir_all(&edges_dir).unwrap();
-        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
-            &edges_dir,
-            "p",
-            "repo",
-            Some("main"),
-            "head-a",
-            vec![signature_test_edge("ACTIVE")],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        assert!(matches!(
-            edge_index::SidecarManifestAuthority::capture(&edges_dir).unwrap(),
-            edge_index::SidecarManifestAuthority::Manifest(_)
-        ));
-        let registered = state.corpus_registered_project_ids();
-        assert!(
-            !registered.contains(bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE),
-            "the fixture's registered set must not name the agent lane"
-        );
-        rebuild_edge_index_from_shared(&state, false).unwrap();
-        let before = capture_edge_rebuild_authority(&edges_dir, Some(&registered))
-            .unwrap()
-            .signature;
-
-        let session = entity_ref::EntityRef::Session {
-            provider: "claude".into(),
-            session_id: "sess-1".into(),
-        };
-        let manifest: orchestration::agents::types::AgentManifest =
-            serde_json::from_value(serde_json::json!({
-                "description": "distilled reviewer",
-                "provenance": {
-                    "kind": "distilled",
-                    "distilled_by": "distiller",
-                    "evidence_session_ids": [session.to_string()],
-                },
-            }))
-            .unwrap();
-        let agent_ref = orchestration::agents::types::AgentRef {
-            name: "reviewer".into(),
-            version: 1,
-        };
-        persist_agent_provenance_edges(&state, &agent_ref, &manifest).unwrap();
-        assert!(
-            edges_dir
-                .join("explicit")
-                .join(format!(
-                    "{}.jsonl",
-                    bbox_edge_sidecar::edge_sidecar::AGENT_PROVENANCE_LANE
-                ))
-                .is_file()
-        );
-        let after = capture_edge_rebuild_authority(&edges_dir, Some(&registered))
-            .unwrap()
-            .signature;
-        assert_ne!(before, after, "the agent lane write must trigger a rebuild");
-
-        rebuild_edge_index_from_shared(&state, false).unwrap();
-        let agent = entity_ref::EntityRef::Agent {
-            name: "reviewer".into(),
-            version: 1,
-        };
-        let view = state.code_read_view.read();
-        let published = view.edge_index.forward_edges(&agent);
-        assert_eq!(published.len(), 1, "published agent edges: {published:?}");
-        assert_eq!(published[0].kind, "DERIVED_FROM");
-        assert_eq!(published[0].target, session);
-    }
-
-    #[test]
     fn edge_rebuild_refuses_oversized_active_input_before_parsing() {
         let mut env = crate::util::TestEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -2834,14 +2483,31 @@ mod tests {
         );
     }
 
+    /// Register a project beside the state directory and return its id, the
+    /// lane stem its edge sidecar is admitted under.
+    fn registered_watcher_lane(state: &SharedState) -> String {
+        let store_dir = state.store_dir.canonicalize().unwrap();
+        let project = store_dir.parent().unwrap().join("watcher-project");
+        std::fs::create_dir_all(&project).unwrap();
+        state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&project)
+            .unwrap()
+            .project_id
+    }
+
     /// Publish a sidecar graph and return the watcher cursor over it plus the
     /// published edge count.
     fn published_watcher_graph(state: &SharedState) -> (EdgeIndexWatcherCursor, usize) {
         let edges_dir = edge_sidecar_dir(state);
         std::fs::create_dir_all(&edges_dir).unwrap();
+        let lane = registered_watcher_lane(state);
         bbox_edge_sidecar::edge_sidecar::append_edges(
             &edges_dir,
-            "agents",
+            &lane,
             &[signature_test_edge("A"), signature_test_edge("B")],
         )
         .unwrap();
@@ -2912,9 +2578,10 @@ mod tests {
         let (mut cursor, published) = published_watcher_graph(&state);
         let published_signature = cursor.last_signature;
 
+        let lane = registered_watcher_lane(&state);
         bbox_edge_sidecar::edge_sidecar::append_edges(
             &edges_dir,
-            "agents",
+            &lane,
             &[signature_test_edge("C")],
         )
         .unwrap();

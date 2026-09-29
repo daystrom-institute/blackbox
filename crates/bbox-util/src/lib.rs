@@ -4,5 +4,4 @@
 
 pub mod global_render;
 pub mod guidance;
-pub mod legacy_migration;
 pub mod util;

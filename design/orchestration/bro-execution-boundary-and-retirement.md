@@ -142,7 +142,7 @@ replace compiled-router and deployed-catalog verification.
 | `crates/bbox-system-events`, `src/system_events_runtime`, `src/tools/system_events.rs` | Remove programmable reaction engine, event journal and its MCP management surface | Bro status/tail/transcript evidence comes from task records and roster/tail projection. Forgejo integration recipes move to external owners. |
 | `src/orchestration/supervision.rs` | Keep useful execution measurements | Distinguish from `src/tools/atoms/supervision.rs`, which launches higher-order work. Preserve honest last-request context measurements without compaction alarm semantics. |
 | Whiteboard runtime/tools and `crates/bbox-whiteboards` | Remove board lifecycle/voting orchestration and board storage | Detach attention, corpus providers, the `whiteboard:` entity type, schema consumers and project-catalog owner rows. |
-| `crates/bbox-packets`, `src/server/surface.rs`, artifact support | Keep minimal deterministic permission/policy machinery initially | Remove workflow routing, phase and auto-advisor packet consumers. Ordinary bro tool filtering currently depends on packet evaluation; missing policy must never silently widen access. Reassess generic packet authoring after consumers are reduced. |
+| `src/server/surface.rs`, artifact support | Keep deterministic permission/policy machinery | Ordinary bro tool filtering uses the surface policy in daemon configuration; missing policy must never silently widen access. |
 | `src/embed_runtime.rs` | Keep embeddings and contradiction observations | Replace `contradiction-review-arc` launch with the existing note/evidence fallback. An indexing event must not start a new planning process. |
 | `src/server/{open,state,background,restore}.rs` | Keep corpus and bro service initialization | Remove automation hooks individually. Shared startup also owns indexing, publication, provenance, vector maintenance and artifact restoration for retained kinds. |
 
@@ -236,14 +236,14 @@ without an event journal or reaction executor. Preserve only necessary
 task/session evidence. No task completion, embedding change, or observation read should trigger
 an atom, workflow, advisor, or Slack action after retirement.
 
-### E6: permissions survive packet and artifact reduction
+### E6: permissions survive artifact reduction
 
 Keep shared MCP filtering, scoped instructions, code-mode filtering and worker
-policy composition. Ordinary bro dispatch uses packet-backed surface policy;
-missing packet behavior currently permits passthrough. Keep the required policy
-subset or replace it with explicit equivalent enforcement before deleting any
-policy artifact. Probe flat, qualified MCP and nested code-mode aliases so a
-removed restriction cannot survive as a bypass.
+policy composition. Ordinary bro dispatch uses the surface policy in daemon
+configuration. Keep the required policy subset or replace it with explicit
+equivalent enforcement before deleting any policy artifact. Probe flat,
+qualified MCP and nested code-mode aliases so a removed restriction cannot
+survive as a bypass.
 
 ## Deployed consumer snapshot
 
@@ -304,7 +304,7 @@ deployment authority applies; gates below are technical prerequisites.
 
 - Capture exact installed dependencies and inactive records; stop their admission
   before deleting handlers. Remove Badgey scheduled jobs and application agents,
-  workflows, packets, brofiles and auto-install defaults coherently.
+  workflows, brofiles and auto-install defaults coherently.
 - Remove the 22 Badgey/consultant/Slack tools, bot bridge, consultant runtime,
   linkage stores and startup recovery. Apply E2 to catalog/receipt migration.
 - Implement E3 before removing Slack collector enrollment/configuration. Stop
@@ -337,7 +337,7 @@ deployment authority applies; gates below are technical prerequisites.
   automation adapters and their 12 MCP tools. Keep only demonstrated execution
   observations.
 - Remove whiteboard runtime, its ten tools and its storage.
-- Restrict artifact kinds and packet consumers; update attention, graph/schema,
+- Restrict artifact kinds; update attention, graph/schema,
   doctor, storage inventory, project migration and knowledge signposts.
 - Remove retired jobs from shared startup individually. Indexing, publication,
   embeddings, native transcripts and source freshness continue operating.
@@ -390,7 +390,7 @@ caller without retaining their old executable manifest.
 | Source-owned footprint | Required disposition |
 | --- | --- |
 | `system-defaults/{atoms,workflows,badgey}/`, `system-defaults/agents/badgey.json` | Stop installation and remove executable definitions for retiring runtimes. |
-| `system-defaults/agents/{workflows,crons,packets}/` | Remove nightly evaluation and application composition; preserve independently useful simple roles and their prompt/output contracts. |
+| `system-defaults/agents/{workflows,crons}/` | Remove nightly evaluation and application composition; preserve independently useful simple roles and their prompt/output contracts. |
 | `system-defaults/{maintenance,agentic-corpus}/` | Extract E4 operations; remove graph-based schedules, auto-edge/digest and review automation. Preserve direct corpus APIs and required health behavior. |
 | `.bbox/workflows/{gap-processing,blackbox-review}.json`, `.bbox/atoms/gap-cluster-validator.json` | Retire repo-owned execution manifests. Inspect associated brofiles independently. |
 | `schema/{atom,workflow}.schema.json` | Remove new-write/execution schemas after preserving legacy record readers separately. |

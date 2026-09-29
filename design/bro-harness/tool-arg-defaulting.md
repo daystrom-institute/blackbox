@@ -24,8 +24,8 @@ Evidence chain (2026-06-10, thread-36f3cced / gap-16d79781):
   primary checkout because file tools resolve against launch cwd (original
   gap facet — since closed by host-owned worktree creation, a72a216, plus
   `project_dir → --cwd → ToolCx.root`).
-- glm's websearch flail (gap-c21e34a3) and `unwrap_jsonish` in the packet
-  compiler are the same class: models fumbling generic MCP arg shapes.
+- glm's websearch flail (gap-c21e34a3) is the same class: models fumbling
+  generic MCP arg shapes.
 
 The ambient scope block already tells dispatched agents their pre-bound ids
 (session, project, bro, thread) — as prose the model must re-type into args.
@@ -98,10 +98,10 @@ breaking:
 - Tool docs and prompts migrate to `cwd` opportunistically.
 
 **Status (2026-06-11, gap-6366c92d / thread-55d51135 item 3): done.** The
-schema-advertised name on the dispatch tools — `bro_exec`, `bro_resume`,
-`bro_broadcast`, `bro_agent_dispatch` — is now `cwd`, with `project_dir`
-retained as a deprecated serde alias (the inverse of the interim 830c2c0
-state, which advertised `project_dir` and aliased `cwd`). Tool docs, prompts,
+schema-advertised name on the dispatch tools (`bro_exec`, `bro_resume`) is
+now `cwd`, with `project_dir` retained as a deprecated serde alias (the
+inverse of the interim 830c2c0 state, which advertised `project_dir` and
+aliased `cwd`). Tool docs, prompts,
 example skills, and design-doc dispatch examples migrated in the same pass.
 Project-dir-*semantic* params (code-nav/refactor/slice `project_dir` read
 roots, `bro_team`/`bro_brofile`/badgey/allocator project scopes) keep their

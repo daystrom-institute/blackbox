@@ -235,7 +235,6 @@ pub enum Bucket {
     GitMessage,
     Notes,
     Threads,
-    AgentManifest,
     /// Project-graph vertices whose schema opts them into embedding
     /// (unified-retrieval design 4.4; one route for every graph, Q3). The
     /// embedding input is the composed label + `embed: true` property
@@ -244,7 +243,7 @@ pub enum Bucket {
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 9] = [
+    pub const ALL: [Bucket; 8] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
@@ -252,7 +251,6 @@ impl Bucket {
         Bucket::GitMessage,
         Bucket::Notes,
         Bucket::Threads,
-        Bucket::AgentManifest,
         Bucket::Graph,
     ];
 
@@ -265,7 +263,6 @@ impl Bucket {
             Self::GitMessage => "git_message",
             Self::Notes => "notes",
             Self::Threads => "threads",
-            Self::AgentManifest => "agent_manifest",
             Self::Graph => "graph",
         }
     }
@@ -497,7 +494,6 @@ pub struct RoutesConfig {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
-    pub agent_manifest: Option<String>,
     pub graph: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
@@ -518,7 +514,6 @@ pub struct BucketRoutes {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
-    pub agent_manifest: Option<String>,
     pub graph: Option<String>,
 }
 
@@ -532,7 +527,6 @@ impl BucketRoutes {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
-            Bucket::AgentManifest => self.agent_manifest.as_deref(),
             Bucket::Graph => self.graph.as_deref(),
         }
     }
@@ -548,7 +542,6 @@ impl RoutesConfig {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
-            Bucket::AgentManifest => self.agent_manifest.as_deref(),
             Bucket::Graph => self.graph.as_deref(),
         }
     }
@@ -983,11 +976,6 @@ fn bucket_from_str(bucket: &str) -> Result<Bucket> {
 }
 
 fn vector_entity_ref(raw: &str) -> Option<EntityRef> {
-    if let Some((name, version, _component)) =
-        crate::embed_queue::parse_agent_component_entity_id_parts(raw)
-    {
-        return Some(EntityRef::Agent { name, version });
-    }
     EntityRef::parse(raw).ok()
 }
 
@@ -1216,8 +1204,8 @@ threads = "ollama"
         )
         .unwrap();
         let routes = router.configured_routes();
-        // 9 global buckets + 9 per-project rows for proj1234.
-        assert_eq!(routes.len(), 18);
+        // 8 global buckets + 8 per-project rows for proj1234.
+        assert_eq!(routes.len(), 16);
         assert!(routes.iter().any(|route| {
             route.bucket == Bucket::Threads
                 && route.project_id.as_deref() == Some("proj1234")
@@ -1461,49 +1449,68 @@ threads = "ollama"
         let store = std::sync::Arc::new(bbox_vectors::VectorStore::open(dir.path()).unwrap());
         let _guard = bbox_vectors::install_test_global(store.clone());
         let route = EmbeddingRouter::default()
-            .route(Bucket::AgentManifest, None)
+            .route(Bucket::Knowledge, None)
             .unwrap()
             .vector_route_id();
+        store
+            .upsert(&route, "knowledge:aaaa0001", "a", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert(&route, "knowledge:aaaa0002", "b", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert(&route, "knowledge:aaaa0003", "c", vec![0.0, 1.0])
+            .unwrap();
+        // Rows whose entity id no longer parses (legacy agent manifest
+        // components share the partition) never surface as members.
         store
             .upsert(
                 &route,
                 "agent_embed:reviewer:v1:primary",
-                "a",
+                "d",
                 vec![1.0, 0.0],
             )
-            .unwrap();
-        store
-            .upsert(
-                &route,
-                "agent_embed:copywriter:v1:primary",
-                "b",
-                vec![1.0, 0.0],
-            )
-            .unwrap();
-        store
-            .upsert(&route, "agent_embed:writer:v1:primary", "c", vec![0.0, 1.0])
             .unwrap();
 
-        let clusters = cluster_neighbors_within_router(
-            &EmbeddingRouter::default(),
-            "agent_manifest",
-            "",
-            0.99,
-        )
-        .unwrap();
+        let clusters =
+            cluster_neighbors_within_router(&EmbeddingRouter::default(), "knowledge", "", 0.99)
+                .unwrap();
         assert_eq!(clusters.len(), 1);
         assert_eq!(
             clusters[0].members,
             vec![
-                EntityRef::Agent {
-                    name: "copywriter".into(),
-                    version: 1,
+                EntityRef::Knowledge {
+                    id: "aaaa0001".into(),
                 },
-                EntityRef::Agent {
-                    name: "reviewer".into(),
-                    version: 1,
+                EntityRef::Knowledge {
+                    id: "aaaa0002".into(),
                 }
             ]
         );
+    }
+
+    /// Embed configs written with a route for the removed agent manifest
+    /// bucket still load; the key is ignored.
+    #[test]
+    fn legacy_agent_manifest_route_key_is_ignored() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.providers.ollama]
+model = "custom-local"
+
+[embed.routes]
+notes = "ollama"
+agent_manifest = "ollama"
+
+[embed.routes.per_project.p1]
+agent_manifest = "ollama"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            router.route(Bucket::Notes, None).unwrap().document_model,
+            "custom-local"
+        );
+        assert!(bucket_from_str("agent_manifest").is_err());
     }
 }

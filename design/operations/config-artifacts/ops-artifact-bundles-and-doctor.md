@@ -26,20 +26,18 @@ is still exactly `Workflow, Packet, Brofile, Agent, Atom, Team, Cron`
 Phase 0-7 plan in the companion doc is still all forward work.
 
 Since v1 the shipped `system-defaults/` surface has grown well past the handful
-of members the original examples imply. The full default surface is 275 JSON
-files (264 excluding sidecars/templates) plus markdown and script assets:
+of members the original examples imply. The full default surface is 234 JSON
+files (233 excluding templates) plus markdown and script assets:
 
 | Category | Count | Install path today |
 |---|---|---|
 | atoms | 140 | `bbox_artifact_install kind=atom` |
 | workflows | 41 | `bbox_artifact_install kind=workflow` or `bro_workflow_install` |
 | brofiles | 35 | `bbox_artifact_install kind=brofile` |
-| packets | 30 (+10 `.audit_examples.json` sidecars) | `bbox_artifact_install kind=packet` |
 | agents | 6 | `bbox_artifact_install kind=agent` |
 | crons | 6 | partial artifact path or `bro_cron_install` |
 | macros | 4 | **compiled into the binary** (`include_str!`) |
 | teamplates | 2 (+1 inline team) | **shell script** curling `/admin/team/upsert` |
-| mcp-surfaces | 1 | `bbox_compile` |
 | system memories | 28 `.md` | **loaded at daemon init**, never installed |
 | scripts/fixtures | 7 `.py`/`.sh` + 2 `.md` | workflow-referenced assets, never staged |
 
@@ -73,7 +71,6 @@ manual install order is becoming an operations liability.
 Today the artifact catalog manages only:
 
 - workflows
-- packets
 - brofiles
 - agents
 - atoms
@@ -107,7 +104,9 @@ tool shows the truth.
 Artifact catalog:
 
 - `src/artifacts.rs` defines `ArtifactKind::{Workflow, Packet, Brofile, Agent,
-  Atom, Team, Cron}`.
+  Atom, Team, Cron}`. `Packet` is a retired kind: installed receipts list under
+  an explicit kind filter and can be removed, but install and boot restore
+  refuse it.
 - `ArtifactCatalog::install_value[_scoped]` stores active JSON payloads,
   `metadata.json`, `.versions/v<version>.json`, and
   `.versions/v<version>.metadata.json`.
@@ -131,14 +130,13 @@ Activation path:
   through its native runtime path before recording metadata.
 - Workflow install compiles and writes the orchestration runtime store's
   `workflows/<id>.json`.
-- Packet install compiles into the packet store.
 - Brofile install writes the global brofile registry and verifies resolution.
 - Agent install validates dependencies, computes manifest embeddings, records
   provenance edges, and may enqueue agent-manifest embeddings.
 - Atom install validates dependency references.
 - Team install is catalog-only today.
-- `deactivate_artifact` removes workflow files, packet domains, brofiles, and
-  cron runtime files; agents, atoms, and teams currently have no separate
+- `deactivate_artifact` removes workflow files, brofiles, and cron runtime
+  files; agents, atoms, and teams currently have no separate
   runtime registry to tear down.
 
 Inlet runtime:
@@ -232,14 +230,6 @@ Newly surfaced subsystems and gaps (2026-05-30 regrounding):
   installs such a workflow must guarantee those `.py`/`.md` assets resolve; the
   catalog has no concept of workflow assets today. See
   [Workflow Assets](#workflow-assets).
-- **`.audit_examples.json` are companion datasets, not auto-loaded.** They pair
-  with packets (`entry-quality.json` ↔ `entry-quality.audit_examples.json`) but
-  have **no runtime consumer in `src/`** — they are validated only by a shipped
-  test (`shipped_packet_audit_examples_pass`, `src/tools/artifacts.rs:1054`) and
-  are the `{entity, expected}` datasets an operator feeds to `bbox_audit`. They
-  are not separate artifacts and are not read by packet install/compile. A
-  bundle treats the sidecar as travelling with its packet member for hashing and
-  copy, not as an installable unit.
 
 ## Thesis
 
@@ -282,7 +272,6 @@ This changes the mental model from:
 ```text
 some defaults use bbox_artifact_install
 some defaults use bro_cron_install
-some defaults use bbox_compile
 operator remembers order
 ```
 
@@ -332,16 +321,15 @@ Initial managed kinds:
 | Kind | Native owner | Name field | Activation |
 |---|---|---|---|
 | `workflow` | workflow registry | `name` | compile, capability validate, write runtime workflow spec |
-| `packet` | packet store | `domain` | compile packet |
 | `brofile` | brofile store | `name` | save and resolve brofile |
 | `agent` | agent catalog/registry | `name` | validate, embed manifest, provenance edges |
 | `atom` | atom catalog/registry | `name` | validate atom install |
 | `macro` | macro registry | `id` | validate `inputs_schema`, register into `MacroRegistry` (replaces `include_str!` builtins) |
 | `teamplate` | team store (`teamplates/`) | `name` | validate member brofile refs exist, `save_teamplate` |
 | `team` | team store (`teams/`) | `name` | resolve members, `save_team` / `admin_team_upsert` (replaces `install-teams.sh`) |
-| `cron` | cron registry | `name` | validate schedule + routing packet, persist, spawn loop |
-| `poller` | poller registry | `name` | validate fetch/selector shape + routing packet, persist, spawn loop |
-| `webhook` | webhook registry | `name` | validate signature policy + routing packet, persist endpoint |
+| `cron` | cron registry | `name` | validate schedule, persist, spawn loop |
+| `poller` | poller registry | `name` | validate fetch/selector shape, persist, spawn loop |
+| `webhook` | webhook registry | `name` | validate signature policy, persist endpoint |
 
 Notes on the kind table:
 
@@ -371,13 +359,8 @@ their desired lifecycle state.
 {
   "name": "blackbox-system-defaults",
   "version": 1,
-  "description": "Default Blackbox agents, atoms, inlets, packets, and workflows.",
+  "description": "Default Blackbox agents, atoms, inlets, and workflows.",
   "members": [
-    {
-      "kind": "packet",
-      "source": "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.json",
-      "name": "cron-routing/embed-compaction"
-    },
     {
       "kind": "workflow",
       "source": "system-defaults/agentic-corpus/workflows/embed-compaction-arc.json"
@@ -860,8 +843,7 @@ place to reason about install/uninstall/provenance/upgrade behavior.
 Bundle order may be explicit, but the installer should still validate obvious
 dependency edges:
 
-- cron/poller/webhook routing packets must exist before activation.
-- workflow references to packets, atoms, brofiles, teams, subworkflows, and MCP
+- workflow references to atoms, brofiles, teams, subworkflows, and MCP
   hook targets must validate before activation.
 - workflow **assets** (scripts/fixtures referenced by repo-relative path, e.g.
   `system-defaults/phase-decompose/scripts/epoch-check.py`) must resolve at plan
@@ -873,8 +855,8 @@ dependency edges:
 - teamplate-backed teams need their teamplate (and its member brofiles) active.
 
 Activation order for the system-default surface therefore settles to roughly:
-packets → brofiles → macros/agents/atoms → teamplates → teams →
-workflows → inlets (cron/poller/webhook). The bundle planner enforces
+brofiles → macros/agents/atoms → teamplates → teams → workflows →
+inlets (cron/poller/webhook). The bundle planner enforces
 the edges it can detect; explicit bundle order covers the rest until Phase 7
 auto-ordering lands.
 
@@ -882,15 +864,10 @@ The first bundle implementation can use explicit bundle order plus validation.
 A later pass can add static
 dependency extraction to reorder automatically and report cycles.
 
-Current direct inlet installers do not verify that `routing_packet` exists at
-install time. Managed artifacts should be stricter: cron, poller, and webhook
-activators must resolve their `routing_packet` before activation so a bad bundle
-fails before any endpoint or tick loop is installed.
-
 ## System Defaults Bundle Layout
 
 The v1 layout (a flat `refactor-atoms`, one `agentic-corpus-maintenance`,
-`badgey`, `mcp-surfaces`) under-counts the real tree. The shipped surface splits
+`badgey`) under-counts the real tree. The shipped surface splits
 into cohesive directory groups, several of which v1 omitted entirely
 (`phase-decompose/`, `supervision/`, a `maintenance/` tree separate from
 `agentic-corpus/`). The bundle manifests map onto these directory groups:
@@ -898,41 +875,40 @@ into cohesive directory groups, several of which v1 omitted entirely
 ```text
 system-defaults/bundles/
   blackbox-system-defaults.json   # top-level meta-bundle → child bundles
-  agentic-corpus.json             # auto-digest/auto-edge/contradiction/eval/embed packets+workflows+brofiles+crons, contradiction-specialists team
-  maintenance.json                # daily-compaction cron+packet+workflow (own tree, NOT agentic-corpus)
-  agents.json                     # default agents + agent-eval cron/packets/workflows
-  phase-decompose.json            # phase-decompose workflows + brofiles + packets + teamplates + script/fixture assets
-  supervision.json                # supervision atoms + brofiles + workflows + packets
+  agentic-corpus.json             # auto-digest/auto-edge/contradiction/eval/embed workflows+brofiles+crons, contradiction-specialists team
+  maintenance.json                # daily-compaction cron+workflow (own tree, NOT agentic-corpus)
+  agents.json                     # default agents + agent-eval cron/workflows
+  phase-decompose.json            # phase-decompose workflows + brofiles + teamplates + script/fixture assets
+  supervision.json                # supervision atoms + brofiles + workflows
   refactor.json                   # refactor atoms (140) + brofiles + workflow wrappers + macros
-  badgey.json                     # badgey agents + brofiles + workflows + packets + crons
+  badgey.json                     # badgey agents + brofiles + workflows + crons
 ```
 
 Suggested ownership, grounded in the directory groups:
 
 - `blackbox-system-defaults`: shallow meta-bundle that references the children.
-- `agentic-corpus`: `system-defaults/agentic-corpus/**` packets, workflows,
-  brofiles, and crons, plus the promoted `contradiction-specialists` team
+- `agentic-corpus`: `system-defaults/agentic-corpus/**` workflows, brofiles,
+  and crons, plus the promoted `contradiction-specialists` team
   (retiring `install-teams.sh`). **Excludes `nightly-eval-arc`** — it runs the
   repo-root `eval/run-agentic-eval.sh` against `${meta.project_dir}` and only
   works against this repository, so it is classified repo-internal and is not a
   portable bundle member (see Workflow Assets → Out-of-tree assets). The
   `source_glob` for this bundle's workflows must exclude `nightly-eval-arc.json`.
-- `maintenance`: `system-defaults/maintenance/**` — daily-compaction cron, its
-  cron-routing packet, and the arc workflow. This is a separate shipped tree and
+- `maintenance`: `system-defaults/maintenance/**`: daily-compaction cron and
+  the arc workflow. This is a separate shipped tree and
   deserves its own bundle, not folding into agentic-corpus.
 - `agents`: `system-defaults/agents/**` — default agents plus their co-located
-  `crons/`, `packets/`, and eval `workflows/`.
+  `crons/` and eval `workflows/`.
 - `phase-decompose`: `system-defaults/phase-decompose/**` teamplates and
-  script/fixture assets, plus `system-defaults/workflows/phase-decompose/**`,
-  `system-defaults/brofiles/phase-decompose/**`, and the phase-decompose packets
-  under `agentic-corpus/packets/phase-decompose/`. This is the strongest case
+  script/fixture assets, plus `system-defaults/workflows/phase-decompose/**`
+  and `system-defaults/brofiles/phase-decompose/**`. This is the strongest case
   for asset-aware activation.
 - `supervision`: `system-defaults/atoms/supervision/**`,
-  `brofiles/supervision-*`, `workflows/supervision/**`, and supervision packets.
+  `brofiles/supervision-*`, and `workflows/supervision/**`.
 - `refactor`: the 140 `system-defaults/atoms/refactor/**` atoms, the refactor
   brofiles/personas, `workflows/refactor/**`, and the four macros.
-- `badgey`: `system-defaults/badgey/**` agents, brofiles, workflows, packets,
-  and crons.
+- `badgey`: `system-defaults/badgey/**` agents, brofiles, workflows, and
+  crons.
 
 Meta-bundles are shallow references to child bundles, never duplicated member
 lists. The generation record expands transitive membership so uninstall stays
@@ -955,11 +931,9 @@ so a manifest can declare a whole group:
 The planner expands a `source_glob` member into concrete members at plan time,
 records each resolved source + hash in the generation, and applies the same
 dependency/drift checks per file. Exclusions are required because some "json"
-files are sidecars/templates, not artifacts: `.audit_examples.json` (packet
-companion datasets), `_base.outputs.schema.json` and `_template.prompt.md`
-(refactor atom templates). The planner must not treat those as installable
-members; it carries `.audit_examples.json` alongside its packet for hashing/copy
-only.
+files are templates, not artifacts: `_base.outputs.schema.json` and
+`_template.prompt.md` (refactor atom templates). The planner must not treat
+those as installable members.
 
 ## Upgrade Helper
 
@@ -979,8 +953,7 @@ Checks:
 - installed system-default bundle generation vs shipped bundle source hash
 - changed shipped defaults by member content hash
 - missing managed runtime objects
-- unmanaged runtime objects under the workflow/inlet runtime stores, and packet
-  domains that match shipped default names but lack catalog metadata
+- unmanaged runtime objects under the workflow/inlet runtime stores
 - index schema version and whether a full reindex is required
 - embedding route configuration vs existing vector partition identity
 - embedding queue health and route errors
@@ -1079,9 +1052,8 @@ Sections:
   macros that are not yet catalog-managed (i.e. still relying on a stale
   compiled-in builtin); teamplates/teams present in the store but uncataloged
   (e.g. left over from `install-teams.sh`)
-- `inlets`: installed webhooks/pollers/crons, routing packet
-  existence, running tick loops for poller/cron specs
-- `workflows`: installed workflow count, missing referenced packets/atoms/
+- `inlets`: installed webhooks/pollers/crons, running tick loops for poller/cron specs
+- `workflows`: installed workflow count, missing referenced atoms/
   brofiles where statically detectable, and **missing workflow assets**
   (referenced script/fixture paths that do not resolve)
 - `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
@@ -1120,7 +1092,7 @@ Extend `ArtifactKind`:
 ```rust
 pub enum ArtifactKind {
     Workflow,
-    Packet,
+    Packet,     // retired: installed receipts list and remove, never activate
     Brofile,
     Agent,
     Atom,
@@ -1257,10 +1229,6 @@ drift and require an explicit operator choice:
   no-source-tree deployment requires it. Repo-internal workflows whose assets
   live outside `system-defaults/` (e.g. `nightly-eval-arc`) are excluded from the
   portable bundle.
-- **`.audit_examples.json` are packet companion datasets, not artifacts.** They
-  travel with their packet member for hashing/copy and feed `bbox_audit`; they
-  are never installed as standalone units. Glob membership must exclude them
-  along with `_*.json` / `_*.md` refactor templates.
 - **Bundle membership supports `source_glob`.** Hand-enumerating 140 atoms is a
   rot hazard; manifests declare directory groups and the planner expands them at
   plan time.

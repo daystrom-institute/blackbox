@@ -50,10 +50,10 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state_dir>/blackbox-knowledge.json` | Knowledge store |
 | `BLACKBOX_THREADS_PATH` | `<state_dir>/blackbox-threads.json` | Thread store |
 | `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Notes store |
-| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Pins store |
+| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Legacy pin rows read by the project catalog migration |
 | `BLACKBOX_PROJECTS_PATH` | `<state_dir>/projects.json` | Project registry |
 | `BLACKBOX_GAPS_PATH` | `<state_dir>/blackbox-gaps.json` | Gap notes store |
-| `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Compiled rule packets |
+| `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Packet records the project catalog inventories; nothing else reads them |
 | `BLACKBOX_ARTIFACTS_DIR` | `<state_dir>/artifacts` | Artifact catalog |
 | `BRO_HOME` | `<state_dir>/bro` | Bro orchestration state |
 | `BLACKBOX_VECTORS_PATH` | platform state dir `blackbox/vectors` (NOT below `state_dir`) | Vector store |
@@ -148,14 +148,8 @@ probing routes and dispatch, and the wrong one for validating anything on the
 catalog plane (zero-checkout-authority reads, collector-published projects,
 attachment admission, publisher advance).
 
-Catalog mode needs a version-2 store at the resolved projects path, and a fresh
-state root cannot get one by migrating: `project-catalog migrate --preflight`
-inventories owner stores that a never-written bundle does not have, emits
-`immutable_lane_missing` for each, and the apply then refuses the unclean report
-with `error.project_catalog_migration_report_not_clean`. Migration carries an
-occupied bundle across; it has nothing to carry here.
-
-Initialize the store explicitly instead, before first boot:
+Catalog mode needs a version-2 store at the resolved projects path.
+Initialize it explicitly before first boot:
 
 ```bash
 STATE=/tmp/blackbox-dev-throwaway/state
@@ -176,7 +170,7 @@ It refuses, naming the offending store, when:
 |---|---|
 | `error.project_catalog_genesis_catalog_exists` | a version-2 catalog is already there; genesis never replaces one |
 | `error.project_catalog_genesis_catalog_state_present` | the bundle carries catalog-owned artifacts (attachments, journal, marker, receipt, assets, stage, backups, accepted publications) |
-| `error.project_catalog_genesis_owner_not_empty` | a legacy owner store holds project-scoped rows; that bundle is migration input, so run `project-catalog migrate` |
+| `error.project_catalog_genesis_owner_not_empty` | a legacy owner store holds project-scoped rows; genesis initializes only a bundle with no project state |
 | `error.project_catalog_genesis_owner_unprobeable` | an owner store could not be read, so its emptiness cannot be proved; an unreadable store is never counted as empty |
 
 A version-1 projects store registering **zero** projects is the one legacy

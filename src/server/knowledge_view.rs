@@ -106,19 +106,6 @@ impl SessionKnowledgeView {
         self.append_built_from_table(output, &table)
     }
 
-    pub(crate) fn append_list_built_from(&self, output: String) -> String {
-        let returned_ids = output
-            .lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix('[')?;
-                let end = rest.find(']')?;
-                let id = rest[..end].trim();
-                (!id.is_empty()).then(|| id.to_string())
-            })
-            .collect::<Vec<_>>();
-        self.append_built_from_for_ids(output, &returned_ids)
-    }
-
     pub(crate) fn metadata_for_entity_ref(
         &self,
         entity_ref: &str,

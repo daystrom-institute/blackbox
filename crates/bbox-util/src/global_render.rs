@@ -157,9 +157,7 @@ pub fn global_target_path(provider: &str) -> Option<Result<PathBuf>> {
 /// Shared global-memory destination for provider-neutral content. Provider
 /// global files stay small and include this by reference.
 ///
-/// Lives under `~/.blackbox/` — provider-neutral by design. Historical
-/// location was `~/.claude-shared/BLACKBOX.md`; that path now serves as a
-/// back-compat symlink (see `migrate_legacy_defaults`).
+/// Lives under `~/.blackbox/`, provider-neutral by design.
 ///
 /// Env override: `BLACKBOX_GLOBAL_COMMON_MD`.
 pub fn global_common_target_path() -> Result<PathBuf> {

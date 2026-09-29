@@ -50,8 +50,7 @@ scope, the regrounded design adds new managed kinds and one migration:
 
 Two categories stay out of the artifact model: system memories (auto-loaded,
 `src/server/open.rs:236`) and — only after the macro migration — nothing else.
-`.audit_examples.json` are packet companion datasets with no runtime consumer,
-not artifacts. See the companion design's Regrounding Note for the full table.
+See the companion design's Regrounding Note for the full table.
 
 ```text
 Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7
@@ -345,7 +344,6 @@ Helper structs:
 Extract current kinds first:
 
 - workflow
-- packet
 - brofile
 - agent
 - atom
@@ -353,10 +351,9 @@ Extract current kinds first:
 
 Then add inlet activators:
 
-- cron: schedule validation, routing packet validation, persist, spawn loop;
-- poller: spec validation, routing packet validation, persist, spawn loop;
-- webhook: signature policy validation, routing packet validation, persist
-  endpoint.
+- cron: schedule validation, persist, spawn loop;
+- poller: spec validation, persist, spawn loop;
+- webhook: signature policy validation, persist endpoint.
 
 Then the new non-inlet activators:
 
@@ -469,7 +466,7 @@ BundleMember {
     kind,
     source?,        // single artifact source
     source_glob?,   // OR a directory glob expanded at plan time
-    exclude?,       // glob exclusions (e.g. _*.json, *.audit_examples.json)
+    exclude?,       // glob exclusions (e.g. _*.json, _*.md)
     name?,
     version?,
     role?,
@@ -508,8 +505,7 @@ Plan validation must complete before mutation.
 
 Initial dependency checks:
 
-- inlets resolve `routing_packet`;
-- workflows resolve statically detectable packets, atoms, brofiles, teams,
+- workflows resolve statically detectable atoms, brofiles, teams,
   subworkflows, and MCP hook targets;
 - workflow-backed atoms resolve workflow;
 - profile-backed atoms resolve brofile;
@@ -579,7 +575,7 @@ Update `src/watcher.rs`:
 - recognize `.bbox/bundles/`;
 - refactor watcher handling to accept `SharedState` or a narrower plan/apply
   context. The current event path has roots plus `ArtifactCatalog`, which is not
-  enough to validate packets, touch registries, or activate bundle members;
+  enough to validate members, touch registries, or activate bundle members;
 - `auto_apply=false` or absent: catalog and validate the bundle manifest only;
 - `auto_apply=true`: call the same plan/apply path as
   `bbox_artifact_bundle_apply`;
@@ -596,8 +592,8 @@ system-defaults/bundles/
   blackbox-system-defaults.json   # meta → children
   agentic-corpus.json             # incl. promoted contradiction-specialists team
   maintenance.json                # daily-compaction (own tree)
-  agents.json                     # agents + agent-eval cron/packets/workflows
-  phase-decompose.json            # workflows + brofiles + packets + teamplates + assets
+  agents.json                     # agents + agent-eval cron/workflows
+  phase-decompose.json            # workflows + brofiles + teamplates + assets
   supervision.json
   refactor.json                   # 140 atoms (glob) + brofiles + workflows + macros
   badgey.json
@@ -607,11 +603,8 @@ Use shallow meta-bundle references. The generation record expands transitive
 membership so uninstall remains precise.
 
 Use `source_glob` for large groups (refactor atoms, workflow trees) rather than
-enumerating members by hand. Exclusions are mandatory: skip
-`*.audit_examples.json` (packet companion datasets), `_*.json`
-(`_base.outputs.schema.json`), and `_*.md` (`_template.prompt.md`). The planner
-carries a packet's `.audit_examples.json` sidecar alongside it for hashing/copy
-but never installs it as a member.
+enumerating members by hand. Exclusions are mandatory: skip `_*.json`
+(`_base.outputs.schema.json`) and `_*.md` (`_template.prompt.md`).
 
 The `refactor.json` bundle includes the four macros and is the migration target
 for the de-`include_str!`'d builtins. The `agentic-corpus.json` bundle owns the
@@ -791,8 +784,7 @@ Implement sections incrementally:
   specs, stale old-path files, bundle generation drift; shipped macros not yet
   catalog-managed (stale compiled-in builtin); teamplates/teams in the store but
   uncataloged (leftover `install-teams.sh` rosters);
-- `inlets`: installed webhooks/pollers/crons, routing packet
-  existence, poller/cron loop status;
+- `inlets`: installed webhooks/pollers/crons, poller/cron loop status;
 - `workflows`: installed workflows, statically detectable missing refs, and
   missing workflow assets (unresolved script/fixture paths);
 - `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
@@ -822,7 +814,6 @@ Tests:
 - stale `applying` operation is reported as `blocked`;
 - unmanaged runtime spec is reported but not mutated;
 - old-path duplicate is reported as cleanup, not auto-overwritten;
-- missing routing packet for an inlet is reported;
 - summary output remains compact and JSON output is stable enough for callers.
 
 **Acceptance gate:** doctor can replace the scattered manual smoke checklist
@@ -848,7 +839,6 @@ Checks:
 - changed shipped defaults by member content hash;
 - missing managed runtime objects;
 - unmanaged runtime objects under runtime/inlet stores;
-- shipped default packet domains without catalog metadata;
 - index schema/chunker marker and whether full reindex is required;
 - embedding route identity vs existing vector partition identity;
 - embedding queue health and route errors;
@@ -919,7 +909,6 @@ Work:
 
 - extract static dependency refs from workflows;
 - extract refs from atoms and agents;
-- extract `routing_packet` refs from inlets;
 - extract provider-sync refs;
 - auto-order bundle operations;
 - report cycles before mutation.

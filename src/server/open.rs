@@ -13,8 +13,6 @@ use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
-use crate::packets::Packets;
-use crate::pins::Pins;
 use crate::producer_claims::ProducerClaims;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
@@ -616,7 +614,7 @@ pub(super) fn open_shared_state(
 
     // Gap store mirrors the kb repo-owned model. Load every registered repo's
     // committed `.bbox/gaps/` into the query surface BEFORE any producer
-    // (bbox_packet_gap, gap-spool import) can save — a save with the repo's
+    // (gap-spool import) can save — a save with the repo's
     // gaps not yet loaded would treat the in-memory set as authoritative and
     // purge committed `.bbox/gaps/` files for a repo-owned project.
     let gaps_path = cfg.paths.gaps_path.clone();
@@ -666,11 +664,6 @@ pub(super) fn open_shared_state(
     let notes_persister = StorePersister::spawn("notes", notes_store.clone(), notes_path.clone());
     tracing::info!("Notes store: {}", notes_path.display());
 
-    let pins_path = cfg.paths.pins_path.clone();
-    let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path)?));
-    let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
-    tracing::info!("Pins store: {}", pins_path.display());
-
     let checkout_mutations_path = cfg.paths.checkout_mutations_path.clone();
     let checkout_mutations_store = Arc::new(RwLock::new(CheckoutMutations::open(
         &checkout_mutations_path,
@@ -713,10 +706,6 @@ pub(super) fn open_shared_state(
         },
         _ => unreachable!("the store probe selects exactly one project authority"),
     };
-
-    let packets_dir = cfg.paths.packets_dir.clone();
-    let packets_store = Packets::open(&packets_dir)?;
-    tracing::info!("Packets store: {}", packets_dir.display());
 
     let artifacts_dir = cfg.paths.artifacts_dir.clone();
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
@@ -946,8 +935,6 @@ pub(super) fn open_shared_state(
         threads_persister,
         notes: notes_store,
         notes_persister,
-        pins: pins_store,
-        pins_persister,
         checkout_mutations: checkout_mutations_store,
         checkout_mutations_persister,
         producer_claims: producer_claims_store,
@@ -984,7 +971,6 @@ pub(super) fn open_shared_state(
         catalog_gap_published_cache: RwLock::new(Default::default()),
         project_graph_views: RwLock::new(Default::default()),
         publisher_authorization_cache: RwLock::new(Default::default()),
-        packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
@@ -1412,6 +1398,88 @@ mod tests {
                 .project_id,
             record.project_id
         );
+    }
+
+    /// A state directory holding a packet tree (records, their lock files,
+    /// the event log) and packet artifacts opens and restores cleanly. No
+    /// store opens the tree, boot restore skips the retired artifact kind,
+    /// and both project-catalog owner captures still parse the legacy rows.
+    #[test]
+    fn a_state_dir_holding_a_legacy_packet_store_opens() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotStateV1,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let packets = root.join("packets");
+        std::fs::create_dir_all(packets.join("global")).unwrap();
+        std::fs::create_dir_all(packets.join("project")).unwrap();
+        std::fs::write(
+            packets.join("global/packet-0000000a.json"),
+            br#"{"id":"packet-0000000a","domain":"legacy/rubric","scope":"global","rules":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(packets.join("global/packet-0000000a.json.lock"), b"").unwrap();
+        std::fs::write(
+            packets.join("project/packet-0000000b.json"),
+            br#"{"id":"packet-0000000b","domain":"legacy/triage","scope":"project","project":"/legacy/repo","rules":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            packets.join("events.jsonl"),
+            b"{\"op\":\"compile\",\"outcome\":\"ok\"}\n",
+        )
+        .unwrap();
+        let tree_before = std::fs::read(packets.join("project/packet-0000000b.json")).unwrap();
+        crate::artifacts::ArtifactCatalog::open(&root)
+            .unwrap()
+            .install_value(
+                crate::artifacts::ArtifactKind::Packet,
+                "legacy".into(),
+                &serde_json::json!({"domain":"legacy/rubric","version":1,"scope":"global","rules":[]}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let state = Arc::new(SharedState::for_test(&root));
+        assert_eq!(
+            crate::server::routes::restore_runtime_artifacts_from_catalog(&state).unwrap(),
+            0
+        );
+
+        let limits = OwnerSnapshotLimitsV1::default();
+        let artifacts =
+            crate::artifacts::capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+        assert!(
+            matches!(artifacts.state, OwnerSnapshotStateV1::Present { .. }),
+            "{:?}",
+            artifacts.state
+        );
+        let tree =
+            bbox_indexing::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(
+                &packets, limits,
+            )
+            .unwrap();
+        assert!(
+            matches!(tree.state, OwnerSnapshotStateV1::Present { .. }),
+            "{:?}",
+            tree.state
+        );
+        assert!(
+            tree.rows
+                .iter()
+                .any(|row| row.stable_row_id == "packet-0000000b"),
+            "{:?}",
+            tree.rows
+        );
+        assert_eq!(
+            std::fs::read(packets.join("project/packet-0000000b.json")).unwrap(),
+            tree_before
+        );
+        assert!(packets.join("events.jsonl").is_file());
     }
 
     #[test]

@@ -151,14 +151,6 @@ pub struct RosterSummaryV1 {
     /// from `TaskInner.started_at`.
     #[serde(default)]
     pub started_at: Option<u64>,
-    /// Agent attribution separate from `label` (wave 7c). The
-    /// dashboard needs to surface both `agentLabel` and `broLabel`
-    /// distinctly, but `label` already collapses them via
-    /// `bro_label.or(agent_label)`. Carrying both keeps the
-    /// projection lossless without forcing the dashboard back into
-    /// a per-task inner lock.
-    #[serde(default)]
-    pub agent_label: Option<String>,
     /// True when the latest terminal result was interrupted by operator
     /// control. Additive marker layered on top of `status=cancelled`.
     #[serde(default)]
@@ -364,7 +356,6 @@ mod tests {
             origin: Origin::AgentDispatch,
             workflow_owned: false,
             started_at: Some(1_700_000_000_000),
-            agent_label: Some("team-x::member-y".to_string()),
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -391,7 +382,6 @@ mod tests {
             "origin",
             "workflow_owned",
             "started_at",
-            "agent_label",
             "interrupted",
         ] {
             assert!(

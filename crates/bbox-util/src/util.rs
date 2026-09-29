@@ -4,18 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// The one-time legacy-state migration moved to its own module (it is large
-/// enough to own one), but every caller reaches it through `util::`, so the
-/// surface is re-exported here rather than repointed across four crates.
-pub use crate::legacy_migration::{
-    INJECTED_EACCES, INJECTED_EIO, LEGACY_MIGRATION_JOURNAL_NAME, LEGACY_MIGRATION_LOCK_NAME,
-    LegacyMigrationDestinations, LegacyMigrationFault, LegacyMigrationFaultGuard,
-    LegacyMigrationLock, LegacyMove, arm_legacy_migration_faults, cross_device_temp_path,
-    legacy_entry_present, legacy_migration_journal_path, legacy_migration_lock_path,
-    migrate_legacy_defaults, migrate_legacy_entry, recover_legacy_migration,
-    try_lock_legacy_migration,
-};
-
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";
 
 /// Neutral rider appended to a tool response when a durable repo-owned file is
@@ -127,7 +115,7 @@ impl Drop for TestEnvGuard {
 
 /// ISO-8601 UTC timestamp with second precision and a trailing `Z`.
 /// Canonical store-timestamp format; the implementation lives in
-/// bbox-corpus-core so leaf crates (bbox-packets) share it.
+/// bbox-corpus-core so leaf crates share it.
 pub use bbox_corpus_core::util::now_iso;
 
 pub fn blackbox_mcp_name() -> String {
@@ -200,14 +188,6 @@ pub fn blackbox_pins_path(home: &Path) -> PathBuf {
 pub fn blackbox_projects_path(home: &Path) -> PathBuf {
     env_path("BLACKBOX_PROJECTS_PATH")
         .unwrap_or_else(|| blackbox_state_dir(home).join("projects.json"))
-}
-
-/// Rule-packets live as one-file-per-packet under a directory rather than
-/// a single merged JSON. Each packet can be substantial (rank tables,
-/// rule trees, provenance arrays) and the per-scope layout makes
-/// `global` vs `project` cleanup trivial.
-pub fn blackbox_packets_dir(home: &Path) -> PathBuf {
-    env_path("BLACKBOX_PACKETS_DIR").unwrap_or_else(|| blackbox_state_dir(home).join("packets"))
 }
 
 pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
@@ -347,29 +327,6 @@ mod tests {
             unsafe { std::env::set_var("BRO_HOME", v) };
         } else {
             unsafe { std::env::remove_var("BRO_HOME") };
-        }
-    }
-
-    #[test]
-    fn packets_dir_default_is_state_packets() {
-        let _guard = test_env_lock();
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-
-        // Save and clear env vars
-        let orig_packets_dir = std::env::var("BLACKBOX_PACKETS_DIR").ok();
-        unsafe {
-            std::env::remove_var("BLACKBOX_PACKETS_DIR");
-        }
-
-        let packets_dir = blackbox_packets_dir(home);
-        assert!(packets_dir == blackbox_state_dir(home).join("packets"));
-
-        // Restore
-        if let Some(v) = orig_packets_dir {
-            unsafe { std::env::set_var("BLACKBOX_PACKETS_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("BLACKBOX_PACKETS_DIR") };
         }
     }
 }

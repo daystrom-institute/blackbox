@@ -81,7 +81,7 @@ try:
  print('provider discovery and synthetic dispatch/resume peak advisories PASS',flush=True)
  for name in ['bro_when_any','bro_when_all']:
   call(name,{'task_ids':['00000000-0000-0000-0000-000000000000'],'timeout_seconds':0},True)
- for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'}),('bbox_packet',{'action':'typo'})]:
+ for name,args in [('bro_brofile',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','scope':'typo'}),('bro_mcp',{'action':'list','pattern':'ignored'}),('bbox_embed_partitions',{'action':'explode'}),('bbox_thread',{'action':'get','detail':'typo'})]:
   if name in names:call(name,args,True)
  print('selector and wait refusals PASS',flush=True)
  # List before each synthetic creation; all writes stay in the isolated bundle.
@@ -131,15 +131,6 @@ try:
  assert server_name in inventory['servers'] and 'synthetic-secret' not in json.dumps(inventory)
  print('MCP exact server identity PASS',flush=True)
  call('bbox_artifact_list',{'kind':'agent'})
- filters=[f'tool_{n:04}_'+('界'*12) for n in range(300)]
- call('bbox_artifact_install',{'kind':'agent','artifact':{'kind':'agent','name':'synthetic-summary-agent','version':1,'manifest':{'description':'Synthetic audit fixture','when_to_use':['when testing exact MCP recovery'],'brofile_inline':{'provider':'glm','filters':{'allow':filters}},'filter_overlay':{'allow':filters,'disallow':[]}}}})
- summary=call('bro_agent_describe',{'agent':'synthetic-summary-agent'})
- assert summary['planes']['computed_merge']['status']=='computed'
- full=exact('bro_agent_describe',{'agent':'synthetic-summary-agent','detail_plane':'summary','body_limit':4096})
- assert full['planes']['computed_merge']['merged']['allow']==filters
- metadata=exact('bro_agent_describe',{'agent':'synthetic-summary-agent','detail_plane':'metadata','body_limit':512})
- assert metadata['name']=='synthetic-summary-agent'
- print('agent summary and installation metadata recovery PASS',flush=True)
  call('bro_allocator_probe',{'provider':'glm'},True)
  probe_text='Synthetic diagnostic: '+('界\n"'*1500)
  call('bro_allocator_probe',{'provider':'glm','raw_summary':probe_text})
@@ -165,18 +156,6 @@ try:
  assert all(isinstance(row['peak_usage'],bool) for row in preview['candidates'])
  assert preview['candidates'][0]['exclusion_reason']=='quota_exhausted',preview
  print('runtime quota cooldown expiry and authoritative quota refusal PASS',flush=True)
- call('bbox_packet_list',{})
- consequent='Synthetic large consequent: '+('界\n"'*4000)
- compiled=call('bbox_compile',{'domain':'synthetic-result-fixture','scope':'global','rules':[{'id':'always','antecedent':{'op':'True'},'classification':'pass','consequent':consequent}]})
- pid=re.search(r'packet-[0-9a-f]{8}',str(compiled)).group(0)
- result=call('bbox_apply',{'packet_id':pid,'entity':{}}); assert result['match'] is True and result['detail_limited'] is True
- recovered=exact('bbox_apply',{'packet_id':pid,'entity':{},'result_body_limit':1024},'result_cursor')
- assert recovered['prediction']['consequent']==consequent
- report=call('bbox_audit',{'packet_id':pid,'dataset':[{'entity':{'large':consequent},'expected':'different'}],'mismatch_detail':True})
- assert report['fidelity']==0
- recovered=exact('bbox_audit',{'packet_id':pid,'dataset':[{'entity':{},'expected':'different'}],'result_body_limit':1024},'result_cursor')
- assert recovered['fidelity']==0 and len(recovered['mismatches'])==1
- print('packet exact result and audit recovery PASS',flush=True)
  # Reconciled caller-contract fixes, with every mutation isolated above.
  for args in [{'task_ids':[]},{'provider':'synthetic-unknown-provider','dry_run':False}]:
   call('bro_prune',args,True)
@@ -188,7 +167,7 @@ try:
  thread_metadata=exact('bbox_thread',{'action':'get','id':tid,'detail':'metadata','body_limit':512})
  assert tid in json.dumps(thread_metadata)
  orientation=call('bbox_describe_schema',{})
- schema=exact('bbox_describe_schema',{'mode':'full','include_agents':False,'body_limit':4096})
+ schema=exact('bbox_describe_schema',{'mode':'full','body_limit':4096})
  assert [r['entity_type'] for r in orientation['vertex_types']]==[r['entity_type'] for r in schema['vertex_types']]
  assert all('key_fields' not in r for r in orientation['vertex_types'])
  assert all('key_fields' in r for r in schema['vertex_types'])

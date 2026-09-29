@@ -29,6 +29,7 @@ pub(crate) mod project_catalog_inventory_adapters;
 pub mod project_catalog_migration;
 pub mod project_catalog_migration_lock;
 pub(crate) mod project_catalog_notes_owner;
+pub mod project_catalog_packet_tree;
 pub mod project_catalog_probe;
 pub mod project_catalog_rebuild;
 pub mod project_catalog_rebuild_planning;

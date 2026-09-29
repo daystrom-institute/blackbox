@@ -139,7 +139,7 @@ helpers and eight bespoke bypasses. The canonical spine:
   duplicate claims), `sync_declared_aliases` (startup alias rewrite from
   committed config);
 - the daemon-side wrappers in `src/tools/scope.rs`:
-  `resolve_project_write_scope` / `resolve_project_write` (a
+  `resolve_project_write` (a
   `RepositoryMutation` lease probe whose `AttachmentNotFound` arm returns the
   raw selector verbatim as the durable scope key: the load-bearing
   unregistered-write pass-through) and `rescope_project_filter_value` (maps
@@ -171,9 +171,7 @@ plan):
 - B6 the storage tools (`storage_health`, `storage_gc`,
   `storage_migration`): `ProjectRegistry::resolve` then raw pass-through on
   miss;
-- B7 packet project matching by exact string equality
-  (`bbox-packets/src/lib.rs`);
-- B8 `bbox_mcp_surface` passing `p.project` raw while the `/mcp?project=`
+- B7 `bbox_mcp_surface` passing `p.project` raw while the `/mcp?project=`
   wire head resolves through `resolve_project_context(Read)` and then falls
   back to the literal for parity.
 
@@ -186,8 +184,8 @@ arc already cut the path fallback.
 
 Store keying: coordination and knowledge stores key project scope by absolute
 canonical path strings. `project_ref_counts` and `migrate_project_refs` in
-`src/server/routes.rs` enumerate eleven stores (knowledge, threads, notes,
-pins, packets, slack channel bindings, slack proposal links, teams,
+`src/server/routes.rs` enumerate ten stores (knowledge, threads, notes,
+pins, slack channel bindings, slack proposal links, teams,
 whiteboards, pollers, crons). The Phase 1 inventory vocabulary
 `LegacyPathStoreKindV1` names fourteen logical owners (knowledge, gap,
 thread, note, pin, roadmap, packet, task, proposal, slack binding,
@@ -1290,10 +1288,10 @@ the observations the Phase 6 cut will consume.
 
 ### 9.3 Bespoke resolver retirement
 
-B1-B8 as listed in section 2.2 are each either reimplemented on the engine
+B1-B7 as listed in section 2.2 are each either reimplemented on the engine
 (B2, B3, B4, B5), moved above the crate boundary (B1), or preserved as
 tagged v1 compatibility semantics behind the engine (B6, the hash arm of
-B2). B8 has no counterpart: MCP surfaces are daemon configuration and do not
+B2). B7 has no counterpart: MCP surfaces are daemon configuration and do not
 read a project selector. No bespoke selector code path survives outside the engine after P2-E;
 `resolve_project_context` and its helpers survive only as the internals of
 the v1 backend.

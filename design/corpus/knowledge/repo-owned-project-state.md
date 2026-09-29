@@ -127,8 +127,8 @@ So portability is actually **worse** than "per-machine id": an absolute path
 string doesn't survive a different `$HOME`, a different checkout location, or a
 second user — let alone a second machine. And the repo carries only the **rendered
 markdown** (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`), a **lossy** projection that
-cannot be reverse-derived to the structured entries (`bbox_absorb` is now an
-explicit no-op, `src/tools/render.rs:24`).
+cannot be reverse-derived to the structured entries (rendered files are never
+imported back into the store).
 
 The one thing that travels with the repo (markdown) can't be reverse-derived; the
 thing that should travel (structured entries) lives off-repo under a key that
@@ -139,14 +139,14 @@ doesn't move.
 On a fresh second machine where the daemon's store is empty-for-this-project but
 the repo's instruction files are already managed and committed:
 
-1. `bbox_bootstrap` **refuses** — detects the files as "already
-   blackbox-generated" and imports nothing (HIGH#2 of the second-machine
-   bootstrap issues).
+1. Nothing imports the committed instruction files: they are already
+   blackbox-generated, so there is nothing to reconstruct entries from (HIGH#2
+   of the second-machine bootstrap issues).
 2. `bbox_render scope=project` from the empty-for-this-project store produces a
    **near-empty stub**, which would **overwrite committed content** (a 74-line
    conventions file collapses to ~6 lines).
-3. `bbox_absorb`, the former reverse path, is a **no-op** — rendered markdown is
-   not round-trippable to structured entries.
+3. There is no reverse path: rendered markdown is not round-trippable to
+   structured entries.
 
 Net: committed project knowledge can be neither re-imported nor reproduced on the
 second machine. There is no supported reconciliation path. This is the
@@ -386,8 +386,8 @@ Mapped to the second-machine bootstrap issues (scratch log since resolved and re
 
 - **HIGH#2 (clobber trap)** — gone by construction: render derives from the
   committed tree, identical everywhere.
-- **HIGH#1 (`bbox_absorb` no-op vs docs)** — the need for absorb disappears;
-  structured source is committed and authoritative.
+- **HIGH#1 (no reverse path from rendered files)**: the need for one
+  disappears; structured source is committed and authoritative.
 - **MEDIUM (render-target staleness)** — folded into the render-policy decision and
   the ancestor locality doc's unfinished migration.
 

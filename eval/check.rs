@@ -102,10 +102,6 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         include_str!("queries/cross-modal-workflow-engine.json"),
     ),
     (
-        "cross-modal-rule-packets",
-        include_str!("queries/cross-modal-rule-packets.json"),
-    ),
-    (
         "cross-modal-entity-ref-parser",
         include_str!("queries/cross-modal-entity-ref-parser.json"),
     ),
@@ -221,7 +217,6 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
         "check_cross_modal_knowledge_store" => check_cross_modal_knowledge_store,
         "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
         "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
-        "check_cross_modal_rule_packets" => check_cross_modal_rule_packets,
         "check_cross_modal_entity_ref_parser" => check_cross_modal_entity_ref_parser,
         "check_cross_modal_notes_side_channel" => check_cross_modal_notes_side_channel,
         _ => return None,
@@ -367,7 +362,6 @@ stub_checker!(check_transcript_harness_in_process_provider);
 stub_checker!(check_cross_modal_knowledge_store);
 stub_checker!(check_cross_modal_recursion_guard);
 stub_checker!(check_cross_modal_workflow_engine);
-stub_checker!(check_cross_modal_rule_packets);
 stub_checker!(check_cross_modal_entity_ref_parser);
 stub_checker!(check_cross_modal_notes_side_channel);
 
@@ -379,9 +373,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn all_26_manifests_parse_and_round_trip() {
+    fn all_25_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 26);
+        assert_eq!(manifests.len(), 25);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -425,7 +419,7 @@ mod tests {
             (QueryClass::ConceptualDesignDoc, 6),
             (QueryClass::StaleDecisionLookup, 2),
             (QueryClass::TranscriptProvenance, 6),
-            (QueryClass::CrossModalCodeProse, 6),
+            (QueryClass::CrossModalCodeProse, 5),
         ] {
             assert_eq!(class_counts.get(&class).copied(), Some(count), "{class:?}");
         }
@@ -435,7 +429,7 @@ mod tests {
     #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
                 transcript corpus on disk, which is absent in a fresh checkout. Run with \
                 `cargo test -- --ignored` against a real corpus."]
-    fn all_26_manifests_have_resolvable_expected_refs() {
+    fn all_25_manifests_have_resolvable_expected_refs() {
         let manifests = load_manifests().expect("all eval manifests parse");
         for manifest in &manifests {
             for raw in &manifest.expected_entity_refs {
@@ -649,11 +643,11 @@ mod tests {
     fn chunks_for_path(
         abs_path: &Path,
         rel_path: &Path,
-    ) -> anyhow::Result<Vec<crate::chunker::Chunk>> {
+    ) -> anyhow::Result<Vec<bbox_chunker::Chunk>> {
         let bytes = fs::read(abs_path)?;
         let sniff_len = bytes.len().min(4096);
         let mut chunks = Vec::new();
-        for chunker in crate::chunker::default_registry() {
+        for chunker in bbox_chunker::default_registry() {
             if !chunker.claims(rel_path, &bytes[..sniff_len]) {
                 continue;
             }
@@ -679,18 +673,17 @@ mod tests {
         ))
     }
 
-    fn bound_chunks(chunks: &[crate::chunker::Chunk]) -> Vec<crate::chunker::Chunk> {
+    fn bound_chunks(chunks: &[bbox_chunker::Chunk]) -> Vec<bbox_chunker::Chunk> {
         chunks
             .iter()
             .flat_map(|chunk| {
-                if chunk.content.len() <= crate::chunker::MAX_CHUNK_BYTES {
+                if chunk.content.len() <= bbox_chunker::MAX_CHUNK_BYTES {
                     return vec![chunk.clone()];
                 }
                 let mut out = Vec::new();
                 let mut start = 0usize;
                 while start < chunk.content.len() {
-                    let mut end =
-                        (start + crate::chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
+                    let mut end = (start + bbox_chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
                     while !chunk.content.is_char_boundary(end) {
                         end -= 1;
                     }

@@ -3,25 +3,11 @@
 //!
 //! # Why this exists
 //!
-//! The durable-catalog plan always described two ways a version-2 store comes
-//! into being. The parent plan's origin section names them directly: "A fresh
-//! v2 initializer writes `FreshV2`. The v1 importer writes
-//! `MigratedV1 { transaction_id }`." Only the importer ever got an operator
-//! surface. `ProjectCatalogStore::initialize_empty` existed as a library
-//! entry, used exclusively by tests, so on a real host the ONLY documented
-//! route into catalog mode ran through `project-catalog migrate`.
-//!
-//! That route is closed to a fresh bundle by construction, not by accident.
-//! Migration preflight inventories the owner stores through ten immutable
-//! lanes; on a bundle where the corpus index, vector root, edge manifests, and
-//! Git cursor directory have never been written, six of those lanes
-//! (`project-scoped-refs`, `edge-workspaces`, `git-metadata`,
-//! `legacy-path-observations`, `repo-grouping-proofs`,
-//! `legacy-namespace-clusters`) capture as `Missing`, each becomes an
-//! `immutable_lane_missing` hard refusal, the report is not `Clean`, and
-//! `apply --configured` refuses with
-//! `error.project_catalog_migration_report_not_clean`. A greenfield deployment
-//! therefore could not reach the split topology at all.
+//! A version-2 store has two origins. A fresh v2 initializer writes
+//! `FreshV2`; the v1 importer wrote `MigratedV1 { transaction_id }`, and
+//! catalogs of that origin stay verified at every open. Genesis is the only
+//! operator route into catalog mode: the v1 importer has no operator surface,
+//! so a bundle that still holds v1 project state cannot enter catalog mode.
 //!
 //! # What genesis writes, and why it is not a synthesized migration
 //!
@@ -326,8 +312,8 @@ fn refuse_non_fresh_census(census: &[GenesisOwnerCensusRowV1]) -> GenesisResult<
         return Err(error(
             "error.project_catalog_genesis_owner_not_empty",
             format!(
-                "these legacy owner stores hold project-scoped rows: {}; that state is \
-                 migration input, so run `project-catalog migrate` instead of genesis",
+                "these legacy owner stores hold project-scoped rows: {}; genesis \
+                 initializes only a bundle with no project state",
                 occupied.join(", ")
             ),
         ));
@@ -389,7 +375,7 @@ fn census_owner_stores(
         ),
         (
             "packet-rows",
-            bbox_packets::capture_project_catalog_owner_snapshot(
+            crate::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(
                 &owners.packet_root,
                 limits.durable_owners,
             ),

@@ -14,7 +14,6 @@ dirs = "6"
 anyhow = "1"
 libc = "0.2"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
-bbox-packets = { path = "../bbox-packets" }
 parking_lot = "0.12"
 strum = { version = "0.26", features = ["derive"] }
 tracing = "0.1"

@@ -34,13 +34,13 @@ dispatch).
 | 3. Single-implementer path | **Done** | `phase-decompose-supervised-impl` plus `phase-decompose-main` direct branch. Live direct smoke passed after `InitEpoch` hardening (`arc-6381ec7ba9c34201b427897cd40884a5`). |
 | 4. Ensemble decomposition | **Done** | `phase-decompose-ensemble-decompose` v20, `phase-decomposer-panel`, facilitator strict-DAG synthesis, mechanical `lint-dag.py` byte/coverage validation, `normalize-dag-measurements.py` derived-byte normalization, degraded-ref carry-through, and explicit terminal-verdict taxonomy handling. |
 | 5. Foreach implementer dispatch | **Done** | `phase-decompose-main` foreaches over `vars.dag.sub_units` into `phase-decompose-supervised-impl` and collects sub-results. |
-| 6. Recomposition council + remediation | **Done** | `phase-decompose-recompose` v6, `phase-recompose-council`, verdict packet, remediation packet back-edge, epoch-ceiling routing, stdin-backed mechanical recompose assertions, and arc-id status observability. Final live decomposed smoke passed (`arc-5a5fd112da724ce7a06ab7d1fe007bd8`). Edit/merge mediation is out of v1. |
+| 6. Recomposition council + remediation | **Done** | `phase-decompose-recompose` v6, `phase-recompose-council`, verdict routing, remediation packet back-edge, epoch-ceiling routing, stdin-backed mechanical recompose assertions, and arc-id status observability. Final live decomposed smoke passed (`arc-5a5fd112da724ce7a06ab7d1fe007bd8`). Edit/merge mediation is out of v1. |
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
 `Branch`, `Fork`, `Wait`, `gate`, and `durable` actors. The new
-artifacts are: several agent manifests, brofiles, teamplates, packet
-definitions, and workflow JSON artifacts.
+artifacts are: several agent manifests, brofiles, teamplates, and
+workflow JSON artifacts.
 
 ```
 Phase 1 ──▶ Phase 2 ──┬──▶ Phase 3 ──┐
@@ -172,10 +172,9 @@ kind=agent`.
      `vars.evidence_bundle` and `vars.triage_verdict`. DAG construction
      belongs to the decomposer/ensemble path after discovery.
 
-2.3 **Parent gate packet.** After the discovery subworkflow exports
+2.3 **Parent gate.** After the discovery subworkflow exports
    `triage_verdict` to the parent, the PARENT node carries a `gate`
-   packet (`domain:phase-decompose/triage`). Reads
-   `vars.triage_verdict` and emits `fit_direct` or
+   that reads `vars.triage_verdict` and emits `fit_direct` or
    `needs_decompose`. Subworkflow gate verdicts are not promoted
    (the engine exports vars only) — the parent must have its
    own gate. The parent's `Branch` routes on `last_verdict`.
@@ -184,7 +183,7 @@ kind=agent`.
    `phase_doc_path` into the discovery subworkflow. On completion,
    exports `evidence_bundle` and `triage_verdict` are promoted back to
    parent vars by the engine's subworkflow export path. The parent's next
-   node carries a gate packet that reads `vars.triage_verdict` and
+   node carries a gate that reads `vars.triage_verdict` and
    emits the classification. `Branch` routes on `last_verdict`.
    **Subworkflow gate verdicts are not promoted** — the parent needs
    its own gate after export.
@@ -194,7 +193,7 @@ produces a measured evidence bundle and a triage verdict. The parent
 branches correctly on `fit_direct` vs `needs_decompose`.
 
 **Estimated size:** 1 brofile (~30 lines), 1 workflow JSON artifact
-(~100-150 lines), 1 gate packet (~30 lines). No new Rust code.
+(~100-150 lines). No new Rust code.
 
 ---
 
@@ -265,19 +264,17 @@ parallel with Phase 3.
      summed from the evidence bundle; it excludes fixed workflow prompt,
      brofile, ambient scope, and MCP-injection overhead.
 
-4.4 **DAG validation.** A gate packet on the Synthesize node verifies
+4.4 **DAG validation.** A gate on the Synthesize node verifies
    the DAG shape (required fields present, sub_units non-empty,
    merge_order matches sub_unit_ids). **Coverage and measured-byte lint
-   cannot be fully expressed as packet rules today** — `ForAll`
-   quantifies over one array path but cannot correlate an
-   outer `criterion_id` into an inner `Exists` over sibling `sub_units[*]`
-   acceptance subsets, and packet rules cannot sum ref bytes.
+   are not gate checks**: they correlate an outer `criterion_id` against
+   sibling `sub_units[*]` acceptance subsets and sum ref bytes.
    `SynthesizeDag/on_exit` therefore extracts DAG refs, runs
    `normalize-dag-measurements.py` to recompute sub-unit bytes from the
    evidence bundle, and runs `lint-dag.py`. The lint fails on missing
    acceptance coverage, missing or unexpected degraded refs, and sub-unit
    bytes over `target_context_window`.
-   The packet gate handles structural validation; coverage and byte accuracy
+   The gate handles structural validation; coverage and byte accuracy
    are mechanical hook validation in v1.
 
 **Deliverable:** A `needs_decompose` verdict routes to the decomposer
@@ -285,8 +282,7 @@ panel. The panel produces a validated DAG with per-sub-unit refs,
 acceptance subsets, and measured byte sizes.
 
 **Estimated size:** 1 teamplate (~30 lines), 2-3 brofiles (~90 lines),
-   workflow nodes in the parent workflow (~150 lines), 1 gate packet
-   (~40 lines). No new Rust code.
+   workflow nodes in the parent workflow (~150 lines). No new Rust code.
 
 ---
 
@@ -383,8 +379,7 @@ for the supervision/adversarial patterns.
 6.5 **Epoch ceiling.** `max_epochs` is not a `NodeSpec` field.
    The shipped workflow initializes
    `vars.epoch`, runs `system-defaults/phase-decompose/scripts/epoch-check.py`
-   to compute `vars.epoch_status`, and routes through the
-   `domain:phase-decompose/epoch-ceiling` packet. The packet reads
+   to compute `vars.epoch_status`, and routes through a gate that reads
    `epoch_status=continue|halt` instead of hardcoding a numeric ceiling,
    so `max_epochs` remains runtime-configurable. The remediation back-edge
    increments `vars.epoch` before re-entering discovery.
@@ -399,8 +394,8 @@ the council, converted into a remediation packet, and resolved iteratively.
 A phase that truly can't converge halts after the epoch ceiling.
 
 **Estimated size:** 1 teamplate (~30 lines), council brofiles (~60
-lines), parent workflow nodes for council/remediation (~150 lines), 1 gate
-packet for epoch ceiling (~20 lines). No new Rust code.
+lines), parent workflow nodes for council/remediation (~150 lines). No new
+Rust code.
 
 ---
 
@@ -409,11 +404,11 @@ packet for epoch ceiling (~20 lines). No new Rust code.
 | Phase | Can start after | New Rust | New artifacts | Test |
 |---|---|---|---|---|
 | 1. Scout manifest | - | - | 1 agent JSON | bro_agent_dispatch returns structured leads |
-| 2. Inlet agent | 1 | - | 1 brofile, 1 workflow, 1 packet | Phase doc → evidence bundle + triage verdict |
+| 2. Inlet agent | 1 | - | 1 brofile, 1 workflow | Phase doc → evidence bundle + triage verdict |
 | 3. Single-implementer | 2, supervision S1, S2, S3, S5, S7, S8 subset | - | 1 workflow | fit_direct -> implementer -> advisor -> done |
-| 4. Ensemble decompose | 2 | - | 1 teamplate, 2-3 brofiles, 1 packet | needs_decompose → panel deliberation → validated DAG |
+| 4. Ensemble decompose | 2 | - | 1 teamplate, 2-3 brofiles | needs_decompose → panel deliberation → validated DAG |
 | 5. Foreach implementers | 3, 4, supervision S6-S8 | - | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
-| 6. Recompose council | 5, supervision S9 | - | 1 teamplate, 2 brofiles, 1 packet | Work remains → remediation packet → converge or halt |
+| 6. Recompose council | 5, supervision S9 | - | 1 teamplate, 2 brofiles | Work remains → remediation packet → converge or halt |
 
 Additional Rust code: `src/dispatch_mcp.rs` now injects the `agent-internal`
 MCP surface for dispatched bros, and `src/workflow/ops.rs` now makes
@@ -562,7 +557,6 @@ Required external review drove the final hardening pass:
 | Agent manifests | 1, 4, 6 | `system-defaults/agents/code-reviewer.json` |
 | bro_agent_dispatch | 1, 2 | `src/tools/agents.rs` |
 | bro_workflow_install | 2, 3 | `src/tools/orchestrate.rs` |
-| bbox_compile / bbox_audit | 2, 4, 6 | `src/tools/packets.rs` |
 
 ## Dependency on supervision-phased-implementation.md
 

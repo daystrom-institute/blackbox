@@ -14,8 +14,6 @@ use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::tail::TailEvent;
 use crate::orchestration::{self, TaskStore};
-use crate::packets::Packets;
-use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
@@ -94,8 +92,6 @@ pub(crate) struct SharedState {
     pub(crate) threads_persister: StorePersister<Threads>,
     pub(crate) notes: Arc<RwLock<Notes>>,
     pub(crate) notes_persister: StorePersister<Notes>,
-    pub(crate) pins: Arc<RwLock<Pins>>,
-    pub(crate) pins_persister: StorePersister<Pins>,
     /// Durable pending checkout mutations (repo-owned file writes the
     /// daemon validated but cannot apply; the checkout-owner collector
     /// polls and acks them over the producer channel).
@@ -207,7 +203,6 @@ pub(crate) struct SharedState {
     /// bypass the cached decision immediately.
     pub(crate) publisher_authorization_cache:
         RwLock<super::knowledge_lifecycle::PublisherAuthorizationCache>,
-    pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
@@ -554,10 +549,6 @@ impl SharedState {
         self.threads_persister.request_durable().await
     }
 
-    pub(crate) async fn persist_pins_durable(&self) -> anyhow::Result<()> {
-        self.pins_persister.request_durable().await
-    }
-
     pub(crate) async fn persist_checkout_mutations_durable(&self) -> anyhow::Result<()> {
         self.checkout_mutations_persister.request_durable().await
     }
@@ -640,7 +631,6 @@ impl SharedState {
                     }
                 }
             },
-            packets: &self.packets,
             artifacts: &self.artifacts,
             project_graph_views: &self.project_graph_views,
             store_dir: &self.store_dir,
@@ -748,9 +738,6 @@ impl SharedState {
         let threads_store = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
         let threads_persister =
             StorePersister::spawn("threads-test", threads_store.clone(), threads_path);
-        let pins_path = store_dir.join("pins.json");
-        let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
-        let pins_persister = StorePersister::spawn("pins-test", pins_store.clone(), pins_path);
         let checkout_mutations_path = store_dir.join("checkout-mutations.json");
         let checkout_mutations_store = Arc::new(RwLock::new(
             crate::checkout_mutations::CheckoutMutations::open(&checkout_mutations_path).unwrap(),
@@ -792,8 +779,6 @@ impl SharedState {
             threads_persister,
             notes: notes_store,
             notes_persister,
-            pins: pins_store,
-            pins_persister,
             checkout_mutations: checkout_mutations_store,
             checkout_mutations_persister,
             producer_claims: producer_claims_store,
@@ -842,7 +827,6 @@ impl SharedState {
             catalog_gap_published_cache: RwLock::new(BTreeMap::new()),
             project_graph_views: RwLock::new(Default::default()),
             publisher_authorization_cache: RwLock::new(Default::default()),
-            packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),

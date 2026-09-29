@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::knowledge::{ForgetParams, KnowledgeListParams, LearnParams, ResponseFormat};
-use crate::packets::packet_matches_query;
 use crate::server::BlackboxServer;
 use crate::system_memory;
 
@@ -14,7 +13,6 @@ use rmcp::{tool, tool_router};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
-const DEFAULT_PACKET_SIDECAR_LIMIT: usize = 8;
 const DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT: usize = 6;
 const KNOWLEDGE_DETAIL_PAGE_BYTES: usize = 4096;
 const KNOWLEDGE_DETAIL_MIN_PAGE_BYTES: usize = 256;
@@ -125,7 +123,7 @@ fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
 /// Extract the top knowledge entry id from a `kb.list` entries block for the
 /// response breadcrumb. The block opens with `N entries:\n\n[<id>] …`, so the
 /// first bracketed token is the highest-ranked entry. Returns None for the
-/// "No entries found." sentinel (no `[`), so a packet-only or memory-only
+/// "No entries found." sentinel (no `[`), so a memory-only
 /// response does not emit a spurious entry pointer.
 fn first_entry_id(entries_block: &str) -> Option<String> {
     let start = entries_block.find('[')? + 1;
@@ -1646,7 +1644,7 @@ fn validate_knowledge_detail_selection(
 impl BlackboxServer {
     #[tool(
         name = "bbox_learn",
-        description = "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
+        description = "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope."
     )]
     pub(crate) async fn bbox_learn(
         &self,
@@ -1659,7 +1657,6 @@ impl BlackboxServer {
             Ok(format) => format,
             Err(e) => return Self::err_text(&format!("Error: {e:#}")),
         };
-        let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
         let start = std::time::Instant::now();
         let server = self.clone();
         // Covered projects write through the checkout-owner backchannel:
@@ -1778,10 +1775,7 @@ impl BlackboxServer {
                 }
                 match format {
                     ResponseFormat::Text => {
-                        let mut text = match warning {
-                            Some(w) => format!("{}{}", result.message, w),
-                            None => result.message,
-                        };
+                        let mut text = result.message;
                         if let Some(rider) = &rider {
                             text.push_str(rider);
                         }
@@ -1803,9 +1797,6 @@ impl BlackboxServer {
                         if let Some(summary) = result.summary {
                             payload["summary"] = serde_json::json!(summary);
                         }
-                        if let Some(w) = warning {
-                            payload["warnings"] = serde_json::json!([w.trim().to_string()]);
-                        }
                         let bytes = serde_json::to_string(&payload)
                             .map(|s| s.len())
                             .unwrap_or_default();
@@ -1823,7 +1814,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces bounded rule-packet and system-memory sidecars; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"system_memory\" to list memory metadata."
     )]
     pub(crate) async fn bbox_knowledge(
         &self,
@@ -1888,67 +1879,10 @@ impl BlackboxServer {
             if p.diagnostics_detail == Some(true) {
                 return exact_diagnostics_response(&view.diagnostics, &p);
             }
-            // Captured before packets/memories are appended, so it reflects the
-            // top knowledge entry (not a packet/memory line).
+            // Captured before memories are appended, so it reflects the
+            // top knowledge entry (not a memory line).
             let top_entry_id = first_entry_id(&combined);
             let recall_ids = entry_ids(&combined);
-
-            // Surface matching packets. Uses the same match semantics as
-            // bbox_packet_list so the two tools agree on what "matches" means.
-            let all_packets = server.state.packets.read().list_all()?;
-            let matching_packets: Vec<_> =
-                if let Some(q) = p.query.as_deref().filter(|q| !q.is_empty()) {
-                    all_packets
-                        .into_iter()
-                        .filter(|pkt| packet_matches_query(pkt, q))
-                        .collect()
-                } else if p.category.as_deref() == Some("packet") {
-                    all_packets
-                } else {
-                    Vec::new()
-                };
-
-            if !matching_packets.is_empty() {
-                if !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str("\n── Rule-packets ───────────────────────────────\n");
-                let limit = p
-                    .limit
-                    .map(|limit| limit as usize)
-                    .unwrap_or(DEFAULT_PACKET_SIDECAR_LIMIT)
-                    .min(DEFAULT_PACKET_SIDECAR_LIMIT);
-                for pkt in matching_packets.iter().take(limit) {
-                    let histogram: Vec<String> = pkt
-                        .rules
-                        .iter()
-                        .fold(BTreeMap::<String, usize>::new(), |mut acc, r| {
-                            *acc.entry(r.classification.clone()).or_insert(0) += 1;
-                            acc
-                        })
-                        .into_iter()
-                        .map(|(k, v)| format!("{k}:{v}"))
-                        .collect();
-                    combined.push_str(&format!(
-                        "[{}] Packet | domain: {} | scope: {} | {} rules [{}] | created {}\n",
-                        pkt.id,
-                        compact_text_fragment(&pkt.domain, 200),
-                        compact_text_fragment(&pkt.scope, 64),
-                        pkt.rules.len(),
-                        compact_text_fragment(&histogram.join(", "), 256),
-                        pkt.created_at,
-                    ));
-                }
-                if matching_packets.len() > limit {
-                    combined.push_str(&format!(
-                        "  [truncated rule-packets: showing {limit} of {}; use bbox_packet_list for structured filters]\n",
-                        matching_packets.len()
-                    ));
-                }
-                combined.push_str(
-                    "  (use bbox_packet_list for filter/query/preview; bbox_apply to evaluate)\n",
-                );
-            }
 
             // Also surface matching system memories. See
             // system-defaults/memories/ — these are file-loaded runbooks
@@ -1985,7 +1919,7 @@ impl BlackboxServer {
             }
 
             // Top-level breadcrumb: pull the highest-ranked knowledge entry into
-            // the graph funnel. Packets and memories carry their own pointers
+            // the graph funnel. Memories carry their own pointers
             // above; this completes the response-breadcrumb plane for entries.
             if let Some(id) = &top_entry_id {
                 let entity_ref = knowledge_entity_ref(id);
@@ -2339,7 +2273,7 @@ mod tests {
 
         assert!(out.contains("[system] sm-refactor"));
         assert!(out.contains("[system] sm-refactor-rust"));
-        assert!(!out.contains("[system] sm-rule-packets"));
+        assert!(!out.contains("[system] sm-transcript-retrieval"));
     }
 
     #[test]
@@ -2914,7 +2848,7 @@ mod tests {
     fn exact_system_memory_read_pages_oversized_record() {
         init_system_memory();
         let memory =
-            system_memory::exact_query(Some("sm-rule-packets")).expect("canonical system memory");
+            system_memory::exact_query(Some("sm-refactor")).expect("canonical system memory");
         assert!(memory.content.len() > KNOWLEDGE_DETAIL_PAGE_BYTES);
         let p = KnowledgeListParams {
             query: Some(memory.id.clone()),

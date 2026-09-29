@@ -56,11 +56,12 @@ Do not resume a session while its previous task is still running. Check with
 
 ## Fanout
 
-Broadcast to a team:
+Dispatch each team member, then wait on the team:
 
 ```text
-bro_broadcast(team="reviewers", prompt="review this diff for correctness")
-bro_when_all(task_ids=["task-a", "task-b"], timeout_seconds=60)
+bro_exec(bro="reviewers::correctness", prompt="review this diff for correctness")
+bro_exec(bro="reviewers::security", prompt="review this diff for security")
+bro_when_all(team="reviewers", timeout_seconds=60)
 ```
 
 Use `bro_when_any` for races where the first useful answer wins. The losers keep

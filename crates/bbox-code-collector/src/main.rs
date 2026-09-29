@@ -329,7 +329,6 @@ fn init_project_scaffolding(path: &Path, announce: bool) -> Result<PathBuf> {
     for dir in [
         "brofiles",
         "workflows",
-        "packets",
         "teams",
         "agents",
         "local",
@@ -5221,7 +5220,6 @@ mod tests {
         for dir in [
             "brofiles",
             "workflows",
-            "packets",
             "teams",
             "agents",
             "local",

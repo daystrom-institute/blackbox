@@ -46,9 +46,7 @@ mod tests {
             "commit:repo1234:abcdef1234567890",
             "task:task-12345678",
             "bash_call:session123:7",
-            "agent:code-reviewer@v3",
-            "packet:domain:phase-decompose/triage",
-            "artifact:packet/phase-decompose/triage@1",
+            "artifact:team/example@1",
         ]
     }
 

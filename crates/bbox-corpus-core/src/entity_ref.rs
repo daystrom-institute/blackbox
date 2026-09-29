@@ -31,13 +31,11 @@ pub enum EntityType {
     Commit,
     Task,
     BashCall,
-    Agent,
-    Packet,
     Artifact,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 21] = [
+    pub const ALL: [EntityType; 19] = [
         EntityType::Knowledge,
         EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
@@ -56,8 +54,6 @@ impl EntityType {
         EntityType::Commit,
         EntityType::Task,
         EntityType::BashCall,
-        EntityType::Agent,
-        EntityType::Packet,
         EntityType::Artifact,
     ];
 
@@ -81,8 +77,6 @@ impl EntityType {
             EntityType::Commit => "commit",
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
-            EntityType::Agent => "agent",
-            EntityType::Packet => "packet",
             EntityType::Artifact => "artifact",
         }
     }
@@ -121,8 +115,6 @@ impl EntityType {
             EntityType::Commit => "commit:<repo_id>:<sha>",
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
-            EntityType::Agent => "agent:<name>@v<version>",
-            EntityType::Packet => "packet:domain:<domain>",
             EntityType::Artifact => "artifact:<kind>/<name>@<version>",
         }
     }
@@ -231,13 +223,6 @@ pub enum EntityRef {
         session: String,
         turn: u32,
     },
-    Agent {
-        name: String,
-        version: u32,
-    },
-    Packet {
-        selector: String,
-    },
     Artifact {
         kind: String,
         name: String,
@@ -313,8 +298,6 @@ impl EntityRef {
                 EntityRef::Task { task_id }
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
-            EntityType::Agent => parse_agent(input, rest),
-            EntityType::Packet => parse_packet(input, rest),
             EntityType::Artifact => parse_artifact(input, rest),
         }
     }
@@ -434,19 +417,6 @@ impl EntityRef {
             EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
             EntityRef::Task { task_id } => Ok(format!("task:{task_id}")),
             EntityRef::BashCall { session, turn } => Ok(format!("bash_call:{session}:{turn}")),
-            EntityRef::Agent { name, version } => {
-                if name.is_empty() || name.contains(':') || *version == 0 {
-                    return Err(EntityRefRenderError {
-                        field: "name/version",
-                        value: format!("{name}@v{version}"),
-                        message: format!(
-                            "agent ref has invalid name/version: name={name:?}, version={version}"
-                        ),
-                    });
-                }
-                Ok(format!("agent:{name}@v{version}"))
-            }
-            EntityRef::Packet { selector } => Ok(format!("packet:{selector}")),
             EntityRef::Artifact {
                 kind,
                 name,
@@ -480,8 +450,6 @@ impl EntityRef {
             EntityRef::Commit { .. } => EntityType::Commit,
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
-            EntityRef::Agent { .. } => EntityType::Agent,
-            EntityRef::Packet { .. } => EntityType::Packet,
             EntityRef::Artifact { .. } => EntityType::Artifact,
         }
     }
@@ -858,30 +826,6 @@ fn parse_bash_call(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseE
         session: non_empty(input, session, EntityType::BashCall, "session")?.to_string(),
         turn: parse_u32(input, turn, EntityType::BashCall, "turn")?,
     })
-}
-
-fn parse_agent(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
-    require_no_colon(input, rest, EntityType::Agent)?;
-    let value = non_empty(input, rest, EntityType::Agent, "name@version")?;
-    let (name, version_str) = value
-        .rsplit_once("@v")
-        .ok_or_else(|| shape_error(input, EntityType::Agent))?;
-    let name = non_empty(input, name, EntityType::Agent, "name")?;
-    Ok(EntityRef::Agent {
-        name: name.to_string(),
-        version: parse_u32(input, version_str, EntityType::Agent, "version")?,
-    })
-}
-
-fn parse_packet(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
-    let selector = non_empty(input, rest, EntityType::Packet, "selector")?;
-    if selector.starts_with("domain:") || selector.starts_with("packet-") {
-        Ok(EntityRef::Packet {
-            selector: selector.to_string(),
-        })
-    } else {
-        Err(shape_error(input, EntityType::Packet))
-    }
 }
 
 fn parse_artifact(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
@@ -1277,72 +1221,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_ref_round_trips() {
-        let agent = EntityRef::Agent {
-            name: "code-reviewer".to_string(),
-            version: 3,
-        };
-        let rendered = agent.render();
-        assert_eq!(rendered, "agent:code-reviewer@v3");
-        let parsed = EntityRef::parse(&rendered).unwrap();
-        assert_eq!(parsed, agent);
-        assert_eq!(parsed.entity_type(), EntityType::Agent);
-        assert!(!parsed.is_virtual());
-    }
-
-    #[test]
-    fn agent_ref_rejects_missing_version() {
-        let err = EntityRef::parse("agent:reviewer").unwrap_err();
-        assert!(err.message.contains("agent"));
-        assert!(err.suggested_fix.is_some());
-    }
-
-    #[test]
-    fn agent_ref_rejects_non_numeric_version() {
-        let err = EntityRef::parse("agent:reviewer@vabc").unwrap_err();
-        assert!(err.message.contains("version"));
-    }
-
-    #[test]
-    fn agent_ref_rejects_colon_in_name() {
-        let err = EntityRef::parse("agent:reviewer:extra@v1").unwrap_err();
-        assert!(err.message.contains("agent"));
-    }
-
-    #[test]
-    fn agent_ref_rejects_empty_name() {
-        let err = EntityRef::parse("agent:@v1").unwrap_err();
-        assert!(err.message.contains("name"));
-    }
-
-    #[test]
-    fn agent_ref_render_rejects_empty_name() {
-        let bad = EntityRef::Agent {
-            name: "".to_string(),
-            version: 1,
-        };
-        assert!(bad.try_render().is_err());
-    }
-
-    #[test]
-    fn agent_ref_render_rejects_colon_in_name() {
-        let bad = EntityRef::Agent {
-            name: "bad:name".to_string(),
-            version: 1,
-        };
-        assert!(bad.try_render().is_err());
-    }
-
-    #[test]
-    fn agent_ref_render_rejects_version_zero() {
-        let bad = EntityRef::Agent {
-            name: "reviewer".to_string(),
-            version: 0,
-        };
-        assert!(bad.try_render().is_err());
-    }
-
-    #[test]
     fn project_file_v2_ref_round_trips() {
         let rendered = "project_file_v2:proj1234:head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:relhash:chunkhash:7";
         let parsed = EntityRef::parse(rendered).unwrap();
@@ -1539,14 +1417,7 @@ mod tests {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            18 => EntityRef::Agent {
-                name: rng.token("agent-"),
-                version: 1 + (rng.next() as u32) % 10,
-            },
-            19 => EntityRef::Packet {
-                selector: format!("domain:{}", rng.token("packet-domain-")),
-            },
-            20 => EntityRef::Artifact {
+            18 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),

@@ -136,7 +136,6 @@ checkout_root_path	src/tools/projects.rs	fn bbox_project_init	1	collapse into th
 checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	5	collapse into the lease confined readers
 checkout_root_path	src/tools/render.rs	fn bbox_render	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
-checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope	1	collapse into the lease confined readers
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_strings	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_with_alternate	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn read_stable_repository_object_format	1	route through the verified-commit git wrapper

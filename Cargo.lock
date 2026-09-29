@@ -625,7 +625,6 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-corpus-core",
- "bbox-packets",
  "bbox-util",
  "dirs",
  "hex",
@@ -691,7 +690,6 @@ dependencies = [
  "bbox-knowledge",
  "bbox-knowledge-source",
  "bbox-knowledge-source-store",
- "bbox-packets",
  "bbox-project-graph",
  "bbox-slack",
  "bbox-stores",
@@ -835,22 +833,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-packets"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-corpus-core",
- "chrono",
- "regex",
- "rmcp",
- "serde",
- "serde_json",
- "strum 0.26.3",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "bbox-project-graph"
 version = "0.0.1"
 dependencies = [
@@ -890,7 +872,6 @@ dependencies = [
  "bbox-edge-index",
  "bbox-indexing",
  "bbox-knowledge",
- "bbox-packets",
  "bbox-system-memory",
  "bbox-threads",
  "parking_lot",
@@ -1220,7 +1201,6 @@ dependencies = [
  "bbox-knowledge-source-client",
  "bbox-knowledge-source-store",
  "bbox-mcp-tools",
- "bbox-packets",
  "bbox-project-graph",
  "bbox-project-render",
  "bbox-providers",

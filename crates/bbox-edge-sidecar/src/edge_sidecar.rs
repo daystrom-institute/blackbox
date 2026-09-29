@@ -1120,10 +1120,6 @@ pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     ids
 }
 
-/// Lane stem that holds agent provenance edges. It is not a project id, so
-/// admission accepts it regardless of the registered-project set.
-pub const AGENT_PROVENANCE_LANE: &str = "agents";
-
 /// The one admission rule for edge sidecar lane files. The rebuild signature
 /// fold and every loader path admit a lane through this predicate, so a lane
 /// that can change the signature is always loaded and a lane the loaders skip
@@ -1138,7 +1134,7 @@ pub fn sidecar_lane_is_admitted(
     let Some(stem) = sidecar_file_stem(path) else {
         return false;
     };
-    stem == AGENT_PROVENANCE_LANE || registered_project_ids.contains(stem)
+    registered_project_ids.contains(stem)
 }
 
 /// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
@@ -1680,7 +1676,6 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
 //   project_files.rs  → replace_materialized_edges_incremental ("project")
 //   git_history.rs    → replace_materialized_edges (full) or merge_materialized_edges (incremental) ("git")
 //   tool_edges.rs     → append_observed_edges
-//   routes.rs         → append_explicit_edges (global agents.jsonl)
 //   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
 
@@ -1967,80 +1962,6 @@ pub fn merge_materialized_edges(
         }
     }
     replace_project_edges(edges_dir, namespace, project_id, &merged)
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: Legacy edge extraction dry-run
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LegacyExtractionPlan {
-    pub project_id: String,
-    pub legacy_path: String,
-    pub total_lines: u64,
-    pub derived_lines: u64,
-    pub tool_lines: u64,
-    pub explicit_lines: u64,
-    pub malformed_lines: u64,
-    pub blank_lines: u64,
-    pub managed_replacement_exists: bool,
-    pub extractable: bool,
-}
-
-pub fn plan_legacy_edge_extraction(
-    edges_dir: &Path,
-    project_id: &str,
-) -> Result<LegacyExtractionPlan> {
-    let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
-    let mut plan = LegacyExtractionPlan {
-        project_id: project_id.to_string(),
-        legacy_path: legacy_path.display().to_string(),
-        ..Default::default()
-    };
-
-    let managed = managed_derived_edges_dir(edges_dir);
-    plan.managed_replacement_exists = managed
-        .join("project")
-        .join(format!("{project_id}.jsonl"))
-        .exists()
-        || managed
-            .join("git")
-            .join(format!("{project_id}.jsonl"))
-            .exists();
-
-    let file = match fs::File::open(&legacy_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plan),
-        Err(e) => return Err(e.into()),
-    };
-
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines() {
-        let line = line?;
-        plan.total_lines += 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            plan.blank_lines += 1;
-            continue;
-        }
-        match serde_json::from_str::<Edge>(trimmed) {
-            Ok(edge) => match edge.provenance {
-                EdgeProvenance::Derived => plan.derived_lines += 1,
-                EdgeProvenance::Explicit => {
-                    if edge.kind == "RAN_BASH" {
-                        plan.tool_lines += 1;
-                    } else {
-                        plan.explicit_lines += 1;
-                    }
-                }
-                EdgeProvenance::Implicit => plan.explicit_lines += 1,
-            },
-            Err(_) => plan.malformed_lines += 1,
-        }
-    }
-
-    plan.extractable = plan.managed_replacement_exists && plan.total_lines > plan.blank_lines;
-    Ok(plan)
 }
 
 #[cfg(test)]

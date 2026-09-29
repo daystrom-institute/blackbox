@@ -46,8 +46,8 @@ Not for user-stated rules. Those go to durable memory.
 ### `done`
 
 Emit one when you are the dispatched executor for a bro/task/workflow/atom. This
-includes work launched through `bro_*` MCP tools, `bro_agent_dispatch`,
-workflow actors, atom invocations, and team broadcasts. The done note is the
+includes work launched through `bro_*` MCP tools, workflow actors, atom
+invocations, and team fan-outs. The done note is the
 orchestrator's fastest acceptance signal for delegated work.
 
 Do not emit `done` merely because you performed a direct operator-side MCP

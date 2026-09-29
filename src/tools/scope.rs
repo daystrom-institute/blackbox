@@ -30,32 +30,18 @@ pub(crate) struct ProjectWriteResolution {
 }
 
 impl BlackboxServer {
-    /// Resolve a raw `project` path/id to `(durable_scope, write_dir)`.
+    /// Resolve a raw `project` path/id for a write: the durable scope, the
+    /// resolving project id, and the checkout scope when the write lands in a
+    /// checkout.
     ///
     /// - Recognized worktrees (managed fleet worktrees AND in-tree linked
     ///   worktrees like `.claude/worktrees/<name>`) key to the registered
-    ///   base; `write_dir = Some(worktree)` redirects repo-owned committed
-    ///   files into the worktree checkout.
+    ///   base; the checkout scope redirects repo-owned committed files into
+    ///   the worktree checkout.
     /// - Other registered projects resolve through the registry to their
-    ///   canonical path (`write_dir = None`).
+    ///   canonical path.
     /// - Unregistered selectors pass through untouched without filesystem
     ///   probing outside checkout authority.
-    pub(crate) fn resolve_project_write_scope(
-        &self,
-        raw: &str,
-    ) -> anyhow::Result<(String, Option<String>)> {
-        self.resolve_project_write(raw).map(|resolution| {
-            let write_dir = resolution
-                .checkout_scope
-                .as_ref()
-                .map(|checkout| checkout.checkout_project_dir.clone());
-            (resolution.durable_scope, write_dir)
-        })
-    }
-
-    /// Rich write resolution used by the dark provisional overlay. Existing
-    /// store callers can keep the tuple wrapper above until their own overlay
-    /// migration lands.
     ///
     /// Reimplemented on the shared resolver engine (phase-2 §9.2,
     /// Selection/Write): the engine supplies identity and the durable store
@@ -343,7 +329,7 @@ impl BlackboxServer {
         Some((ctx.store_key, checkout_dir))
     }
 
-    /// Filter-side companion to [`Self::resolve_project_write_scope`]: map a
+    /// Filter-side companion to [`Self::resolve_project_write`]: map a
     /// project FILTER value to its registered base only when it is a
     /// recognized checkout alias (`None` otherwise — caller keeps the raw
     /// value). Substring filters and other non-path values pass through
@@ -478,12 +464,18 @@ mod tests {
         }
 
         // In-tree linked worktree: base durable scope, worktree write dir.
-        let (scope, write_dir) = fx
+        let resolution = fx
             .server
-            .resolve_project_write_scope(fx.worktree.to_str().unwrap())
+            .resolve_project_write(fx.worktree.to_str().unwrap())
             .unwrap();
-        assert_eq!(scope, base_str);
-        assert_eq!(write_dir.as_deref(), fx.worktree.to_str());
+        assert_eq!(resolution.durable_scope, base_str);
+        assert_eq!(
+            resolution
+                .checkout_scope
+                .as_ref()
+                .map(|checkout| checkout.checkout_project_dir.as_str()),
+            fx.worktree.to_str()
+        );
 
         // Plain subdirectory: the deliberate legacy quirk resolves it to
         // the base with NO worktree aliasing (the broker's Write→Read

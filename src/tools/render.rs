@@ -418,9 +418,7 @@ mod tests {
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_record::ResolvedCheckoutScope;
     use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
-    use bbox_knowledge::overlay::{
-        OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue, provisional_entity_ref,
-    };
+    use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -520,13 +518,8 @@ mod tests {
 
     struct VisibilityFixture {
         server: BlackboxServer,
-        state: Arc<crate::server::SharedState>,
-        project: PathBuf,
         scope: PublishedScope,
         own_checkout: ResolvedCheckoutScope,
-        own_ref: String,
-        peer_ref: String,
-        source_file: PathBuf,
     }
 
     fn visibility_fixture(temp: &tempfile::TempDir) -> VisibilityFixture {
@@ -607,18 +600,13 @@ mod tests {
             checkout_project_dir: project.to_string_lossy().into_owned(),
             branch_ref: Some("refs/heads/main".into()),
         };
-        let server = BlackboxServer::new(state.clone());
+        let server = BlackboxServer::new(state);
         server
             .session_checkout
             .set(Some(Arc::new(own_checkout.clone())))
             .unwrap();
         VisibilityFixture {
             server,
-            state,
-            project,
-            own_ref: provisional_entity_ref(&scope, own_id, "visible"),
-            peer_ref: provisional_entity_ref(&scope, peer_id, "visible"),
-            source_file,
             scope,
             own_checkout,
         }

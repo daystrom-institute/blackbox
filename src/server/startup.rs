@@ -4,7 +4,7 @@ use crate::util;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
+pub(super) fn init_logging(home: &Path) {
     let log_dir = util::blackbox_log_dir(home);
     std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
     let file_appender = tracing_appender::rolling::Builder::new()
@@ -39,9 +39,6 @@ pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
     // Install ring once at startup; first consumer is the dispatch-path MCP
     // client, which otherwise kills the dispatched task's driver mid-flight.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    for msg in migrated {
-        tracing::info!("migrated legacy blackbox path: {msg}");
-    }
 }
 
 fn expand_home_path(home: &Path, path: &str) -> PathBuf {

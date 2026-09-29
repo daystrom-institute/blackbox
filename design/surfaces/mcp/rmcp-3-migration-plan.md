@@ -265,7 +265,7 @@ slice independently of Phase 2, not task notifications.
   `list_resources` / `read_resource` consult the same per-request surface
   resolution.
 - Protocol cursor pagination + `ttl_ms`/`cache_scope` on list/read.
-- Catalogs: brofiles, teams, artifacts, atoms, packets, live tasks;
+- Catalogs: brofiles, teams, artifacts, atoms, live tasks;
   threads optional.
 
 ## Phase 5: MRTR approval gates (opportunistic)

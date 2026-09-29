@@ -328,6 +328,7 @@ mod tests {
         "bbox_project_detach",
         "bbox_project_default_attachment",
         "bbox_project_promote",
+        "bbox_project_scope_migrate",
         "bbox_project_publisher_bind",
         "bbox_project_publisher_advance",
         "bbox_project_publisher_status",

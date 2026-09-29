@@ -2722,7 +2722,6 @@ mod tests {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store
@@ -2814,7 +2813,6 @@ mod tests {
             store_dir.clone(),
             state.task_store.clone(),
             state.tail_tx.clone(),
-            None,
             None,
             None,
             bro_core::Origin::AgentDispatch,
@@ -2973,7 +2971,6 @@ mod tests {
             root.clone(),
             store.clone(),
             tail_tx.clone(),
-            None,
             None,
             None,
             bro_core::Origin::AgentDispatch,

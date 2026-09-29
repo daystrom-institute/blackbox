@@ -15,8 +15,9 @@ Use the persistence layer that matches the durability, audience, and speaker of 
   - Recall entries (`category="memory", render=false`): useful facts worth finding later, but not worth loading every turn. Indexed only, never rendered.
   - Commitments: a design or workflow commitment is a `convention` entry whose content states the rule and the reason for it.
 - `bbox_forget` retires an entry by deleting it. To replace an entry, `bbox_forget` the old one, then `bbox_learn` the new one. For project entries, git history of `.bbox/knowledge/<id>.json` carries prior versions and the reason for the change.
-- `bbox_pin`: persisted but scope-limited ambient context for one active session, bro, thread, or work item. Never rendered into managed memory.
 - `bbox_note`: workstream side-channel during execution. This is not durable policy memory; it is execution telemetry for the current loop.
+
+Guidance that should stay hot for the current arc is not a persistence lane: it belongs in the dispatch brief or the work-item thread (`bbox_thread`).
 
 ## Speaker matters
 
@@ -44,10 +45,10 @@ Durable entries are approved with the operator before the write; there is no rev
 - You want searchability, not prompt residency.
 - You are unsure whether it deserves rendered treatment.
 
-### Use `bbox_pin` when
+### Keep it in the dispatch brief or thread when
 
 - The context must stay hot across turns for one active execution lane.
-- The right audience is a matching session, bro, thread, or work item.
+- The right audience is the executor of this arc, not every future session.
 - Rendering it into repo agent files would be pollution.
 - Examples include migration-phase guidance, active-arc sequencing, and temporary executor charters.
 
@@ -69,6 +70,6 @@ Durable entries are approved with the operator before the write; there is no rev
 
 If unsure between a rendered entry and a recall entry, choose `render=false`.
 
-If unsure between `pin` and `learn`, ask: should an unrelated future agent inherit this by default? If no, `pin`.
+If unsure whether guidance is standing policy or active-arc context, ask: should an unrelated future agent inherit this by default? If no, it goes in the dispatch brief or the work-item thread, not `learn`.
 
 If unsure between a recall entry and `note`, ask: should a future session know this before it starts? If yes, a `render=false` entry. If no, `note`.

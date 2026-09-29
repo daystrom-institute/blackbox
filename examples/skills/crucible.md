@@ -1,6 +1,6 @@
 ---
 description: Orchestrator-led implementation workflow — durable pair-programmer implementer, continuous red-team ensemble, coordinated through bbox work-item threads with structured notes as the signal channel
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_broadcast, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_note_resolve, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_note_resolve, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <task description>
 ---
 
@@ -28,13 +28,13 @@ Substantial implementation work, coordinated by the main-session orchestrator th
 ## PROTOCOL INVARIANTS
 
 - **Implementer is durable.** One `bro_exec` at start, then only `bro_resume`. A fresh `bro_exec` on a follow-up destroys the compartmentalized context that is crucible's whole point.
-- **Ensemble continuity is automatic via `bro_broadcast` against a team name.** Each member retains their own session across rounds; broadcast N+1 auto-resumes each reviewer's session. Use individual `bro_resume` only for bilateral recovery (one reviewer died, one needs a correction).
+- **Ensemble continuity comes from team member sessions.** Round 1 dispatches each member with `bro_exec(bro="<team>::<member>")`; every later round is `bro_resume(bro="<team>::<member>")` per member, so each reviewer keeps its own session across rounds. Resume a single member only for bilateral recovery (one reviewer died, one needs a correction).
 - **Reviewers are blind to each other within a round.** Orchestrator is the synthesizer — quote each side back to the others in next-round prompts. Cross-pollination is deliberate when orchestrator chooses it, not a default.
 - **`thread_id` threads every dispatch.** Implementer and reviewers both copy it into `bbox_note(thread_id=...)` so the orchestrator reads the full signal trail with one `bbox_notes(thread_id=...)` call instead of parsing prose.
 - **`task_id` from the `[scope]` block is the per-dispatch correlation key.** Implementer and reviewers copy it verbatim into every `bbox_note(task_id=...)`.
 - **Mechanical recursion guard stays on.** Implementer and reviewers cannot call `bro_*` — do NOT set `allow_recursion=true`. They are executors.
 - **Named-bro routing is unsafe across sibling sessions.** If a brofile has multiple recent task histories, `bro_resume(bro="...")` can pick the wrong session. Record the `taskId`/`sessionId` returned by your most recent `bro_exec` or `bro_resume` and pass it explicitly when resuming if there's any chance of ambiguity.
-- **Turn discipline.** Ensemble rounds stop when a voice re-raises a prior concern: either produce concrete evidence to refute or concede. Never retreat on pressure alone, never rubber-stamp. Cap at 8 broadcast rounds per work-item before halting and escalating to the user.
+- **Turn discipline.** Ensemble rounds stop when a voice re-raises a prior concern: either produce concrete evidence to refute or concede. Never retreat on pressure alone, never rubber-stamp. Cap at 8 ensemble rounds per work-item before halting and escalating to the user.
 
 ---
 
@@ -102,18 +102,19 @@ bro_team(action="list")
 
 …or build ad-hoc. Minimum viable is two cross-provider voices; three is better if Gemini's available and the topic has architectural weight.
 
-### 2c. Brief the ensemble (first broadcast — carries problem space)
+### 2c. Brief the ensemble (first round: carries problem space)
+
+One dispatch per member:
 
 ```
-bro_broadcast(
-  team="<topic>-review",
+bro_exec(
+  bro="<topic>-review::<member>",
   prompt=<FIRST-ROUND PROMPT>,
-  cwd=<cwd>,
-  allow_recursion=false
+  cwd=<cwd>
 )
 ```
 
-Reviewers retain this context across all subsequent broadcasts. First-round prompt shape:
+Then `bro_when_all(team="<topic>-review")`. Reviewers retain this context across all subsequent rounds. First-round prompt shape:
 
 ```
 Task: <task_description>
@@ -168,7 +169,7 @@ Classify findings: agreed / majority / minority / contradictory. Revise plan inc
 
 ### 2f. Convergence rounds (as needed)
 
-For each follow-up round, broadcast a **delta-shaped** prompt — quote each reviewer's prior position and pose the specific remaining disagreement. The team-named broadcast auto-resumes each reviewer's session:
+For each follow-up round, send a **delta-shaped** prompt to every member with `bro_resume(bro="<topic>-review::<member>", prompt=...)`: quote each reviewer's prior position and pose the specific remaining disagreement. Each resume continues that reviewer's session:
 
 ```
 ROUND 2 — plan revision.
@@ -363,14 +364,14 @@ git diff <rollback_ref>...HEAD -- <relevant paths>
 
 ## PHASE 5 — POST-WORK ENSEMBLE AUDIT
 
-### 5a. Broadcast audit prompt (delta-shaped — reviewers already know the plan)
+### 5a. Send the audit prompt (delta-shaped: reviewers already know the plan)
+
+One resume per member, then `bro_when_all(team="<topic>-review")`:
 
 ```
-bro_broadcast(
-  team="<topic>-review",
-  prompt=<AUDIT PROMPT>,
-  cwd=<cwd>,
-  allow_recursion=false
+bro_resume(
+  bro="<topic>-review::<member>",
+  prompt=<AUDIT PROMPT>
 )
 ```
 
@@ -473,8 +474,8 @@ bro_wait(task_id=<new_task_id>, timeout_seconds=3600)
 
 Then choose:
 
-- **Small fixup, low risk:** orchestrator verifies directly (read diff, targeted checks). Skip ensemble re-broadcast. Move to Phase 7.
-- **Substantial fixup or correctness-critical:** re-broadcast Phase 5 audit prompt variant (reviewers still have full context).
+- **Small fixup, low risk:** orchestrator verifies directly (read diff, targeted checks). Skip the ensemble re-audit. Move to Phase 7.
+- **Substantial fixup or correctness-critical:** resume every member with a Phase 5 audit prompt variant (reviewers still have full context).
 
 ### 6c. Exit
 
@@ -579,7 +580,7 @@ Response: for that member alone, `bro_resume(bro="<alias>", prompt="Your prior t
 - **Turn caps hit** (4 pre-work rounds, 3 fixup rounds): halt, escalate to user. Don't push through.
 - **Mechanical recursion guard triggers** on a reviewer/implementer: expected, don't disable. They're not orchestrators.
 - **Work packet too large** (past ~30KB): split across multiple implementer rounds. The implementer holds task context in the session; packets carry deltas.
-- **Implementer disputes the core premise repeatedly**: stop. Re-open the plan. Re-broadcast to ensemble. The implementer is on the ground, trust ground-truth over plan-on-paper.
+- **Implementer disputes the core premise repeatedly**: stop. Re-open the plan. Resume the ensemble with the revised plan. The implementer is on the ground, trust ground-truth over plan-on-paper.
 
 ---
 

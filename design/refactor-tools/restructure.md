@@ -300,7 +300,7 @@ src/
                                 # bbox_packet_gap
     bbox_inbox.rs               # bbox_inbox
     bbox_pins.rs                # bbox_pin
-    bbox_bootstrap.rs           # bbox_reindex
+    bbox_index.rs               # bbox_reindex
     bro_exec.rs                 # bro_exec, bro_resume, bro_status, bro_wait,
                                 # bro_cancel, bro_when_all, bro_when_any
     badgey.rs                   # Badgey public tool facade. Child modules:
@@ -476,7 +476,7 @@ fn new(state: SharedState) -> Self {
             + Self::bbox_graph_tools()
             + Self::bbox_inbox_tools()
             + Self::bbox_pins_tools()
-            + Self::bbox_bootstrap_tools()
+            + Self::bbox_index_tools()
             + Self::bbox_artifacts_tools()
             + Self::bro_exec_tools()
             + Self::badgey_tools()

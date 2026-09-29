@@ -29,20 +29,17 @@ import re, sys, pathlib
 ALLOWLIST = {
     # Baseline: sync handlers present when Phase 4 landed (wave 16). These
     # are in-memory reads / control ops verified non-blocking at baseline
-    # time (wave-13 inventory + wave-16 sweep; the two disk-writing sync
-    # handlers, bbox_packet_gap and bro_slack_bind, were converted instead
-    # of baselined). Do NOT add names here without a reasoned review —
+    # time (wave-13 inventory + wave-16 sweep; the disk-writing sync
+    # handler bro_slack_bind was converted instead of baselined). Do NOT add names here without a reasoned review —
     # convert the handler to async + run_blocking instead.
     "atom_delegate", "atom_describe", "atom_get", "atom_list", "atom_search",
     "atom_status", "bbox_artifact_list", "bbox_describe_schema",
     "bbox_embed_status", "bbox_gaps", "bbox_notes",
     "bbox_project_list", "bbox_thread_list",
-    "bro_agent_describe", "bro_agent_get", "bro_agent_list",
-    "bro_agent_search", "bro_allocator_probe", "bro_allocator_status",
+    "bro_allocator_probe", "bro_allocator_status",
     "bro_allocator_trace", "bro_brofile", "bro_cancel", "bro_council_list",
     "bro_council_open", "bro_council_posts", "bro_dashboard",
-    "bro_interrupt", "bro_mcp", "bro_providers", "bro_prune",
-    "bro_retro",
+    "bro_mcp", "bro_providers", "bro_prune",
     "bro_status", "bro_steer", "tool_identity_get",
     "tool_identity_list",
 }

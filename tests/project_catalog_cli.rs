@@ -3,14 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use bbox_code_source::source_selector;
-use bbox_code_source_store::{ActivationRecord, CodeSourceStore};
-use bbox_config::config::{self, LoadOptions};
+use bbox_code_source_store::ActivationRecord;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::ProjectId;
-use bbox_corpus_index::index::TranscriptIndex;
-use bbox_edge_sidecar::manifest::ManifestIndex;
-use bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits;
-use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_vectors::VectorStore;
 use serde_json::Value;
@@ -42,71 +37,6 @@ fn write_collected_activation(state: &Path, project_id: &str, generation_id: &st
         &state.join(format!("code-sources/activations/{project_id}.json")),
         &serde_json::to_vec(&activation).unwrap(),
     );
-}
-
-fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
-    let state = root.join("state");
-    let index_path = state.join("index");
-    let index = TranscriptIndex::open_or_create_with_records(
-        &index_path,
-        Vec::new(),
-        None,
-        state.join("projects.json"),
-        state.join("blackbox-knowledge.json"),
-        state.join("blackbox-threads.json"),
-        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
-    )
-    .unwrap();
-    drop(index);
-    write(
-        &index_path.join("_meta.json"),
-        br#"{"version":2,"rows":{}}"#,
-    );
-
-    VectorStore::open(state.join("vectors")).unwrap();
-    ManifestIndex::new()
-        .write_atomic(&state.join("edges"))
-        .unwrap();
-    fs::create_dir_all(state.join("git_meta")).unwrap();
-
-    for (name, body) in [
-        ("blackbox-knowledge.json", r#"{"version":1,"entries":[]}"#),
-        ("blackbox-gaps.json", r#"{"version":1,"gaps":[]}"#),
-        ("blackbox-threads.json", r#"{"version":1,"threads":[]}"#),
-        ("blackbox-notes.json", r#"{"version":1,"notes":[]}"#),
-        ("blackbox-pins.json", r#"{"version":1,"pins":[]}"#),
-    ] {
-        write(&state.join(name), body.as_bytes());
-    }
-
-    for directory in [
-        state.join("packets"),
-        state.join("artifacts"),
-        state.join("bro/badgey/proposals"),
-        state.join("bro/whiteboards"),
-    ] {
-        fs::create_dir_all(directory).unwrap();
-    }
-    write(&state.join("bro/tasks.json"), b"[]");
-    write(
-        &state.join("bro/slack-channel-bindings.json"),
-        br#"{"bindings":{}}"#,
-    );
-    write(
-        &state.join("bro/slack-proposal-links.json"),
-        br#"{"order":[],"links":{},"by_proposal":{}}"#,
-    );
-
-    let config = config::load_with(LoadOptions {
-        config_path: Some(config_path.to_path_buf()),
-        ..Default::default()
-    })
-    .unwrap();
-    CodeSourceStore::open(
-        state.join("code-sources"),
-        project_catalog_migration_store_limits(&config),
-    )
-    .unwrap();
 }
 
 fn run(args: &[&str]) -> Output {
@@ -413,7 +343,7 @@ fn help_and_version_do_not_load_config_or_create_state() {
     for args in [
         vec![
             "project-catalog",
-            "migrate",
+            "genesis",
             "--help",
             "--config",
             invalid_config.to_str().unwrap(),
@@ -434,43 +364,39 @@ fn help_and_version_do_not_load_config_or_create_state() {
 fn parser_failures_use_clap_output_instead_of_json() {
     let output = run(&[
         "project-catalog",
-        "migrate",
-        "--preflight",
-        "--report",
-        "/tmp/report.json",
+        "get",
+        "--projects-path",
+        "/tmp/projects.json",
     ]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--resolution"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--project"));
 }
 
 #[test]
 fn domain_errors_use_one_redacted_json_envelope() {
     let directory = tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let config_path = root.join("config.toml");
+    let (state, projects_path, config_path) = fresh_unwritten_bundle(&root);
     write(
-        &config_path,
-        format!(
-            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
-            root.join("protected"),
-            root.join("protected").join("vectors")
-        )
-        .as_bytes(),
+        &projects_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "project_id": "p_legacy_one00000",
+                "canonical_path": root.join("absent-checkout"),
+                "registered_at": "2026-08-08T00:00:00Z",
+                "is_git_repo": false,
+            }],
+        }))
+        .unwrap(),
     );
 
-    let output = run(&[
-        "project-catalog",
-        "verify",
-        "--root",
-        root.join("missing-rehearsal").to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]);
+    let output = genesis_command(&state, &config_path);
     assert!(!output.status.success());
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["version"], 1);
-    assert_eq!(envelope["command"], "project_catalog_verify");
+    assert_eq!(envelope["command"], "project_catalog_genesis");
     assert!(envelope.get("result").is_none());
     let envelope = envelope.as_object().unwrap();
     assert_eq!(envelope.len(), 3);
@@ -482,133 +408,6 @@ fn domain_errors_use_one_redacted_json_envelope() {
     assert!(error.contains_key("code"));
     assert!(error.contains_key("message"));
     assert_redacted(&Value::Object(envelope.clone()), &root);
-}
-
-#[test]
-fn cli_runs_clean_preflight_apply_and_fresh_verify() {
-    let directory = tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let rehearsal_root = root.join("rehearsal");
-    let protected_root = root.join("protected");
-    let config_path = root.join("config.toml");
-    write(
-        &config_path,
-        format!(
-            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
-            protected_root,
-            protected_root.join("vectors")
-        )
-        .as_bytes(),
-    );
-    fs::create_dir_all(&protected_root).unwrap();
-    initialize_empty_owner_state(&rehearsal_root, &config_path);
-
-    let report = rehearsal_root.join("review/report.json");
-    let resolution = rehearsal_root.join("review/resolution.json");
-    let local_paths = rehearsal_root.join("review/local-paths.json");
-    let preflight = success_json(&run(&[
-        "project-catalog",
-        "migrate",
-        "--preflight",
-        "--report",
-        report.to_str().unwrap(),
-        "--resolution",
-        resolution.to_str().unwrap(),
-        "--include-local-paths",
-        local_paths.to_str().unwrap(),
-        "--state-dir",
-        rehearsal_root.join("state").to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]));
-    assert_eq!(preflight["command"], "project_catalog_migrate_preflight");
-    assert_eq!(preflight["result"]["status"], "clean");
-    assert!(report.is_file());
-    assert!(resolution.is_file());
-    assert!(local_paths.is_file());
-    assert_redacted(&preflight, &root);
-
-    let held =
-        ProjectCatalogMigrationLock::acquire_shared(&rehearsal_root.join("state/projects.json"))
-            .unwrap();
-    let refused = run(&[
-        "project-catalog",
-        "migrate",
-        "--apply",
-        "--report",
-        report.to_str().unwrap(),
-        "--resolution",
-        resolution.to_str().unwrap(),
-        "--rehearsal-root",
-        rehearsal_root.to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]);
-    assert!(!refused.status.success());
-    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(
-        refused["error"]["code"],
-        "error.project_catalog_lifetime_lock_busy"
-    );
-    assert_redacted(&refused, &root);
-    drop(held);
-
-    let source_path = rehearsal_root.join("state/blackbox-knowledge.json");
-    let source_before = fs::read(&source_path).unwrap();
-    let mut drifted_source = source_before.clone();
-    drifted_source.push(b'\n');
-    fs::write(&source_path, &drifted_source).unwrap();
-    let drifted = run(&[
-        "project-catalog",
-        "migrate",
-        "--apply",
-        "--report",
-        report.to_str().unwrap(),
-        "--resolution",
-        resolution.to_str().unwrap(),
-        "--rehearsal-root",
-        rehearsal_root.to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]);
-    assert!(!drifted.status.success());
-    let drifted: Value = serde_json::from_slice(&drifted.stdout).unwrap();
-    assert_ne!(drifted["error"]["code"], Value::Null);
-    assert_redacted(&drifted, &root);
-    fs::write(&source_path, source_before).unwrap();
-    let apply = success_json(&run(&[
-        "project-catalog",
-        "migrate",
-        "--apply",
-        "--report",
-        report.to_str().unwrap(),
-        "--resolution",
-        resolution.to_str().unwrap(),
-        "--rehearsal-root",
-        rehearsal_root.to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]));
-    assert_eq!(apply["command"], "project_catalog_migrate_apply");
-    assert_eq!(apply["result"]["outcome"], "applied");
-    assert_redacted(&apply, &root);
-
-    let verify = success_json(&run(&[
-        "project-catalog",
-        "verify",
-        "--root",
-        rehearsal_root.to_str().unwrap(),
-        "--config",
-        config_path.to_str().unwrap(),
-    ]));
-    assert_eq!(verify["command"], "project_catalog_verify");
-    assert_eq!(
-        verify["result"]["transaction_id"],
-        apply["result"]["verification"]["transaction_id"]
-    );
-    assert_eq!(verify["result"]["attached_project_count"], 0);
-    assert_eq!(verify["result"]["omitted_catalog_count"], 0);
-    assert_redacted(&verify, &root);
 }
 
 #[test]
@@ -1810,245 +1609,6 @@ fn retire_refuses_on_a_slack_channel_binding() {
     assert!(bindings["bindings"].as_object().unwrap().is_empty());
 }
 
-/// Plan sections 3.2 and 4.2, as amended during the operational-cut repair
-/// arc: configured apply takes the lifetime claim as a PROBE before any
-/// target read or mutation, then RELEASES it so the migration transaction
-/// can perform its own exclusive acquisition (the flock self-conflict
-/// class: a second same-process descriptor can never take the lock
-/// exclusively while any claim is held). It cannot use `open_admin_store`,
-/// whose strict open would refuse the still-version-1 configured store that
-/// exists at exactly this moment.
-///
-/// This test pins the probe's ORDERING with missing artifacts. The full
-/// production binding, real artifacts driven through this same CLI to
-/// `Applied` under a free lock and refused under an external shared
-/// holder, is `migrate_apply_configured_reaches_applied_through_the_released_probe`
-/// below; the transaction-level self-conflict half lives at the facade
-/// layer in
-/// `configured_apply_installs_the_reviewed_post_image_on_the_configured_layout`
-/// (bbox-indexing).
-#[test]
-fn migrate_apply_configured_takes_the_lifetime_claim_before_touching_the_target() {
-    let directory = tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let (_state, projects_path, config_path, _index) = isolated_state_root(&root);
-
-    // Artifacts that do not exist: if the claim were taken AFTER the target
-    // read, the refusal would name the missing artifacts instead of the lock.
-    let invocation = || {
-        run(&[
-            "project-catalog",
-            "migrate",
-            "--apply",
-            "--configured",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--report",
-            root.join("review/report.json").to_str().unwrap(),
-            "--resolution",
-            root.join("review/resolution.json").to_str().unwrap(),
-        ])
-    };
-
-    // Premise: with the lock FREE the claim succeeds, so whatever this
-    // invocation goes on to report is not the lock refusal.
-    let available: Value = serde_json::from_slice(&invocation().stdout).unwrap();
-    assert_ne!(
-        available["error"]["code"], "error.project_catalog_cli_lock",
-        "an unheld lifetime lock must not produce the claim refusal: {available}"
-    );
-
-    // A shared holder is exactly what a live daemon looks like.
-    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
-    let refused = invocation();
-    assert!(!refused.status.success());
-    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
-    drop(held);
-}
-
-/// The production binding of the probe-release contract: the REAL CLI, real
-/// reviewed artifacts, real target. The facade pin proves the transaction
-/// half; this proves `execute_migrate`'s own claim handling, which is where
-/// the certified defect lived (the CLI held its shared claim across the
-/// facade call and every configured apply self-refused with
-/// `lifetime_lock_busy`).
-///
-/// Order matters: the external-holder refusal runs FIRST, while the target
-/// is still v1 and the artifacts valid, proving the probe runs before any
-/// target access. Then the same artifacts reach `Applied` under a free
-/// lock, which is exactly the assertion that fails if the held-claim
-/// behavior is ever restored.
-#[test]
-fn migrate_apply_configured_reaches_applied_through_the_released_probe() {
-    let directory = tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let config_path = root.join("config.toml");
-    write(
-        &config_path,
-        format!(
-            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
-            root.join("state"),
-            root.join("state").join("vectors")
-        )
-        .as_bytes(),
-    );
-    initialize_empty_owner_state(&root, &config_path);
-    let projects_path = root.join("state/projects.json");
-    // Configured mode resolves the corpus index from env/platform, not
-    // state_dir: pin it inside the fixture or the preflight walks the
-    // host's real index.
-    let index_path = root.join("state/index");
-    let report = root.join("review/report.json");
-    let resolution = root.join("review/resolution.json");
-
-    let preflight = success_json(&run_with_isolated_index(
-        &[
-            "project-catalog",
-            "migrate",
-            "--preflight",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--report",
-            report.to_str().unwrap(),
-            "--resolution",
-            resolution.to_str().unwrap(),
-        ],
-        &index_path,
-    ));
-    assert_eq!(preflight["result"]["status"], "clean");
-
-    let apply = |()| {
-        run_with_isolated_index(
-            &[
-                "project-catalog",
-                "migrate",
-                "--apply",
-                "--configured",
-                "--config",
-                config_path.to_str().unwrap(),
-                "--report",
-                report.to_str().unwrap(),
-                "--resolution",
-                resolution.to_str().unwrap(),
-            ],
-            &index_path,
-        )
-    };
-
-    // An external shared holder (what a live daemon looks like): the probe
-    // refuses before any target access, and the artifacts stay consumable.
-    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
-    let refused = apply(());
-    assert!(!refused.status.success());
-    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
-    drop(held);
-
-    // Free lock: the probe releases and the transaction's own exclusive
-    // acquisition succeeds. A CLI that held its claim across the facade
-    // call fails HERE with error.project_catalog_lifetime_lock_busy.
-    let applied = success_json(&apply(()));
-    assert_eq!(applied["result"]["outcome"], "applied");
-
-    // And the same shared core keeps re-apply idempotent through the CLI.
-    let reapplied = success_json(&apply(()));
-    assert_eq!(reapplied["result"]["outcome"], "already_applied");
-}
-
-/// A missing or mode-incompatible `migrate` target is a TYPED handler
-/// refusal, produced before configuration loading (plan section 3.1, Q-A).
-/// The named config path does not exist, so a refusal that reached the
-/// config loader would carry `error.project_catalog_cli_config` instead.
-#[test]
-fn migrate_target_rules_refuse_before_configuration_is_loaded() {
-    let directory = tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let absent_config = root.join("no-such-config.toml");
-
-    let missing_target = run(&[
-        "project-catalog",
-        "migrate",
-        "--apply",
-        "--config",
-        absent_config.to_str().unwrap(),
-        "--report",
-        root.join("review/report.json").to_str().unwrap(),
-        "--resolution",
-        root.join("review/resolution.json").to_str().unwrap(),
-    ]);
-    assert!(!missing_target.status.success());
-    let missing_target: Value = serde_json::from_slice(&missing_target.stdout).unwrap();
-    assert_eq!(
-        missing_target["error"]["code"],
-        "error.project_catalog_cli_arguments"
-    );
-
-    let incompatible_target = run(&[
-        "project-catalog",
-        "migrate",
-        "--preflight",
-        "--configured",
-        "--config",
-        absent_config.to_str().unwrap(),
-        "--report",
-        root.join("review/report.json").to_str().unwrap(),
-        "--resolution",
-        root.join("review/resolution.json").to_str().unwrap(),
-    ]);
-    assert!(!incompatible_target.status.success());
-    let incompatible_target: Value = serde_json::from_slice(&incompatible_target.stdout).unwrap();
-    assert_eq!(
-        incompatible_target["error"]["code"],
-        "error.project_catalog_cli_arguments"
-    );
-}
-
-/// Plan section 3.2: `verify --require-exclusive-availability` is the
-/// bridge-down proof, and it selects the CONFIGURED target. A live daemon
-/// holds the configured lifetime lock SHARED, so the exclusive probe finds
-/// no guard and the command refuses.
-///
-/// Both halves are asserted: the first pins that the refusal is caused by
-/// the held lock rather than by the rest of the invocation, and the second
-/// pins the refusal itself.
-#[test]
-fn verify_require_exclusive_availability_refuses_while_the_bridge_holds_the_lock() {
-    let directory = tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let (_state, projects_path, config_path, _index) = isolated_state_root(&root);
-
-    // `--require-exclusive-availability` SELECTS the configured target (plan
-    // section 3.2), so it carries no `--root`: the layout it probes and then
-    // verifies is the one this `--config` resolves.
-    let invocation = |config: &str| {
-        run(&[
-            "project-catalog",
-            "verify",
-            "--config",
-            config,
-            "--require-exclusive-availability",
-        ])
-    };
-
-    // Premise: with the lock FREE the availability probe passes, so whatever
-    // this invocation goes on to report is not the lock refusal.
-    let available = invocation(config_path.to_str().unwrap());
-    let available: Value = serde_json::from_slice(&available.stdout).unwrap();
-    assert_ne!(
-        available["error"]["code"], "error.project_catalog_cli_lock",
-        "an unheld lifetime lock must not produce the bridge-live refusal: {available}"
-    );
-
-    // The proof: a shared holder is exactly what a live bridge looks like.
-    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
-    let refused = invocation(config_path.to_str().unwrap());
-    assert!(!refused.status.success());
-    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
-    drop(held);
-}
-
 /// A state bundle with no catalog and no owner state at all: the greenfield
 /// deployment shape `project-catalog genesis` exists to serve. Returns the
 /// state directory, the projects path, and the isolated configuration file.
@@ -2170,7 +1730,6 @@ fn genesis_refuses_a_bundle_that_registers_a_legacy_project() {
     );
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("legacy-projects"), "{message}");
-    assert!(message.contains("migrate"), "{message}");
 }
 
 /// A bundle holding project-scoped coordination rows is migration input even

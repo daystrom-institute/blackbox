@@ -363,9 +363,21 @@ mod tests {
     #[test]
     fn load_and_keep_default_order() {
         let catalog = fixture_default_catalog();
-        // 29 .md files on disk minus the `system-memory-catalog.md` nav-map
-        // (explicitly ignored by the loader, see loader.rs IGNORED_FILES) = 28.
-        assert_eq!(catalog.memories.len(), 28);
+        // Every .md file on disk except the `system-memory-catalog.md`
+        // nav-map, which the loader ignores (loader.rs
+        // NON_MEMORY_MARKDOWN_FILES).
+        let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../system-defaults/memories");
+        let on_disk = fs::read_dir(&defaults)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".md") && name != "system-memory-catalog.md"
+            })
+            .count();
+        assert_eq!(catalog.memories.len(), on_disk);
         assert_eq!(catalog.memories[0].id, "sm-agentic-opening-sequence");
         assert_eq!(catalog.memories[1].id, "sm-atoms");
     }
@@ -586,16 +598,16 @@ mod tests {
     #[test]
     fn search_finds_by_tag_query() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("packet"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        let hits = catalog.search(Some("taxonomy"));
+        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
     }
 
     #[test]
     fn search_finds_by_id_query() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("sm-rule-packets"));
+        let hits = catalog.search(Some("sm-persistence-taxonomy"));
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "sm-rule-packets");
+        assert_eq!(hits[0].id, "sm-persistence-taxonomy");
     }
 
     #[test]
@@ -621,17 +633,15 @@ mod tests {
     #[test]
     fn search_finds_by_title_query() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("rule-packets"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        let hits = catalog.search(Some("etiquette"));
+        assert!(hits.iter().any(|m| m.id == "sm-create-etiquette"));
     }
 
     #[test]
     fn search_finds_by_body_content() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("generating function"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
-        let review_hits = catalog.search(Some("adversarial"));
-        assert!(review_hits.iter().any(|m| m.id == "sm-review-packets"));
+        let hits = catalog.search(Some("spelling"));
+        assert!(hits.iter().any(|m| m.id == "sm-create-etiquette"));
     }
 
     #[test]
@@ -665,24 +675,24 @@ mod tests {
     #[test]
     fn search_case_insensitive() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("PACKET"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        let hits = catalog.search(Some("TAXONOMY"));
+        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
     }
 
     #[test]
     fn search_defaults_adjacent_terms_to_or() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("adversarial rubric"));
-        assert!(hits.iter().any(|m| m.id == "sm-review-packets"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        let hits = catalog.search(Some("etiquette taxonomy"));
+        assert!(hits.iter().any(|m| m.id == "sm-create-etiquette"));
+        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
     }
 
     #[test]
     fn search_honors_and_and_exclusion() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("packets AND review -access-table"));
-        assert!(hits.iter().any(|m| m.id == "sm-review-packets"));
-        assert!(!hits.iter().any(|m| m.id == "sm-auth-packets"));
+        let hits = catalog.search(Some("refactor AND rust -java"));
+        assert!(hits.iter().any(|m| m.id == "sm-refactor-rust"));
+        assert!(!hits.iter().any(|m| m.id == "sm-refactor-java"));
     }
 
     #[test]
@@ -697,19 +707,19 @@ mod tests {
     #[test]
     fn get_accepts_canonical_and_bare() {
         let catalog = fixture_default_catalog();
-        assert!(catalog.get("sm-rule-packets").is_some());
-        assert!(catalog.get("rule-packets").is_some());
+        assert!(catalog.get("sm-gap-notes").is_some());
+        assert!(catalog.get("gap-notes").is_some());
         assert!(catalog.get("nonexistent").is_none());
     }
 
     #[test]
     fn format_for_listing_has_system_prefix() {
         let catalog = fixture_default_catalog();
-        let memory = catalog.get("sm-rule-packets").unwrap();
+        let memory = catalog.get("sm-gap-notes").unwrap();
         let out = format_for_listing(memory);
-        assert!(out.starts_with("[system] sm-rule-packets"));
-        assert!(out.contains("ref: system_memory:sm-rule-packets"));
-        assert!(out.contains("Rule-packets"));
+        assert!(out.starts_with("[system] sm-gap-notes"));
+        assert!(out.contains("ref: system_memory:sm-gap-notes"));
+        assert!(out.contains("Gap notes"));
     }
 
     #[test]
@@ -804,18 +814,6 @@ mod tests {
         for memory in &catalog.memories {
             assert!(memory.id.starts_with("sm-"));
         }
-    }
-
-    #[test]
-    fn rule_packets_memory_loaded_and_nonempty() {
-        let catalog = fixture_default_catalog();
-        let memory = catalog
-            .get("sm-rule-packets")
-            .expect("sm-rule-packets must exist");
-        assert!(memory.content.len() > 500);
-        assert!(memory.content.contains("bbox_compile"));
-        assert!(memory.content.contains("bbox_apply"));
-        assert!(memory.content.contains("bbox_audit"));
     }
 
     #[test]

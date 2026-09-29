@@ -27,7 +27,7 @@ brief: "Replace the single-actor pathologist in the pathology flows with a heter
 > **replaced** with the bridgecrew-aligned model described below: an independent
 > validator with exclusion teeth, conflict-triggered debate, and unresolved
 > disagreement that survives into the correction plan. This now spans all four
-> flows (arch + perf × java + rust). The "Workflow shape", "Gate packet", and
+> flows (arch + perf × java + rust). The "Workflow shape", "Workflow gate", and
 > "Acceptance criteria" sections describe the implemented design; the prior
 > broken text has been removed.
 
@@ -339,9 +339,9 @@ teeth.
 
 ## Gate rules (v2)
 
-Lattice `["ready_debate","ready_skip","ready","invalid"]`; first-match evaluation;
-reads `vars.board_check.*` (the `whiteboard_summarize` output). Four rules plus the
-catch-all:
+Shared by all four flows. Lattice `["ready_debate","ready_skip","ready","invalid"]`;
+first-match evaluation; reads `vars.board_check.*` (the `whiteboard_summarize`
+output). Four rules plus the catch-all:
 
 - `blind_all_lenses_posted` → `ready` when phase=blind, post_count≥5, and all five
   lens aliases `has_posted` (participation).

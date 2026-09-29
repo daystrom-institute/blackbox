@@ -19,7 +19,7 @@ programming surface:
 
 - an LLM or human authors a static JSON workflow once;
 - the workflow engine executes it deterministically;
-- packets make mechanical decisions over structured state;
+- gates make mechanical decisions over structured state;
 - hooks mutate that state through typed, auditable primitives;
 - no runtime LLM judgment or shell escape is required for the mechanical
   part of the computation.
@@ -31,7 +31,7 @@ Turing completeness is useful here only as a stress test. It asks:
 > deterministic language?
 
 The current system is close. Workflow control flow already supplies
-branching, looping, and bounded composition. Packet predicates already
+branching, looping, and bounded composition. Gate predicates already
 supply pure decision logic over an `ArcContext` entity. Hook ops already
 mutate `vars`. The gap is dynamic indexed access: workflows cannot yet
 read or write "the cell at the current position" without falling back to
@@ -39,27 +39,25 @@ shell or bespoke code.
 
 ## 2. Current expressive layers
 
-### 2.1 Packet predicates
+### 2.1 Gate predicates
 
-The predicate AST (`src/packets.rs`) is intentionally pure. A predicate
-evaluates against one JSON entity and returns a Boolean. It has no
-mutation, no I/O, and no unbounded recursion. `Apply` composition is
-depth-bounded by `MAX_COMPOSITION_DEPTH`; quantified predicates iterate
-over finite arrays.
+The gate predicate AST is intentionally pure. A predicate evaluates
+against one JSON entity and returns a Boolean. It has no mutation, no
+I/O, and no unbounded recursion. Composition is depth-bounded;
+quantified predicates iterate over finite arrays.
 
-That is the right shape. Packets should remain decidable decision
+That is the right shape. Gate predicates should remain decidable decision
 procedures. Their job in the workflow language is not to compute by
 side effect; it is to classify the current machine state.
 
-What packets currently do well:
+What gate predicates currently do well:
 
 - compare scalar fields;
 - compose Boolean predicates;
 - inspect dotted fields in the flattened `ArcContext`;
-- quantify over finite arrays;
-- compose packet decisions through bounded `Apply`.
+- quantify over finite arrays.
 
-What packets cannot yet express cleanly:
+What gate predicates cannot yet express cleanly:
 
 - read a string character at a dynamic index;
 - read an array element at a dynamic index;
@@ -78,7 +76,7 @@ language:
 |---|---|
 | Sequence | node `next` |
 | Loop | `goto` back-edge |
-| Branch | packet gate plus `branch.cases` |
+| Branch | node `gate` plus `branch.cases` |
 | Stack-ish composition | inline and referenced subworkflows |
 | State | `ArcContext.vars` |
 | Typed writes | `vars_schema` checked on writes to declared vars |
@@ -159,11 +157,11 @@ Read one symbol from a string at a dynamic index.
 
 Required semantics:
 
-- `field` resolves using the existing packet dotted-path lookup.
+- `field` resolves using the existing predicate dotted-path lookup.
 - `index` accepts either an integer literal or a template expression
   resolved against the predicate entity.
 - Predicate-side template resolution for `index` is new evaluator
-  capability. Existing packet field lookup is static; this primitive
+  capability. Existing predicate field lookup is static; this primitive
   should add a narrow helper for literal-or-`${...}` scalar resolution
   rather than importing the workflow hook templater wholesale.
 - Indexing is by Unicode scalar value unless the primitive is explicitly
@@ -234,7 +232,7 @@ Read one object value by a dynamic key and compare it.
 ```
 
 This is useful for transition maps, lookup tables, and workflow-local
-indexes. It also avoids forcing authors to generate giant branch packets
+indexes. It also avoids forcing authors to generate giant branch gates
 when a table lookup is the clearer representation.
 
 ### 4.4 Alternative: `PathAt`
@@ -348,11 +346,11 @@ dynamic addressing.
 
 The engine already has two related resolution systems:
 
-- packet field lookup over a JSON entity;
+- predicate field lookup over a JSON entity;
 - workflow hook/template resolution over `ArcContext`.
 
 Those systems are not currently the same thing. Hook args already use
-workflow template rendering, but packet predicates currently use static
+workflow template rendering, but gate predicates currently use static
 dotted-path lookup through the predicate entity. Predicate-side
 `"${vars.position}"` support should therefore be treated as a new,
 narrow evaluator helper for `index` and `key` fields.
@@ -388,7 +386,7 @@ reason about.
 Minimum test:
 
 - `vars.state`
-- one gate packet per state or one combined gate packet
+- one gate per state or one combined gate
 - branch cases for each classification
 - transition nodes that mutate `vars.state`
 
@@ -450,7 +448,7 @@ computability argument.
 
 ### Phase 1: indexed reads
 
-Add packet predicates:
+Add gate predicates:
 
 1. `StringCharAt`
 2. `ArrayAt`
@@ -510,7 +508,7 @@ Add only after the primitive semantics settle:
 
 The workflow language is "mechanically complete enough" when:
 
-- packet gates can branch on dynamically addressed state;
+- gates can branch on dynamically addressed state;
 - hook ops can mutate dynamically addressed state;
 - authors can build deterministic state machines without shell hooks;
 - authors can build small interpreters or validators without runtime LLM

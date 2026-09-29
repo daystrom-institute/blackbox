@@ -906,8 +906,6 @@ fn thread_edge_kind_name(kind: &EdgeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
-    use std::io::Write;
 
     use super::*;
 
@@ -1401,38 +1399,47 @@ mod tests {
         assert!(index.forward_edges(&orphan_source).is_empty());
     }
 
+    /// A legacy `agents` lane whose rows name agent entities loads without
+    /// error: the lane is not admitted under a registered set, and when every
+    /// lane is admitted its agent-typed rows are skipped as unparseable.
     #[test]
-    fn sidecar_loader_keeps_global_agent_edges_with_project_filter() {
+    fn legacy_agent_lane_rows_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let source = EntityRef::Agent {
-            name: "distilled-reviewer".into(),
-            version: 1,
-        };
         let target = EntityRef::Session {
             provider: "claude".into(),
             session_id: "sess-1".into(),
         };
-        append_edges_dedup(
-            dir.path(),
-            "agents",
-            &[Edge {
-                source: source.clone(),
-                kind: "DERIVED_FROM".into(),
-                target,
-                provenance: EdgeProvenance::Explicit,
-                confidence: EdgeConfidence::Exact,
-                metadata: BTreeMap::new(),
-                project_id: None,
-            }],
-        )
-        .unwrap();
+        let kept = Edge {
+            source: target.clone(),
+            kind: "DESCRIBES".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        };
+        let mut legacy = serde_json::to_value(&kept).unwrap();
+        legacy["source"] = serde_json::json!({
+            "type": "agent",
+            "name": "distilled-reviewer",
+            "version": 1,
+        });
+        legacy["kind"] = serde_json::json!("DERIVED_FROM");
+        let lines = [legacy.to_string(), serde_json::to_string(&kept).unwrap()];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_jsonl(&dir.path().join("agents.jsonl"), &lines);
 
         let registered = HashSet::new();
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen, true);
+        assert_eq!(index.edge_count(), 0);
 
-        assert_eq!(index.forward_edges(&source).len(), 1);
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
+        assert_eq!(index.edge_count(), 1);
+        assert_eq!(index.forward_edges(&target).len(), 1);
     }
 
     #[test]
@@ -2173,72 +2180,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_legacy_extraction_classifies_lines() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let derived = derived_chunker_edge("NEXT_SECTION");
-        let tool = observed_tool_edge("RAN_BASH");
-        let explicit = explicit_edge("SUPERSEDES");
-
-        append_project_edges(dir.path(), "p1", &[derived]).unwrap();
-        append_edges(dir.path(), "p1", &[tool]).unwrap();
-        append_edges(dir.path(), "p1", &[explicit]).unwrap();
-        {
-            let mut f = OpenOptions::new()
-                .append(true)
-                .open(dir.path().join("p1.jsonl"))
-                .unwrap();
-            f.write_all(b"\n").unwrap();
-            f.write_all(b"not json\n").unwrap();
-        }
-
-        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert_eq!(plan.total_lines, 5);
-        assert_eq!(plan.derived_lines, 1);
-        assert_eq!(plan.tool_lines, 1);
-        assert_eq!(plan.explicit_lines, 1);
-        assert_eq!(plan.blank_lines, 1);
-        assert_eq!(plan.malformed_lines, 1);
-        assert!(!plan.managed_replacement_exists);
-        assert!(!plan.extractable);
-    }
-
-    #[test]
-    fn plan_legacy_extraction_detects_managed_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let derived = derived_chunker_edge("NEXT_SECTION");
-        append_project_edges(dir.path(), "p1", std::slice::from_ref(&derived)).unwrap();
-
-        let plan_before = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert!(!plan_before.managed_replacement_exists);
-
-        replace_materialized_edges(dir.path(), "project", "p1", &[derived]).unwrap();
-
-        let plan_after = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert!(plan_after.managed_replacement_exists);
-        assert!(plan_after.extractable);
-    }
-
-    #[test]
-    fn plan_tool_only_legacy_lane_is_extractable_with_managed_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        append_edges(dir.path(), "p1", &[observed_tool_edge("RAN_BASH")]).unwrap();
-        replace_materialized_edges(
-            dir.path(),
-            "project",
-            "p1",
-            &[derived_chunker_edge("NEXT_SECTION")],
-        )
-        .unwrap();
-
-        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert_eq!(plan.derived_lines, 0);
-        assert_eq!(plan.tool_lines, 1);
-        assert!(plan.managed_replacement_exists);
-        assert!(plan.extractable);
-    }
-
-    #[test]
     fn repeated_materialized_replace_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let edge = derived_chunker_edge("CALLS");
@@ -2746,7 +2687,7 @@ mod tests {
                 ("explicit", edges_dir.join("explicit")),
                 ("observed", edges_dir.join("observed")),
             ] {
-                for stem in ["p1", "ghost", AGENT_PROVENANCE_LANE] {
+                for stem in ["p1", "ghost", "agents"] {
                     let line =
                         make_explicit_edge_line(&format!("{lane}-{stem}"), "DESCRIBES", "target");
                     write_jsonl(&lane_dir.join(format!("{stem}.jsonl")), &[&line]);
@@ -2771,11 +2712,7 @@ mod tests {
 
         let expected: BTreeSet<String> = ["top", "explicit", "observed"]
             .into_iter()
-            .flat_map(|lane| {
-                ["p1", AGENT_PROVENANCE_LANE]
-                    .into_iter()
-                    .map(move |stem| format!("{lane}-{stem}"))
-            })
+            .flat_map(|lane| ["p1"].into_iter().map(move |stem| format!("{lane}-{stem}")))
             .collect();
         assert_eq!(legacy, expected, "legacy-missing mode admitted lanes");
         assert_eq!(

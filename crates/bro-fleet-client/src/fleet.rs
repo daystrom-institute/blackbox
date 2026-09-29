@@ -449,7 +449,7 @@ pub const INTERN_PREFIX: &str = "[INTERN]";
 pub const CLASSIFIER_NAME_PREFIX: &str = "\u{27c2}intern:";
 
 /// Default classifier prompt. The wording IS the policy (mirrors the
-/// `bro_retro` doc): it has to license silence (PASS) as the normal outcome
+/// workload-retro prompt): it has to license silence (PASS) as the normal outcome
 /// without discouraging a genuinely useful suggestion. Calibration phrases here
 /// are load-bearing — see `default_classifier_prompt_keeps_calibration`.
 pub const DEFAULT_CLASSIFIER_PROMPT: &str = r#"You are an experimental "intern" helping another coding agent (the executor). Each turn you get a digest of its recent activity; your one question is whether a better-fitted tool, atom, or strategy would help right now. The rich, project-tuned prompt is meant to live in fleet.json's classifier.prompt; this is only the minimal fallback.
@@ -2671,7 +2671,6 @@ mod tests {
             managed_worktree: Some("/tmp/worktree".to_string()),
             workflow_owned: false,
             started_at: Some(42),
-            agent_label: Some(format!("agent-{id}")),
             interrupted: false,
             error_teaser: None,
             transcript_path: None,

@@ -31,7 +31,6 @@ pub enum ToolCategory {
     Notes,
     Gaps,
     Artifacts,
-    Packets,
     Orchestration,
     StorageHealth,
     Workspace,
@@ -51,7 +50,6 @@ impl ToolCategory {
             Self::Notes => "Side-channel notes",
             Self::Gaps => "Gap notes",
             Self::Artifacts => "Artifact catalog",
-            Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Tool-call history",
@@ -75,7 +73,7 @@ impl ToolCategory {
                 "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Knowledge => {
-                "Memory lanes: `bbox_learn` for operator-approved rendered rules and, with `render=false`, approved cold recall; `bbox_pin` for scoped active context."
+                "Memory lanes: `bbox_learn` for operator-approved rendered rules and, with `render=false`, approved cold recall."
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
@@ -87,13 +85,10 @@ impl ToolCategory {
                 "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
             }
             Self::Artifacts => {
-                "Versioned catalog for packets, brofiles, simple agents and teams. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
-            }
-            Self::Packets => {
-                "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
+                "Versioned catalog for brofiles and teams. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Orchestration => {
-                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
+                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again: it starts fresh with no memory). For ensembles: several `bro_exec` calls + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
             Self::StorageHealth => {
                 "Read-only storage inventory for edge sidecar hygiene. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
@@ -111,7 +106,6 @@ impl ToolCategory {
 fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     match category {
         ToolCategory::Gaps => Some("sm-gap-notes"),
-        ToolCategory::Packets => Some("sm-rule-packets"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
         ToolCategory::StorageHealth => Some("sm-storage-health"),
         ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
@@ -127,7 +121,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Threads,
     ToolCategory::Notes,
     ToolCategory::Artifacts,
-    ToolCategory::Packets,
     ToolCategory::Orchestration,
 ];
 
@@ -183,7 +176,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions to kick convergence immediately; a background residue sweeper otherwise drives every non-transcript route to full coverage on its own, including residue past the per-route queue cap, so a `stalled` route converges without repeated manual calls. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, agent_manifest, graph (project-graph vertices whose schema opts them into embedding; rebuilt from the installed published views, and the one route that also tombstones vectors of vertices no longer embed-eligible), and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent — already-embedded items dedupe at enqueue). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
+        when_to_use: "Use after changing embedding routes or provider dimensions to kick convergence immediately; a background residue sweeper otherwise drives every non-transcript route to full coverage on its own, including residue past the per-route queue cap, so a `stalled` route converges without repeated manual calls. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, graph (project-graph vertices whose schema opts them into embedding; rebuilt from the installed published views, and the one route that also tombstones vectors of vertices no longer embed-eligible), and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent — already-embedded items dedupe at enqueue). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
@@ -250,8 +243,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
-        summary: "Orient to entity types and edge families. mode=full expands fields and agents; include_agents=false omits agents. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages.",
-        when_to_use: "Use once for graph vocabulary and traversal orientation. Default omits agent catalogs; include_agents=true or mode=full adds them. mode=agents is a deprecated full alias; unknown modes fail. dispatch_adapter remains on each agent row. No rendered text mirror or duplicate agent grouping is returned. Orientation retains entity types, population counts and edge families while omitting per-type field tables. mode=full expands fields; include_agents=false can suppress its agent inventory. body_limit/cursor recovers the selected complete JSON; oversized responses automatically start body pages. Concatenate body.text before parsing; changed selectors or evidence refuse continuation.",
+        summary: "Orient to entity types and edge families. mode=full expands fields and filters. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages.",
+        when_to_use: "Use once for graph vocabulary and traversal orientation. Unknown modes fail. No rendered text mirror is returned. Orientation retains entity types, population counts and edge families while omitting per-type field tables. mode=full expands fields. body_limit/cursor recovers the selected complete JSON; oversized responses automatically start body pages. Concatenate body.text before parsing; changed selectors or evidence refuse continuation.",
         example: Some("bbox_describe_schema()"),
     },
     ToolDoc {
@@ -297,7 +290,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
-        summary: "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename).",
+        summary: "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename).",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
         example: Some(
             r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#,
@@ -320,7 +313,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_unregister",
         category: ToolCategory::Projects,
-        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface.",
+        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface.",
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning. Compatibility unregistration can complete before auxiliary watcher cleanup fails; status=partial preserves the committed registry change.",
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
@@ -407,26 +400,17 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
-        summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
-        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; route to `bbox_pin`. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope.",
+        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; it belongs in the dispatch brief or the work-item thread. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
     },
     ToolDoc {
-        name: "bbox_pin",
-        category: ToolCategory::Knowledge,
-        summary: "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope. action=list returns bounded preview pages (200-char bodies); id + full=true is the exact recovery read through a content-bound body cursor.",
-        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. Self-inspection: `bbox_pin(action=\"list\")` with scope/target/project filters returns your active anchors — pins are not surfaced via `bbox_knowledge`, so `list` is the discovery surface and `action=list,id=<pin-id>,full=true` is the exact read. Pins are host-owned state: `project` accepts a project_id or registered alias and matches by project identity, with literal-substring fallback plus a diagnostic. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
-        example: Some(
-            r#"bbox_pin(action="list", project="89bd722f")   # then: bbox_pin(action="list", id="pin-<hex>", full=true)"#,
-        ),
-    },
-    ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces bounded rule-packet and system-memory sidecars; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters.",
-        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`), active threads (`bbox_thread_list`), or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications; reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
+        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"system_memory\" to list memory metadata.",
+        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for side-channel notes (`bbox_notes`), active threads (`bbox_thread_list`), or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
     },
     ToolDoc {
@@ -440,7 +424,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
-        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` renders the project's provider files (CLAUDE.md / AGENTS.md / GEMINI.md, which include PROJECT.md by reference) plus `.bbox/guidance` satellites IN THE CHECKOUT THAT OWNS IT: the code collector whose producer grant covers the project's published scope applies a daemon-built plan and returns a path-free receipt (`status`, per-output `dispositions`, `current`). The caller's visibility is kept: unbound defaults to `published`, `provisional=\"own\"` needs checkout context, `all` keeps its meaning. Hand-authored provider files are preserved (`refused`); generated ones are replaced. If the owner has not answered within the wait, the response is `render_pending` with an `operation` id: call `bbox_render(project, operation)` to retrieve that operation's recorded receipt (it never re-applies; a newer render makes it historical). Refusals name the fix: `error.render_owner_*` for an owner that is stale, lacks the render lane, or does not hold the checkout, and `error.render_locality_required` when no owner covers the project (enroll the checkout with `bbox-code-collector add <path>` on its host). Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` renders the project's provider files (CLAUDE.md / AGENTS.md / GEMINI.md, which include PROJECT.md by reference) plus `.bbox/guidance` satellites IN THE CHECKOUT THAT OWNS IT: the code collector whose producer grant covers the project's published scope applies a daemon-built plan and returns a path-free receipt (`status`, per-output `dispositions`, `current`). The caller's visibility is kept: unbound defaults to `published`, `provisional=\"own\"` needs checkout context, `all` keeps its meaning. Hand-authored provider files are preserved (`refused`); generated ones are replaced. If the owner has not answered within the wait, the response is `render_pending` with an `operation` id: call `bbox_render(project, operation)` to retrieve that operation's recorded receipt (it never re-applies; a newer render makes it historical). Refusals name the fix: `error.render_owner_*` for an owner that is stale, lacks the render lane, or does not hold the checkout, and `error.render_locality_required` when no owner covers the project (enroll the checkout with `bbox-code-collector add <path>` on its host). Do not use render as a way to keep active-work guidance hot across turns; that belongs in the dispatch brief or the work-item thread. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     // ── Threads ──────────────────────────────────────────────────────
@@ -489,9 +473,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_gap",
         category: ToolCategory::Gaps,
         summary: "File a first-class substrate gap note into the repo-owned gap store.",
-        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow: a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too, NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). While authoring a rule-packet, use `bbox_packet_gap` instead (it emits the companion gap for you). See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow: a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too, NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(
-            r#"bbox_gap(title="Packet AST cannot express rate predicates", gap_kind="packet_ast", domain="review-policy", wanted_capability="Classify entities by count/rate within a time window.", dedupe_key="packet_ast/review-policy/rate-window-predicate", impact="medium")"#,
+            r#"bbox_gap(title="No primitive classifies entities by rate within a time window", gap_kind="tooling", domain="review-policy", wanted_capability="Classify entities by count/rate within a time window.", dedupe_key="tooling/review-policy/rate-window-predicate", impact="medium")"#,
         ),
     },
     ToolDoc {
@@ -523,8 +507,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a packet, brofile, simple agent or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, atom and cron installation is retired.",
-        when_to_use: "List before installing. The installer validates packet, brofile, simple-agent or team JSON and records its version. Teams require installed member brofiles; reinstalling preserves live sessions. Automatic advisors are retired: dispatch reviewers explicitly. Caller paths are never read by this tool.",
+        summary: "Install a brofile or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, packet, atom and cron installation is retired.",
+        when_to_use: "List before installing. The installer validates brofile or team JSON and records its version. Teams require installed member brofiles; reinstalling preserves live sessions. Automatic advisors are retired: dispatch reviewers explicitly. Caller paths are never read by this tool.",
         example: Some(
             r#"bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"brodex","lens":"Review correctness and explain material findings."})"#,
         ),
@@ -534,13 +518,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Artifacts,
         summary: "List installed artifact summaries with live next_offset pages. body_limit/cursor recovers the complete redacted inventory; metadata=true with kind/name and optional version reads an exact installation receipt. Retired kinds require an explicit kind filter.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family. body_limit/cursor without limit/offset recovers the complete filtered inventory as JSON pages. metadata=true with kind/name and optional version recovers a complete redacted installation receipt; omit list/detail selectors. Source URLs and daemon paths are withheld in both modes. Oversized summary fields carry omission markers. Offset pages are live; concurrent catalog changes can move rows.",
-        example: Some(r#"bbox_artifact_list(kind="packet")"#),
+        example: Some(r#"bbox_artifact_list(kind="brofile")"#),
     },
     ToolDoc {
         name: "bbox_artifact_supersede",
         category: ToolCategory::Artifacts,
         summary: "Mark one installed artifact superseded by another artifact of the same kind.",
-        when_to_use: "Use when a customized packet/brofile/agent replaces an installed version but you want the old version retained for audit. The receipt reports catalog_updated and runtime_deactivated separately; status=partial preserves a completed catalog write if runtime cleanup fails. Source URLs and daemon paths are withheld.",
+        when_to_use: "Use when a customized brofile/agent replaces an installed version but you want the old version retained for audit. The receipt reports catalog_updated and runtime_deactivated separately; status=partial preserves a completed catalog write if runtime cleanup fails. Source URLs and daemon paths are withheld.",
         example: Some(
             r#"bbox_artifact_supersede(kind="brofile", name="reviewer", superseded_by="reviewer-v2")"#,
         ),
@@ -551,57 +535,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Hard-remove one installed artifact.",
         when_to_use: "Use for obsolete catalog artifacts that should be pruned, not superseded. dry_run=true lists paths; dry_run=false requires confirm=true.",
         example: None,
-    },
-    // ── Rule-packets ─────────────────────────────────────────────────
-    ToolDoc {
-        name: "bbox_compile",
-        category: ToolCategory::Packets,
-        summary: "Compile a rubric / judge / decision-function into a shareable packet. Reach here when you're writing a priority-ordered rubric, ranking proposals against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones. Symptom: you're about to paste the same rubric text into multiple sub-agent prompts - compile once and dispatch the packet_id instead. Rules are first-match-wins over a predicate AST; validate with bbox_audit before trusting. Packets compose via `Apply{packet_id, expect}` - extract `is_breaking` / `privileged_role` / etc. once, reuse across packets. Full workflow: sm-rule-packets via bbox_knowledge.",
-        when_to_use: "Symptoms that mean \"compile a packet\": (1) you're coordinating multiple sub-agents and pasting the same rubric text into each prompt — compile once, dispatch `packet_id` instead, guarantees bit-identical standards; (2) you're ranking a batch of proposals/PRs/incidents against shared criteria; (3) you've got 10+ labeled examples and need a mechanism that generalizes to the 100+ unlabeled ones; (4) you're about to write Python/prose to implement a decision tree. First-match-wins so put anomalies before general rules. Always follow with `bbox_audit` to verify fidelity.",
-        example: Some(
-            r#"bbox_compile(domain="pr-triage", classification_lattice=["fail","flag","manual","pass","info"], rules=[{"id":"fail_tests","classification":"fail","antecedent":{"op":"Eq","field":"tests_pass","value":false},"consequent":"REJECT"},{"id":"flag_api_change","classification":"flag","antecedent":{"op":"Eq","field":"api_surface_changed","value":true},"consequent":"FLAG"},{"id":"pass_default","classification":"pass","emit":"fallback","antecedent":{"op":"True"},"consequent":"ACCEPT"}])"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_apply",
-        category: ToolCategory::Packets,
-        summary: "Evaluate a packet against one entity deterministically, without an LLM. mode=\"first\" returns the first matching rule; mode=\"all\" returns one bounded finding page plus an aggregate verdict. Continue finding pages with next_finding_offset.",
-        when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator: evaluate rather than reinterpret the rubric. mode=all reports finding_count, packet_rule_order, finding_offset, and next_finding_offset. Default rows use bounded consequent previews; packet body pages remain the exact reader. Exact result_body_limit/result_cursor pages recover oversized results by deterministic re-evaluation without another observation event; keep packet, mode and input unchanged.",
-        example: Some(
-            r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_audit",
-        category: ToolCategory::Packets,
-        summary: "Run a packet against a mode-specific {entity, expectation}[] dataset and report fidelity plus bounded mismatch pages. Fidelity measures agreement with the supplied dataset, not universal classifier correctness. Continue mismatches with next_mismatch_offset.",
-        when_to_use: "Run after `bbox_compile` against the observations the rules were derived from. mode=first expects {entity, expected}; mode=all expects {entity, expected_verdict?, expected_rule_ids?}. The response preserves per-row outcomes, dataset_index, totals, ordering, and continuation. Oversized batches are rejected before an observation event is written. Exact result_body_limit/result_cursor pages recover complete reports by deterministic re-evaluation without another observation event; keep packet, mode and dataset unchanged.",
-        example: Some(
-            r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_packet_list",
-        category: ToolCategory::Packets,
-        summary: "Discover compiled packet summary pages (default 20, maximum 100). Filter before paging and continue with next_offset. detail=true adds histograms and rule previews. Read complete rules with bbox_inspect_entity(entity_ref=packet:<id>, property=body).",
-        when_to_use: "Run BEFORE `bbox_compile` on any new domain. Query by concept (\"breaking\", \"pii\", \"deny\") when you don't know the exact domain label. If a match exists: reuse via `bbox_apply` or compose via `Apply{packet_id, expect}` inside your new packet — don't re-derive. Pair with `bbox_packet_events(packet_id=...)` to check the packet's track record (fidelity, no_match rate) before depending on it. Pages order by created_at descending then id; latest_per_domain=true selects the newest revision per domain before paging. For faithful policy edits, inspect packet:<id> with property=body and join body.text pages using property_cursor=body.next_cursor. The body is complete installed JSON, including rules, lookup tables, classification configuration and provenance. Pass authoring fields to bbox_compile to create a new revision; do not send storage metadata as authoring input.",
-        example: Some(r#"bbox_packet_list(query="breaking", latest_per_domain=true, limit=10)"#),
-    },
-    ToolDoc {
-        name: "bbox_packet_events",
-        category: ToolCategory::Packets,
-        summary: "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since.",
-        when_to_use: "Diagnostic surface for the packet subsystem. Continue older pages with next_cursor; appends preserve older offsets; changed filters, removals, or rewritten events reject continuation. detail=true expands small events. event_ref from any row returns an exact event through body pages, including oversized details; continue with body_cursor=body.next_cursor. Exact reads omit list filters.",
-        example: Some(r#"bbox_packet_events(op="gap", limit=20)"#),
-    },
-    ToolDoc {
-        name: "bbox_packet_gap",
-        category: ToolCategory::Packets,
-        summary: "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives - every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap').",
-        when_to_use: "Reach here when you've tried to compile a packet but the AST can't express part of what you need. Don't silently fall back to prose — logging the gap turns the blocker into a vote for a new primitive. Equally valid for partial-compile cases: compile the mechanizable part, log a gap for the rest.",
-        example: Some(
-            r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
-        ),
     },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
@@ -658,7 +591,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_when_all",
         category: ToolCategory::Orchestration,
         summary: "Observe ALL selected tasks or team members until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch.",
-        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. all_completed means every selected task reached a terminal state (failed/cancelled included); all_succeeded separately requires every task to have succeeded; outcome_counts gives the mix, and running tasks keep timed_out rows, so a timeout never becomes success. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
+        when_to_use: "Fan-out/fan-in pattern. Pair with several `bro_exec` dispatches for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. all_completed means every selected task reached a terminal state (failed/cancelled included); all_succeeded separately requires every task to have succeeded; outcome_counts gives the mix, and running tasks keep timed_out rows, so a timeout never becomes success. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
         example: None,
     },
     ToolDoc {
@@ -666,13 +599,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Block until the FIRST task completes; use for races instead of polling each task yourself.",
         when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. any_completed means at least one task reached a terminal state (failed/cancelled included); any_succeeded separately requires a successful completion; outcome_counts gives the mix, and rows keep each task's own status with timed_out for those still running. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bro_broadcast",
-        category: ToolCategory::Orchestration,
-        summary: "Send the same prompt to every team member. `cwd` (canonical; `project_dir` deprecated alias) overrides the working directory for every member dispatch.",
-        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds. Every member keeps a receipt with identity and admission outcome (taskId/sessionId or a per-member error); over-long error text is truncated, oversized fan-out or teams whose minimal receipts cannot fit the response budget reject before any dispatch, and large aggregates compact later receipts behind receiptsTruncated without dropping any member from the reply. Later member failures remain per-member receipts and preserve earlier admitted task IDs. team_persistence separately reports persisted, unconfirmed or unchanged history. Fresh and resumed members preserve explicit brofile tool defaults; no authority opt-out is inferred. Workflow/atom-owned sessions refuse ordinary takeover, including legacy team history identity. Only tracked admissions produce taskId/history; a tracked failed setup remains recoverable through bro_status.",
         example: None,
     },
     ToolDoc {
@@ -686,7 +612,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
         summary: "Page recent task summaries for lookup; do not take over another operator's task.",
-        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Agent metrics cover only returned tasks. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results, and coordination wait tools when awaiting completion.",
+        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results, and coordination wait tools when awaiting completion.",
         example: None,
     },
     ToolDoc {
@@ -695,15 +621,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Queue a user steer into a running bro-harness process without cancelling the active turn.",
         when_to_use: "Use when a running bro should incorporate extra direction but does not need to stop its current turn. If the task already finished, use bro_resume instead. Only live harness child processes are steerable.",
         example: Some(r#"bro_steer(task_id="...", prompt="Prefer the smaller scoped fix.")"#),
-    },
-    ToolDoc {
-        name: "bro_interrupt",
-        category: ToolCategory::Orchestration,
-        summary: "Interrupt a running bro-harness process; optionally queue redirect text to run after interruption repair.",
-        when_to_use: "Use when the current turn is going the wrong way and should stop now. Pass prompt for interrupt-and-redirect; omit it for a plain interrupt. This is different from bro_cancel: the live session is repaired and can continue inside the same task.",
-        example: Some(
-            r#"bro_interrupt(task_id="...", prompt="Stop that path; inspect the boundary doc first.")"#,
-        ),
     },
     ToolDoc {
         name: "bro_cancel",
@@ -716,15 +633,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_prune",
         category: ToolCategory::Orchestration,
         summary: "Drop terminal tasks from the store + persisted tasks.json; filter by status/provider/age, or pass task_ids to drop only specific tasks you created.",
-        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Pass task_ids=[…] to drop exactly the tasks you created without a status-wide sweep of the shared store (matches any terminal status unless status is also given). Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched. Pass retro=true to fire a fire-and-forget workload retrospective on each pruned task before it's dropped (see bro_retro); tune with retro_min_turns / retro_max. Rejects explicit empty task_ids and invalid providers. Freezes a maximum 256-task/24 KiB encoded-ID selection before effects; narrow larger selections. persistence=requested distinguishes admission from completion. Retro starts after tasks are dropped.",
+        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Pass task_ids=[…] to drop exactly the tasks you created without a status-wide sweep of the shared store (matches any terminal status unless status is also given). Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched. Pass retro=true to fire a fire-and-forget workload retrospective on each pruned task before it's dropped (the bro self-files substrate gaps via bbox_gap only if something is worth surfacing); tune with retro_min_turns / retro_max. Rejects explicit empty task_ids and invalid providers. Freezes a maximum 256-task/24 KiB encoded-ID selection before effects; narrow larger selections. persistence=requested distinguishes admission from completion. Retro starts after tasks are dropped.",
         example: Some(r#"bro_prune(task_ids=["abc123"])"#),
-    },
-    ToolDoc {
-        name: "bro_retro",
-        category: ToolCategory::Orchestration,
-        summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task.",
-        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself (missing/awkward bbox_/bro_ tools, stale guidance or memories, clumsy workflow/dispatch steps) and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; the operator's bulk path at cleanup time is `bro mcp call bro_prune '{\"retro\":true}' --surface ops`.",
-        example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {
         name: "bro_providers",
@@ -744,7 +654,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_team",
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and teams without automatic advisor execution. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages.",
-        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. New advisor arguments are rejected. Legacy advisor settings/history remain readable and are marked execution=retired in summaries; create and waits never execute them. Dispatch any reviewer explicitly with bro_exec/bro_resume. list/list_templates/roster page at default 20, maximum 100; next_offset continues with the same exact name/project filters. get/get_template return exact stored JSON: concatenate body.text pages using cursor=body.next_cursor, then parse; source changes invalidate cursors. Template scope accepts global or project. In catalog mode, project template operations refuse because legacy .bro files have no owner transport; use global templates or owner-side operations. Team creation uses global template/brofile configuration and retains project_dir as worker context. Expanded membership must be 1..256; counts outside this range refuse before allocation or persistence. Team members resume existing sessions on later broadcasts; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Wrong-action mutation fields refuse. Dissolve caps cancellation at 64 tasks/16 KiB encoded IDs before effects and reports cancellation_requested plus skipped terminal/missing history and removal status. Cancellation failure retains the team.",
+        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. New advisor arguments are rejected. Legacy advisor settings/history remain readable and are marked execution=retired in summaries; create and waits never execute them. Dispatch any reviewer explicitly with bro_exec/bro_resume. list/list_templates/roster page at default 20, maximum 100; next_offset continues with the same exact name/project filters. get/get_template return exact stored JSON: concatenate body.text pages using cursor=body.next_cursor, then parse; source changes invalidate cursors. Template scope accepts global or project. In catalog mode, project template operations refuse because legacy .bro files have no owner transport; use global templates or owner-side operations. Team creation uses global template/brofile configuration and retains project_dir as worker context. Expanded membership must be 1..256; counts outside this range refuse before allocation or persistence. Team members resume existing sessions on later turns; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Wrong-action mutation fields refuse. Dissolve caps cancellation at 64 tasks/16 KiB encoded IDs before effects and reports cancellation_requested plus skipped terminal/missing history and removal status. Cancellation failure retains the team.",
         example: Some(
             r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
         ),
@@ -760,46 +670,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     // ── Workflows ────────────────────────────────────────────────────
 
-    // ── Agents ──────────────────────────────────────────────────
-    ToolDoc {
-        name: "bro_agent_list",
-        category: ToolCategory::Orchestration,
-        summary: "List installed agents in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; bro_agent_get/bro_agent_describe reads one exact agent.",
-        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history, including retired adapter-backed manifests marked inactive. Retired manifests remain readable by exact name/ref but never appear as callable agents.",
-        example: Some(r#"bro_agent_list(include_superseded=true)"#),
-    },
-    ToolDoc {
-        name: "bro_agent_get",
-        category: ToolCategory::Orchestration,
-        summary: "Read one agent by name or agent-ref with lifecycle state, a manifest summary, and exact redacted manifest body pages.",
-        when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
-        example: Some(r#"bro_agent_get(name="reviewer")"#),
-    },
-    ToolDoc {
-        name: "bro_agent_describe",
-        category: ToolCategory::Orchestration,
-        summary: "Compact per-plane dispatch surface for one agent.",
-        when_to_use: "Pre-dispatch inspection: see the stored manifest, resolved brofile, filter overlay, the computed deny-wins merge, and the runtime planes describe does not compute (project filters, surface packet, per-dispatch overrides, recursion guard). detail_plane=manifest|brofile pages the exact redacted JSON with body.next_cursor; a missing brofile returns an actionable readiness error. Use before bro_agent_dispatch to preview the dispatch plan. detail_plane=metadata pages installation history; detail_plane=summary pages every computed filter and warning. Large default planes carry these exact-read hints.",
-        example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
-    },
-    ToolDoc {
-        name: "bro_agent_search",
-        category: ToolCategory::Orchestration,
-        summary: "Search installed agents with ranked compact previews and exact manifest recovery hints. Returned count is top-k, not total matches. debug adds bounded ranking/vector diagnostics.",
-        when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results. returned and selection=ranked_top_k describe ranking output rather than total matches. Stable name/version are preserved; descriptions and two pattern examples are bounded with original counts and omission markers. debug opts into bounded source/vector diagnostics. Byte-limited ranked-tail omissions are explicit; expand through get/describe.",
-        example: Some(
-            r#"bro_agent_search(query="review pull request for security issues", limit=3)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bro_agent_dispatch",
-        category: ToolCategory::Orchestration,
-        summary: "Dispatch a registered agent for a focused task. Resolves the brofile, merges filters, validates inputs and starts one bro turn. Custom dispatch adapters are retired and refused. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member).",
-        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Set the session's working directory with `cwd` (canonical; `project_dir` accepted as a deprecated alias). Pass runtime={...} to overlay tier/pool/pin allocation on the standard bro dispatch path. Recursion is manifest-declared: an agent whose manifest sets allow_recursion=true dispatches with the recursive bro_* tools available; there is no per-call override (ad-hoc recursive dispatch is bro_exec's allow_recursion). Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
-        example: Some(
-            r#"bro_agent_dispatch(agent="code-reviewer", cwd="/repo/x", args={"diff": "..."})"#,
-        ),
-    },
     // ── Atoms ───────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_tool_calls",
@@ -828,17 +698,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_storage_gc",
         category: ToolCategory::StorageHealth,
         summary: "Preview (default) or apply storage GC. Returns bounded counts, estimated bytes, protection counts, stage outcomes, and a receipt_id; exact detail is opt-in and paged.",
-        when_to_use: "Use after bbox_storage_health. dry_run=true never deletes; dry_run=false runs a fresh native plan, not a saved preview. Responses use status, apply_requested and counts, not an applied boolean. status=applied means every requested stage completed without reported errors; partial means apply had errors, not that nothing changed. GC is non-atomic: earlier deletions remain and failed tree removals may have partial effects. incomplete is a preview with stage errors. deleted_bytes_estimate uses plan-time sizes of fully removed edge candidates, excludes packets, and is not exact disk-space recovery. unconfirmed_count covers eligible candidates not confirmed removed (including native skips and errors). detail=candidates/deleted/errors/exclusions/packets/full returns exact JSON body pages, default/max 4096 bytes, minimum 4; concatenate body.text fragments to recover the selected JSON. The first operation response includes totals even with detail. Later detail reads contain only outcome, receipt_id, expires_in_seconds, detail and body; read receipt_id with default detail=summary to recover totals. Continue using receipt_id, the SAME detail, and body.next_cursor only. Cursor without receipt_id, non-default GC options on a receipt read, and unknown options are rejected before work. Receipt reads never plan or delete. Receipts are daemon-local immutable reports, NOT executable plans or durable records: retained up to 15 minutes and 16 receipts, subject to earlier eviction/restart. Download needed details promptly; an unavailable receipt never triggers GC. The cache targets 64 MiB of serialized detail, retaining an oversized newest receipt alone rather than discarding post-apply evidence. External sweepers must read detail=exclusions in full before acting; summary counts do not authorize a sweep. Rollback-marker refusal and protected roots remain enforced. Native defaults retain newest backups and observed history; inactive snapshot age/recent/grace preferences do not override per-workspace count (32) and byte (8 GiB) ceilings. Active snapshots stay protected. Dangling/legacy orphans auto-prune only after grace; explicitly unregistered storage requires prune_explicitly_unregistered=true. prune_duplicate_packets=true dedupes across ALL packet scopes/projects (the edge project filter does not narrow it), keeps newest identical content per domain/scope/project, protects Apply references, and reports packet/lock failures without losing earlier deletion counts.",
+        when_to_use: "Use after bbox_storage_health. dry_run=true never deletes; dry_run=false runs a fresh native plan, not a saved preview. Responses use status, apply_requested and counts, not an applied boolean. status=applied means every requested stage completed without reported errors; partial means apply had errors, not that nothing changed. GC is non-atomic: earlier deletions remain and failed tree removals may have partial effects. incomplete is a preview with stage errors. deleted_bytes_estimate uses plan-time sizes of fully removed edge candidates and is not exact disk-space recovery. unconfirmed_count covers eligible candidates not confirmed removed (including native skips and errors). detail=candidates/deleted/errors/exclusions/full returns exact JSON body pages, default/max 4096 bytes, minimum 4; concatenate body.text fragments to recover the selected JSON. The first operation response includes totals even with detail. Later detail reads contain only outcome, receipt_id, expires_in_seconds, detail and body; read receipt_id with default detail=summary to recover totals. Continue using receipt_id, the SAME detail, and body.next_cursor only. Cursor without receipt_id, non-default GC options on a receipt read, and unknown options are rejected before work. Receipt reads never plan or delete. Receipts are daemon-local immutable reports, NOT executable plans or durable records: retained up to 15 minutes and 16 receipts, subject to earlier eviction/restart. Download needed details promptly; an unavailable receipt never triggers GC. The cache targets 64 MiB of serialized detail, retaining an oversized newest receipt alone rather than discarding post-apply evidence. External sweepers must read detail=exclusions in full before acting; summary counts do not authorize a sweep. Rollback-marker refusal and protected roots remain enforced. Native defaults retain newest backups and observed history; inactive snapshot age/recent/grace preferences do not override per-workspace count (32) and byte (8 GiB) ceilings. Active snapshots stay protected. Dangling/legacy orphans auto-prune only after grace; explicitly unregistered storage requires prune_explicitly_unregistered=true.",
         example: Some(
             r#"bbox_storage_gc(detail="candidates"); bbox_storage_gc(receipt_id="<returned id>", detail="candidates", cursor="<body.next_cursor>")"#,
         ),
-    },
-    ToolDoc {
-        name: "bbox_storage_migrate_legacy_edges",
-        category: ToolCategory::StorageHealth,
-        summary: "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Selectors (project_id, operator alias, registered path) resolve through one authority in both modes; unknown selectors fail both. Dry-run plans are paged; only selected page targets are planned after sidecar discovery.",
-        when_to_use: "Migrating pre-Phase-2 legacy sidecars into lane-split storage. The project selector resolves project_id, operator alias, and registered path through the SAME authority for dry-run and apply; an unknown selector refuses identically in both modes instead of returning an empty plan set. Dry-run without a filter plans every registered project with a sidecar, paged in project order (limit default 20, max 100; follow next_offset, restart at 0 after lifecycle actions) and reports unregistered sidecars it skipped. apply requires exactly one registered project; limit/offset are refused there before any scan. Operates on daemon-local edge storage; drops derived only when managed replacement exists; quarantines malformed lines.",
-        example: None,
     },
     // ── Reactions ──────────────────────────────────────────────────
 
@@ -902,9 +765,9 @@ before dissolving ad hoc teams, and ask the operator to prune terminal tasks \
 `retro=true`). Cleanup is operator-gated, not automatic.
 - Memory lanes: `bbox_thread` (investigation state), \
 `bbox_learn` (operator-approved standing rules; `render=false` for cold \
-grep-able facts), `bbox_pin` (arc-bound hot context). \
-The one-year test picks between rendered and pin — would it still be correct \
-a year from now with current arcs done?
+grep-able facts). Arc-bound hot context belongs in the dispatch brief or the \
+work-item thread. The one-year test decides: would it still be correct a year \
+from now with current arcs done?
 - Compose gates, retries, schedules and review protocols in your caller. Blackbox \
 executes and resumes bro turns; it does not choose the next application step.
 - `bbox_learn` is for operator-approved, user-stated rules; `bbox_note(kind=learned)` is for \
@@ -1015,9 +878,8 @@ fn render_persistence_workflow(out: &mut String) {
     out.push_str("Lane selection - when preparing a persistence proposal, walk the ladder and stop at the first yes:\n\n");
     out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
     out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn`\n");
-    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_learn` with `render=false`\n");
-    out.push_str("4. Otherwise - arc-bound guidance that must stay hot for one execution lane - → `bbox_pin`\n\n");
-    out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
+    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_learn` with `render=false`\n\n");
+    out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it: it belongs in the dispatch brief or the work-item thread, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
     out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, propose the exact storage text, lane, and scope before replying; only emit the storage call after the operator approves it.\n\n");
 
     out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
@@ -1063,7 +925,7 @@ fn topic_for_category(category: ToolCategory) -> GuidanceTopic {
         ToolCategory::Transcripts | ToolCategory::Graph | ToolCategory::ProjectGraphs => {
             GuidanceTopic::Retrieval
         }
-        ToolCategory::Knowledge | ToolCategory::Packets => GuidanceTopic::Persistence,
+        ToolCategory::Knowledge => GuidanceTopic::Persistence,
         ToolCategory::Threads
         | ToolCategory::Notes
         | ToolCategory::Artifacts
@@ -1285,10 +1147,7 @@ mod tests {
     #[test]
     fn render_defers_deep_tool_categories_to_system_memories() {
         let md = render_markdown();
-        for (cat, memory_id) in [
-            (ToolCategory::Packets, "sm-rule-packets"),
-            (ToolCategory::Orchestration, "sm-bro-dispatch-patterns"),
-        ] {
+        for (cat, memory_id) in [(ToolCategory::Orchestration, "sm-bro-dispatch-patterns")] {
             assert!(md.contains(&format!("## {}", cat.heading())));
             assert!(md.contains(&format!(
                 "`{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`"
@@ -1352,8 +1211,8 @@ mod tests {
     #[test]
     fn render_includes_system_memory_hint() {
         let md = render_markdown();
-        assert!(md.contains("sm-rule-packets"));
-        assert!(md.contains("bbox_knowledge(query=\"sm-rule-packets\")"));
+        assert!(md.contains("sm-bro-dispatch-patterns"));
+        assert!(md.contains("bbox_knowledge(query=\"sm-bro-dispatch-patterns\")"));
         assert!(!md.contains("bro_orchestrate_run"));
         assert!(!md.contains("## Whiteboards"));
     }

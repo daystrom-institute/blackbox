@@ -851,9 +851,8 @@ impl ProjectCatalogStore {
     /// its bytes stay recoverable and the transaction still sees the absent
     /// catalog its journal invariants describe.
     ///
-    /// A legacy store carrying ANY project record still refuses: those
-    /// identities are exactly what `project-catalog migrate` exists to carry
-    /// across, and admitting them here would make genesis a migration bypass.
+    /// A legacy store carrying ANY project record still refuses: genesis
+    /// initializes only a bundle with no project identities to carry.
     /// An attachment snapshot or migration marker refuses under both entries.
     pub fn initialize_empty_over_fresh_bundle(
         projects_path: impl Into<PathBuf>,

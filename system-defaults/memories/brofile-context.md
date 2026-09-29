@@ -52,9 +52,9 @@ Changing a brofile or project-local override is not retroactive for a live
 provider session. If the goal is to test a new context policy, dissolve and
 recreate the team so members start fresh sessions from the new brofiles.
 
-`bro_broadcast` resumes existing team member sessions on later rounds. For
+Team members resume their existing sessions on later rounds. For
 fresh-context validation, instantiate a fresh team or dissolve/recreate the
-existing team before broadcasting.
+existing team before the next round.
 
 ## Creation surface
 

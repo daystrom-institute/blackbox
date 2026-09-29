@@ -24,7 +24,6 @@ pub(crate) mod transcript_source;
 // The published-view install gate lives here and is exercised from the
 // catalog tool's acceptance tests, which is why this module is crate
 // visible while its knowledge/gap siblings are not.
-mod ambient_pins;
 pub(crate) mod control;
 pub(crate) mod drain;
 pub(crate) mod knowledge_view;
@@ -79,21 +78,17 @@ impl BlackboxServer {
                 + crate::tools::gaps::router()
                 + crate::tools::threads::router()
                 + crate::tools::artifacts::router()
-                + crate::tools::packets::router()
-                + crate::tools::attention::router()
                 + crate::tools::graph::router()
                 + crate::tools::transcripts::router()
                 + crate::tools::sessions::router()
                 + crate::tools::knowledge::router()
                 + crate::tools::render::router()
-                + crate::tools::agents::router()
                 + crate::tools::roster::router()
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()
                 + crate::tools::doctor::router()
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
-                + crate::tools::storage_migration::router()
                 + crate::tools::tool_calls::router(),
             embed_status_snapshots: Default::default(),
             surface: std::sync::OnceLock::new(),

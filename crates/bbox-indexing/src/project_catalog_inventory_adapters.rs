@@ -2992,7 +2992,7 @@ fn capture_durable_owner_snapshots(
         bbox_stores::pins::capture_project_catalog_owner_snapshot(path, limits)
     })?;
     let packet = capture_owner_snapshot_path(&paths.packet_root, |path| {
-        bbox_packets::capture_project_catalog_owner_snapshot(path, limits)
+        crate::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(path, limits)
     })?;
     let task = capture_owner_snapshot_path(&paths.task_store_path, |path| {
         capture_legacy_task_owner_snapshot(path, limits)

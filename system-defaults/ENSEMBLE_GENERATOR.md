@@ -102,7 +102,7 @@ Survey the target repo. Run these checks before asking the operator anything:
    - Any provider-specific constraints (e.g., gemini excluded)
 
 6. Existing ensemble infrastructure
-   - bbox_artifact_list → any existing workflows, brofiles, packets?
+   - bbox_artifact_list → any existing workflows or brofiles?
    - Any existing teams or teamplates?
 
 7. Transcript history
@@ -235,7 +235,7 @@ Customizations to propose based on the interview:
 Ask:
 
 > "Does this workflow shape match your needs? I can add pre-review grounding
-> steps, post-review callbacks, or adjust the gate rules."
+> steps or post-review callbacks."
 
 ## Phase 5: Mint (Generate and Install Artifacts)
 
@@ -305,8 +305,6 @@ mechanics this generator uses. Fetch them via `bbox_knowledge` when needed:
 
 - **Workflow primitives:** `bbox_knowledge(query="sm-workflow-orchestration")`
   — actor kinds, transition types, hooks, vars_schema, subworkflows, wait nodes.
-- **Design packets:** `bbox_knowledge(query="sm-rule-packets")`
-  — how to encode evaluation criteria as rule-packets.
 - **Pathology ensemble (reference):** `design/refactor-tools/pathology-ensemble-review.md`
   — the original projection of these 5 dimensions into architecture pathology.
 - **Pathology dispatch (operator guide):** `docs/pathology-dispatch.md`

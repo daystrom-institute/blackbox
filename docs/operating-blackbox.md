@@ -65,30 +65,11 @@ systemctl --user restart blackbox.service
 Restart `blackbox-dev.service` only if you updated the dev daemon too.
 Prod and dev intentionally use different installed binary paths.
 
-### Rehearse the project-catalog migration offline
+### Offline project-catalog administration
 
 The `blackbox project-catalog` commands do not contact or restart the daemon.
-In Phase 1, apply accepts only an explicit isolated rehearsal root and refuses
-the configured live state:
-
-```bash
-blackbox project-catalog migrate --preflight \
-  --state-dir /path/to/rehearsal/state \
-  --report /path/to/rehearsal/review/report.json \
-  --resolution /path/to/rehearsal/review/resolution.json
-
-blackbox project-catalog migrate --apply \
-  --report /path/to/rehearsal/review/report.json \
-  --resolution /path/to/rehearsal/review/resolution.json \
-  --rehearsal-root /path/to/rehearsal
-
-blackbox project-catalog verify --root /path/to/rehearsal
-```
-
-Use `--config`, `--state-dir`, or `--projects-path` when the source bundle does
-not come from the normal daemon configuration. Preflight is read-only except
-for the explicit review artifacts. `--include-local-paths` is preflight-only
-and writes a separate owner-sensitive report.
+Use `--config`, `--state-dir`, or `--projects-path` when the bundle does not
+come from the normal daemon configuration.
 
 When the daemon is stopped or runs somewhere that cannot read this host's
 attachment paths, promote an attached legacy-local project through the offline
@@ -513,7 +494,6 @@ Protect:
 - `~/.local/state/blackbox/blackbox-knowledge.json`
 - `~/.local/state/blackbox/blackbox-notes.json`
 - `~/.local/state/blackbox/blackbox-threads.json`
-- `~/.local/state/blackbox/blackbox-pins.json`
 - `~/.local/state/blackbox/projects.json`
 - `~/.local/state/blackbox/project-catalog-migration.json`
 - `~/.local/state/blackbox/project-catalog-migration-receipt.json`

@@ -26,7 +26,7 @@ Related:
 
 Blackbox tunes retrieval blind. There is no instrument that answers "for a
 question whose answer we *know*, where in the pipeline did the answer get lost?"
-Without it, the coherence path's Brick 2 (indexing system memories/packets,
+Without it, the coherence path's Brick 2 (indexing system memories,
 demoting `bbox_knowledge` to a lens) would be asserted, not measured — and the
 RRF/rerank/dedup/diversify passes already in `hybrid_search_typed` are tuned by
 intuition. This harness is what let the Daystrom spike iterate on tiering and
@@ -78,7 +78,7 @@ it reached**, in precedence order (highest = earliest loss):
 
 | Verdict | Reached as far as | Fix it points to |
 |---|---|---|
-| `NotIndexed` | no tantivy doc for the entity at all | **Brick 2** — the store isn't an indexed doc type (system memories, packets today) |
+| `NotIndexed` | no tantivy doc for the entity at all | **Brick 2**: the store isn't an indexed doc type (system memories today) |
 | `NotRetrieved` | indexed, but absent from both BM25 (even at depth `limit*32`) and vector fetch | lexical vs semantic gap — tokenizer, chunking, or embedding route; sub-tag `bm25_miss` / `vector_miss` |
 | `FusedTooLow` | present in a ranked list, but RRF ranked it below `fetch` | `RRF_K`, list weighting, the file-aggregation blend |
 | `RerankedDown` | survived fusion, but `apply_rerank` pushed it below kept entries | type/recency multipliers over-penalizing the entity's kind |

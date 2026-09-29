@@ -1364,7 +1364,6 @@ mod tests {
         let expected_allow: Vec<&str> = vec![
             "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
-            "mcp__blackbox__bbox_pin",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
             "Read",
@@ -1433,7 +1432,6 @@ mod tests {
         let expected_allow: Vec<&str> = vec![
             "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
-            "mcp__blackbox__bbox_pin",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
             "Read",

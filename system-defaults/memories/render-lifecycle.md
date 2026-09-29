@@ -13,7 +13,6 @@ This is the compact model:
 - `bbox_learn` creates or updates knowledge entries. It is the only write lane, and entries are approved with the operator before the write.
 - `bbox_render` publishes renderable knowledge (entries with `render=true`) into managed files.
 - Rendered files are unidirectional projections. Nothing imports edits from them.
-- `bbox_pin` is not part of this lifecycle. Pins stay out of rendered memory entirely.
 
 ## Normal forward path
 
@@ -54,7 +53,7 @@ not a different daemon path or hand-authored internal transport parameters.
 ## What each verb is not
 
 - `bbox_render` is not an approval step. It publishes what is already stored and renderable.
-- `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," use `bbox_pin`, not render.
+- `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," put it in the dispatch brief or the work-item thread, not render.
 - `bbox_learn` with `render=false` is not a render input. Those entries are indexed for recall only.
 
 ## Keep hot vs cold

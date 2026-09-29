@@ -132,19 +132,6 @@ fn latest(server: &BlackboxServer, scope: &PublishedScope, id: &str) -> Knowledg
     serde_json::from_str(row.mutation.content_json.as_deref().unwrap()).unwrap()
 }
 
-fn serialized_text(result: &CallToolResult) -> (usize, String) {
-    let wire = serde_json::to_vec(result).unwrap();
-    let envelope: serde_json::Value = serde_json::from_slice(&wire).unwrap();
-    let text = envelope["content"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|content| content["text"].as_str())
-        .unwrap()
-        .to_string();
-    (wire.len(), text)
-}
-
 #[tokio::test]
 async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publication() {
     let (fixture, server, scope) = fixture();

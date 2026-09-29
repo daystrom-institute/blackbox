@@ -375,17 +375,6 @@ pub fn enqueue_transcript(
 // engine (`index::embed_hook`); re-exported here for the embed-side callers.
 pub use bbox_indexing::index::embed_hook::project_file_entity_id;
 
-/// Parse an `agent_embed:<name>:v<version>:<component>` vector entity id
-/// into its plain parts. The agent-typed wrapper lives in the daemon's
-/// embed runtime; this layer stays free of orchestration types.
-pub fn parse_agent_component_entity_id_parts(entity_id: &str) -> Option<(String, u32, String)> {
-    let rest = entity_id.strip_prefix("agent_embed:")?;
-    let (agent_part, component_part) = rest.rsplit_once(':')?;
-    let (name, version_part) = agent_part.rsplit_once(":v")?;
-    let version = version_part.parse::<u32>().ok()?;
-    Some((name.to_string(), version, component_part.to_string()))
-}
-
 pub fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());

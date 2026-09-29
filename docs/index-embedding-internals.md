@@ -17,7 +17,7 @@ transcripts, registered projects, git history, and durable JSON stores.
 | `~/.local/state/blackbox/edges/` | Project edge sidecars | No |
 | `~/.local/state/blackbox/git_meta/` | Git indexing fingerprints | No |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and IDs | Yes |
-| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads, pins | Yes |
+| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads | Yes |
 
 ## Tantivy index
 
@@ -137,7 +137,6 @@ Common routes:
 | `notes` | Side-channel notes |
 | `threads` | Thread records |
 | `transcripts` | Transcript blocks |
-| `agent_manifest` | Agent manifest documents |
 | `graph` | Project-graph vertices whose schema opts them into embedding: one route for every graph (`[embed.routes] graph`, per-project overridable). The embedding input is the composed projection (label, then the `embed: true` property values in schema order), never raw vertex JSON, and only under the three-way gate (`index_policy.embeddings_enabled`, `embed: true` on the property, vertex type not in `retrieval_excluded_types`). Vectors are enqueued when a published graph view installs and backfilled by `bbox_reembed(route="graph")` from the in-memory accepted generations (the word index never stores the embed projection); vertices that leave the eligible set are tombstoned. `bbox_project_graph_describe` reports `embed_eligible_vertex_count` / `embedded_vertex_count` per graph. |
 
 Text routes are bucket-keyed; `[embed.routes.per_project]` can override
