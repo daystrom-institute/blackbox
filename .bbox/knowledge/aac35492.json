@@ -1,19 +1,14 @@
 {
   "id": "aac35492",
   "title": "List Before Create",
-  "content": "Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, teamplates/teams, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.",
-  "variants": {},
+  "content": "Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.",
   "category": "workflow",
   "scope": "project",
+  "project_id": "89bd722f",
   "providers": [],
   "priority": "standard",
-  "weight": 100,
-  "status": "active",
-  "approval": "user_confirmed",
   "render": true,
-  "decay": true,
-  "source": "user",
   "created_at": "2026-04-18T20:01:32Z",
-  "updated_at": "2026-04-18T20:01:32Z",
+  "updated_at": "2026-09-29T19:46:19Z",
   "recall_count": 0
 }
