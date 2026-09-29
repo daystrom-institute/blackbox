@@ -42,8 +42,8 @@ Include these surfaces when they were relevant:
   tree visibility, env/provider/session details, tool-denial clarity, and
   whether an outside operator could reconstruct what happened.
 - **Blackbox grounding path**: whether recall, graph search, gap store, notes,
-  threads, evidence bundles, and provenance tools were easy to choose correctly
-  for the task shape.
+  threads, and evidence bundles were easy to choose correctly for the task
+  shape.
 - **Fleet / steering / resume loop**: composer behavior, queued input, harness
   echo, interrupt/resume semantics, activity/status display, and whether the
   session recovered cleanly after steering or compaction.
@@ -101,7 +101,7 @@ Good gap candidates:
   ownership was unclear.
 - The steering/resume/queued-input loop made state ambiguous or durable scrollback
   misleading.
-- Evidence/provenance tooling made the correct path hard to choose.
+- Evidence tooling made the correct path hard to choose.
 - A recurring workflow needed a first-class primitive instead of manual ceremony.
 
 Do not file a gap for:

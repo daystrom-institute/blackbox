@@ -27,7 +27,7 @@ questions about corpora it doesn't index.
 
 ## MCP Availability Check
 
-Before any other work call `mcp__blackbox__bbox_stats` with no args. If the tool is missing or
+Before any other work call `mcp__blackbox__bbox_describe_schema` with no args. If the tool is missing or
 returns a connection error:
 
 1. State: "Blackbox (bbox) MCP tools are not available. Parent must `/mcp` and retry."
@@ -58,8 +58,8 @@ Readers you should use, roughly in rank of frequency:
 | `bbox_messages` | Read conversation flow; supports role filter, `from_end=true`, pagination, `max_content_length` |
 | `bbox_hybrid_search` | Search the entire indexed corpus; narrow with `doc_type=transcript` or project / role / account / source / channel filters |
 | `bbox_context` | Surrounding turns around a hit (its `exact_read`, or `conversation.file_path` + `conversation.byte_offset`) |
-| `bbox_stats` | Corpus health / "is this session indexed yet" sanity check |
-| `bbox_knowledge` | Peek at stored rules/decisions/remembers (read-only; never mutate) |
+| `bbox_describe_schema` | Entity populations and edge families: a cheap "is the corpus populated" sanity check |
+| `bbox_knowledge` | Peek at stored rules and recall entries (read-only; never mutate) |
 | `bbox_notes` | List side-channel notes filtered by project / session / thread / kind |
 | `bbox_thread_list` | Inspect open / active / stale threads — don't open, continue, or resolve |
 

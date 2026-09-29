@@ -13,7 +13,7 @@ Checked-in **prose prompts** — documents whose audience is an agent, not a
 human reader. Two species live here:
 
 - **Operator-pointed** — a human aims a live agent at the file ("read
-  `DOC_REVIEW.md` and run it against `design/x.md`"). These live at the root of
+  `DESIGN_PANEL.md` and plan the phase in `design/x.md`"). These live at the root of
   `prompts/`.
 - **Dispatched-agent lenses** — a brofile or orchestrator points a *dispatched*
   bro at the file as its operating doc. These live under
@@ -30,14 +30,13 @@ an agent is told to read.
 | Prompt | When to point an agent at it |
 |--------|------------------------------|
 | [daily-boot-sequence.md](daily-boot-sequence.md) | Daily conductor: clean → survey residuals/net-news → process gaps → refine & process the TODO list → closeout. Sequences the other daily prompts; owns the TODO-refinement loop + closeout. |
-| [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall prod daemon/bro/bro-harness, restart prod service (gated). |
-| [daily-cleaning-beta.md](daily-cleaning-beta.md) | Beta-line sibling of daily-cleaning.md: same reset, but tracks `beta/blackbox-v2` as the integration branch (sync + landing checks against beta) instead of `main`. Linux/systemd hosts. |
-| [daily-cleaning-beta-mac.md](daily-cleaning-beta-mac.md) | macOS sibling of daily-cleaning-beta.md: same beta reset, but F4 restarts the prod daemon via `launchctl kickstart -k` against `~/Library/LaunchAgents/com.daystrom.blackbox.plist` (LaunchAgent, not systemd unit). |
+| [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall the checkout-host satellites and CLIs, restart the collectors (gated), check the deployed daemon with `bbox_doctor`. |
+| [daily-cleaning-beta.md](daily-cleaning-beta.md) | Beta-line sibling of daily-cleaning.md: same reset, but tracks `beta/blackbox-v2` as the integration branch (sync + landing checks against beta) instead of `main`. Linux hosts. |
+| [daily-cleaning-beta-mac.md](daily-cleaning-beta-mac.md) | macOS sibling of daily-cleaning-beta.md: same beta reset, but F3 signs the installed binaries with `stablesign` and F4 restarts the collectors via `launchctl kickstart -k` against their per-user LaunchAgents. |
 | [gap-processing.md](gap-processing.md) | Caller-owned grouping, bro validation and synthesis of gap records; preserve evidence and resolve only with operator authority. |
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |
 | [CLOSEOUT-beta.md](CLOSEOUT-beta.md) | Beta-line sibling of CLOSEOUT.md: fold a worktree into `beta/blackbox-v2` instead of `main`. |
 | [DESIGN_PANEL.md](DESIGN_PANEL.md) | Produce a reviewed implementation plan for **one phase or slice**: author-critic default, three-author panel escalation, adjudicated repair loop, independent review bookend to exact PASS. Prototype-stage orchestration runbook; fan-out is operator-directed via child orchestrators. |
-| [DOC_REVIEW.md](DOC_REVIEW.md) | Dispatch the 5-lens `blackbox-review` ensemble against a design doc. |
 | [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up notes. |
 | [RETRO_HARNESS.md](RETRO_HARNESS.md) | End-of-session self-report for a **`bro fleet` / bro-harness** session: what felt helpful, noisy, missing, or awkward. Files gaps only for reusable substrate defects. |
 | [RETRO_ISOLATE_REFACTOR.md](RETRO_ISOLATE_REFACTOR.md) | Post-probe retro for a **code-mode session driving the refactor namespace bindings** (`code.*`/`lsp.*`/`analysis.*`/`edits.*`) — the live-probe instrument for refactor-tools-v2. Files gaps in `*/refactor-tools/*`. |

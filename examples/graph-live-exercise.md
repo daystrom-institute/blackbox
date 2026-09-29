@@ -4,7 +4,9 @@
 against a throwaway daemon and prints a PASS or FAIL row per step. It is a
 live exercise, not a unit test: every step goes through the real surfaces an
 operator or an agent would use, over HTTP, against a daemon that owns nothing
-outside its throwaway root.
+outside its throwaway root. It connects on the `ops` MCP surface, which serves
+the operator tools (`bbox_project_publisher_*`, `bbox_project_graph_*`,
+`bbox_project_catalog_*`) the acceptance and published-read steps call.
 
 ## Rerun
 

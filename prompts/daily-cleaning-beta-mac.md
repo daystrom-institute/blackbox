@@ -7,23 +7,24 @@ topic:
   - prompts
   - maintenance
   - macos
-brief: "macOS sibling of daily-cleaning-beta.md. Same start-of-day reset to beta/blackbox-v2, but the prod daemon is a launchd service under ~/Library/LaunchAgents/ (com.daystrom.blackbox) and is restarted with `launchctl kickstart -k`, not `systemctl --user`. Linux hosts with systemd should use daily-cleaning-beta.md as-is."
+brief: "macOS sibling of daily-cleaning-beta.md. Same start-of-day checkout-host reset to beta/blackbox-v2, but every installed binary is signed with stablesign and the collectors (and fleetd, only when it changed) are restarted with `launchctl kickstart -k` against their per-user LaunchAgents. Linux hosts should use daily-cleaning-beta.md as-is."
 ---
 
 # Daily Cleaning (beta/blackbox-v2, macOS)
 
 Reset the local environment to a fresh, current state at the start of a day,
 tracking the **`beta/blackbox-v2`** integration branch instead of `main`. This
-prompt is the **macOS** sibling of [`daily-cleaning-beta.md`](daily-cleaning-beta.md)
-— everything is identical except **F4 (daemon restart)**, which uses `launchctl`
-against the per-user LaunchAgent at `~/Library/LaunchAgents/com.daystrom.blackbox.plist`
-instead of `systemctl --user restart blackbox.service`. Use
+prompt is the **macOS** sibling of [`daily-cleaning-beta.md`](daily-cleaning-beta.md).
+Two things differ: **F3** signs every installed binary with `stablesign`, and
+**F4** restarts the collectors (and `fleetd`, only when it changed) with
+`launchctl kickstart -k` against their per-user LaunchAgents instead of the
+host's service manager. Use
 [`daily-cleaning-beta.md`](daily-cleaning-beta.md) on Linux hosts; use this one
 on macOS.
 
 This prompt is **operator-pointed and intentionally destructive**: it discards
-the build cache, prunes worktrees, and restarts the production daemon. It is
-safe *because a human invokes it interactively* and accepts those effects — do
+the build cache, prunes worktrees, and restarts the checkout-host collectors.
+It is safe *because a human invokes it interactively* and accepts those effects; do
 not wire it into an unattended schedule without revisiting the gates below.
 
 You are operating in the **main worktree** (`~/repos/transcript-search`, branch
@@ -101,93 +102,129 @@ du -sh target 2>/dev/null          # record before (may be slow on large dirs)
 cargo clean
 ```
 
-## F3 — Cold rebuild + reinstall (prod)
+## F3 - Cold rebuild + reinstall checkout-host binaries
 
-Rebuild release binaries and reinstall the **production** surfaces:
-`blackboxd`, `bro`, and `bro-harness`. (Do **not** install to the `-dev`
-binary; this resets prod from the beta code.)
+The corpus daemon does not run on this host: it is a containerized workload
+that the cluster build/converge path deploys (see "Where Heavy Work Runs" in
+[`docs/project-guides/validation.md`](../docs/project-guides/validation.md)).
+This phase never builds, installs or restarts `blackboxd`, and it copies no
+system memories (they ship in the daemon's runtime image). It rebuilds the
+checkout-host satellites and CLIs from the beta code and reinstalls them:
+`bro`, `bro-harness`, `fleetd`, `bbox-code-collector`,
+`bbox-transcript-collector`, and the offline `blackbox` CLI.
+
+First record the build id of the installed `fleetd`; F4 uses it to decide
+whether `fleetd` changed:
 
 ```bash
-cargo build --release                 # blackboxd, bro-slack (root package)
-cargo build --release -p bro-cli      # bro (fleet/orchestration CLI — split out of the root package 2026-06-03)
-cargo build --release -p bro-harness  # bro-harness (workspace member crate)
+~/.local/bin/fleetd --version   # "fleetd <version> (<build id>)"; the build id is the commit it was built from
+```
 
-ls -l target/release/blackboxd target/release/bro target/release/bro-harness   # ALL THREE must exist, freshly built
+```bash
+cargo build --release -p bro-cli -p bro-harness -p fleetd \
+  -p bbox-code-collector -p bbox-transcript-collector
+cargo build --release --bin blackbox   # offline blackbox CLI (root package)
 
-install -m 755 target/release/blackboxd   ~/.local/bin/blackboxd
-install -m 755 target/release/bro         ~/.local/bin/bro
-install -m 755 target/release/bro-harness ~/.local/bin/bro-harness
+ls -l target/release/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}   # ALL SIX must exist, freshly built
+
+install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
+install -m 755 target/release/blackbox ~/.local/bin/
 ```
 
 > ⛔ **If any expected binary is missing from `target/release/` after the
 > builds, STOP and surface it.** Do not narrow the install list to make the
 > command succeed, and do not infer an explanation (e.g. "it must be a
-> subcommand now") — a missing binary almost always means the bin target moved
-> to a different workspace crate (exactly what happened when `bro` moved to
-> `bro-cli`, dfa907a). Find the crate that declares the bin
-> (`grep -rl 'name = "bro' crates/*/Cargo.toml Cargo.toml`), build it with
+> subcommand now"). A missing binary almost always means the bin target moved
+> to a different workspace crate. Find the crate that declares the bin
+> (`grep -rl 'name = "<bin>"' crates/*/Cargo.toml Cargo.toml`), build it with
 > `-p <crate>`, and install from there. A skipped reinstall leaves a stale
-> binary that silently passes `bro --version` while running week-old code.
+> binary that silently passes `--version` while running old code.
 
-Refresh runtime-loaded system memories to the current checkout (part of a full
-reset). `cp` is interactive-aliased on this host — bypass it:
+Sign every installed binary with `stablesign`, the same way
+[`docs/operating-blackbox.md`](../docs/operating-blackbox.md) signs `fleetd`.
+An unsigned satellite fails its first daemon dial on a TCC prompt you never
+see:
 
 ```bash
-install -d ~/.local/share/blackbox/memories
-command cp -af system-defaults/memories/. ~/.local/share/blackbox/memories/
+for bin in bro bro-harness fleetd bbox-code-collector bbox-transcript-collector blackbox; do
+  stablesign ~/.local/bin/$bin
+done
+codesign --verify --strict --verbose=2 ~/.local/bin/bbox-transcript-collector
 ```
 
-## F4 — Restart prod daemon  ⛔ GATED
+If a headless `stablesign` fails with `errSecInternalComponent` or the keychain
+reports `User interaction is not allowed`, run the same loop in a GUI terminal
+under the logged-in user.
 
-On macOS the prod daemon is a per-user **launchd** LaunchAgent, not a systemd
-unit. The plist lives at
-`~/Library/LaunchAgents/com.daystrom.blackbox.plist`; the service label is
-`com.daystrom.blackbox` and is registered into the `gui/$UID` domain
-(`launchctl print` will show `gui/<uid>/com.daystrom.blackbox`).
+## F4 - Kickstart collectors (fleetd only if changed)  ⛔ GATED
 
-LaunchAgents are **shared infrastructure** — other Claude accounts and
-background bros in this user session all hit the same daemon on
-`127.0.0.1:7264`. Restarting it mid-session briefly disconnects all of them,
-and here you are cutting **beta code** into prod, so confirm the operator
-actually wants beta running as prod. Do a read-only scope check and **get
-explicit operator confirmation for the named service** even though the
-operator invoked this prompt — the cleaning authorizes the *rebuild*, this
-gate authorizes the *cutover*.
+On macOS the collectors and `fleetd` are per-user **launchd** LaunchAgents in
+the `gui/$UID` domain: `com.daystrom.bbox-code-collector`,
+`com.daystrom.bbox-transcript-collector`, and `com.daystrom.fleetd`.
+
+They are **shared host infrastructure** other Claude accounts and background
+bros in this user session depend on, and here you are cutting **beta code**
+into them, so confirm the operator actually wants beta running on this host.
+Do a read-only scope check and **get explicit operator confirmation for each
+named service** even though the operator invoked this prompt: the cleaning
+authorizes the *rebuild*, this gate authorizes the *cutover*.
 
 ```bash
-# 1. Verify the LaunchAgent is registered and the binary on disk is the one
-#    the plist points at (catches a drifted ~/.local/bin/blackboxd).
-launchctl list | grep com.daystrom.blackbox                        # expect: "<pid> 0  com.daystrom.blackbox"
-plutil -p ~/Library/LaunchAgents/com.daystrom.blackbox.plist | grep -E 'Program|Label'   # expect: Program = ~/.local/bin/blackboxd
-
-# 2. Verbose state read (state/pid/last exit code) before the cutover.
-launchctl print "gui/$(id -u)/com.daystrom.blackbox" 2>&1 | grep -E 'state|pid|last exit code'
+# 1. Read-only scope check: state/pid/last exit code before the cutover.
+for label in com.daystrom.bbox-code-collector com.daystrom.bbox-transcript-collector; do
+  launchctl print "gui/$(id -u)/$label" 2>&1 | grep -E 'state|pid|last exit code'
+done
 
 # --- confirm with operator, then: ---
 
-# 3. In-process restart. `launchctl kickstart -k` SIGKILLs the running instance
-#    and respawns it under the SAME service registration — much cleaner than
-#    `launchctl unload && launchctl load`, which drops KeepAlive across the
-#    gap and can race with the watchdog if anything else is holding a handle.
-launchctl kickstart -k "gui/$(id -u)/com.daystrom.blackbox"
+# 2. In-process restart under the SAME service registration.
+launchctl kickstart -k "gui/$(id -u)/com.daystrom.bbox-code-collector"
+launchctl kickstart -k "gui/$(id -u)/com.daystrom.bbox-transcript-collector"
 
-# 4. Verify the new pid is alive and the daemon answers on the port.
-launchctl print "gui/$(id -u)/com.daystrom.blackbox" 2>&1 | grep -E 'state|pid|last exit code'   # expect: state = running, fresh pid, last exit code = 0
-curl -fsS "127.0.0.1:${BBOX_PORT:-7264}/roster" >/dev/null && echo "daemon answering"
+# 3. Verify fresh pids.
+for label in com.daystrom.bbox-code-collector com.daystrom.bbox-transcript-collector; do
+  launchctl print "gui/$(id -u)/$label" 2>&1 | grep -E 'state|pid|last exit code'   # expect: state = running, fresh pid
+done
 ```
 
-If `launchctl list` returns nothing for `com.daystrom.blackbox`, the LaunchAgent
-isn't loaded — surface that to the operator before trying `kickstart`. The
-remediation is `launchctl load ~/Library/LaunchAgents/com.daystrom.blackbox.plist`,
-not a daemon-binary reinstall.
+A running job is not proof of a successful scan: check each collector's log for
+a new completed cycle. If `launchctl print` finds no service for a label, the
+LaunchAgent isn't loaded; surface that to the operator before trying
+`kickstart`. The remediation is `launchctl load ~/Library/LaunchAgents/<label>.plist`,
+not a binary reinstall.
 
 > ⛔ **Do not use `launchctl unload` then `launchctl load` to "restart".** That
-> path is equivalent to a stop + start, not an in-process restart, and (a) the
-> service can be relaunched in the gap by something other than launchd, (b)
-> KeepAlive is torn down across the gap, (c) environment variables from the
-> plist are re-evaluated at load time, which can silently change behavior if
-> `~/Library/LaunchAgents/com.daystrom.blackbox.plist` drifted. `kickstart -k`
-> is the cutover; `unload`/`load` is a service-registration rewrite.
+> is a stop + start that tears down KeepAlive across the gap and re-evaluates
+> the plist's environment at load time. `kickstart -k` is the cutover;
+> `unload`/`load` is a service-registration rewrite.
+
+**fleetd.** Restart it ONLY if it changed, and only after its own explicit
+operator confirmation: restarting `fleetd` kills every harness worker it
+supervises (see "The fleet supervisor" in
+[`docs/operating-blackbox.md`](../docs/operating-blackbox.md)). Compare the
+build id recorded in F3 against the synced checkout:
+
+```bash
+git diff --quiet <recorded build id> HEAD -- \
+  crates/fleetd crates/bro-core crates/bro-protocol crates/bro-rpc Cargo.lock \
+  && echo "fleetd unchanged: leave it running"
+```
+
+If it changed, name the live sessions it will kill when asking, then:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.daystrom.fleetd"
+```
+
+If the operator declines, leave it running and report the deferral.
+`bro-harness` needs no restart: new sessions pick up the new binary.
+
+Finally, check the deployed daemon (not a localhost port):
+
+```bash
+bro mcp call bbox_doctor '{"format":"summary"}' --surface ops
+```
 
 ## F5 — Report
 
@@ -199,13 +236,15 @@ Return a tight summary:
   true orphans (path + branch + `beta/blackbox-v2..branch` commit count), fleet
   worktrees (listed, untouched).
 - **Disk:** `target/` size before → after clean; total reclaimed.
-- **Installed:** `blackboxd --version` / `bro --version` / `bro-harness`
+- **Installed:** `bro --version` / `fleetd --version` / `bro-harness`
   version, PLUS the install mtimes
-  (`ls -l ~/.local/bin/blackboxd ~/.local/bin/bro ~/.local/bin/bro-harness`) —
-  all three must postdate this cleaning run; `--version` alone cannot detect a
-  stale binary. Note whether the prod service was restarted (or deferred at the
-  gate).
-- **Daemon health:** pre-cutover pid → post-cutover pid, `state` from
-  `launchctl print`, and `/roster` probe result.
+  (`ls -l ~/.local/bin/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}`):
+  all six must postdate this cleaning run; `--version` alone cannot detect a
+  stale binary. Include the `codesign --verify` result.
+- **Services:** collectors restarted (pre/post pids from `launchctl print`) or
+  deferred at the gate; `fleetd` restarted, left running because unchanged, or
+  deferred at the gate.
+- **Daemon health:** the `bbox_doctor` summary findings from the deployed
+  daemon.
 
 Keep the report operational; do not narrate every command.

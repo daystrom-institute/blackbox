@@ -4,7 +4,6 @@ This directory retains useful brofile prompts and team definitions. These are
 optional inputs for caller-owned work; installation does not start a schedule
 or choose subsequent tasks.
 
-Auto-digest, auto-edge, evaluation, bootstrap and embedding workflows and their
-crons are retired. Vector maintenance and storage retention run directly in the
-daemon without those artifacts. Use the direct corpus and health tools to inspect
-state. See [system defaults](../system-defaults.md) for installation semantics.
+Vector maintenance and storage retention run directly in the daemon. Inspect
+state with the corpus tools and the operator health tools. See
+[system defaults](../system-defaults.md) for installation semantics.

@@ -26,9 +26,8 @@ plan:
 
 - `design/daemon-runtime/locality-first-decomposition.md`;
 - `design/daemon-runtime/distributed-code-source-collector-impl.md`;
-- `design/corpus/agentic-corpus/project-taxonomy-standardization.md`;
-- `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`; and
-- `design/daemon-runtime/checkout-provenance-export-impl.md`.
+- `design/corpus/agentic-corpus/project-taxonomy-standardization.md`; and
+- `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
 
 Current code contains the distributed code-source collector and may contain
 completed earlier decomposition phases, but it is expected not to contain the
@@ -65,7 +64,7 @@ plan is implementable and complete.
    fabricate an absolute path anywhere in that lane.
 4. Trace catalog identity and attachment requirements through published and
    provisional knowledge/gaps, `built_from` responses, publisher authority,
-   blame, render, file providers, provenance, refactor/mutation, artifacts,
+   render, file providers, refactor/mutation, artifacts,
    tool/transcript edges, coordination stores, and path-keyed compatibility
    migration. Distinguish durable logical state from execution-path state.
 5. Challenge the two-file transaction and v1 import at every crash boundary,

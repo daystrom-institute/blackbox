@@ -39,7 +39,7 @@ EVIDENCE="$ROOT/evidence"
 DAEMON_LOG="$ROOT/daemon.log"
 PID_FILE="$ROOT/daemon.pid"
 TOKEN_FILE="$ROOT/producer.token"
-MCP_URL="http://127.0.0.1:$PORT/mcp?surface=default"
+MCP_URL="http://127.0.0.1:$PORT/mcp?surface=ops"
 
 REPO_ID="graph-exercise-repository"
 PRODUCER_ID="graph-exercise-producer"
@@ -303,17 +303,11 @@ EOF
   "id": "1a2b3c4d",
   "title": "Governance records carry their own schema",
   "content": "The committed governance record graph ships its schema next to its rows, so a reader validates vertices and edges against the same generation it read.",
-  "variants": {},
   "category": "convention",
   "scope": "project",
   "providers": [],
   "priority": "standard",
-  "weight": 100,
-  "status": "active",
-  "approval": "user_confirmed",
   "render": false,
-  "decay": false,
-  "source": "user",
   "created_at": "2026-01-15T00:00:00Z",
   "updated_at": "2026-01-15T00:00:00Z",
   "recall_count": 0
@@ -324,17 +318,11 @@ EOF
   "id": "5e6f7a8b",
   "title": "Claims cite the evidence that supports them",
   "content": "Every active claim in the governance record cites at least one evidence, review, or decision vertex, so a traversal from a claim reaches its support in one hop.",
-  "variants": {},
   "category": "convention",
   "scope": "project",
   "providers": [],
   "priority": "standard",
-  "weight": 100,
-  "status": "active",
-  "approval": "user_confirmed",
   "render": false,
-  "decay": false,
-  "source": "user",
   "created_at": "2026-01-15T00:00:00Z",
   "updated_at": "2026-01-15T00:00:00Z",
   "recall_count": 0

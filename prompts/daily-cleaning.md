@@ -6,15 +6,15 @@ audience: operator
 topic:
   - prompts
   - maintenance
-brief: "Start-of-day environment reset: sync to latest main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall the prod daemon/bro/bro-harness, restart the prod service. Operator-invoked and intentionally destructive — the operator running it interactively IS the authorization."
+brief: "Start-of-day checkout-host reset: sync to latest main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall the checkout-host satellites and CLIs (bro, bro-harness, fleetd, collectors, blackbox), restart the collectors, check the deployed daemon with bbox_doctor. Operator-invoked and intentionally destructive: the operator running it interactively IS the authorization."
 ---
 
 # Daily Cleaning
 
 Reset the local environment to a fresh, current state at the start of a day.
 This prompt is **operator-pointed and intentionally destructive**: it discards
-the build cache, prunes worktrees, and restarts the production daemon. It is
-safe *because a human invokes it interactively* and accepts those effects — do
+the build cache, prunes worktrees, and restarts the checkout-host collectors.
+It is safe *because a human invokes it interactively* and accepts those effects; do
 not wire it into an unattended schedule without revisiting the gates below.
 
 You are operating in the **main worktree** (`~/repos/transcript-search`, branch
@@ -89,43 +89,80 @@ du -sh target 2>/dev/null          # record before
 cargo clean
 ```
 
-## F3 — Cold rebuild + reinstall (prod)
+## F3 - Cold rebuild + reinstall checkout-host binaries
 
-Rebuild release binaries and reinstall the **production** surfaces:
-`blackboxd`, `bro`, and `bro-harness`. (Do **not** install to the `-dev`
-binary; this resets prod.)
+The corpus daemon does not run on this host: it is a containerized workload
+that the cluster build/converge path deploys (see "Where Heavy Work Runs" in
+[`docs/project-guides/validation.md`](../docs/project-guides/validation.md)).
+This phase never builds, installs or restarts `blackboxd`, and it copies no
+system memories (they ship in the daemon's runtime image). It rebuilds the
+checkout-host satellites and CLIs and reinstalls them:
+`bro`, `bro-harness`, `fleetd`, `bbox-code-collector`,
+`bbox-transcript-collector`, and the offline `blackbox` CLI.
+
+First record the build id of the installed `fleetd`; F4 uses it to decide
+whether `fleetd` changed:
 
 ```bash
-cargo build --release                 # blackboxd, bro, bro-irc, bro-slack (root package)
-cargo build --release -p bro-harness  # bro-harness (workspace member crate)
-
-install -m 755 target/release/blackboxd   ~/.local/bin/blackboxd
-install -m 755 target/release/bro         ~/.local/bin/bro
-install -m 755 target/release/bro-harness ~/.local/bin/bro-harness
+~/.local/bin/fleetd --version   # "fleetd <version> (<build id>)"; the build id is the commit it was built from
 ```
 
-Refresh runtime-loaded system memories to the current checkout (part of a full
-reset). `cp` is interactive-aliased on this host — bypass it:
-
 ```bash
-install -d ~/.local/share/blackbox/memories
-command cp -af system-defaults/memories/. ~/.local/share/blackbox/memories/
+cargo build --release -p bro-cli -p bro-harness -p fleetd \
+  -p bbox-code-collector -p bbox-transcript-collector
+cargo build --release --bin blackbox   # offline blackbox CLI (root package)
+
+ls -l target/release/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}   # ALL SIX must exist, freshly built
+
+install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
+install -m 755 target/release/blackbox ~/.local/bin/
 ```
 
-## F4 — Restart prod daemon  ⛔ GATED
+> ⛔ **If any expected binary is missing from `target/release/` after the
+> builds, STOP and surface it.** Do not narrow the install list to make the
+> command succeed, and do not infer an explanation (e.g. "it must be a
+> subcommand now"). A missing binary almost always means the bin target moved
+> to a different workspace crate. Find the crate that declares the bin
+> (`grep -rl 'name = "<bin>"' crates/*/Cargo.toml Cargo.toml`), build it with
+> `-p <crate>`, and install from there. A skipped reinstall leaves a stale
+> binary that silently passes `--version` while running old code.
 
-`blackbox.service` is a **shared service** other accounts and background bros
-depend on. Restarting it mid-session disrupts them. Before restarting, do a
-read-only scope check and **get explicit operator confirmation for the named
-service** even though the operator invoked this prompt — the cleaning authorizes
-the *rebuild*, this gate authorizes the *cutover*.
+## F4 - Restart collectors (fleetd only if changed)  ⛔ GATED
+
+The collectors and `fleetd` are **shared host infrastructure** other accounts
+and background bros depend on. Before restarting anything, do a read-only
+scope check and **get explicit operator confirmation for each named service**
+even though the operator invoked this prompt: the cleaning authorizes the
+*rebuild*, this gate authorizes the *cutover*.
+
+1. **Collectors.** Restart `bbox-code-collector` and
+   `bbox-transcript-collector` through the host's service manager (whatever
+   unit or supervisor this host runs them under), then confirm each is running
+   and completes a new collection cycle. A running job is not proof of a
+   successful scan; check its cycle report.
+2. **fleetd.** Restart it ONLY if it changed, and only after its own explicit
+   operator confirmation: restarting `fleetd` kills every harness worker it
+   supervises (see "The fleet supervisor" in
+   [`docs/operating-blackbox.md`](../docs/operating-blackbox.md)). Compare the
+   build id recorded in F3 against the synced checkout:
+
+   ```bash
+   git diff --quiet <recorded build id> HEAD -- \
+     crates/fleetd crates/bro-core crates/bro-protocol crates/bro-rpc Cargo.lock \
+     && echo "fleetd unchanged: leave it running"
+   ```
+
+   If it changed, name the live sessions it will kill when asking, then restart
+   it through the host's service manager. If the operator declines, leave it
+   running and report the deferral.
+3. **bro-harness.** No restart: new sessions pick up the new binary; running
+   sessions keep theirs.
+
+Finally, check the deployed daemon (not a localhost port):
 
 ```bash
-systemctl --user status blackbox.service          # read-only scope check first
-# --- confirm with operator, then: ---
-systemctl --user restart blackbox.service
-systemctl --user is-active blackbox.service        # expect: active
-curl -fsS "127.0.0.1:${BBOX_PORT:-7264}/roster" >/dev/null && echo "daemon answering"
+bro mcp call bbox_doctor '{"format":"summary"}' --surface ops
 ```
 
 ## F5 — Report
@@ -138,8 +175,14 @@ Return a tight summary:
   true orphans (path + branch + `main..branch` commit count), fleet worktrees
   (listed, untouched).
 - **Disk:** `target/` size before → after clean; total reclaimed.
-- **Installed:** `blackboxd --version` / `bro --version` / `bro-harness`
-  version, and whether the prod service was restarted (or deferred at the gate).
-- **Daemon health:** `is-active` + `/roster` probe result.
+- **Installed:** `bro --version` / `fleetd --version` / `bro-harness`
+  version, PLUS the install mtimes
+  (`ls -l ~/.local/bin/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}`):
+  all six must postdate this cleaning run; `--version` alone cannot detect a
+  stale binary.
+- **Services:** collectors restarted or deferred at the gate; `fleetd`
+  restarted, left running because unchanged, or deferred at the gate.
+- **Daemon health:** the `bbox_doctor` summary findings from the deployed
+  daemon.
 
 Keep the report operational; do not narrate every command.

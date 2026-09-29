@@ -44,8 +44,8 @@ Domain home for the dispatch plane. Boundary contract:
   locality wrapper. The external-client `default` surface deliberately hides
   lifecycle tools including `bbox_render`, so routing a cockpit worker there
   makes checkout-local render impossible even when workspace authority is
-  valid. Workflow workers remain on `agent-internal`; recursive agent and atom
-  dispatches remain on `default`.
+  valid. Workflow workers remain on `agent-internal`; every other origin
+  dispatches on `default`.
 
 ## Persisted task compatibility and damaged snapshots
 
@@ -78,8 +78,8 @@ Domain home for the dispatch plane. Boundary contract:
 Badgey and the stateful consultant runtime have no tool routes, agent adapter,
 atom execution backend, registry reconstruction, or startup recovery. Legacy
 consultant atom implementations and handles remain decodable for historical
-records; new installation and execution refuse. Ordinary bro execution and
-named bro agents remain available.
+records; new installation and execution refuse. Ordinary bro execution
+remains available.
 
 Existing `badgey/proposals` and `badgey/action_journal` beneath the configured
 bro store are inactive archives. Startup does not open, reconcile, move, or

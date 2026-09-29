@@ -1,6 +1,6 @@
 +++
 title = "Agentic opening sequence — orient, search, inspect, traverse, answer"
-tags = ["opening", "opening-sequence", "grounding", "first-step", "first-loop", "agentic", "agentic-tools", "discover", "discover-seed", "inspect", "inspect-entity", "find-paths", "bundle-evidence", "bundle", "describe-schema", "where", "what", "why", "who", "how", "when", "trace", "chain", "blast-radius", "impact", "lineage", "history", "provenance", "navigate", "search-quality", "graph-walk", "answer-protocol", "verification", "self-check", "answer"]
+tags = ["opening", "opening-sequence", "grounding", "first-step", "first-loop", "agentic", "agentic-tools", "discover", "inspect", "inspect-entity", "find-paths", "bundle-evidence", "bundle", "describe-schema", "where", "what", "why", "who", "how", "when", "trace", "chain", "blast-radius", "impact", "lineage", "history", "provenance", "navigate", "search-quality", "graph-walk", "answer-protocol", "verification", "self-check", "answer"]
 order = 0
 template = false
 +++
@@ -47,8 +47,8 @@ and edge families.
 
 - **Structural** (`IN_FILE`, `IN_SESSION`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`) — containment, thread relations, and sequence
 - **AST** (`DEFINED_IN`, `CONTAINS_SYMBOL`, `HAS_FIELD`, `IMPLEMENTS_TRAIT`, `CALLS`, `USES_TYPE`) — code navigation
-- **Knowledge** (`KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD`): knowledge provenance
-- **Provenance** (`SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE`) — origin trails
+- **Knowledge** (`KNOWLEDGE_FROM_SESSION`): knowledge provenance
+- **Provenance** (`SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE`): origin trails
 - **Git** (`COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC`) — version control history
 - **Format-specific** (`LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF`) — cross-reference within docs
 - **Tool-call** (`RAN_BASH`): shell commands agents ran
@@ -118,8 +118,9 @@ each change. A bare
 incomplete.
 
 **REPLACEMENT** ("what replaced X?", "what's the current version?"):
-cite BOTH the old (`SUPERSEDES` source) AND the new (`SUPERSEDES`
-target) entities. State the supersession direction explicitly.
+cite BOTH the old AND the new entity, with the evidence that links them
+(for a project knowledge entry, the git history of
+`.bbox/knowledge/<id>.json`). State the replacement direction explicitly.
 
 **HOW** ("how does X work?"): assemble a
 `bbox_bundle_evidence(question, [code_chunks, design_docs])` answer

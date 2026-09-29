@@ -89,29 +89,17 @@ Prefer sandbox-scoped tools and idioms over host/outside-daemon assumptions:
 When the task is to author behavior, choose the lowest surface that matches the
 durability and control-plane shape:
 
-- **NARF cells** — use `narf_exec` for one-shot JS composition, or
-  `narf_prepare` followed by `narf_run` when the rendered source/contract needs
-  review before execution. A cell receives values, not ref envelopes. Host tools
-  return values into the cell; use JS for transforms and return a compact
-  summary, structured value, or KV name rather than a blob.
-- **NARF dialect** — cells have `narf.encode.yaml`,
-  `narf.encode.frontmatter(attrs, body)`, and
-  `narf.encode.mdTable(rows, columns?)` for non-JS-native output formats.
-  `mdTable` accepts an array of objects and optional explicit column order.
-  Use `narf.kv.set/get/peek/delete` only on exact names the author already
-  holds; in-box KV enumeration/search is intentionally absent. Use model-facing
-  KV list/peek/get tools, when present, to survey keys before authoring a cell
-  that dereferences them. Ordinary JS `await` is live within the current
-  activation; cross-turn or restart-safe waiting requires an explicit durable
-  handle from a host producer.
-- **Refactor work** — pull `sm-refactor` and the language memory when the
-  compact catalog is not enough. Use `bbox_refactor_status` to inventory exact
-  items/kinds, then `bbox_refactor_plan_kinds(language=..., safety_class=...)`
-  to choose a safe next primitive before `bbox_refactor_plan`; apply only after
-  reviewing a plan with `bbox_refactor_apply(confirm=true)`. LSP-backed kinds
-  such as
-  `rust_lsp_rename` should return a plan or fail closed with a clear LSP
-  error/timeout. If an LSP-backed plan remains `tool_running` after a wait
+- **Code-mode cells** - use `exec` to run a JS/TS cell that composes
+  `tools.*` calls, emits content with `text()`, and persists values across
+  cells with `store()`/`load()`; use `wait` to resume or terminate a
+  still-running cell by `cell_id`. Host tools return values into the cell; use
+  JS for transforms and return a compact summary or structured value rather
+  than a blob.
+- **Refactor work** - pull `sm-refactor` and the language memory when the
+  compact catalog is not enough. Refactor bindings (`code.*`, `edits.*`,
+  `lsp.*`, `java.*`, `analysis.*`) are cell-only namespace globals, never
+  `tools.<ns>.*`. LSP-backed operations fail closed with a clear LSP
+  error/timeout. If an LSP-backed call stays `tool_running` after a wait
   timeout, inspect `bro_status`, cancel only your own task if needed, and file a
   refactor gap with the tool call and idle timing.
 - **Ad-hoc bro dispatch** — use `bro_exec` for a fresh child task,
