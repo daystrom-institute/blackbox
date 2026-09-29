@@ -31,12 +31,12 @@ date: 2026-08-14
 > rule; the file lane (`bbox-file-source` wire crate, `bbox-file-collector`
 > satellite, manifest generations, stage-then-flip activation); the conversation
 > lane (`bbox-conversation-source` wire crate, server-owned per-channel cursors,
-> journaled acceptance with held revisions); and the M2 source-projection
-> substrate `bbox-source-graph` (`SourceProjectionStore`, `GraphDelta`,
-> `NamedCheckpointSet`, `ReconciliationMode`, content-addressed observation
-> retention with `ReplayPlan`, and `SourceProjectionStatus`). The dataset wire
-> lane, its satellite, the schema-directed projection, and the action surface
-> are all new. Reverify every contract name against code before building.
+> journaled acceptance with held revisions). The M2 source-projection
+> substrate (`SourceProjectionStore`, `GraphDelta`, `NamedCheckpointSet`,
+> `ReconciliationMode`, content-addressed observation retention with
+> `ReplayPlan`, and `SourceProjectionStatus`), the dataset wire lane, its
+> satellite, the schema-directed projection, and the action surface are all
+> new. Reverify every contract name against code before building.
 
 Resolves the design frame for `gap-0378c305`. Owned by
 [the graph-native connector campaign](reflective-graph-connector-program.md);
@@ -1176,7 +1176,7 @@ secretly an API-dataset contract wearing a general name.
   patterns are cited directly here; its shape argument (why an append-only log
   is not a file tree) is the template for section 2's argument that an entity
   collection is neither.
-- **Builds on** the M2 source-projection substrate `bbox-source-graph` and the
+- **Builds on** the M2 source-projection substrate and the
   reflective graph kernel `bbox-project-graph`: `SourceProjectionStore`,
   `GraphDelta`, `NamedCheckpointSet`, `ReconciliationMode`, content-addressed
   observation retention, `GraphSchema` with per-property retrieval

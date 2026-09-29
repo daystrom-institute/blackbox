@@ -957,10 +957,8 @@ Scope: connector-managed source graphs in the index, the `graph_source`
 filter, the collision rule (`visible_connector`) honored at query time, and
 the operator review surface for connector retrieval policy.
 
-Separated from M9a for a sequencing reason rather than a design one:
-`crates/bbox-source-graph` is a workspace member but is **not** a dependency
-of the `blackbox` crate or of `bbox-indexing`, and no daemon path
-constructs a `SourceProjectionStore` today. The connector read lane exists
+Separated from M9a for a sequencing reason rather than a design one: no
+daemon path constructs a source projection store. The connector read lane exists
 in `ProjectGraphViewCatalog` and is exercised only by its own tests. The
 transport that feeds it is M4. M9b is therefore gated on M4 landing, and
 carving it out keeps M9a shippable in the meantime.
@@ -1091,9 +1089,7 @@ Layered, extending the campaign's matrix rather than replacing it:
   the real index or the prod daemon.
 
 Public-safe fixtures only. No live tenant data in fixtures, snapshots, or
-examples. `crates/bbox-source-graph/tests/synthetic_api_dataset.rs` is the
-existing synthetic API-dataset connector and is the natural fixture source
-for the connector-plane slices.
+examples.
 
 **Documentation debt this milestone should clear.**
 `docs/graph-retrieval-internals.md` currently describes three ranked lanes
@@ -1213,8 +1209,7 @@ permanent.
   [Reflective Project Graph](../corpus/agentic-corpus/reflective-project-graph.md),
   which deferred full-text and vector indexing of graph vertices out of v1
   and points at the connector program for the follow-on.
-- **Builds on:** the M2 source projection contracts
-  (`crates/bbox-source-graph`) and the M3 evidence binding lane
+- **Builds on:** the M2 source projection contracts and the M3 evidence binding lane
   (`crates/bbox-project-graph/src/evidence.rs`), both landed on
   `beta/blackbox-v2`; the existing hybrid retrieval pipeline described in
   [`docs/graph-retrieval-internals.md`](../../docs/graph-retrieval-internals.md)
