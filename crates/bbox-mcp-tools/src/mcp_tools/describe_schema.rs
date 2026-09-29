@@ -167,8 +167,8 @@ fn edge_families() -> Vec<serde_json::Value> {
         ),
         family(
             "Tool-call",
-            &["EDITED_FILE", "EDITED_BY_SESSION", "READ_FILE", "RAN_BASH"],
-            "Use tool-call edges for transcript events that touched files or executed shell commands.",
+            &["RAN_BASH"],
+            "Use tool-call edges for transcript events that executed shell commands.",
         ),
     ]
 }

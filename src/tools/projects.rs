@@ -694,27 +694,13 @@ impl BlackboxServer {
                         bbox_indexing::checkout_access::CheckoutAccessKind::LocalProjectWalk,
                         bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
                         )?;
-                        let git = project_for_backfill
-                            .is_git_repo
-                            .then(|| {
-                                crate::server::checkout_access::acquire_selected_project_access(
-                                    &checkout_access,
-                                    &project_for_backfill.project_id,
-                                    bbox_indexing::checkout_access::CheckoutAccessKind::GitHistory,
-                                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                                )
-                            })
-                            .transpose()?;
                         index::backfill_tool_edges_for_project(
                             &reindex_cfg,
                             &project_for_backfill.project_id,
                             local.project_root(),
-                            git.as_ref().map(|lease| lease.checkout_root()),
                             || {
                                 checkout_access
-                                    .publication_guard_for(
-                                        std::iter::once(&local).chain(git.iter()),
-                                    )
+                                    .publication_guard_for(std::iter::once(&local))
                                     .map_err(anyhow::Error::new)
                             },
                         )

@@ -8350,7 +8350,7 @@ mod tests {
 
         let proj = vec![derived_edge("k_proj", "DESCRIBES", "k2")];
         let sym = vec![derived_edge("k_sym", "HAS_SYMBOL", "k2")];
-        let git = vec![derived_edge("k_git", "EDITED_FILE", "k2")];
+        let git = vec![derived_edge("k_git", "COMMIT_TOUCHED_FILE", "k2")];
 
         write_dirty_overlay(
             edges_dir,
@@ -8380,7 +8380,7 @@ mod tests {
 
         let proj = vec![derived_edge("k_proj", "DESCRIBES", "k2")];
         let sym = vec![derived_edge("k_sym", "HAS_SYMBOL", "k2")];
-        let git = vec![derived_edge("k_git", "EDITED_FILE", "k2")];
+        let git = vec![derived_edge("k_git", "COMMIT_TOUCHED_FILE", "k2")];
 
         switch_to_dirty_overlay(
             edges_dir,

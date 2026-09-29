@@ -5546,7 +5546,7 @@ mod tests {
                 root: root.join("enrolled"),
                 scope: configured.scope.clone(),
                 git_history: true,
-                provenance: true,
+                provenance: false,
                 published_knowledge: None,
             }],
         )
@@ -5633,7 +5633,7 @@ mod tests {
             root: root.join("b"),
             scope: PublishedScope::try_new("repo-b", ".").unwrap(),
             git_history: true,
-            provenance: true,
+            provenance: false,
             published_knowledge: None,
         };
         write_enrolled_projects(
@@ -5716,7 +5716,7 @@ mod tests {
             root: root.clone(),
             scope: PublishedScope::try_new(first_commit.clone(), ".").unwrap(),
             git_history: true,
-            provenance: true,
+            provenance: false,
             published_knowledge: None,
         };
         let request = probe_onboard_request(&project).unwrap();
