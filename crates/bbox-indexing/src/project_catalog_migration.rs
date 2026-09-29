@@ -294,9 +294,8 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
     /// The resolved `projects.json` path this layout administers.
     ///
     /// Exposed for the offline CLI, which needs the CONFIGURED path to take
-    /// the lifetime lock (`--configured` apply, and the
-    /// `--require-exclusive-availability` bridge-down proof on verify) before
-    /// any store is opened. Read-only: the layout stays the single resolver.
+    /// the lifetime lock before any store is opened. Read-only: the layout
+    /// stays the single resolver.
     pub fn projects_path(&self) -> &Path {
         &self.projects_path
     }
@@ -876,37 +875,17 @@ pub struct ProjectCatalogMigrationApplyResultV1 {
 
 /// Host-local path-bearing parity projection. Deliberately not serializable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectCatalogCompatibilityProjectionV1 {
+pub(crate) struct ProjectCatalogCompatibilityProjectionV1 {
     records: Vec<ProjectRecord>,
     omitted_catalog_count: u64,
 }
 
-impl ProjectCatalogCompatibilityProjectionV1 {
-    pub fn records(&self) -> &[ProjectRecord] {
-        &self.records
-    }
-
-    pub fn omitted_catalog_count(&self) -> u64 {
-        self.omitted_catalog_count
-    }
-}
-
 /// Verify result separates serializable receipt from host-local paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectCatalogMigrationVerifyResultV1 {
+pub(crate) struct ProjectCatalogMigrationVerifyResultV1 {
     receipt: MigrationVerificationReceiptV1,
     compatibility: ProjectCatalogCompatibilityProjectionV1,
     mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
-}
-
-impl ProjectCatalogMigrationVerifyResultV1 {
-    pub fn receipt(&self) -> &MigrationVerificationReceiptV1 {
-        &self.receipt
-    }
-
-    pub fn compatibility(&self) -> &ProjectCatalogCompatibilityProjectionV1 {
-        &self.compatibility
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -930,35 +909,6 @@ pub struct ProjectCatalogMigrationApplyRequestV1 {
     pub resolution_path: PathBuf,
 }
 
-/// The P6-F configured apply request (plan section 3.2, adjudication Q-B).
-///
-/// ONE target layout, not the rehearsal/protected pair. Configured apply is
-/// defined by target equality, so a dual-layout request would either be
-/// self-contradictory (the same layout in both slots, which
-/// `validate_rehearsal_separation` is built to refuse) or would silently
-/// overload the rehearsal request's meaning. The dual-layout
-/// `ProjectCatalogMigrationApplyRequestV1` keeps its rehearsal meaning
-/// unchanged.
-pub struct ProjectCatalogMigrationApplyConfiguredRequestV1 {
-    pub target_layout: ProjectCatalogMigrationResolvedLayoutV1,
-    pub report_path: PathBuf,
-    pub resolution_path: PathBuf,
-}
-
-pub struct ProjectCatalogMigrationVerifyRequestV1 {
-    pub rehearsal_layout: ProjectCatalogMigrationResolvedLayoutV1,
-}
-
-/// The P6-F configured verification request (plan section 3.2).
-///
-/// The shipped `verify` entry refuses a layout without a rehearsal root, so
-/// the configured store cannot be verified through it. This entry verifies
-/// exactly one config-resolved target; the availability probe that precedes
-/// it is a CLI concern, not a facade one.
-pub struct ProjectCatalogMigrationVerifyConfiguredRequestV1 {
-    pub target_layout: ProjectCatalogMigrationResolvedLayoutV1,
-}
-
 /// The only public executable migration authority.
 pub struct ProjectCatalogMigrationFacadeV1;
 
@@ -973,33 +923,6 @@ impl ProjectCatalogMigrationFacadeV1 {
         request: ProjectCatalogMigrationApplyRequestV1,
     ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
         FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).apply_rehearsal(request)
-    }
-
-    /// Apply reviewed artifacts to the CONFIGURED target (plan section 3.2).
-    ///
-    /// Retains every four-hash, report-status, resolution, recapture,
-    /// transaction, mutation-disposition, and post-commit verification check
-    /// that rehearsal apply runs, through the shared
-    /// [`FacadeCoreV1::apply_to_target`] core. It omits exactly one check,
-    /// `validate_rehearsal_separation`, because configured target equality is
-    /// this operation's definition rather than a defect.
-    pub fn apply_configured(
-        request: ProjectCatalogMigrationApplyConfiguredRequestV1,
-    ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
-        FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).apply_configured(request)
-    }
-
-    pub fn verify(
-        request: ProjectCatalogMigrationVerifyRequestV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).verify(request)
-    }
-
-    /// Fresh verification against the CONFIGURED target (plan section 3.2).
-    pub fn verify_configured(
-        request: ProjectCatalogMigrationVerifyConfiguredRequestV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).verify_configured(request)
     }
 }
 
@@ -1112,41 +1035,9 @@ where
         )
     }
 
-    /// Apply to the configured target (plan section 3.2, adjudication Q-B).
-    ///
-    /// The ONLY check omitted relative to rehearsal apply is
-    /// `validate_rehearsal_separation`: under `--configured` the target and
-    /// the protected layout are the same layout by definition, so a
-    /// separation check could only ever refuse the operation it is meant to
-    /// authorize. In its place the target must carry the CONFIGURED shape
-    /// (no rehearsal root), which is the Q-C binding condition that a
-    /// configured-selected layout is config-resolved.
-    fn apply_configured(
-        &self,
-        request: ProjectCatalogMigrationApplyConfiguredRequestV1,
-    ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
-        request.target_layout.validate()?;
-        if request.target_layout.rehearsal_root.is_some() {
-            return Err(unsafe_layout(
-                "configured apply requires a config-resolved layout, not a rehearsal-root layout",
-            ));
-        }
-        self.apply_to_target(
-            &request.target_layout,
-            None,
-            &request.report_path,
-            &request.resolution_path,
-        )
-    }
-
-    /// The shared apply-to-target core (plan section 3.2).
-    ///
-    /// Both apply entries route through this one body so they cannot drift
-    /// transactionally. `artifact_confinement` is the SECOND layout reviewed
-    /// artifacts must also stay clear of; rehearsal apply passes the
-    /// protected configured layout there, and configured apply passes `None`
-    /// because the target already IS that layout and
-    /// `validate_artifact_set` has confined the artifacts against it.
+    /// The apply-to-target core. `artifact_confinement` is the SECOND layout
+    /// reviewed artifacts must also stay clear of; rehearsal apply passes the
+    /// protected configured layout there.
     fn apply_to_target(
         &self,
         target_layout: &ProjectCatalogMigrationResolvedLayoutV1,
@@ -1208,46 +1099,6 @@ where
         validate_apply_result(&result, &report_bytes, &report, &resolution_bytes)?;
         Ok(result)
     }
-
-    fn verify(
-        &self,
-        request: ProjectCatalogMigrationVerifyRequestV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        request.rehearsal_layout.validate()?;
-        if request.rehearsal_layout.rehearsal_root.is_none() {
-            return Err(unsafe_layout(
-                "migration verify requires a rehearsal-root layout",
-            ));
-        }
-        self.verify_target(&request.rehearsal_layout)
-    }
-
-    /// Verify the configured target (plan section 3.2).
-    ///
-    /// Same durable-state verification as the rehearsal entry, with the
-    /// rehearsal-root requirement replaced by its configured counterpart:
-    /// the target must be config-resolved.
-    fn verify_configured(
-        &self,
-        request: ProjectCatalogMigrationVerifyConfiguredRequestV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        request.target_layout.validate()?;
-        if request.target_layout.rehearsal_root.is_some() {
-            return Err(unsafe_layout(
-                "configured verify requires a config-resolved layout, not a rehearsal-root layout",
-            ));
-        }
-        self.verify_target(&request.target_layout)
-    }
-
-    fn verify_target(
-        &self,
-        layout: &ProjectCatalogMigrationResolvedLayoutV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        let result = self.integration.verify(layout)?;
-        validate_verify_result(&result)?;
-        Ok(result)
-    }
 }
 
 pub(crate) struct PreparedPreflightV1 {
@@ -1271,10 +1122,6 @@ pub(crate) trait ClosedMigrationIntegrationV1 {
     ) -> Result<PreparedPreflightV1, ProjectCatalogMigrationError>;
 
     /// Apply reviewed artifacts to ONE explicit layout.
-    ///
-    /// Target-generic by construction: the integration never asked whether
-    /// its layout was a rehearsal root, so both the rehearsal and the
-    /// configured apply entries drive exactly this body.
     fn apply_to_target(
         &self,
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
@@ -1283,11 +1130,6 @@ pub(crate) trait ClosedMigrationIntegrationV1 {
         resolution_bytes: &[u8],
         resolution: &ProjectCatalogMigrationResolutionV1,
     ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError>;
-
-    fn verify(
-        &self,
-        layout: &ProjectCatalogMigrationResolvedLayoutV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4382,13 +4224,6 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
             },
         })
     }
-
-    fn verify(
-        &self,
-        layout: &ProjectCatalogMigrationResolvedLayoutV1,
-    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        verify_installed(layout)
-    }
 }
 
 /// Versioned canonical-JSON namespace-inventory asset persisted through the
@@ -6063,24 +5898,6 @@ fn validate_apply_result(
     Ok(())
 }
 
-fn validate_verify_result(
-    result: &ProjectCatalogMigrationVerifyResultV1,
-) -> Result<(), ProjectCatalogMigrationError> {
-    if result.receipt.version != FACADE_VERSION_V1
-        || !verification_receipt_observations_match(&result.receipt)
-        || result.receipt.omitted_catalog_count != result.compatibility.omitted_catalog_count
-        || result.receipt.attached_project_count
-            != u64::try_from(result.compatibility.records.len()).unwrap_or(u64::MAX)
-    {
-        return Err(ProjectCatalogMigrationError::new(
-            "error.project_catalog_migration_invalid_verify_output",
-            "closed verification returned inconsistent installed state",
-            result.mutation_disposition,
-        ));
-    }
-    Ok(())
-}
-
 fn verification_receipt_observations_match(receipt: &MigrationVerificationReceiptV1) -> bool {
     receipt.expected_catalog_hash == receipt.observed_catalog_hash
         && receipt.expected_attachment_hash == receipt.observed_attachment_hash
@@ -7552,27 +7369,6 @@ mod tests {
             omitted_catalog_count: 0,
         };
         (report, report_bytes, resolution_bytes, receipt)
-    }
-
-    #[test]
-    fn post_open_verify_mismatch_inherits_recovery_disposition() {
-        let (_, _, _, mut receipt) = verification_validation_fixture();
-        receipt.version = 0;
-        let result = ProjectCatalogMigrationVerifyResultV1 {
-            receipt,
-            compatibility: ProjectCatalogCompatibilityProjectionV1 {
-                records: Vec::new(),
-                omitted_catalog_count: 0,
-            },
-            mutation_disposition: ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState,
-        };
-
-        let error = validate_verify_result(&result).unwrap_err();
-
-        assert_eq!(
-            error.mutation_disposition,
-            ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
-        );
     }
 
     #[test]

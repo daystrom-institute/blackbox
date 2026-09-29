@@ -13,8 +13,7 @@
 //! ```text
 //! Item 1, the extended migrated fixture:
 //!   - migrated root through the real facade rehearsal ceremony
-//!       `exit_gate_fixture` (this file), built on the ceremony proven by
-//!       `project_catalog_migration_facade::external_consumer_runs_exact_review_apply_fresh_verify_and_reapply`
+//!       `exit_gate_fixture` (this file)
 //!   - proved legacy commit namespace (recorded in the persisted
 //!       `LegacyCommitNamespaceInventoryAssetV1`)
 //!       `the_extended_migrated_fixture_carries_every_section_11_shape` (this file);

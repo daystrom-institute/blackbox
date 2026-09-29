@@ -519,16 +519,11 @@ closed without mixing epochs.
 ### 6.3 Version-1 import and rollout command
 
 Version-1 import is an explicit offline operation, not a side effect of first
-v2 daemon startup. Add these non-daemon command modes:
-
-```text
-blackbox project-catalog migrate --preflight --report <path> --resolution <path>
-blackbox project-catalog migrate --apply --report <path> --resolution <path> --rehearsal-root <path>
-blackbox project-catalog verify --root <path>
-```
-
-The executable is a thin caller of the one public `bbox-indexing` migration
-facade specified by the active phase implementation document. That facade owns
+v2 daemon startup. It has no operator command surface. A `MigratedV1` catalog is
+verified at every open through its origin marker, receipt binding and
+transaction journal. The one public
+`bbox-indexing` migration facade (preflight and rehearsal apply) remains the
+producer of migrated fixtures for tests. That facade owns
 owner-lane capture, deterministic planning, exact artifact decoding, complete
 participant-registry construction, transaction apply, fresh verification, and
 the host-local compatibility projection. No CLI or later consumer may
