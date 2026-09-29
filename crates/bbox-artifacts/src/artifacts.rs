@@ -121,8 +121,6 @@ pub struct ArtifactListEntry {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2081,15 +2079,7 @@ impl ArtifactCatalog {
                         continue;
                     }
                 }
-                if !p.include_superseded && meta.kind == ArtifactKind::Agent && !meta.active {
-                    continue;
-                }
                 let artifact_path = self.artifact_path(meta.kind, &meta.name)?;
-                let description = if meta.kind == ArtifactKind::Agent {
-                    extract_agent_description(&artifact_path)
-                } else {
-                    None
-                };
                 let current_meta = meta.clone();
                 out.push(ArtifactListEntry {
                     kind: current_meta.kind,
@@ -2101,52 +2091,7 @@ impl ArtifactCatalog {
                     supersedes_chain: current_meta.supersedes_chain,
                     path: artifact_path.to_string_lossy().into_owned(),
                     superseded_by: current_meta.superseded_by,
-                    description,
                 });
-                if p.include_superseded && meta.kind == ArtifactKind::Agent {
-                    let version_dir = self.version_dir_path(meta.kind, &meta.name)?;
-                    if version_dir.exists() {
-                        for version_entry in WalkDir::new(&version_dir)
-                            .max_depth(1)
-                            .into_iter()
-                            .filter_map(|e| e.ok())
-                        {
-                            let version_path = version_entry.path();
-                            let Some(file_name) = version_path.file_name().and_then(|s| s.to_str())
-                            else {
-                                continue;
-                            };
-                            let Some(version) = file_name
-                                .strip_prefix('v')
-                                .and_then(|s| s.strip_suffix(".metadata.json"))
-                            else {
-                                continue;
-                            };
-                            if version == meta.version {
-                                continue;
-                            }
-                            let raw = fs::read_to_string(version_path)
-                                .with_context(|| format!("reading {}", version_path.display()))?;
-                            let version_meta: ArtifactMetadata = serde_json::from_str(&raw)
-                                .with_context(|| format!("parsing {}", version_path.display()))?;
-                            let artifact_path =
-                                self.version_artifact_path(meta.kind, &meta.name, version)?;
-                            let description = extract_agent_description(&artifact_path);
-                            out.push(ArtifactListEntry {
-                                kind: version_meta.kind,
-                                name: version_meta.name,
-                                version: version_meta.version,
-                                source: version_meta.source,
-                                installed_at: version_meta.installed_at,
-                                active: version_meta.active,
-                                supersedes_chain: version_meta.supersedes_chain,
-                                path: artifact_path.to_string_lossy().into_owned(),
-                                superseded_by: version_meta.superseded_by,
-                                description,
-                            });
-                        }
-                    }
-                }
             }
         }
         out.sort_by(|a, b| {
@@ -2314,24 +2259,6 @@ impl ArtifactCatalog {
         serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))
             .map(Some)
-    }
-
-    pub fn update_install_warnings(
-        &self,
-        kind: ArtifactKind,
-        name: &str,
-        warnings: Vec<String>,
-    ) -> Result<ArtifactMetadata> {
-        let meta_path = self.metadata_path(kind, name)?;
-        with_artifact_mutation_lock(&self.root, || {
-            bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
-                let mut meta = self.load_metadata(kind, name)?;
-                meta.install_warnings = warnings;
-                self.save_metadata(&meta)?;
-                self.save_version_metadata(&meta)?;
-                Ok(meta)
-            })
-        })
     }
 
     fn load_metadata(&self, kind: ArtifactKind, name: &str) -> Result<ArtifactMetadata> {
@@ -3022,17 +2949,6 @@ fn canonicalize_value(v: &Value) -> Value {
     }
 }
 
-fn extract_agent_description(artifact_path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(artifact_path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("description")
-        .or_else(|| value.get("manifest")?.get("description"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3192,7 +3108,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_install_list_and_supersede_round_trip() {
+    /// Installed agent receipts from catalogs written before the agent kind
+    /// was retired still list under an explicit kind filter and supersede.
+    fn legacy_agent_receipts_list_and_supersede() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let agent_v1 = serde_json::json!({
@@ -3237,12 +3155,7 @@ mod tests {
                 include_superseded: false,
             })
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "code-reviewer-v2");
-        assert_eq!(
-            rows[0].description.as_deref(),
-            Some("Reviews code for bugs and style")
-        );
+        assert_eq!(rows.len(), 2);
 
         let all_rows = catalog
             .list(&ArtifactListParams {

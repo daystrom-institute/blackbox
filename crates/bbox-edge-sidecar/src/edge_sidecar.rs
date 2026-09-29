@@ -1392,10 +1392,6 @@ pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     ids
 }
 
-/// Lane stem that holds agent provenance edges. It is not a project id, so
-/// admission accepts it regardless of the registered-project set.
-pub const AGENT_PROVENANCE_LANE: &str = "agents";
-
 /// The one admission rule for edge sidecar lane files. The rebuild signature
 /// fold and every loader path admit a lane through this predicate, so a lane
 /// that can change the signature is always loaded and a lane the loaders skip
@@ -1410,7 +1406,7 @@ pub fn sidecar_lane_is_admitted(
     let Some(stem) = sidecar_file_stem(path) else {
         return false;
     };
-    stem == AGENT_PROVENANCE_LANE || registered_project_ids.contains(stem)
+    registered_project_ids.contains(stem)
 }
 
 /// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
@@ -1982,7 +1978,6 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
 //   git_history.rs    → replace_materialized_edges (full) or merge_materialized_edges (incremental) ("git")
 //   tool_edges.rs     → append_observed_edges
 //   provenance.rs     → append_explicit_edges
-//   routes.rs         → append_explicit_edges (global agents.jsonl)
 //   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
 

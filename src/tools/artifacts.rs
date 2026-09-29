@@ -17,7 +17,6 @@ use rmcp::{tool, tool_router};
 pub(crate) enum InstallableArtifactKind {
     Packet,
     Brofile,
-    Agent,
     Team,
 }
 
@@ -26,7 +25,6 @@ impl From<InstallableArtifactKind> for crate::artifacts::ArtifactKind {
         match kind {
             InstallableArtifactKind::Packet => Self::Packet,
             InstallableArtifactKind::Brofile => Self::Brofile,
-            InstallableArtifactKind::Agent => Self::Agent,
             InstallableArtifactKind::Team => Self::Team,
         }
     }
@@ -97,8 +95,8 @@ fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> ser
 fn artifact_metadata_view(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
     serde_json::json!({
         "kind": meta.kind, "name": meta.name, "version": meta.version,
-        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
-        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
         "installed_at": meta.installed_at,
         "content_sha256": meta.content_sha256, "project_id": meta.project_id,
         "local": meta.local, "supersedes": meta.supersedes,
@@ -164,6 +162,7 @@ fn artifact_list_page(
         matches!(
             kind,
             crate::artifacts::ArtifactKind::Workflow
+                | crate::artifacts::ArtifactKind::Agent
                 | crate::artifacts::ArtifactKind::Atom
                 | crate::artifacts::ArtifactKind::Cron
         )
@@ -183,11 +182,6 @@ fn artifact_list_page(
     let artifacts: Vec<_> = rows.into_iter().skip(if exact {0} else {offset}).take(if exact {usize::MAX} else {limit}).map(|entry| {
         let mut row = serde_json::json!({"kind": entry.kind, "name": entry.name, "version": entry.version, "active": entry.active && !retired(entry.kind)});
         if retired(entry.kind) { row["retired"] = serde_json::json!(true); }
-        if let Some(description) = entry.description {
-            let preview: String = if exact || p.detail { description.clone() } else { description.chars().take(200).collect() };
-            if preview.len() < description.len() { row["description_truncated"] = serde_json::json!(true); }
-            row["description"] = serde_json::json!(preview);
-        }
         if let Some(replacement) = entry.superseded_by { row["superseded_by"] = serde_json::json!(replacement); }
         if exact || p.detail {
             row["installed_at"] = serde_json::json!(entry.installed_at);
@@ -227,7 +221,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a packet, brofile, simple agent or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, atom and cron installation is retired."
+        description = "Install a packet, brofile or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, atom and cron installation is retired."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
@@ -533,6 +527,7 @@ mod tests {
         ));
         for kind in [
             artifacts::ArtifactKind::Workflow,
+            artifacts::ArtifactKind::Agent,
             artifacts::ArtifactKind::Atom,
             artifacts::ArtifactKind::Cron,
         ] {
@@ -555,16 +550,17 @@ mod tests {
             );
         }
         assert!(!root.join("workflows").exists());
+        assert!(!root.join("agents").exists());
         assert!(!root.join("crons").exists());
     }
 
     #[test]
-    fn artifact_summary_pages_omit_storage_paths_and_bound_descriptions() {
+    fn artifact_summary_pages_omit_storage_paths() {
         let rows: Vec<_> = (0..105)
             .rev()
             .map(|i| artifacts::ArtifactListEntry {
-                kind: artifacts::ArtifactKind::Agent,
-                name: format!("agent-{i:03}"),
+                kind: artifacts::ArtifactKind::Brofile,
+                name: format!("brofile-{i:03}"),
                 version: "1".into(),
                 source: "https://example.test/?token=synthetic-secret".into(),
                 installed_at: "2026-01-01T00:00:00Z".into(),
@@ -572,7 +568,6 @@ mod tests {
                 supersedes_chain: vec!["previous".into()],
                 path: "/private/daemon/artifact.json".into(),
                 superseded_by: None,
-                description: Some("界".repeat(300)),
             })
             .collect();
         let mut p: ArtifactCatalogListParams =
@@ -585,8 +580,7 @@ mod tests {
             serde_json::to_vec(&first).unwrap().len()
                 <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
         );
-        assert_eq!(first["artifacts"][0]["name"], "agent-000");
-        assert_eq!(first["artifacts"][0]["description_truncated"], true);
+        assert_eq!(first["artifacts"][0]["name"], "brofile-000");
         assert!(first["artifacts"][0].get("supersedes_chain").is_none());
         p.offset = Some(100);
         p.detail = true;
@@ -606,7 +600,7 @@ mod tests {
     #[test]
     fn artifact_expanded_nested_row_has_exact_inventory_recovery() {
         let entry = artifacts::ArtifactListEntry {
-            kind: artifacts::ArtifactKind::Agent,
+            kind: artifacts::ArtifactKind::Brofile,
             name: "large-history".into(),
             version: "1".into(),
             source: "inline".into(),
@@ -615,7 +609,6 @@ mod tests {
             supersedes_chain: vec!["界".repeat(1000); 50],
             path: "/private/daemon/artifact.json".into(),
             superseded_by: None,
-            description: Some("界".repeat(1000)),
         };
         let p: ArtifactCatalogListParams = serde_json::from_value(json!({"detail": true})).unwrap();
         let detail = artifact_list_page(vec![entry.clone()], &p).unwrap();
@@ -641,13 +634,9 @@ mod tests {
             recovered["artifacts"][0]["supersedes_chain"],
             json!(entry.supersedes_chain)
         );
-        assert_eq!(
-            recovered["artifacts"][0]["description"],
-            json!(entry.description)
-        );
         let p: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
         let summary = artifact_list_page(vec![entry], &p).unwrap();
-        assert_eq!(summary["artifacts"][0]["description_truncated"], true);
+        assert!(summary["artifacts"][0].get("supersedes_chain").is_none());
         assert!(summary["next_offset"].is_null());
     }
 
@@ -1195,279 +1184,91 @@ mod tests {
         }
     }
 
+    /// Agent receipts in catalogs written before the kind was retired: boot
+    /// restore skips them, the default listing hides them, an explicit kind
+    /// filter shows them as retired, and removal still works.
     #[tokio::test]
-    async fn agent_artifact_install_list_supersede_round_trip() {
+    async fn legacy_agent_artifact_is_retired_on_boot_restore_and_listing() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let agent_v1 = serde_json::json!({
+        let agent = json!({
             "kind": "agent",
-            "name": "test-reviewer",
-            "version": 1,
+            "name": "legacy-reviewer",
+            "version": 2,
+            "supersedes": "legacy-reviewer",
             "manifest": {
                 "description": "Reviews code for correctness.",
                 "when_to_use": ["after writing code"],
-                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
+                "anti_patterns": ["one-off typo fixes"],
+                "brofile_inline": {"provider": "claude", "lens": "reviewer"},
+                "cost_class": "expensive",
+                "allow_recursion": true,
+                "dispatch_adapter": "removed-adapter",
+                "provenance": {"kind": "distilled", "distilled_by": "badgey-01",
+                    "evidence_session_ids": ["session:claude:sess-1"],
+                    "created_from_threads": [], "accept_count": 1, "reject_count": 0},
+                "embedding": {"model": "m", "computed_at": "2026-01-01T00:00:00Z",
+                    "vector_ref": "agent_embed:legacy-reviewer:v2:primary",
+                    "components": {"primary": "agent_embed:legacy-reviewer:v2:primary"}}
             }
         });
-        let agent_v2 = serde_json::json!({
-            "kind": "agent",
-            "name": "test-reviewer-v2",
-            "version": 2,
-            "supersedes": "test-reviewer",
-            "manifest": {
-                "description": "Reviews code with style checks.",
-                "when_to_use": ["after writing code"],
-                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
-            }
-        });
+        server
+            .state
+            .artifacts
+            .write()
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                "legacy-reviewer.json".into(),
+                &agent,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let meta1 = install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Agent,
-                source: "agent-v1.json".into(),
-                name: None,
-                version: None,
-                supersedes: None,
-            },
-            agent_v1,
-        )
-        .await
-        .unwrap();
-        assert!(meta1.active);
-
-        let meta2 = install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Agent,
-                source: "agent-v2.json".into(),
-                name: None,
-                version: None,
-                supersedes: None,
-            },
-            agent_v2,
-        )
-        .await
-        .unwrap();
-        assert!(meta2.active);
-        assert_eq!(meta2.supersedes_chain, vec!["test-reviewer"]);
-
+        assert_eq!(
+            restore_runtime_artifacts_from_catalog(&server.state).unwrap(),
+            0
+        );
         let rows = server
             .state
             .artifacts
             .read()
-            .list(&ArtifactListParams {
-                kind: Some(artifacts::ArtifactKind::Agent),
+            .list(&artifacts::ArtifactListParams {
+                kind: None,
                 name: None,
                 include_superseded: false,
             })
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "test-reviewer-v2");
+        let unfiltered: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
+        let page = artifact_list_page(rows.clone(), &unfiltered).unwrap();
+        assert!(page["artifacts"].as_array().unwrap().is_empty());
+        let filtered: ArtifactCatalogListParams =
+            serde_json::from_value(json!({"kind": "agent"})).unwrap();
+        let page = artifact_list_page(rows, &filtered).unwrap();
+        assert_eq!(page["artifacts"][0]["name"], "legacy-reviewer");
+        assert_eq!(page["artifacts"][0]["retired"], true);
+        assert_eq!(page["artifacts"][0]["active"], false);
 
-        let all_rows = server
+        server
             .state
             .artifacts
-            .read()
-            .list(&ArtifactListParams {
-                kind: Some(artifacts::ArtifactKind::Agent),
-                name: None,
-                include_superseded: true,
-            })
+            .write()
+            .remove_hard(
+                artifacts::ArtifactKind::Agent,
+                "legacy-reviewer",
+                false,
+                true,
+            )
             .unwrap();
-        assert_eq!(all_rows.len(), 2);
-        let old = all_rows.iter().find(|r| r.name == "test-reviewer").unwrap();
-        assert!(!old.active);
-        assert_eq!(old.superseded_by.as_deref(), Some("test-reviewer-v2"));
-
-        let rows_all = server
-            .state
-            .artifacts
-            .read()
-            .list(&ArtifactListParams {
-                kind: None,
-                name: None,
-                include_superseded: true,
-            })
-            .unwrap();
-        assert_eq!(rows_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn agent_artifact_rejects_non_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let result = install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Agent,
-                source: "bad.json".into(),
-                name: None,
-                version: None,
-                supersedes: None,
-            },
-            serde_json::json!("not an object"),
-        )
-        .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("JSON object"),
-            "expected 'JSON object' in error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_install_records_filter_conflict_warning() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let meta = install_artifact_value(
-            &server.state,
-            artifacts::ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Agent,
-                source: "inline".into(),
-                name: None,
-                version: None,
-                supersedes: None,
-            },
-            serde_json::json!({
-                "kind": "agent",
-                "name": "warning-agent",
-                "version": 1,
-                "manifest": {
-                    "description": "Agent where overlay conflicts are recorded.",
-                    "when_to_use": ["when testing filter warnings"],
-                    "brofile_inline": {
-                        "provider": "claude",
-                        "filters": {
-                            "allow": ["Read"],
-                            "disallow": ["Bash"]
-                        }
-                    },
-                    "filter_overlay": {
-                        "allow": ["Bash"],
-                        "disallow": ["Read"]
-                    }
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        let warnings = &meta.install_warnings;
-        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
-        assert!(
-            warnings.iter().any(|w| w.contains("Bash")),
-            "allow/disallow conflict warning missing: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("Read")),
-            "disallow/allow conflict warning missing: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn agent_install_stamps_embeddings_and_distilled_edges() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let artifact = serde_json::json!({
-            "kind": "agent",
-            "name": "distilled-reviewer",
-            "version": 1,
-            "manifest": {
-                "description": "Reviews recurring code patterns.",
-                "when_to_use": ["when recurring review work appears"],
-                "anti_patterns": ["one-off typo fixes"],
-                "brofile_inline": {"provider": "claude"},
-                "provenance": {
-                    "kind": "distilled",
-                    "distilled_by": "badgey-01",
-                    "evidence_session_ids": ["session:claude:sess-1"],
-                    "created_from_threads": ["thread:thread-abc"],
-                    "accept_count": 1,
-                    "reject_count": 0
-                }
-            }
-        });
-        rt.block_on(install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Agent,
-                source: "distilled-reviewer.json".into(),
-                name: None,
-                version: None,
-                supersedes: None,
-            },
-            artifact,
-        ))
-        .unwrap();
-
-        let stored = server
-            .state
-            .artifacts
-            .read()
-            .load_artifact_value(artifacts::ArtifactKind::Agent, "distilled-reviewer")
-            .unwrap()
-            .unwrap();
-        let embedding = &stored["manifest"]["embedding"];
-        assert_eq!(
-            embedding["components"]["primary"],
-            "agent_embed:distilled-reviewer:v1:primary"
-        );
-        assert_eq!(
-            embedding["components"]["when_to_use"],
-            "agent_embed:distilled-reviewer:v1:when_to_use"
-        );
-        assert_eq!(
-            embedding["components"]["anti_patterns"],
-            "agent_embed:distilled-reviewer:v1:anti_patterns"
-        );
-
-        let agent_ref = crate::entity_ref::EntityRef::Agent {
-            name: "distilled-reviewer".into(),
-            version: 1,
-        };
-        let edges_dir = crate::server::edge_sidecar_dir(&server.state);
-        let durable_edges: Vec<crate::edge_index::Edge> =
-            std::fs::read_to_string(edges_dir.join("explicit/agents.jsonl"))
+            server
+                .state
+                .artifacts
+                .read()
+                .metadata_for(artifacts::ArtifactKind::Agent, "legacy-reviewer")
                 .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-        assert_eq!(durable_edges.len(), 2);
-
-        // Artifact installation persists provenance and only nudges the
-        // single-flight watcher. It must not synchronously parse and publish
-        // the complete graph on the tool-call path.
-        let read_view = server.state.code_read_view.read().clone();
-        assert!(
-            read_view
-                .edge_index
-                .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"])
-                .is_empty()
+                .is_none()
         );
-
-        // Simulate the watcher consuming the nudge, then prove both durable
-        // facts become queryable after the bounded rebuild.
-        crate::server::rebuild_edge_index_from_shared(&server.state, false).unwrap();
-        let published = server.state.code_read_view.read().clone();
-        let edges = published
-            .edge_index
-            .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
-        assert_eq!(edges.len(), 2);
-        assert!(edges.iter().any(|edge| {
-            edge.target
-                == crate::entity_ref::EntityRef::Session {
-                    provider: "claude".into(),
-                    session_id: "sess-1".into(),
-                }
-        }));
-        assert!(edges.iter().any(|edge| {
-            edge.target
-                == crate::entity_ref::EntityRef::Thread {
-                    thread_id: "thread-abc".into(),
-                }
-        }));
     }
 }

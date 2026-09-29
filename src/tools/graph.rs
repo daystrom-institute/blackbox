@@ -1057,15 +1057,11 @@ pub(crate) struct EdgeCompactParams {
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DescribeSchemaParams {
-    /// Include the installed-agent catalog. Default false: compact orientation
-    /// returns graph vocabulary/traversal tips without the potentially large
-    /// agent list.
-    pub include_agents: Option<bool>,
-    /// Convenience mode. `full` includes installed agents; `orientation` keeps
-    /// the compact default. `agents` is a deprecated alias for `full`.
+    /// `full` expands entity properties and filters; `orientation` (the
+    /// default) returns compact graph vocabulary and traversal tips.
     pub mode: Option<String>,
-    /// Exact schema body pages, including any requested agent catalog. Changed
-    /// population or catalog evidence refuses continuation.
+    /// Exact schema body pages. Changed population evidence refuses
+    /// continuation.
     pub cursor: Option<String>,
     /// Exact body bytes, clamped to 4..=4096. Oversized replies also start a body page.
     pub body_limit: Option<usize>,
@@ -1175,13 +1171,12 @@ pub(crate) struct ProjectGraphValidateParams {
 }
 
 impl DescribeSchemaParams {
-    fn include_agents_resolved(&self) -> Result<bool> {
-        let from_mode = match self.mode.as_deref() {
-            None | Some("orientation") => false,
-            Some("full" | "agents") => true,
+    fn full_mode(&self) -> Result<bool> {
+        match self.mode.as_deref() {
+            None | Some("orientation") => Ok(false),
+            Some("full") => Ok(true),
             Some(_) => bail!("Invalid schema mode; use orientation or full"),
-        };
-        Ok(self.include_agents.unwrap_or(from_mode))
+        }
     }
 }
 
@@ -1551,27 +1546,20 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Orient to entity types and edge families. mode=full expands fields and agents; include_agents=false omits agents. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages."
+        description = "Orient to entity types and edge families. mode=full expands fields and filters. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages."
     )]
     pub(crate) fn bbox_describe_schema(
         &self,
         Parameters(p): Parameters<DescribeSchemaParams>,
     ) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
-            let include_agents = p.include_agents_resolved()?;
+            let full = p.full_mode()?;
             let read_view = self.state.complete_code_read_view()?;
-            let agents = include_agents
-                .then(|| self.build_agent_schema_entries())
-                .unwrap_or_default();
             let rendered = mcp_tools::describe_schema::describe_schema_with_options(
                 &self.describe_schema_counts_from_view(&read_view),
-                &agents,
-                DescribeSchemaOptions {
-                    include_agents,
-                    compact: !include_agents && p.mode.as_deref() != Some("full"),
-                },
+                DescribeSchemaOptions { compact: !full },
             )?;
-            let scope = json!(["schema", include_agents, p.mode]).to_string();
+            let scope = json!(["schema", full, p.mode]).to_string();
             let page = bbox_corpus_core::response_page::bounded_json_response(
                 &scope,
                 serde_json::from_str(&rendered)?,
@@ -2157,31 +2145,24 @@ mod tests {
     }
 
     #[test]
-    fn schema_mode_rejects_unknown_values_even_with_explicit_agent_flag() {
-        for include_agents in [None, Some(true), Some(false)] {
+    fn schema_mode_rejects_unknown_values() {
+        for mode in ["ful", "agents"] {
             let params = DescribeSchemaParams {
-                mode: Some("ful".into()),
-                include_agents,
+                mode: Some(mode.into()),
                 ..Default::default()
             };
-            assert!(params.include_agents_resolved().is_err());
+            assert!(params.full_mode().is_err(), "{mode}");
         }
-        assert!(
-            !DescribeSchemaParams::default()
-                .include_agents_resolved()
-                .unwrap()
-        );
+        assert!(!DescribeSchemaParams::default().full_mode().unwrap());
         assert!(
             DescribeSchemaParams {
                 mode: Some("full".into()),
-                include_agents: None,
                 ..Default::default()
             }
-            .include_agents_resolved()
+            .full_mode()
             .unwrap()
         );
     }
-    use crate::artifacts;
     use crate::server::state::SharedState;
     use bbox_indexing::checkout_access::{
         CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
@@ -5552,138 +5533,6 @@ mod tests {
             orphan["status"], "error.not_found",
             "edge-less symbol ref must stay not_found: {orphan}"
         );
-    }
-
-    #[test]
-    fn bbox_describe_schema_omits_installed_agents_by_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let cat = server.state.artifacts.read();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "schema-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "schema-tester",
-                "version": 1,
-                "manifest": {
-                    "description": "Agent for schema test.",
-                    "when_to_use": ["use when testing schema"],
-                    "anti_patterns": ["do not use in prod"],
-                    "brofile_inline": {"provider": "claude"},
-                    "cost_class": "normal",
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "badgey-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "badgey-agent",
-                "version": 3,
-                "manifest": {
-                    "description": "Badgey-backed agent.",
-                    "brofile_inline": {"provider": "claude"},
-                    "cost_class": "cheap",
-                    "dispatch_adapter": "badgey",
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        drop(cat);
-
-        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
-        assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(body["agents_omitted"].as_bool(), Some(true));
-        assert!(body.get("agents").is_none());
-        assert!(body.get("consultants").is_none());
-        assert!(body.get("text").is_none());
-        assert!(
-            body["agents_hint"]
-                .as_str()
-                .unwrap()
-                .contains("include_agents")
-        );
-    }
-
-    #[test]
-    fn bbox_describe_schema_includes_installed_agents_when_requested() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let cat = server.state.artifacts.read();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "schema-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "schema-tester",
-                "version": 1,
-                "manifest": {
-                    "description": "Agent for schema test.",
-                    "when_to_use": ["use when testing schema"],
-                    "anti_patterns": ["do not use in prod"],
-                    "brofile_inline": {"provider": "claude"},
-                    "cost_class": "normal",
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "badgey-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "badgey-agent",
-                "version": 3,
-                "manifest": {
-                    "description": "Badgey-backed agent.",
-                    "brofile_inline": {"provider": "claude"},
-                    "cost_class": "cheap",
-                    "dispatch_adapter": "badgey",
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        drop(cat);
-
-        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams {
-            include_agents: Some(true),
-            mode: None,
-            ..Default::default()
-        }));
-        assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert!(body.get("agents_omitted").is_none());
-        let agents = body["agents"].as_array().expect("agents array");
-        assert_eq!(agents.len(), 1);
-        let schema_tester = agents
-            .iter()
-            .find(|a| a["name"] == "schema-tester")
-            .unwrap();
-        assert_eq!(schema_tester["version"].as_str(), Some("1"));
-        assert_eq!(schema_tester["cost_class"].as_str(), Some("normal"));
-        assert_eq!(schema_tester["when_to_use"].as_array().unwrap().len(), 1);
-        assert_eq!(schema_tester["anti_patterns"].as_array().unwrap().len(), 1);
-        assert!(schema_tester["dispatch_adapter"].is_null());
-
-        assert!(!agents.iter().any(|agent| agent["name"] == "badgey-agent"));
-
-        assert!(body.get("agents_by_dispatch_adapter").is_none());
     }
 
     /// gap-edc84378: transcript entities are deliberately excluded from

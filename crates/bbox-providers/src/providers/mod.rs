@@ -1,6 +1,5 @@
 #![allow(dead_code)] // D1 lands the provider surface; D2 wires public consumers.
 
-pub mod agent;
 pub mod artifact;
 pub mod commit;
 pub mod file;
@@ -464,7 +463,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(whiteboard::WhiteboardProvider),
             Box::new(commit::CommitProvider),
             Box::new(virtual_bash_call::BashCallProvider),
-            Box::new(agent::AgentProvider),
             Box::new(packet::PacketProvider),
             Box::new(artifact::ArtifactProvider),
         ];

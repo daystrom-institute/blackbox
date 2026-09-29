@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::artifacts;
 use crate::server::BlackboxServer;
-use crate::{artifacts, mcp_tools, orchestration};
 
 impl BlackboxServer {
     pub(crate) fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
@@ -61,82 +61,26 @@ impl BlackboxServer {
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());
         counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
-        // Brofile and agent vertices live in the artifact catalog. They
-        // don't naturally appear in EdgeIndex entity counts until a
-        // DERIVED_FROM / SUPERSEDES edge points at them; until that
-        // wire-up matures (design/agent-system.md §8.1), seed the
-        // counts directly from the catalog so describe_schema reflects
-        // installed artifacts.
+        // Brofile vertices live in the artifact catalog and do not appear in
+        // EdgeIndex entity counts until an edge points at them, so seed the
+        // count directly from the catalog.
         let Some(catalog) = self.state.artifacts.try_read() else {
             tracing::warn!(
                 target: "blackbox::tool",
                 tool = "bbox_describe_schema",
-                "artifact catalog is busy; omitting brofile/agent counts"
+                "artifact catalog is busy; omitting brofile counts"
             );
             return counts;
         };
-        for (kind, key) in [
-            (artifacts::ArtifactKind::Brofile, "brofile"),
-            (artifacts::ArtifactKind::Agent, "agent"),
-        ] {
-            let params = artifacts::ArtifactListParams {
-                kind: Some(kind),
-                name: None,
-                include_superseded: false,
-            };
-            if let Ok(entries) = catalog.list(&params) {
-                let active = entries.iter().filter(|e| e.active).count();
-                counts.insert(key.into(), active);
-            }
-        }
-        counts
-    }
-
-    pub(crate) fn build_agent_schema_entries(
-        &self,
-    ) -> Vec<mcp_tools::describe_schema::AgentSchemaEntry> {
-        use orchestration::agents::registry::AgentRegistry;
-        let Some(catalog) = self.state.artifacts.try_read() else {
-            tracing::warn!(
-                target: "blackbox::tool",
-                tool = "bbox_describe_schema",
-                "artifact catalog is busy; omitting installed-agent details"
-            );
-            return Vec::new();
-        };
-        let registry = AgentRegistry::new(&catalog);
         let params = artifacts::ArtifactListParams {
-            kind: Some(artifacts::ArtifactKind::Agent),
+            kind: Some(artifacts::ArtifactKind::Brofile),
             name: None,
             include_superseded: false,
         };
-        let Ok(entries) = catalog.list(&params) else {
-            return Vec::new();
-        };
-        entries
-            .into_iter()
-            .filter(|entry| entry.active)
-            .filter_map(|s| {
-                let (manifest, _) = registry.load_manifest_degraded(&s.name);
-                let manifest = manifest?;
-                if manifest.dispatch_adapter.is_some() {
-                    return None;
-                }
-                let cost_str = match manifest.cost_class {
-                    orchestration::agents::types::AgentCostClass::Cheap => "cheap",
-                    orchestration::agents::types::AgentCostClass::Normal => "normal",
-                    orchestration::agents::types::AgentCostClass::Expensive => "expensive",
-                };
-                Some(mcp_tools::describe_schema::AgentSchemaEntry {
-                    name: s.name,
-                    version: s.version,
-                    description: manifest.description,
-                    when_to_use: manifest.when_to_use,
-                    anti_patterns: manifest.anti_patterns,
-                    cost_class: cost_str.to_string(),
-                    dispatch_adapter: manifest.dispatch_adapter,
-                })
-            })
-            .collect()
+        if let Ok(entries) = catalog.list(&params) {
+            let active = entries.iter().filter(|e| e.active).count();
+            counts.insert("brofile".into(), active);
+        }
+        counts
     }
 }

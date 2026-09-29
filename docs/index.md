@@ -43,7 +43,6 @@ The main operator binaries are:
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
 | [Code Source Collector](code-source-collector.md) | Publish checkout-owned current files to a corpus daemon and operate source transitions |
 | [Artifact Catalog](artifact-catalog.md) | Install, list, supersede, and reason about `system-defaults/` |
-| [Agent System](agent-system.md) | Simple agent artifact contracts |
 | [Badgey](badgey.md) | Retired integration and retained evidence |
 | [Consultant Runtime](consultant-runtime.md) | Retired consultant runtime |
 | [Ingress Paths](ingress-paths.md) | Bro control and collector transport boundaries |

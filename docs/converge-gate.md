@@ -48,7 +48,7 @@ Payload shape:
 | `quiescent_scope` | Always `"tasks,arcs,waiters"`; states what `quiescent` covers |
 | `recent_writes_total` | Thread/note/knowledge writes inside the window (same level as `quiescent`, deliberately not folded into it) |
 | `drain` | `{draining, set_at, reason, set_by, marker_path}` |
-| `running_tasks` | `count` + `tasks[]` (`task_id`, `session_id`, `provider`, `origin`, `bro`, `agent`, `name`, `cwd`, `started_at_ms`, `age_secs`) |
+| `running_tasks` | `count` + `tasks[]` (`task_id`, `session_id`, `provider`, `origin`, `bro`, `name`, `cwd`, `started_at_ms`, `age_secs`) |
 | `workflows_in_flight` | `count` + `arcs[]` (`arc_id`, `arc_thread_id`, `workflow`, `status`, `current_node`, `in_flight_nodes`, `started_at`, `age_secs`) |
 | `long_poll_waiters` | `count` + `waiters[]` (`id`, `tool`, `task_ids`, `age_secs`) |
 | `recent_writes` | `window_minutes`, `total`, `threads[]`, `notes[]`, `knowledge[]` |

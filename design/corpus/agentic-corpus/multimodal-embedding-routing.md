@@ -174,7 +174,7 @@ Compatibility Families / Provider Interface.
 
 `code` stays on `voyage-code-3` until the eval suite says otherwise.
 All prose buckets (`knowledge`, `notes`, `threads`, `docs`,
-`git_message`, `agent_manifest`, `transcripts`) move to the voyage-4
+`git_message`, `transcripts`) move to the voyage-4
 family. The family's shared-space guarantee enables asymmetric retrieval:
 document embeddings on `voyage-4-large` (one-time indexing cost), query
 embeddings on `voyage-4-lite` or local `voyage-4-nano` (per-search
@@ -322,7 +322,6 @@ docs = "voyage_text"
 knowledge = "voyage_text"
 notes = "voyage_text"
 threads = "voyage_text"
-agent_manifest = "voyage_text"
 git_message = "voyage_text"
 transcripts = "voyage_text"
 

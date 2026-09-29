@@ -396,21 +396,6 @@ fn scan_legacy_dir(
         }
 
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == "agents" {
-            if !project_filter_matches(Some("agents"), project_filter) {
-                continue;
-            }
-            totals.accumulate(FileKind::ActiveLegacy, bytes);
-            files.push(StorageFileInfo {
-                path: path.display().to_string(),
-                kind: FileKind::ActiveLegacy,
-                project_id: Some("agents".to_string()),
-                bytes,
-                reason: None,
-            });
-            continue;
-        }
-
         let project_id = stem.to_string();
 
         if !project_filter_matches(Some(&project_id), project_filter) {
@@ -2342,8 +2327,10 @@ mod tests {
         assert_eq!(report.files[0].project_id.as_deref(), Some("proj_aaaa"));
     }
 
+    /// A legacy `agents` lane names no registered project, so it reports as
+    /// an orphan lane rather than an active one.
     #[test]
-    fn agents_sidecar_classified_as_active_legacy() {
+    fn legacy_agents_sidecar_reports_as_orphan() {
         let dir = setup_edges_dir();
         let edges_dir = dir.path().join("edges");
         fs::create_dir_all(&edges_dir).unwrap();
@@ -2351,8 +2338,9 @@ mod tests {
 
         let registered = HashSet::new();
         let report = scan_storage_health(&edges_dir, &registered, None, true).unwrap();
-        assert_eq!(report.totals.active_legacy_files, 1);
+        assert_eq!(report.totals.active_legacy_files, 0);
         assert_eq!(report.files[0].project_id.as_deref(), Some("agents"));
+        assert!(report.files[0].reason.is_some());
     }
 
     #[test]

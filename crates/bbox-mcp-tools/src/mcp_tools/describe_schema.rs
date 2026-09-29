@@ -1,48 +1,21 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
 use serde_json::json;
 
 use bbox_providers::providers;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentSchemaEntry {
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub when_to_use: Vec<String>,
-    pub anti_patterns: Vec<String>,
-    pub cost_class: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_adapter: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DescribeSchemaOptions {
-    pub include_agents: bool,
     pub compact: bool,
 }
 
-impl Default for DescribeSchemaOptions {
-    fn default() -> Self {
-        Self {
-            include_agents: true,
-            compact: false,
-        }
-    }
-}
-
 #[cfg(test)]
-pub fn describe_schema(
-    counts: &BTreeMap<String, usize>,
-    agents: &[AgentSchemaEntry],
-) -> anyhow::Result<String> {
-    describe_schema_with_options(counts, agents, DescribeSchemaOptions::default())
+pub fn describe_schema(counts: &BTreeMap<String, usize>) -> anyhow::Result<String> {
+    describe_schema_with_options(counts, DescribeSchemaOptions::default())
 }
 
 pub fn describe_schema_with_options(
     counts: &BTreeMap<String, usize>,
-    agents: &[AgentSchemaEntry],
     options: DescribeSchemaOptions,
 ) -> anyhow::Result<String> {
     let vertex_types = providers::all_providers()
@@ -73,18 +46,7 @@ pub fn describe_schema_with_options(
         "edge_families": edge_families,
     });
     if options.compact {
-        response["schema_hint"] = json!(
-            "mode=full expands entity properties and filters; include_agents=false omits the installed-agent catalog"
-        );
-    }
-    if options.include_agents {
-        if !agents.is_empty() {
-            response["agents"] = json!(agents);
-        }
-    } else {
-        response["agents_omitted"] = json!(true);
-        response["agents_hint"] =
-            json!("Pass include_agents=true or mode=full for installed agents.");
+        response["schema_hint"] = json!("mode=full expands entity properties and filters");
     }
     Ok(serde_json::to_string(&response)?)
 }
@@ -189,11 +151,7 @@ mod tests {
         for compact in [false, true] {
             let output = describe_schema_with_options(
                 &BTreeMap::from([("roadmap_item".into(), 3)]),
-                &[],
-                DescribeSchemaOptions {
-                    include_agents: false,
-                    compact,
-                },
+                DescribeSchemaOptions { compact },
             )
             .unwrap();
             assert!(!output.to_lowercase().contains("roadmap"));
@@ -204,27 +162,13 @@ mod tests {
     fn compact_orientation_preserves_vocabulary_and_population_counts() {
         let counts = BTreeMap::from([("knowledge".to_owned(), 42)]);
         let full: serde_json::Value = serde_json::from_str(
-            &describe_schema_with_options(
-                &counts,
-                &[],
-                DescribeSchemaOptions {
-                    include_agents: false,
-                    compact: false,
-                },
-            )
-            .unwrap(),
+            &describe_schema_with_options(&counts, DescribeSchemaOptions { compact: false })
+                .unwrap(),
         )
         .unwrap();
         let compact: serde_json::Value = serde_json::from_str(
-            &describe_schema_with_options(
-                &counts,
-                &[],
-                DescribeSchemaOptions {
-                    include_agents: false,
-                    compact: true,
-                },
-            )
-            .unwrap(),
+            &describe_schema_with_options(&counts, DescribeSchemaOptions { compact: true })
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(compact["edge_families"], full["edge_families"]);
@@ -244,7 +188,7 @@ mod tests {
 
     #[test]
     fn schema_lists_all_d1_entity_types() {
-        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
+        let rendered = describe_schema(&BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let vertex_types = value["vertex_types"].as_array().unwrap();
         assert_eq!(vertex_types.len(), providers::all_providers().len());
@@ -269,93 +213,44 @@ mod tests {
                 .any(|value| value["entity_type"] == "bash_call")
         );
         assert!(
-            vertex_types
+            !vertex_types
                 .iter()
                 .any(|value| value["entity_type"] == "agent")
         );
     }
 
     #[test]
-    fn schema_agents_section_structure() {
-        let agents = vec![
-            AgentSchemaEntry {
-                name: "reviewer".into(),
-                version: "2".into(),
-                description: "Reviews code.".into(),
-                when_to_use: vec!["PR review".into()],
-                anti_patterns: vec!["Large diffs".into()],
-                cost_class: "normal".into(),
-                dispatch_adapter: None,
-            },
-            AgentSchemaEntry {
-                name: "badge-tester".into(),
-                version: "1".into(),
-                description: "Badgey adapter.".into(),
-                when_to_use: vec![],
-                anti_patterns: vec![],
-                cost_class: "cheap".into(),
-                dispatch_adapter: Some("badgey".into()),
-            },
-        ];
-        let rendered = describe_schema(&BTreeMap::new(), &agents).unwrap();
+    fn schema_has_no_agent_catalog() {
+        let rendered = describe_schema(&BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-
-        assert!(value["agents"].is_array(), "agents should be array");
-        let agents_arr = value["agents"].as_array().unwrap();
-        assert_eq!(agents_arr.len(), 2);
-        assert_eq!(agents_arr[0]["name"].as_str(), Some("reviewer"));
-        assert_eq!(agents_arr[0]["cost_class"].as_str(), Some("normal"));
-        assert_eq!(agents_arr[0]["when_to_use"].as_array().unwrap().len(), 1);
-        assert_eq!(agents_arr[0]["anti_patterns"].as_array().unwrap().len(), 1);
-        assert_eq!(agents_arr[1]["dispatch_adapter"].as_str(), Some("badgey"));
-
-        assert!(value.get("text").is_none());
-        assert!(value.get("agents_by_dispatch_adapter").is_none());
+        for field in ["agents", "agents_omitted", "agents_hint", "text"] {
+            assert!(value.get(field).is_none(), "{field}");
+        }
     }
 
     #[test]
-    fn schema_no_agents_section_when_empty() {
-        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert!(value.get("agents").is_none());
-        assert!(value.get("agents_by_dispatch_adapter").is_none());
-        assert!(value.get("text").is_none());
-    }
-
-    #[test]
-    fn orientation_omits_unrequested_catalogs_and_keeps_vocabulary() {
+    fn orientation_keeps_vocabulary() {
         let orientation: serde_json::Value = serde_json::from_str(
             &describe_schema_with_options(
                 &BTreeMap::new(),
-                &[],
-                DescribeSchemaOptions {
-                    include_agents: false,
-                    compact: false,
-                },
+                DescribeSchemaOptions { compact: false },
             )
             .unwrap(),
         )
         .unwrap();
         let full: serde_json::Value =
-            serde_json::from_str(&describe_schema(&BTreeMap::new(), &[]).unwrap()).unwrap();
+            serde_json::from_str(&describe_schema(&BTreeMap::new()).unwrap()).unwrap();
         for field in ["vertex_types", "edge_families"] {
             assert_eq!(orientation[field], full[field]);
         }
-        assert_eq!(orientation["agents_omitted"], true);
-        assert!(orientation["agents_hint"].is_string());
-        for field in [
-            "text",
-            "agents",
-            "consultants",
-            "agents_by_dispatch_adapter",
-        ] {
+        for field in ["text", "agents", "consultants"] {
             assert!(orientation.get(field).is_none(), "{field}");
         }
     }
 
     #[test]
     fn schema_does_not_advertise_retired_consultants() {
-        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
+        let rendered = describe_schema(&BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert!(value.get("consultants").is_none());
         assert!(!rendered.contains("badgey_exec"));

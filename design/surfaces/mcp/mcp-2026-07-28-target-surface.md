@@ -380,7 +380,7 @@ durable objects), all mutations, anything parameterized ad hoc.
   cursors, descriptor-only listing (progressive disclosure; `resources/read`
   fetches one full body), plus `ttlMs`/`cacheScope`. This relieves the
   chronic over-cap list-tool pattern (`bbox_artifact_list`,
-  `bbox_describe_schema(include_agents=true)`) that the 80KB cap's bytes
+  `bbox_describe_schema(mode="full")`) that the 80KB cap's bytes
   telemetry exists to flag.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
   packet compile, brofile upsert).

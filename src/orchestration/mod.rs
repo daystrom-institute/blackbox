@@ -1,6 +1,5 @@
 pub mod account_probes;
 pub(crate) mod admission;
-pub mod agents;
 pub mod allocator;
 pub mod brofile;
 pub mod executor;

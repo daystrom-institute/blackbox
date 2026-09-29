@@ -194,7 +194,7 @@ session before fusion.
 Vector lanes are per route: hybrid search iterates on-disk vector
 partitions with a nonzero active count and maps each back to a
 configured text bucket (`code`, `docs`, `knowledge`, `transcripts`,
-`git_message`, `notes`, `threads`, `agent_manifest`, `graph`) or visual
+`git_message`, `notes`, `threads`, `graph`) or visual
 route, and each contributing partition becomes its own ranked list.
 Unmapped partitions are skipped and reported in
 `degraded.skipped_partitions`.
