@@ -50,8 +50,8 @@ Four cooperating pieces:
 
 A producer grant authorizes one bearer-token producer as the authoritative
 source for exact published scopes `{repo_id, bbox_root_relpath}`: onboarding,
-code publication, Git-history and knowledge transport, provenance import,
-and delivery of queued checkout mutations. A scope belongs to at most one
+code publication, Git-history and knowledge transport, and delivery of
+queued checkout mutations. A scope belongs to at most one
 producer, and every published member of one repository history belongs to
 the same producer.
 

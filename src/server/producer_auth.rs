@@ -811,8 +811,8 @@ impl ProducerAuthRuntime {
 
     /// Resolve one authenticated project assignment without requiring every
     /// published member of its repository to belong to this producer. Git
-    /// history is repository-wide; provenance export is intentionally scoped
-    /// to exactly one project.
+    /// history is repository-wide; project-scoped transports are scoped to
+    /// exactly one project.
     pub(crate) fn project_transport_grant(
         &self,
         grant: &ProducerGrant,

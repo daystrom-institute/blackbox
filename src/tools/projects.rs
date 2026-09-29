@@ -427,7 +427,7 @@ impl BlackboxServer {
         }
         self.state.nudge_edge_index_rebuild();
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
-        // provenance import, watcher, kb sync) on the blocking pool.
+        // watcher, kb sync) on the blocking pool.
         let server = self.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             let response = server.run_post_register_pipeline(record)?;
@@ -559,10 +559,9 @@ impl BlackboxServer {
     }
 
     /// The post-register enrichment pipeline (plan §9.1): MCP migration,
-    /// project config + artifact discovery, provenance import, watcher and
-    /// kb registration, and the transcript-edge backfill, all behind the
-    /// same capability leases in both authority modes. Blocking work: call
-    /// from the blocking pool only.
+    /// project config + artifact discovery, watcher and kb registration, and
+    /// the transcript-edge backfill, all behind the same capability leases in
+    /// both authority modes. Blocking work: call from the blocking pool only.
     ///
     /// Capability semantics: a catalog attachment records what its checkout
     /// shape supports; a step whose capability is not recorded is skipped

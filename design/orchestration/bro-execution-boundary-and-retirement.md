@@ -458,8 +458,6 @@ remain independent gaps; they are not a replacement for the MCP surface audit.
   preview/apply semantics, now also part of E4 maintenance extraction.
 - Queued gap mutation lost updates remain a correctness priority for the core
   knowledge/publication path. Retirement does not address them.
-- Sustained `edge_index_warming` for provenance export remains an availability
-  investigation. No orchestration dependency has been established as its cause.
 - Native collection is restored, verified with stablesign and a successful
   background cycle. It remains in the retained execution/corpus baseline.
 

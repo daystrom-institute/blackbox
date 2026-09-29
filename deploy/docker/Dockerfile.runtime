@@ -14,7 +14,7 @@
 
 FROM debian:trixie-slim AS blackboxd
 
-# git remains a runtime dependency for provenance and administrative surfaces.
+# git remains a runtime dependency for Git history and administrative surfaces.
 # ca-certificates serves Voyage and other HTTPS clients. openssh-client keeps
 # explicit SSH Git operations available without adding a checkout connector.
 RUN apt-get update \

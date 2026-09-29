@@ -63,7 +63,7 @@ gate explicit avoids recreating the satellite arc's dead absolute-path bridge.
 
 The following are not smuggled into the file collector:
 
-- Git history transport, Git objects, blame, or provenance import. The current
+- Git history transport or Git objects. The current
   Git-history indexer continues reading the registered local checkout during
   overlap. It joins that local history to the active source generation's
   corpus-side current-chunk map, so file collection does not silently remove
@@ -115,9 +115,8 @@ Wire requests carry only a normalized `PublishedScope`:
 ```
 
 The producer resolves it from the committed `.bbox/config.toml` at local
-`HEAD`, using the same recorded or operator-overridden repo-id authority as
-checkout-local provenance export. Computed bootstrap ids and `aka_repo_ids`
-cannot authorize publication. `bbox_root_relpath` is normalized to `.` or a
+`HEAD`, using the recorded or operator-overridden repo-id authority. Computed
+bootstrap ids and `aka_repo_ids` cannot authorize publication. `bbox_root_relpath` is normalized to `.` or a
 slash-separated relative path with no traversal.
 
 The server resolves the scope against current registered project records using

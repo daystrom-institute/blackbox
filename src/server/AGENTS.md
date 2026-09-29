@@ -91,7 +91,5 @@
   their intentionally empty placeholder, then nudge the same watcher; a graph
   reader may retain a complete old immutable view or wait for the complete new
   one, but may never observe the placeholder as a valid graph.
-- Raw `?project=` remains a surface/filter selector only. Attended blame and
-  provenance export use separate producer-token grants bound to a committed
-  published scope; neither grant implies managed-workspace knowledge or
-  mutation authority, and the three authority lanes are mutually exclusive.
+- Raw `?project=` remains a surface/filter selector only. Managed-workspace
+  authority comes only from the workspace binding header.
