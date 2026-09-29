@@ -5774,6 +5774,8 @@ impl CodeSourceStore {
             &BTreeSet::new(),
             &BTreeSet::new(),
         )?;
+        let owners = self.scrub_serving_owners()?;
+        let mut recorded = BTreeSet::new();
         let mut stats = MaintenanceStats::default();
         for mut generation in generations {
             if !protected.contains(generation.generation_id()) {
@@ -5799,17 +5801,96 @@ impl CodeSourceStore {
                 generation.mark_missing_blob_data();
                 self.save_mixed_generation_locked(&generation)?;
                 self.update_desired_if_same_mixed(&generation)?;
-                self.record_health_failure_locked(
-                    &self
-                        .activation_project_for_generation(generation.generation_id())?
-                        .unwrap_or_else(|| scope_hash(&generation.descriptor().scope)),
-                    "missing_blob_data",
-                    "one or more retained source blobs failed verification",
-                )?;
                 stats.degraded_generations += 1;
+                // Only a serving generation (activated, desired, or an
+                // effective selection) is an outage. A retained or
+                // otherwise rooted generation is only marked: its missing
+                // blobs drop its retention, and the project's serving
+                // generation keeps reporting its own health.
+                if let Some(subject) = owners.subject_for(&generation) {
+                    self.record_health_failure_locked(
+                        &subject,
+                        "missing_blob_data",
+                        "one or more retained source blobs failed verification",
+                    )?;
+                    recorded.insert(subject);
+                }
             }
         }
+        self.clear_unreproduced_scope_blob_health_locked(&recorded)?;
         Ok(stats)
+    }
+
+    /// Who reports a serving generation's missing blobs. The subject is the
+    /// owning project whenever the store can name one, so the row is the
+    /// same one activation clears; a scope hash is used only for a desired
+    /// generation no activation or effective selection ties to a project.
+    fn scrub_serving_owners(&self) -> Result<ScrubServingOwners> {
+        let mut owners = ScrubServingOwners {
+            desired: self.desired_generation_ids()?,
+            ..ScrubServingOwners::default()
+        };
+        if self.paths.anchor().is_file() {
+            let bytes = fs::read(self.paths.anchor())?;
+            let effective = decode_migration_effective_source_manifest_v1(&bytes)?;
+            for selection in effective.selections {
+                let project_id = selection.project_id.to_string();
+                owners
+                    .scope_projects
+                    .entry(scope_hash(&selection.published_scope))
+                    .or_insert_with(|| project_id.clone());
+                owners.effective.insert(selection.generation_id, project_id);
+            }
+        }
+        for entry in fs::read_dir(self.root().join("activations"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
+                continue;
+            }
+            let activation = read_mixed_activation(&entry.path())?;
+            let project_id = activation.project_id().to_string();
+            if let Some(scope) = activation.published_scope() {
+                owners
+                    .scope_projects
+                    .insert(scope_hash(scope), project_id.clone());
+            }
+            owners
+                .activated
+                .insert(activation.generation_id().to_string(), project_id);
+        }
+        Ok(owners)
+    }
+
+    /// Remove scope-keyed `missing_blob_data` rows this scrub did not
+    /// reproduce. Only the scrub writes scope-keyed rows, so a row it no
+    /// longer reproduces describes a generation that was replaced,
+    /// collected, or now reports under its project.
+    fn clear_unreproduced_scope_blob_health_locked(
+        &self,
+        reproduced: &BTreeSet<String>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(self.root().join("health"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
+                continue;
+            }
+            let Ok(record) = read_json::<CodeSourceHealthRecord>(&entry.path()) else {
+                continue;
+            };
+            if record.code != "missing_blob_data"
+                || !is_scope_hash_subject(&record.project_id)
+                || reproduced.contains(&record.project_id)
+            {
+                continue;
+            }
+            let path = self.health_path(&record.project_id, &record.code);
+            match fs::remove_file(&path) {
+                Ok(()) => sync_parent(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     pub fn gc_blobs(&self) -> Result<MaintenanceStats> {
@@ -6784,6 +6865,59 @@ fn validate_retirement_record(record: &RetirementRecord) -> Result<()> {
     Ok(())
 }
 
+/// Serving-generation owners one scrub pass reports against.
+#[derive(Default)]
+struct ScrubServingOwners {
+    activated: BTreeMap<String, String>,
+    effective: BTreeMap<String, String>,
+    desired: BTreeSet<String>,
+    scope_projects: BTreeMap<String, String>,
+}
+
+impl ScrubServingOwners {
+    fn subject_for(&self, generation: &MixedStoredGeneration) -> Option<String> {
+        let generation_id = generation.generation_id();
+        if let Some(project_id) = self
+            .activated
+            .get(generation_id)
+            .or_else(|| self.effective.get(generation_id))
+        {
+            return Some(project_id.clone());
+        }
+        if !self.desired.contains(generation_id) {
+            return None;
+        }
+        let scope = scope_hash(&generation.descriptor().scope);
+        Some(self.scope_projects.get(&scope).cloned().unwrap_or(scope))
+    }
+}
+
+/// A health subject written as a published-scope hash rather than a project.
+fn is_scope_hash_subject(subject: &str) -> bool {
+    subject.len() == 64
+        && subject
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Generation states that are GC roots by themselves, whatever names them.
+///
+/// These are in-flight publications and the serving generation. A
+/// `MissingBlobData` generation is not one: it cannot serve or roll back, so
+/// it stays alive only while an activation, desired pointer, effective
+/// selection, collision lifecycle, or bridge names it. Once nothing names it
+/// the normal retention pass collects it instead of pinning it (and its
+/// surviving blobs) forever.
+fn state_is_intrinsically_protected(state: GenerationState) -> bool {
+    matches!(
+        state,
+        GenerationState::MissingBlobs
+            | GenerationState::Ready
+            | GenerationState::StagingIndex
+            | GenerationState::Active
+    )
+}
+
 fn mixed_protected_generation_ids_from_records(
     generations: &[MixedStoredGeneration],
     activations: &[MixedActivationRecord],
@@ -6892,14 +7026,7 @@ fn mixed_protected_generation_ids_from_records(
         if !authority_scopes.contains(&generation.descriptor().scope) {
             continue;
         }
-        if matches!(
-            generation.state(),
-            GenerationState::MissingBlobs
-                | GenerationState::Ready
-                | GenerationState::StagingIndex
-                | GenerationState::Active
-                | GenerationState::MissingBlobData
-        ) {
+        if state_is_intrinsically_protected(generation.state()) {
             if generation.is_legacy_v1() {
                 bail!("protected legacy generation lacks strict v2 ownership");
             }
@@ -7003,14 +7130,7 @@ fn protected_generation_ids_from_records(
         }
     }
     for generation in generations {
-        if matches!(
-            generation.state,
-            GenerationState::MissingBlobs
-                | GenerationState::Ready
-                | GenerationState::StagingIndex
-                | GenerationState::Active
-                | GenerationState::MissingBlobData
-        ) {
+        if state_is_intrinsically_protected(generation.state) {
             protected.insert(generation.generation_id.clone());
         }
     }
@@ -8405,7 +8525,7 @@ mod tests {
         validate_sha256(&inventory.collision_lifecycle_set_sha256).unwrap();
     }
 
-    fn activation_v1(generation_id: &str) -> ActivationRecord {
+    pub(super) fn activation_v1(generation_id: &str) -> ActivationRecord {
         ActivationRecord {
             version: STORE_VERSION,
             project_id: "project-a".into(),
@@ -11369,5 +11489,323 @@ mod blob_gc_mode_tests {
             .expect("desired pointer must exist");
         assert_eq!(v1.generation_id, mixed.generation_id());
         assert_eq!(v1.state, GenerationState::Ready);
+    }
+}
+
+/// Missing-blob retention and scrub health keying. A `MissingBlobData`
+/// generation is protected only while something serving names it, and the
+/// scrub reports it under the project whose row activation clears.
+#[cfg(test)]
+mod missing_blob_retention_tests {
+    use super::tests::{activation_v1, descriptor};
+    use super::*;
+
+    const PROJECT: &str = "project-a";
+
+    fn catalog_store(root: &Path) -> CodeSourceStore {
+        CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits {
+                unreferenced_blob_grace_hours: 0,
+                retained_generations: 2,
+                ..StoreLimits::default()
+            },
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap()
+    }
+
+    /// Install one v2 generation of `scope` whose single blob holds `body`.
+    /// When `blob_present` is false the blob is never written, so a scrub
+    /// finds it missing.
+    fn install_generation(
+        store: &CodeSourceStore,
+        scope: &PublishedScope,
+        ordinal: u64,
+        state: GenerationState,
+        body: &[u8],
+        blob_present: bool,
+    ) -> StoredGenerationV2 {
+        let hash = sha256_hex(body);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: body.len() as u64,
+        }];
+        let mut descriptor = descriptor(&entries);
+        descriptor.scope = scope.clone();
+        let generation = StoredGenerationV2 {
+            version: MIGRATION_STORE_VERSION,
+            generation_id: generation_id("host-a", &descriptor),
+            producer_id: "host-a".into(),
+            ordinal,
+            descriptor,
+            published_scope: scope.clone(),
+            state,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(1),
+            entity_inventory_sha256: Some("c".repeat(64)),
+        };
+        let directory = store
+            .paths
+            .generation_directory(scope, &generation.generation_id)
+            .unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        write_manifest_jsonl(&directory.join("manifest.jsonl"), &entries).unwrap();
+        atomic_write_json(&directory.join("metadata.json"), &generation).unwrap();
+        if blob_present {
+            let blob = store.blob_path(&hash);
+            fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            fs::write(blob, body).unwrap();
+        }
+        generation
+    }
+
+    fn activate(store: &CodeSourceStore, generation: &StoredGenerationV2) {
+        let activation = ActivationRecordV2::from_v1_for_migration(
+            activation_v1(&generation.generation_id),
+            generation,
+        )
+        .unwrap();
+        store.save_activation_v2(&activation).unwrap();
+    }
+
+    fn set_desired(store: &CodeSourceStore, generation: &StoredGenerationV2) {
+        let path = store
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(&generation.descriptor.scope)));
+        atomic_write_json(&path, generation).unwrap();
+    }
+
+    fn generation_dir(store: &CodeSourceStore, generation: &StoredGenerationV2) -> PathBuf {
+        store
+            .paths
+            .generation_directory(&generation.descriptor.scope, &generation.generation_id)
+            .unwrap()
+    }
+
+    fn blob_rows(store: &CodeSourceStore) -> Vec<String> {
+        store
+            .health_records()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.code == "missing_blob_data")
+            .map(|record| record.project_id)
+            .collect()
+    }
+
+    #[test]
+    fn retired_missing_blob_generation_is_collectable_and_its_legacy_scope_row_clears() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store(&root);
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let retired = install_generation(
+            &store,
+            &scope,
+            1,
+            GenerationState::MissingBlobData,
+            b"retired body",
+            false,
+        );
+        let active = install_generation(
+            &store,
+            &scope,
+            2,
+            GenerationState::Active,
+            b"active body",
+            true,
+        );
+        activate(&store, &active);
+        set_desired(&store, &active);
+        // The row an older build left keyed by the scope hash.
+        let scope_subject = scope_hash(&scope);
+        store
+            .record_health_failure(
+                &scope_subject,
+                "missing_blob_data",
+                "one or more retained source blobs failed verification",
+            )
+            .unwrap();
+        assert_eq!(blob_rows(&store), vec![scope_subject.clone()]);
+        assert!(generation_dir(&store, &retired).is_dir());
+
+        let stats = store.scrub_retained().unwrap();
+        assert_eq!(stats.degraded_generations, 0);
+        assert!(
+            stats.scrubbed_blobs >= 1,
+            "the active generation was scrubbed"
+        );
+        assert!(
+            blob_rows(&store).is_empty(),
+            "a healthy active generation must not stay blocked by a retired one"
+        );
+
+        let gc = store.gc_blobs_for_scopes(&BTreeSet::from([scope])).unwrap();
+        assert_eq!(gc.reclaimed_generations, 1);
+        assert!(!generation_dir(&store, &retired).exists());
+        assert!(generation_dir(&store, &active).is_dir());
+        assert_eq!(
+            store
+                .find_generation_mixed(&active.generation_id)
+                .unwrap()
+                .state(),
+            GenerationState::Active
+        );
+    }
+
+    #[test]
+    fn active_missing_blob_generation_stays_protected_and_reports_under_its_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store(&root);
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let active = install_generation(
+            &store,
+            &scope,
+            1,
+            GenerationState::Active,
+            b"active body",
+            false,
+        );
+        activate(&store, &active);
+        set_desired(&store, &active);
+
+        let stats = store.scrub_retained().unwrap();
+        assert_eq!(stats.degraded_generations, 1);
+        assert_eq!(blob_rows(&store), vec![PROJECT.to_string()]);
+        assert_eq!(
+            store
+                .find_generation_mixed(&active.generation_id)
+                .unwrap()
+                .state(),
+            GenerationState::MissingBlobData
+        );
+        let gc = store
+            .gc_blobs_for_scopes(&BTreeSet::from([scope.clone()]))
+            .unwrap();
+        assert_eq!(gc.reclaimed_generations, 0);
+        assert!(generation_dir(&store, &active).is_dir());
+
+        // Repeated scrubs keep the same single row: no scope-keyed twin.
+        store.scrub_retained().unwrap();
+        assert_eq!(blob_rows(&store), vec![PROJECT.to_string()]);
+    }
+
+    #[test]
+    fn desired_missing_blob_generation_reports_under_the_scope_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store(&root);
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let active = install_generation(
+            &store,
+            &scope,
+            1,
+            GenerationState::Active,
+            b"active body",
+            true,
+        );
+        activate(&store, &active);
+        let desired = install_generation(
+            &store,
+            &scope,
+            2,
+            GenerationState::Ready,
+            b"desired body",
+            false,
+        );
+        set_desired(&store, &desired);
+
+        let stats = store.scrub_retained().unwrap();
+        assert_eq!(stats.degraded_generations, 1);
+        assert_eq!(blob_rows(&store), vec![PROJECT.to_string()]);
+        let gc = store
+            .gc_blobs_for_scopes(&BTreeSet::from([scope.clone()]))
+            .unwrap();
+        assert_eq!(gc.reclaimed_generations, 0);
+        assert!(generation_dir(&store, &desired).is_dir());
+    }
+
+    #[test]
+    fn retained_generation_losing_blobs_is_marked_without_a_blocked_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store(&root);
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let retained = install_generation(
+            &store,
+            &scope,
+            1,
+            GenerationState::Superseded,
+            b"retained body",
+            false,
+        );
+        let active = install_generation(
+            &store,
+            &scope,
+            2,
+            GenerationState::Active,
+            b"active body",
+            true,
+        );
+        activate(&store, &active);
+        set_desired(&store, &active);
+
+        let stats = store.scrub_retained().unwrap();
+        assert_eq!(stats.degraded_generations, 1);
+        assert_eq!(
+            store
+                .find_generation_mixed(&retained.generation_id)
+                .unwrap()
+                .state(),
+            GenerationState::MissingBlobData
+        );
+        assert!(blob_rows(&store).is_empty());
+
+        let gc = store.gc_blobs_for_scopes(&BTreeSet::from([scope])).unwrap();
+        assert_eq!(gc.reclaimed_generations, 1);
+        assert!(!generation_dir(&store, &retained).exists());
+    }
+
+    #[test]
+    fn scrub_clears_orphaned_scope_rows_and_tolerates_a_never_provisioned_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store(&root);
+        let stats = store.scrub_retained().unwrap();
+        assert_eq!(stats.scrubbed_blobs, 0);
+        assert!(store.health_records().unwrap().is_empty());
+
+        // A scope row whose scope no longer has any generation, a
+        // project-keyed row the scrub does not own, and an unrelated code.
+        let orphan_scope = scope_hash(&PublishedScope::try_new("gone", ".").unwrap());
+        store
+            .record_health_failure(&orphan_scope, "missing_blob_data", "stale")
+            .unwrap();
+        store
+            .record_health_failure(PROJECT, "missing_blob_data", "owned by materialization")
+            .unwrap();
+        store
+            .record_health_failure(&orphan_scope, "unrelated_code", "keep")
+            .unwrap();
+        assert_eq!(store.health_records().unwrap().len(), 3);
+
+        store.scrub_retained().unwrap();
+        let remaining = store
+            .health_records()
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.project_id, record.code))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining,
+            vec![
+                (orphan_scope.clone(), "unrelated_code".to_string()),
+                (PROJECT.to_string(), "missing_blob_data".to_string()),
+            ]
+        );
     }
 }
