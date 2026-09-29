@@ -2658,6 +2658,117 @@ fn clear_converged_cutback_health_at_startup(
     }
 }
 
+/// Health subjects the catalog does not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthSubject {
+    /// A project id: its rows live exactly as long as something binds it.
+    Project,
+    /// A repository-history id. No current writer keys health by a
+    /// repository history: history failures are recorded per bound project
+    /// and dead letters live in the git-source store, so such a row is a
+    /// leftover of an older build.
+    RepoHistory,
+    /// A published-scope hash, owned and reconciled by the retained-blob
+    /// scrub.
+    Scope,
+    /// A daemon subsystem such as `_edge_index`.
+    System,
+}
+
+fn classify_health_subject(subject: &str) -> HealthSubject {
+    if subject.starts_with('_') {
+        HealthSubject::System
+    } else if bbox_corpus_core::project_catalog::RepoHistoryId::parse(subject).is_ok() {
+        HealthSubject::RepoHistory
+    } else if subject.len() == 64
+        && subject
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        HealthSubject::Scope
+    } else {
+        HealthSubject::Project
+    }
+}
+
+/// Remove code-source health rows whose subject nothing binds any more.
+///
+/// A project row survives while the catalog holds the project, a producer
+/// assignment or activation record still names it, or a retirement is
+/// queued for it (those rows describe work still in flight). Repository-
+/// history rows are always leftovers (see [`HealthSubject::RepoHistory`]).
+/// Scope and system rows belong to their own reconcilers. Runs at startup,
+/// after every delivered catalog commit, and on the maintenance pass, so a
+/// retired project's rows clear without manual deletion.
+pub(crate) fn clear_unbound_health_subjects(
+    store: &CodeSourceStore,
+    code_sources: &CodeSourceRuntime,
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+) {
+    let health = match store.health_records() {
+        Ok(health) => health,
+        Err(error) => {
+            tracing::warn!(%error, "health reconciliation: loading code-source health failed");
+            return;
+        }
+    };
+    if health.is_empty() {
+        return;
+    }
+    let mut bound = code_sources
+        .assignments()
+        .into_iter()
+        .map(|(_scope, project_id)| project_id)
+        .collect::<BTreeSet<_>>();
+    match store.activation_records_mixed() {
+        Ok(activations) => bound.extend(
+            activations
+                .into_iter()
+                .map(|record| record.project_id().to_string()),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "health reconciliation: loading activations failed");
+            return;
+        }
+    }
+    match store.retirement_records() {
+        Ok(retirements) => bound.extend(retirements.into_iter().map(|record| record.project_id)),
+        Err(error) => {
+            tracing::warn!(%error, "health reconciliation: loading retirements failed");
+            return;
+        }
+    }
+    for record in health {
+        let stale = match classify_health_subject(&record.project_id) {
+            HealthSubject::Project => {
+                !bound.contains(&record.project_id)
+                    && bbox_corpus_core::project_catalog::ProjectId::parse(
+                        record.project_id.clone(),
+                    )
+                    .is_ok_and(|project_id| !catalog.projects.contains_key(&project_id))
+            }
+            HealthSubject::RepoHistory => true,
+            HealthSubject::Scope | HealthSubject::System => false,
+        };
+        if !stale {
+            continue;
+        }
+        match store.clear_health_failure(&record.project_id, &record.code) {
+            Ok(()) => tracing::info!(
+                subject = %record.project_id,
+                code = %record.code,
+                "cleared code-source health for a subject the catalog no longer binds"
+            ),
+            Err(error) => tracing::warn!(
+                subject = %record.project_id,
+                code = %record.code,
+                %error,
+                "health reconciliation: clearing an unbound subject failed"
+            ),
+        }
+    }
+}
+
 fn gate_transient_deadline(
     action: ReducerAction,
     persisted: Option<&CutbackStateV2>,
@@ -2888,6 +2999,17 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                     super::checkout_access::reconcile_catalog_runtime_for_commit(
                         &state, &observer,
                     );
+                    match catalog_store.snapshot() {
+                        Ok(snapshot) => clear_unbound_health_subjects(
+                            &state.code_sources.store(),
+                            &state.code_sources,
+                            snapshot.catalog(),
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "health reconciliation: catalog snapshot unavailable"
+                        ),
+                    }
                 }
                 if let Some(progress) = rescan_progress.as_ref()
                     && progress.is_complete()
@@ -3070,6 +3192,21 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                         Err(error) => {
                             tracing::warn!(%error, "code-source retained blob scrub failed")
                         }
+                    }
+                }
+                if store.record_mode() == RuntimeRecordMode::CatalogV2
+                    && let Some(catalog_store) = state.project_authority.catalog_store()
+                {
+                    match catalog_store.snapshot() {
+                        Ok(snapshot) => clear_unbound_health_subjects(
+                            &store,
+                            &state.code_sources,
+                            snapshot.catalog(),
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "health reconciliation: catalog snapshot unavailable"
+                        ),
                     }
                 }
                 tick = tick.wrapping_add(1);
@@ -4716,6 +4853,7 @@ pub(crate) fn pre_bind_catalog_recovery(
     // persisted-state event to drive a NoOp reduction, so clear only those
     // cutback rows whose authority is already converged.
     clear_converged_cutback_health_at_startup(store, code_sources, &reconstructed_manifest);
+    clear_unbound_health_subjects(store, code_sources, catalog);
 
     Ok(pending_first_republish)
 }
@@ -8105,6 +8243,113 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.project_id == unresolved_id && record.code == "cutback_pending"
         }));
+    }
+
+    #[test]
+    fn unbound_health_subjects_clear_while_bound_and_owned_rows_stay() {
+        use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject, ProjectScope};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let live = "p_0000000000000000000000000000live";
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let live_id = bbox_corpus_core::project_catalog::ProjectId::parse(live).unwrap();
+        catalog.projects.insert(
+            live_id.clone(),
+            CorpusProject {
+                project_id: live_id,
+                scope: ProjectScope::LegacyLocal,
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: live.to_string(),
+                created_at: "2026-09-01T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+
+        // Never provisioned: no rows, nothing to do, nothing created.
+        clear_unbound_health_subjects(&store, &runtime, &catalog);
+        assert!(store.health_records().unwrap().is_empty());
+
+        // A retired project that still holds an activation keeps its rows
+        // until the activation is gone.
+        let activated = "p_000000000000000000000000activated";
+        let activated_scope = PublishedScope::try_new("health-activated", ".").unwrap();
+        let activated_generation = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(activated_scope.clone(), &"a".repeat(40)),
+        );
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            activated,
+            &activated_scope,
+            &activated_generation,
+            None,
+            false,
+        );
+
+        let retired = "p_0000000000000000000000000retired";
+        let orphan_history = "rh_000000000000000000000000000000e1";
+        let scope_subject = bbox_code_source::scope_hash(&activated_scope);
+        let rows = [
+            (live, "source_unavailable"),
+            (activated, "retirement_deferred_active"),
+            (retired, "history_transport_activation_failed"),
+            (retired, "source_unavailable"),
+            (orphan_history, "history_transport_activation_failed"),
+            (orphan_history, "history_transport_activation_deadletter"),
+            (scope_subject.as_str(), "missing_blob_data"),
+            ("_edge_index", "store_refresh_deferred"),
+        ];
+        for (subject, code) in rows {
+            store
+                .record_health_failure(subject, code, "row an older build left")
+                .unwrap();
+        }
+        assert_eq!(store.health_records().unwrap().len(), rows.len());
+
+        clear_unbound_health_subjects(&store, &runtime, &catalog);
+        let expected = BTreeSet::from([
+            (live.to_string(), "source_unavailable".to_string()),
+            (
+                activated.to_string(),
+                "retirement_deferred_active".to_string(),
+            ),
+            (scope_subject.clone(), "missing_blob_data".to_string()),
+            (
+                "_edge_index".to_string(),
+                "store_refresh_deferred".to_string(),
+            ),
+        ]);
+        let remaining = || {
+            store
+                .health_records()
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.project_id, record.code))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(remaining(), expected);
+
+        // Idempotent: a second pass keeps exactly the bound rows.
+        clear_unbound_health_subjects(&store, &runtime, &catalog);
+        assert_eq!(remaining(), expected);
+
+        // Once the activation is gone the retired project's row clears too.
+        store.clear_activation(activated).unwrap();
+        clear_unbound_health_subjects(&store, &runtime, &catalog);
+        let mut without_activated = expected.clone();
+        without_activated.remove(&(
+            activated.to_string(),
+            "retirement_deferred_active".to_string(),
+        ));
+        assert_eq!(remaining(), without_activated);
     }
 
     #[test]
