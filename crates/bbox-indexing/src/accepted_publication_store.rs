@@ -2578,6 +2578,126 @@ pub(crate) fn pointer_source_generation_roots_locked(
     Ok(Some(roots))
 }
 
+/// What one bounded retention step did to one project's generation files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GenerationRetentionStepV1 {
+    /// Generation files present when the step listed the directory.
+    pub(crate) listed: usize,
+    /// Files this step removed.
+    pub(crate) deleted: usize,
+    pub(crate) deleted_bytes: u64,
+    /// Collectable files left for a later step because the step's
+    /// deletion budget ran out.
+    pub(crate) remaining: usize,
+}
+
+/// Remove one project's accepted generation files that nothing needs.
+///
+/// Kept: the pointer's current generation, the pointer's prior arm, every
+/// id in `protected` (in-flight preparations and cached reads), and the
+/// `keep_previous` most recently written generations other than the
+/// current one. Generation ids are content digests with no order, so
+/// recency is the file's modification time. Everything else is removed,
+/// at most `max_deletions` files per call, so a store with a large
+/// backlog drains over several calls without holding the publication
+/// lock for long.
+///
+/// `Ok(None)` means the project has no pointer. Such a project is never
+/// collected: an absent pointer is not proof that nothing references the
+/// files. A pointer that does not decode is an error for the same reason.
+/// Only regular files named `<generation id>.json` are candidates, so
+/// interrupted atomic-replace temporaries and anything unexpected are left
+/// alone. Removing a file twice is a no-op, which makes the step
+/// idempotent.
+#[allow(clippy::disallowed_methods)] // runs on the maintenance thread, never a tokio worker
+pub(crate) fn retain_generations_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    limits: &AcceptedPublicationLimits,
+    protected: &std::collections::BTreeSet<String>,
+    keep_previous: usize,
+    max_deletions: usize,
+) -> AcceptedPublicationStoreResult<Option<GenerationRetentionStepV1>> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let Some(pointer_bytes) =
+        read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?
+    else {
+        return Ok(None);
+    };
+    let pointer = decode_pointer_v1(&pointer_bytes, limits)?;
+    let project_generations = paths.generations().join(project_id.as_str());
+    let Some(directory) =
+        NofollowDirectory::open_existing(&project_generations).map_err(accepted_io_error)?
+    else {
+        return Ok(Some(GenerationRetentionStepV1::default()));
+    };
+    let current = pointer.accepted_generation.as_str().to_string();
+    let prior = pointer
+        .prior_pointer
+        .as_ref()
+        .map(|prior| prior.accepted_generation.as_str().to_string());
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&project_generations).map_err(accepted_io_error)? {
+        let entry = entry.map_err(accepted_io_error)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if AcceptedPublicationGenerationId::parse(stem.to_string()).is_err() {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow a symlink, so a link named
+        // like a generation is skipped rather than resolved.
+        let metadata = entry.metadata().map_err(accepted_io_error)?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        files.push((modified, stem.to_string(), name, metadata.len()));
+    }
+    let listed = files.len();
+    // Newest first; the id breaks ties so the order is deterministic.
+    files.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut previous_kept = 0_usize;
+    let mut collectable = Vec::new();
+    for (_, generation_id, name, bytes) in files {
+        if generation_id == current {
+            continue;
+        }
+        if previous_kept < keep_previous {
+            previous_kept += 1;
+            continue;
+        }
+        if prior.as_deref() == Some(generation_id.as_str()) || protected.contains(&generation_id) {
+            continue;
+        }
+        collectable.push((name, bytes));
+    }
+    let mut step = GenerationRetentionStepV1 {
+        listed,
+        ..GenerationRetentionStepV1::default()
+    };
+    for (name, bytes) in collectable.iter().take(max_deletions) {
+        if directory
+            .remove_regular(name, "accepted-publication generation")
+            .map_err(accepted_io_error)?
+        {
+            step.deleted += 1;
+            step.deleted_bytes = step.deleted_bytes.saturating_add(*bytes);
+        }
+    }
+    step.remaining = collectable.len().saturating_sub(max_deletions);
+    directory
+        .ensure_still_current()
+        .map_err(accepted_io_error)?;
+    Ok(Some(step))
+}
+
 /// Prove this process can act as the accepted-publication authority before
 /// routes bind: the store lock is held and every store directory that
 /// exists is a real directory rather than a redirect. An absent store root

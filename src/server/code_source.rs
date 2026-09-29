@@ -3182,6 +3182,7 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "knowledge-source maintenance failed"),
                 }
+                retain_accepted_generations(&state);
                 if tick.is_multiple_of(24) {
                     match store.scrub_retained() {
                         Ok(stats) => tracing::info!(
@@ -3216,6 +3217,57 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
         })
         .context("spawning code-source maintenance thread")?;
     Ok(())
+}
+
+/// Previous accepted generations kept per project beside the current one.
+/// The prior arm is always kept as well, even when it is older.
+const ACCEPTED_GENERATIONS_KEEP_PREVIOUS: usize = 2;
+/// Deletions per publication-lock hold.
+const ACCEPTED_GENERATION_RETENTION_STEP: usize = 64;
+/// Deletions per maintenance pass; a larger backlog drains over later
+/// passes.
+const ACCEPTED_GENERATION_RETENTION_BUDGET: usize = 512;
+
+/// Collect accepted generations no pointer arm, in-flight preparation,
+/// cached read, or recent-history slot needs, for every catalog project.
+fn retain_accepted_generations(state: &SharedState) {
+    let (Some(runtime), Some(catalog_store)) = (
+        state.accepted_publications.as_ref(),
+        state.project_authority.catalog_store(),
+    ) else {
+        return;
+    };
+    let snapshot = match catalog_store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%error, "accepted generation retention: catalog snapshot unavailable");
+            return;
+        }
+    };
+    let pass = runtime.retain_generations_pass(
+        snapshot.catalog().projects.keys().cloned(),
+        ACCEPTED_GENERATIONS_KEEP_PREVIOUS,
+        ACCEPTED_GENERATION_RETENTION_STEP,
+        ACCEPTED_GENERATION_RETENTION_BUDGET,
+    );
+    for (project_id, error) in &pass.failures {
+        tracing::warn!(
+            project_id = %project_id,
+            code = error.code(),
+            error = %error,
+            "accepted generation retention skipped a project"
+        );
+    }
+    if pass.deleted > 0 || pass.budget_exhausted || pass.dropped_failures > 0 {
+        tracing::info!(
+            projects = pass.projects,
+            generations = pass.deleted,
+            bytes = pass.deleted_bytes,
+            budget_exhausted = pass.budget_exhausted,
+            dropped_failures = pass.dropped_failures,
+            "accepted generation retention reclaimed superseded generations"
+        );
+    }
 }
 
 fn schedule_cutback(

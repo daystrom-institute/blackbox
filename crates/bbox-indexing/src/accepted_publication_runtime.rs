@@ -34,7 +34,7 @@ use crate::accepted_publication_store::{
     acquire_accepted_publication_lock, commit_pointer_locked, install_generation_off_lock,
     installed_pointer_tokens_locked, pointer_generation_roots_locked,
     pointer_source_generation_roots_locked, prepare_accepted_publication_v1,
-    probe_global_store_locked, selected_pointer_source_binding,
+    probe_global_store_locked, retain_generations_locked, selected_pointer_source_binding,
     verify_selected_with_binding_locked,
 };
 
@@ -742,6 +742,33 @@ pub struct InstalledAcceptedPointer {
     pub source: AcceptedPublicationSourceBinding,
     /// The prior arm's generation id, when the pointer carries one.
     pub prior_generation_id: Option<String>,
+}
+
+/// What one maintenance retention pass did across the catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedRetentionPass {
+    /// Projects with a pointer that the pass visited.
+    pub projects: usize,
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+    /// True when the pass stopped at its deletion budget; the next pass
+    /// continues where this one stopped.
+    pub budget_exhausted: bool,
+    /// Projects whose step failed, capped at `MAX_REPORTED_SCAN_FAILURES`.
+    pub failures: Vec<(ProjectId, AcceptedPublicationRuntimeError)>,
+    /// Failures beyond the cap.
+    pub dropped_failures: usize,
+}
+
+/// What one bounded retention step did to one project's accepted
+/// generation files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedGenerationRetention {
+    pub listed: usize,
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+    /// Collectable files left for a later step by the deletion budget.
+    pub remaining: usize,
 }
 
 /// A publish request after the caller has resolved Git and read sources.
@@ -1511,6 +1538,125 @@ impl AcceptedPublicationRuntime {
                 .prior_pointer
                 .as_ref()
                 .map(|prior| prior.accepted_generation.as_str().to_string()),
+        }))
+    }
+
+    /// One retention pass over `projects`: each project is drained in
+    /// steps of at most `step` deletions (one publication-lock hold each)
+    /// until it has nothing left to collect or the pass has removed
+    /// `budget` files. A failing project is reported and skipped; it never
+    /// stops the pass. Running the pass again is a no-op once everything
+    /// collectable is gone.
+    pub fn retain_generations_pass<I>(
+        &self,
+        projects: I,
+        keep_previous: usize,
+        step: usize,
+        budget: usize,
+    ) -> AcceptedRetentionPass
+    where
+        I: IntoIterator<Item = ProjectId>,
+    {
+        let step = step.max(1);
+        let mut pass = AcceptedRetentionPass::default();
+        let mut left = budget;
+        for project_id in projects {
+            if left == 0 {
+                pass.budget_exhausted = true;
+                break;
+            }
+            let mut visited = false;
+            loop {
+                match self.retain_generations(&project_id, keep_previous, step.min(left)) {
+                    Ok(None) => break,
+                    Ok(Some(outcome)) => {
+                        visited = true;
+                        pass.deleted += outcome.deleted;
+                        pass.deleted_bytes =
+                            pass.deleted_bytes.saturating_add(outcome.deleted_bytes);
+                        left = left.saturating_sub(outcome.deleted);
+                        if outcome.remaining == 0 {
+                            break;
+                        }
+                        if left == 0 {
+                            pass.budget_exhausted = true;
+                            break;
+                        }
+                        if outcome.deleted == 0 {
+                            // Nothing removable was removed (a concurrent
+                            // remover got there first); a later pass
+                            // re-lists instead of spinning here.
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if pass.failures.len() < MAX_REPORTED_SCAN_FAILURES {
+                            pass.failures.push((project_id.clone(), error));
+                        } else {
+                            pass.dropped_failures += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            if visited {
+                pass.projects += 1;
+            }
+        }
+        pass
+    }
+
+    /// One bounded retention step over one project's accepted generations.
+    ///
+    /// Keeps the current generation, the prior arm, the `keep_previous`
+    /// most recently written other generations, every in-flight
+    /// preparation, and the generation a cached read pins; removes at most
+    /// `max_deletions` of the rest. `Ok(None)` means the project has no
+    /// pointer and nothing was collected.
+    ///
+    /// The publication lock holds the pointer arms still, and the in-flight
+    /// registry is held across the whole step: a preparation registers its
+    /// root before it checks for an existing content-addressed file, so it
+    /// either registered before this step read the registry (and its file
+    /// is protected) or it runs after the step and finds its file absent
+    /// and writes it.
+    pub fn retain_generations(
+        &self,
+        project_id: &ProjectId,
+        keep_previous: usize,
+        max_deletions: usize,
+    ) -> Result<Option<AcceptedGenerationRetention>, AcceptedPublicationRuntimeError> {
+        let guard = self.lock()?;
+        let in_flight = self.in_flight.roots.write();
+        let mut protected = BTreeSet::new();
+        if let Some(roots) = in_flight.get(project_id) {
+            protected.extend(roots.keys().cloned());
+        }
+        if let Some(pinned) = self
+            .cache
+            .read()
+            .get(project_id)
+            .and_then(|cached| cached.content.as_ref())
+        {
+            protected.insert(pinned.stamp.generation_id.clone());
+        }
+        let step = retain_generations_locked(
+            &self.paths,
+            &guard,
+            project_id,
+            &self.limits,
+            &protected,
+            keep_previous,
+            max_deletions,
+        )
+        .map_err(|error| AcceptedPublicationRuntimeError::from_store(&error))?;
+        drop(in_flight);
+        drop(guard);
+        Ok(step.map(|step| AcceptedGenerationRetention {
+            listed: step.listed,
+            deleted: step.deleted,
+            deleted_bytes: step.deleted_bytes,
+            remaining: step.remaining,
         }))
     }
 
@@ -2596,6 +2742,312 @@ mod tests {
                 .accepted_commit(),
             COMMIT_TWO
         );
+    }
+
+    // ── Accepted generation retention ────────────────────────────────
+
+    fn generation_files(fixture: &Fixture, project_id: &ProjectId) -> BTreeSet<String> {
+        match fs::read_dir(fixture.paths.generations().join(project_id.as_str())) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        }
+    }
+
+    fn set_age(fixture: &Fixture, project_id: &ProjectId, generation_id: &str, age_secs: u64) {
+        let path = fixture
+            .paths
+            .generations()
+            .join(project_id.as_str())
+            .join(format!("{generation_id}.json"));
+        fs::File::options()
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(age_secs))
+            .unwrap();
+    }
+
+    /// Publish `count` generations, oldest first, with strictly ordered
+    /// modification times so recency does not depend on clock granularity.
+    fn publish_chain(
+        fixture: &Fixture,
+        runtime: &AcceptedPublicationRuntime,
+        project_id: &ProjectId,
+        count: usize,
+    ) -> Vec<String> {
+        let mut generations = Vec::new();
+        for index in 0..count {
+            let commit = format!("{:040x}", index + 1);
+            let receipt = match runtime.advance_tokens(project_id).unwrap() {
+                None => run_publish(runtime, establish_request(project_id, &commit), "g0"),
+                Some(tokens) => run_publish(
+                    runtime,
+                    advance_request(project_id, &commit, tokens),
+                    &format!("g{index}"),
+                ),
+            }
+            .unwrap();
+            generations.push(receipt.generation_id().to_string());
+        }
+        for (index, generation) in generations.iter().enumerate() {
+            set_age(
+                fixture,
+                project_id,
+                generation,
+                ((count - index) as u64) * 60,
+            );
+        }
+        generations
+    }
+
+    #[test]
+    fn retention_keeps_current_prior_and_two_previous_and_is_idempotent() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_retention");
+        let chain = publish_chain(&fixture, &runtime, &project_id, 6);
+        assert_eq!(generation_files(&fixture, &project_id).len(), 6);
+
+        let step = runtime
+            .retain_generations(&project_id, 2, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.listed, 6);
+        assert_eq!(step.deleted, 3);
+        assert!(step.deleted_bytes > 0);
+        assert_eq!(step.remaining, 0);
+        let kept = generation_files(&fixture, &project_id);
+        assert_eq!(
+            kept,
+            chain[3..]
+                .iter()
+                .map(|id| format!("{id}.json"))
+                .collect::<BTreeSet<_>>(),
+            "current, the prior arm, and one more previous generation survive"
+        );
+
+        let again = runtime
+            .retain_generations(&project_id, 2, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.deleted, 0, "a second pass is a no-op");
+        assert_eq!(generation_files(&fixture, &project_id), kept);
+
+        // Serving is unaffected, and the prior arm still backs a fallback.
+        let fresh = fixture.runtime();
+        assert_eq!(
+            fresh
+                .load_verified(&project_id)
+                .unwrap()
+                .content_stamp()
+                .generation_id(),
+            chain[5]
+        );
+        fixtures::corrupt_generation(
+            &fixture.paths,
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(chain[5].clone()).unwrap(),
+        );
+        let fallback = fixture.runtime().load_verified(&project_id).unwrap();
+        assert_eq!(
+            fallback.binding_stamp().selection(),
+            AcceptedPublicationSelection::Prior
+        );
+        assert_eq!(fallback.content_stamp().generation_id(), chain[4]);
+    }
+
+    /// The prior arm survives even when it is older than the two most
+    /// recent previous generations, and so do in-flight preparations and
+    /// the generation a cached read pins.
+    #[test]
+    fn retention_never_removes_the_prior_arm_or_protected_generations() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_retention_prior");
+        let chain = publish_chain(&fixture, &runtime, &project_id, 4);
+        // The prior arm (chain[2]) becomes the OLDEST file, and two newer
+        // unrelated generations appear beside it.
+        set_age(&fixture, &project_id, &chain[2], 10_000);
+        let directory = fixture.paths.generations().join(project_id.as_str());
+        let newer = ["a".repeat(64), "b".repeat(64)];
+        for (index, id) in newer.iter().enumerate() {
+            fs::write(directory.join(format!("{id}.json")), b"{}").unwrap();
+            set_age(&fixture, &project_id, id, 5 + index as u64);
+        }
+        // An in-flight preparation: installed, never committed.
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let in_flight = runtime
+            .prepare_publish(
+                advance_request(&project_id, COMMIT_THREE, tokens),
+                sources("in flight"),
+            )
+            .unwrap();
+        set_age(&fixture, &project_id, in_flight.generation_id(), 20_000);
+
+        runtime
+            .retain_generations(&project_id, 2, 64)
+            .unwrap()
+            .unwrap();
+        let kept = generation_files(&fixture, &project_id);
+        for survivor in [
+            chain[3].as_str(),
+            chain[2].as_str(),
+            newer[0].as_str(),
+            newer[1].as_str(),
+            in_flight.generation_id(),
+        ] {
+            assert!(
+                kept.contains(&format!("{survivor}.json")),
+                "{survivor}: {kept:?}"
+            );
+        }
+        assert!(!kept.contains(&format!("{}.json", chain[0])));
+        assert!(!kept.contains(&format!("{}.json", chain[1])));
+
+        // Once the preparation is dropped its generation is collectable.
+        let in_flight_id = in_flight.generation_id().to_string();
+        drop(in_flight);
+        runtime
+            .retain_generations(&project_id, 2, 64)
+            .unwrap()
+            .unwrap();
+        assert!(!generation_files(&fixture, &project_id).contains(&format!("{in_flight_id}.json")));
+    }
+
+    /// A store with hundreds of generations drains in bounded steps, and
+    /// files that are not generation files are never touched.
+    #[test]
+    fn retention_drains_hundreds_of_generations_in_bounded_steps() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_retention_bulk");
+        let chain = publish_chain(&fixture, &runtime, &project_id, 2);
+        let directory = fixture.paths.generations().join(project_id.as_str());
+        for index in 0..400_u64 {
+            let id = format!("{:064x}", index + 1);
+            fs::write(directory.join(format!("{id}.json")), vec![b'x'; 64]).unwrap();
+            set_age(&fixture, &project_id, &id, 100_000 + index);
+        }
+        fs::write(directory.join(".tmp-generation"), b"partial").unwrap();
+        fs::write(directory.join("notes.txt"), b"operator note").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            directory.join(format!("{}.json", chain[1])),
+            directory.join(format!("{}.json", "c".repeat(64))),
+        )
+        .unwrap();
+
+        let mut steps = 0;
+        let mut deleted = 0;
+        loop {
+            let step = runtime
+                .retain_generations(&project_id, 2, 64)
+                .unwrap()
+                .unwrap();
+            steps += 1;
+            deleted += step.deleted;
+            assert!(step.deleted <= 64);
+            if step.remaining == 0 {
+                break;
+            }
+            assert!(steps < 20, "retention must converge");
+        }
+        assert_eq!(
+            deleted, 399,
+            "all but the most recent previous fake survive"
+        );
+        assert_eq!(steps, 7);
+        let kept = generation_files(&fixture, &project_id);
+        assert!(kept.contains(&format!("{}.json", chain[1])));
+        assert!(
+            kept.contains(&format!("{}.json", chain[0])),
+            "the prior arm"
+        );
+        assert!(
+            kept.contains(&format!("{:064x}.json", 1)),
+            "the newest fake"
+        );
+        assert!(kept.contains(".tmp-generation"));
+        assert!(kept.contains("notes.txt"));
+        #[cfg(unix)]
+        assert!(kept.contains(&format!("{}.json", "c".repeat(64))));
+        assert_eq!(
+            runtime
+                .load_verified(&project_id)
+                .unwrap()
+                .content_stamp()
+                .generation_id(),
+            chain[1]
+        );
+    }
+
+    /// The maintenance pass drains every project within its budget, skips
+    /// a damaged project without stopping, resumes where a budget-limited
+    /// pass stopped, and is a no-op once nothing is collectable.
+    #[test]
+    fn retention_pass_is_bounded_isolates_failures_and_converges() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let damaged = project("p_pass_a_damaged");
+        publish_chain(&fixture, &runtime, &damaged, 5);
+        fs::write(fixture.paths.pointer(&damaged), b"{not json").unwrap();
+        let never = project("p_pass_b_never");
+        let first = project("p_pass_c_first");
+        let second = project("p_pass_d_second");
+        publish_chain(&fixture, &runtime, &first, 8);
+        publish_chain(&fixture, &runtime, &second, 8);
+        let projects = [damaged.clone(), never, first.clone(), second.clone()];
+
+        let limited = runtime.retain_generations_pass(projects.clone(), 2, 2, 7);
+        assert_eq!(limited.deleted, 7);
+        assert!(limited.budget_exhausted);
+        assert_eq!(limited.failures.len(), 1);
+        assert_eq!(limited.failures[0].0, damaged);
+        assert_eq!(generation_files(&fixture, &first).len(), 3);
+        assert_eq!(generation_files(&fixture, &second).len(), 6);
+
+        let rest = runtime.retain_generations_pass(projects.clone(), 2, 2, 512);
+        assert_eq!(rest.deleted, 3);
+        assert!(!rest.budget_exhausted);
+        assert_eq!(rest.projects, 2);
+        assert_eq!(generation_files(&fixture, &second).len(), 3);
+        assert_eq!(
+            generation_files(&fixture, &damaged).len(),
+            5,
+            "a damaged pointer protects everything"
+        );
+
+        let again = runtime.retain_generations_pass(projects, 2, 2, 512);
+        assert_eq!(again.deleted, 0);
+        assert!(!again.budget_exhausted);
+    }
+
+    /// No pointer means nothing is collected, and an undecodable pointer
+    /// is an error rather than an empty root set.
+    #[test]
+    fn retention_never_collects_without_a_readable_pointer() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let never = project("p_retention_never");
+        assert_eq!(runtime.retain_generations(&never, 2, 64).unwrap(), None);
+
+        let orphan = project("p_retention_orphan");
+        let directory = fixture.paths.generations().join(orphan.as_str());
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..5 {
+            fs::write(directory.join(format!("{:064x}.json", index + 1)), b"{}").unwrap();
+        }
+        assert_eq!(runtime.retain_generations(&orphan, 2, 64).unwrap(), None);
+        assert_eq!(generation_files(&fixture, &orphan).len(), 5);
+
+        let damaged = project("p_retention_damaged");
+        publish_chain(&fixture, &runtime, &damaged, 4);
+        fs::write(fixture.paths.pointer(&damaged), b"{not json").unwrap();
+        assert!(runtime.retain_generations(&damaged, 2, 64).is_err());
+        assert_eq!(generation_files(&fixture, &damaged).len(), 4);
     }
 
     #[test]
