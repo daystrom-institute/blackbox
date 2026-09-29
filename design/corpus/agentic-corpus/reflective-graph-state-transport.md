@@ -273,7 +273,7 @@ and is not citable as published evidence.
 
 **V1 is file-first.** Edit `.bbox/graphs/<id>/*` in a checkout, validate with
 the checkout-side tool, commit. The commit is the publish gate; the checkout
-owner captures a candidate and the operator advances the pointer. Between edit
+owner captures a candidate and the daemon accepts it. Between edit
 and commit, provisional capture makes the change visible in `own` and, on
 explicit request, `all`. The daemon never opens or writes a checkout path.
 

@@ -433,7 +433,7 @@ The executable dependency map from this rebaseline is:
    collection cannot solve.
 2. **Remote knowledge transport: complete through KT-F.** See
    [knowledge-source-transport-impl.md](knowledge-source-transport-impl.md).
-   Operator-accepted committed publication candidates, leased provisional
+   Committed publication candidates accepted from the configured ref, leased provisional
    workspaces, harness-native project knowledge/gap mutations, durable
    `WorkspaceId` binding, strict watcher/read/write cutover, and the
    covered-route retirement proof are live. Shared local implementations remain

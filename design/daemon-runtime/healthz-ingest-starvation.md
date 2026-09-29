@@ -110,7 +110,7 @@ held across I/O) producing an I6 failure (the control plane must never
 contend with another plane).
 
 The holder is the publication side of the same lock, which runs correctly on
-the blocking pool (`attempt_publisher_auto_advance` is wrapped in
+the blocking pool (`accept_ready_candidate` is wrapped in
 `blocking(...)` at `knowledge_source.rs:1166-1171`) and holds the lock across
 the publication. So an ingest batch produces exactly the pairing required:
 long lock holds on one side, spin-sleeping worker-thread waiters on the

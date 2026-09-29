@@ -9,7 +9,7 @@ topic:
   - corpus
   - bro-harness
 tags: [locality, knowledge-source, provisional, publisher, workspace, cutover]
-brief: "Move repo-owned knowledge and gap acquisition to checkout owners without changing accepted-publication, provisional-visibility, promotion, or merge-gate semantics. One authenticated source contract carries operator-accepted committed publication candidates and lease-bound provisional workspace snapshots; blackboxd validates, stores, and projects them without opening project paths."
+brief: "Move repo-owned knowledge and gap acquisition to checkout owners without changing accepted-publication, provisional-visibility, promotion, or merge-gate semantics. One authenticated source contract carries committed publication candidates, accepted from the configured ref as they finalize, and lease-bound provisional workspace snapshots; blackboxd validates, stores, and projects them without opening project paths."
 ---
 
 # Remote knowledge source transport
@@ -27,8 +27,8 @@ After this plan lands for a transport-governed published project:
 
 1. a checkout owner can publish one immutable committed candidate containing
    both `.bbox/knowledge` and `.bbox/gaps`;
-2. an operator can establish or advance accepted publication from that exact
-   candidate without blackboxd opening a checkout;
+2. blackboxd accepts that exact candidate into accepted publication, from the
+   project's configured ref, without opening a checkout;
 3. a managed workspace can publish one leased provisional snapshot containing
    its baseline, working knowledge, working gaps, and ancestry witness;
 4. project-scoped knowledge and gap mutations execute inside the owning
@@ -149,23 +149,28 @@ lane commitments.
 Rejected: independent watchers/uploads, because current accepted publication
 and merge-gate behavior treats knowledge and gaps as one reviewed change.
 
-### KT-D3: Publication remains an operator mutation
+### KT-D3: The configured ref is the acceptance gate
 
-A producer can upload and finalize a `Ready` candidate. It cannot move the
-accepted-publication pointer. `bbox_project_publisher_advance` gains a typed
-candidate source arm selected by immutable candidate generation id, while its
-existing attachment arm remains during overlap.
+A producer uploads and finalizes a `Ready` candidate; it has no request that
+moves the accepted-publication pointer. Blackboxd accepts the candidate as it
+finalizes when it comes from the project's bound producer, at the accepted
+scope, on the configured ref, and passes candidate validation. The first
+valid candidate from the owning producer establishes the pointer and makes
+its branch ref the configured ref. Merging to that ref is the review gate.
+The mechanics live in [publisher-auto-advance.md](publisher-auto-advance.md).
 
-The operator still supplies mode, project, expected catalog epoch, expected
-accepted generation/pointer tokens, and audit reason. The server derives the
+Moves that change the producer, the configured ref, or the scope, and
+rollback to an earlier candidate, are operator moves through
+`bbox_project_publisher_advance`, selected by immutable candidate generation
+id; its attachment arm remains for uncovered projects. The server derives the
 project from the candidate's authenticated scope and refuses cross-project,
-cross-producer, stale-token, stale-scope, corrupt, or non-ready candidates.
+cross-producer, stale-scope, corrupt, or non-ready candidates, and every
+pointer move compare-and-swaps against the pointer it was checked against.
 
 Remote observation changes one freshness fact deliberately: the full ref is
 proved stable during producer capture, not re-resolved by blackboxd at pointer
-swap. The candidate id, observed ref tip, capture time, producer id, and source
-commit are visible before acceptance. The operator selects that exact evidence;
-the server never substitutes a newer candidate.
+swap. Acceptance serves the exact candidate that finalized; the server never
+substitutes a newer one.
 
 ### KT-D4: Pointer V2 separates content from source binding
 
@@ -183,8 +188,8 @@ AcceptedPublicationSourceBindingV2 =
 ```
 
 Current and prior arms each carry their own binding. V1 pointers decode as the
-attachment arm; no automatic rewrite occurs. The first operator-accepted
-remote candidate writes V2 and retains the prior V1 arm exactly. Status and
+attachment arm; no automatic rewrite occurs. The first accepted remote
+candidate writes V2 and retains the prior V1 arm exactly. Status and
 health report binding kind without paths.
 
 Accepted published reads do not require the source generation after pointer
@@ -759,7 +764,8 @@ Minimum end-to-end cases:
 
 - No arbitrary filesystem, Git object, pack, bundle, clone, fetch, ref-update,
   or shell RPC.
-- No automatic knowledge acceptance by a producer or model.
+- No acceptance authority for a producer or model: acceptance follows the
+  configured ref, and the producer cannot choose the ref, scope, or pointer.
 - No caller-selected project id, attachment id, catalog epoch, corpus entity,
   accepted record, overlay value, tombstone, or promotion result.
 - No new producer credential family.

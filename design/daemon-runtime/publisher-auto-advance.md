@@ -1,336 +1,223 @@
 ---
-title: "Publisher auto-advance: an operator-granted acceptance policy"
+title: "Candidate acceptance: the configured ref is the only gate"
 kind: design
-lifecycle: partial
+lifecycle: implemented
 corpus: blackbox-design
 topic:
   - daemon-runtime
   - knowledge
   - corpus
-tags: [publisher, accepted-publication, producer, policy, gap-a6911d0e]
-brief: "Default-off operator grants for establishing and advancing accepted publication from a project's owning producer through the exact operator acceptance path: producer-level auto_publish establishes the first pointer on the first candidate's full branch ref, then the pointer's auto-advance grant governs the linear fast path."
+tags: [publisher, accepted-publication, producer, retention, gap-a6911d0e]
+brief: "Every Ready publication candidate from a project's bound producer, on its accepted scope and configured ref, is accepted as it finalizes; the first valid candidate from the owning producer establishes the pointer. The operator tool only rebinds the producer or ref, moves the scope, or rolls back. Accepted generations beyond the current one, the prior arm, and the two most recent previous ones are collected by maintenance."
 ---
 
-# Publisher auto-advance
+# Candidate acceptance
 
-> **Status: partial.** The policy, the shared acceptance path, the trigger,
-> the ledger, and the status surface are implemented. Not yet done: a
-> durable audit record of the triggering reason (section 7), and a live
-> exercise against a real collector.
+## 0. The rule
 
-## 0. The problem
+Merging to a project's configured ref is the only gate on what the daemon
+serves. The checkout owner's collector captures that ref into an immutable
+Ready candidate; the daemon accepts it as the candidate finalizes. No grant,
+policy flag, or per-generation operator act stands between a valid candidate
+and the accepted pointer.
 
-The collector uploads a Ready knowledge-source publication candidate and
-then nothing serves it. Acceptance requires an operator to call
-`bbox_project_publisher_advance` with three compare-and-swap tokens.
-Observed live: a committed graph generation reached durable terminal
-success collector-side and sat unserved indefinitely, with nothing in any
-status surface saying why.
+"Valid" is the validation every publish runs, unchanged:
 
-The operator cost per routine commit is a status read, three tokens, and a
-tool call. On a continuously running collector that cost is paid on every
-knowledge commit, which is how "the pointer is stale" becomes the normal
-state of a project rather than an incident.
+- producer authentication and the producer's transport grant for the scope;
+- the catalog's current published scope;
+- candidate byte integrity (content-addressed manifests and blobs, pinned
+  for the whole acceptance);
+- the configuration lane parsing in the daemon's configuration domain;
+- knowledge, gap, graph, evidence, and configuration normalization into one
+  immutable generation.
 
-## 1. What this narrows, and why that is not a contradiction
+A candidate that fails any of these is refused whole and the prior accepted
+generation keeps serving.
 
-`knowledge-source-transport-impl.md` section 10 lists as a non-goal:
+## 1. What is accepted
 
-> No automatic knowledge acceptance by a producer or model.
-
-That non-goal is deliberate and this design does not reopen it. It
-narrows it, and the narrowing turns on WHO decides.
-
-The non-goal forbids the PRODUCER (or a model) from gaining acceptance
-discretion. What it protects is the property that a checkout owner cannot
-make blackboxd serve content nobody approved. This feature leaves that
-property intact:
-
-- acceptance authority moves to the OPERATOR ahead of time, either per
-  project through an audited publisher act or per producer through daemon
-  config;
-- the producer gains no new capability whatsoever. It uploads and
-  finalizes exactly as before, and cannot enable, widen, read, or infer
-  the grant;
-- no model is anywhere on this path. The trigger is the daemon's own
-  finalize handler;
-- the grant is scoped to the owning producer and the catalog scope. The first
-  candidate must name a full branch ref, which becomes the pointer's ref.
-  Later advances remain bound to that exact ref;
-
-The operator's approval moves from per-generation to per-lane. The
-producer-level `auto_publish` grant covers only the first pointer for
-projects that producer currently owns. The pointer installed by that
-establish carries the per-project auto-advance grant for later generations.
-Both policies are opt-in and default off.
-
-Rejected framing: "the producer is trusted now". It is not. A granted
-project still refuses a candidate from a different producer, a different
-scope, or a different ref, and still runs the full acceptance validation
-on the bytes.
-
-## 2. Where the policy lives, and the two candidates considered
-
-The binding constraint is that **the grant must not be self-activating**:
-whatever authorizes an acceptance must not be something the candidate
-being accepted supplies.
-
-### 2.1 Rejected: the accepted generation's committed project config
-
-The natural-sounding home is a `[publisher] auto_advance = true` table in
-the project's committed `.bbox/config.toml`, read from the CURRENTLY
-ACCEPTED generation. The self-activation problem is solved by the
-sequencing: a config change only takes effect after one manual advance has
-accepted a generation carrying it, and that manual advance is the audited
-operator grant.
-
-It was rejected for two reasons.
-
-**Cost.** The accepted generation carries three source lanes (knowledge,
-gaps, graphs) and no project config. Reading a committed config from it
-means a fourth lane through `bbox-knowledge-source`'s descriptor and
-limits, `bbox-knowledge-source-store`'s manifest/blob/finalize path, the
-collector's capture, `AcceptedPublicationBuildInputV1`, the immutable
-generation shape, its hashes and counts, and every golden id that binds
-them. That is a transport-contract change to carry one boolean.
-
-**Authority shape.** The grant would then be producer-attested bytes: the
-daemon would read a blob the producer uploaded to decide whether to trust
-blobs the producer uploads. The one-manual-advance rule does rescue the
-safety argument, but it makes the operator's grant an implicit
-consequence of accepting a commit rather than an explicit act. An operator
-reading an audit trail should see the moment they granted acceptance, not
-have to infer it from a config diff inside an accepted generation.
-
-### 2.2 Accepted-pointer metadata for continuing auto-advance
-
-The grant is a field on `AcceptedPublicationPointerV1`:
-
-```text
-auto_advance: Option<{ enabled: bool, granted_reason: String }>
-```
-
-It is set by an explicit `auto_advance` parameter on
-`bbox_project_publisher_advance`, or by a successful producer-level
-`auto_publish` establish. An operator call uses its bounded
-`audit_reason`; auto-publish uses
-`policy:auto_publish producer=<id>`.
-
-Why the pointer and not the catalog record (`CorpusProject`): the catalog
-was the other operator-owned candidate, and it would work. It was rejected
-on blast radius and on fit. `CorpusProject` is a `deny_unknown_fields`
-struct with 66 construction sites and its own validation, migration,
-genesis, and rebuild paths; adding a field there to express a fact about
-accepted publication puts publication state in the catalog. The pointer,
-by contrast, is the object the feature already has to respect: it is the
-compare-and-swap anchor, it is written by exactly one code path, and it
-already holds the source binding the policy has to match against.
-
-Properties this buys:
-
-- **Additive and inert.** The field is `Option` with `serde(default,
-  skip_serializing_if)`. Every pointer written before this feature encodes
-  byte-identically and keeps its `pointer_sha256`, which is a live
-  compare-and-swap token.
-- **One locked read.** `auto_advance_grant()` returns the grant, the CAS
-  tokens, the accepted scope, the published ref, and the source binding
-  from one read of one pointer under the publication lock. Reading the
-  grant and the tokens separately would let an advance land between them,
-  and a policy attempt would present tokens for a pointer whose grant it
-  never checked.
-- **Unreachable by the producer.** No transport route writes a pointer.
-
-### 2.3 Producer config for the first pointer
-
-`auto_publish = true` on one `[[code_collection.producers]]` entry is an
-operator-authored pre-grant. It applies only while that producer is the
-project's effective owner through a config pin or durable claim. A Ready
-candidate qualifies only when its producer is that owner, its scope is the
-project's catalog scope, its full ref is a non-empty `refs/heads/...` branch,
-and the project has an attached, repo-knowledge capable attachment with the
-same validated scope. The attachment's checked-out `branch_ref` does not
-constrain publication. The first candidate's branch ref becomes the pointer's
-ref.
-
-The daemon establishes through `publish_from_ready_candidate` with
-`PublisherPublishMode::Establish` and
-`AutoAdvanceGrantUpdate::Set { enabled: true, ... }`. The ordinary
-acceptance path performs candidate validation, catalog epoch checks,
-source revalidation, and the pointer swap. The installed pointer therefore
-contains both the accepted producer binding and the standing auto-advance
-grant.
-
-## 3. The activation rule
-
-> Continuing auto-advance reads the grant from the pointer that is CURRENTLY
-> accepted. That pointer grant comes from an operator publisher act or from
-> operator daemon config authorizing the first auto-publish establish.
-> Candidate bytes can never authorize their own acceptance.
-
-Consequences for continuing auto-advance:
-
-- **Enabling takes one operator advance.** The operator passes
-  `auto_advance=true` on an advance (or an establish). That call is
-  ordinary operator authority with full CAS tokens and an audit reason.
-  The FIRST candidate the policy may accept is the next one.
-- **Establish requires the separate producer pre-grant.** With no installed
-  pointer and no `auto_publish` grant on the effective owner, the attempt
-  reports `no_accepted_publication`.
-- **Continuing auto-advance cannot widen itself.** It passes
-  `AutoAdvanceGrantUpdate::Inherit`, which carries the operator's grant
-  forward unchanged. The auto-publish establish passes `Set` only because
-  operator config already authorized that producer.
-- **Revocation is symmetric.** `auto_advance=false` on any later operator
-  advance clears the grant.
-
-## 4. Scope: first publication and the linear fast path
-
-With no pointer, auto-publish proceeds only when all of these hold:
+With an installed pointer, a candidate advances it when all of these hold:
 
 | Condition | Otherwise |
 |---|---|
-| The effective owner has `auto_publish = true` | `no_accepted_publication` |
-| The candidate's producer is the effective owner | `producer_mismatch` |
+| The pointer is bound to a producer | `binding_not_producer` |
+| The pointer does not already name this candidate | `already_accepted` |
+| The candidate's producer is the bound producer | `producer_mismatch` |
+| The candidate's scope is the accepted scope | `scope_changed` |
+| The candidate's full ref is the pointer's ref (the configured ref) | `ref_changed` |
+| This candidate has not been attempted in this daemon lifetime | `already_attempted` |
+
+With no pointer, the first valid candidate establishes one when all of these
+hold:
+
+| Condition | Otherwise |
+|---|---|
+| A producer owns the project's catalog scope (config pin or durable claim) | `no_owning_producer` |
+| The candidate's producer is that owner | `producer_mismatch` |
 | The candidate's scope is the catalog scope | `scope_changed` |
-| The candidate's ref is a non-empty full branch ref | `ref_changed` |
-| An attached repo-knowledge capable attachment has the catalog scope | `ref_changed` |
-| This candidate has not been attempted | `already_attempted` |
+| The candidate's ref is a non-empty `refs/heads/...` branch ref | `ref_not_branch` |
+| An attached, repo-knowledge capable attachment carries the catalog scope | `no_attached_checkout` |
 
-With a pointer, continuing auto-advance proceeds only when all of these hold,
-checked against the accepted pointer:
+The attachment proves the project was admitted for publication (remote
+onboarding registers one). Its checked-out branch does not constrain
+publication: the establishing candidate's branch ref becomes the configured
+ref, and every later candidate is bound to it.
 
-| Condition | Otherwise |
-|---|---|
-| A pointer is installed | `no_accepted_publication` |
-| Its grant is `enabled` | `policy_disabled` |
-| Its source binding is `Producer` | `binding_not_producer` |
-| It does not already name this candidate | `already_accepted` |
-| The candidate's producer matches the bound producer | `producer_mismatch` |
-| The candidate's scope equals the accepted scope | `scope_changed` |
-| The candidate's `full_ref` equals the accepted ref | `ref_changed` |
-| This candidate has not been attempted | `already_attempted` |
+## 2. What waits for the operator
 
-Establish, rollback to a prior arm, scope migration, producer rebind, and
-any other non-linear move stay manual by construction. The only automatic
-establish is the no-pointer `auto_publish` case. Once any pointer exists,
-including a disabled or rolled-back pointer, that establish path is closed.
-Continuing policy moves remain reachable only through
-`PublisherPublishMode::Advance` with the current pointer's own tokens.
+The refusals in the first table other than `already_*` are valid content that
+would change the producer, the scope, or the configured ref. The daemon does
+not make those moves on its own; the candidate waits, its refusal is recorded,
+and `bbox_project_publisher_advance` makes the move:
 
-## 5. Reuse, not a parallel path
+| Operation | Moves the pointer to | Refuses |
+|---|---|---|
+| `rebind` | a candidate from a different producer or ref, whose ref becomes the configured ref; a producer candidate for an attachment-bound pointer; or the first pointer for a project whose first candidate was refused | a candidate on the bound producer and ref (acceptance serves it), and any candidate while the catalog scope differs from the accepted scope |
+| `scope_move` | a candidate at the catalog's current scope after a scope migration, which clears the bridge | a project with no pointer, and a project whose scopes already agree |
+| `rollback` | a specific earlier Ready candidate from the bound producer, scope, and ref | any other producer, scope, or ref, the candidate already served, and a project with no pointer |
 
-`publish_from_ready_candidate` is the single candidate-acceptance path.
-`bbox_project_publisher_advance` and the policy trigger both call it, so
-"the policy validates identically" is structural rather than a claim about
-two similar functions. It returns `PublishError` rather than `anyhow` so
-the operator tool keeps `may_have_swapped()` and its post-failure
+A rollback holds until the next candidate finalizes, which is accepted as
+usual. The remedy for bad content on the ref is a revert merged to the ref;
+rollback serves known-good content while that lands.
+
+For an uncovered project (no knowledge transport row), `rebind` and
+`scope_move` also accept `attachment_id` with `full_ref`, publishing that
+attached checkout at that ref. Covered projects refuse the attachment arm.
+
+The tool reads the installed pointer, checks the operation against it, and
+advances with that pointer's compare-and-swap tokens. A candidate accepted
+between the read and the swap turns the move into a pointer-conflict refusal
+instead of a silent overwrite; the operator reads status and repeats the move
+if it still applies. `expected_catalog_epoch` guards catalog authority the
+same way.
+
+## 3. One acceptance path
+
+`publish_from_ready_candidate` is the single candidate-acceptance path. The
+finalize trigger and the operator tool both call it, so a candidate validates
+identically whichever caller accepts it. It returns `PublishError` rather than
+`anyhow` so both callers keep `may_have_swapped()` and its post-failure
 reconvergence.
 
-The continuing auto-advance caller uses `Advance` with tokens read from the
-pointer it is replacing, passes `Inherit`, and generates
-`policy:auto_advance producer=<id> source=<generation>`.
+Automatic acceptance advances with the tokens of the pointer its checks read,
+so two finalizes racing for one project cannot both swap: the loser refuses as
+a pointer conflict and the winner's generation serves.
 
-The first-publication caller uses `Establish`, passes `Set` with
-`enabled=true`, and generates `policy:auto_publish producer=<id>`. It runs
-only after proving that no pointer exists, the candidate matches the effective
-owner and catalog scope, its ref is a full branch ref, and an eligible
-attachment exists. The accepted pointer records that first candidate's ref;
-normal auto-advance binds every later candidate to it.
+## 4. Trigger, failure, and the no-storm rule
 
-## 6. Trigger, failure, and the no-storm rule
-
-The trigger is the daemon's publication finalize handler, immediately
-after the store makes the generation Ready. It runs before the finalize
-response so a producer that polls status right away cannot observe an
-unserved candidate the daemon was already accepting.
+The trigger is the daemon's publication finalize handler, immediately after
+the store makes the candidate Ready. It runs before the finalize response so a
+producer that polls status right away cannot observe an unserved candidate the
+daemon was already accepting.
 
 - **At most one attempt per uploaded candidate**, claimed in a bounded
-  in-process ledger BEFORE the attempt, so a failure consumes the claim
-  too. A repeated finalize of the same upload reports
-  `already_attempted`.
-- **No retry, ever.** A refusal logs once at warn and stops. The operator
-  advances manually after a refusal.
-- **The prior accepted generation keeps serving, unless the refusal
-  reached the swap.** The policy only ever calls the ordinary acceptance
-  path, which swaps a pointer or refuses. The one case with no clean
-  either/or is a failure raised at or after the atomic pointer
-  replacement: the new pointer is durably installed and the attempt still
-  reports an error, which is what `PublishError::may_have_swapped()`
-  names. The policy carries that flag through its refusal outcome and
+  in-process ledger BEFORE the attempt, so a failure consumes the claim too.
+- **No retry, ever.** A refusal logs once at warn and stops. The next
+  candidate from the collector is the next attempt.
+- **The prior accepted generation keeps serving, unless the refusal reached
+  the swap.** A failure raised at or after the atomic pointer replacement
+  leaves the new pointer installed while reporting an error, which is what
+  `PublishError::may_have_swapped()` names. Acceptance carries that flag and
   converges on it, exactly as the operator tool does.
 - **A refusal never fails the upload.** The producer's finalize succeeded
   regardless.
-- **Every exit records a reason.** A candidate sitting unserved with
-  nothing said anywhere is the failure this design exists to end;
-  replacing it with an unexplained skip would reproduce it.
+- **Every exit records a reason.** A candidate sitting unserved with nothing
+  said anywhere is the failure the ledger exists to prevent.
 
-Whenever the pointer moved (an acceptance, or a refusal that reached the
-swap) the policy performs the same post-swap convergence the operator tool
-does: invalidate the projected caches, converge the published knowledge
-index, and refresh published graph views. An acceptance additionally
-records the accepted publication mutation observation. Converging is not a
-retry: it touches projections only and never re-enters the acceptance
-path, so the no-storm rule above is unaffected.
+Whenever the pointer moved (an acceptance, or a refusal that reached the swap)
+acceptance performs the post-swap convergence: invalidate the projected
+caches, converge the published knowledge index, and refresh published graph
+views. Converging touches projections only and never re-enters the acceptance
+path.
 
 Graph views are the projection with no second chance. Knowledge and gaps
 rebuild on read, so a missed convergence heals itself on the next request;
-`project_graph_views` serves whatever was last installed, so a missed (or
-degraded) refresh keeps serving the previous generation until the next
-accept or a daemon restart. That is also why the refresh refuses to
-install a prior-arm read over an installed view: a verified read falls
-back to the pointer's prior arm whenever the current generation does not
-verify, and latching that fallback into the graph read surface is
-indistinguishable, to a reader, from an accept that never happened.
+`project_graph_views` serves whatever was last installed. That is also why
+the refresh refuses to install a prior-arm read over an installed view: a
+verified read falls back to the pointer's prior arm whenever the current
+generation does not verify, and latching that fallback into the graph read
+surface is indistinguishable, to a reader, from an acceptance that never
+happened.
 
-Converging on this path is necessary and not sufficient, because the
-accept is not the only writer of that view. Overlay recomputation, a
-provisional capture, and the boot pass all install published views too,
-each from accepted content IT resolved, and each spends real time between
-resolving and installing. With collectors cycling every couple of minutes
-across a dozen projects, an acceptance lands inside one of those windows
-routinely, and the slower caller then reinstalls the superseded view on
-top of the fresh one. So the ordering rule lives at the install site
-rather than on this path: a view whose accepted generation is not the one
-the pointer currently names may not replace a view that is already
-serving, whichever caller built it. The pointer is the authority because
-generation ids are content digests with no order, and keying the gate on
-the pointer is also what keeps it from latching a stale view forever: the
-next install for the pointer's own generation is admitted.
+The acceptance is not the only writer of that view. Overlay recomputation,
+provisional capture, and the boot pass install published views too, each
+from accepted content it resolved, and each spends real time between
+resolving and installing. So the ordering rule lives at the install site: a
+view whose accepted generation is not the one the pointer currently names may
+not replace a view that is already serving, whichever caller built it. The
+pointer is the authority because generation ids are content digests with no
+order, and keying the gate on the pointer keeps it from latching a stale view
+forever: the next install for the pointer's own generation is admitted.
 
-## 7. Observability, and one honest gap
+## 5. Index convergence reads the published view
 
-`bbox_project_publisher_status` reports an `auto_advance` object:
+Accepted-publication index convergence (after a swap and in the boot pass)
+rebuilds the project's knowledge scope from the `published` view: accepted
+content only. It never reads peer provisional snapshots, whose leases expire
+on their own schedule; a convergence that read them would record a degraded
+peer read for every expired lease on every swap and would index transient
+peer state. Provisional content stays visible through the `own` and `all`
+views that request it.
 
-```text
-grant:        { enabled, granted_reason, eligible_binding }
-last_attempt: { source_generation_id, producer_id, outcome, ... }
-```
+## 6. Accepted generation retention
 
-`grant` is durable (it is a pointer fact). `last_attempt` is
-in-process and bounded: it answers "what did the policy just do", not
-"what has it ever done". The durable answer to the latter is the accepted
-pointer's own producer binding, which names the exact source generation.
-For an auto-published first pointer, `grant.granted_reason` durably exposes
-`policy:auto_publish producer=<id>`.
+Every acceptance installs a new immutable generation. The store maintenance
+pass (hourly, first at startup) collects the ones nothing needs. Per project,
+it keeps:
 
-**Gap.** `bbox_project_publisher_advance` does not thread `audit_reason`
-into any durable record today. It is a structured log field and a response
-field only; scope migration records an operator reason durably, publisher
-advance does not. The policy therefore stamps
-`policy:auto_advance producer=<id> source=<generation>` into the same log
-line the operator advance uses (`tool = "publisher_auto_advance"`,
-`"catalog administration mutation"`) and into the ledger, but not into a
-durable audit store, because no such store exists for this operation. If a
-durable publisher audit trail is wanted, it should be added for BOTH
-callers at once rather than only for the policy lane.
+- the pointer's current generation;
+- the pointer's prior arm, always, even when it is older than the rest;
+- the two most recently written other generations (generation ids are
+  content digests with no order, so recency is the file's modification time);
+- every generation an in-flight preparation registered, and the generation a
+  cached read pins.
 
-## 8. Non-goals
+Everything else is removed. A project with no pointer is never collected, and
+a pointer that does not decode fails that project's step without touching its
+files: absent or unreadable authority is not proof that nothing references a
+generation. Only regular files named `<generation id>.json` are candidates,
+so interrupted atomic-replace temporaries and anything unexpected are left
+alone.
 
-- No producer-supplied policy, in any encoding, over any route. The
-  producer-level grant is operator daemon config.
-- No model on the acceptance path.
-- No establish except the operator-configured `auto_publish` first pointer.
-  No rollback, scope change, or producer rebind by policy.
-- No retry, backoff, or queue. One attempt, then the operator.
-- No durable per-attempt history. The ledger is bounded and in-process.
+Each step removes at most 64 files under one publication-lock hold, and a
+pass removes at most 512, so a large backlog drains over a few passes without
+holding the lock for long. The in-flight registry is held across a step: a
+preparation registers its generation before checking for an existing
+content-addressed file, so it either registered first (and its file is
+protected) or runs after the step and writes the file afresh. Removing an
+already-removed file is a no-op, so the pass is idempotent and a second run
+over a drained store does nothing.
+
+## 7. Legacy state
+
+- **Pointer grant field.** A pointer may carry an `auto_advance` object. It
+  decodes and is ignored, whatever its shape, and a new pointer never writes
+  it. A legacy pointer keeps its installed bytes, and therefore its
+  `pointer_sha256`, until the next swap replaces it.
+- **Producer config.** `auto_publish` under `[[code_collection.producers]]`
+  parses and has no effect.
+
+## 8. Observability
+
+`bbox_project_publisher_status` reports `acceptance.last_attempt`
+(`source_generation_id`, `producer_id`, `outcome`, refusal `code` and
+`detail`, `may_have_swapped`, `at_unix_secs`); `detail=acceptance` returns it
+as exact bounded pages. The ledger is in-process and bounded: it answers "what
+did acceptance just do". The durable answer is the pointer itself, whose
+producer binding names the exact source generation it serves.
+
+Each acceptance logs one `catalog administration mutation` line with
+`tool = "candidate_acceptance"` and an audit reason of the form
+`acceptance:<establish|advance> producer=<id> source=<generation>`. Operator
+moves log the same line with `tool = "bbox_project_publisher_advance"`, the
+operation, and the operator's `audit_reason`.
+
+## 9. Non-goals
+
+- No acceptance authority for the producer or a model: the producer uploads
+  what the configured ref holds and cannot choose the ref, the scope, or the
+  pointer.
+- No automatic producer, scope, or ref change; those are operator moves.
+- No retry, backoff, or queue for refused candidates.
+- No durable per-attempt history; the ledger is bounded and in-process.
 - No change to accepted content, its normalization, or its hashes.

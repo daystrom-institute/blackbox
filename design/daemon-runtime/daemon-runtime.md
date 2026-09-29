@@ -35,4 +35,4 @@ all of that work.
 - [Durable project catalog Phase 6 implementation plan](durable-project-catalog-phase6-impl.md)
 - [Slim v1 project catalog importer](slim-v1-importer.md)
 - [Typed Git-history transport implementation plan](git-history-provenance-transport-impl.md)
-- [Publisher auto-advance: an operator-granted acceptance policy](publisher-auto-advance.md)
+- [Candidate acceptance: the configured ref is the only gate](publisher-auto-advance.md)

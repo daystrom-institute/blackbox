@@ -132,3 +132,13 @@
   (installed verification already holds the mutation lock when it asks) and
   is therefore advisory: the locked capture re-reads the store, and a root
   set that no longer matches it fails closed there.
+
+## Accepted publication pointers and retention
+
+- Pointers decode and ignore a legacy `auto_advance` field and never write
+  it; every other unknown pointer field refuses. Acceptance consults no grant.
+- Accepted generation retention keeps the current generation, the prior arm,
+  the two most recently written other generations, in-flight preparations,
+  and cached pins. It never collects a project whose pointer is absent or
+  unreadable, and it holds the in-flight registry across each step so a
+  preparation that reuses an existing content-addressed file cannot lose it.

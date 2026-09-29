@@ -142,34 +142,37 @@ configured authority; a recorded attachment path is not a fallback read route.
 
 ## Publishing Project Graphs
 
-A registered project's `.bbox/graphs/<graph_id>/` tree only becomes a
-queryable graph after an explicit acceptance step. The collector uploading a
-Ready candidate does not, by itself, advance what `bbox_project_graph_list`
-and `bbox_project_graph_describe` serve under published visibility:
+A registered project's `.bbox/graphs/<graph_id>/` tree becomes a queryable
+graph when a commit carrying it reaches the project's configured ref. The
+collector captures that ref into a Ready candidate, and the daemon accepts the
+candidate as it finalizes: the first valid candidate from the owning producer
+establishes the accepted pointer, and every later candidate on the same ref
+advances it. Graph, knowledge, gap, and configuration lanes ride the same
+accepted generation. `bbox_project_publisher_status` is read-only and reports
+the accepted generation plus `acceptance.last_attempt`, which names why the
+latest candidate was or was not accepted.
+
+A candidate from a different producer or ref, or at a new scope after a scope
+migration, waits for an operator move, and so does serving an earlier
+candidate:
 
 ```text
-bbox_project_publisher_status(project_id="p_...")
 bbox_project_publisher_advance(
   project_id="p_...",
-  source_generation_id="...",
-  mode="establish",
-  expected_generation_id="...",
-  expected_pointer_sha256="...",
+  operation="rebind",
+  source_generation_id="kps_...",
   expected_catalog_epoch=7,
-  audit_reason="publish reviewed graph"
+  audit_reason="collector now captures refs/heads/release"
 )
 ```
 
-`bbox_project_publisher_status` is read-only and reports the compare-and-swap
-tokens (`generation_id`, `pointer_sha256`) that `bbox_project_publisher_advance`
-requires as `expected_generation_id`/`expected_pointer_sha256`, alongside
-`expected_catalog_epoch` from the project catalog. Until the advance call
-succeeds, published-visibility graph reads keep serving the prior accepted
-generation (or nothing, on a first publish) even though the candidate is
-sitting Ready. `examples/graph-live-exercise.sh` runs this exact sequence
-end to end (`step_publish` uploads the candidate, `step_accept` advances it).
+`operation` is `rebind`, `scope_move`, or `rollback`. Until a candidate is
+accepted, published-visibility graph reads keep serving the prior accepted
+generation (or nothing, before the first acceptance).
+`examples/graph-live-exercise.sh` runs the sequence end to end
+(`step_publish` uploads the candidate, `step_accept` confirms its acceptance).
 
-A successful advance triggers a full rebuild of the complete graph view.
+A successful acceptance triggers a full rebuild of the complete graph view.
 Graph queries, including `bbox_project_graph_list`, `bbox_project_graph_describe`,
 `bbox_inspect_entity`, and `bbox_find_paths`, can answer
 `error.edge_index_warming` for the few minutes the rebuild takes on a large

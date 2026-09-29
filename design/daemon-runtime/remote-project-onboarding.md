@@ -194,17 +194,15 @@ which scaffolds as part of enrollment.
 ## 5. Publication defaults
 
 A claimed or pinned project's knowledge and gaps become visible once an
-accepted publication pointer exists. Producer config gains
-`auto_publish = true`: for a project with no accepted pointer, the first
-Ready candidate from the project's owning producer, on a non-empty full
-branch ref and with an attached repo-knowledge capable attachment for the
-catalog scope, is established through the same acceptance path as
-`bbox_project_publisher_advance(mode="establish")`, and the project's
-auto-advance grant is installed on that pointer. The first candidate's branch
-ref becomes the pointer's ref; later advances stay bound to it. The
-attachment's currently checked-out branch does not select or constrain the
-published ref. Establish never happens for a project that already has a
-pointer, and rollback and scope changes stay manual.
+accepted publication pointer exists. For a project with no accepted pointer,
+the first valid Ready candidate from the project's owning producer, on a
+non-empty full branch ref and with an attached repo-knowledge capable
+attachment for the catalog scope, establishes it through the ordinary
+acceptance path. The first candidate's branch ref becomes the configured ref;
+every later candidate on it is accepted as it finalizes. The attachment's
+currently checked-out branch does not select or constrain the published ref.
+Producer, ref, and scope changes and rollback are operator moves
+([publisher-auto-advance.md](publisher-auto-advance.md)).
 
 ## 6. Onboarding skill over MCP
 
@@ -235,8 +233,8 @@ per-read volatile values (clock times, ages); it changes only when the
 instance facts it states change.
 
 The skill body is rendered at read time from instance facts: fresh producer
-presence (host label, enroll roots, config path, service label), claim and
-auto-publish policy, and the daemon's `advertise_url` when configured. It
+presence (host label, enroll roots, config path, service label), claim
+policy, and the daemon's `advertise_url` when configured. It
 states the register call, the commit step, the host-shell `add` fallback,
 the verification reads, and for a host with no collector the collector
 config to write, with `server_url` set from `advertise_url`. The
@@ -303,8 +301,8 @@ uncovered; nothing fails open.
 - command channel: enroll outside enroll roots refuses collector-side;
   producer selection by longest root, ambiguity, no producer, stale
   presence; idempotent re-register; timeout pending result.
-- publication defaults: auto-publish establishes once from the owning
-  producer's Ready candidate and installs auto-advance; never re-establishes.
+- publication defaults: the first valid candidate from the owning producer
+  establishes the pointer; later candidates on its ref advance it.
 - skill: served through skills/list, resources, and prompts; body reflects
   presence and policy; digest matches the served body.
 - end to end on the estate: register a throwaway repository from an MCP
