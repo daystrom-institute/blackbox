@@ -65,7 +65,7 @@ depends on `blackbox`.
 ## 3. Capability parity
 
 The child receives the complete daemon MCP server, not a curated reconstruction
-of selected tools. Qualified names such as `mcp__blackbox__bbox_search` remain
+of selected tools. Qualified names such as `mcp__blackbox__bbox_hybrid_search` remain
 the catalog authority and stay subject to server-side surfaces plus the
 dispatch allow/deny filter.
 

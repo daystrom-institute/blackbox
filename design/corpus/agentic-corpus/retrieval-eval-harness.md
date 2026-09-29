@@ -17,7 +17,7 @@ Related:
 - [Locate-Information Coherence Path](locate-information-coherence.md) — parent arc; this is its Brick 3.
 - `src/mcp_tools/hybrid_search.rs` — `hybrid_search_typed`; the retrieval pipeline this harness grades.
 - `src/search/rrf.rs` — `fuse_rrf`. `src/search/rerank.rs` — `apply_rerank`.
-- `src/index/search.rs` — BM25 fetch (`hybrid_bm25_hits`); `bbox_search`.
+- `src/index/search.rs` - BM25 fetch (`hybrid_bm25_hits`).
 - `src/mcp_tools/inspect.rs`, `find_paths.rs`, `bundle_evidence.rs` — the traversal/bundling tools graded by Conditioned/EndToEnd modes.
 - `src/server/state.rs` — `SharedState::for_test`; isolated index construction for fixtures.
 - Spike provenance: `../daystrom-mk2/spikes/Daystrom.Spike.McpPoc/EvaluationHarness.cs`.
@@ -70,10 +70,6 @@ entity that did not surface, classify **which stage dropped it**.
 9. **File dedup** — `retain` best chunk per `file_dedup_key`.
 10. **Modal diversification** — `diversify_by_chunk_kind(results, limit)`.
 11. **Truncate to `limit`.**
-
-`bbox_search` (transcript-only) is a simpler subset (BM25 + snippet, no vector
-fusion); the harness grades it with the same funnel minus the vector/fusion
-stages.
 
 ## The stage funnel (blackbox MissStage)
 
@@ -207,13 +203,11 @@ Steps 1–3 are the minimum that makes Brick 2 measurable; 4–6 deepen it.
 ## Open questions
 
 - **Suite authorship:** hand-author fixtures, or mine real
-  `sm-agentic-opening-sequence` / quoted-phrase `bbox_search` traces for question→answer pairs?
+  `sm-agentic-opening-sequence` / quoted-phrase `bbox_hybrid_search` traces for question→answer pairs?
 - **Held-out discipline:** who/what guarantees the held-out set stays unconsulted
   during tuning.
 - **Trace generality:** trace a single target per call (simple) vs all expected
   refs for a query in one pass (fewer re-runs, more bookkeeping).
-- **`bbox_search` parity:** one funnel with vector/fusion stages marked N/A for
-  transcript-only search, or a separate reduced funnel.
 
 ## Status
 

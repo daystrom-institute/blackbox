@@ -106,7 +106,7 @@ Survey the target repo. Run these checks before asking the operator anything:
    - Any existing teams or teamplates?
 
 7. Transcript history
-   - bbox_search for recent review/design/architecture discussions
+   - bbox_hybrid_search (doc_type=transcript) for recent review/design/architecture discussions
    - bbox_knowledge for settled decisions and conventions
 ```
 

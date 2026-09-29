@@ -192,10 +192,10 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 
 - **Single bbox_knowledge call as the entire grounding step.** Knowledge
   is rendered RULES, not corpus. Most questions need search-or-graph too.
-- **Iterating bbox_search 5 different ways.** If 2-3 reformulations
-  don't surface the answer, switch to `bbox_hybrid_search` (vector lane
-  catches paraphrases) or `bbox_describe_schema` (you may be looking at
-  the wrong entity type).
+- **Iterating keyword queries 5 different ways.** If 2-3 reformulations
+  don't surface the answer, drop the narrowing filters on
+  `bbox_hybrid_search` (vector lane catches paraphrases) or switch to
+  `bbox_describe_schema` (you may be looking at the wrong entity type).
 - **Inventing entity refs.** If you didn't read it from a tool response
   this turn, query for it. The bad_input error returns a `suggested_fix`.
 - **Truncating paths in the answer.** When the user asks

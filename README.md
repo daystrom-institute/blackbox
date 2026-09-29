@@ -56,7 +56,9 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
 
 - Retrieve evidence with `bbox_hybrid_search`, inspect exact entity refs with
   `bbox_inspect_entity`, and package supporting refs with `bbox_bundle_evidence`.
-- Read conversations with `bbox_search`, `bbox_context` and `bbox_messages`.
+- Read conversations by narrowing `bbox_hybrid_search` with `doc_type` or a
+  conversation filter (`role`, `source`, `channel`, ...), then follow hits with
+  `bbox_context` and `bbox_messages`.
   `bbox_tool_calls` pages through indexed historical tool calls.
 - Query durable conventions with `bbox_knowledge`. Track active investigation
   state with `bbox_thread`; durable memory changes require operator authority.

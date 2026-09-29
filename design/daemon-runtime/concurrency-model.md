@@ -268,7 +268,7 @@ Per-event ingest keeps the per-task `inner` Mutex (it is brief and correct) but:
 
 `/tail` decoration reads a cached team-ref map
 maintained on dispatch events instead of per-event file I/O. Heavy sync tools
-(`bbox_search`, `bbox_code_*`, `bbox_refactor_plan`, `bbox_reindex`) become
+(`bbox_hybrid_search`, `bbox_code_*`, `bbox_refactor_plan`, `bbox_reindex`) become
 async handlers wrapping `spawn_blocking`. `cap_response_text` gains the I7
 JSON-aware envelope.
 

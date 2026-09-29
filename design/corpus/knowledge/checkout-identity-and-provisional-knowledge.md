@@ -625,8 +625,8 @@ peer document or drop a shadowing own result below the candidate cutoff.
 Inspection of a compound provisional ref is stable and unambiguous even when
 several checkouts modify the same logical entry.
 
-Static corpus surfaces such as `bbox_search` have no
-checkout authority and exclude provisional knowledge before TopDocs cutoff.
+Static corpus reads have no checkout authority and exclude provisional
+knowledge before TopDocs cutoff.
 Hybrid retrieval removes static indexed knowledge, injects the authorized
 request view as its own candidate lane, and permits a knowledge vector hit only
 when that exact entity id is present in the same view. A modified own-checkout

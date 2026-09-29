@@ -56,8 +56,8 @@ Readers you should use, roughly in rank of frequency:
 | `bbox_sessions_list` | Browse by project / name / provider / recency; translate ids ↔ names |
 | `bbox_session` | Metadata for a known session (name or UUID): project, duration, counts |
 | `bbox_messages` | Read conversation flow; supports role filter, `from_end=true`, pagination, `max_content_length` |
-| `bbox_search` | FTS across the entire indexed corpus; filter by project / role / account |
-| `bbox_context` | Surrounding turns around a byte offset returned by search |
+| `bbox_hybrid_search` | Search the entire indexed corpus; narrow with `doc_type=transcript` or project / role / account / source / channel filters |
+| `bbox_context` | Surrounding turns around a hit (its `exact_read`, or `conversation.file_path` + `conversation.byte_offset`) |
 | `bbox_stats` | Corpus health / "is this session indexed yet" sanity check |
 | `bbox_knowledge` | Peek at stored rules/decisions/remembers (read-only; never mutate) |
 | `bbox_notes` | List side-channel notes filtered by project / session / thread / kind |
@@ -87,14 +87,14 @@ two or three tool calls.
 
 ### C. Provenance ("when did we decide / start doing X")
 
-1. `bbox_search query='"..."' role=user` with the quoted phrase: direct provenance
-2. If the exact phrase misses: `bbox_search query="..."` with phrasing variants
+1. `bbox_hybrid_search query='"..."' role=user` with the quoted phrase: direct provenance
+2. If the exact phrase misses: `bbox_hybrid_search query="..." doc_type=transcript` with phrasing variants
 3. `bbox_context` around the earliest hit for surrounding turns
 4. If the rule has been restated across sessions, list the reinforcement turns too
 
 ### D. Cross-session search ("find sessions that touched X")
 
-1. `bbox_search query="..." project="..."` — scope by project when known
+1. `bbox_hybrid_search query="..." project="..." doc_type=transcript`: scope by project when known
 2. `bbox_sessions_list` to translate bare session ids into names and timestamps
 3. If the parent needs depth on a single match, switch to pattern A or B for that session
 
@@ -217,6 +217,6 @@ Do not invent a gap to look thorough.
 ## Efficiency Notes
 
 - Start with the single most targeted call. Most provenance questions resolve in one
-  quoted-phrase `bbox_search` plus one `bbox_context`.
+  quoted-phrase `bbox_hybrid_search` plus one `bbox_context`.
 - For >1000-message sessions, sample — don't read cover to cover.
 - Never call `bbox_reindex` — leave corpus maintenance to the daemon.

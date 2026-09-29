@@ -405,7 +405,7 @@ cap.
   ever added.
 - Tool-result pagination stays app-level: protocol cursors exist only on
   list/read endpoints, not `tools/call`. For the large-response tools
-  (`bro_dashboard`, `bbox_search`, `bbox_hybrid_search`), converge on a
+  (`bro_dashboard`, `bbox_hybrid_search`), converge on a
   uniform `{items, next_cursor, total_estimate}` envelope instead of per-tool
   bespoke limit params. The 80KB cap + spill envelope stays regardless.
 - structuredContent going forward: 2026-07-28 allows any JSON value, so new

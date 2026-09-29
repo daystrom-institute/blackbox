@@ -91,7 +91,7 @@ Expected evidence type: {manifest["required_evidence"]}
 Forbidden stale answers: {manifest.get("forbidden_stale_answers", [])}
 """
 if strategy == "search-only":
-    instructions = "Use only bbox_search. Collect canonical entity refs from the search result metadata or snippets when present."
+    instructions = "Use only bbox_hybrid_search with doc_type=\"transcript\". Collect canonical entity refs from the entity_id values of the result rows."
 elif strategy == "static-hybrid":
     instructions = "Call bbox_hybrid_search exactly once. Do not inspect or traverse. Collect entity_id values from the result rows."
 else:

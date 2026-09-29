@@ -497,9 +497,9 @@ repeated complaints about a file, failed refactor attempts, public API opt-out
 debates, compile-fix churn, or abandoned module-split plans. Narrative alone is
 insufficient.
 
-Primary measurements: `bbox_search` for operator complaints, `bbox_notes` for
-agent-side pain, `bbox_thread_list` for abandoned work threads,
-`bbox_hybrid_search` for related design docs and decisions, git log for
+Primary measurements: `bbox_hybrid_search` for operator complaints in
+conversations and for related design docs and decisions, `bbox_notes` for
+agent-side pain, `bbox_thread_list` for abandoned work threads, git log for
 fix/revert density, and `bbox_blame` for line-level provenance where relevant.
 
 Correction-plan output: transcript anchors, dates, current code state, trend,

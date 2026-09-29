@@ -20,7 +20,7 @@ Related:
 - `src/system_memory/catalog.rs` — `format_for_signpost`, `format_for_listing`, in-memory `search`.
 - `src/mcp_tools/hybrid_search.rs` — `HybridSearchResponse.next_steps`, `build_next_steps`; pre-existing Daystrom-derived dedup/diversify passes.
 - `src/mcp_tools/inspect.rs` - `recommended_next_hops`.
-- `src/index/search.rs` — `bbox_search` render + breadcrumb footer.
+- `src/index/search.rs` - lexical transcript search and conversation hit coordinates for `bbox_hybrid_search`.
 - `src/entity_ref.rs` — `EntityType` taxonomy (graph entities); no `SystemMemory` variant today.
 - `src/embed/mod.rs` — `Bucket` enum (embedding routes).
 - Gap: `af74086b` (mcp_surface / knowledge / broad-query-output-bounding).
@@ -94,7 +94,7 @@ traversal" as a measured fix — prose treated as a tunable parameter.
 
 | Plane | Members | Reached via | Daystrom levers applied? |
 |---|---|---|---|
-| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search`, `bbox_search` | yes - typed refs, breadcrumbs, tiering |
+| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search` | yes - typed refs, breadcrumbs, tiering |
 | **In-memory rule stores** | rule-packets, system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no — not indexed, not graph-addressable |
 | **Artifact/agent catalogs** | agents, atoms, workflows, brofiles, artifacts | bespoke `*_list` / `*_search` / `*_describe` | no — each its own shape |
 
@@ -133,10 +133,10 @@ overflow.
 Every locate-information surface now ends by naming the next tool with concrete
 refs:
 - `bbox_hybrid_search` → structured `next_steps` + text footer carrying the top
-  seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`; empty
-  results yield a broaden-the-query hint.
-- `bbox_search` → footer with the top hit's coordinates for
-  `bbox_context(file, offset)` / `bbox_messages(session)`.
+  seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`;
+  conversation hits carry `conversation` coordinates and an `exact_read` for
+  `bbox_context(file, offset)` / `bbox_messages(session)`; empty results yield
+  a broaden-the-query hint.
 - `bbox_knowledge` → top-level "Next steps" pulling the highest-ranked entry
   into `inspect_entity` + `bundle_evidence`; packets already carried
   `bbox_apply`, memories carry the Brick-0 signpost.
