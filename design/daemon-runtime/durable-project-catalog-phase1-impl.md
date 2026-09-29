@@ -658,27 +658,26 @@ Add:
   `crates/bbox-indexing/tests/fixtures/project-catalog-migration/`.
 
 The migration engine consumes explicit paths and immutable inventory inputs. It
-does not read global environment variables. The thin CLI resolves configured or
-explicit paths and passes them in.
+does not read global environment variables. Callers resolve explicit paths and
+pass them in.
 
-P1-C exposes one high-level public facade for preflight, rehearsal apply, and
-complete migration-aware verification. The facade accepts explicit resolved
+P1-C exposes one high-level public facade for preflight and rehearsal apply;
+apply ends with complete migration-aware verification of the installed state.
+The facade accepts explicit resolved
 paths and typed options and returns typed results and errors. It owns assembly
 of the complete participant registry and is the only public entry point that
-may execute or verify a migration transaction. P1-D must not expose individual
-participant internals or reconstruct the registry in the CLI.
+may execute or verify a migration transaction. No caller may expose individual
+participant internals or reconstruct the registry.
 
 The public executable surface is
 `project_catalog_migration::ProjectCatalogMigrationFacadeV1` with exactly
-three operations:
+two operations:
 
 ```text
 preflight(ProjectCatalogMigrationPreflightRequestV1)
     -> ProjectCatalogMigrationPreflightResultV1
 apply_rehearsal(ProjectCatalogMigrationApplyRequestV1)
     -> ProjectCatalogMigrationApplyResultV1
-verify(ProjectCatalogMigrationVerifyRequestV1)
-    -> ProjectCatalogMigrationVerifyResultV1
 ```
 
 Requests carry non-serializable, already-resolved typed layouts plus explicit
@@ -1326,15 +1325,14 @@ refuse. Pair-installed but marker-absent state recovers only through its
 prepared journal; without one it fails
 `error.project_catalog_migration_incomplete`.
 
-Phase 1 CLI apply requires an explicit isolated rehearsal root different from
+Apply requires an explicit isolated rehearsal root different from
 the configured live projects path. The guard compares canonical parent and
-target paths, not a caller-supplied boolean. The engine itself is the same code
-Phase 6 later activates for the configured path. Rehearsal redirects every
+target paths, not a caller-supplied boolean. Rehearsal redirects every
 participant, legacy source, checkout fixture, and GC root to isolated copies;
 it changes destination, not transaction semantics.
 
-Facade verification is a fresh reopen, never an inspection of the in-memory
-apply result. `verify` derives the fixed layout from the rehearsal root,
+Post-apply verification is a fresh reopen, never an inspection of the
+in-memory apply result. It derives the fixed layout from the rehearsal root,
 bounded-no-follow reads only enough journal and attachment evidence to recover
 the observation-id-to-checkout-root registry, requires a unique root-contained
 mapping, rebuilds the complete registry, and then invokes migration-aware
@@ -1367,8 +1365,8 @@ Fixture and property tests cover:
 
 - empty v1 store;
 - an external-consumer integration test completing preflight, rehearsal apply,
-  idempotent reapply, and fresh verify through only the three public facade
-  operations;
+  idempotent reapply, and fresh post-apply verification through only the two
+  public facade operations;
 - all ten owner lanes as complete, missing, corrupt, reordered, and changed
   snapshots, proving the staging `owner_lane_unsupported` path is gone;
 - every composite lane with one omitted, duplicated, changed, missing, or
@@ -1502,29 +1500,15 @@ gate; P1-D repeats this exact facade rehearsal through the thin executable.
 Add a root-package binary at `src/bin/blackbox.rs` and an explicit Cargo binary
 entry. Use the root package's existing `clap` dependency.
 
-Commands:
-
-```text
-blackbox project-catalog migrate --preflight --report <path> --resolution <path>
-blackbox project-catalog migrate --apply --report <path> --resolution <path> --rehearsal-root <path>
-blackbox project-catalog verify --root <path>
-```
-
-Common options include explicit projects path, state dir, report, and
-resolution. Both preflight and apply require `--resolution`; first preflight
-may create the canonical empty artifact at that explicit path, while apply
-requires the existing exact report/resolution pair and refuses unless the
-report is clean. Preflight alone accepts
-`--include-local-paths <sensitive-report-path>`. Defaults use the same config
-loader as the daemon, but help and version remain side-effect-free.
-`--preflight` is read-only except for the explicit report, first-use
-resolution, and optional sensitive report. `--apply` refuses without an
-exclusive lifetime lock and an isolated rehearsal root in Phase 1. The exact
+The executable hosts the offline `project-catalog` administration verbs.
+Version-1 migration has no subcommand: the facade's preflight and rehearsal
+apply are library operations that produce migrated fixtures for tests, and
+strict catalog open verifies every `MigratedV1` catalog through its origin
+marker, receipt binding, and transaction journal. Defaults use the same config
+loader as the daemon, but help and version remain side-effect-free. The exact
 `blackbox` name is final: the package and library already own it, while
 `blackboxd` remains daemon-only.
 
-`--root` and `--rehearsal-root` both name the rehearsal state root, never a
-`projects.json` file. The facade derives participant paths from that root.
 An explicit `--state-dir` re-roots the complete conventional bundle; an
 explicit `--projects-path` then overrides its projects member and therefore
 wins when both are present. With no state override, non-project members remain

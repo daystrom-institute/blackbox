@@ -96,15 +96,12 @@ traversal" as a measured fix — prose treated as a tunable parameter.
 |---|---|---|---|
 | **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search` | yes - typed refs, breadcrumbs, tiering |
 | **In-memory memory store** | system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no: not indexed, not graph-addressable |
-| **Artifact/agent catalogs** | agents, atoms, workflows, brofiles, artifacts | bespoke `*_list` / `*_search` / `*_describe` | no — each its own shape |
+| **Artifact catalogs** | brofiles, teams | bespoke `*_list` / `*_describe` | no, each its own shape |
 
-The decisive evidence: `EntityType` (`src/entity_ref.rs`) *includes* `Agent`
-as a graph entity, but the search index (`add_text(f.doc_type, …)` across
+The decisive evidence: the search index (`add_text(f.doc_type, …)` across
 `src/index/`) only covers `project_file, thread, commit, knowledge, roadmap`
-(+`transcript`/`note`). So agents are graph nodes you can *traverse to* but
-cannot *retrieve by content* in `hybrid_search`. System memories are not even
-graph entities: they are a parallel file catalog reached only through
-`bbox_knowledge`'s string matcher. `bbox_knowledge` is the only tool that bolts
+(+`transcript`/`note`), and system memories are not graph entities: they are a
+parallel file catalog reached only through `bbox_knowledge`'s string matcher. `bbox_knowledge` is the only tool that bolts
 the in-memory store onto a query, and it did so without index, graph, or
 tiering.
 
@@ -159,7 +156,7 @@ Concretely:
 - New `EntityType::SystemMemory` in `src/entity_ref.rs` (ref grammar
   `system_memory:<id>`) so memories become **inspectable and bundleable** — a
   runbook can then be an answer entity in an evidence bundle, with edges to the
-  atoms/tools it signposts.
+  tools it signposts.
 - `bbox_knowledge` becomes `hybrid_search` filtered to
   `knowledge | system_memory` with the tiered renderer (signpost default,
   full on exact id). One retrieval path with two filters, not two retrieval
@@ -179,7 +176,7 @@ deferred; it is not a substitute for it.
   runbooks are ~40KB; per-section lifts recall, matching the project-file
   aggregation rationale in `hybrid_search.rs`).
 - Graph edges for memories: do we materialize `SystemMemory --SIGNPOSTS-->
-  Atom/Tool` edges from the runbook prose, or leave memories edge-light?
+  Tool` edges from the runbook prose, or leave memories edge-light?
 - Lens migration: keep the `category="system_memory"` catalog listing and the
   exact-id short-circuit as fast paths, or route everything through the index.
 

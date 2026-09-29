@@ -104,8 +104,7 @@ The provisional semantic core is also mostly source-neutral:
   history payloads.
 - `bbox-code-collector` is the thin checkout owner. It already verifies a
   configured committed scope, refuses redirects and unsafe remote HTTP, and
-  captures code, Git history, and provenance without linking index/store
-  crates. It is the initial producer binary for this contract.
+  captures code and Git history without linking index/store crates. It is the initial producer binary for this contract.
 - GH-G makes typed Git transport authoritative for covered repositories. Its
   marker and observation taxonomy are a pattern, not a marker to overload:
   knowledge is project-scoped and has separate publication/provisional gates.
@@ -722,8 +721,8 @@ carrier. The broker's strict capability policy remains as defense in depth.
 2. Preserve bridge and uncovered `LegacyLocal` adapters until their own gate.
 3. Update the locality inventory, knowledge design status, operations docs,
    and governing all-adapter closeout report.
-4. Begin the next checkout-local arc, blame or project render, based on the
-   remaining dependency map.
+4. Begin the next checkout-local arc, project render, based on the remaining
+   dependency map.
 
 ## 9. Verification matrix
 
@@ -766,7 +765,7 @@ Minimum end-to-end cases:
 - No new producer credential family.
 - No branch-private replacement for shared provisional visibility.
 - No global guidance render transport; global render stays operator-host local.
-- No project render write or blame relocation in this arc; local knowledge
+- No project render write in this arc; local knowledge
   mutations continue reporting render pending.
 - No deletion of bridge assets, V1 accepted pointers, checkout registry data,
   or attachments merely because a transport row becomes authoritative.
@@ -778,7 +777,6 @@ remote knowledge source named by
 [`locality-first-decomposition.md`](./locality-first-decomposition.md). It
 consumes the semantics of
 [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
-without superseding that design. GH-G and KT-A through KT-F are complete and
-are no longer the next locality arc. The locality program continues with the
-typed blame boundary, followed by project render and the remaining local
+without superseding that design. GH-G and KT-A through KT-F are complete. The
+locality program continues with project render and the remaining local
 project-file walk retirement gates.

@@ -103,10 +103,12 @@ tool shows the truth.
 
 Artifact catalog:
 
-- `src/artifacts.rs` defines `ArtifactKind::{Workflow, Packet, Brofile, Agent,
-  Atom, Team, Cron}`. `Packet` is a retired kind: installed receipts list under
-  an explicit kind filter and can be removed, but install and boot restore
-  refuse it.
+- `crates/bbox-artifacts/src/artifacts.rs` defines `ArtifactKind::{Workflow,
+  Packet, Brofile, Agent, Atom, Team, Cron}`. Only `Brofile` and `Team` are
+  installable. `Workflow`, `Packet`, `Agent`, `Atom`, and `Cron` stay as kinds
+  only so persisted catalogs load: their receipts list under an explicit kind
+  filter and can be removed, but install and boot restore refuse them with
+  `error.retired_artifact_kind`.
 - `ArtifactCatalog::install_value[_scoped]` stores active JSON payloads,
   `metadata.json`, `.versions/v<version>.json`, and
   `.versions/v<version>.metadata.json`.
@@ -114,10 +116,8 @@ Artifact catalog:
 - `ArtifactMetadata` records source, version, install time, active flag,
   content hash, optional project id, supersession fields, and install warnings.
 - `bbox_artifact_install`, `bbox_artifact_list`, `bbox_artifact_supersede`, and
-  `bbox_artifact_remove` are the public MCP tools in `src/tools/artifacts.rs`.
-  Cron is already accepted as an artifact kind, but its activation still writes
-  the old runtime path and has not gone through the planned activator/path
-  extraction.
+  `bbox_artifact_remove` are operator tools in `src/tools/artifacts.rs`,
+  reached through `bro mcp call <tool> '<json>' --surface ops`.
 - Hard remove exists for one global artifact and calls `deactivate_artifact`
   before deleting catalog files.
 - Project-scoped artifacts exist in the storage layer and `.bbox/` watcher, but
@@ -126,68 +126,22 @@ Artifact catalog:
 
 Activation path:
 
-- `install_artifact_value` in `src/server/routes.rs` validates each known kind
-  through its native runtime path before recording metadata.
-- Workflow install compiles and writes the orchestration runtime store's
-  `workflows/<id>.json`.
+- `install_artifact_value` in `src/server/routes.rs` validates each installable
+  kind through its native runtime path before recording metadata.
 - Brofile install writes the global brofile registry and verifies resolution.
-- Agent install validates dependencies, computes manifest embeddings, records
-  provenance edges, and may enqueue agent-manifest embeddings.
-- Atom install validates dependency references.
-- Team install is catalog-only today.
-- `deactivate_artifact` removes workflow files, brofiles, and cron runtime
-  files; agents, atoms, and teams currently have no separate
-  runtime registry to tear down.
-
-Inlet runtime:
-
-- `bro_webhook_install`, `bro_poller_install`, and `bro_cron_install` live in
-  `src/tools/orchestrate.rs`.
-- Webhooks persist under the orchestration runtime store's
-  `webhooks/<name>.json`, install into
-  `WebhookRegistry`, and expose `/webhook/<name>`.
-- Pollers persist under the orchestration runtime store's
-  `pollers/<name>.json`, install into
-  `PollerRegistry`, and spawn a tick loop.
-- Crons persist under the orchestration runtime store's `crons/<name>.json`,
-  install into
-  `CronRegistry`, validate schedule syntax, and spawn a tick loop.
-- Those tools expose list operations, but pollers and webhooks have no catalog
-  metadata, supersession chain, bundle membership, hard uninstall, or source
-  tracking. Cron has partial artifact support but no bundle metadata or new
-  daemon-owned runtime path yet.
-- `CronRegistry` already exposes `remove`, which aborts the handle and drops
-  run state. `PollerRegistry` keeps `JoinHandle`s and aborts the previous handle
-  on reinstall but does not expose uninstall/remove. `WebhookRegistry` has
-  install/get/list and no remove API. Managed removal therefore still requires
-  new registry methods for pollers/webhooks and a status-oriented cleanup pass
-  for cron, not just wiring existing functions into `deactivate_artifact`.
-- Daemon startup restores webhooks, pollers, and crons directly from that
-  runtime store and respawns poller/cron loops. That restore path bypasses the
-  artifact catalog today, so doctor must treat these runtime files as
-  potentially unmanaged until the artifact path owns them.
+- Team install writes the teamplate file and the team instance, then verifies
+  them.
+- `deactivate_artifact` removes brofiles; teams and the retired kinds have no
+  separate runtime registry to tear down.
 
 System defaults:
 
 - `system-defaults/system-defaults.md` says the daemon does not auto-install the tree.
-- `docs/artifact-catalog.md` calls `system-defaults/` the shipped catalog
-  source, but explicitly treats crons/webhooks as install-order dependencies
-  rather than catalog kinds.
-- `system-defaults/badgey/crons/*.json`,
-  `system-defaults/agentic-corpus/crons/*.json`, and
-  `system-defaults/agents/crons/*.json` are therefore shipped defaults that
-  can be installed through the partial cron artifact path but still lack bundle
-  membership and neutral runtime-store semantics.
+- `docs/artifact-catalog.md` documents the operator install path for brofiles
+  and teams and points at `system-defaults/` for the retained shipped artifacts.
 - MCP surfaces are daemon configuration, not shipped `system-defaults/`
   specs: the built-in table is `crates/bbox-config/src/default_surfaces.toml`
   and `[surfaces.<name>]` tables in the daemon config file override it.
-- Runtime serde ignores extra top-level fields in inlet JSON specs, while the
-  artifact catalog requires a version to install. Shipped cron specs already
-  carry top-level `version` fields. Future shipped poller/webhook defaults must
-  do the same; adoption/backfill of already-active user specs can synthesize
-  `version="unmanaged"` with an explicit warning. Do not add `version` or
-  `supersedes` fields to runtime structs just for cataloging; serde's existing
-  tolerance for extra fields is the compatibility boundary.
 
 Operations baseline:
 
@@ -322,7 +276,6 @@ Initial managed kinds:
 |---|---|---|---|
 | `workflow` | workflow registry | `name` | compile, capability validate, write runtime workflow spec |
 | `brofile` | brofile store | `name` | save and resolve brofile |
-| `agent` | agent catalog/registry | `name` | validate, embed manifest, provenance edges |
 | `atom` | atom catalog/registry | `name` | validate atom install |
 | `macro` | macro registry | `id` | validate `inputs_schema`, register into `MacroRegistry` (replaces `include_str!` builtins) |
 | `teamplate` | team store (`teamplates/`) | `name` | validate member brofile refs exist, `save_teamplate` |
@@ -359,7 +312,7 @@ their desired lifecycle state.
 {
   "name": "blackbox-system-defaults",
   "version": 1,
-  "description": "Default Blackbox agents, atoms, inlets, and workflows.",
+  "description": "Default Blackbox atoms, inlets, and workflows.",
   "members": [
     {
       "kind": "workflow",
@@ -676,8 +629,8 @@ This keeps runtime-specific behavior in one place per kind and lets bundles run
 the same path a single install uses.
 
 The implementation is not a trivial wrapper. `install_artifact_value` currently
-conflates validation, runtime activation, catalog write, agent embedding, and
-provenance edge persistence. The first implementation should extract one
+conflates validation, runtime activation, and catalog write. The first
+implementation should extract one
 activator at a time while preserving exact existing behavior for the current
 kinds before adding poller, webhook, and bundle support.
 
@@ -850,12 +803,11 @@ dependency edges:
   time — see [Workflow Assets](#workflow-assets).
 - workflow-backed atoms need their workflow active.
 - profile-backed atoms need their brofile active.
-- agents with `brofile_ref` need the brofile active.
 - teamplate members reference brofiles; brofiles activate before teamplates.
 - teamplate-backed teams need their teamplate (and its member brofiles) active.
 
 Activation order for the system-default surface therefore settles to roughly:
-brofiles → macros/agents/atoms → teamplates → teams → workflows →
+brofiles → macros/atoms → teamplates → teams → workflows →
 inlets (cron/poller/webhook). The bundle planner enforces
 the edges it can detect; explicit bundle order covers the rest until Phase 7
 auto-ordering lands.
@@ -877,11 +829,9 @@ system-defaults/bundles/
   blackbox-system-defaults.json   # top-level meta-bundle → child bundles
   agentic-corpus.json             # auto-digest/auto-edge/contradiction/eval/embed workflows+brofiles+crons, contradiction-specialists team
   maintenance.json                # daily-compaction cron+workflow (own tree, NOT agentic-corpus)
-  agents.json                     # default agents + agent-eval cron/workflows
   phase-decompose.json            # phase-decompose workflows + brofiles + teamplates + script/fixture assets
   supervision.json                # supervision atoms + brofiles + workflows
   refactor.json                   # refactor atoms (140) + brofiles + workflow wrappers + macros
-  badgey.json                     # badgey agents + brofiles + workflows + crons
 ```
 
 Suggested ownership, grounded in the directory groups:
@@ -897,8 +847,6 @@ Suggested ownership, grounded in the directory groups:
 - `maintenance`: `system-defaults/maintenance/**`: daily-compaction cron and
   the arc workflow. This is a separate shipped tree and
   deserves its own bundle, not folding into agentic-corpus.
-- `agents`: `system-defaults/agents/**` — default agents plus their co-located
-  `crons/` and eval `workflows/`.
 - `phase-decompose`: `system-defaults/phase-decompose/**` teamplates and
   script/fixture assets, plus `system-defaults/workflows/phase-decompose/**`
   and `system-defaults/brofiles/phase-decompose/**`. This is the strongest case
@@ -907,8 +855,6 @@ Suggested ownership, grounded in the directory groups:
   `brofiles/supervision-*`, and `workflows/supervision/**`.
 - `refactor`: the 140 `system-defaults/atoms/refactor/**` atoms, the refactor
   brofiles/personas, `workflows/refactor/**`, and the four macros.
-- `badgey`: `system-defaults/badgey/**` agents, brofiles, workflows, and
-  crons.
 
 Meta-bundles are shallow references to child bundles, never duplicated member
 lists. The generation record expands transitive membership so uninstall stays
@@ -1092,9 +1038,9 @@ Extend `ArtifactKind`:
 ```rust
 pub enum ArtifactKind {
     Workflow,
-    Packet,     // retired: installed receipts list and remove, never activate
+    Packet,     // retired: persisted receipts list and remove, never activate
     Brofile,
-    Agent,
+    Agent,      // retired: persisted receipts list and remove, never activate
     Atom,
     Macro,      // identity = `id`; replaces include_str! builtins
     Teamplate,  // team template (members by brofile)

@@ -59,8 +59,8 @@ JSON into typed observation records declared by that artifact, and publishes
 bounded batches with a proposed **named checkpoint transition** over a
 dedicated authenticated lane. The corpus accepts the batch, retains it content
 addressed, and interprets the same schema artifact to project it
-deterministically into a **connector-owned source graph** through the landed
-`SourceProjectionStore`.
+deterministically into a **connector-owned source graph** held by the M2
+source projection store (`SourceProjectionStore`).
 
 Three properties are the point, and each is a property the other two profiles
 cannot supply for this shape:
@@ -452,15 +452,14 @@ must not require the payload; reprojection is the only consumer.
 ### 5.4 The satellite
 
 `bbox-dataset-collector` is **one generic satellite with per-vendor adapter
-modules**, following the file collector rather than the Slack collector.
+modules**, following the file collector rather than a per-vendor satellite.
 
-The two landed satellites made opposite choices for good reasons. The file
-collector is generic because its per-store surface is a `RemoteSourceConnector`
-implementation behind a stable trait and everything around it (policy,
-journal, logical paths, the publication cycle, the wire client) is genuinely
-shared. `bbox-slack-collector` is per-vendor because Slack's read-method
-allowlist, enrollment policy, thread sweeps, and reconciliation window are the
-substance of the design rather than parameters of it.
+The file collector is generic because its per-store surface is a
+`RemoteSourceConnector` implementation behind a stable trait and everything
+around it (policy, journal, logical paths, the publication cycle, the wire
+client) is genuinely shared. A Slack producer is per-vendor because Slack's
+read-method allowlist, enrollment policy, thread sweeps, and reconciliation
+window are the substance of its design rather than parameters of it.
 
 This lane resembles the file collector. A vendor contributes a schema artifact
 (data, not code) plus a normalizer that turns vendor JSON into records the
@@ -497,7 +496,7 @@ allowed; corpus knowledge is not.
 
 ## 6. Source schemas as catalog artifacts, and schema-directed projection
 
-Operator decision 7650b743fb23c265 already ratified the shipping mechanism:
+The operator already ratified the shipping mechanism:
 versioned corpus artifacts through the existing artifact catalog, not compiled
 into connector binaries, with signed distribution deferred to the hosted
 hardening milestone. This section settles what the artifact contains and what

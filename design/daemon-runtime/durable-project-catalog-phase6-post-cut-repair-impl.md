@@ -166,9 +166,6 @@ Every current consumer is converted explicitly:
   cheap metrics;
 - the workflow records before/after connectivity diagnostics around rebuild so
   the repair's recall effect remains observable;
-- the inbox attention pass uses the nonblocking bounded diagnostics action: a
-  breached graph raises the existing alert, while diagnostic unavailability is
-  reported separately from a healthy result;
 - `bbox_embed_status` remains cheap by default and exposes diagnostics only
   behind its explicit request flag/action;
 - doctor explicitly requests the bounded diagnostic response when evaluating

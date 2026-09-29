@@ -28,12 +28,10 @@ one task registry and one event broadcast, and both fleet-launched and
 framework-dispatched agents land in them:
 
 - `/control/exec` — the cockpit's dispatch path (`control_exec_handler`,
-  `src/server/routes.rs:872`; mounted at `src/server/mcp.rs:68`, aliased
-  `/irc/exec` at `:103`) creates a task in `state.task_store`.
-- `bro_exec` / workflow nodes / atoms create tasks in the
-  **same** `state.task_store` and emit to the **same** `state.tail_tx`
-  (`src/tools/orchestrate.rs:175-176` threads `state.task_store.clone()` +
-  `state.tail_tx.clone()`; atoms/supervision read `state.task_store`).
+  `src/server/routes.rs`; mounted in `src/server/mcp.rs`) creates a task in
+  `state.task_store`.
+- `bro_exec` creates tasks in the **same** `state.task_store` and emits to the
+  **same** `state.tail_tx`.
 
 Despite that, the cockpit keeps a **second, client-side** copy of fleet data:
 
@@ -244,11 +242,8 @@ empty; PROJECT.md's `dispatch_origin` is an unrelated refactor-run flag). Add an
 
 | Creation site | `origin` |
 |---|---|
-| `control_exec_handler` (`/control/exec`, `/irc/exec`) | `Cockpit` |
+| `control_exec_handler` (`/control/exec`) | `Cockpit` |
 | `bro_exec` | `AgentDispatch` |
-| `orchestrate.rs` workflow nodes | `Workflow` |
-| atoms | `Atom` |
-| cron / webhook ingress | `Cron` / `Webhook` |
 
 It rides the Tier-1 summary DTO and drives the tabs:
 
@@ -256,7 +251,7 @@ It rides the Tier-1 summary DTO and drives the tabs:
 - **Tab "Dispatched Agents"** — everything else (framework-launched).
 
 This is **not** a one-line change despite being additive: `origin` must be set at
-~7 disjoint creation sites, added to `TaskInner` and to the wire
+every creation site, added to `TaskInner` and to the wire
 `bro_protocol::TaskSnapshot` (which today carries only
 task/session/status/last_message/error, `crates/bro-protocol/src/lib.rs:46`), and
 **persisted** so the tab survives a daemon restart and a reload-reconcile. The
@@ -267,9 +262,9 @@ roster's **filter facets**, orthogonal to the origin tabs.
 
 ### 4.2 Control verbs are already origin-agnostic
 
-Steer / resume / interrupt / closeout / retro all run through `/control/*` (and
+Steer / resume / interrupt / closeout all run through `/control/*` (and
 `bro_*`) against a daemon `task_id` — the daemon does not care who launched it.
-So "spy on dispatched agents, steer/resume them, run retros" is already
+So "spy on dispatched agents, steer/resume them" is already
 *mechanically* possible; the cockpit simply has not been **showing** those tasks.
 The fold-in surfaces addressable state; it does not build new control paths.
 
@@ -332,8 +327,7 @@ endpoint. No new task fields, no client behavior change yet.
 
 **Slice 1b — `origin` plumbing (cross-cutting; the audit IS the work).** Add
 `origin` to `TaskInner` and `bro_protocol::TaskSnapshot`, set it at every creation
-site (`/control/exec`, `bro_exec`, workflow, atoms, cron,
-webhook), persist it, and test restart-survival. This is the risk-bearing slice
+site (`/control/exec`, `bro_exec`), persist it, and test restart-survival. This is the risk-bearing slice
 (§4.1) — call it out as a creation-site audit, not a one-liner. Tabs depend on it.
 
 **Slice 2 — Roster SSE + client subscription.** Add the `RosterAdded/Updated/
@@ -384,7 +378,7 @@ remove the redundant interactive tail surface; doc the new tabbed cockpit.
 - **Focused transcript hydration** loses no events at the snapshot→stream
   boundary (the cursor contract), and deep history beyond the 50-event live
   window reflows from the transcript-replay source, not the daemon snapshot.
-- **`origin` survives** persistence + reload (a `Workflow` bro does not reappear
+- **`origin` survives** persistence + reload (an `AgentDispatch` bro does not reappear
   as a `Cockpit` agent after a daemon restart).
 - **Orchestrator-owned override** is confirm/ack-gated and emits an audit event;
   it is not performable as a silent passive action.

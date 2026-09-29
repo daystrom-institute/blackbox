@@ -85,11 +85,11 @@ substantial and the deaths are load-bearing, so both get named.
   identity bridges"; "Mirroring is a semantic downgrade dressed as a transport").
   The daemon runs in the cage on an immutable image digest with zero checkout
   filesystem authority.
-- **The `git` and `local_mirror` connectors.** Four landed transports cover repo
-  mirroring entirely: code collector (current bytes), Git history/provenance
-  transport, knowledge-source transport for `.bbox/`, checkout-local blame and
-  render. Cloning into the corpus host delivers strictly less (no uncommitted
-  state, no worktrees, no dirty-buffer blame) while adding git-version,
+- **The `git` and `local_mirror` connectors.** Landed transports cover repo
+  mirroring entirely: code collector (current bytes), Git history transport,
+  knowledge-source transport for `.bbox/`, and checkout-local render. Cloning
+  into the corpus host delivers strictly less (no uncommitted state, no
+  worktrees) while adding git-version,
   submodule, path-encoding, and ssh-credential archaeology to the daemon image.
 - **Daemon-side sync workers.** The predecessor put the sync driver in the daemon
   under the poller substrate and left its actor topology open. Moving the driver
@@ -858,10 +858,10 @@ auth flow.
   cross-producer convergence accepted and closable by an operator-declared
   alias. Section 8 records the landed shape and the downgrade story;
   `gap-0c7ec76c` closes with the phase-0 fold.
-- **Remote provenance on the wire**: DECIDED 2026-08-13 (operator, decision
-  bb2cc144c47840b0). The connector wire carries `remote_id`,
-  `remote_version`, and a renderable remote URL as manifest-entry metadata
-  from its FIRST version, so evidence can cite the source document. The
+- **Remote provenance on the wire**: DECIDED 2026-08-13 (operator). The
+  connector wire carries `remote_id`, `remote_version`, and a renderable remote
+  URL as manifest-entry metadata from its FIRST version, so evidence can cite
+  the source document. The
   cheap-once wire bump is taken while the wire is greenfield.
 - **Export churn from vendor renderer changes** (section 7). Backburner,
   re-evaluate at phase 2 with real Drive traffic. Standing recommendation:
@@ -933,6 +933,3 @@ auth flow.
   its identity principle (durable scope is identity, observed paths are
   attachment facts) is what section 8 applies to a store with no commit to derive
   identity from.
-- **Distinct from** the Slack agent bridge (`design/integrations/slack/`), an
-  interactive dispatch surface rather than a corpus source. Corpus ingestion from
-  Slack is the campaign sibling above.

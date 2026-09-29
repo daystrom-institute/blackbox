@@ -178,8 +178,7 @@ Deliberately not done here:
   producer auth and applies source transitions on the worker, which reads
   every producer token file, does a full `read_dir` of the store root plus
   an fsync (`reap_upload_body_tempfiles`), and reads every activation
-  record; `git_source.rs:350` and `:467` do three fs syscalls each on the
-  provenance export path; and the `tempfile_in(...)` plus `.reopen()` pair
+  record; and the `tempfile_in(...)` plus `.reopen()` pair
   in every blob PUT (`code_source.rs:971-976`,
   `knowledge_source.rs:1544-1549`, `git_source.rs:609-614` and `:881-886`)
   is two synchronous opens on a worker. None of these spin-sleep for

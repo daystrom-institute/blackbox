@@ -67,7 +67,7 @@ transport/aggregation contract explicitly out of scope here. Nothing here may
 be extended to remote workers without that contract.
 
 Out of scope, deliberately, on their own triggers: the harness-ward moves
-(provenance, blame, render relocation), the code-corpus collector, and the
+(render relocation), the code-corpus collector, and the
 corpus off-host move.
 
 ### 0.1 Implementation checkpoint and correction rule
@@ -889,7 +889,7 @@ Each slice lands on the monolith and gets the full lane gate.
   recognition set, never the broad read set, or a user worktree's scratch
   leaks in. Two gates stay distinct (`bbox-corpus-core` CLAUDE.md invariant);
   this design consumes them.
-- **Legacy host-local stores.** Notes, pins, and roadmaps continue
+- **Legacy host-local stores.** Notes and roadmaps continue
   to use their older path resolver, which can normalize a selector to a
   registered monorepo root's canonical path. That behavior is now explicit and
   is not durable published-scope authority. Migrating those stores is a

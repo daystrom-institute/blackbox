@@ -11,7 +11,7 @@ brief: "Hub for durable knowledge, notes, gap logs, rendered memories, and syste
 # Knowledge And Memory
 
 Knowledge and memory are the curated layers above raw transcripts and indexed
-files: durable rules, decisions, notes, system memories, and rendered provider
+files: durable rules, notes, system memories, and rendered provider
 context.
 
 ## Docs

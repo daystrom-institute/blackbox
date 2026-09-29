@@ -255,9 +255,8 @@ Phase 3 does not:
   scope-bearing v2 store records (Phase 4). Section 6 item 6 defines the one
   bounded interaction Phase 3 has with the grant table;
 - wire accepted-publication generations or catalog-keyed knowledge/gap views
-  into live views, or move blame/render/provenance/file providers to their
-  final adapter shapes (Phase 5). Blame's indexed-path handling changes only
-  as far as section 9 item 4 requires for the new document fields;
+  into live views, or move render/file providers to their final adapter
+  shapes (Phase 5);
 - delete v1 compatibility lanes, the literal filter lane, eight-hex bridge
   compat, or `load_project_records` consumers (Phase 6);
 - implement `bbox_repo_history_namespace_resolve`, ambiguous-namespace

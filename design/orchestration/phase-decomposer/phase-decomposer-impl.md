@@ -1,7 +1,7 @@
 ---
 title: "Phase Decomposer - Implementation Plan"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - orchestration

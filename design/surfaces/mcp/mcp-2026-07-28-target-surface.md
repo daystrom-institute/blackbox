@@ -144,7 +144,7 @@ fleetd task ownership, auth) and collected in the Decisions section.
    (tasks, resources) are projections that accelerate capable clients, not
    replacements that fork the contract.
 3. **Resources are the browse plane.** Catalogs with durable IDs and JSON
-   bodies (brofiles, teams, artifacts, atoms, live tasks) get
+   bodies (brofiles, teams, artifacts, live tasks) get
    URI-addressable read projections with protocol cursor pagination. Writes
    stay tools; MCP resources are read-only, which matches our mutation
    tools' existing audit/gating shape.
@@ -196,8 +196,8 @@ Scope channels, ranked by client reach:
   lists.
 - Checkout authority (`resolve_project_write` + dark overlay refresh) must
   be **corpus-plane-only** in the target state. Locality-first
-  decomposition removes the daemon's reach into checkouts (harness-native
-  blame, checkout-local render, collector-produced indexing, the
+  decomposition removes the daemon's reach into checkouts (checkout-local
+  render, collector-produced indexing, the
   published-plus-provisional knowledge lane), so write-authority resolution
   keys off the project registry, identity stores, and the provisional lane,
   never daemon-local fs/git walks. That makes the required shared cache
@@ -252,10 +252,8 @@ Caveats:
   ourselves (next section).
 - Steer and interrupt stay tools; forcing them into `tasks/update` would
   violate the envelope's semantics.
-- Scope decision (Q3): bro dispatches first. Workflow runs are equally
-  task-shaped but carry richer state (node graph); expose them as tasks only
-  if the bro projection proves clean, otherwise as `blackbox://run/{id}`
-  resources.
+- Scope decision (Q3): bro dispatches first; the other task-shaped tools
+  below follow only if the bro projection proves clean.
 
 ### Task candidates beyond dispatch
 
@@ -267,14 +265,12 @@ than a few seconds". By that rule:
 | --- | --- |
 | `bbox_reindex` (full) | Index builds are the canonical long job; today a background actor with no client-visible handle |
 | `bbox_reembed` | Embedding rebuilds run minutes to hours on large partitions |
-| `bbox_edge_compact(apply)` / `bbox_storage_gc(apply)` / `bbox_storage_migrate_legacy_edges(apply)` | Storage maintenance over many projects; dry-run stays a tool, apply becomes a task |
-| `consultant_apply_proposal` (and badgey) | Already secretly a task: dispatches work, returns `applied_task_id`, and its Pending -> Applying -> Applied/Failed state machine is literally the task lifecycle. The split begin/complete-apply pair exists only because the protocol had no task primitive |
-| `atom_invoke` | Atom runs are dispatched executions with run records |
+| `bbox_edge_compact(apply)` / `bbox_storage_gc(apply)` | Storage maintenance over many projects; dry-run stays a tool, apply becomes a task |
 | `bbox_project_register` | Registration is instant but schedules background indexing; the follow-through deserves a task handle |
 
-The pattern worth naming: `consultant_apply_proposal`, `bro_exec`, and
-`atom_invoke` each independently reinvented task-handle-over-tools. The
-extension collapses three bespoke lifecycles into one protocol shape.
+The pattern worth naming: `bro_exec` and the background maintenance tools
+each implement task-handle-over-tools independently. The extension collapses
+those bespoke lifecycles into one protocol shape.
 
 ### fleetd and location-independent task handles
 
@@ -331,7 +327,6 @@ as tools:
 blackbox://brofile/{name}
 blackbox://team/{name}
 blackbox://artifact/{kind}/{name}
-blackbox://atom/{id}
 blackbox://task/{id}                                (live task state)
 blackbox://project/{project}/artifact/{kind}/{name} (explicit project encoding)
 blackbox://skills/onboard-project/SKILL.md
@@ -339,10 +334,10 @@ blackbox://skills/onboard-project/SKILL.md
 
 The classification rule for resource candidacy: a durable ID plus a JSON
 body that clients currently enumerate through a bounded list tool. Beyond
-the four catalogs:
+these catalogs:
 
 - **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
-  `blackbox://gap/{id}`, `blackbox://note/{id}`, `blackbox://roadmap/{id}`,
+  `blackbox://gap/{id}`, `blackbox://note/{id}`,
   `blackbox://project/{id}`, `blackbox://provider/{name}`.
 - **`blackbox://sm/{id}`** (system memories). Agents fetch `sm-*` runbooks
   constantly via free-text `bbox_knowledge` when they already know the ID;
@@ -410,12 +405,12 @@ cap.
   bespoke limit params. The 80KB cap + spill envelope stays regardless.
 - structuredContent going forward: 2026-07-28 allows any JSON value, so new
   or changed tools should ship `outputSchema` + `structuredContent`. No mass
-  retrofit of the 177 existing tools.
+  retrofit of existing tools.
 
 ## MRTR approval gates (SEP-2322)
 
 Operator-confirmation flows today are "dispatch, get refused, re-dispatch
-with a flag" (consultant proposal applies, destructive admin ops, RX-V1
+with a flag" (destructive admin ops, RX-V1
 operator-authority flags). MRTR lets a tool return `InputRequiredResult`
 with an elicitation; the client answers and retries the original request
 with `inputResponses`. Elicitation UX already exists client-side in
@@ -473,8 +468,8 @@ Recommendations stated; operator red-lines here.
   flip prod after a live round-trip confirms the selected endpoint and
   negotiated protocol/capabilities. Source or strings probes select test
   candidates; they do not establish negotiation.
-- **Q3 (task scope)**: bro dispatches only, or workflow runs as tasks too?
-  Recommend bro first, workflow runs fast-follow or `blackbox://run/{id}`.
+- **Q3 (task scope)**: bro dispatches only, or the maintenance tools as
+  tasks too? Recommend bro first, maintenance tools fast-follow.
 - **Q4 (checkout authority cache)**: invalidation for the per-request
   write-authority cache. Recommend generation-keyed + TTL backstop.
 - **Q5 (deny semantics)**: the only deny case is an unknown surface.

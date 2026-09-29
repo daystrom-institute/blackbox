@@ -10,9 +10,10 @@ brief: "Hub for atom-era supervision: mechanical telemetry, classifier observati
 
 # Supervised Execution
 
-Supervision wraps primary atom or workflow execution without changing the
-primary contract. The cluster separates mechanical telemetry from semantic
-classification and advisor recovery policy.
+This cluster records the supervision designs for atom and workflow execution:
+mechanical telemetry, semantic classification and advisor recovery policy.
+Retained execution measurements belong to bro execution, as defined by the
+[bro execution boundary](../bro-execution-boundary-and-retirement.md).
 
 ## Docs
 

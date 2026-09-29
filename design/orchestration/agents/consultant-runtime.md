@@ -1,7 +1,7 @@
 ---
 title: "Consultant Runtime - Badgey dissolution into generic primitives"
 kind: design
-lifecycle: implemented
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - orchestration

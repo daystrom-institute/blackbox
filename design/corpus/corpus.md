@@ -4,14 +4,14 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - corpus
-brief: "Hub for Blackbox corpus, knowledge, provenance, storage, code navigation, and Badgey designs."
+brief: "Hub for Blackbox corpus, knowledge, storage, and code navigation designs."
 ---
 
 # Corpus
 
-This hub groups the designs for Blackbox as a searchable, provenance-aware
-working memory: indexed project files, transcripts, knowledge, notes, graph
-edges, storage, and corpus-facing assistants.
+This hub groups the designs for Blackbox as a searchable working memory:
+indexed project files, transcripts, knowledge, notes, graph edges, and storage.
+Badgey and commit work provenance are archived records.
 
 ## Core Corpus
 

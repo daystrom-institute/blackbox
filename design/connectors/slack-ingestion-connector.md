@@ -14,22 +14,19 @@ tags:
   - producer
   - transcripts
   - ingestion
-brief: "Index visible Slack messages as a searchable conversation corpus through a read-scoped producer satellite. Slack is the conversation profile of the connector family and mechanically an API-dataset observation: messages ride an append-only ingest lane with per-channel cursors, not the code-source manifest lane. Complement of the bro-slack agent bridge, which keeps interaction; this doc owns observation only."
+brief: "Index visible Slack messages as a searchable conversation corpus through a read-scoped producer satellite. Slack is the conversation profile of the connector family and mechanically an API-dataset observation: messages ride an append-only ingest lane with per-channel cursors, not the code-source manifest lane."
 date: 2026-08-11
 ---
 
 # Slack Ingestion Connector
 
-Status (2026-08-16): partial. The corpus lane is landed on
-`beta/blackbox-v2` (first committed 2026-08-13):
-`bbox-conversation-source`, `bbox-conversation-source-store`, and
-`bbox-slack-collector` project Slack messages into the word index
-through the transcript adapter. The rest of this connector design
-remains proposed. The `bro-slack` Socket Mode sidecar is separate
-shipped code (`crates/bro-slack`); its v1 design is archived
-(`../integrations/slack/bro-slack.md`) and only the next iteration
-(`../integrations/slack/bro-slack-next.md`) is proposed.
-Reverify contract names against code before building on them.
+Status: partial. The corpus lane is landed: `bbox-conversation-source`
+(wire contract) and `bbox-conversation-source-store` accept conversation
+observations, and the daemon projects them into the word index through the
+transcript adapter. The Blackbox distribution ships no Slack producer; the
+producer sections below are the contract an external producer implements.
+The rest of this connector design remains proposed. Reverify contract names
+against code before building on them.
 
 ## 1. What this connector observes
 
@@ -98,7 +95,7 @@ redaction from an append; and pollutes code search with pseudo-files the file
 classifier, active-selector constraint, and every code-facing reader must
 special-case forever.
 
-### Two more rejected shapes
+### Another rejected shape
 
 **The daemon polls Slack directly.** Smallest new machinery, wrong plane. It
 puts a workspace-wide credential inside the cage daemon, gives the corpus plane
@@ -107,30 +104,19 @@ daemon-availability concern. Producer-plane observation keeps the credential on
 the producer host and the corpus host a receiver, which is the point of the
 collector template.
 
-**The bridge's live event stream as sole authority.** The `bro-slack` sidecar
-already receives every message event over Socket Mode, but indexing straight
-off it is wrong as the *only* source: no backfill, dropped events across
-disconnects and restarts, and ack semantics targeting interaction latency
-rather than corpus completeness. It survives in a strictly subordinate role
-(section 5.4) as a low-latency dirty-marking hint.
-
 ## 3. Producer: a read-scoped Slack satellite
 
-### 3.1 Sibling binary, shared credential host
+### 3.1 Standalone satellite, dedicated credential
 
-The producer is `bbox-slack-collector`: a read-only satellite that holds the
-Slack read credential and publishes to the corpus host over the authenticated
-internal wire. It is **a sibling of the `bro-slack` bridge, not an extension
-of it**. Because it reads nothing local to a checkout host, its home is the
-cluster beside the daemon it feeds (its own Deployment from the shared runtime
-image, journal on a small volume, credentials as owner-only files delivered by
-the cluster's secrets plane); a laptop launchd agent was the first deployment
-and was retired for laptop-class failure modes (2026-08-16).
+The producer is a read-only satellite that holds the Slack read credential and
+publishes to the corpus host over the authenticated internal wire. Because it
+reads nothing local to a checkout host, its home is beside the daemon it feeds
+(its own deployment, journal on a small volume, credentials as owner-only files
+delivered by the deployment's secrets plane).
 
-Folding ingestion into the bridge process (one process, one app, one reconnect
-loop) was considered and rejected:
+Its Slack credential is its own, never shared with an interactive Slack app:
 
-- **Scope auditability.** The bridge needs interactive write scopes
+- **Scope auditability.** An interactive app needs write scopes
   (`chat:write`, `views:*`, eventually channel creation); the reader needs
   `channels:history`, `groups:history`, `users:read`, later `files:read`.
   Merged into one grant, nobody can read the workspace's installed-app page and
@@ -139,46 +125,19 @@ loop) was considered and rejected:
   the producer asserts at startup that its grant carries no write scope and
   refuses to run otherwise, making the operator's standing no-writes-to-Slack
   rule a property of the credential rather than of the code path. That
-  assertion is impossible in a process that also holds the posting token.
+  assertion is impossible in a process that also holds a posting token.
 - **Rate-limit isolation.** A multi-hour backfill and an interactive mention
   response should not draw on the same bucket.
 
-**RULED (operator, 2026-08-13): the deployed posture is ONE app, the
-existing interactive bot.** The requirement is observation from the bot's own
-perspective: the bot's channel membership defines exactly what it indexes, so
-the bot can search its own history when directed by humans. A Slack app holds
-one bot token per install carrying all granted scopes, so a read-only
-credential for the same bot identity does not exist; credential-level
-enforcement is therefore unavailable, and write-safety moves to the collector's
-code path as a threefold contract: the collector has no write call sites, its
-Slack client is allowlisted to the read API families (conversations.list,
-users.conversations for the membership-mode roster, conversations.history,
-conversations.replies, users.*, and cursor pagination) and refuses any other
-method by construction, and the dependency ceiling is enforced by acceptance
-script. The agents-never-post rule is untouched: it binds agents, and the
-collector is an observer that structurally cannot compose a write. The
-two-app split remains documented below as the posture for deployments that
-want credential-level enforcement and separable workspace audit; it is not
-the deployed shape here.
-
-Consequence of one app: the interactive bot and the collector share one rate
-budget, so the S3 workspace token bucket must span both processes, and until
-it exists the collector self-throttles conservatively and yields to
-interactive traffic. Steady-state observation remains watermark polling, not
-the bot's socket-mode event stream: events miss everything during downtime
-while polling self-heals; event-assisted freshness (the bridge nudging the
-collector) is a later optimization. The first consuming deployment resolves
-the bot token from the operator's secret vault via the op CLI at startup
-(a secret reference, never a literal in config), per the secrets-provider
-design.
-
-Original recommendation, retained for deployments without the
-bot-perspective requirement: **two Slack apps**, the existing interactive app
-and a read-only observer app. Where an operator insists on one app without
-the bot-perspective requirement, the fallback is two token files with
-distinct grants and the same startup assertion, which is supported but weaker
-because the workspace-level audit surface no longer separates the purposes. Both processes share the producer host and therefore
-share credential delivery, supervision, and the operator's secret plane
+Write safety also holds in the code path: the producer has no write call
+sites, its Slack client is allowlisted to the read API families
+(conversations.list, users.conversations for the membership-mode roster,
+conversations.history, conversations.replies, users.*, and cursor pagination)
+and refuses any other method by construction, and the dependency ceiling is
+enforced by acceptance script. Steady-state observation is watermark polling,
+not a socket-mode event stream: events miss everything during downtime while
+polling self-heals. The credential reaches the producer as a secret reference,
+never a literal in config, per the secrets-provider design
 ([`../operations/config-artifacts/secrets-provider.md`](../operations/config-artifacts/secrets-provider.md)).
 
 ### 3.2 Producer discipline
@@ -331,14 +290,8 @@ rather than duplicating.
 The honest limit: **delete detection is window-bounded.** A message deleted
 outside the window is not detected, and the corpus may retain text the
 workspace no longer shows. That is a policy fact the operator accepts when
-enabling the connector; it is why the window is configurable and why the hint
-channel matters. Stating the limit beats claiming coverage that does not exist.
-
-The hint channel: where the bridge runs on the same host, it can hand the
-reader `message`, `message_changed`, and `message_deleted` notices as
-low-latency hints that mark a channel dirty and pull its reconciliation window
-forward immediately. Hints are advisory. Nothing lands or is removed on a hint
-alone; every hinted change is confirmed by an API read.
+enabling the connector; it is why the window is configurable. Stating the
+limit beats claiming coverage that does not exist.
 
 ### 5.5 Rate-limit discipline
 
@@ -360,7 +313,7 @@ deliberately narrow membership may set `enrollment = "membership"`: every
 member channel of an enabled class enrolls, an invite is enrollment, a
 non-empty include still narrows, and excludes still win. This never widens
 visibility beyond the membership bound; it removes the need to restate that
-bound in globs. The first deployment runs membership mode.
+bound in globs.
 
 - **Index only what the token can already see.** The connector never widens its
   own visibility: it never calls `conversations.join`, never enrolls a channel
@@ -370,10 +323,9 @@ bound in globs. The first deployment runs membership mode.
   channel in the producer host's config, its scope in the corpus host's
   producer grant. A denylist overrides the allowlist. Same shape as remote
   project onboarding, for the same reason.
-- **No agent self-service enrollment.** The bridge design floated a
-  `/bbox index-channel` slash command for per-channel opt-in. Retired here: it
-  is a user-triggered mutation of corpus scope, the exact shape the onboarding
-  design rejected.
+- **No agent self-service enrollment.** Per-channel opt-in by slash command or
+  any other user-triggered mutation of corpus scope is the exact shape the
+  onboarding design rejected.
 - **Private channels and DMs are policy-gated, default off.** Each class is a
   separate flag, and enabling a class still requires per-conversation
   allowlisting. DMs are never allowlisted by pattern.
@@ -395,8 +347,8 @@ bound in globs. The first deployment runs membership mode.
   (`ChannelRosterRequestV1::complete`), and the store then records an
   `is_member: false` observation for every channel it previously held that
   the sweep omits, journaled rather than deleted so history and re-enrollment
-  both survive. Under the deployed membership-mode posture, `users.conversations`
-  is exactly the bot's own membership, so the collector's membership-mode
+  both survive. Under membership mode, `users.conversations`
+  is exactly the bot's own membership, so the producer's membership-mode
   roster genuinely is that complete set and marks it so; explicit mode's
   policy-narrowed enrolled set is not provably complete and leaves the flag
   false. `complete` is additive and optional on the wire (default `false`),
@@ -422,11 +374,10 @@ layers that can disagree is a footgun, and the honest control point is what
 gets ingested, not what gets returned. If a conversation should not be
 findable, it should not be enrolled. The counterargument is in section 10.
 
-**Graph projection is future work.** The bridge design sketched a Slack entity
-grammar (`slack_message`, `slack_user`, `slack_channel`, `slack_thread`) with
-`IN_THREAD`, `BY_USER`, `IN_CHANNEL`, and permalink-anchored provenance edges.
-That sketch is salvage input to the reflective-graph connector program, not to
-v1 here (see
+**Graph projection is future work.** A Slack entity grammar (`slack_message`,
+`slack_user`, `slack_channel`, `slack_thread`) with `IN_THREAD`, `BY_USER`,
+`IN_CHANNEL`, and permalink-anchored provenance edges is input to the
+reflective-graph connector program, not to v1 here (see
 [`reflective-graph-connector-program.md`](reflective-graph-connector-program.md)
 and [`../corpus/agentic-corpus/reflective-project-graph.md`](../corpus/agentic-corpus/reflective-project-graph.md)).
 What v1 owes that projection is field completeness: the provenance fields above
@@ -439,8 +390,7 @@ line through a commit and a session to the motivating Slack message is
 ## 8. Non-goals
 
 - No writes to Slack of any kind: no posting, editing, reactions, joins,
-  channel creation, or modals. The bridge owns interaction; this connector owns
-  observation.
+  channel creation, or modals.
 - No agent self-service channel enrollment, and no MCP tool that mutates
   ingestion scope.
 - No full-workspace exfiltration by default. There is no "index everything"
@@ -448,8 +398,6 @@ line through a commit and a session to the motivating Slack message is
 - Not an audit or compliance archive. This is a searchable corpus with
   window-bounded delete detection, not a legally defensible record. That need
   is served by Slack's own export and retention machinery.
-- No replacement for the bridge's live search context, which remains the
-  surface for not-yet-ingested workspace content.
 - No chunking, rendering, or summarization in the producer.
 - No Slack dependency inside the corpus daemon.
 
@@ -502,21 +450,17 @@ projection under the connector program.
 
 1. **Non-git scope minting.** Inherited from the connector family; see
    `remote-source-connectors.md`. Not re-decided here.
-2. **One Slack app or two.** Recommendation is two. Operator call, because it
-   is a workspace-admin act.
-3. **Role mapping.** Collapsing authorship to human-versus-app to preserve
+2. **Role mapping.** Collapsing authorship to human-versus-app to preserve
    existing role filters is pragmatic, not obviously right. A dedicated
    author-kind field may be cleaner than reusing role.
-4. **Default search inclusion for privacy-gated conversations.** Section 7
+3. **Default search inclusion for privacy-gated conversations.** Section 7
    makes everything ingested searchable. The counterargument, that a private
    channel ingested for one purpose should not silently widen every agent's
    recall, is real and not fully answered.
-5. **Reconciliation window size,** and whether documents older than the window
+4. **Reconciliation window size,** and whether documents older than the window
    should carry a staleness marker so readers know delete detection no longer
    covers them.
-6. **Hint-channel coupling.** Whether the bridge-to-reader hint channel earns
-   its coupling early or should wait until reconciliation lag is measured.
-7. **Retention conflict.** A workspace with an auto-delete retention policy
+5. **Retention conflict.** A workspace with an auto-delete retention policy
    expects messages to vanish; an ingested corpus outlives that policy, and
    window-bounded delete detection will not close the gap. Whether the
    connector should mirror a workspace retention setting as a corpus TTL is
@@ -535,14 +479,6 @@ projection under the connector program.
 - **Companion of** [`remote-source-connectors.md`](remote-source-connectors.md):
   the file-tree profile of the same family, and owner of the non-git
   scope-minting analysis inherited here.
-- **Companion of** [`../integrations/slack/bro-slack.md`](../integrations/slack/bro-slack.md)
-  and [`../integrations/slack/bro-slack-next.md`](../integrations/slack/bro-slack-next.md):
-  the bridge owns interaction, this connector owns observation. They share a
-  workspace, a producer host, and a credential plane, and nothing else.
-- **Continues** the bridge's deferred Phase II ingestion sketch (channel
-  indexing, file ingestion, permalink-anchored provenance, Slack entity refs),
-  salvaged here and re-homed onto the locality axis; the bridge docs should
-  stop claiming them.
 - **Companion of** [`../operations/config-artifacts/secrets-provider.md`](../operations/config-artifacts/secrets-provider.md):
   how the producer's Slack credential and corpus `ServiceToken` reach the host.
 - **Feeds** [`reflective-graph-connector-program.md`](reflective-graph-connector-program.md):

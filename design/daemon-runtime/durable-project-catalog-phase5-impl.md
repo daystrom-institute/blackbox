@@ -29,7 +29,7 @@ At the Phase 5 exit gate, proved against isolated migrated v2 state and the brid
 10. Provisional overlay keys remain `OverlayKey { published_scope, checkout_id }`.
 11. Catalog overlay computation receives accepted published manifests and checkout-local Git evidence through a separate entry point with no publisher alternate.
 12. `published` remains available whenever the accepted generation verifies. `own` fails explicitly when baseline proof is unavailable. `all` omits only unavailable peers and reports structured degradation.
-13. File inspection, blame, render, provenance note I/O, artifact watching, repository mutation, and tool-edge path resolution open checkout bytes only while the matching capability lease is alive.
+13. File inspection, render, artifact watching, repository mutation, and tool-edge path resolution open checkout bytes only while the matching capability lease is alive.
 14. Tool-edge leases remain in `bbox-indexing`. The lower `bbox-corpus-index` carrier contains pure project identity and already-validated roots, not `ValidatedCheckoutLease`.
 15. Artifact watchers use native attachment identity while retaining `ArtifactWatchAccess`, event-time lease reacquisition, and publication guards.
 16. Checkout observations keep their closed, low-cardinality key space. Per-project capability status is a separate bounded runtime projection.
@@ -74,7 +74,6 @@ The production authority switch remains prohibited by [D-002](../../DECISION_LED
 - No new `BuiltFromStamp` variants.
 - No project ids, attachment ids, or paths added to `CheckoutAccessObservations`.
 - No structured MCP error envelope.
-- No partial-success redesign of legacy provenance import/export.
 - No daemon refactor MCP revival.
 - No requirement that unregistered `bbox_project_init(path)` already have an attachment.
 - No claim that Phase 5 closes D-033 item 1.
@@ -119,7 +118,6 @@ Code anchors in this section were verified at `994b3187f61c`. This section is in
 - `preserve_transient_if_latest` is bounded, but baseline unavailability after detach is a definitive structural state and must not be preserved as a transient.
 ### 3.5 The checkout lease substrate is complete
 - `CheckoutAccessKind` is the closed nine-variant enum at `crates/bbox-indexing/src/checkout_access.rs:36-46`.
-- The correct provenance variant is `ProvenanceNoteIo`.
 - `CheckoutAccessErrorCode` is the closed sixteen-variant enum at `checkout_access.rs:277-296`.
 - `ValidatedCheckoutLease` carries opened directory handles, logical identity, roots, operation kind, intent, and source lane.
 - `CheckoutAccessBroker::revalidate` is at `checkout_access.rs:742`.
@@ -133,9 +131,6 @@ Code anchors in this section were verified at `994b3187f61c`. This section is in
 - `resolve_file` at `file.rs:102` starts from attached `ProjectRecord` rows.
 - File scope discovery uses `PublisherConfigTreeRead` at `file.rs:138-154`.
 - File content uses `RenderFileProvider` at `file.rs:157-200`.
-- Graph blame and provenance selection in `src/tools/graph.rs` start from `ProjectRecord`.
-- `acquire_provenance_projects` at `graph.rs:418-443` acquires `ProvenanceNoteIo` for every requested project and returns on the first failure.
-- `bbox_provenance_export_plan` at `graph.rs:852-903` is the separate corpus-computation path, but it still checks `ProjectRecord` membership.
 - `bbox_project_init` is in `src/tools/projects.rs:608-622`.
 - `bbox_project_eject` is in `src/tools/projects.rs:953-970`.
 - Catalog attach probes an explicit path off-lock before an attachment exists at `src/tools/project_catalog.rs:497-528`.
@@ -232,15 +227,11 @@ Rejected alternative: declare that errors are "not strings" without defining and
 Decision: `bbox_project_init(path)` may initialize an unregistered absolute path. Once a selector resolves a catalog project, eject and every other daemon mutation require `RepositoryMutation`.
 Rationale: attach needs identity-bearing config, so pre-attachment bootstrap must exist.
 Rejected alternative: require an attachment before init. That is circular.
-### 4.20 Provenance has three distinct contracts
-Decision: `bbox_provenance_export_plan` remains corpus computation and drops its `ProjectRecord` membership check in catalog mode. Legacy export and import require `ProvenanceNoteIo` for every selected project and return typed refusal on failure.
-Rationale: plan generation does not open Git notes, while legacy import/export do.
-Rejected alternative: silently convert legacy all-project operations into partial success with skipped projects.
-### 4.21 D-033 item 1 remains
+### 4.20 D-033 item 1 remains
 Decision: Phase 5 retains the final bind or advance detach-at-swap residual documented in [D-033 item 1](../../DECISION_LEDGER.md#d-033). Health reports a detached or stale binding and status guides explicit repair.
 Rationale: catalog detach does not take the publication lock and does not participate in the broker lifecycle fence.
 Rejected alternative: claim the current publication guard already excludes catalog detach.
-### 4.22 Bridge capability asymmetry remains
+### 4.21 Bridge capability asymmetry remains
 Decision: bridge read lanes keep their broad version-1 authority. Catalog lanes enforce recorded capabilities and degrade per operation, as fixed by [D-032](../../DECISION_LEDGER.md#d-032).
 Rationale: version-1 records contain no capability bits and cannot truthfully derive them.
 Rejected alternative: weaken catalog capability checks to preserve bridge grant behavior.
@@ -502,7 +493,7 @@ Gate:
 - targeted overlay nextest for knowledge and gaps; bridge overlay parity; cluster verification
 ### P5-E: Read adapter conversion
 Ownership:
-- `crates/bbox-providers/src/providers/file.rs`; `src/tools/graph.rs`; `src/tools/render.rs`; `src/server/repo_io.rs`; `crates/bbox-provenance/src/lib.rs` verification only
+- `crates/bbox-providers/src/providers/file.rs`; `src/tools/graph.rs`; `src/tools/render.rs`; `src/server/repo_io.rs`
 Dependencies:
 - P5-A project publication status; Phase 2 shared resolver; existing checkout broker
 File provider:
@@ -513,32 +504,20 @@ File provider:
 5. Keep absolute path matching limited to active attachment metadata.
 6. Never scan `ProjectRecord::canonical_path` in catalog mode.
 7. Return attachment-required, ambiguous, capability-denied, stale, or unsafe path codes through `err_text`.
-Blame:
-1. Resolve project id and normalized relative path from corpus identity.
-2. Select one attachment through the catalog resolver.
-3. Acquire `Blame`.
-4. Require the selected repository contain the requested commit or snapshot.
-5. Refuse arbitrary attachment HEAD blame.
 Render:
 1. Resolve project identity before target path.
 2. Acquire `RenderFileProvider` with Write intent.
 3. Remove catalog fallback through `ProjectRecord::canonical_path`.
 4. Global render remains attachment-free.
-Provenance:
-1. Replace catalog `ProjectRecord` membership checks with project identity.
-2. Keep `bbox_provenance_export_plan` corpus computation.
-3. Require `ProvenanceNoteIo` for every selected legacy Git-note export/import project.
-4. Return on the first typed refusal.
-5. Do not invent partial skipped-project output.
 Repo knowledge/gap reads:
 1. Add native attachment-id repository carriers.
 2. Acquire `KnowledgeGapOverlayRead`.
 3. Keep carrier ids path-free.
 4. Keep display paths non-authoritative.
 Verification:
-- relative file with session attachment; relative file with default selection; unique base selection; ambiguous attachment; absolute file under active attachment; stale ledger path does not grant authority; traversal and symlink refusal; blame commit present and missing; render attached and remote-only; provenance plan with catalog identity; provenance export/import typed refusal; repo read capability denial
+- relative file with session attachment; relative file with default selection; unique base selection; ambiguous attachment; absolute file under active attachment; stale ledger path does not grant authority; traversal and symlink refusal; render attached and remote-only; repo read capability denial
 Gate:
-- targeted provider, graph, render, provenance, and repo-I/O tests; no raw catalog path open before lease; cluster verification
+- targeted provider, graph, render, and repo-I/O tests; no raw catalog path open before lease; cluster verification
 ### P5-F: Mutation, watcher, repo-I/O, and tool-edge conversion
 Ownership:
 - `src/tools/projects.rs`; `src/tools/project_catalog.rs`; `src/server/repo_io.rs`; `crates/bbox-artifacts/src/watcher.rs`; `src/server/checkout_access.rs`; `crates/bbox-corpus-index/src/index/tool_edges.rs`; `crates/bbox-indexing/src/index/reindex.rs`
@@ -636,9 +615,7 @@ Gate:
 | Local source walker | `LocalProjectWalk` | `local_code_source` | `error.project_attachment_required` or `error.project_capability_denied` | source unavailable or retained last-good collected view |
 | Repo knowledge/gap publisher | published read: none; bind/advance: `PublisherConfigTreeRead`; overlays: `KnowledgeGapOverlayRead` | `repo_knowledge` | `error.project_attachment_required`, `error.project_capability_denied`, or overlay domain error | accepted published content remains; advance and Own unavailable; All omits unavailable peers |
 | Git history | `GitHistory` | `git_history` | `error.project_attachment_required` or `error.project_capability_denied` | no current-file overlay; stale commit docs remain labeled |
-| Blame | `Blame` | `blame` | `error.project_attachment_required`, `error.project_capability_denied`, or commit mismatch | no blame; corpus and provenance remain |
 | Render/file provider | `RenderFileProvider` | `render_output` | `error.project_attachment_required` or `error.project_capability_denied` | no project render or working-tree file read |
-| Provenance note import/export | `ProvenanceNoteIo` | `provenance_note_io` | `error.project_attachment_required` or `error.project_capability_denied` | plan generation remains corpus-only; Git-note I/O refuses |
 | Init/eject/mutation/refactor | `RepositoryMutation` | `repo_mutation` | `error.project_attachment_required`, `error.project_capability_denied`, or write-gate denial | unregistered init bootstrap remains; catalog-targeted mutation refuses |
 | Artifacts/watchers | `ArtifactWatchDiscovery` | `artifact_watching` | no watcher plus bounded capability health | durable artifact metadata remains; filesystem discovery stops |
 | Tool/transcript edges | `LocalProjectWalk` | `local_code_source` | bounded `unresolvable_path_event` diagnostic | transcript corpus remains; path edge is skipped and never re-id'd |
@@ -657,7 +634,7 @@ Add:
 ### 10.4 Overlay domain codes
 - `error.provisional_overlay_unavailable`; `error.overlay_baseline_unavailable`; `error.overlay_snapshot_stale`; `error.overlay_accepted_content_changed`
 ### 10.5 Mapping rules
-- tool errors remain `err_text` with one stable code prefix; do not add duplicate `ProjectResolveError` variants for every checkout code; Published never returns an overlay error; Own returns the exact overlay domain error; All returns accepted content plus bounded `degraded.overlays`; legacy provenance import/export returns the first typed refusal; file, blame, render, and mutation do not translate missing attachment into project-not-found; diagnostics include project id and attachment id when known; diagnostics omit absolute paths and unbounded raw Git errors
+- tool errors remain `err_text` with one stable code prefix; do not add duplicate `ProjectResolveError` variants for every checkout code; Published never returns an overlay error; Own returns the exact overlay domain error; All returns accepted content plus bounded `degraded.overlays`; file, render, and mutation do not translate missing attachment into project-not-found; diagnostics include project id and attachment id when known; diagnostics omit absolute paths and unbounded raw Git errors
 
 ## 11. Bridge parity contract
 Bridge mode keeps:
@@ -667,7 +644,7 @@ New catalog-only tools:
 - `bbox_project_publisher_advance`; `bbox_project_publisher_status`
 On bridge they return `error.project_catalog_inactive`.
 Parity fixture covers:
-- published knowledge and gaps; Own and All overlays; file provider; blame; render; provenance plan and Git-note tools; project list; doctor existing sections; checkout observation snapshot
+- published knowledge and gaps; Own and All overlays; file provider; render; project list; doctor existing sections; checkout observation snapshot
 Allowed bridge-visible additions:
 - dormant code and types; catalog-inactive refusal from new tools; empty catalog runtime state not serialized into existing responses
 Any other bridge output change requires a new explicit decision.
@@ -720,7 +697,7 @@ Health never creates authority. Cache entries never authorize paths.
 For every section 9 row:
 - explicit attachment; session attachment; operator default; single active attachment; unique base; ambiguous selection; no attachment; inactive attachment; capability denied; identity mismatch; scope mismatch; safe relative path; traversal refusal; symlink refusal; revalidation failure; publication guard for writes
 Additional:
-- blame requested commit present; blame requested commit missing; global render without lease; provenance plan without Git-note lease; legacy provenance all-project failure is not partial; unregistered init bootstrap; native watcher attachment id; watcher relocation; remote tool-edge diagnostic
+- global render without lease; unregistered init bootstrap; native watcher attachment id; watcher relocation; remote tool-edge diagnostic
 ### 13.6 Health tests
 - operation counter schema unchanged; no project ids in observation snapshot; accepted Current; accepted Prior; accepted Missing; accepted Corrupt; binding Attached; binding Detached; scope refresh required; advance available; advance attachment required; overlay fresh; overlay baseline unavailable; watcher active; watcher unavailable; observer duplicate; observer failure rescan; health contains no paths
 ### 13.7 Fault injection
@@ -754,7 +731,7 @@ All three proof mechanisms in clause 2 are blocking.
 Create a catalog-only facade with:
 - catalog store; accepted-publication runtime; `RecordlessProjectRecordsProvider`; `DenyCheckoutAccess`; no version-1 registry; no legacy publisher store access
 Run:
-- lexical search; hybrid search; graph inspect; graph path traversal; evidence bundle; entity-ref resolution; project-file provider; storage GC; collected activation and rebuild; published knowledge; published gaps; provenance export plan
+- lexical search; hybrid search; graph inspect; graph path traversal; evidence bundle; entity-ref resolution; project-file provider; storage GC; collected activation and rebuild; published knowledge; published gaps
 The denial seam is field-level, not method-level. `ProjectRecordsProvider` exposes one method, `records_snapshot`, and `ProjectRecordsSnapshot` carries two distinct views: `records` is the attached-only path-bearing compatibility rows, and `corpus_project_ids` is the complete catalog project-id set that seeds corpus identity surfaces (`crates/bbox-corpus-core/src/project_record.rs:324-337`). Panicking on `records_snapshot` would deny both views at once and kill the very corpus paths this clause must prove: schema rebuild and the collected-activation pass reach the id set through `records_provider.records_snapshot().corpus_project_ids` (`crates/bbox-corpus-index/src/index/mod.rs:362` and `:436`), and `src/server/open.rs:711` seeds the edge registered-project set from the same field.
 
 `RecordlessProjectRecordsProvider` therefore returns a live snapshot whose `corpus_project_ids` is the full catalog set derived through the catalog-records projection, whose `authority_epoch` is the catalog epoch, and whose `records` is empty with `omitted_catalog_count` equal to the catalog project count. Empty `records` is the stronger proof: a panic proves only that the accessor was never called, while an empty attached-row view proves no corpus-only path derives behavior from `ProjectRecord` content, and any path that still did would surface a typed refusal or an observable empty result rather than passing by luck.
@@ -778,10 +755,10 @@ The audit is checked into the acceptance test or script input. Unclassified call
 ### 14.3 Clause 3: remote-only projects degrade per capability
 Exercise every table row against a project with valid accepted content and zero attachments.
 Expected:
-- local source walker retains last-good collected view or reports unavailable; published knowledge and gaps serve accepted content; publisher advance returns attachment-required; Own returns provisional overlay unavailable; All returns accepted content plus degraded peers; Git current overlay unavailable, stale history remains labeled; blame returns attachment-required; render/file returns attachment-required; provenance plan succeeds; provenance Git-note I/O returns attachment-required; catalog-targeted mutation returns attachment-required; no watcher is installed; artifact metadata remains; tool path event is diagnosed and never re-id'd; project capability status reports availability without inventing denied acquisition counts
+- local source walker retains last-good collected view or reports unavailable; published knowledge and gaps serve accepted content; publisher advance returns attachment-required; Own returns provisional overlay unavailable; All returns accepted content plus degraded peers; Git current overlay unavailable, stale history remains labeled; render/file returns attachment-required; catalog-targeted mutation returns attachment-required; no watcher is installed; artifact metadata remains; tool path event is diagnosed and never re-id'd; project capability status reports availability without inventing denied acquisition counts
 ### 14.4 Bridge parity proof
 Replay canonical bridge fixtures for:
-- publisher authorization; published views; overlays; file provider; blame; render; provenance; project administration; watcher behavior; checkout observations; doctor existing sections
+- publisher authorization; published views; overlays; file provider; render; project administration; watcher behavior; checkout observations; doctor existing sections
 New catalog tools refuse with `error.project_catalog_inactive`. No existing bridge response field or ordering changes.
 
 ## 15. Risks and defect closures
@@ -815,11 +792,9 @@ Closure: all tool tests assert stable code-prefixed `err_text`.
 Closure: catalog view path has no recall hydration call and runs under `DenyCheckoutAccess`.
 ### Risk 15: D-033 item 1 is accidentally described as fixed
 Closure: status and tests name the residual explicitly. No acceptance criterion claims mutual exclusion with detach.
-### Risk 16: legacy provenance becomes silently partial
-Closure: mixed attached/remote request test expects the first typed refusal.
-### Risk 17: static proof misses runtime opens
+### Risk 16: static proof misses runtime opens
 Closure: runtime denial, static lint, and call-site audit are all blocking.
-### Risk 18: bridge response changes through shared types
+### Risk 17: bridge response changes through shared types
 Closure: no new `BuiltFromStamp` variants, bridge caches unchanged, and canonical fixture comparison at every runtime milestone.
 
 ## 16. Exit criteria and Phase 6 handoff

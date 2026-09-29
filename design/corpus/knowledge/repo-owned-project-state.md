@@ -112,8 +112,8 @@ repo-anchored:
   `src/knowledge.rs:700`).
 - Thread *inputs* accept an optional project path (params, `src/threads.rs:33`),
   stored on the thread as a plain `String` (`src/threads.rs:172`, populated from
-  `p.project.unwrap_or("")`, `:328`). Notes (`src/notes.rs:32`) and pins
-  (`src/pins.rs:32`) hold `project: Option<String>`. All are path strings, not ids.
+  `p.project.unwrap_or("")`, `:328`). Notes (`src/notes.rs:32`) hold
+  `project: Option<String>`. All are path strings, not ids.
 - `bbox_project_rename` migrates state by rewriting `old_record.canonical_path` →
   `record.canonical_path` across the stores (`src/tools/projects.rs:278`+, via
   `migrate_project_refs` at `:285`), which is the tell that **the path string is
@@ -192,11 +192,10 @@ layer and wrong for the activity layer — different natures want different home
 
 | Kind | Nature | Home | Why |
 |---|---|---|---|
-| knowledge, decisions, conventions | durable, reviewable, branch-aligned | **committed** `.bbox/` | config-like; git is ideal; PR review *is* the approval workflow |
+| knowledge (conventions, rules) | durable, reviewable, branch-aligned | **committed** `.bbox/` | config-like; git is ideal; PR review *is* the approval workflow |
 | accepted roadmap items | durable intent | **committed** `.bbox/` | but see roadmap caveat below |
 | promoted/resolved thread snapshots | durable record of past activity | **committed** `.bbox/record/` | the *record* belongs with the code it explains |
 | live threads, side-channel notes | high-churn activity, often session/bro/task-bound | **local** `.bbox/local/` (gitignored) | committing churns merges and *leaks per-host identity* (session UUIDs, bro IDs, absolute paths) |
-| pins | ambient execution context for one lane | **local** `.bbox/local/` | never rendered today; scoped to a live session/bro/thread — committing them is meaningless cross-machine |
 | index, embeddings, edge sidecars | derived cache | **host** (`~/.local/state`) | reproducible from source; never authoritative |
 
 **Roadmap caveat (from review):** accepted roadmap *items* are durable and can be
@@ -221,12 +220,11 @@ we do not invent one.
     mcp.json                  # (exists) project MCP wiring
     knowledge/                # NEW: one file per entry
       <entry-id>.json
-    decisions/                # NEW: durable commitments w/ rationale + supersession
     roadmap/                  # NEW: accepted item bodies (not ranking state)
     record/                   # NEW: promoted/resolved thread snapshots (scrubbed)
     local/                    # gitignored — host/session-bound activity
       .gitignore              # (exists)
-      threads/ notes/ pins/   # NEW: live activity
+      threads/ notes/         # NEW: live activity
       <kind>/                 # (exists) local artifacts
   CLAUDE.md / AGENTS.md / GEMINI.md   # derived; committed behind render --check (policy B)
   PROJECT.md                  # hand-authored, included by reference (unchanged)
@@ -324,7 +322,7 @@ Contract:
    (`:535`). So `.bbox/knowledge/*.json` would be indexed twice — once as a raw
    project_file, once as a structured knowledge entity — producing duplicate,
    confusing search hits. The spooler must **exclude the structured `.bbox/` dirs**
-   (`knowledge/`, `decisions/`, `roadmap/`, `record/`) from generic project_file
+   (`knowledge/`, `roadmap/`, `record/`) from generic project_file
    indexing and own them as knowledge entities instead.
 
 ## Promotion contract (new — this is net-new, not "already there")

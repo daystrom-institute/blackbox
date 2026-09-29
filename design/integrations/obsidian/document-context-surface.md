@@ -9,7 +9,7 @@ topic:
   - document-context
 date: 2026-05-15
 status: "design proposal v1; reviewed by Opus and DeepSeek"
-brief: "Designs an Obsidian plugin and Blackbox document-context surface for enriching notes with graph, provenance, git, knowledge, and related-document context."
+brief: "Designs an Obsidian plugin and Blackbox document-context surface for enriching notes with graph, git, knowledge, and related-document context."
 ---
 
 # Obsidian Document Context Surface
@@ -18,16 +18,16 @@ brief: "Designs an Obsidian plugin and Blackbox document-context surface for enr
 
 Obsidian is a strong local reading and writing environment, but its native graph
 model is intentionally simple: files, links, backlinks, tags, aliases, and
-frontmatter. Blackbox has a richer graph around the same documents: provenance,
-commit history, git notes, transcript sessions, work threads, notes, knowledge
-entries, semantic edges, symbol references, and vector similarity.
+frontmatter. Blackbox has a richer graph around the same documents: commit
+history, transcript sessions, work threads, notes, knowledge entries, semantic
+edges, symbol references, and vector similarity.
 
 When an operator is reading a design document in Obsidian, that context is
 currently invisible unless they switch back to an agent CLI and manually run
 graph/search tools. The result is a split-brain workflow:
 
 - Obsidian owns the reading surface.
-- Blackbox owns the provenance and graph context.
+- Blackbox owns the graph context.
 - The operator has to manually ask for the context that should be ambient.
 
 The desired product is not "Obsidian can call every blackbox MCP tool." The
@@ -52,7 +52,7 @@ mechanics, graph traversal policy, chunk aggregation, or corpus ranking.
 
 ## Goals
 
-1. Show blackbox provenance, git, knowledge, thread, note, link, and related-doc
+1. Show blackbox git, knowledge, thread, note, link, and related-doc
    context while reading a document in Obsidian.
 2. Keep the first version read-only and low-risk.
 3. Return an opinionated document-level model instead of raw graph dumps.
@@ -60,9 +60,7 @@ mechanics, graph traversal policy, chunk aggregation, or corpus ranking.
 5. Aggregate chunk-level `project_file` data into a whole-document view.
 6. Make the response usable by non-Obsidian clients later: editor plugins, web
    dashboards, Slack unfurls, and CLI inspectors.
-7. Preserve blackbox namespace conventions: workspace-shaped MCP handlers use
-   `work_*`, while plain HTTP endpoints may use route names.
-8. Keep operator-authored documents unchanged unless a later explicit write
+7. Keep operator-authored documents unchanged unless a later explicit write
    workflow is designed and approved.
 
 ## Non-Goals
@@ -78,9 +76,6 @@ mechanics, graph traversal policy, chunk aggregation, or corpus ranking.
   bundling. The document context surface composes those capabilities for one
   user-facing shape.
 - Do not build a general graph visualization product in v1.
-- Do not implement live git-note fallback reads in this surface. Git-note
-  provenance appears only after normal bbox import/indexing has made it graph
-  state.
 
 ## Design Anti-Conventions
 
@@ -89,7 +84,7 @@ blackbox, Obsidian, or MCP tooling might expect them:
 
 - **No MCP session in the plugin.** The Obsidian plugin speaks plain HTTP. It does
   not initialize, handshake, heartbeat, or teardown an MCP session. The server
-  still exposes an optional `work_document_context` MCP tool for agent clients,
+  still exposes an optional `bbox_document_context` MCP tool for agent clients,
   but the Obsidian path avoids MCP transport entirely.
 - **No markdown mutation in v1.** Accepted document relations are written to
   `.bbox/` sidecar state, never to the source markdown. A later design may
@@ -158,8 +153,8 @@ Relevant existing capabilities:
 | Entity inspection | `bbox_inspect_entity` returns properties and targeted edges for one entity ref. |
 | Path finding | `bbox_find_paths` returns direction-preserving graph paths for multi-hop explanations. |
 | Evidence bundles | `bbox_bundle_evidence` packages entity refs and path ids into a bounded evidence object. |
-| Provenance | Tool-call, transcript, thread, note, and commit provenance are already modeled in the graph and docs. |
-| Edge vocabulary | `SUPERSEDES` and `DERIVED_FROM` are existing knowledge/agent edge kinds; roadmap supersession is separately projected as `ROADMAP_SUPERSEDES`. |
+| Work context | Transcript sessions, threads, notes, and commits are already modeled in the graph. |
+| Edge vocabulary | `SUPERSEDES` and `DERIVED_FROM` are existing knowledge and artifact edge kinds. |
 | HTTP daemon | `blackboxd` already serves non-MCP routes beside `/mcp`. |
 
 The main gap is not raw data. The gap is a product-shaped, document-scoped
@@ -190,7 +185,6 @@ For a `design/*.md` document, useful sections are:
 
 | Section | Meaning |
 |---|---|
-| `provenance` | Sessions, tasks, brofiles, agents, notes, or threads that created, edited, reviewed, or discussed the document. |
 | `git` | Commits touching the document, commit subjects, and linked work objects when available. |
 | `lifecycle` | `DERIVED_FROM`, `SUPERSEDES`, superseded-by, archived-by, replacement, and design lineage relationships. |
 | `knowledge` | Decisions, conventions, memories, and runbooks derived from, cited by, or topically tied to the document. |
@@ -217,7 +211,7 @@ GET /context/document?project=/abs/project&path=design/foo.md
 Optional query params:
 
 ```text
-include=provenance,git,lifecycle,knowledge,threads,attention,implementation,explicit_links,potential_related
+include=git,lifecycle,knowledge,threads,attention,implementation,explicit_links,potential_related
 max_items=8
 related_limit=10
 similarity_threshold=0.65
@@ -246,11 +240,11 @@ refs plus short human labels. This endpoint is read-only even though it uses
 
 ### Optional MCP Wrapper
 
-Expose the same capability as a workspace-shaped MCP tool for agents and
-editor clients that already speak MCP:
+Expose the same capability as an MCP tool for agents and editor clients that
+already speak MCP:
 
 ```text
-work_document_context(project, path, include?, max_items?, related_limit?)
+bbox_document_context(project, path, include?, max_items?, related_limit?)
 ```
 
 The implementation should be shared with the HTTP route. The MCP wrapper is a
@@ -276,8 +270,8 @@ Top-level shape:
     "chunk_count": 7
   },
   "summary": {
-    "headline": "Design doc with 3 provenance links, 4 commits, and 6 related candidates.",
-    "badges": ["provenance", "open-followups", "suggested-links"]
+    "headline": "Design doc with 4 commits, 2 open followups, and 6 related candidates.",
+    "badges": ["open-followups", "suggested-links"]
   },
   "sections": [],
   "actions": [
@@ -292,22 +286,22 @@ Section shape:
 
 ```json
 {
-  "kind": "provenance",
-  "title": "Provenance",
+  "kind": "git",
+  "title": "Git",
   "confidence": "asserted",
   "items": [
     {
-      "id": "session:codex:019e...",
-      "label": "Originating Codex session",
-      "summary": "Created during workspace tools review.",
-      "target_ref": "session:codex:019e...",
+      "id": "commit:abc123",
+      "label": "Add workspace tools review",
+      "summary": "Commit touching this document.",
+      "target_ref": "commit:abc123",
       "target_path": null,
-      "edges": ["EDITED_BY_SESSION"],
+      "edges": ["COMMIT_TOUCHED_FILE"],
       "evidence": [
         {
           "kind": "edge",
           "ref": "project_file:d723917f:<rel_path_hash>:<chunk_hash>:0",
-          "edge": "EDITED_BY_SESSION"
+          "edge": "COMMIT_TOUCHED_FILE"
         }
       ],
       "actions": [
@@ -322,7 +316,7 @@ Confidence vocabulary:
 
 | Confidence | Meaning |
 |---|---|
-| `asserted` | Backed by explicit graph edge, git data, stored knowledge, or imported provenance. |
+| `asserted` | Backed by explicit graph edge, git data, or stored knowledge. |
 | `derived` | Computed from deterministic local data, for example markdown links or commit touch history. |
 | `heuristic` | Based on syntax or text matching where false positives are possible. |
 | `suggested` | Vector/BM25 similarity candidate; not a durable claim. |
@@ -352,9 +346,9 @@ Use stable `code` values for tests and UI branching. Human text belongs in
 its own degraded marker or omit the section and add a top-level degraded marker.
 
 Cross-section duplicates are allowed when the same entity carries different
-meaning in different sections. For example, a session may appear under
-`provenance` because it edited the document and under `threads` because it
-belongs to a related work thread. Section kind disambiguates the rendering.
+meaning in different sections. For example, a commit may appear under `git`
+because it touched the document and under `implementation` because it also
+touched the source files the design describes. Section kind disambiguates the rendering.
 
 ## Document Resolution
 
@@ -412,15 +406,15 @@ The default recipe for markdown design documents:
    - collect graph edges for document chunk refs through an internal batched
      EdgeIndex lookup, not one MCP call per chunk;
    - collect `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`,
-     `EDITED_BY_SESSION`, `EDITED_IN_COMMIT`, `COMMIT_TOUCHED_FILE`,
+     `EDITED_IN_COMMIT`, `COMMIT_TOUCHED_FILE`,
      `NOTE_IN_THREAD`, `NOTE_FROM_SESSION`, `KNOWLEDGE_FROM_SESSION`,
      `DERIVED_FROM`, `SUPERSEDES`, and contradictions when present.
    - lifecycle items for design documents usually arrive through linked
-     knowledge or agent entities; direct document-to-document lifecycle edges are
+     knowledge or artifact entities; direct document-to-document lifecycle edges are
      not expected by default.
 3. **Git context**
    - recent commits touching the file;
-   - commit subjects, authors, dates, and linked work provenance.
+   - commit subjects, authors, dates, and linked work objects.
 4. **Threads and notes**
    - notes whose entity refs, body, or thread links mention the document;
    - unresolved `dispute`, `assumption`, `followup`, and `blocked` first;
@@ -622,7 +616,6 @@ readability outside blackbox-aware tools.
   "projectRoot": "/home/invidious/repos/transcript-search",
   "vaultRoot": "/home/invidious/repos/transcript-search",
   "enabledSections": [
-    "provenance",
     "git",
     "lifecycle",
     "knowledge",
@@ -715,7 +708,7 @@ change without touching the source file.
 
 ### Phase 2 - Asserted Context Sections
 
-- Implement `provenance`, `git`, `lifecycle`, `knowledge`, `threads`,
+- Implement `git`, `lifecycle`, `knowledge`, `threads`,
   `attention`, `implementation`, and `explicit_links` sections from existing
   stores and graph edges.
 - Deduplicate by target entity ref and by target path.
@@ -734,9 +727,9 @@ change without touching the source file.
 
 ### Phase 4 - MCP Wrapper
 
-- Add `work_document_context` using the same service function.
-- Document it as a workspace/document-context helper, not a raw graph primitive.
-- Add the `work_document_context` stanza to `tool_docs.rs`.
+- Add `bbox_document_context` using the same service function.
+- Document it as a document-context helper, not a raw graph primitive.
+- Add the `bbox_document_context` stanza to `tool_docs.rs`.
 - Keep `bbox_*` graph tools as the lower-level expert surface.
 
 ### Phase 5 - Obsidian Plugin Prototype
@@ -777,14 +770,14 @@ change without touching the source file.
    written to the vault automatically.
 4. A server test proves path traversal is rejected.
 5. A server test proves chunk-level entities are aggregated to one document.
-6. Section tests cover every asserted v1 section: `provenance`, `git`,
+6. Section tests cover every asserted v1 section: `git`,
    `lifecycle`, `knowledge`, `threads`, `attention`, `implementation`, and
    `explicit_links`.
 7. A server test proves self-matches are excluded from related candidates.
 8. A server test proves section degradation returns a stable degraded marker.
 9. A document with more than 50 chunks returns partial results plus degraded
    markers instead of blocking the editor-facing route indefinitely.
-10. The same service function backs HTTP and `work_document_context`.
+10. The same service function backs HTTP and `bbox_document_context`.
 
 ## Open Questions
 

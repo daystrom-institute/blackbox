@@ -175,7 +175,7 @@ These are the rules new code must satisfy and migration drives old code toward:
   a brief lock; persistence requested from the owner actor. Two durability
   classes: **telemetry** (tasks, slack continuity) acks
   immediately, write-behind + coalescing; **operator-durable** (knowledge,
-  threads, notes, gaps, roadmap, pins, projects, artifacts) acks only
+  threads, notes, gaps, roadmap, projects, artifacts) acks only
   after the actor reports durable — callers await off-worker completion, so a
   `bbox_learn` that returned ok survives a crash.
 - **I5 — Bounded memory, defined overflow.** Per-task in-memory event ring

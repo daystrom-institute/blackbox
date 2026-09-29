@@ -223,8 +223,8 @@ Explicit deferrals, each with rationale:
   overlay degradation after publisher detach.** Deferred to Phase 5
   (governing section 15). Phase 4 touches the effective-source state
   machine only.
-- **Blame, render, file-provider, artifact-watcher, and provenance-note
-  adapter conversion.** Deferred to Phase 5.
+- **Render, file-provider, and artifact-watcher adapter conversion.**
+  Deferred to Phase 5.
 - **Removing the `ProjectRecord` compatibility view.** Deferred to Phase 6.
 - **Git overlay cutback behavior.** Phase 3 P3-F delivers the Git overlay
   as a post-activation best-effort step. Phase 4 does not change overlay

@@ -11,37 +11,30 @@ tags:
   - refactor-tools
   - pathology
   - ensemble
-  - whiteboard
   - architecture
 date: 2026-05-30
 updated: 2026-05-31
-status: "partial — sound. Five-dimension lens model + bridgecrew-aligned deliberation (independent validator with exclusion teeth, conflict-triggered debate, surviving contradictions) implemented across all four flows (arch+perf × java+rust). Pending a live end-to-end smoke run."
+status: "partial: five-dimension lens brofiles, validators and panel teamplates installed for all four flows (arch+perf x java+rust); the caller composes the review rounds."
 brief: "Replace the single-actor pathologist in the pathology flows with a heterogeneous review ensemble: five orthogonal review dimensions projected per language into lens instances, plus an independent validator. Deliberation follows bridgecrew — the validator traces each claim and refutes false positives (excluded from the plan), debate is conflict-triggered, and unresolved disagreement survives into the plan as contradictions requiring human judgment, not a consensus gate."
 ---
 
 # Pathology Ensemble Review
 
-> **Status (2026-05-31): the deliberation core has been redesigned and
-> implemented.** The earlier consensus-by-concession mechanism — the
-> `debate_resolved` gate that forced `unresolved_challenges == 0` — has been
-> **replaced** with the bridgecrew-aligned model described below: an independent
-> validator with exclusion teeth, conflict-triggered debate, and unresolved
-> disagreement that survives into the correction plan. This now spans all four
-> flows (arch + perf × java + rust). The "Workflow shape", "Workflow gate", and
-> "Acceptance criteria" sections describe the implemented design; the prior
-> broken text has been removed.
+> **Status.** The lens model and the bridgecrew-aligned deliberation model
+> (an independent validator with exclusion teeth, conflict-triggered debate, and
+> unresolved disagreement that survives into the correction plan) span all four
+> flows (arch + perf x java + rust). Lens brofiles, validator brofiles and panel
+> teamplates are installed defaults. The caller owns round sequencing, gates and
+> plan synthesis using ordinary bro dispatch.
 
 ## Why this exists
 
-The previously shipped pathology workflows described a multi-specialist
-whiteboard review in their design docs, but the implemented artifact used a
-**single durable actor** (`pathologist`) that opened a whiteboard, posted every
-claim under one identity, and transitioned `blind → read → debate → resolve` by
-itself. The "debate" was one model talking to itself; the whiteboard transitions
-were ceremony. All diagnostic diversity came from the diagnosis atoms — but every
-atom dispatched through the **same** `*-pathologist` brofile (`codex` /
-`gpt-5.5`), so there was zero provider, persona, or perspective diversity, and no
-adversarial cross-check of any atom's output.
+A single-actor pathology review (`pathologist`) posts every claim under one
+identity and runs its own `blind → read → debate → resolve` sequence. The
+"debate" is one model talking to itself; the phase transitions are ceremony.
+When every diagnosis candidate is produced through the **same**
+`*-pathologist` brofile (`codex` / `gpt-5.5`), there is zero provider, persona,
+or perspective diversity, and no adversarial cross-check of any candidate.
 
 This is the documented failure mode of single-agent self-reflection. Huang et
 al. (2024) found self-reflections "tend to repeat earlier misconceptions and do
@@ -218,7 +211,7 @@ current model becomes acceptable, Corroboration is the slot to move.
 
 All five run at `effort: high` where the provider honors effort. All five are
 read-only: the lens brofiles disallow `Write`/`Edit`/`Bash`/`bro_*`/
-knowledge-mutation, and allow only the read/measure/whiteboard surface. Dispatch:
+knowledge-mutation, and allow only the read/measure surface. Dispatch:
 `claude` direct via the Claude Code CLI; `deepseek`/`glm`/`brodex` via
 `bro-harness` (`deepseek`/`glm` Anthropic transport, `brodex` Responses).
 
@@ -245,8 +238,8 @@ facilitator is not a debate participant.
 ## The independent validator (exclusion teeth)
 
 The load-bearing addition over the old single-actor design is a dedicated
-**validator** that runs *after* the blind lens round and *before* debate, in the
-whiteboard's `validate` phase. It is one read-only actor per flow
+**validator** that runs *after* the blind lens round and *before* debate. It is
+one read-only actor per flow
 (`{arch,perf}-{java,rust}-pathology-validator`, `brodex`/`gpt-5.5`).
 
 It is **not** bridgecrew's prose claim-tracer (`R10.5`), and deliberately so:
@@ -267,96 +260,61 @@ validator is reframed as an **evidence-prover with a divided labor**:
   operation that settles it (an LSP-verified partition, `rust_public_api_guard`, an
   object-safety report, an `extract` dry-run; for perf, the call-path fetch/await/
   materialization check plus `baseline_refs` corroboration); (3) **bundles** what it
-  touched with `bbox_bundle_evidence` and (4) **posts one verdict per finding
-  immediately** (`confirmed`/`refuted`/`inconclusive`) with the bundle id in the body.
+  touched with `bbox_bundle_evidence` and (4) **returns one verdict per finding**
+  (`confirmed`/`refuted`/`inconclusive`) with the bundle id.
 
-Posting per finding is also the **convergence mechanism** — the validator can't
-silently burn time investigating without emitting, so no node timeout is needed (a
-timeout would just mask a real hang). The bundle persists in bbox, re-queryable by
-id; only the id rides the annotation (a first-class `evidence_ref` annotation field
-is a queued fast-follow over carrying it in the body). This makes the exclusion teeth
+Emitting a verdict per finding is also the **convergence mechanism**: the
+validator cannot silently burn time investigating without emitting. The bundle
+persists in bbox, re-queryable by id. This makes the exclusion teeth
 **evidence-backed**: a refuted finding is dropped because a reproducible operation
 shows the claim false, not because an LLM asserted it.
 
-The exclusion is **engine-computed**, not prompt-enforced. `Board::post_standing`
-(`src/whiteboards.rs`) derives each post's standing from its validation
-annotations — precedence: any `refuted` → **Excluded**; else any `inconclusive`
-(no confirmed) → **Inconclusive** (survives, severity-capped); else ≥1 `confirmed`
-→ **Confirmed**; else **Unvalidated** (survives with a warning). `whiteboard_summarize`
-surfaces `surviving_post_ids` / `excluded_post_ids` plus per-standing counts, so a
-refuted finding **cannot** reach the correction plan: the synthesis prompt builds
-only from `surviving_post_ids`, and the renderer lists excluded posts in a
-`## Refuted Findings` appendix.
+The caller computes each finding's standing from its verdicts, with fixed
+precedence: any `refuted` -> **Excluded**; else any `inconclusive` (no confirmed)
+-> **Inconclusive** (survives, severity-capped); else at least one `confirmed` ->
+**Confirmed**; else **Unvalidated** (survives with a warning). Plan synthesis
+builds only from surviving findings, and the rendered plan lists excluded findings
+in a `## Refuted Findings` appendix.
 
-## Workflow shape (one skeleton, all four flows)
+## Review rounds (one skeleton, all four flows)
 
-The node graph mirrors `phase-decompose-ensemble-decompose` but inserts the
-validate phase and replaces the consensus gate:
+The caller runs the same round structure for every flow:
 
 ```text
-Setup            "" actor: default vars, baseline commit (git rev-parse HEAD),
-                 whiteboard_open (opened_by=facilitator), register the 5 lens
-                 aliases (soundness/precision/economy/resilience/corroboration)
-                 + the validator alias (validator)
-Survey           facilitator: cheap measurement, select bounded atom_requests
-                 + normalize_*_pathology_atom_requests (allowlist-enforced)
-FocusedAtoms     foreach atom_request (parallelism 3) → atom_results
-                 (child subworkflow: atom_invoke → bro_wait → atom_status)
-BlindPost        panel (kind: ensemble): each lens posts ONE blind entry under
-                 its alias, setting target_file/location/finding_refs/severity
-ValidateBlind    gate → ready → TransitionToValidate ; invalid → BoardInvalid
-TransitionToValidate  facilitator: blind → read → validate
-Validate         validator: trace each claim, post one validation annotation per
-                 post (confirmed/refuted/inconclusive)
-ValidateValidation  gate → ready_debate (conflicts) → TransitionToDebate ;
-                 ready_skip (no conflicts) → TransitionToResolve ; invalid → BoardInvalid
-TransitionToDebate  facilitator: validate → debate
-Debate           panel: conflict-triggered, targeted challenge/corroborate + vote;
-                 every surviving post gets cross-agent review; genuine disagreement
-                 is LEFT as an unresolved challenge (no forced resolution)
-ValidateDebate   gate (participation/coverage, NOT unresolved=0) →
-                 ready → TransitionToResolve ; invalid → Debate (loop)
-TransitionToResolve  facilitator: {validate|debate} → resolve + whiteboard_summarize
-                 → board_summary (surviving/excluded/contradiction signals)
-Synthesize       facilitator: build plan from surviving posts only, exclude refuted,
-                 carry unresolved challenges into `contradictions`, refuted into
-                 `refuted_findings`; on_exit parse_json → plan_json
-WritePlan        write_*_pathology_plan hook → design/refactor[/perf]/plans/<slug>.md
+Survey      facilitator: cheap measurement, bounded diagnosis candidates
+BlindPost   panel team: each lens returns ONE blind review (target file, location,
+            finding refs, severity) without seeing the other lenses
+Validate    validator: trace each finding, one verdict per finding
+            (confirmed/refuted/inconclusive)
+Debate      panel, only when verdicts or lens reviews conflict: targeted
+            challenge/corroborate plus a vote; every surviving finding gets
+            cross-lens review; genuine disagreement is LEFT unresolved
+Synthesize  facilitator: plan from surviving findings only; unresolved
+            challenges become `contradictions`, refuted findings become
+            `refuted_findings`
 ```
 
-The conflict-free `validate → resolve` skip (a new allowed transition in
-`Phase::allows_transition_to`) realizes bridgecrew's "skip debate when zero
-conflicts." `ValidateDebate` loops back to `Debate` on insufficient participation
-(a hard max-rounds backstop bounds it), never on outstanding challenges —
-unresolved challenges are the point, not a failure.
+Debate is skipped when validation produces zero conflicts. Debate repeats on
+insufficient participation (bounded by a hard max-rounds backstop), never on
+outstanding challenges: unresolved challenges are the point, not a failure.
 
-### Why the panel reviews atoms rather than replacing them
+### Why the panel reviews candidates rather than producing them
 
-The atoms stay (cheap, bounded, single-question producers, per-atom SAST/compiler
-gate). The ensemble is adversarial review of the atom outputs across the five
-orthogonal axes, and the validator is the independent critic that gives refutation
-teeth.
+Candidate production stays cheap and bounded (single-question analyses with their
+own SAST/compiler gates). The ensemble is adversarial review of those candidates
+across the five orthogonal axes, and the validator is the independent critic that
+gives refutation teeth.
 
-## Gate rules (v2)
+## Round gates
 
-Shared by all four flows. Lattice `["ready_debate","ready_skip","ready","invalid"]`;
-first-match evaluation; reads `vars.board_check.*` (the `whiteboard_summarize`
-output). Four rules plus the catch-all:
+Shared by all four flows and enforced by the caller:
 
-- `blind_all_lenses_posted` → `ready` when phase=blind, post_count≥5, and all five
-  lens aliases `has_posted` (participation).
-- `validation_complete_with_conflicts` → `ready_debate` when phase=validate,
-  post_count≥5, `unvalidated_count=0` (every post validated — the validator
-  annotates rather than posts, so completeness is proven by zero unvalidated
-  posts), and `conflict_count≥1`.
-- `validation_complete_no_conflicts` → `ready_skip` when phase=validate,
-  post_count≥5, `unvalidated_count=0`, and `conflict_count=0`.
-- `debate_participation_complete` → `ready` when phase=debate, post_count≥5,
-  **`unreviewed_post_count=0`** (every post got a cross-agent challenge or
-  corroborate — closes the "zero challenges trivially ready" hole) and
-  `vote_count≥1`. It **does not read `unresolved_challenges`** — unresolved
-  challenges survive into the plan.
-- `invalid_default` → `invalid`.
+- **Blind round complete** when all five lens aliases have returned a review.
+- **Validation complete** when every finding carries a verdict; proceed to
+  debate when at least one conflict exists, otherwise straight to synthesis.
+- **Debate complete** when every surviving finding has a cross-lens challenge or
+  corroboration and at least one vote was cast. The gate never reads the count of
+  unresolved challenges; unresolved challenges survive into the plan.
 
 ## Plan-document shape
 
@@ -366,8 +324,8 @@ The emitted correction plan keeps the existing frontmatter and sections
 `Deferred`, `Dispatch Payload`) and adds two: a `## Contradictions Requiring
 Human Judgment` section (surviving unresolved challenges, never force-resolved)
 and a `## Refuted Findings` appendix (validator-excluded posts with their trace,
-omitted when nothing was refuted). The PD-dispatch handoff
-(`phase-decompose-main-edit`) is unaffected.
+omitted when nothing was refuted). The plan hands off to phase decomposition
+unchanged.
 
 ## Artifacts (installed)
 
@@ -377,28 +335,14 @@ omitted when nothing was refuted). The PD-dispatch handoff
 | validator brofile ×4 | `…/pathology-lens/{arch,perf}-{java,rust}-pathology-validator.json` (brodex / gpt-5.5, read-only) |
 | panel teamplate ×4 | `system-defaults/refactor/pathology/teamplates/{java,rust}-pathology-panel.json` (arch) + `{java,rust}-perf-pathology-panel.json` (perf) |
 | facilitator brofile ×4 | `{java,rust}-architecture-pathologist.json` (v2, `agent_name=facilitator`) + `{java,rust}-performance-pathologist.json` |
-| workflow ×4 | `system-defaults/workflows/refactor/{arch-pathology-java,arch-pathology-rust,perf-pathology-java,perf-pathology-rust}.json` (v2) |
 
-The language-agnostic `perf-pathology.json` (v1) is superseded by the two
-per-language perf workflows; `docs/perf-pathology-dispatch.md` should be updated
-to point at them.
+**Team instantiation.** A panel dispatch resolves an **instantiated team** from
+the teams store, not a teamplate. Per flow:
 
-**Installation note (verified during the live smoke).** The `kind: ensemble`
-actor resolves its `team` via `load_team` (`src/orchestration/team.rs`), which
-reads an **instantiated team** from the teams store — NOT a teamplate, and with
-no teamplate fallback. So installing the panel as a `team` *artifact* or saving
-it as a *teamplate* is not enough; `bro_orchestrate_run` fails the BlindPost
-dispatch with `Unknown team: <panel>` until the team is instantiated. Required
-per-flow adoption sequence:
-
-1. Install the five lens brofiles + the validator brofile + the facilitator.
-2. Save the panel teamplate (`bro_team save_template`, or install the team
-   artifact).
-3. **Instantiate the team:** `bro_team(action="create", name=<panel>,
-   template=<panel>)` — this writes the team into the teams store that
-   `load_team` reads. Without this step the ensemble cannot dispatch.
-
-Neither a `save_template` nor a daemon restart substitutes for step 3.
+1. Install the five lens brofiles, the validator brofile and the facilitator.
+2. Save the panel teamplate (`bro_team save_template`).
+3. Instantiate the team: `bro_team(action="create", name=<panel>,
+   template=<panel>)`. Without this step the panel cannot dispatch.
 
 ## Acceptance criteria
 
@@ -416,8 +360,7 @@ Neither a `save_template` nor a daemon restart substitutes for step 3.
 - `PE-3`: Every panel member and the validator are read-only.
 - `PE-4`: Rust `RES`/`PRC` lenses surface `acknowledge_repr` /
   `acknowledge_public_api_change` and authority grades as gates per RX-V1/RX-V3.
-- `PE-5`: Each `normalize` op passes an explicit `allowed_atoms`.
-- `PE-6`: A no-edit smoke run reaches `WritePlan` for each of the four flows.
+- `PE-5`: A no-edit smoke run produces a correction plan for each of the four flows.
 
 ## Open questions
 
@@ -434,12 +377,9 @@ Neither a `save_template` nor a daemon restart substitutes for step 3.
   [Architecture Pathology](arch-pathology.md) and
   [Rust Architecture Pathology](rust/rust-arch-pathology.md).
 - The lens model mirrors the ensemble shape of
-  [Phase-Decomposer Dispatch](../../docs/pd-dispatch.md) /
-  `phase-decompose-ensemble-decompose`.
+  [Phase Decomposer](../orchestration/phase-decomposer/phase-decomposer.md) and its
+  `decomposer-panel` teamplate.
 - The deliberation **follows** the bridgecrew adversarial-review plugin
   (`daystrom-institute/claude-plugins`, `bridgecrew/REVIEW_BOOTSTRAP.md` R10.5
   Validator + R12.1 sweep): independent refutation with exclusion teeth,
   conflict-triggered targeted debate, and disagreement surviving to the operator.
-  The whiteboard primitives were reverse-engineered against the phaser whiteboard
-  server (`daystrom-institute/claude-plugins`, `phaser/servers/whiteboard.js`),
-  which validated the blind-visibility and self-annotation guards reused here.

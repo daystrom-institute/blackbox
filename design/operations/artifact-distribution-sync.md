@@ -34,9 +34,9 @@ deployed daemon can never run stale system artifacts.
   dev daemon resolves the tree from its source checkout. Config/env override:
   `BLACKBOX_SYSTEM_DEFAULTS_DIR`; empty/absent disables the sync.
 - **Reconcile at startup** (`open.rs`, after `ArtifactCatalog::open`, before
-  cron/workflow restore so boot restores the corrected set): walk the bundled
-  tree, map leaf directories to artifact kinds (workflows, crons, brofiles,
-  agents, atoms, teams), and for each artifact:
+  the artifact restore so boot restores the corrected set): walk the bundled
+  tree, map leaf directories to artifact kinds (brofiles, teams), and for each
+  artifact:
   - absent from the catalog: install it.
   - installed at a lower version with system provenance (its recorded source
     is a system-defaults path or URL, or it was installed by a prior sync):

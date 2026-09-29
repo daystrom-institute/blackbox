@@ -625,7 +625,7 @@ it should not become a weaker back door into durable memory.
 - No attempt to make every local ontology part of bbox core.
 - No lifecycle system in the fixed floor.
 - No epistemic framework in the fixed floor.
-- No automatic promotion to knowledge, decisions, pins, roadmap items, or
+- No automatic promotion to knowledge, roadmap items, or
   system memories.
 - No LLM in validation.
 - No graph database query language in V1.

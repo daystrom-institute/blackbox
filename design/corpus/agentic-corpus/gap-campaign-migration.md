@@ -9,7 +9,7 @@ topic:
   - graph
   - design-corpus
 tags: [design-corpus, graph, gaps, campaigns, migration-plan]
-brief: "Plan only: map 18 open gap-log records onto five proposed dsg:Campaign vertices with a per-gap dsg:Inquiry or dsg:Concept stub, each SOURCED_FROM its GapRef, using the schema v2 campaign layer. No vertices are created and no gap is edited by this document."
+brief: "Plan only: map 14 open gap-log records onto four proposed dsg:Campaign vertices with a per-gap dsg:Inquiry or dsg:Concept stub, each SOURCED_FROM its GapRef, using the schema v2 campaign layer. No vertices are created and no gap is edited by this document."
 date: 2026-08-18
 ---
 
@@ -33,7 +33,7 @@ Related:
 The gap log holds durable substrate gaps as flat records: each one is a
 capability someone wanted and did not have, filed at the moment of friction.
 That is the right shape for filing and closing, and the wrong shape for
-planning: eighteen open gaps today form five recognizable initiatives, but the
+planning: fourteen open gaps today form four recognizable initiatives, but the
 grouping lives in nobody's head and in no queryable store. The gap log cannot
 say "these six gaps are one campaign, this is its status, and these two designs
 anchor it", and the design graph until now could not point back at a gap.
@@ -82,7 +82,7 @@ consumer shows up.
 
 ## The mapping
 
-Five proposed campaigns; eighteen gaps; one Inquiry or Concept stub per gap.
+Four proposed campaigns; fourteen gaps; one Inquiry or Concept stub per gap.
 "Inquiry" is used where the gap still holds an open question (what, how, or
 whether); "Concept" is used where the gap names a durable idea that already
 has a second articulation (a design doc plus the gap) and only needs a home in
@@ -106,21 +106,7 @@ designs (`RELATES_TO`): `doc/design/corpus/agentic-corpus/multimodal-embedding-r
 | gap-ab3ef97f | file: virtual entity for IN_FILE cleanup | Concept | `concept/file-virtual-entity` | - | A first-class file entity replaces the chunk[0]-as-file proxy for IN_FILE edges (schema bump); articulated by the search-quality walk and the gap. |
 | gap-85c45849 | Per-turn LLM scoring for ranker | Inquiry | `inquiry/rerank-stage-vs-per-turn-scoring` | question | Does a cross-encoder rerank stage over the fused top-k beat per-turn LLM scoring on the shipped MRR/recall metrics, and at what k? |
 
-### Campaign 2: `campaign/provenance-completion`
-
-Summary: close the gaps between the provenance design and what the runtime
-records: historical backfill of tool-call edges, arc-produced-commit wiring,
-git-notes sync automation, and a generic anchor-indexed lookup. Anchor design:
-`doc/design/corpus/commit-work-provenance.md`.
-
-| Gap | Title | Stub | Slug | Kind | One-line statement |
-|---|---|---|---|---|---|
-| gap-ef78d005 | Backfill tool-call edges for newly-registered projects | Inquiry | `inquiry/provenance-backfill-on-reindex` | question | Should reindex backfill tool-call provenance edges from historical transcripts, and what bounds the cost on a large corpus? |
-| gap-718d5b26 | ARC_PRODUCED_COMMIT edge wiring | Concept | `concept/arc-produced-commit-edge` | - | An arc records its producing commit at exit and emits an ARC_PRODUCED_COMMIT edge; designed, advertised in schema, not yet wired. |
-| gap-f9f68f7c | Bidirectional git-notes sync hooks | Inquiry | `inquiry/git-notes-sync-automation` | question | Git hooks or a daemon subscription: which mechanism auto-exports provenance notes on commit and imports on fetch without surprising operators? |
-| gap-311023fd | Anchor-indexed provenance lookups | Inquiry | `inquiry/generic-anchor-index` | concept | Generalize the per-commit and per-session anchor indices into one anchor-indexed lookup that future provenance walks reuse. |
-
-### Campaign 3: `campaign/eval-coverage`
+### Campaign 2: `campaign/eval-coverage`
 
 Summary: turn designed evaluation into standing gates: the remaining
 probe-team question shapes, live proof of the pathology ensemble family, and
@@ -133,7 +119,7 @@ richer per-class checker semantics. Anchor design:
 | gap-9d0f9159 | Pathology ensemble flows unproven | Inquiry | `inquiry/pathology-ensemble-live-proof` | question | Prove the three unproven pathology flows and re-run the heterogeneous panel on real providers; requires the prod daemon host and healthy providers. |
 | gap-b45dc2d0 | Per-class checker logic beyond Any/All/First | Inquiry | `inquiry/per-class-checker-semantics` | concept | Per-query-class checker richness (at-least-n, must-include-path-validation, weighted contributions) beyond the v1 pass_strictness. |
 
-### Campaign 4: `campaign/pipeline-wiring`
+### Campaign 3: `campaign/pipeline-wiring`
 
 Summary: finish deferred plumbing in the deterministic orchestration
 pipelines: ensemble output boundaries, multi-partition compaction per tick,
@@ -147,7 +133,7 @@ all three; leave `RELATES_TO` empty rather than guess).
 | gap-bfe61876 | Multi-partition compaction per arc tick | Concept | `concept/compaction-all-stale-partitions-per-tick` | - | The compaction tick iterates every stale partition through the foreach primitive instead of worst-only per cron; unblocked, wiring deferred. |
 | gap-17d65325 | Auto-digest source_query plumbing | Inquiry | `inquiry/task-completed-carries-source-query` | question | When the task-completed signal triggers auto-digest, how does the trigger payload carry the originating source_query end to end? |
 
-### Campaign 5: `campaign/structural-guardrails`
+### Campaign 4: `campaign/structural-guardrails`
 
 Summary: structural fixes the substrate keeps working around: a per-turn tool
 call budget for agentic actors, and explicit vector-store passing in place of
@@ -160,7 +146,7 @@ doc id).
 | gap-fdacb6ed | Per-turn MCP tool-call budget for agentic actor | Inquiry | `inquiry/per-turn-tool-call-budget` | question | What primitive budgets tool calls per LLM turn (not per workflow node), and does the eval show the runaway-loop failure the soft prompt budget was meant to hold off? |
 | gap-a02e5c7d | VectorStore singleton refactor | Concept | `concept/vector-store-explicit-passing` | - | Thread `&VectorStore` through call sites instead of the module-level singleton so tests inject isolated stores. |
 
-Counts: 6 + 4 + 3 + 3 + 2 = 18 gaps; 13 Inquiry stubs, 5 Concept stubs.
+Counts: 6 + 3 + 3 + 2 = 14 gaps; 10 Inquiry stubs, 4 Concept stubs.
 
 Note on the Concept stubs: `dsg:Concept` requires `status` and `statement`,
 and the design-graph rule mints Concepts lazily (second articulation). Each
@@ -218,7 +204,7 @@ requires the Campaign first. The verb-by-verb equivalent:
 
 ## Open questions for review
 
-- Campaign 4's anchoring design: is there a single workflow-runtime design
+- Campaign 3's anchoring design: is there a single workflow-runtime design
   the three pipeline gaps hang under, or should the campaign carry no anchor?
 - Whether `dsg:OpenQuestion` vertices already raised by designs should be
   re-homed under campaigns via `PART_OF` in the same pass, or left until a

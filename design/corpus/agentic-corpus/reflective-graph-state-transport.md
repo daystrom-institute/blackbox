@@ -305,7 +305,7 @@ and do not ride this lane.
 - No daemon-local mutable graph store, and no daemon read of a checkout path.
 - No per-vertex overlay granularity and no cross-generation graph merge.
 - No full-text or vector indexing of graph vertices; the kernel defers it.
-- No promotion of graph facts into knowledge, decisions, pins, or rendered
+- No promotion of graph facts into knowledge or rendered
   memory; that stays explicit and operator-gated.
 - No cross-machine scratch-graph visibility, and no remote-branch fetch to
   reconstruct a torn-down workspace's overlay.

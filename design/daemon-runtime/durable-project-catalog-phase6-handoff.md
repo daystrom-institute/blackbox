@@ -104,7 +104,7 @@ cannot see, and both are blocking from `src/server/state.rs`:
 | Input | Checked by | What it catches that a count cannot |
 |---|---|---|
 | `scripts/checkout-callsite-audit.tsv` | `acceptance-checkout-callsites.sh`, blocking from `checkout_callsite_audit_is_complete` | An unclassified checkout-open call site. A count stays flat when a site is replaced by a different unaudited one. |
-| `tests/fixtures/bridge-parity/bridge-parity.json` | `bridge_parity_holds_against_canonical_fixtures`, an ordinary blocking test | A bridge RESPONSE change. Every count can stay flat while a deletion silently alters what the bridge returns, including through a type the bridge and the catalog share (Risk 18). |
+| `tests/fixtures/bridge-parity/bridge-parity.json` | `bridge_parity_holds_against_canonical_fixtures`, an ordinary blocking test | A bridge RESPONSE change. Every count can stay flat while a deletion silently alters what the bridge returns, including through a type the bridge and the catalog share (Phase 5 Risk 17). |
 
 The parity fixture is the input Phase 6 leans on most heavily, because
 the deletion campaign's failure mode is removing something that was
@@ -178,7 +178,7 @@ Each row names the bridge surface it pins and what happens to that row:
 | `project_administration` | `bbox_project_list` over `ProjectRecord` | Dies with 3.1. This row is the one that will move FIRST, because it renders record fields directly. |
 | `watcher_carriers` | `ArtifactWatchAttachment::{Selected, CheckoutId}` | Dies with 3.4. |
 | `checkout_observations` | Compatibility lane key-space and the granted/denied split | Dies with 3.5. Its `active_compatibility_lanes` going empty IS the cut signal. |
-| `file_provider`, `blame`, `render`, `provenance_export_plan`, `provenance_note_export`, `provenance_note_import` | Bridge-lane ROUTING into surfaces that survive | Row dies; the surface does not. A red row here during Phase 6 means a converted adapter changed output, which is a defect, not progress. |
+| `render` | Bridge-lane ROUTING into a surface that survives | Row dies; the surface does not. A red row here during Phase 6 means a converted adapter changed output, which is a defect, not progress. |
 | `doctor_report` | The COMPLETE serialized doctor response, findings and messages included, less only [D-041](../../DECISION_LEDGER.md#d-041) and the declared exact-value substitutions (daemon version, host state directory, fixture root, observation wall clock) | Row dies. Doctor survives; its bridge-shaped findings do not. |
 | `catalog_only_tools_refuse` | `bbox_project_publisher_advance` and `_status` refusing `error.project_catalog_inactive` | INVERTS at retirement. The fixture daemon runs bridge mode, where this refusal stays correct through and after the P6-F operator cut, so the row is carried UNCHANGED through Phase 6 (live catalog-mode success is proved separately by the catalog lane's own tests). At the retirement-phase bridge deletion this is the one row that must be DELETED rather than carried: a bridge-modeless tree cannot refuse this way, so a row asserting it would be actively false. |
 

@@ -158,7 +158,7 @@ Four properties of the landed annotation surface constrain this design:
    type system. M9 must keep that orthogonality; a retrieval concern that
    starts constraining legal values has leaked.
 
-This is the shape operator decision `b1a11d7cf59f2545` ratified: *"by
+This is the shape the operator's index-eligibility ruling ratified: *"by
 default only vertex labels are word-indexed; graph schemas declare
 per-property annotations for text indexing and embedding participation, and
 embeddings are strictly per-kind opt-in under per-graph policy. No property
@@ -389,15 +389,15 @@ Three notes on the shape.
 
 `text_retrieval_enabled` defaults **true**, which reads backwards until you
 notice where the conservatism already lives. With no property annotations a
-graph contributes labels and nothing else, which is exactly what decision
-`b1a11d7cf59f2545` asked for. A default-false gate would mean every schema
+graph contributes labels and nothing else, which is exactly what the
+index-eligibility ruling asked for. A default-false gate would mean every schema
 author must opt in twice to get the documented default behavior, and the
 second opt-in would become boilerplate that stops meaning anything. The
 field exists to be turned OFF.
 
 `retrieval_excluded_types` exists because a connector source schema is a
-versioned corpus artifact shipped through the artifact catalog (decision
-`7650b743fb23c265`), not something the tenant edits. Without a policy-side
+versioned corpus artifact shipped through the artifact catalog, not
+something the tenant edits. Without a policy-side
 exclusion, a tenant who wants one vertex type out of retrieval has to fork
 a vendor schema. Exclusion is coarse and per-type on purpose: per-property
 tenant overrides would fork the annotation authority in two, and then no
@@ -581,8 +581,8 @@ longer resolves.
 Incremental work is keyed on `GraphGeneration.fingerprint` plus the
 `ProjectGraphGenerationIdentity`. An accepted generation whose fingerprint
 matches the indexed one is a no-op, which makes an idempotent connector
-refresh (the campaign's exact-replay case, already idempotent in
-`SourceProjectionStore::accept`) free rather than a full lane rewrite.
+refresh (the campaign's exact-replay case, which the M2 source projection
+contract makes idempotent) free rather than a full lane rewrite.
 
 A `ProjectGraphOverlayValue::Tombstone` removes that graph's provisional
 lane; `remove_provisional` removes the whole workspace's provisional lanes.
@@ -1131,7 +1131,7 @@ extension is available when a case exists.
 *Decided 2026-08-16: one route in v1.*
 
 **Q4. Should connector graphs be word-indexed by default?**
-*Recommendation: yes for labels, per decision `b1a11d7cf59f2545`, with
+*Recommendation: yes for labels, per the index-eligibility ruling, with
 `retrieval_excluded_types` as the tenant's recourse.* The alternative,
 requiring per-graph opt-in for the connector plane, makes the common case
 ("I connected a source and now I want to search it") require an edit to a
@@ -1199,9 +1199,9 @@ permanent.
   [Reflective Project Graph](../corpus/agentic-corpus/reflective-project-graph.md),
   which deferred full-text and vector indexing of graph vertices out of v1
   and points at the connector program for the follow-on.
-- **Builds on:** the M2 source projection contracts and the M3 evidence binding lane
-  (`crates/bbox-project-graph/src/evidence.rs`), both landed on
-  `beta/blackbox-v2`; the existing hybrid retrieval pipeline described in
+- **Builds on:** the M2 source projection contracts (not built) and the M3
+  evidence binding lane (`crates/bbox-project-graph/src/evidence.rs`, landed
+  on `beta/blackbox-v2`); the existing hybrid retrieval pipeline described in
   [`docs/graph-retrieval-internals.md`](../../docs/graph-retrieval-internals.md)
   and [`docs/index-embedding-internals.md`](../../docs/index-embedding-internals.md),
   with the corrections noted in section 8.

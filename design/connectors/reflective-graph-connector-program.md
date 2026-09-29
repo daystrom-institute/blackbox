@@ -42,10 +42,11 @@ status refreshed 2026-08-16. Landed on `beta/blackbox-v2`:
 - **File-source transport (phase 1, 2026-08-13)**: `bbox-file-source`
   wire crate, `bbox-file-collector` satellite, `bbox-file-source-store`
   generation store.
-- **Slack conversation lane (M5b corpus lane, 2026-08-13)**:
-  `bbox-conversation-source`, `bbox-conversation-source-store`,
-  `bbox-slack-collector`, projected into the word index through the
-  transcript adapter (schema `agentic-corpus-g12-conversation-projection`).
+- **Conversation corpus lane (M5b corpus lane, 2026-08-13)**:
+  `bbox-conversation-source` and `bbox-conversation-source-store`,
+  projected into the word index through the transcript adapter (schema
+  `agentic-corpus-g12-conversation-projection`). The distribution ships no
+  Slack producer.
 
 M4's API-dataset profile is designed, not landed; its contracts are
 owned by [API-Dataset Connector](api-dataset-connector.md)
@@ -588,8 +589,8 @@ Two further notes on the implemented shape:
 Status: partial. The shared transport and identity layers are landed for
 the file-tree and conversation profiles (`bbox-file-source`,
 `bbox-file-collector`, `bbox-file-source-store`,
-`bbox-conversation-source`, `bbox-conversation-source-store`,
-`bbox-slack-collector`). The API-dataset profile is designed, not
+`bbox-conversation-source`, `bbox-conversation-source-store`). The
+API-dataset profile is designed, not
 landed; [API-Dataset Connector](api-dataset-connector.md) owns its
 contracts.
 
@@ -658,10 +659,11 @@ survive a schema-version replay.
 
 ### Milestone 5b: Slack ingestion (corpus lane)
 
-Status: LANDED 2026-08-13 (corpus lane):
-`bbox-conversation-source`, `bbox-conversation-source-store`,
-`bbox-slack-collector`, projected into the word index through the
-transcript adapter.
+Status: corpus lane LANDED 2026-08-13:
+`bbox-conversation-source` and `bbox-conversation-source-store`,
+projected into the word index through the transcript adapter. The
+distribution ships no Slack producer; an external producer implements the
+contract in `slack-ingestion-connector.md`.
 
 The Slack connector's v1 ships message ingestion into the conversation corpus
 without graph projection; its design, producer shape, cursors, and privacy
@@ -808,9 +810,9 @@ all pass integration tests.
 |---|---|---|---|
 | R0 | Accepted contracts and fixtures | M0 | Accepted |
 | R1 | Project-defined reflective graphs | M1 | LANDED |
-| R2 | Rebuildable source graphs and generic evidence endpoints | M2-M3 | LANDED |
+| R2 | Rebuildable source graphs and generic evidence endpoints | M2-M3 | Partial (M3 evidence endpoints landed; M2 source graphs not built) |
 | R3 | File-tree and API-dataset profiles on one runtime | M4 | Partial (file-tree and conversation transport landed; API-dataset proposed) |
-| R3b | Slack messages corpus-searchable | M5b | LANDED (corpus lane) |
+| R3b | Slack messages corpus-searchable | M5b | Partial (corpus lane landed; no Slack producer ships) |
 | R4 | Inspectable Xero semantic projection from fixtures | M5 | Proposed |
 | R5 | Project-code to bounded Xero file evidence | M6 | Proposed |
 | R6 | Durable Xero books overlay | M7 | Proposed |
@@ -906,18 +908,17 @@ Added by the 2026-08-11 re-grounding:
   plane through the modernized secrets-provider design rather than a
   hypothetical future seam.
 
-Decided 2026-08-13 (operator ratification of the standing recommendations;
-knowledge decisions referenced):
+Decided 2026-08-13 (operator ratification of the standing recommendations):
 
-- Retained-observation policy (98d9f430f62ad8ca): accepted observation
+- Retained-observation policy: accepted observation
   batches are retained content-addressed, defaulting to current plus prior
   generation and everything younger than a retention window, per source
   class and widenable by deployment policy; reprojection beyond the horizon
   degrades honestly to re-observe.
-- Source schema shipping (7650b743fb23c265): versioned corpus artifacts
+- Source schema shipping: versioned corpus artifacts
   through the existing artifact catalog, not compiled into connector
   binaries; signed distribution deferred to M10-era hardening.
-- Index eligibility (b1a11d7cf59f2545): conservative and schema-directed;
+- Index eligibility: conservative and schema-directed;
   labels word-indexed by default, per-property annotations for text and
   embedding participation, embeddings strictly per-kind opt-in under
   per-graph policy. Schema authors annotate as they write.

@@ -182,8 +182,8 @@ are forward-looking and must not block the resolver consolidation.
 Additive migration is enough:
 
 1. Consolidate the existing resolution logic into a shared project/workspace
-   resolver used by `bbox_*`, `bro_*`, and workflow code that currently
-   accepts `project`, `project_dir`, `cwd`, or path-like parameters.
+   resolver used by `bbox_*` and `bro_*` code that currently accepts
+   `project`, `project_dir`, `cwd`, or path-like parameters.
 2. Add alias support for registered projects so `project="blackbox"` and
    `project="d723917f"` resolve identically.
 3. Attach an optional session workspace map to dispatched agents:

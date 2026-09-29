@@ -4,7 +4,7 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - orchestration
-brief: "Hub for Blackbox orchestration designs: atoms, agents, workflows, supervision, phase decomposition, and live handoff."
+brief: "Hub for Blackbox orchestration designs: the bro execution boundary, supervision, phase decomposition, live handoff, and historical atom, agent and workflow records."
 ---
 
 # Orchestration
@@ -12,11 +12,10 @@ brief: "Hub for Blackbox orchestration designs: atoms, agents, workflows, superv
 This hub groups designs for starting, supervising, composing, and recovering
 agentic work.
 
-The accepted [bro execution boundary and retirement plan](bro-execution-boundary-and-retirement.md)
-now guides implementation: retain reliable bro execution and corpus capabilities,
-move higher-order orchestration to callers, and retire the daemon workflow,
-atom, application reaction, Slack and Badgey runtimes. The designs below describe
-the existing system and its history; the retirement plan records dependencies,
+The [bro execution boundary](bro-execution-boundary-and-retirement.md) defines
+the split: Blackbox provides reliable bro execution and corpus capabilities, and
+callers own higher-order orchestration. The atom, agent, workflow and supervision
+designs below are historical records; the boundary doc records dependencies,
 preserved capabilities, migration contracts and verification gates.
 
 ## Capability Runtime

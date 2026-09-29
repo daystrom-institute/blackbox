@@ -345,7 +345,6 @@ Extract current kinds first:
 
 - workflow
 - brofile
-- agent
 - atom
 - team (currently a no-op — see the real activator below)
 
@@ -508,8 +507,7 @@ Initial dependency checks:
 - workflows resolve statically detectable atoms, brofiles, teams,
   subworkflows, and MCP hook targets;
 - workflow-backed atoms resolve workflow;
-- profile-backed atoms resolve brofile;
-- agents with `brofile_ref` resolve brofile.
+- profile-backed atoms resolve brofile.
 
 ### 3.3 Apply And Generation Records
 
@@ -592,11 +590,9 @@ system-defaults/bundles/
   blackbox-system-defaults.json   # meta → children
   agentic-corpus.json             # incl. promoted contradiction-specialists team
   maintenance.json                # daily-compaction (own tree)
-  agents.json                     # agents + agent-eval cron/workflows
   phase-decompose.json            # workflows + brofiles + teamplates + assets
   supervision.json
   refactor.json                   # 140 atoms (glob) + brofiles + workflows + macros
-  badgey.json
 ```
 
 Use shallow meta-bundle references. The generation record expands transitive
@@ -908,7 +904,7 @@ ships.
 Work:
 
 - extract static dependency refs from workflows;
-- extract refs from atoms and agents;
+- extract refs from atoms;
 - extract provider-sync refs;
 - auto-order bundle operations;
 - report cycles before mutation.

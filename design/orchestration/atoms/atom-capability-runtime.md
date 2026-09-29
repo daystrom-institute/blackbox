@@ -8,14 +8,15 @@ topic:
 tags:
   - atoms
   - refactor-tools
-brief: "Crosscut hub for atoms as public, contracted capabilities over brofiles, workflows, deterministic runners, and adapters."
+brief: "Crosscut hub for the atom and agent capability designs over brofiles, workflows, deterministic runners, and adapters."
 ---
 
 # Atom Capability Runtime
 
-Atoms are the public capability boundary. Bros remain runtime workers; agents
-are the predecessor discovery wrapper; workflows can expose reusable capability
-boundaries through atom bindings.
+This cluster records the atom and agent capability designs. Blackbox dispatches
+ordinary bros configured by brofiles and teams; callers own higher-order
+composition, as defined by the
+[bro execution boundary](../bro-execution-boundary-and-retirement.md).
 
 ## Core Docs
 

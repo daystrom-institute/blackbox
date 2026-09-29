@@ -26,7 +26,7 @@ Related:
 - [Retrieval Eval Harness](retrieval-eval-harness.md) - the measurement
   instrument the design-graph suite reuses; also the donor-spike provenance
   pointer (`../daystrom-mk2/spikes/Daystrom.Spike.McpPoc/`).
-- [Knowledge And Memory](knowledge/knowledge-and-memory.md) - the store-side
+- [Knowledge And Memory](../knowledge/knowledge-and-memory.md) - the store-side
   boundary partner (what does NOT move into this graph).
 - `docs/corpus-frontmatter-schema.md` - the frontmatter chassis the miner
   projects from.

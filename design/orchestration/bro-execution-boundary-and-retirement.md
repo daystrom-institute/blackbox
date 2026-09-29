@@ -75,7 +75,7 @@ an advisor. Blackbox does not replace the retiring workflow graph with another
 daemon-hosted programmable orchestration framework.
 
 The corpus remains a separate core responsibility: native transcripts, retained
-conversation history, search, graph/provenance, project publication, knowledge,
+conversation history, search, graph, project publication, knowledge,
 gaps, notes, and threads survive. Mechanical maintenance required for those
 services also survives without requiring workflow or atom execution.
 
@@ -128,23 +128,23 @@ replace compiled-router and deployed-catalog verification.
 
 | Owner / entry points | Target | Dependency work before removal |
 | --- | --- | --- |
-| `src/tools/dispatch.rs`, `roster.rs`; `/control/*`, `/roster`, `/tail` in `src/server/mcp.rs` | Keep direct bro control, wait aggregation, explicit broadcast, membership and routing | Remove advisor launches from waits and automatic team continuation. Preserve worker cwd, pin precedence, admission/resume leases, result paging and closeout. |
+| `src/tools/dispatch.rs`, `roster.rs`; `/control/*`, `/roster`, `/tail` in `src/server/mcp.rs` | Keep direct bro control, wait aggregation, membership and routing | Remove advisor launches from waits and automatic team continuation. Preserve worker cwd, pin precedence, admission/resume leases, result paging and closeout. |
 | `src/orchestration/executor.rs`, `fleetd_client.rs`; `crates/fleetd`, `bro-rpc`, `bro-protocol`, `bro-fleet-client`, `bro-cli` | Keep worker execution and Fleet | Preserve authentication, generation fencing, acknowledgement after ingest, child reconnect/replay, control routes and closeout contracts. Remove CLI workflow commands and workflow-only UI actions. |
 | `crates/bro-harness`, `bro-code-mode`, `bro-capabilities`, `bro-tools`, `bbox-refactor` | Keep local execution, code mode, filtered capabilities, refactor bindings, local hooks | Remove only daemon `atom_invoke` projection and retired tool guidance. Native refactor operations do not become casualties of atom removal. |
-| `src/orchestration/agents`, `src/tools/agents.rs` | Keep simple installed role templates while they add value beyond brofiles | Remove Badgey adapters and application evaluation/promotion/composition loops. Generic single-bro dispatch has independent consumers. Do not keep a workflow/atom execution adapter under an agent name. |
+| `src/orchestration/agents`, `src/tools/agents.rs` | Remove installed agent templates; brofiles carry role configuration for ordinary dispatch | Remove Badgey adapters and application evaluation/promotion/composition loops. Generic single-bro dispatch through `bro_exec` has independent consumers. Do not keep a workflow/atom execution adapter under an agent name. |
 | `src/tools/badgey*`, `consultant/`; `src/orchestration/badgey`, `consultant` | Remove runtime and public surface | `consultant/consumers.rs` registers only Badgey. Remove queue, proposal, action journal and recovery wiring after records are archived. Preserve user knowledge produced by those processes. |
 | `crates/bro-slack`, `bbox-slack`; Slack handlers/stores in server/config tools | Remove interactive Slack integration | Detach channel/thread/proposal mappings from project-catalog migration owners and preserve old receipt decoding. Remove credentials only from the retired consumer's configuration, not shared credentials used elsewhere. |
 | `crates/bbox-slack-collector`, runtime image and cage deployment | Retire Slack-specific collection from the Blackbox distribution | Stop new Slack collection only after separating ingest authorization from retained read enrollment. Future Slack freshness ends unless an external producer takes ownership. Generic conversation ingestion and historical search stay. |
 | `src/workflow`, `src/tools/orchestrate*`, `src/server/{dispatch,restore,workflow_runtime,workflow_capabilities}.rs`, `src/routing.rs` | Remove workflow compiler/engine, arcs, waits, operation DSL and execution routes | Extract essential vector/storage operations; distinguish `src/routing.rs` event DSL from `src/server/surface.rs` permission evaluation. Keep shared `/control/*` handlers from mixed files. |
 | `src/orchestration/atoms`, `src/tools/atoms*` | Remove atom registry, composition, invocation, delegation and automatic supervision | Inventory actual runner operations. Preserve meaningful refactor/file/process operations in existing harness modules. External orchestration can reuse prompts as files without keeping the atom runtime. |
-| `src/tools/workspace.rs` and workflow workspace dispatch | Remove `work_*` adapters | Host-owned file/git execution remains in harness tools. Indexed tool-call recall must remain reachable through corpus retrieval with precise provenance. Do not restore daemon-local checkout execution. |
+| `src/tools/workspace.rs` and workflow workspace dispatch | Remove `work_*` adapters | Host-owned file/git execution remains in harness tools. Indexed tool-call recall must remain reachable through corpus retrieval. Do not restore daemon-local checkout execution. |
 | `src/crons.rs`, `pollers.rs`, `webhooks.rs` and adapters | Remove configurable application triggers | Move schedule ownership outside Blackbox; preserve required service maintenance as narrow operations. Remove inbound webhook routes, replay stores and autonomous restore. |
 | `crates/bbox-system-events`, `src/system_events_runtime`, `src/tools/system_events.rs` | Remove programmable reaction engine, event journal and its MCP management surface | Bro status/tail/transcript evidence comes from task records and roster/tail projection. Forgejo integration recipes move to external owners. |
 | `src/orchestration/supervision.rs` | Keep useful execution measurements | Distinguish from `src/tools/atoms/supervision.rs`, which launches higher-order work. Preserve honest last-request context measurements without compaction alarm semantics. |
 | Whiteboard runtime/tools and `crates/bbox-whiteboards` | Remove board lifecycle/voting orchestration and board storage | Detach attention, corpus providers, the `whiteboard:` entity type, schema consumers and project-catalog owner rows. |
 | `src/server/surface.rs`, artifact support | Keep deterministic permission/policy machinery | Ordinary bro tool filtering uses the surface policy in daemon configuration; missing policy must never silently widen access. |
 | `src/embed_runtime.rs` | Keep embeddings and contradiction observations | Replace `contradiction-review-arc` launch with the existing note/evidence fallback. An indexing event must not start a new planning process. |
-| `src/server/{open,state,background,restore}.rs` | Keep corpus and bro service initialization | Remove automation hooks individually. Shared startup also owns indexing, publication, provenance, vector maintenance and artifact restoration for retained kinds. |
+| `src/server/{open,state,background,restore}.rs` | Keep corpus and bro service initialization | Remove automation hooks individually. Shared startup also owns indexing, publication, vector maintenance and artifact restoration for retained kinds. |
 
 Paths above identify source ownership, not paths a remote MCP caller should read
 to recover a tool result. The source layout may change during extraction; update
@@ -156,8 +156,8 @@ this map at each milestone.
 
 `bro_wait` and `bro_when_all` currently call `maybe_resume_team_advisor` in
 `src/tools/dispatch.rs`; team routing and `src/tools/roster.rs` can launch advisor
-work separately from Badgey. Remove both automatic paths. Keep explicit caller
-broadcast and bounded wait-all/wait-any over existing tasks. Keep fixed resource
+work separately from Badgey. Remove both automatic paths. Keep bounded
+wait-all/wait-any over existing tasks. Keep fixed resource
 limits and execution safety, but application retry/continuation policy belongs
 to the caller.
 
@@ -283,7 +283,7 @@ deployment authority applies; gates below are technical prerequisites.
 - Commit the accepted boundary, all-name map, consumer snapshot, extraction
   contracts, and validation procedure. Link the ongoing audit to this plan.
 - Record which residual response fixes are replaced by retirement. Keep mutation
-  consistency and provenance readiness as independent work.
+  consistency as independent work.
 - Freeze feature expansion in retiring families for this campaign. Do not spend
   another milestone polishing reaction DTOs that will disappear.
 
@@ -390,7 +390,7 @@ caller without retaining their old executable manifest.
 | Source-owned footprint | Required disposition |
 | --- | --- |
 | `system-defaults/{atoms,workflows,badgey}/`, `system-defaults/agents/badgey.json` | Stop installation and remove executable definitions for retiring runtimes. |
-| `system-defaults/agents/{workflows,crons}/` | Remove nightly evaluation and application composition; preserve independently useful simple roles and their prompt/output contracts. |
+| `system-defaults/agents/{workflows,crons}/` | Remove nightly evaluation, application composition and installed agent definitions. |
 | `system-defaults/{maintenance,agentic-corpus}/` | Extract E4 operations; remove graph-based schedules, auto-edge/digest and review automation. Preserve direct corpus APIs and required health behavior. |
 | `.bbox/workflows/{gap-processing,blackbox-review}.json`, `.bbox/atoms/gap-cluster-validator.json` | Retire repo-owned execution manifests. Inspect associated brofiles independently. |
 | `schema/{atom,workflow}.schema.json` | Remove new-write/execution schemas after preserving legacy record readers separately. |

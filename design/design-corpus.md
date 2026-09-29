@@ -19,9 +19,9 @@ describes behavior that matters for implementation, verify it against the code,
 - [Connectors](connectors/connectors.md) - producer-plane observers of remote
   stores and API datasets (drives, Xero, Slack) publishing into the corpus;
   file-tree, API-dataset, and conversation profiles.
-- [Corpus](corpus/corpus.md) - search, provenance, knowledge, notes, storage,
-  code navigation, and corpus-facing assistants.
-- [Orchestration](orchestration/orchestration.md) - atoms, agents, workflows,
+- [Corpus](corpus/corpus.md) - search, knowledge, notes, storage, and code
+  navigation.
+- [Orchestration](orchestration/orchestration.md) - bro execution,
   supervision, phase decomposition, and runtime handoff.
 - [Bro-Harness](bro-harness/bro-harness.md) - the custom headless coding agent:
   transports, tool surface, clipboard, tool chaining, hooks, diagnostics,
@@ -32,13 +32,13 @@ describes behavior that matters for implementation, verify it against the code,
   architecture: tokio topology, plane isolation, lock discipline, and
   persistence actors.
 - [Refactor Tools](refactor-tools/refactor-tools.md) - structural refactor
-  machinery, refactor atoms, Rust expansion, and Java gap closure.
-- [Integrations](integrations/integrations.md) - Obsidian, Slack, and other
-  external user-facing adapters.
-- [Surfaces](surfaces/surfaces.md) - MCP, workspace tools, and provider
-  transcript read planes.
-- [Operations](operations/operations.md) - config, artifacts, bundles, doctor,
-  and evented coordination.
+  machinery, Rust expansion, and Java gap closure.
+- [Integrations](integrations/integrations.md) - Obsidian and other external
+  user-facing adapters.
+- [Surfaces](surfaces/surfaces.md) - MCP and provider transcript read
+  planes.
+- [Operations](operations/operations.md) - config, artifacts, bundles, and
+  doctor.
 
 ## Lifecycle
 

@@ -340,14 +340,14 @@ Producer failure policy is **per-turn opt-in**, default render-without:
 
 - `context.{first_turn,resume_turn}.on_failure: "render_without"` (default):
   if the producer errors, times out, or returns output that fails its
-  declared schema, dispatch logs a `dispatch.context_producer.failure`
-  system event, emits a warning into the turn receipt, and renders the
+  declared schema, dispatch emits a `dispatch.context_producer.failure`
+  tail event, emits a warning into the turn receipt, and renders the
   template with empty `template_inputs`. Suitable for enrichment producers
   (atom signposts, fresh deltas) where missing extras are acceptable.
 - `context.{first_turn,resume_turn}.on_failure: "fail"`: producer failure
   fails the turn. The dispatch sequence runs the producer before any
   *external* side effect (provider launch, `dispatch.template_resolved`
-  system event emission, task-store insertion). The resume-lease table
+  tail event emission, task-store insertion). The resume-lease table
   is a special case: current `bro_resume` acquires the lease before
   building args (`src/tools/dispatch.rs:517`). Moving lease acquisition
   after producer success would let two concurrent resumes both run
@@ -366,7 +366,7 @@ Producer failure policy is **per-turn opt-in**, default render-without:
 
   `bro_exec` follows the same ordering minus the lease step. A producer
   failure on `bro_exec` returns `error.context_producer_failed` and
-  leaves the task store, lease table, and system-event log unchanged.
+  leaves the task store, lease table, and tail stream unchanged.
   Suitable for governance producers whose output is load-bearing (e.g.
   a completion contract a reviewer brofile depends on).
 
@@ -617,7 +617,7 @@ lease back before returning.
 6. If `context.resume_turn.context_producer` is set, invoke the atom producer
    and merge its capped `template_inputs`. On `on_failure: fail`, **release
    the lease** and return `error.context_producer_failed` — no provider
-   process is spawned, no system event is emitted, the bro's session state
+   process is spawned, no tail event is emitted, the bro's session state
    is not touched.
 7. Render the resolved template into the final prompt.
 8. Apply provider-default policy and assemble provider argv.
@@ -634,7 +634,7 @@ context object. Pinning old template behavior can be added later if operators
 actually need it, but it is not part of v1.
 
 To make brofile drift visible without inventing a pinning mechanism, every
-dispatch emits a `dispatch.template_resolved` system event with the brofile
+dispatch emits a `dispatch.template_resolved` tail event with the brofile
 name, brofile version, resolved template ref (or inline-hash for literal
 templates), template content hash, and producer ref/version. A long-lived bro
 whose brofile is edited mid-arc therefore shows a clear event boundary on the
@@ -810,9 +810,9 @@ entry; resolution does not depend on filesystem layout alone.
   `resolve_dispatch_filters` appear in argv for both fresh and resumed
   dispatches. The textual ambient layer moving into a template must
   not silently lift the mechanical guard.
-- Emit a `dispatch.template_resolved` system event per turn carrying brofile
+- Emit a `dispatch.template_resolved` tail event per turn carrying brofile
   name/version, template ref/hash, and producer ref/version, so brofile
-  drift mid-arc is visible in the event log.
+  drift mid-arc is visible in the task's tail.
 
 ### Phase 4: Cleanup
 

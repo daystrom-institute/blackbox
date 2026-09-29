@@ -47,7 +47,7 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 Decompose on **locality**, not authority:
 
 - The **checkout plane** is everything whose truth is a mutable working copy
-  on some machine: file bytes, git history and notes, blame, worktrees,
+  on some machine: file bytes, git history, worktrees,
   `.bbox/` entry files, rendered provider memory, build/validation runs, and
   every process spawned against a checkout with the operator's credentials.
   This plane is owned by the machine that owns the checkout, and its
@@ -55,7 +55,7 @@ Decompose on **locality**, not authority:
   (for the operator's own checkouts). The daemon never reaches into it.
 - The **corpus plane** is everything append-only, derived, or shared:
   transcripts, the tantivy index, vectors/embeddings, the graph, the
-  knowledge/threads/notes/pins/gaps stores' central lanes, orchestration
+  knowledge/threads/notes/gaps stores' central lanes, orchestration
   state, ingress, and credential brokering. This plane can move off-host.
 
 The ordering constraint is the whole design: **empty the daemon of
@@ -345,7 +345,7 @@ to it:
    contract remote-worker-boundary.md wants in `bro-core` for artifact
    envelopes.
 
-Pins, live threads, and notes are unaffected: they are host-local activity
+Live threads and notes are unaffected: they are host-local activity
 by design (`.bbox/local/`, central stores) and never had a code-plane twin.
 
 ## 5. The code-corpus collector

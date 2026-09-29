@@ -74,7 +74,7 @@ first place."
 |---|---|---|
 | **What** | the agent's mutable checkout | indexed/historical/cross-project view |
 | **Owner** | the worker (harness) | the daemon, permanently |
-| **Tools** | tree-sitter lanes (`bbox_code_query/refs/outline`), slices, refactor plan+apply, LSP servers and their session pool, validation runs | tantivy symbols, `bbox_hybrid_search`, graph walks, knowledge, blame/provenance, transcripts |
+| **Tools** | tree-sitter lanes (`bbox_code_query/refs/outline`), slices, refactor plan+apply, LSP servers and their session pool, validation runs | tantivy symbols, `bbox_hybrid_search`, graph walks, knowledge, transcripts |
 | **`semantic_status`** | `lsp_verified`, `syntax_only` | `indexed_hints` |
 | **Crossing mechanism** | does not cross; executes in the worker | MCP out-box, as today (`CorpusCapability` seam) |
 
@@ -151,8 +151,8 @@ The authority that used to sit at apply-time belongs here once apply targets
 scratch space. The worker may do anything to its working set; the operator
 moment is whether the resulting artifact — a branch, an EditSet, a publish, a
 durable knowledge write — is accepted into canonical state. Concretely:
-merge/publish gates, provenance stamping and export, reindex-on-publish, review
-lanes for shared-store writes. One gate at the boundary instead of N gates in
+merge/publish gates, reindex-on-publish, and operator approval of shared-store
+writes. One gate at the boundary instead of N gates in
 the pipeline — which is also the only gate shape that has survived contact with
 reality (cf. the adjudication-boundary retirement recorded in
 [`refactor-tools-v2.md`](./refactor-tools-v2.md) §2).
@@ -167,10 +167,10 @@ audited at re-entry.**
 
 | Stays in the daemon | Why it passes |
 |---|---|
-| **The corpus** — tantivy, graph, embeddings, transcripts, blame/provenance | aggregates across projects, sessions, machines; workers query out-box |
-| **Shared stores** - knowledge, decisions, threads, notes, pins, roadmap | multi-writer state; daemon owns consistency and review lanes |
-| **The orchestration singleton** — dispatch, teams, workflows, crons, cross-worker promise coordination, the seq-ordered steer/interrupt plane | singleton by definition; a worker cannot own the thing that owns workers |
-| **Ingress** - webhooks, pollers | needs a stable address; ephemeral workers have none |
+| **The corpus**: tantivy, graph, embeddings, transcripts | aggregates across projects, sessions, machines; workers query out-box |
+| **Shared stores** - knowledge, threads, notes, gaps | multi-writer state; daemon owns consistency |
+| **The orchestration singleton**: dispatch, teams, cross-worker wait coordination, the seq-ordered steer/interrupt plane | singleton by definition; a worker cannot own the thing that owns workers |
+| **Ingress** - collector ingest endpoints | needs a stable address; ephemeral workers have none |
 | **Credential brokering** | keys are minted/injected per-dispatch, never baked into images (capability = tool + credential + scope) |
 | **The integration boundary** (§4.2) | the re-entry point into every shared store above |
 
@@ -182,7 +182,7 @@ daemon's host checkout is itself a legitimate working set for interactive
 sessions. The refactor surface does not even keep that projection: per
 [`refactor-tools-v2.md`](./refactor-tools-v2.md) §7 (decided), refactor tooling
 becomes **in-harness only**; external/MCP-only agents direct refactoring via
-ad-hoc `bro_exec`/`bro_resume` orchestration or consume a canned atom.
+ad-hoc `bro_exec`/`bro_resume` orchestration.
 
 ## 6. The isolation gradient is the migration path
 

@@ -30,7 +30,6 @@ Companion designs:
 - [`distributed-code-source-collector-impl.md`](distributed-code-source-collector-impl.md)
 - [`project-taxonomy-standardization.md`](../corpus/agentic-corpus/project-taxonomy-standardization.md)
 - [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
-- [`checkout-provenance-export-impl.md`](checkout-provenance-export-impl.md)
 
 ## 1. Outcome and bounded scope
 
@@ -59,9 +58,9 @@ Those prerequisites make mixed-view results and hidden filesystem fallbacks
 observable during migration. They do not authorize the identity cut by
 themselves.
 
-This is still an overlap slice. Local project walking, Git history, blame,
-rendering, repo-owned knowledge publication, provenance note import, artifact
-watching, and mutation tools remain available through attachments. Their
+This is still an overlap slice. Local project walking, Git history,
+rendering, repo-owned knowledge publication, artifact watching, and mutation
+tools remain available through attachments. Their
 continued existence does not prevent a remote-only catalog project from being
 searchable. Moving those producers to typed checkout-to-corpus transports is a
 later decomposition slice.
@@ -129,14 +128,13 @@ implementer:
 
 This slice does not:
 
-- transport Git objects, Git history, blame execution, or Git-note import from
-  another host;
+- transport Git objects or Git history from another host;
 - transport repo-owned knowledge or gaps from a checkout host;
 - expose a model-facing arbitrary JSON, filesystem, or blob endpoint;
 - make provisional `all` visibility cross-host;
 - implement session workspace mount maps that do not exist yet;
 - silently merge two old project ids that claim one durable scope;
-- rewrite existing project, symbol, commit, provenance, artifact, or edge refs
+- rewrite existing project, symbol, commit, artifact, or edge refs
   to a newly minted identity;
 - declare the whole daemon checkout-free or move the corpus off-host; or
 - reopen multi-fleet routing, broad contradiction policy, or the optional
@@ -161,9 +159,9 @@ either skipped, hidden from readers, or deleted by a later purge.
 
 The same conflation appears above the index. Publisher election scans checkout
 paths. Knowledge and gap views hydrate a durable project with
-`canonical_path`. Blame, render, file providers, refactor tools, artifact
-watchers, and provenance import accept a logical project and then assume that
-it names one local directory. Several selectors accept a raw project id only
+`canonical_path`. Render, file providers, refactor tools, and artifact
+watchers accept a logical project and then assume that it names one local
+directory. Several selectors accept a raw project id only
 when it looks like eight hexadecimal characters.
 
 Adding `canonical_path: Option<_>` to this record would spread an optional-path
@@ -516,7 +514,7 @@ installed or available from a verified backup. `old = Absent` rollback removes
 only an exact matching transaction-created image. Any incomplete set fails
 closed without mixing epochs.
 
-### 6.3 Version-1 import and rollout command
+### 6.3 Version-1 import
 
 Version-1 import is an explicit offline operation, not a side effect of first
 v2 daemon startup. It has no operator command surface. A `MigratedV1` catalog is
@@ -546,8 +544,7 @@ generated artifact. A staleness refusal sends the operator back to an explicit
 preflight invocation; only that invocation may create a new plan. Apply then
 performs the journaled transaction and emits the resulting catalog epoch. The
 final v2 daemon holds the lifetime lock too. A v2 daemon that sees v1 bytes
-fails closed with the exact preflight/apply command; it never attempts an
-implicit import.
+fails closed; it never attempts an implicit import.
 
 Before import, take a read-only inventory of:
 
@@ -764,8 +761,8 @@ marker, stage, backup, G1, and quarantine roots.
 Phase 1 through Phase 5 run this exact protocol only against isolated copied
 state. The facade does not copy live state: an operator or hermetic test
 prepares the isolated v1 bundle, then reruns preflight against that bundle so
-path digests and post-images bind the destination it will mutate. The supported
-live rollout occurs in Phase 6: deploy the v1-compatible
+path digests and post-images bind the destination it will mutate. The live
+rollout ran once, in Phase 6: deploy the v1-compatible
 bridge under the normal shared-service approval process, run preflight, resolve
 every refusal, stop that daemon, run apply while holding the exclusive lifetime
 lock, then start the complete v2 runtime. Tests cover a live bridge preventing
@@ -801,8 +798,8 @@ attachment selector, or exactly one operator-selected default with the needed
 capability. They never choose the first clone.
 
 Route hybrid search, transcript search, knowledge/gaps, threads, notes,
-pins, roadmap, packets, bindings, provenance planning,
-tool-edge stamping, and storage surfaces through this resolver. Preserve the
+roadmap, bindings, tool-edge stamping, and storage surfaces through this
+resolver. Preserve the
 current asymmetric read and write gates when resolving attachments.
 
 ### 7.2 Administrative semantics
@@ -1427,8 +1424,10 @@ silently:
 
 1. Remove the old-scope producer assignment and reload. This revokes its token
    authority; the collected generation remains effective or cutback-pending.
-2. For an attached project, run `bbox_project_scope_migrate --dry-run`, then the
-   attachment-proven MCP migration. For a project with zero attachments, stop
+2. For an attached project, the operator runs the attachment-proven MCP
+   migration through
+   `bro mcp call bbox_project_scope_migrate '<json>' --surface ops`, first
+   with `dry_run=true`. For a project with zero attachments, stop
    the daemon under shared-service approval and run the offline
    `blackbox project-catalog scope-migrate --operator-attested` dry-run/apply
    while holding the exclusive lifetime lock, then restart. Either path leaves
@@ -1630,17 +1629,13 @@ covered row.
 | Local source walker | `project_id` + generation | source unavailable or retained last-good view |
 | Repo knowledge/gap publisher | project + scope + accepted commit | covered Published: remote accepted source only; compatibility lanes retain last accepted snapshot and report unavailable |
 | Git history | project/repo + code generation | no current-file overlay, stale commit docs labeled |
-| Blame | project + relative path + requested commit | `attachment_required` or commit mismatch |
 | Render/file provider | project + relative refs | `attachment_required` |
-| Provenance note import/export | stable project refs | `attachment_required` for Git note I/O |
 | Init/eject/mutation/refactor | stable project selection | `attachment_required` or write-gate denial |
 | Artifacts/watchers | project-stamped artifacts | covered Published: no carrier or local checkout operation; compatibility lanes retain durable catalog metadata |
 | Tool/transcript edges | catalog project id + relative anchor | unresolvable path event is diagnosed, never re-id'd |
 
-Blame must verify that the selected attachment contains the requested commit or
-snapshot; it cannot blame arbitrary attachment `HEAD`. Render filters by
-project id immediately even while output remains attachment-side. Provenance
-plan generation stays corpus-only; only legacy Git-note I/O acquires a lease.
+Render filters by project id immediately even while output remains
+attachment-side.
 
 Every adapter returns a bounded structured error or degraded health state. No
 adapter silently selects another checkout, falls back from collected to local,
@@ -1730,8 +1725,8 @@ reattach, reassign, restart, and explicit retirement converge exactly once.
    live views, rebind, and advance.
 2. Key accepted knowledge/gap views by catalog identity and stamps, including
    per-checkout overlay-baseline degradation after publisher detach.
-3. Move blame, render, provenance notes, file providers, artifact watchers,
-   refactor/mutation, and tool-edge path resolution to leases.
+3. Move render, file providers, artifact watchers, refactor/mutation, and
+   tool-edge path resolution to leases.
 4. Surface capability-specific health and typed attachment errors.
 
 Exit gate: no corpus-only request requires `ProjectRecord`; every remaining
@@ -1828,7 +1823,7 @@ implemented.
 ### Identity and migration
 
 - A version-1 singleton import preserves project id, aliases, timestamps,
-  commit namespace, every project-file/symbol/commit/provenance ref, activation,
+  commit namespace, every project-file/symbol/commit ref, activation,
   vector selector, edge manifest, artifact key, and sidecar location.
 - Missing-path, non-Git, shallow, and uncommitted-authority records survive as
   `legacy_local` without manufactured scope.
@@ -2016,8 +2011,8 @@ implemented.
 
 ### Checkout adapters
 
-- Remote-only blame, render, file, eject, mutation, artifact-watch, and Git-note
-  operations return typed capability errors without filesystem access.
+- Remote-only render, file, eject, mutation, and artifact-watch operations
+  return typed capability errors without filesystem access.
 - Publisher binding cannot change through branch switch, checkout `HEAD`, or a
   config edit. Detach retains the last accepted snapshot.
 - Accepted knowledge and gap generations survive restart with no attachment;
@@ -2073,8 +2068,8 @@ selectors use stable catalog identity, every remaining checkout access is an
 explicit observable lease, and detach cannot delete durable project state.
 
 The daemon is not yet checkout-free. The next slices use the same scope-bound
-producer credential infrastructure for typed Git-history/provenance and
-published knowledge transports. Each replaces one adapter in section 14. Only
+producer credential infrastructure for typed Git-history and published
+knowledge transports. Each replaces one adapter in section 14. Only
 after checkout-access observations are zero outside intentional local mutation
 and session-bound operations, plus cutback has been proven, may the legacy
 adapters be retired and the corpus process moved off-host.

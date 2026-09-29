@@ -30,7 +30,7 @@ Date: 2026-07-26
 
 Governing design:
 [`durable-project-catalog-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-impl.md)
-sections 6.3 (version-1 import and rollout command), 7.2 through 7.3
+sections 6.3 (version-1 import), 7.2 through 7.3
 (migration transaction and path-keyed durable-store backfill), 9.2
 (observability and proof), 10.3 (catalog-mode startup), 11 (lock order),
 12 (collector authority and cutback state machine), 13.2 (publisher
@@ -153,18 +153,10 @@ named rollback asset (FD-8, section 10.1).
 This section states every binding decision the plan implements. Each is a
 plan-stated decision with rationale, not an open question.
 
-**FD-1. Two new verbs only; existing variant topology retained, with
-exactly two additive flags.** The only new `ProjectCatalogCommand`
+**FD-1. Two new verbs only.** The only new `ProjectCatalogCommand`
 variants are `DurableBackfill(DurableBackfillArgs)` and
 `PathFreeRebuild(PathFreeRebuildArgs)`, spelled as governing section 15
-names the operations. The shipped `Migrate` and `Verify` variants keep
-their topology: `Migrate` has `ArgGroup("mode")` over `preflight|apply`
-(`src/bin/blackbox.rs:249-253`), and `Verify` is its own variant taking
-`--root` (`src/bin/blackbox.rs:294-297`). Exactly two additive flags
-extend them, both defined in section 3.2 and neither changing existing
-invocations: `--configured` on `MigrateArgs` (apply-target selection) and
-`--require-exclusive-availability` on `VerifyArgs` (the bridge-down
-proof, not a new verb). New verbs carry a preflight/apply/verify mode
+names the operations. New verbs carry a preflight/apply/verify mode
 triple internally (section 3.1).
 
 `durable-backfill` stamps and rewrites path-keyed durable-store rows across
@@ -295,7 +287,7 @@ command parses.
   claims silently cross roots. `--configured` derives the real configured
   projects path and (for apply) requires the exclusive lifetime lock
   (section 4). `--rehearsal-root` derives participant paths from the
-  isolated root, exactly as shipped `migrate --apply` does today.
+  isolated root.
 - **Preflight targets the state it captures.** With `--rehearsal-root`,
   preflight runs against the operator-created isolated bundle: D-026
   requires rerunning preflight against that bundle before rehearsal
@@ -333,18 +325,9 @@ exactly one target BEFORE facade invocation; the facade itself validates
 the target layout, artifact confinement, exact identity binding,
 predecessor state, transaction recovery, and post-commit verification; a
 rehearsal-selected layout must carry the expected rehearsal-root shape
-and a configured-selected layout must be config-resolved; the configured
-MIGRATE apply takes the factored lifetime claim (section 4.2) as a
-PROBE and releases it before the facade call (amended during the
-operational-cut repair arc: the migration transaction re-acquires the
-same advisory lock exclusively on its own descriptor, which cannot
-coexist with any claim this process still holds - the section 4.1
-flock self-conflict class - so held coverage made every configured
-apply refuse lifetime_lock_busy against itself; the transaction's own
-exclusive acquisition is the runbook-ordering enforcement and the
-stopped-service window is the exclusion, exactly as section 4.2's
-claim-helper contract states); the NEW-VERB applies keep the held-claim
-caller precondition because their facades do not re-acquire; rehearsal
+and a configured-selected layout must be config-resolved; configured
+applies hold the factored lifetime claim (section 4.2) because their
+facades do not re-acquire; rehearsal
 apply takes no configured-store lock and performs no hidden configured
 fallback; verify is target-explicit under the same selection rules; and
 no second manifest writer, transaction owner, or recovery
@@ -359,47 +342,12 @@ Both new commands produce the D-020 versioned result envelope. The envelope
 `project_catalog_path_free_rebuild_apply`,
 `project_catalog_path_free_rebuild_verify`.
 
-### 3.2. Existing command changes
+### 3.2. Version-1 migration surface
 
-**`migrate` gains the configured-target capability for apply only
-(adjudication Q-B, ratified shape).** Add `--configured` to `MigrateArgs`
-as an alternative to `--rehearsal-root`, enforced by the section 3.1
-two-layer mechanism. Preflight requires neither flag: live migration
-preflight captures configured state through `ConfigArgs` resolution with
-no target flag, exactly as governing section 6.3 specifies ("It can run
-while the v1 daemon remains available"). The D-026 isolated-bundle
-preflight that precedes a `migrate` rehearsal apply keeps its shipped
-shape: `ConfigArgs` (`--projects-path`/`--state-dir`) pointed at the
-bundle, since `--rehearsal-root` conflicts with `--preflight` on the
-shipped `MigrateArgs` and this plan does not change the shipped surface.
-
-Configured apply is NOT a CLI-layer flag over the shipped facade path:
-`FacadeCoreV1::apply_rehearsal` calls `validate_rehearsal_separation`,
-which by design refuses any target not isolated from the protected
-layout, and under `--configured` the two ARE the same layout. The
-ratified shape keeps `apply_rehearsal` untouched and introduces a
-distinct configured entry (`apply_configured` or equivalent) whose
-request carries one `target_layout`, `report_path`, and
-`resolution_path`. Its path validates the target layout, runs
-`validate_artifact_set` and `validate_artifact_target` against that
-target, decodes the exact artifacts, and retains every four-hash,
-report-status, resolution, recapture, transaction,
-mutation-disposition, and post-commit verification check, omitting ONLY
-`validate_rehearsal_separation` because configured target equality is the
-operation's definition. Both entries share a private apply-to-target
-core so they cannot drift transactionally. The dual-layout
-`ProjectCatalogMigrationApplyRequestV1` keeps its rehearsal meaning
-unchanged; it is never conditionally overloaded.
-
-Lock acquisition for configured apply uses the factored claim helper of
-section 4.2 (`acquire_admin_lifetime_claim`), NOT `open_admin_store`:
-the shipped `open_admin_store` strict-opens a v2 store, which correctly
-refuses the still-version-1 configured store that exists before the
-migration transaction runs. The CLI takes the claim as a PROBE before
-any target read or mutation and releases it before the facade call
-(amended during the operational-cut repair arc; the transaction's own
-exclusive acquisition is the enforcement, per the section-4.2 note
-below).
+Version-1 migration has no subcommand. The migration facade keeps
+preflight and rehearsal apply as the producer of migrated fixtures, and
+strict catalog open verifies every `MigratedV1` catalog through its origin
+marker, receipt binding, and transaction journal.
 
 **Lock discipline (preflight).** Governing section 6.3 states "preflight
 takes a shared/read lock." This matches the shipped code: preflight capture
@@ -411,32 +359,8 @@ closure. A shared lifetime lock does not exclude the daemon's own shared
 handle, so preflight runs while the bridge is live and sees a consistent
 snapshot.
 
-**`verify` gains the exclusive-availability proof mode AND a
-configured-target verification entry (adjudication Q-B).** Add
-`--require-exclusive-availability` to `VerifyArgs`. When set, the command
-attempts `ProjectCatalogMigrationLock::try_acquire_exclusive` against the
-configured projects path. If it returns `Ok(Some(_))`, the bridge is down; the
-guard is dropped and verification proceeds. If it returns `Ok(None)`, the
-command exits nonzero with `error.project_catalog_cli_lock` and a message
-stating the lifetime lock is shared (bridge is live). This replaces a proposed
-`lock-status` verb: it reuses the existing `Verify` variant and result
-envelope.
-
-The availability probe alone is not P6-F's configured verification: the
-shipped `VerifyArgs` requires `--root` and the verification facade
-rejects layouts without a rehearsal root, so the configured store cannot
-be verified as shipped. The ratified shape: plain `verify --root ...`
-retains rehearsal verification unchanged;
-`verify --require-exclusive-availability --config ...` selects the
-CONFIGURED layout (`--require-exclusive-availability` conflicts with
-`--root`), performs the availability probe, and invokes a
-configured-target verification entry that does not require a rehearsal
-root. Every existing invocation remains valid. The probe primitive
-shipped at `4b995c63` is retained as-is; the configured-target
-verification entry completes it.
-
-No other changes to the shipped surface. `Add`, `List`, `Get`, `Alias`,
-`ScopeMigrate`, and `Retire` are untouched.
+`Add`, `List`, `Get`, `Alias`, `ScopeMigrate`, and `Retire` are
+untouched.
 
 ### 3.3. `durable-backfill` semantics
 
@@ -579,8 +503,8 @@ newer binary wrote survive. The remaining three have ratified shapes:
 - **Provenance (Q-E3, REVERSED by Q-E3b): EXEMPT BY CONSTRUCTION.**
   Provenance capture requires a nonempty `project_id`, derives it from
   the legacy project record/repository association, and emits ONLY
-  `OwnerSnapshotRowV1::InventoryTarget { project_id, .. }` rows
-  (`crates/bbox-provenance/src/lib.rs:439-560`); legacy ledger bindings
+  `OwnerSnapshotRowV1::InventoryTarget { project_id, .. }` rows; legacy
+  ledger bindings
   form exclusively from `LegacyProjectSelector` rows via
   `legacy_path_observations`, so a legitimate captured migration cannot
   produce a Provenance stamping obligation, and the legacy project id
@@ -848,10 +772,7 @@ aborted apply, not corruption.
 **The factored lifetime claim (adjudication Q-B).** `open_admin_store`
 composes two things: the exclusive-then-downgrade lock acquisition
 (steps 1 through 3) and a strict `ProjectCatalogStore::open_existing`
-(step 4). The strict open correctly refuses a version-1 store, so
-`open_admin_store` CANNOT be called unchanged before the configured
-migration has run - exactly the moment configured apply needs the lock.
-The acquisition portion is factored into a lock-only helper:
+(step 4). The acquisition portion is factored into a lock-only helper:
 
 ```text
 acquire_admin_lifetime_claim(projects_path)
@@ -860,21 +781,10 @@ acquire_admin_lifetime_claim(projects_path)
     -> return guard
 ```
 
-The CLI takes the claim as a PROBE before any target read or mutation,
-then RELEASES it before the facade call (amended during the
-operational-cut repair arc): the migration transaction re-acquires the
-same advisory lock exclusively on its own descriptor, which cannot
-coexist with any claim this process still holds, so held coverage made
-every configured apply refuse lifetime_lock_busy against itself. The
-probe proves no daemon holds the store at that instant with the
-operator-actionable refusal; the transaction's own exclusive
-acquisition, taken before recovery, mutation-lock acquisition, or
-publication, is the runbook-ordering enforcement, and a daemon entering
-the probe-release window makes the transaction refuse with no durable
-mutation. `open_admin_store` continues to use the helper and then
-strict-opens, for operations whose target is already version 2 (the new
-verbs' configured applies, which run after migration, and whose facades
-do not re-acquire, so their held-claim caller precondition stands).
+The new verbs' configured applies hold the claim for the complete facade
+call; their facades do not re-acquire, so that held-claim caller
+precondition stands. `open_admin_store` uses the helper and then
+strict-opens, for operations whose target is already version 2.
 
 ### 4.3. Rehearsal apply needs no exclusive lock
 

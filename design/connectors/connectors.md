@@ -64,5 +64,5 @@ code-source collector transport.
   rides.
 - [Operations](../operations/operations.md) - config lifecycle and the
   secrets provider layer.
-- [Integrations](../integrations/integrations.md) - the Slack agent bridge,
-  which the Slack ingestion connector complements but does not replace.
+- [Integrations](../integrations/integrations.md) - user-facing adapters
+  over Blackbox surfaces.

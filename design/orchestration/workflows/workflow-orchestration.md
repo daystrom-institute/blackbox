@@ -5,14 +5,15 @@ corpus: blackbox-design
 topic:
   - orchestration
   - workflows
-brief: "Hub for workflow-shaped orchestration, context assembly, workflow-backed atoms, and live tmux handoff."
+brief: "Hub for brofile context assembly and workflow expressiveness analysis."
 ---
 
 # Workflow Orchestration
 
-Workflow specs are the deterministic coordination surface around agentic work.
-This cluster covers prompt context assembly, workflow-backed atoms, and live
-handoff to human-visible tmux state.
+This cluster covers brofile prompt context assembly and the workflow
+expressiveness analysis. Deterministic coordination around agentic work belongs
+to callers, as defined by the
+[bro execution boundary](../bro-execution-boundary-and-retirement.md).
 
 ## Docs
 

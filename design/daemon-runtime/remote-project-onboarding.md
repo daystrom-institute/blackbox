@@ -23,8 +23,9 @@ by the collector or the daemon. The only real decision is ownership, and it
 has an answer that needs a human only when two producers claim the same
 repository.
 
-The target: an agent calls `bbox_project_register(path)`, commits the
-`.bbox` identity files it is told to commit, and the project publishes. No
+The target: one ops-surface call,
+`bro mcp call bbox_project_register '{"path":"<path>"}' --surface ops`, a
+commit of the `.bbox` identity files it names, and the project publishes. No
 daemon config edit, no deploy, no collector restart, no grant question.
 
 ## 1. Model
@@ -38,8 +39,8 @@ Four cooperating pieces:
    scaffolds `.bbox`, derives the scope and published ref, records the
    project in an enrolled-projects sidecar, and onboards immediately. The
    running collector reloads its configuration without a restart.
-3. **Agent-initiated enrollment (MCP).** The collector reports the roots it
-   is willing to enroll under. `bbox_project_register` on a path the daemon
+3. **Remote enrollment (MCP ops surface).** The collector reports the roots
+   it is willing to enroll under. `bbox_project_register` on a path the daemon
    cannot see routes an enroll command to the covering collector over the
    producer channel and returns the onboard receipt.
 4. **Onboarding skill (MCP).** The daemon serves an onboarding skill whose
@@ -119,7 +120,7 @@ require a restart.
 
 ```text
 bbox-code-collector --config <cfg> add <path> [--ref <full_ref>]
-    [--no-git-history] [--no-provenance] [--no-published-knowledge]
+    [--no-git-history] [--no-published-knowledge]
 ```
 
 1. Canonicalize `<path>`; require an existing directory inside a main Git
@@ -129,8 +130,8 @@ bbox-code-collector --config <cfg> add <path> [--ref <full_ref>]
    the repository root, so a subdirectory yields a subtree scope.
 4. Derive the published ref: `--ref`, else the branch `origin/HEAD` names,
    else the current branch.
-5. Record the project in the sidecar atomically with Git history,
-   provenance, and published knowledge enabled unless disabled by flag.
+5. Record the project in the sidecar atomically with Git history and
+   published knowledge enabled unless disabled by flag.
    Re-adding an enrolled root is idempotent.
 6. Onboard the project immediately over the producer channel.
 7. Print a JSON receipt: project id, attachment id, scope, published ref,

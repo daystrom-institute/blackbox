@@ -1238,7 +1238,7 @@ arms implement governing section 7.2:
   validating to a different scope returns `scope_migration_required` with
   the exact dry-run command; neither creates a second project. Nomination
   ingestion per section 7.6. The post-register enrichment pipeline
-  (artifacts, provenance import, watchers, kb roots, transcript backfill)
+  (artifacts, watchers, kb roots, transcript backfill)
   runs behind the same capability leases in both modes.
 - `bbox_project_rename` becomes attachment relocation: same checkout id and
   same validated `PublishedScope` after the move, committed in one pair
@@ -1269,14 +1269,14 @@ class taxonomy fixed here:
 
 | family | surfaces | class | notes |
 |---|---|---|---|
-| corpus search | `bbox_search`, `bbox_cite`, `bbox_sessions_list`, `work_tool_calls` | Filter | B1 retired: `bbox-corpus-index` search gains a typed pre-resolved filter input `{ project_id: Option<String>, literal: String }`; resolution moves to the daemon/mcp-tools boundary (dependency direction forbids calling the engine from `bbox-corpus-index`). Literal lane semantics preserved verbatim. |
-| hybrid/graph search | `bbox_hybrid_search`, `bbox_discover_seed_entities` | Filter | B2 converted to the engine; the v1 arm keeps the eight-hex pass-through and hash fallback as tagged compatibility outcomes; the v2 arm never mints identity. |
+| corpus search | `bbox_sessions_list`, `bbox_tool_calls` | Filter | B1 retired: `bbox-corpus-index` search gains a typed pre-resolved filter input `{ project_id: Option<String>, literal: String }`; resolution moves to the daemon/mcp-tools boundary (dependency direction forbids calling the engine from `bbox-corpus-index`). Literal lane semantics preserved verbatim. |
+| hybrid/graph search | `bbox_hybrid_search` | Filter | B2 converted to the engine; the v1 arm keeps the eight-hex pass-through and hash fallback as tagged compatibility outcomes; the v2 arm never mints identity. |
 | knowledge | learn/forget, `bbox_knowledge`, render, knowledge/gap views | write=Selection, list=Filter | wrappers reimplemented on the engine; existing fallback-cut and checkout-identity guards unchanged. |
 | gaps | `bbox_gap`, `bbox_gaps`, resolve/update | same as knowledge | |
-| coordination | threads (x2 + roadmap promote), notes, pins, inbox, roadmap, whiteboards | write=Selection, list=Filter | the three direct `fleet_worktree_scope_and_dir` call sites route through the engine's worktree arm. |
-| graph/provenance | `bbox_ref_size`, `bbox_blame`, provenance export/import, `bbox_edge_compact` | Selection | B3 folded into the engine id arm. `bbox_edge_compact` keeps raw-id behavior on the v1 arm (tagged) and fails closed on unknown ids on the v2 arm. |
+| coordination | threads (x2 + roadmap promote), notes, roadmap | write=Selection, list=Filter | the three direct `fleet_worktree_scope_and_dir` call sites route through the engine's worktree arm. |
+| graph | `bbox_edge_compact` | Selection | B3 folded into the engine id arm. `bbox_edge_compact` keeps raw-id behavior on the v1 arm (tagged) and fails closed on unknown ids on the v2 arm. |
 | admin/storage | lifecycle tools (9.1), storage tools | Selection (storage: Filter) | B6 raw pass-through preserved on v1 as documented compatibility, tagged. |
-| slack/orchestration config | `bro_slack_bind`, `bro_mcp` project scope | Selection | B4/B5 route through the engine; unregistered-path storage behavior preserved on v1, tagged. |
+| orchestration config | `bro_mcp` project scope | Selection | B5 routes through the engine; unregistered-path storage behavior preserved on v1, tagged. |
 | HTTP | `/mcp?project=` | Filter | resolves via the engine; literal fallback v1-only, tagged. |
 | dispatch plane | `bro_*`/`work_*`/control-plane `cwd`/`project_dir` | none | out of scope: execution targets (section 3); only the existing ambient-pin resolution moves onto the engine wrapper it already uses. |
 
@@ -1344,7 +1344,7 @@ executed in CI (integration test) and live (catalog-mode bootsmoke):
    no-authority/empty outcome with response stamps and without a lease.
    Serving accepted published knowledge/gap content for an attachment-less
    project is the Phase 5 view wiring and is explicitly not asserted here;
-3. path operations (render, blame target selection, knowledge write) on the
+3. path operations (render, knowledge write) on the
    two-attachment project require a session pin, explicit attachment id, or
    configured default, and succeed with exactly one attachment selected;
 4. unknown absolute paths, unknown ids, duplicate aliases, and equal-depth
@@ -1412,15 +1412,12 @@ The Phase 1 ten-step protocol is unchanged (build, `which stablesign`,
 stable-sign the exact binaries, unused isolated port,
 `scripts/dev-isolated-daemon.sh`, listening log with throwaway paths, HTTP
 probes, MCP initialize, milestone assertion, graceful shutdown and Trash).
-Catalog-mode smokes additionally produce the isolated migrated root first
-and verify it with the stable-signed `blackbox` CLI. Per D-030, the root is
-materialized by the ignored facade-driving producer test (byte-identical to
-the production apply ceremony) rather than by CLI preflight/apply against a
-synthetic layout: the CLI preflight source is config-shaped by design, and a
+Catalog-mode smokes additionally produce the isolated migrated root first;
+strict catalog open verifies it. Per D-030, the root is materialized by the
+ignored facade-driving producer test rather than by preflight against a
+synthetic layout: preflight's source is config-shaped by design, and a
 synthetic config-shaped fixture cannot supply live publisher git evidence
-(`publisher_git_evidence_missing`). The CLI preflight/apply envelopes were
-live-smoked against real state in P1-D; the smoke's CLI role here is
-`verify --root` on the produced root. Do not copy, replace,
+(`publisher_git_evidence_missing`). Do not copy, replace,
 sign, restart, or signal the production or persistent dev service; any
 future need for the persistent dev instance requires the read-only scope
 check and explicit operator approval.

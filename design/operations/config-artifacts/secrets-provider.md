@@ -82,16 +82,15 @@ provider-type config pattern, one error taxonomy, one redacted value type, in
 
 | Consumer | Plane | Secrets it needs | Custody |
 |---|---|---|---|
-| Corpus daemon (cage) | corpus | Embedding route API keys, webhook signing secrets, producer-grant verification material | Cluster secrets plane, delivered as file-shaped references |
+| Corpus daemon (cage) | corpus | Embedding route API keys, producer-grant verification material | Cluster secrets plane, delivered as file-shaped references |
 | Code collector | producer | Its `ServiceToken` for the corpus transport | Producer host, file-sourced |
 | Connector satellite (proposed) | producer | Its `ServiceToken`, plus per-source OAuth client secrets and rotating refresh tokens | Producer host, file-sourced, with a writable reference for refresh |
 | Harness child | producer-adjacent | Provider transport credentials for its dispatch | Composed centrally today, delivered per child (section 13) |
-| `bro` CLI | checkout | A scope-bound `ServiceToken` for blame, provenance, and MCP routes | Operator host, file-sourced |
+| `bro` CLI | checkout | A scope-bound `ServiceToken` for MCP routes | Operator host, file-sourced |
 
 The daemon's own consumers are not on this contract yet: embedding providers
 read a named env var at construction, MCP injection resolves a secret entry
-through process env, webhook verification reads a per-endpoint env var, and
-provider dispatch env is synthesized from process env plus brofile account
+through process env, and provider dispatch env is synthesized from process env plus brofile account
 records. The sanctioned static resolver exists and serves three call sites.
 Converging them is phase work, not a precondition for the custody rules.
 
@@ -193,8 +192,8 @@ broken locally and reports that through its publisher status; it does not fail
 over to a central broker, because there is not one. This is what makes the
 connector program deployable on a machine the corpus cannot reach into.
 
-**Corpus plane.** The daemon holds embedding route API keys, webhook signing
-secrets, and producer-grant verification material. In the deployed topology these arrive as file-shaped
+**Corpus plane.** The daemon holds embedding route API keys and producer-grant
+verification material. In the deployed topology these arrive as file-shaped
 references produced by the cluster secrets plane (section 5), so the daemon's
 resolution path is the boring one: read a file, check ownership and mode,
 redact, cache in memory.
@@ -295,7 +294,6 @@ secrets arrive on the platform lane by default:
 | Secret | Lane | Why |
 |---|---|---|
 | Embedding route API keys | Synced | Long-lived vendor keys; a stale cached value beats an embedding outage. Rotation lands on the config reload that reconstructs embed providers. |
-| Webhook signing secrets | Synced | Verification must keep working during a secrets-plane outage or every inbound event fails closed at once. |
 | Producer-grant verification material | Synced | Transport auth must survive an outage; otherwise a sealed vault silently stops all corpus ingestion. |
 | Any future short-TTL dynamic credential | Direct | Dynamic credentials are the whole reason the direct lane exists. |
 
@@ -445,10 +443,10 @@ single-operator posture stands.
    validation, and a read-only status surface listing providers and health but
    never values. Gate: default behavior with an empty config section is
    byte-identical to today.
-3. **Corpus-plane consumer adoption.** Embed key references, webhook signing
-   references, MCP injection references behind the per-project grant list, and
-   generated-token persistence onto the writable contract. Gate: an embed
-   request and an inbound webhook each run from a reference with no plaintext
+3. **Corpus-plane consumer adoption.** Embed key references, MCP injection
+   references behind the per-project grant list, and generated-token
+   persistence onto the writable contract. Gate: an embed request runs from a
+   reference with no plaintext
    in any persisted artifact or log; an ungranted project-local reference
    fails closed.
 4. **Producer-plane adoption.** Collector and connector satellite config take

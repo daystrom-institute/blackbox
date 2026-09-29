@@ -38,7 +38,6 @@ of 2026-05-30:
   sharing `pathology_common` with arch); plan path
   `design/refactor/perf/plans/<slug>.md`, `kind: performance-correction-plan`,
   `PP-*` criteria.
-- Operator runbook: `docs/perf-pathology-dispatch.md`.
 
 The smell catalog mapped to **6 grouped detector atoms** rather than one atom
 per smell (v0 chose cost-center families over a 1:1 ontology). Remaining: a live

@@ -7,7 +7,7 @@ topic:
   - orchestration
   - phase-decomposer
 date: 2026-05-10
-status: "implemented as system-defaults/phase-decompose workflows, brofiles, teamplates, fixtures, and the corpus-pathfinder agent manifest"
+status: "phase-decompose brofiles (including the corpus-pathfinder scout), teamplates, scripts and fixtures are installed defaults; callers compose the stages"
 brief: "Routes oversized phase docs through scouting, evidence sizing, optional decomposition, parallel implementation, and recomposition."
 ---
 
@@ -15,8 +15,9 @@ brief: "Routes oversized phase docs through scouting, evidence sizing, optional 
 
 Date: 2026-05-10
 Status: implemented after live no-edit validation on 2026-05-16. The shipped
-surface is `system-defaults/phase-decompose` workflows, brofiles, teamplates,
-fixtures, and the `corpus-pathfinder` agent manifest. Final
+surface is the `system-defaults/phase-decompose` teamplates, scripts and
+fixtures plus the phase-decompose brofiles, including the `corpus-pathfinder`
+scout. Final
 hardened live proof: `arc-5a5fd112da724ce7a06ab7d1fe007bd8` reached `Done`
 with `recompose_verdict=satisfied` after measured DAG lint, eight supervised
 no-edit subflows, and mechanical recomposition assertions. Edit/merge mediation
@@ -150,7 +151,7 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
 
 2. **Dispatch scouts.** `foreach` over question-shapes
    (`schema.rs:193-276`). Each iteration runs a scout subworkflow —
-   corpus-pathfinder agent returning structured leads (tldr,
+   corpus-pathfinder scout returning structured leads (tldr,
    entity_refs, path_ids, bundle_handle, gap_check). Scouts are
    parallel-safe, dispatched up to `foreach.parallelism`.
    Results collect into `vars.scout_results` (`engine.rs:1834-1839`).
@@ -244,8 +245,8 @@ Only when `triage_verdict == needs_decompose`. The parent workflow's
 
 ### 4.2 What it does
 
-A caller-owned panel deliberation: the caller fans proposals out with
-`bro_broadcast` and collects them with `bro_when_all`:
+A caller-owned panel deliberation: the caller dispatches each panel member
+with `bro_exec` and collects the proposals with `bro_when_all`:
 
 - **Blind proposal:** Each panel member proposes a decomposition
   independently. Proposals are typed structured JSON with target
@@ -404,7 +405,6 @@ repair, and live mutating validation.
 | Arc-level policy gate | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Compaction anchor (rolling summary) | `src/workflow/engine.rs` | implemented |
 | Durable actor sessions | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
-| Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
 | Advisor checkpoint/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
 | Classifier workflow-backed atom pattern | `system-defaults/atoms/supervision/classifier.json`, `system-defaults/workflows/supervision/classifier.json`, `src/tools/atoms.rs` | implemented |
@@ -436,9 +436,9 @@ repair, and live mutating validation.
 
 ## 9. Build sequence
 
-1. **Scout agent manifest.** Corpus-pathfinder as installed JSON agent
-   (`system-defaults/agents/corpus-pathfinder.json`). Strict-typed structured
-   output. Parallel-safe.
+1. **Scout brofile.** Corpus-pathfinder as an installed brofile
+   (`system-defaults/brofiles/phase-decompose/corpus-pathfinder.json`).
+   Strict-typed structured output. Parallel-safe.
 2. **Inlet agent.** The discovery subworkflow that orchestrates scouts,
    aggregates results, estimates per-ref bytes, and produces the triage
    verdict + evidence bundle.

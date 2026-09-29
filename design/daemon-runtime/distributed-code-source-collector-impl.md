@@ -832,6 +832,6 @@ The next decomposition gate remains explicit: replace the overlap-only
 requirement for a local `ProjectRecord` with a durable corpus project catalog
 and host-local checkout attachments. That design must migrate project
 selection, display paths, repo-owned knowledge publication, aliases, Git
-history, blame, and any host-path-bearing API together. Only after that gate,
+history, and any host-path-bearing API together. Only after that gate,
 plus the already deferred checkout-local surfaces, may the corpus be called
 mount-free or moved off-host.

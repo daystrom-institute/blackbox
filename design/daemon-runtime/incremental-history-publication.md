@@ -365,7 +365,7 @@ Contract:
 3. A `Planned` revision is NONTERMINAL for startup and worker discovery:
    recovery enumerates journals AND ledgers with the same
    one-plan-per-probe discipline as journal checkpoints. The GH plan
-   section 7.9 `zero-prepared-journal` cutover proof extends to "zero
+   section 7.7 `zero-prepared-journal` cutover proof extends to "zero
    nonterminal cores AND zero `Planned` revisions".
 4. **Bounded settle** (round-2 finding 3): "settling" a `Planned` revision
    is a deterministic classification, never an open-ended retry. If live
@@ -504,12 +504,12 @@ Decision Ledger entry whose number is assigned at implementation time.
 | GH plan section 7.3 step 7 | Replaced by IH-D1 modes plus IH-D3 per-project actions; searcher exposure gated on in-writer verification. |
 | GH plan section 7.3 steps 9-11 | Gain the revision-ledger path for selector-only evolution (IH-D4). |
 | GH plan section 7.4 (recovery) | Extended per IH-D5b; step 4's receipt probe becomes the per-project action-list probe over ALL planned projects. |
-| GH plan section 7.9 zero-prepared-journal proof | Becomes zero nonterminal cores and zero `Planned` revisions. |
-| GH plan section 7.10 observation taxonomy | Currency predicate evaluation while a revision is live: a `Planned` revision within its bounded settle window is not currency loss; classification text amended accordingly. |
+| GH plan section 7.7 zero-prepared-journal proof | Becomes zero nonterminal cores and zero `Planned` revisions. |
+| GH plan section 7.8 observation taxonomy | Currency predicate evaluation while a revision is live: a `Planned` revision within its bounded settle window is not currency loss; classification text amended accordingly. |
 | GH plan GH-C mechanics and verification rows | Activation ordering gains the revision path and bounded settle; verification matrix gains delta/owner-flip/namespace-change/revision-crash/wedged-revision rows (section 7 here). |
 | GH plan section 9 health vocabulary | Adds `publication_mode`, guard-clause diagnostics, revision ordinal, and settle-classification outcomes to history health detail. |
-| GH plan section 10 bridge parity (closed 17-entry list) | Gains entries for delta publication mode, revision ledger, per-project reuse, and delta-time vector tombstones; per that section's own rule this requires plan amendment and re-review, provided by this design's review rounds plus the section 9 ceremony. |
-| GH plan section 11.4 fault matrix | Gains the IH-D5b crash points. |
+| GH plan section 10 bridge parity (closed 12-entry list) | Gains entries for delta publication mode, revision ledger, per-project reuse, and delta-time vector tombstones; per that section's own rule this requires plan amendment and re-review, provided by this design's review rounds plus the section 9 ceremony. |
+| GH plan section 11.3 fault matrix | Gains the IH-D5b crash points. |
 | GH plan section 12 exit gate | Gains delta-vs-full equivalence, revision-crash, wedged-revision settle, and post-P6-R full-replacement steps. |
 | Phase 6 `P6-R` (no parallel rebuild manifest) | Unchanged as a manifest rule; a completed P6-R rebuild invalidates delta admission for the next activation (IH-D5b). |
 | `bbox-indexing/CLAUDE.md` and writer-actor inline invariants | Amended: "publication proves the whole-lane commitment; it may reach it by guarded, pre-probed, in-writer-verified delta, must reach it by full replacement otherwise"; edge/receipt equality restated over the `Publish` set; delete-by-`repo_id`-alone remains forbidden. |
@@ -583,7 +583,7 @@ Decision Ledger entry whose number is assigned at implementation time.
 4. Sweeper re-enable (remove `BLACKBOX_EMBED_SWEEP_INTERVAL_SECS=0` from
    bbox-cage index.ts, converge); first sweep is the one-time family
    migration.
-5. Unpause the affected high-volume `git_history`/`provenance`
+5. Unpause the affected high-volume `git_history`
    collector lanes; verify two passes with no re-activation churn and
    delta-sized publications.
 6. Prune the orphaned voyage-code-3 partition once nothing maps to it.
@@ -609,6 +609,6 @@ review rounds:
    unselected sibling membership does not force re-emission.
 7. The amendment re-review is a scoped surface with full GH certification
    rigor: the existing phase-family reviewers and gates over GH-C, sections
-   7.3/7.4/7.9/7.10, section 9 health, section 10 parity, P3-F
+   7.3/7.4/7.7/7.8, section 9 health, section 10 parity, P3-F
    GC/tombstones, P6-R interaction, GH-F/G cutover proofs, and the exit
-   matrix; unrelated GH-A/B/D/E milestones are not reopened.
+   matrix; unrelated GH-A/B milestones are not reopened.

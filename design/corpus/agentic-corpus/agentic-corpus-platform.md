@@ -11,7 +11,7 @@ brief: "Hub for the agentic corpus substrate: indexing, entity graph, embeddings
 # Agentic Corpus Platform
 
 The agentic corpus is the substrate that indexes transcripts and project source,
-projects them into a typed entity graph, and exposes search/provenance surfaces.
+projects them into a typed entity graph, and exposes search surfaces.
 
 ## Docs
 

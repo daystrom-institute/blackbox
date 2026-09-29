@@ -76,10 +76,9 @@ plan.
 | `StreamableHttpService` + `LocalSessionManager`, `with_stateful_mode(true)`, keepalive from `BBOX_MCP_SESSION_KEEPALIVE_SECS` | `src/server/mcp.rs` (`build_http_app`) | `with_stateful_mode` renamed to `with_legacy_session_mode`; `NeverSessionManager` available for stateless |
 | Per-session OnceLocks (`surface`, `surface_tools`, `surface_project`, `session_checkout`) pinned at `initialize` | `src/server/handler.rs`, `src/server/state.rs` | The one hard collision. No `initialize` in 2026-07-28; fresh handler per request. Phase 1 rework |
 | Manual `ServerHandler` impl (`call_tool` -> `tool_router.call`, surface-filtered `list_tools`/`get_tool`) | `src/server/handler.rs` | Return types widen to `CallToolResponse` etc. (`.into()`); surface filtering logic itself is version-agnostic |
-| 177 `#[tool]` macros across `src/tools/*.rs` | `src/tools/` | Free: macro users need no MRTR changes |
-| Progress notifications (`context.meta.get_progress_token()`, `peer.send_notification(ProgressNotification)`) | `src/server/progress.rs`, `src/tools/dispatch.rs`, `src/tools/workspace.rs` | Survives (request-scoped progress stays on the response stream). `Meta` -> `RequestMetaObject` rename |
+| `#[tool]` macros across `src/tools/*.rs` | `src/tools/` | Free: macro users need no MRTR changes |
+| Progress notifications (`context.meta.get_progress_token()`, `peer.send_notification(ProgressNotification)`) | `src/server/progress.rs`, `src/tools/dispatch.rs` | Survives (request-scoped progress stays on the response stream). `Meta` -> `RequestMetaObject` rename |
 | App-level cancellation (`bro_cancel` = SIGTERM + store transition) | `src/tools/dispatch.rs` | No protocol cancellation for tools today; tasks extension adds `tasks/cancel` in Phase 2 |
-| Client: workflow `mcp_call` op (stdio + streamable HTTP self-call), `().serve(transport)` | `src/mcp_client.rs` | `serve()` still works (legacy lifecycle); Phase 1 upgrades to `serve_with_lifecycle(Auto)` |
 | Client: harness child -> daemon, `StreamableHttpClientTransport` | `crates/bro-harness/src/mcp.rs` | Same; the one client pair we own end to end (proving ground) |
 | 80KB response cap + spill envelope | `src/server/response.rs` | Orthogonal while loopback, but the spill-to-daemon-disk rationale ("every client has file-read tools") is a localhost assumption. Phase 4 serves spills as `blackbox://spill/{id}`; required before the corpus daemon goes remote |
 | Capabilities: `enable_tools()` only; no resources/prompts/subscriptions | `src/server/handler.rs` (`get_info`) | Greenfield for Phase 4 resource projection |
@@ -127,8 +126,8 @@ observable behavior change. Checklist:
    `Option<Value>` (we emit text content, so likely no-op).
 8. Result constructors now initialize `result_type: Some(COMPLETE)` and the
    server omits it for legacy peers; no action beyond snapshot updates.
-9. Client call sites keep `serve()` (legacy lifecycle) in both
-   `src/mcp_client.rs` and `crates/bro-harness/src/mcp.rs`. From rmcp
+9. The client call site keeps `serve()` (legacy lifecycle) in
+   `crates/bro-harness/src/mcp.rs`. From rmcp
    3.5.0 the default client info (including the `()` handler's) requests
    `initialize` at 2026-07-28, so zero behavior change requires a client
    info pinned to `ProtocolVersion::LATEST_WITH_INITIALIZE`. The daemon's
@@ -180,11 +179,10 @@ path for current clients. No tasks/resources yet.
    `serve_with_lifecycle` (`Discover` or `Auto`).
 6. Deterministic `tools/list` ordering; set `ttl_ms` +
    `cache_scope: Private` on `ListToolsResult`.
-7. Upgrade both client paths to `serve_with_lifecycle`: `Auto` mode
-   (probe discover, fall back to legacy) for `mcp_call` and the harness
-   child client. Third-party stdio servers (biofilter) exercise the legacy
-   fallback; the daemon self-call exercises the modern path once the gate
-   is on.
+7. Upgrade the harness child client to `serve_with_lifecycle`: `Auto`
+   mode (probe discover, fall back to legacy). Third-party stdio servers
+   (biofilter) exercise the legacy fallback; the harness connection to the
+   daemon exercises the modern path once the gate is on.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the
@@ -265,13 +263,13 @@ slice independently of Phase 2, not task notifications.
   `list_resources` / `read_resource` consult the same per-request surface
   resolution.
 - Protocol cursor pagination + `ttl_ms`/`cache_scope` on list/read.
-- Catalogs: brofiles, teams, artifacts, atoms, live tasks;
+- Catalogs: brofiles, teams, artifacts, live tasks;
   threads optional.
 
 ## Phase 5: MRTR approval gates (opportunistic)
 
 - `InputRequiredResult` with elicitation for operator-confirmation flows
-  (consultant applies, destructive admin, RX-V1 flags), gated on client
+  (destructive admin, RX-V1 flags), gated on client
   elicitation support.
 - If state ever crosses MRTR rounds statelessly, adopt rmcp's
   `request-state` feature (HMAC codec) for integrity.

@@ -164,8 +164,8 @@ The executable gates include:
   loss.
 - No transport of absolute checkout paths, file bodies, or blob content beyond
   the existing daemon-local indexing boundary.
-- Git history, provenance, knowledge, blame, and render keep their independent
-  transport markers and compatibility decisions.
+- Git history, knowledge, and render keep their independent transport markers
+  and compatibility decisions.
 
 ## 5. Parent-plan effect
 

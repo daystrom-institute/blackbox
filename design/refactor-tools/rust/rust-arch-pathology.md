@@ -32,8 +32,6 @@ of 2026-05-30:
 - All **12 V0 diagnosis atoms** shipped under
   `system-defaults/atoms/refactor/rust-architecture-*.json` (matches §"V0 Rust
   pathology atoms" exactly).
-- Operator runbook: `docs/pathology-dispatch.md` (install + dispatch) and
-  `docs/reference-implementations.md`.
 
 Remaining: the §"Rejected or deferred from v0" / §"Future work" atoms, to be
 revisited after real pathology runs. A successful end-to-end live run is not
@@ -56,7 +54,7 @@ that an error type has become an architectural dumping ground, or that feature
 gates encode an accidental product matrix. Rust pathology owns those judgments.
 
 After operator review, the correction plan is handed to
-[Phase-Decomposer Dispatch](../../../docs/pd-dispatch.md) as normal
+[Phase Decomposer](../../orchestration/phase-decomposer/phase-decomposer.md) as normal
 `phase_doc_text` plus explicit `acceptance_criteria`.
 
 ## Relationship to the Java workflow
@@ -66,7 +64,7 @@ unchanged:
 
 - Pathology is upstream of refactor execution and stops at a correction plan.
 - Cheap survey comes first; LLM diagnosis is bounded to likely hotspots.
-- Whiteboard review challenges, merges, or rejects diagnosis candidates before
+- Ensemble review challenges, merges, or rejects diagnosis candidates before
   the plan is durable.
 - Findings that SAST can make are rejected as pathology atoms.
 - Multiple atom signals on one locus become one diagnosis, not a smell dump.
@@ -490,8 +488,8 @@ was not inspected.
 Diagnostic question: where has operator or agent history already identified
 Rust architectural pain, and does current code confirm it?
 
-Blackbox has transcripts, notes, work threads, decisions, refactor plans, and
-git provenance. Rust pathology checks whether current code still matches the
+Blackbox has transcripts, notes, work threads, knowledge, refactor plans, and
+git history. Rust pathology checks whether current code still matches the
 complaint and whether the architectural pressure has grown since the prior pain:
 repeated complaints about a file, failed refactor attempts, public API opt-out
 debates, compile-fix churn, or abandoned module-split plans. Narrative alone is
@@ -611,8 +609,8 @@ Example acceptance criteria:
 
 ## Remediation handoff
 
-Remediation uses the existing PD invocation shape documented in
-[pd-dispatch.md](../../../docs/pd-dispatch.md). Pathology does not require PD
+Remediation uses the existing PD invocation shape described in
+[Phase Decomposer](../../orchestration/phase-decomposer/phase-decomposer.md). Pathology does not require PD
 to learn Rust-specific fields.
 
 Minimum handoff:

@@ -5,20 +5,21 @@ corpus: blackbox-design
 topic:
   - integrations
   - slack
-brief: Hub for Slack-native Blackbox sidecar, agent iteration, egress, and bridge designs.
+brief: Hub for Slack design records.
 tags:
   - integrations
 ---
 
 # Slack
 
-Slack designs cover the Socket Mode sidecar, Slack-native agent iteration,
-egress, and app-home controls.
+Blackbox ships no Slack integration. The archived bro-slack design is kept as a
+record. Slack message observation is the conversation profile of the connector
+family.
 
 ## Docs
 
-- [bro-slack](bro-slack.md)
-- [bro-slack next](bro-slack-next.md)
+- [bro-slack](bro-slack.md) (archived)
+- [Slack Ingestion Connector](../../connectors/slack-ingestion-connector.md)
 
 ## Crosscuts
 
