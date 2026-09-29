@@ -271,7 +271,7 @@ CI gating was rejected for v0. Report-only diagnostics may come later.
 ## Relationship to existing designs
 
 - Sibling to [Architecture Pathology](arch-pathology.md).
-- Remediation uses [Phase-Decomposer](../orchestration/phase-decomposer/phase-decomposer.md)
+- Remediation uses Phase-Decomposer
   or a small wrapper around the same PD dispatch shape.
 - Refactor execution can use [Refactor Agents](refactor-agents.md) and
   [Refactor Compound Runs](refactor-compound-runs.md) when a slice maps to

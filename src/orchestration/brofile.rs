@@ -1475,36 +1475,6 @@ mod tests {
     }
 
     #[test]
-    fn phase_decomposer_edit_implementer_parses() {
-        let src =
-            include_str!("../../system-defaults/brofiles/phase-decompose/edit-implementer.json");
-        let bf: Brofile = serde_json::from_str(src).expect("phase-decomposer edit brofile parses");
-        assert_eq!(bf.name, "phase-decomposer-edit-implementer");
-        assert_eq!(bf.provider, Provider::Brodex);
-        // Retiered to runtime allocation (commit 6ae3437): model/effort are no
-        // longer hardcoded; the brofile selects a "premium" runtime tier.
-        assert_eq!(bf.model, None);
-        assert_eq!(bf.effort, None);
-        assert_eq!(
-            bf.runtime.as_ref().and_then(|r| r.tier.as_deref()),
-            Some("premium")
-        );
-        assert_eq!(
-            bf.context.as_ref().and_then(|c| c.provider_defaults),
-            Some(ProviderDefaultsMode::SuppressWhenSupported)
-        );
-        let lens = bf.lens.as_deref().unwrap_or("");
-        assert!(lens.contains("edit-capable bounded implementer"));
-        assert!(lens.contains("must not dispatch or resume agents"));
-        assert!(lens.contains("strict JSON only"));
-    }
-
-    /// Rust + Java refactor personas share a core allow/disallow surface:
-    /// exec/wait, code.* facts, analysis.* reductions, lsp.* authority,
-    /// edits.* algebra, and the grounding MCP tools. Their extensions mirror
-    /// the live language surfaces. Java adds java.*. Rust adds rust.* and
-    /// build.gate for the compiler repair loop.
-    #[test]
     fn rust_and_java_refactor_personas_share_tool_surface() {
         let rust_src =
             include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
@@ -1666,25 +1636,6 @@ mod tests {
                 "{name} should suppress provider defaults for profile-backed atoms"
             );
         }
-    }
-
-    #[test]
-    fn phase_decomposer_scout_brofile_suppresses_defaults() {
-        let src =
-            include_str!("../../system-defaults/brofiles/phase-decompose/corpus-pathfinder.json");
-        let bf: Brofile = serde_json::from_str(src).expect("corpus-pathfinder brofile parses");
-        assert_eq!(bf.name, "corpus-pathfinder");
-        assert_eq!(bf.provider, Provider::Brodex);
-        assert_eq!(
-            bf.context.as_ref().and_then(|c| c.provider_defaults),
-            Some(ProviderDefaultsMode::SuppressWhenSupported)
-        );
-        assert!(
-            bf.lens
-                .as_deref()
-                .unwrap_or("")
-                .contains("one focused discovery charter")
-        );
     }
 
     #[test]

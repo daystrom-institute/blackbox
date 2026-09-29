@@ -54,7 +54,7 @@ that an error type has become an architectural dumping ground, or that feature
 gates encode an accidental product matrix. Rust pathology owns those judgments.
 
 After operator review, the correction plan is handed to
-[Phase Decomposer](../../orchestration/phase-decomposer/phase-decomposer.md) as normal
+Phase Decomposer as normal
 `phase_doc_text` plus explicit `acceptance_criteria`.
 
 ## Relationship to the Java workflow
@@ -610,7 +610,7 @@ Example acceptance criteria:
 ## Remediation handoff
 
 Remediation uses the existing PD invocation shape described in
-[Phase Decomposer](../../orchestration/phase-decomposer/phase-decomposer.md). Pathology does not require PD
+Phase Decomposer. Pathology does not require PD
 to learn Rust-specific fields.
 
 Minimum handoff:

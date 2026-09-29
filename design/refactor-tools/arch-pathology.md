@@ -518,7 +518,7 @@ not imply atoms may set authority flags such as
 
 ## Relationship to existing designs
 
-- Sibling-shaped to [Phase-Decomposer](../orchestration/phase-decomposer/phase-decomposer.md):
+- Sibling-shaped to Phase-Decomposer:
   same broad dispatch discipline, different output.
 - Upstream of [AST-Assisted Refactor Mechanization](ast-refactor-mechanization.md)
   and [Refactor Agents](refactor-agents.md): pathology proposes; those surfaces

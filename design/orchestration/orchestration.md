@@ -41,7 +41,6 @@ the [Design Corpus](../design-corpus.md) Topic Hubs:
 ## Workflow Execution
 
 - [Workflow Orchestration](workflows/workflow-orchestration.md)
-- [Brofile Context Templates](workflows/context-assembly-system.md)
 - [Turing Completeness](workflows/turing-completeness.md)
 
 ## Supervised Execution
@@ -54,10 +53,3 @@ the [Design Corpus](../design-corpus.md) Topic Hubs:
 - [Turn-end Advisor](supervision/supervision-turn-end-advisor.md)
 - [Supervision Phased Implementation](supervision/supervision-phased-implementation.md)
 - [Runtime Allocation Tier Mapping](supervision/runtime-allocation-tier-mapping.md)
-
-## Large Work Decomposition
-
-- [Large Work Decomposition](phase-decomposer/large-work-decomposition.md)
-- [Phase Decomposer](phase-decomposer/phase-decomposer.md)
-- [Phase Decomposer - Implementation Plan](phase-decomposer/phase-decomposer-impl.md)
-- [Archived Phase Decomposer v0](phase-decomposer/phase-decomposer-archived.md)

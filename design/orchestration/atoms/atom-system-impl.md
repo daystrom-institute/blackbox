@@ -29,9 +29,6 @@ Related:
 - [Workflow Engine](../../../docs/workflows.md) - current workflow actor/subworkflow model.
 - [Supervision Impl](../supervision/supervision-impl.md) - advisor/oracle policy substrate.
   state.
-- [Phase Decomposer](../phase-decomposer/phase-decomposer.md) and
-  [Phase Decomposer Impl](../phase-decomposer/phase-decomposer-impl.md) - workflow-level
-  parallelism, decomposition, recomposition, and mediation.
 - [Refactor Compound Runs](../../refactor-tools/refactor-compound-runs.md) - transactional refactor
   runner.
 - `sm-refactor` and `sm-refactor-rust` - current bbox refactor tool runbooks.

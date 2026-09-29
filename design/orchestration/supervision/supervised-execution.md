@@ -31,4 +31,3 @@ Retained execution measurements belong to bro execution, as defined by the
 
 - [Atom Capability Runtime](../atoms/atom-capability-runtime.md)
 - [Workflow Orchestration](../workflows/workflow-orchestration.md)
-- [Large Work Decomposition](../phase-decomposer/large-work-decomposition.md)

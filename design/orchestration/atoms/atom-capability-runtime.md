@@ -29,6 +29,5 @@ composition, as defined by the
 
 - [Workflow Orchestration](../workflows/workflow-orchestration.md)
 - [Supervised Execution](../supervision/supervised-execution.md)
-- [Large Work Decomposition](../phase-decomposer/large-work-decomposition.md)
 - [Refactor Agents](../../refactor-tools/refactor-agents.md)
 - [Rust Refactor Atoms - Batch 2](../../refactor-tools/rust/rust-refactor-atoms-batch2.md)

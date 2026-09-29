@@ -33,9 +33,6 @@ Related:
   [Supervision Impl](../supervision/supervision-impl.md) - oracle / advisor / evaluation roles
   over running work.
   focus for live runs.
-- [Phase Decomposer](../phase-decomposer/phase-decomposer.md) and
-  [Phase Decomposer Impl](../phase-decomposer/phase-decomposer-impl.md) - workflow-level
-  decomposition, foreach dispatch, recomposition, and mediation.
 - [Refactor Compound Runs](../../refactor-tools/refactor-compound-runs.md) - deterministic compound
   tool-runner shape.
 

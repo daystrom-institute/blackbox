@@ -17,11 +17,9 @@ to callers, as defined by the
 
 ## Docs
 
-- [Brofile Context Templates](context-assembly-system.md)
 - [Turing Completeness](turing-completeness.md)
 
 ## Crosscuts
 
 - [Atom Capability Runtime](../atoms/atom-capability-runtime.md)
 - [Supervised Execution](../supervision/supervised-execution.md)
-- [Large Work Decomposition](../phase-decomposer/large-work-decomposition.md)

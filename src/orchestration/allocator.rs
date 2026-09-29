@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn inert_structured_output_request_honors_static_provider_pin() {
         with_provider_bins(|| {
-            // Simulate corpus-pathfinder: a static-provider brofile with no
+            // A static-provider brofile with no
             // runtime block whose output schema forces a StructuredOutput
             // derived capability into existence. The request carries no
             // tier/pool/pin of its own — it is inert.
@@ -3017,7 +3017,7 @@ mod tests {
     #[test]
     fn exclude_providers_for_diversity_narrows_pool_and_resolves_distinct_lane() {
         with_provider_bins(|| {
-            // Premium tiered request (the phase-decompose panel shape). On its
+            // Premium tiered request (a review-panel shape). On its
             // own it would resolve to the tiebreak winner (brodex, sorts first).
             let base = || RuntimeRequest {
                 tier: Some("premium".to_string()),

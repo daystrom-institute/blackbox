@@ -377,7 +377,7 @@ the teams store, not a teamplate. Per flow:
   [Architecture Pathology](arch-pathology.md) and
   [Rust Architecture Pathology](rust/rust-arch-pathology.md).
 - The lens model mirrors the ensemble shape of
-  [Phase Decomposer](../orchestration/phase-decomposer/phase-decomposer.md) and its
+  Phase Decomposer and its
   `decomposer-panel` teamplate.
 - The deliberation **follows** the bridgecrew adversarial-review plugin
   (`daystrom-institute/claude-plugins`, `bridgecrew/REVIEW_BOOTSTRAP.md` R10.5
