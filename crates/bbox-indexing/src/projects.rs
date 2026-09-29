@@ -742,7 +742,7 @@ pub use bbox_corpus_core::project_selector::ResolveIntent;
 /// than growing new bespoke chains.
 ///
 /// Known write-side quirk, deliberately NOT codified here: the legacy write
-/// chain (`resolve_project_write_scope`) lets a plain subdirectory of a
+/// chain (the daemon's `resolve_project_write`) lets a plain subdirectory of a
 /// registered root fall through to canonicalize-pass-through, keying state
 /// under the subdirectory itself. Under `Write` intent this resolver returns
 /// the base for the root/exact matches and `None` for plain subdirectories,

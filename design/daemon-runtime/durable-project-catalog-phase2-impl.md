@@ -139,7 +139,7 @@ helpers and eight bespoke bypasses. The canonical spine:
   duplicate claims), `sync_declared_aliases` (startup alias rewrite from
   committed config);
 - the daemon-side wrappers in `src/tools/scope.rs`:
-  `resolve_project_write_scope` / `resolve_project_write` (a
+  `resolve_project_write` (a
   `RepositoryMutation` lease probe whose `AttachmentNotFound` arm returns the
   raw selector verbatim as the durable scope key: the load-bearing
   unregistered-write pass-through) and `rescope_project_filter_value` (maps
