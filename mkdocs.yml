@@ -56,7 +56,6 @@ nav:
     - Artifact Catalog: artifact-catalog.md
     - Agent System: agent-system.md
     - Badgey: badgey.md
-    - Councils & Whiteboards: councils-whiteboards.md
     - MCP Surfaces: mcp-surfaces.md
   - Integrations:
     - Ingress Paths: ingress-paths.md

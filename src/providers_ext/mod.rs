@@ -43,7 +43,6 @@ mod tests {
             "note:note-12345678",
             "symbol:proj1234:crate::Type::method:defhash",
             "brofile:auditor",
-            "whiteboard:board-12345678",
             "commit:repo1234:abcdef1234567890",
             "task:task-12345678",
             "bash_call:session123:7",

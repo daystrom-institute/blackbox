@@ -84,6 +84,17 @@ pub struct Edge {
     pub project_id: Option<String>,
 }
 
+/// Endpoint types with no surviving entity family, each with the field that
+/// carries its identity. Rows naming one stay inert on disk.
+const RETIRED_ENDPOINT_TYPES: [(&str, &str); 2] = [("roadmap_item", "id"), ("whiteboard", "board_id")];
+
+fn retired_endpoint_id_field(endpoint: &serde_json::Value) -> Option<&'static str> {
+    RETIRED_ENDPOINT_TYPES
+        .iter()
+        .find(|(kind, _)| endpoint["type"] == *kind)
+        .map(|(_, id_field)| *id_field)
+}
+
 /// Decode surviving edges while allowing retired rows to remain inert on disk.
 /// Provenance is retained only for the overlay deletion guard.
 pub fn decode_live_edge_row(bytes: &[u8]) -> Result<(Option<Edge>, EdgeProvenance)> {
@@ -99,9 +110,9 @@ pub fn decode_live_edge_row(bytes: &[u8]) -> Result<(Option<Edge>, EdgeProvenanc
             let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
             let mut retired = false;
             for field in ["source", "target"] {
-                if value[field]["type"] == "roadmap_item" {
+                if let Some(id_field) = retired_endpoint_id_field(&value[field]) {
                     anyhow::ensure!(
-                        value[field]["id"].is_string(),
+                        value[field][id_field].is_string(),
                         "invalid retired edge endpoint"
                     );
                     retired = true;
@@ -684,8 +695,8 @@ impl TranscriptEdgeLaneWalk {
         }
         let value: serde_json::Value =
             serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
-        if value["source"]["type"] == "roadmap_item"
-            || value["target"]["type"] == "roadmap_item"
+        if retired_endpoint_id_field(&value["source"]).is_some()
+            || retired_endpoint_id_field(&value["target"]).is_some()
             || value["kind"]
                 .as_str()
                 .is_some_and(|kind| kind.starts_with("ROADMAP_"))
@@ -2537,6 +2548,12 @@ mod project_catalog_snapshot_tests {
                 .ordinal,
             1
         );
+        let mut board = serde_json::to_value(&live).unwrap();
+        board["target"] = serde_json::json!({"type": "whiteboard", "board_id": "board-stale"});
+        board["kind"] = serde_json::json!("BOARD_FROM_ARC");
+        let (edge, _) = decode_live_edge_row(board.to_string().as_bytes()).unwrap();
+        assert!(edge.is_none());
+        assert!(walk.accept(&board.to_string()).unwrap().is_none());
         retired["provenance"] = serde_json::json!("invalid");
         assert!(decode_live_edge_row(retired.to_string().as_bytes()).is_err());
         assert!(decode_live_edge_row(b"{broken").is_err());

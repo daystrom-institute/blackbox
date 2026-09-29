@@ -20,7 +20,7 @@ use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links, whiteboards,
+    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links,
 };
 
 // ---------------------------------------------------------------------------
@@ -289,14 +289,6 @@ pub(crate) struct SharedState {
     /// fleet poll. See `src/orchestration/mod.rs::RosterView`.
     pub(crate) roster_view: Arc<orchestration::RosterView>,
     pub(crate) store_dir: PathBuf,
-
-    /// Whiteboards — multi-agent deliberation boards shared between
-    /// in-workflow ensembles, in-workflow facilitators, and external
-    /// agents (operator's Claude, dispatched help, eventually humans
-    /// through slack/ntfy adapters). Phase transitions emit routed
-    /// signals through `dispatch_routed_event` so wait_for_phase
-    /// nodes resume on the same pipeline webhook ingress uses.
-    pub(crate) whiteboards: whiteboards::SharedRegistry,
 
     /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
     /// All resume paths must acquire this before spawning a provider
@@ -665,7 +657,6 @@ impl SharedState {
             },
             packets: &self.packets,
             artifacts: &self.artifacts,
-            whiteboards: self.whiteboards.as_ref(),
             project_graph_views: &self.project_graph_views,
             store_dir: &self.store_dir,
         }
@@ -924,7 +915,6 @@ impl SharedState {
 
 
 
-            whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
 
 
 

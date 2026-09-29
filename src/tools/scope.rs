@@ -1,7 +1,7 @@
 //! Shared project write-scope resolution for store tool adapters.
 //!
 //! Stores that key durable state by project path (knowledge, gaps, pins,
-//! notes, and whiteboards) must agree on what a
+//! and notes) must agree on what a
 //! caller-supplied `project` value means when the caller works inside a
 //! worktree: the durable scope is the registered BASE project, while
 //! repo-owned committed files belong in the WORKTREE checkout so they travel

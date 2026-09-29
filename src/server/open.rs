@@ -21,7 +21,7 @@ use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, config, edge_index, index, orchestration, path_cache, slack_channel_bindings,
-    slack_proposal_links, system_memory, tool_docs, vectors, whiteboards,
+    slack_proposal_links, system_memory, tool_docs, vectors,
 };
 
 pub(super) struct OpenedServer {
@@ -1032,8 +1032,6 @@ pub(super) fn open_shared_state(
         roster_tx,
         roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: store_dir.clone(),
-
-        whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
 
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         drain: super::drain::DrainState::open(&store_dir),

@@ -98,7 +98,6 @@ pub use bbox_util::util;
 // call sites resolve unchanged.
 use bbox_artifacts::watcher;
 use bbox_vectors as vectors;
-use bbox_whiteboards::whiteboards;
 
 /// Initialize the process-wide system-memory catalog for tests. The
 /// repo-root `system-defaults/memories` path is owned here (the root crate),

@@ -1,15 +1,9 @@
-//! Historical whiteboard records and project ownership adapters.
-//! No dispatch, deliberation transitions, voting or signal machinery.
+//! Historical whiteboard record shapes and the project-catalog owner adapters
+//! that capture and stamp them. Nothing loads or serves boards at runtime.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 // ── Phase + roles ──────────────────────────────────────────────────
 
@@ -182,15 +176,8 @@ pub struct Board {
     pub arc_thread_id: Option<String>,
 }
 
-#[derive(Default)]
-pub struct WhiteboardRegistry {
-    boards: RwLock<HashMap<String, Arc<RwLock<Board>>>>,
-    storage_dir: RwLock<Option<PathBuf>>,
-    paths: RwLock<HashMap<String, PathBuf>>,
-}
-
 /// Capture persisted boards that retain a legacy literal project selector.
-/// This does not initialize a [`WhiteboardRegistry`] or create its directory.
+/// This does not create the store directory.
 pub fn capture_project_catalog_owner_snapshot(
     storage_dir: &std::path::Path,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
@@ -378,161 +365,6 @@ pub fn read_project_catalog_owner_rows(
     )
 }
 
-/// Remove persisted boards owned by one project. Missing stores are empty;
-/// malformed or unsafe entries refuse instead of being treated as absent.
-pub fn discharge_project_catalog_rows(
-    storage_dir: &Path,
-    project_id: &str,
-    selectors: &[String],
-) -> Result<usize> {
-    let metadata = match std::fs::symlink_metadata(storage_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("whiteboard store root is not a safe directory");
-    }
-    let mut removals = Vec::new();
-    let mut synced_dirs = Vec::new();
-    // `archive/` is part of the store's own layout (archived boards move
-    // there). The owner-row evidence capture walks the whole tree for
-    // `*.json`, so the discharge must sweep the archive too or archived
-    // boards survive as undischargeable references; anything else
-    // non-canonical still refuses.
-    let archive_dir = storage_dir.join("archive");
-    for dir in [storage_dir, archive_dir.as_path()] {
-        match std::fs::symlink_metadata(dir) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => bail!("whiteboard store contains a non-canonical entry"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        }
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            if dir == storage_dir
-                && entry.file_type()?.is_dir()
-                && !entry.file_type()?.is_symlink()
-                && entry.file_name() == OsStr::new("archive")
-            {
-                continue;
-            }
-            if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json"))
-            {
-                bail!("whiteboard store contains a non-canonical entry");
-            }
-            let board: Board = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-            let owned = match board.project_id.as_deref() {
-                Some(owner) => owner == project_id,
-                None => selectors.iter().any(|selector| selector == &board.project),
-            };
-            if owned {
-                removals.push(entry.path());
-                if !synced_dirs.contains(&dir.to_path_buf()) {
-                    synced_dirs.push(dir.to_path_buf());
-                }
-            }
-        }
-    }
-    for path in &removals {
-        std::fs::remove_file(path)?;
-    }
-    for dir in &synced_dirs {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(removals.len())
-}
-
-pub type SharedRegistry = Arc<WhiteboardRegistry>;
-
-impl WhiteboardRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Load retained records without creating directories or changing phases.
-    /// Both the legacy root and archive subdirectory remain readable.
-    pub fn set_storage_dir(&self, dir: PathBuf) -> Result<()> {
-        let mut slot = self.storage_dir.write();
-        if slot.is_some() {
-            return Ok(());
-        }
-        let mut boards = HashMap::new();
-        let mut paths = HashMap::new();
-        for source in [dir.clone(), dir.join("archive")] {
-            let entries = match std::fs::read_dir(&source) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            for entry in entries {
-                let path = entry?.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    continue;
-                }
-                let bytes = std::fs::read(&path)?;
-                match serde_json::from_slice::<Board>(&bytes) {
-                    Ok(board) => {
-                        if boards.contains_key(&board.id) {
-                            bail!("duplicate historical whiteboard {}", board.id);
-                        }
-                        paths.insert(board.id.clone(), path);
-                        boards.insert(board.id.clone(), Arc::new(RwLock::new(board)));
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "unreadable historical whiteboard retained")
-                    }
-                }
-            }
-        }
-        *self.boards.write() = boards;
-        *self.paths.write() = paths;
-        *slot = Some(dir);
-        Ok(())
-    }
-
-    fn persist_project(&self, id: &str, project: &str) -> Result<()> {
-        let path = self
-            .paths
-            .read()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("historical whiteboard {id} has no retained source"))?;
-        // Change only the ownership selector. Unknown historical fields survive.
-        let mut document: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        document
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("invalid whiteboard {id}"))?
-            .insert("project".into(), Value::String(project.into()));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&document)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    pub fn list_ids(&self) -> Vec<String> {
-        self.boards.read().keys().cloned().collect()
-    }
-
-    pub fn get(&self, id: &str) -> Option<Arc<RwLock<Board>>> {
-        self.boards.read().get(id).cloned()
-    }
-
-    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Result<usize> {
-        let boards = self.boards.read().values().cloned().collect::<Vec<_>>();
-        let mut updated = 0usize;
-        for board_lock in boards {
-            let mut board = board_lock.write();
-            if board.project == old_project {
-                self.persist_project(&board.id, new_project)?;
-                board.project = new_project.to_string();
-                updated += 1;
-            }
-        }
-        Ok(updated)
-    }
-}
-
 // ── Project-catalog row stamping (P6-B) ─────────────────────────
 
 #[cfg(test)]
@@ -705,73 +537,5 @@ mod owner_row_stamping {
 
         assert!(stamp(&fixture, &fixture.row_a, "a1b2c3d4").is_err());
         assert!(!fixture.probe.exists());
-    }
-}
-
-#[cfg(test)]
-mod history_tests {
-    use super::*;
-
-    fn historical(id: &str, owner: &str) -> Value {
-        serde_json::json!({
-            "id":id, "topic":"review", "project":"/repo/old", "project_id":owner,
-            "created_at":"2026-01-01T00:00:00Z", "phase":"blind", "phase_history":[],
-            "agents":{}, "posts":[], "annotations":[], "votes":[], "future_field":{"keep":true}
-        })
-    }
-
-    #[test]
-    fn historical_loading_is_read_only_and_project_rename_preserves_archive_fields() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap().join("boards");
-        let absent = WhiteboardRegistry::new();
-        absent.set_storage_dir(root.clone()).unwrap();
-        assert!(!root.exists());
-        std::fs::create_dir_all(root.join("archive")).unwrap();
-        let path = root.join("archive/old.json");
-        let original = serde_json::to_vec(&historical("old", "project-a")).unwrap();
-        std::fs::write(&path, &original).unwrap();
-        let registry = WhiteboardRegistry::new();
-        registry.set_storage_dir(root.clone()).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        assert_eq!(registry.get("old").unwrap().read().phase, Phase::Blind);
-        assert_eq!(
-            registry
-                .rename_project_refs("/repo/old", "/repo/new")
-                .unwrap(),
-            1
-        );
-        let updated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let mut expected = historical("old", "project-a");
-        expected["project"] = Value::String("/repo/new".into());
-        assert_eq!(updated, expected);
-        assert!(!root.join("old.json").exists());
-    }
-
-    #[test]
-    fn retirement_discharge_preserves_other_owners_and_is_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join("archive")).unwrap();
-        for (path, id, owner) in [
-            ("archive/owned.json", "owned", "project-a"),
-            ("other.json", "other", "project-b"),
-        ] {
-            std::fs::write(
-                root.join(path),
-                serde_json::to_vec(&historical(id, owner)).unwrap(),
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            discharge_project_catalog_rows(&root, "project-a", &["/repo/old".into()]).unwrap(),
-            1
-        );
-        assert_eq!(
-            discharge_project_catalog_rows(&root, "project-a", &["/repo/old".into()]).unwrap(),
-            0
-        );
-        assert!(root.join("other.json").exists());
-        assert!(!root.join("archive/owned.json").exists());
     }
 }

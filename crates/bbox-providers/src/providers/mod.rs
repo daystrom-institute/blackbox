@@ -14,7 +14,6 @@ pub mod system_memory;
 pub mod thread;
 pub mod transcript;
 pub mod virtual_bash_call;
-pub mod whiteboard;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -29,7 +28,6 @@ use bbox_knowledge::knowledge::Knowledge;
 use bbox_packets::Packets;
 use bbox_threads::notes::Notes;
 use bbox_threads::threads::Threads;
-use bbox_whiteboards::whiteboards::WhiteboardRegistry;
 use parking_lot::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +144,6 @@ pub struct CorpusStores<'a> {
     pub project_authority: ProviderProjectAuthority<'a>,
     pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
-    pub whiteboards: &'a WhiteboardRegistry,
     /// Installed published project-graph views: the source of the graph
     /// embedding route's coverage (the embed projection lives only in the
     /// in-memory accepted generation, never in the word index).
@@ -461,7 +458,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(note::NoteProvider),
             Box::new(symbol::SymbolProvider),
             Box::new(symbol::SymbolV2Provider),
-            Box::new(whiteboard::WhiteboardProvider),
             Box::new(commit::CommitProvider),
             Box::new(virtual_bash_call::BashCallProvider),
             Box::new(agent::AgentProvider),

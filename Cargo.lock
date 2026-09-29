@@ -915,7 +915,6 @@ dependencies = [
  "bbox-packets",
  "bbox-system-memory",
  "bbox-threads",
- "bbox-whiteboards",
  "parking_lot",
  "serde_json",
  "tantivy",
@@ -1124,13 +1123,10 @@ dependencies = [
 name = "bbox-whiteboards"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "bbox-corpus-core",
- "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
 ]
 
 [[package]]

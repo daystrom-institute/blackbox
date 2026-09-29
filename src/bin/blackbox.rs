@@ -4218,12 +4218,6 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             })?,
         )
         .map_err(|error| discharge_error("artifact_rows", error))?;
-        bbox_whiteboards::whiteboards::discharge_project_catalog_rows(
-            &self.config.paths.bro_home.join("whiteboards"),
-            project_id.as_str(),
-            &selectors,
-        )
-        .map_err(|error| discharge_error("whiteboard_rows", error))?;
         bbox_packets::discharge_project_catalog_rows(
             &self.config.paths.packets_dir,
             project_id.as_str(),
@@ -4704,7 +4698,7 @@ fn validate_retirement_targets_absent(
 /// audit history. Slack rows are the opposite case and are included: both
 /// slack stores key their rows to a project by id and by project directory,
 /// so they are logical-identity references like any other coordination row.
-const RETIRE_REFERENCE_CLASSES: [&str; 19] = [
+const RETIRE_REFERENCE_CLASSES: [&str; 18] = [
     "code_source_activation",
     "code_source_generations",
     "producer_assignments",
@@ -4715,7 +4709,6 @@ const RETIRE_REFERENCE_CLASSES: [&str; 19] = [
     "note_rows",
     "pin_rows",
     "artifact_rows",
-    "whiteboard_rows",
     "packet_rows",
     "slack_channel_bindings",
     "slack_proposal_links",
@@ -4980,13 +4973,6 @@ fn probe_retire_evidence(
             "artifact_rows",
             bbox_artifacts::artifacts::capture_project_catalog_owner_snapshot(
                 &config.paths.artifacts_dir,
-                owner_limits,
-            ),
-        ),
-        (
-            "whiteboard_rows",
-            bbox_whiteboards::whiteboards::capture_project_catalog_owner_snapshot(
-                &config.paths.bro_home.join("whiteboards"),
                 owner_limits,
             ),
         ),
