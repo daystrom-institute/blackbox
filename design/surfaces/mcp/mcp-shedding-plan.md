@@ -79,7 +79,7 @@ disposition below is one config edit.
 | Retrieval | `bbox_hybrid_search`, `bbox_context`, `bbox_messages`, `bbox_session`, `bbox_sessions_list`, `bbox_inspect_entity` | `bbox_stats` | Fold `bbox_search` into `bbox_hybrid_search`. Delete `bbox_cite`, `bbox_topics`, `bbox_discover_seed_entities`, `bbox_ref_size`. Delete `bbox_corpus_search` and repoint the harness `corpus_search` alias at `bbox_hybrid_search`. Delete `bbox_find_paths`, `bbox_bundle_evidence`, `bbox_describe_schema` (graph family). Delete `bbox_tool_calls`. | |
 | Knowledge | `bbox_knowledge`, `bbox_learn`, `bbox_forget`, `bbox_render` | | Fold `bbox_remember` into `bbox_learn` (`render=false`). Delete `bbox_decide`, `bbox_knowledge_link`, `bbox_lint`, `bbox_review`, `bbox_absorb`, `bbox_bootstrap`. | |
 | Work tracking | `bbox_thread`, `bbox_thread_list`, `bbox_gap`, `bbox_gaps`, `bbox_gap_update`, `bbox_gap_resolve` | | Delete `bbox_inbox`, `bbox_pin`, `bbox_note`, `bbox_notes`, `bbox_note_resolve` | |
-| Dispatch | `bro_exec`, `bro_resume`, `bro_status`, `bro_wait`, `bro_when_all`, `bro_when_any`, `bro_steer`, `bro_cancel`, `bro_dashboard`, `bro_providers`, `bro_brofile` | `bro_prune`, `bro_allocator_status`, `bro_allocator_trace`, `bro_allocator_probe`, `bro_mcp` | Delete `bro_retro`, `bro_broadcast`, `bro_interrupt`, `bro_report`, `bro_agent_list`, `bro_agent_get`, `bro_agent_describe`, `bro_agent_search`, `bro_agent_dispatch` | `bro_team` |
+| Dispatch | `bro_exec`, `bro_resume`, `bro_status`, `bro_wait`, `bro_when_all`, `bro_when_any`, `bro_steer`, `bro_cancel`, `bro_dashboard`, `bro_providers`, `bro_brofile` | `bro_prune`, `bro_allocator_status`, `bro_allocator_trace`, `bro_allocator_probe`, `bro_mcp` | Delete `bro_retro`, `bro_broadcast`, `bro_interrupt`, `bro_report`, `bro_agent_list`, `bro_agent_get`, `bro_agent_describe`, `bro_agent_search`, `bro_agent_dispatch`, `bro_team` | |
 | Projects | `bbox_project_list` | `bbox_project_register`, `_init`, `_rename`, `_unregister`, `_eject`, `_catalog_list`, `_catalog_get`, `_attach`, `_detach`, `_default_attachment`, `_promote`, `_scope_migrate`, `_publisher_bind`, `_publisher_advance`, `_publisher_status`, `bbox_project_graph_list`, `_describe`, `_validate` | | |
 | Index and storage | | `bbox_reindex`, `bbox_reembed`, `bbox_embed_status`, `bbox_embed_partitions`, `bbox_storage_gc`, `bbox_storage_health`, `bbox_edge_compact`, `bbox_doctor` | Delete `bbox_storage_migrate_legacy_edges` (Stage 6) | |
 | Artifacts | | `bbox_artifact_install`, `_list`, `_remove`, `_supersede` | | |
@@ -87,7 +87,7 @@ disposition below is one config edit.
 | Provenance | | | Delete `bbox_blame`, `bbox_provenance_export`, `_export_plan`, `_import` (Stage 5) | |
 | Surfaces | | | Delete `bbox_mcp_surface` (Stage 1) | |
 
-End state: 28 agent-facing tools, 36 ops-only, 43 deleted or folded, 1 open.
+End state: 28 agent-facing tools, 36 ops-only, 44 deleted or folded, 0 open.
 
 Per-tool notes:
 
@@ -112,6 +112,17 @@ Per-tool notes:
   `tool_call` documents; the next reindex pass deletes any an older release
   left, and the tool fields stay in the index schema so the schema version
   does not change.
+- `bro_team`: dispatch is ad hoc (`provider`) or through a named brofile
+  (`bro`); an ensemble is several `bro_exec` calls joined with
+  `bro_when_all(task_ids=...)` and continued with `bro_resume(session_id=...,
+  provider=...)`. Teamplates, team instances, team-member targeting,
+  team waits, the team dashboard and tail filters, and the team HTTP routes
+  go. The team artifact kind is retired like the agent kind: install and
+  boot restore refuse it, an explicit kind filter shows its receipts as
+  retired, and removal works. Daemon `teamplates/` and `teams/` directories
+  and repo `.bro/teamplates` files are inert; published configuration trees
+  that still carry teamplates keep verifying and their teamplates are
+  ignored.
 - `bro_interrupt` is covered by `bro_cancel` plus `bro_resume`, and
   `bro_steer` for mid-turn input.
 - `bbox_project_list` stays as the one agent-facing project reader so
@@ -327,10 +338,9 @@ startup pass removes `edges/observed/`, `edges/explicit/`,
 
 ## Open decisions
 
-- **Knowledge publishing machinery.** Provisional and published overlays
-  and the knowledge-source crates publish project entries that already live
-  in git. Revisit once Stage 4 has slimmed the model.
-- **`bro_team`.** Low use; keep or delete.
+- **Provisional knowledge views.** Every valid candidate from the configured
+  ref is accepted automatically; the `own` and `all` views that serve unmerged
+  edits stay until it is settled whether workers need remote read-your-writes.
 
 ## Remaining gates
 

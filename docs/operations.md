@@ -33,7 +33,7 @@ will run.
 | `~/.local/state/blackbox/blackbox-threads.json` | Work threads and their session/edge linkage | ~500KB |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Packet records the project catalog inventories as owner rows; nothing else reads them | varies |
-| `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed brofiles and teams, plus historical receipts) | varies |
+| `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed brofiles, plus historical receipts) | varies |
 | `~/.local/state/blackbox/bro/` | **The entire bro directory** - see breakdown below | varies |
 
 The `bro/` subtree in detail:
@@ -42,10 +42,9 @@ The `bro/` subtree in detail:
 |---|---|
 | `mcp.json` | Global MCP server registry (all installed providers + filters) |
 | `brofiles/` | All installed brofile persona+model+lens triples |
-| `teamplates/` | Team templates |
-| `teams/` | Instantiated teams |
 | `tasks.json` | Task lifecycle records for all dispatched bros |
 | `workflows/`, `webhooks/`, `crons/`, `slack-channel-bindings.json`, `slack-proposal-links.json` | Historical records the project catalog inventories as owner rows |
+| `teamplates/`, `teams/` | Retired team records; nothing reads them |
 
 ### Rebuild - safe to lose
 
@@ -166,8 +165,6 @@ state dir so it never touches the deployed daemon's state. See
     ├── bro/                     ← PROTECT (entire subtree)
     │   ├── mcp.json
     │   ├── brofiles/
-    │   ├── teamplates/
-    │   ├── teams/
     │   ├── tasks.json
     │   └── ...                  # historical records the catalog inventories
     ├── vectors/                 ← REBUILD (bbox_reembed per route)

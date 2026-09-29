@@ -493,8 +493,9 @@ pub struct AcceptedEvidenceSourceV1 {
 }
 
 /// One accepted project configuration input (`.bro/brofiles/<name>.json`,
-/// `.bro/teamplates/<name>.json`, `.bbox/mcp.json` or `.bbox/config.toml`).
-/// The store keeps exact bytes; the daemon's configuration domain parses them.
+/// `.bbox/mcp.json` or `.bbox/config.toml`, or a retired
+/// `.bro/teamplates/<name>.json` an earlier collector published). The store
+/// keeps exact bytes; the daemon's configuration domain parses them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedConfigSourceV1 {
@@ -3570,6 +3571,7 @@ mod tests {
                 ".bro/brofiles/reviewer.json",
                 br#"{"name":"reviewer","provider":"claude"}"#.as_slice(),
             ),
+            // A retired teamplate an earlier collector published.
             (
                 ".bro/teamplates/squad.json",
                 br#"{"name":"squad","members":[]}"#.as_slice(),

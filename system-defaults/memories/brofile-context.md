@@ -1,6 +1,6 @@
 +++
 title = "Brofile context - provider default suppression and minimal probes"
-tags = ["bro", "brofile", "context", "provider-defaults", "suppression", "teams"]
+tags = ["bro", "brofile", "context", "provider-defaults", "suppression"]
 order = 6
 template = false
 +++
@@ -43,18 +43,15 @@ override. A typical minimal probe lens is:
 `You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.`
 
 Keep the model/account/provider selection in the brofile fields. Keep prompt
-assembly policy in `context`. This makes teamplates reusable and lets
-`bro_brofile(action="get"|"list")` show the full operational contract.
+assembly policy in `context`. This makes brofiles reusable across dispatches
+and lets `bro_brofile(action="get"|"list")` show the full operational contract.
 
-## Team/session implications
+## Session implications
 
 Changing a brofile or project-local override is not retroactive for a live
-provider session. If the goal is to test a new context policy, dissolve and
-recreate the team so members start fresh sessions from the new brofiles.
-
-Team members resume their existing sessions on later rounds. For
-fresh-context validation, instantiate a fresh team or dissolve/recreate the
-existing team before the next round.
+provider session: a resumed session keeps the context it was launched with.
+To test a new context policy, start fresh sessions with `bro_exec` instead of
+resuming existing ones.
 
 ## Creation surface
 
@@ -71,5 +68,5 @@ Then create with context:
 `bro_brofile(action="create", scope="project", project_dir="/path/to/repo", name="drone-probe-codex-spark", provider="codex", model="gpt-5.3-codex-spark", lens="You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.", context={"provider_defaults":"suppress_when_supported"})`
 
 Validate by reading the brofile back and, for prompt-sensitive changes,
-dispatching a fresh session or recreated team with a constrained prompt such
+dispatching a fresh session with a constrained prompt such
 as `PING respond only PONG`.

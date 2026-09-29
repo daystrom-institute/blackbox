@@ -763,13 +763,11 @@ impl BlackboxServer {
             );
         }
         if let Some(bro_name) = &p.bro {
-            let task_id = dispatched.task.id();
-            orchestration::team::propagate_session_id(&task_id, &session_id, &self.state.store_dir);
-            // Named-bro dispatches should remain labeled even before or after
-            // team resolution; record_task_to_bro already stamped the label and
-            // task history at spawn time.
-            if dispatched.task.inner.lock().bro_label.is_none() {
-                dispatched.task.inner.lock().bro_label = Some(bro_name.clone());
+            // record_task_to_bro stamped the label at spawn time; a named
+            // dispatch keeps it even when that path did not run.
+            let mut inner = dispatched.task.inner.lock();
+            if inner.bro_label.is_none() {
+                inner.bro_label = Some(bro_name.clone());
             }
         }
 
@@ -810,7 +808,6 @@ impl BlackboxServer {
             brofile_coerce_workspace,
             runtime_lease,
         ) = match self.resolve_resume_target(
-            p.bro.as_deref(),
             p.session_id.as_deref(),
             p.provider.as_deref(),
             p.cwd.as_deref(),
@@ -884,7 +881,7 @@ impl BlackboxServer {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: p.bro.clone(),
+            bro_name: None,
             thread_id: None,
             work_item_id: None,
             provider: Some(provider),
@@ -963,10 +960,6 @@ impl BlackboxServer {
         }
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
-
-        if let Some(bro_name) = &p.bro {
-            self.record_task_to_bro(bro_name, &task);
-        }
 
         let inner = task.inner.lock();
         let mut response = json!({
@@ -1574,14 +1567,8 @@ impl BlackboxServer {
             .register("bro_wait", vec![p.task_id.clone()]);
         let caller_token = context.meta.get_progress_token();
         tracing::info!(target: "blackbox::progress", tool = "bro_wait", has_token = caller_token.is_some(), token = ?caller_token, "entry");
-        let progress_handle = caller_token.map(|token| {
-            spawn_progress_notifier(
-                vec![task.clone()],
-                context.peer.clone(),
-                token,
-                self.state.store_dir.clone(),
-            )
-        });
+        let progress_handle = caller_token
+            .map(|token| spawn_progress_notifier(vec![task.clone()], context.peer.clone(), token));
 
         let completed = orch::wait_for_task_with_timeout(&task, p.timeout_seconds).await;
         if let Some(h) = progress_handle {
@@ -1593,17 +1580,15 @@ impl BlackboxServer {
             orch::timeout_snapshot_json(&task)
         };
         let mut out = result;
-        if let Some(team_ref) =
-            orchestration::team::find_bro_ref_for_task(&p.task_id, &self.state.store_dir)
-        {
-            out["bro"] = Value::String(team_ref.member_name.clone());
+        if let Some(name) = task.inner.lock().bro_label.clone() {
+            out["bro"] = Value::String(name);
         }
         Self::ok_json(&out)
     }
 
     #[tool(
         name = "bro_when_all",
-        description = "Observe ALL selected tasks or team members until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch."
+        description = "Observe ALL selected tasks until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch."
     )]
     pub(crate) async fn bro_when_all(
         &self,
@@ -1613,36 +1598,27 @@ impl BlackboxServer {
         if let Err(error) = validate_wait_timeout(p.timeout_seconds) {
             return Self::err_text(error);
         }
-        let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
+        let tasks = match self.resolve_when_tasks(p.task_ids.as_deref()) {
             Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
         };
         let task_ids: Vec<String> = tasks.iter().map(|task| task.id()).collect();
         let _long_poll = self.state.long_polls.register("bro_when_all", task_ids);
 
-        let progress_handle = context.meta.get_progress_token().map(|token| {
-            spawn_progress_notifier(
-                tasks.clone(),
-                context.peer.clone(),
-                token,
-                self.state.store_dir.clone(),
-            )
-        });
+        let progress_handle = context
+            .meta
+            .get_progress_token()
+            .map(|token| spawn_progress_notifier(tasks.clone(), context.peer.clone(), token));
 
         // Wait concurrently (like Promise.all), not sequentially
         let timeout = p.timeout_seconds;
-        let store_dir = self.state.store_dir.clone();
         let futs: Vec<_> = tasks
             .iter()
             .map(|task| {
                 let task = task.clone();
-                let sd = store_dir.clone();
                 async move {
                     let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
-                    let bro_name = {
-                        let inner = task.inner.lock();
-                        orchestration::team::find_bro_name_for_task(&inner.id, &sd)
-                    };
+                    let bro_name = task.inner.lock().bro_label.clone();
                     let mut r = if completed {
                         orch::mcp_task_result_json(&task)
                     } else {
@@ -1692,7 +1668,7 @@ impl BlackboxServer {
         if let Err(error) = validate_wait_timeout(p.timeout_seconds) {
             return Self::err_text(error);
         }
-        let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
+        let tasks = match self.resolve_when_tasks(p.task_ids.as_deref()) {
             Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
         };
@@ -1702,14 +1678,10 @@ impl BlackboxServer {
         // Check if any already done
         let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
         let progress_handle = if !any_done {
-            context.meta.get_progress_token().map(|token| {
-                spawn_progress_notifier(
-                    tasks.clone(),
-                    context.peer.clone(),
-                    token,
-                    self.state.store_dir.clone(),
-                )
-            })
+            context
+                .meta
+                .get_progress_token()
+                .map(|token| spawn_progress_notifier(tasks.clone(), context.peer.clone(), token))
         } else {
             None
         };
@@ -1742,10 +1714,7 @@ impl BlackboxServer {
 
         let mut rows = Vec::new();
         for task in &tasks {
-            let inner = task.inner.lock();
-            let bro_name =
-                orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
-            drop(inner);
+            let bro_name = task.inner.lock().bro_label.clone();
 
             let mut r = if task.inner.lock().status.is_terminal() {
                 orch::mcp_task_result_json(task)
@@ -2161,18 +2130,7 @@ impl BlackboxServer {
         }
 
         if let Some(label) = bro_label {
-            let brofile = match orchestration::team::resolve_bro_selector(
-                label,
-                &orchestration::team::load_all_teams(&self.state.store_dir),
-            ) {
-                Ok(Some(bro_match)) => {
-                    let member = &bro_match.team.members[bro_match.member_idx];
-                    self.state
-                        .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
-                }
-                _ => self.state.dispatch_brofile(label, cwd)?,
-            };
-            if let Some(bf) = brofile {
+            if let Some(bf) = self.state.dispatch_brofile(label, cwd)? {
                 orchestration::brofile::enforce_provider_defaults(provider, bf.context.as_ref())?;
                 let env = orchestration::brofile::resolve_provider_env(
                     provider,
@@ -2278,14 +2236,6 @@ impl BlackboxServer {
         bro_name: &str,
         project_dir: Option<&str>,
     ) -> Result<Option<orchestration::brofile::Brofile>, String> {
-        let store_dir = &self.state.store_dir;
-        let teams = orchestration::team::load_all_teams(store_dir);
-        if let Ok(Some(bro_match)) = orchestration::team::resolve_bro_selector(bro_name, &teams) {
-            let member = &bro_match.team.members[bro_match.member_idx];
-            return self
-                .state
-                .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref());
-        }
         self.state.dispatch_brofile(bro_name, project_dir)
     }
 
@@ -2312,78 +2262,10 @@ impl BlackboxServer {
         let store_dir = &self.state.store_dir;
 
         if let Some(name) = bro_name {
-            let teams = orchestration::team::load_all_teams(store_dir);
-            match orchestration::team::resolve_bro_selector(name, &teams)? {
-                Some(bro_match) => {
-                    let member = &bro_match.team.members[bro_match.member_idx];
-                    let bf = self
-                        .state
-                        .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
-                        .ok_or(format!("Brofile not found: {}", member.brofile))?;
-                    orchestration::brofile::enforce_provider_defaults(
-                        bf.provider,
-                        bf.context.as_ref(),
-                    )?;
-                    let env = orchestration::brofile::resolve_provider_env(
-                        bf.provider,
-                        bf.account.as_deref(),
-                        bf.model.as_deref(),
-                        store_dir,
-                        bf.context.as_ref(),
-                    );
-                    let opts = if bf.model.is_some()
-                        || bf.effort.is_some()
-                        || bf.code_mode.is_some()
-                        || bf.service_tier.is_some()
-                    {
-                        Some(ExecOpts {
-                            model: bf.model.clone(),
-                            effort: bf.effort.clone(),
-                            provider_defaults: None,
-                            code_mode: bf.code_mode,
-                            service_tier: bf.service_tier.clone(),
-                            output_schema: None,
-                        })
-                    } else {
-                        None
-                    };
-                    let opts = orchestration::providers::exec_opts_with_provider_defaults(
-                        opts,
-                        bf.context.as_ref(),
-                    );
-                    let cwd = project_dir
-                        .map(String::from)
-                        .or(bro_match.team.project_dir.clone());
-                    // §6: fold the brofile's surface into its filters so
-                    // every dispatch path inherits the same surface governance.
-                    let surface_filters = crate::server::surface::dispatch_surface_filters(
-                        &self.state.config.read().surfaces,
-                        bf.surface.as_deref(),
-                    );
-                    let filters = crate::server::progress::combine_dispatch_filters(
-                        bf.filters.as_ref(),
-                        surface_filters.as_ref(),
-                    );
-                    return Ok((
-                        bf.provider,
-                        bf.lens,
-                        opts,
-                        env,
-                        cwd,
-                        filters,
-                        bf.tool_defaults,
-                        bf.coerce_workspace.unwrap_or(false),
-                        bf.context,
-                    ));
-                }
-                None => {
-                    // Standalone brofile fallback
-                }
-            }
             let bf = self
                 .state
                 .dispatch_brofile(name, project_dir)?
-                .ok_or(format!("Unknown bro or brofile: {name}"))?;
+                .ok_or(format!("Unknown brofile: {name}"))?;
             orchestration::brofile::enforce_provider_defaults(bf.provider, bf.context.as_ref())?;
             let env = orchestration::brofile::resolve_provider_env(
                 bf.provider,
@@ -2459,14 +2341,10 @@ impl BlackboxServer {
     /// Ordinary caller resumes cannot take over a session owned by another runtime.
     /// The stored session ID is authoritative even if the caller changes provider.
     /// Internal workflow/atom recovery uses its own lower-level dispatch path.
-    fn ensure_ordinary_resume_ownership(
-        &self,
-        session_id: &str,
-        member_task_id: Option<&str>,
-    ) -> Result<(), String> {
+    fn ensure_ordinary_resume_ownership(&self, session_id: &str) -> Result<(), String> {
         for task in self.state.task_store.read().all_tasks() {
             let inner = task.inner.lock();
-            if (inner.session_id == session_id || member_task_id == Some(inner.id.as_str()))
+            if inner.session_id == session_id
                 && (inner.workflow_owned
                     || orchestration::workflow_owned_for_origin(inner.origin)
                     || inner.provider == Provider::Workflow)
@@ -2485,7 +2363,6 @@ impl BlackboxServer {
     #[allow(clippy::type_complexity)]
     pub(crate) fn resolve_resume_target(
         &self,
-        bro_name: Option<&str>,
         session_id: Option<&str>,
         raw_provider: Option<&str>,
         project_dir: Option<&str>,
@@ -2506,126 +2383,8 @@ impl BlackboxServer {
     > {
         let store_dir = &self.state.store_dir;
 
-        if let Some(name) = bro_name {
-            let teams = orchestration::team::load_all_teams(store_dir);
-            let bro_match = orchestration::team::resolve_bro_selector(name, &teams)?
-                .ok_or_else(|| {
-                    if matches!(self.state.dispatch_brofile(name, project_dir), Ok(Some(_))) {
-                        format!(
-                            "Brofile \"{name}\" is not in a team — use exec first or provide session_id + provider"
-                        )
-                    } else {
-                        format!("Unknown bro: {name}")
-                    }
-                })?;
-            let member = &bro_match.team.members[bro_match.member_idx];
-            let sid = member
-                .session_id
-                .as_deref()
-                .filter(|s| *s != "pending")
-                .ok_or(format!(
-                    "Bro \"{name}\" has no active session — use exec first"
-                ))?;
-            self.ensure_ordinary_resume_ownership(
-                sid,
-                member.task_history.last().map(String::as_str),
-            )?;
-            let bf = self
-                .state
-                .dispatch_brofile(&member.brofile, bro_match.team.project_dir.as_deref())?
-                .ok_or(format!("Brofile not found: {}", member.brofile))?;
-            let lease = member.task_history.last().and_then(|task_id| {
-                orchestration::allocator::lookup_lease_for_task(store_dir, task_id)
-            });
-            // Resume must honor the policy the session was launched
-            // under, not whatever the brofile says today. Bind to the
-            // lease-captured runtime provider AND brofile context when
-            // a lease exists; fall back to the current brofile only
-            // when no lease was recorded (fresh / never-allocated).
-            let runtime_provider = lease.as_ref().map(|l| l.provider).unwrap_or(bf.provider);
-            let effective_context = lease
-                .as_ref()
-                .and_then(|l| l.brofile_context.as_ref())
-                .or(bf.context.as_ref());
-            orchestration::brofile::enforce_provider_defaults(runtime_provider, effective_context)?;
-            let (provider, opts, env) = if let Some(lease) = lease.as_ref() {
-                let provider = lease.provider;
-                let opts = orchestration::allocator::exec_opts_for_lane(
-                    &orchestration::allocator::RuntimeLane {
-                        provider,
-                        account: lease.account.clone(),
-                        tier: lease.tier.clone(),
-                        model: lease.model.clone(),
-                        effort: lease.effort.clone(),
-                        capabilities: lease.capabilities.clone(),
-                    },
-                );
-                let env = orchestration::brofile::resolve_provider_env(
-                    provider,
-                    lease.account.as_deref(),
-                    lease.model.as_deref(),
-                    store_dir,
-                    effective_context,
-                );
-                (provider, opts, env)
-            } else {
-                let env = orchestration::brofile::resolve_provider_env(
-                    bf.provider,
-                    bf.account.as_deref(),
-                    bf.model.as_deref(),
-                    store_dir,
-                    effective_context,
-                );
-                let opts = if bf.model.is_some() || bf.effort.is_some() {
-                    Some(ExecOpts {
-                        model: bf.model.clone(),
-                        effort: bf.effort.clone(),
-                        provider_defaults: None,
-                        // Resume restores the session's persisted code_mode; the
-                        // daemon does not re-pass it (mirrors --model).
-                        code_mode: None,
-                        // Resume restores the session's persisted service tier.
-                        service_tier: None,
-                        // Resume does not re-pass the output schema.
-                        output_schema: None,
-                    })
-                } else {
-                    None
-                };
-                let opts = orchestration::providers::exec_opts_with_provider_defaults(
-                    opts,
-                    effective_context,
-                );
-                (bf.provider, opts, env)
-            };
-            let cwd = project_dir
-                .map(String::from)
-                .or(bro_match.team.project_dir.clone());
-            // §6: fold the brofile's surface into its filters on resume too.
-            let surface_filters = crate::server::surface::dispatch_surface_filters(
-                &self.state.config.read().surfaces,
-                bf.surface.as_deref(),
-            );
-            let filters = crate::server::progress::combine_dispatch_filters(
-                bf.filters.as_ref(),
-                surface_filters.as_ref(),
-            );
-            return Ok((
-                provider,
-                sid.to_string(),
-                bf.lens,
-                opts,
-                env,
-                cwd,
-                filters,
-                bf.tool_defaults,
-                bf.coerce_workspace.unwrap_or(false),
-                lease,
-            ));
-        }
-
         if let (Some(sid), Some(p)) = (session_id, raw_provider) {
-            self.ensure_ordinary_resume_ownership(sid, None)?;
+            self.ensure_ordinary_resume_ownership(sid)?;
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
@@ -2697,58 +2456,21 @@ impl BlackboxServer {
             ));
         }
 
-        Err("Provide either bro or session_id + provider".into())
+        Err("Provide session_id + provider".into())
     }
 
     /// Resolve the full aggregate-wait selection up front. The whole
-    /// selection is validated before any waiting: ambiguous selectors,
-    /// empty selections, teams with memberless/pruned history, unknown IDs,
-    /// and oversized fanout reject with actionable errors. Duplicate IDs are
+    /// selection is validated before any waiting: empty selections, unknown
+    /// IDs, and oversized fanout reject with actionable errors. Duplicate IDs are
     /// deliberately preserved (one row per requested occurrence).
     pub(crate) fn resolve_when_tasks(
         &self,
-        team_name: Option<&str>,
         task_ids: Option<&[String]>,
     ) -> Result<Vec<Arc<orch::Task>>, String> {
-        if let (Some(team), Some(ids)) = (team_name, task_ids) {
-            return Err(format!(
-                "Provide either team or task_ids, not both (team={}, task_ids={})",
-                orch::truncated_chars(team, 64),
-                ids.len()
-            ));
-        }
-        let ids: Vec<String> = if let Some(name) = team_name {
-            let team = orchestration::team::load_team(name, &self.state.store_dir)
-                .ok_or_else(|| format!("Unknown team: {}", orch::truncated_chars(name, 64)))?;
-            if team.members.is_empty() {
-                return Err(format!(
-                    "Team {} has no members",
-                    orch::truncated_chars(name, 64)
-                ));
-            }
-            let mut memberless = Vec::new();
-            let mut ids = Vec::with_capacity(team.members.len());
-            for member in &team.members {
-                match member.task_history.last() {
-                    Some(id) => ids.push(id.clone()),
-                    None => memberless.push(orch::truncated_chars(&member.name, 64)),
-                }
-            }
-            if !memberless.is_empty() {
-                return Err(format!(
-                    "Team {} members have no task history: {}. Dispatch or broadcast before waiting",
-                    orch::truncated_chars(name, 64),
-                    summarize_when_ids(&memberless)
-                ));
-            }
-            ids
-        } else if let Some(ids) = task_ids {
-            if ids.is_empty() {
-                return Err("Empty task_ids array".into());
-            }
-            ids.to_vec()
-        } else {
-            return Err("Provide either team or task_ids".into());
+        let ids: Vec<String> = match task_ids {
+            Some([]) => return Err("Empty task_ids array".into()),
+            Some(ids) => ids.to_vec(),
+            None => return Err("Provide task_ids".into()),
         };
         if ids.len() > orch::WHEN_TARGET_LIMIT {
             return Err(format!(
@@ -2804,8 +2526,6 @@ fn summarize_when_ids(ids: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::server::state::SharedState;
 
@@ -2840,108 +2560,6 @@ mod tests {
         }
     }
 
-    fn assert_team_dispatch_source(server: &BlackboxServer, root: &Path, catalog: bool) {
-        use orchestration::{brofile, team};
-        let project = root.join("worker-checkout");
-        std::fs::create_dir_all(&project).unwrap();
-        let project = project.to_str().unwrap();
-        for (scope, provider, model) in [
-            ("global", "glm", "global-model"),
-            ("project", "deepseek", "project-model"),
-        ] {
-            let bf = serde_json::from_value(serde_json::json!({
-                "name": "reviewer", "provider": provider, "model": model,
-            }))
-            .unwrap();
-            brofile::save_brofile(
-                &bf,
-                scope,
-                &server.state.store_dir,
-                (scope == "project").then_some(project),
-            )
-            .unwrap();
-        }
-        team::save_team(
-            &team::Team {
-                name: "panel".into(),
-                teamplate: "panel-template".into(),
-                members: vec![team::TeamMember {
-                    name: "reviewer".into(),
-                    brofile: "reviewer".into(),
-                    session_id: Some("synthetic-session".into()),
-                    task_history: vec![],
-                }],
-                advisor: None,
-                project_dir: Some(project.into()),
-                created_at: 0,
-                diversity_floor: None,
-            },
-            &server.state.store_dir,
-        );
-        let expected_provider = if catalog {
-            Provider::Glm
-        } else {
-            Provider::Deepseek
-        };
-        let expected_model = if catalog {
-            "global-model"
-        } else {
-            "project-model"
-        };
-        let bf = server
-            .resolve_exec_brofile_for_allocator("panel::reviewer", None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(bf.provider, expected_provider);
-        let (provider, _, opts, _, cwd, _, _, _, _) = server
-            .resolve_exec_target(Some("panel::reviewer"), None, None)
-            .unwrap();
-        assert_eq!(provider, expected_provider);
-        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
-        assert_eq!(cwd.as_deref(), Some(project));
-        let (provider, sid, _, opts, _, cwd, _, _, _, _) = server
-            .resolve_resume_target(Some("panel::reviewer"), None, None, None)
-            .unwrap();
-        assert_eq!(provider, expected_provider);
-        assert_eq!(sid, "synthetic-session");
-        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
-        assert_eq!(cwd.as_deref(), Some(project));
-        let (opts, _) = server
-            .resolve_workload_retro_runtime(
-                "missing-task",
-                expected_provider,
-                "synthetic-session",
-                Some("panel::reviewer"),
-                Some(project),
-            )
-            .unwrap();
-        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
-        // A caller cwd override remains worker context, not source authority.
-        let (_, _, _, _, cwd, _, _, _, _) = server
-            .resolve_exec_target(Some("panel::reviewer"), None, Some("worker-context"))
-            .unwrap();
-        assert_eq!(cwd.as_deref(), Some("worker-context"));
-        if catalog {
-            std::fs::remove_file(server.state.store_dir.join("brofiles/reviewer.json")).unwrap();
-            assert!(
-                server
-                    .resolve_exec_brofile_for_allocator("panel::reviewer", None)
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                server
-                    .resolve_exec_target(Some("panel::reviewer"), None, None)
-                    .is_err()
-            );
-            assert!(
-                server
-                    .resolve_resume_target(Some("panel::reviewer"), None, None, None)
-                    .is_err()
-            );
-        }
-    }
-
     /// A catalog project with no checkout on disk: every dispatch and resume
     /// entry path resolves the project's accepted brofile first, falls back
     /// to global only for names the accepted view proves absent, and refuses
@@ -2949,7 +2567,7 @@ mod tests {
     #[test]
     fn catalog_dispatch_entry_paths_consume_the_accepted_project_view() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
-        use orchestration::{brofile, team};
+        use orchestration::brofile;
         let fixture = CatalogFixture::new();
         let project = "p_dispatch_accepted";
         let scope = CatalogFixture::scope(".");
@@ -2977,32 +2595,6 @@ mod tests {
             .unwrap();
             brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
         }
-        team::save_team(
-            &team::Team {
-                name: "panel".into(),
-                teamplate: "panel-template".into(),
-                members: vec![
-                    team::TeamMember {
-                        name: "reviewer".into(),
-                        brofile: "reviewer".into(),
-                        session_id: Some("synthetic-session".into()),
-                        task_history: vec![],
-                    },
-                    team::TeamMember {
-                        name: "writer".into(),
-                        brofile: "writer".into(),
-                        session_id: None,
-                        task_history: vec![],
-                    },
-                ],
-                advisor: None,
-                project_dir: Some(project.into()),
-                created_at: 0,
-                diversity_floor: None,
-            },
-            &server.state.store_dir,
-        );
-
         // bro_exec with a caller cwd naming the project.
         let (provider, _, opts, _, _, _, _, _, _) = server
             .resolve_exec_target(Some("reviewer"), None, Some(project))
@@ -3013,47 +2605,26 @@ mod tests {
             .resolve_exec_target(Some("writer"), None, Some(project))
             .unwrap();
         assert_eq!(opts.unwrap().model.as_deref(), Some("global-writer"));
-        // Team member exec, resume, retro and allocator selection.
-        let (provider, _, opts, _, cwd, _, _, _, _) = server
-            .resolve_exec_target(Some("panel::reviewer"), None, None)
-            .unwrap();
-        assert_eq!(provider, Provider::Deepseek);
-        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
-        assert_eq!(cwd.as_deref(), Some(project));
-        let (provider, _, _, opts, _, _, _, _, _, _) = server
-            .resolve_resume_target(Some("panel::reviewer"), None, None, None)
-            .unwrap();
-        assert_eq!(provider, Provider::Deepseek);
-        assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
+        // Workload retro and allocator selection resolve the same brofile.
         let (opts, _) = server
             .resolve_workload_retro_runtime(
                 "missing-task",
                 Provider::Deepseek,
                 "synthetic-session",
-                Some("panel::reviewer"),
+                Some("reviewer"),
                 Some(project),
             )
             .unwrap();
         assert_eq!(opts.unwrap().model.as_deref(), Some("project-model"));
         let allocator = server
-            .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+            .resolve_exec_brofile_for_allocator("reviewer", Some(project))
             .unwrap()
             .unwrap();
         assert_eq!(allocator.model.as_deref(), Some("project-model"));
-        // The roster row resolves the same way.
-        let saved = team::load_team("panel", &server.state.store_dir).unwrap();
-        let entry = crate::tools::bro_helpers::build_member_entry(
-            &saved,
-            &saved.members[0],
-            &server.state,
-            &server.state.idx.read().reindex_config(),
-        );
-        assert_eq!(entry.model.as_deref(), Some("project-model"));
-        assert_eq!(entry.provider, "deepseek");
 
         // An unavailable project view refuses every path by name.
         for result in [
-            // `solo` is no team member, so the caller cwd selects the project.
+            // The caller cwd selects the project.
             server
                 .resolve_exec_target(Some("solo"), None, Some(unpublished))
                 .map(|_| ()),
@@ -3074,24 +2645,8 @@ mod tests {
         assert_eq!(error.code(), "error.project_config_publication_unavailable");
     }
 
-    #[test]
-    fn catalog_team_dispatch_uses_global_brofile_and_preserves_worker_cwd() {
-        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
-        let server = fixture.server();
-        let root = fixture.root().canonicalize().unwrap();
-        assert_team_dispatch_source(&server, &root, true);
-    }
-
-    #[test]
-    fn bridge_team_dispatch_preserves_project_brofile_override() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        assert_team_dispatch_source(&server, &root, false);
-    }
-
     #[tokio::test]
-    async fn legacy_advisor_team_waits_observe_without_launching_or_mutating() {
+    async fn waits_observe_without_launching_and_leave_legacy_team_files_inert() {
         use rmcp::model::CallToolRequestParams;
         use rmcp::{ClientHandler, ServiceExt};
         struct WaitClient;
@@ -3101,19 +2656,26 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
         let state = server.state.clone();
-        let team: orchestration::team::Team = serde_json::from_value(json!({
-            "name": "legacy-panel", "teamplate": "legacy-template", "created_at": 0,
-            "members": [{"name":"reviewer", "brofile":"unused-member", "session_id": "member-session", "task_history":["observed-task"]}],
-            "advisor": {"name":"old-advisor", "config": {
-                "brofile":"missing-advisor", "charter":"Legacy charter",
-                "mode":"blocking"
-            }, "session_id":"old-advisor-session", "task_history":["old-advisor-task"]}
-        })).unwrap();
-        orchestration::team::save_team(&team, &state.store_dir);
+        // A team record an earlier release wrote stays on disk untouched.
         let team_path = state.store_dir.join("teams/legacy-panel.json");
+        std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &team_path,
+            serde_json::to_vec(&json!({
+                "name": "legacy-panel", "teamplate": "legacy-template", "created_at": 0,
+                "members": [{"name":"reviewer", "brofile":"unused-member",
+                    "session_id": "member-session", "task_history":["observed-task"]}],
+                "advisor": {"name":"old-advisor", "config": {
+                    "brofile":"missing-advisor", "charter":"Legacy charter", "mode":"blocking"
+                }, "session_id":"old-advisor-session", "task_history":["old-advisor-task"]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         assert!(team_path.starts_with(&root));
         let before = std::fs::read(&team_path).unwrap();
         let task = orch::test_task("observed-task", orch::TaskStatus::Completed, Provider::Glm);
+        task.inner.lock().bro_label = Some("reviewer".into());
         state
             .task_store
             .write()
@@ -3139,10 +2701,6 @@ mod tests {
                 (
                     "bro_wait",
                     json!({"task_id":"observed-task", "timeout_seconds":0}),
-                ),
-                (
-                    "bro_when_all",
-                    json!({"team":"legacy-panel", "timeout_seconds":0}),
                 ),
                 (
                     "bro_when_all",
@@ -3202,17 +2760,6 @@ mod tests {
         Some(ids.iter().map(|id| id.to_string()).collect())
     }
 
-    fn save_when_team(server: &BlackboxServer, name: &str, members: Value) {
-        let team: orchestration::team::Team = serde_json::from_value(json!({
-            "name": name,
-            "teamplate": "when-template",
-            "created_at": 0,
-            "members": members,
-        }))
-        .unwrap();
-        orchestration::team::save_team(&team, &server.state.store_dir);
-    }
-
     fn when_row<'a>(value: &'a Value, id: &str) -> &'a Value {
         value["results"]
             .as_array()
@@ -3230,7 +2777,7 @@ mod tests {
 
         // All-missing selections reject instead of becoming empty success.
         let err = server
-            .resolve_when_tasks(None, when_ids(&["missing-a"]).as_deref())
+            .resolve_when_tasks(when_ids(&["missing-a"]).as_deref())
             .err()
             .expect("selection must reject");
         assert!(err.contains("Unknown task IDs"), "{err}");
@@ -3239,7 +2786,7 @@ mod tests {
         // Oversized individual IDs are truncated in the diagnostic itself.
         let long_id = "m".repeat(300);
         let err = server
-            .resolve_when_tasks(None, Some(&[long_id.clone()]))
+            .resolve_when_tasks(Some(&[long_id.clone()]))
             .err()
             .expect("selection must reject");
         assert!(err.contains(&"m".repeat(64)), "{err}");
@@ -3251,14 +2798,14 @@ mod tests {
         let huge_id = "h".repeat(64 * 1024);
         seed_when_task(&server.state, &huge_id, orch::TaskStatus::Completed);
         let err = server
-            .resolve_when_tasks(None, Some(&[huge_id]))
+            .resolve_when_tasks(Some(&[huge_id]))
             .err()
             .expect("selection must reject");
         assert!(err.contains("cannot fit minimal reply receipts"), "{err}");
 
         // Mixed known/missing rejects the whole selection, naming the gap.
         let err = server
-            .resolve_when_tasks(None, when_ids(&["known-done", "missing-b"]).as_deref())
+            .resolve_when_tasks(when_ids(&["known-done", "missing-b"]).as_deref())
             .err()
             .expect("selection must reject");
         assert!(err.contains("missing-b"), "{err}");
@@ -3266,99 +2813,24 @@ mod tests {
 
         // Duplicates are deliberately preserved, one row per occurrence.
         let tasks = server
-            .resolve_when_tasks(None, when_ids(&["known-done", "known-done"]).as_deref())
+            .resolve_when_tasks(when_ids(&["known-done", "known-done"]).as_deref())
             .unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].id(), "known-done");
 
-        // Competing selectors are ambiguous and reject.
-        let err = server
-            .resolve_when_tasks(Some("panel"), when_ids(&["known-done"]).as_deref())
-            .err()
-            .expect("selection must reject");
-        assert!(err.contains("not both"), "{err}");
-
         // Empty selections reject, including the missing-selector case.
-        assert!(server.resolve_when_tasks(None, Some(&[])).is_err());
-        assert!(server.resolve_when_tasks(None, None).is_err());
+        assert!(server.resolve_when_tasks(Some(&[])).is_err());
+        assert!(server.resolve_when_tasks(None).is_err());
 
         // Oversized fanout rejects before any waiting.
         let oversized: Vec<String> = (0..=orch::WHEN_TARGET_LIMIT)
             .map(|index| format!("bulk-{index}"))
             .collect();
         let err = server
-            .resolve_when_tasks(None, Some(&oversized))
+            .resolve_when_tasks(Some(&oversized))
             .err()
             .expect("selection must reject");
         assert!(err.contains("exceeds the aggregate wait limit"), "{err}");
-    }
-
-    #[test]
-    fn when_team_selection_defines_stale_history_and_empty_teams() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-
-        let err = server
-            .resolve_when_tasks(Some("ghost-team"), None)
-            .err()
-            .expect("selection must reject");
-        assert!(err.contains("Unknown team"), "{err}");
-
-        // An empty team rejects instead of an empty all-true aggregate.
-        save_when_team(&server, "empty-team", json!([]));
-        let err = server
-            .resolve_when_tasks(Some("empty-team"), None)
-            .err()
-            .expect("selection must reject");
-        assert!(err.contains("no members"), "{err}");
-
-        // Members without dispatch history reject with guidance.
-        save_when_team(
-            &server,
-            "fresh-team",
-            json!([
-                {"name": "alpha", "brofile": "bf-alpha", "task_history": []},
-                {"name": "beta", "brofile": "bf-beta", "task_history": []}
-            ]),
-        );
-        let err = server
-            .resolve_when_tasks(Some("fresh-team"), None)
-            .err()
-            .expect("selection must reject");
-        assert!(err.contains("no task history"), "{err}");
-        assert!(err.contains("alpha") && err.contains("beta"), "{err}");
-
-        // Stale (pruned) team history IDs reject the whole selection.
-        seed_when_task(&server.state, "live-task", orch::TaskStatus::Completed);
-        save_when_team(
-            &server,
-            "stale-team",
-            json!([
-                {"name": "live", "brofile": "bf-live", "task_history": ["live-task"]},
-                {"name": "stale", "brofile": "bf-stale", "task_history": ["pruned-task"]}
-            ]),
-        );
-        let err = server
-            .resolve_when_tasks(Some("stale-team"), None)
-            .err()
-            .expect("selection must reject");
-        assert!(err.contains("pruned-task"), "{err}");
-
-        // A healthy team resolves each member's latest task.
-        save_when_team(
-            &server,
-            "healthy-team",
-            json!([{
-                "name": "live",
-                "brofile": "bf-live",
-                "task_history": ["older-task", "live-task"]
-            }]),
-        );
-        let tasks = server
-            .resolve_when_tasks(Some("healthy-team"), None)
-            .unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id(), "live-task");
     }
 
     #[tokio::test]
@@ -3574,8 +3046,7 @@ mod tests {
 
     #[test]
     fn resolve_exec_target_standalone_brofile_fallback() {
-        // gap-a5e152fb verification: `bro_exec(bro="<name>")` falls through
-        // the live-team selector to a saved brofile template by name — the
+        // `bro_exec(bro="<name>")` resolves a saved brofile by name: the
         // launch path for ad-hoc recursion-enabled dispatch
         // (`allow_recursion` rides ExecParams on this same path).
         let tmp = tempfile::tempdir().unwrap();
@@ -3602,7 +3073,7 @@ mod tests {
         let err = server
             .resolve_exec_target(Some("no-such-bro"), None, None)
             .unwrap_err();
-        assert!(err.contains("Unknown bro or brofile"), "got: {err}");
+        assert!(err.contains("Unknown brofile"), "got: {err}");
     }
 
     #[test]
@@ -4104,46 +3575,6 @@ mod tests {
         assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
     }
 
-    #[tokio::test]
-    async fn bro_resume_team_history_refuses_owned_task_before_brofile_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let task = orch::test_task("owned", orch::TaskStatus::Completed, Provider::Glm);
-        task.inner.lock().origin = bro_core::Origin::Atom;
-        server
-            .state
-            .task_store
-            .write()
-            .insert("owned".into(), task)
-            .unwrap();
-        orchestration::team::save_team(
-            &orchestration::team::Team {
-                name: "panel".into(),
-                teamplate: "review".into(),
-                members: vec![orchestration::team::TeamMember {
-                    name: "reviewer".into(),
-                    brofile: "missing-brofile".into(),
-                    // Legacy history still protects ownership when IDs disagree.
-                    session_id: Some("legacy-team-session".into()),
-                    task_history: vec!["owned".into()],
-                }],
-                advisor: None,
-                project_dir: None,
-                created_at: 0,
-                diversity_floor: None,
-            },
-            &server.state.store_dir,
-        );
-        let p = serde_json::from_value(json!({
-            "prompt": "continue", "bro": "panel::reviewer",
-        }))
-        .unwrap();
-        let result = server.bro_resume(Parameters(p)).await;
-        assert_eq!(result.is_error, Some(true));
-        assert!(call_result_text(&result).contains("error.owner_managed_session"));
-        assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
-    }
-
     #[test]
     fn ordinary_resume_ownership_preserves_current_and_external_sessions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4165,14 +3596,14 @@ mod tests {
                 .unwrap();
             let sid = format!("sess-{id}");
             let (provider, resolved_sid, ..) = server
-                .resolve_resume_target(None, Some(&sid), Some("glm"), None)
+                .resolve_resume_target(Some(&sid), Some("glm"), None)
                 .unwrap();
             assert_eq!(provider, Provider::Glm);
             assert_eq!(resolved_sid, sid);
         }
         assert!(
             server
-                .resolve_resume_target(None, Some("external-session"), Some("glm"), None)
+                .resolve_resume_target(Some("external-session"), Some("glm"), None)
                 .is_ok()
         );
         assert_eq!(server.state.task_store.read().all_tasks().len(), 5);
@@ -4181,19 +3612,15 @@ mod tests {
     #[tokio::test]
     async fn drain_leaves_bro_resume_ungated() {
         // Resumes continue existing sessions and are exempt by design. With
-        // drain set, a resume of an unknown bro fails on the lookup, never
-        // on the maintenance gate.
+        // drain set, a resume without a session selector fails on target
+        // resolution, never on the maintenance gate.
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         server.state.drain.set(None, None).unwrap();
-        let p: ResumeParams = serde_json::from_value(json!({
-            "prompt": "continue",
-            "bro": "ghost-bro-for-drain-test",
-        }))
-        .unwrap();
+        let p: ResumeParams = serde_json::from_value(json!({"prompt": "continue"})).unwrap();
         let result = server.bro_resume(Parameters(p)).await;
         let text = call_result_text(&result);
-        assert!(text.contains("Unknown bro"), "{text}");
+        assert!(text.contains("Provide session_id + provider"), "{text}");
         assert!(
             !text.contains(crate::server::drain::MAINTENANCE_PENDING_CODE),
             "{text}"
@@ -4378,85 +3805,6 @@ mod tests {
                 .contains(&orchestration::providers::Capability::ToolUse)
         );
     }
-    #[test]
-    fn resolve_resume_target_rejects_ambiguous_bro_names_across_live_teams() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        save_test_brofile(&tmp, "reviewer");
-
-        for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
-            orchestration::team::save_team(
-                &orchestration::team::Team {
-                    name: team_name.to_string(),
-                    teamplate: "review".into(),
-                    members: vec![orchestration::team::TeamMember {
-                        name: "reviewer".into(),
-                        brofile: "reviewer".into(),
-                        session_id: Some(session_id.into()),
-                        task_history: vec![],
-                    }],
-                    advisor: None,
-                    project_dir: None,
-                    created_at: 0,
-                    diversity_floor: None,
-                },
-                &tmp.path().join("bro"),
-            );
-        }
-
-        let err = server
-            .resolve_resume_target(Some("reviewer"), None, None, None)
-            .unwrap_err();
-        assert!(err.contains("Ambiguous bro name: reviewer"));
-        assert!(err.contains("red"));
-        assert!(err.contains("blue"));
-    }
-
-    #[test]
-    fn resolve_resume_target_accepts_scoped_team_bro_selector() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        save_test_brofile(&tmp, "reviewer");
-
-        for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
-            orchestration::team::save_team(
-                &orchestration::team::Team {
-                    name: team_name.to_string(),
-                    teamplate: "review".into(),
-                    members: vec![orchestration::team::TeamMember {
-                        name: "reviewer".into(),
-                        brofile: "reviewer".into(),
-                        session_id: Some(session_id.into()),
-                        task_history: vec![],
-                    }],
-                    advisor: None,
-                    project_dir: Some(format!("/tmp/{team_name}")),
-                    created_at: 0,
-                    diversity_floor: None,
-                },
-                &tmp.path().join("bro"),
-            );
-        }
-
-        let (
-            provider,
-            session_id,
-            _lens,
-            _opts,
-            _env,
-            cwd,
-            _filters,
-            _tool_defaults,
-            _coerce_ws,
-            _runtime_lease,
-        ) = server
-            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
-            .unwrap();
-        assert_eq!(provider, Provider::Deepseek);
-        assert_eq!(session_id, "sid-blue");
-        assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
-    }
-
     fn update_probe_params() -> AllocatorProbeParams {
         AllocatorProbeParams {
             provider: "brodex".into(),

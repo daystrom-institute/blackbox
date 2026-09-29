@@ -2,7 +2,8 @@
 
 `bro` launches, observes, and controls provider sessions. Callers compose those
 operations in their own code; Blackbox owns task identity, provider routing,
-worker transport, and execution recovery. Team waits never choose follow-up work.
+worker transport, and execution recovery. Waits never choose follow-up work.
+Dispatch is ad hoc (`provider`) or through a named brofile (`bro`).
 
 ## Retrying an uncertain dispatch
 
@@ -56,13 +57,16 @@ Do not resume a session while its previous task is still running. Check with
 
 ## Fanout
 
-Dispatch each team member, then wait on the team:
+Dispatch one named brofile per role, then wait on the returned task ids:
 
 ```text
-bro_exec(bro="reviewers::correctness", prompt="review this diff for correctness")
-bro_exec(bro="reviewers::security", prompt="review this diff for security")
-bro_when_all(team="reviewers", timeout_seconds=60)
+bro_exec(bro="correctness-reviewer", prompt="review this diff for correctness")
+bro_exec(bro="security-reviewer", prompt="review this diff for security")
+bro_when_all(task_ids=["<task-id-1>", "<task-id-2>"], timeout_seconds=60)
 ```
+
+Later rounds resume each recorded session with
+`bro_resume(session_id=..., provider=...)`.
 
 Use `bro_when_any` for races where the first useful answer wins. The losers keep
 running until you cancel them.
@@ -73,7 +77,7 @@ Use non-blocking reads when you are supervising:
 
 ```text
 bro_status(task_id="<task-id>", tail=20)
-bro_dashboard(team="bbox-red")
+bro_dashboard(status="running")
 ```
 
 ## Cancel And Prune
@@ -109,69 +113,13 @@ bro_brofile(action="get", name="rust-refactor-persona")
 List before create. Brofiles are often installed through the artifact catalog
 from `system-defaults/brofiles/`.
 
-## Teams
-
-Teams are named sets of brofiles:
-
-```text
-bro_team(action="list")
-bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")
-```
-
-`list`, `list_templates`, and `roster` return summary pages, with default
-`limit=20` (clamped to 1..100), a response byte cap, and `next_offset` for
-continuation. `list` and `list_templates` accept an exact `name` filter.
-`project_dir` filters live teams by their stored association; it is not a file
-handle or evidence of daemon checkout access. Roster members carry stored brofile
-names and session/task identities, without resolving configuration from a checkout.
-
-```text
-bro_team(action="list_templates")
-bro_team(action="roster", name="bbox-red", limit=20)
-bro_team(action="get_template", name="red-team")
-bro_team(action="get", name="bbox-red")
-```
-
-`get_template` exposes the full template; `get` exposes the live team's stored
-configuration, including advisor overrides and task history. These exact reads
-return JSON text under `body`, even for small records. Concatenate `body.text`
-while following `body.next_cursor` unchanged, then parse the resulting JSON.
-Each body page is at most 4096 encoded bytes; `body_limit` can request a smaller
-page. Changed records or selectors reject stale cursors; restart without one.
-Summary pages do not hide full advisor charters, context, or brofile lenses in
-structured content. Malformed stored records report errors instead of disappearing.
-
-`scope` applies only to template actions and accepts `global` (default) or
-`project`. Project template discovery requires an explicit absolute owner-host
-`project_dir` in legacy bridge mode. Catalog mode refuses reads and writes of legacy
-`.bro/teamplates` because it has no remote source lane. Inspect or edit those
-files with the owning checkout's file tools, or use daemon-owned templates with
-`scope="global"` without `project_dir`. No discovery path falls back to the
-daemon's current directory.
-
-In catalog mode, `create` resolves templates and brofiles only from the
-daemon-owned global catalogs. `project_dir` remains the worker/team association;
-it does not select project template or brofile overrides on the daemon. A
-missing global dependency refuses before a team is instantiated. Successful
-creation returns `memberCount`, `templateScope="global"`, and roster/get hints
-instead of repeating every member. Creation starts no advisor tasks. Existing
-advisor settings and history remain readable; summaries mark them
-`execution="retired"`, and creation receipts carry `advisorExecution="retired"`
-only when the template contains those legacy settings. New `advisor` arguments
-are rejected. Legacy advisor brofiles are not resolved or executed.
+## Waits
 
 `bro_wait`, `bro_when_all`, and `bro_when_any` only observe existing tasks.
-Neither completion nor timeout launches an advisor or continuation. Dispatch a
-review explicitly with `bro_exec` or `bro_resume` when the caller needs one.
-Templates require at least one member, every slot count must be positive, and
-expanded members must total at most 256. Saving or
-creating an invalid template refuses before allocation or persistence; counts
-are never truncated. Existing invalid templates remain inspectable and their
-summary includes an admission error until corrected.
-
-Use teams for ensemble review, blind comparison, provider races, or repeated
-panels. The caller owns gates, retries, subsequent work, and cleanup in ordinary
-code, using explicit bro control operations.
+Neither completion nor timeout launches a continuation. Dispatch a review
+explicitly with `bro_exec` or `bro_resume` when the caller needs one. The caller
+owns gates, retries, subsequent work, and cleanup in ordinary code, using
+explicit bro control operations.
 
 ## Provider Catalog
 

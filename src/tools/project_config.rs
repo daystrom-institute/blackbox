@@ -1,6 +1,5 @@
 //! Catalog-mode project bro configuration: the daemon's one read view and one
-//! write lane for repo-owned `.bro/brofiles`, `.bro/teamplates` and
-//! `.bbox/mcp.json`.
+//! write lane for repo-owned `.bro/brofiles` and `.bbox/mcp.json`.
 //!
 //! A caller's path or selector only selects a catalog project; it never grants
 //! filesystem authority. Reads come from the project's verified accepted
@@ -40,7 +39,7 @@ pub(crate) enum ProjectConfigContext {
 
 /// A verified accepted configuration view plus the identity it was read at.
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 pub(crate) struct AcceptedProjectConfig {
     pub(crate) project_id: String,
@@ -51,7 +50,7 @@ pub(crate) struct AcceptedProjectConfig {
 
 /// One queued guarded configuration mutation, as its producer reports it.
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectConfigMutationReceipt {
@@ -73,7 +72,7 @@ pub(crate) struct ProjectConfigMutationReceipt {
 /// The authorized landing place: the published scope whose checkout owner
 /// receives the mutation, and the file inside it.
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProjectConfigLanding {
@@ -101,7 +100,7 @@ impl ProjectConfigLanding {
 
 /// Where one configuration mutation stands now.
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectConfigMutationStatus {
@@ -123,7 +122,7 @@ pub(crate) struct ProjectConfigMutationStatus {
 
 /// The change a configuration edit makes to its base bytes.
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectConfigEdit {
@@ -312,31 +311,6 @@ impl SharedState {
             .map_err(|error| error.to_string())
     }
 
-    /// Dispatch-time teamplate resolution, same precedence as brofiles.
-    pub(crate) fn resolve_config_teamplate(
-        &self,
-        name: &str,
-        project_dir: Option<&str>,
-    ) -> Result<Option<Resolved<orchestration::team::Teamplate>>, ProjectConfigError> {
-        let store_dir = &self.store_dir;
-        Ok(match self.project_config_context(project_dir)? {
-            ProjectConfigContext::Local(project_dir) => {
-                orchestration::team::resolve_teamplate(name, store_dir, project_dir.as_deref()).map(
-                    |value| Resolved {
-                        value,
-                        source: ProjectConfigSource::Local,
-                    },
-                )
-            }
-            ProjectConfigContext::GlobalOnly => {
-                orchestration::project_config::resolve_teamplate(None, name, store_dir)
-            }
-            ProjectConfigContext::Accepted(snapshot) => {
-                orchestration::project_config::resolve_teamplate(Some(&snapshot), name, store_dir)
-            }
-        })
-    }
-
     /// The project MCP store dispatch filters merge over the global store.
     /// Bridge mode keeps its daemon-local read, including discarding load
     /// errors; catalog mode reads the accepted store or fails by name.
@@ -356,7 +330,7 @@ impl SharedState {
 }
 
 // Guarded write-lane producer API: the project-scope configuration actions
-// of bro_brofile, bro_team and bro_mcp are its callers.
+// of bro_brofile and bro_mcp are its callers.
 #[allow(dead_code)]
 impl SharedState {
     fn catalog_project_for_scope(&self, scope: &PublishedScope) -> Option<String> {

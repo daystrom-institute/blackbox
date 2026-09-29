@@ -7,7 +7,7 @@ use crate::orchestration::brofile::store_identity;
 use crate::orchestration::providers::Provider;
 use crate::server::progress::extra_filters_from_params;
 use crate::server::state::BlackboxServer;
-use crate::tools::bro_params::{BrofileParams, DashboardParams, ProvidersParams, TeamParams};
+use crate::tools::bro_params::{BrofileParams, DashboardParams, ProvidersParams};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -82,23 +82,6 @@ impl BlackboxServer {
             }
         };
 
-        let team_task_ids: Option<std::collections::HashSet<String>> = match p.team.as_ref() {
-            None => None,
-            Some(name) => match orchestration::team::load_team(name, &self.state.store_dir) {
-                Some(team) => Some(
-                    team.members
-                        .iter()
-                        .flat_map(|member| member.task_history.clone())
-                        .collect(),
-                ),
-                None => {
-                    return Self::err_text(
-                        "Team filter could not be loaded; use bro_team(action=list) to select an existing team",
-                    );
-                }
-            },
-        };
-
         // Wave 7c: read the materialized RosterView snapshot instead
         // of iterating `task_store` and locking every per-task inner
         // mutex. `RosterEventSink::emit_*` keeps the view fresh at
@@ -106,10 +89,8 @@ impl BlackboxServer {
         // serves the same fields the legacy projection read under
         // the lock — without contending with event ingest on busy
         // tasks (invariant I6 of design/daemon-runtime/concurrency-
-        // model.md). The team lookup is a per-call filesystem scan
-        // (does not take a per-task inner mutex).
+        // model.md).
         let snapshot = self.state.roster_view.snapshot();
-        let store_dir = self.state.store_dir.clone();
 
         let mut selected: Vec<_> = snapshot
             .into_iter()
@@ -121,11 +102,6 @@ impl BlackboxServer {
                 }
                 if let Some(fs) = filter_status {
                     if s.status != fs {
-                        return false;
-                    }
-                }
-                if let Some(ref ids) = team_task_ids {
-                    if !ids.contains(s.task_id.as_str()) {
                         return false;
                     }
                 }
@@ -146,8 +122,6 @@ impl BlackboxServer {
             .take(limit)
             .map(|s| {
                 let task_id_str = s.task_id.as_str().to_string();
-                let bro_name =
-                    orchestration::team::find_bro_name_for_task(&task_id_str, &store_dir);
 
                 // Recompute `elapsed` from summary timestamps so the
                 // dashboard row matches the legacy projection
@@ -174,9 +148,6 @@ impl BlackboxServer {
                     "hasResult": s.status.is_terminal() && has_last_message,
                     "hasLastMessage": has_last_message,
                 });
-                if let Some(name) = bro_name {
-                    entry["bro"] = Value::String(name);
-                }
                 if let Some(ref label) = label_from_summary(&s) {
                     entry["broLabel"] = Value::String(label.clone());
                 }
@@ -657,266 +628,10 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(
-        name = "bro_team",
-        description = "Manage teamplates and teams without automatic advisor execution. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
-    )]
-    pub(crate) async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
-        if let Err(error) =
-            validate_team_params(&p).and_then(|()| require_team_template_locality(self, &p))
-        {
-            return Self::err_text(&error.to_string());
-        }
-        if matches!(
-            p.action.as_str(),
-            "list" | "list_templates" | "roster" | "get" | "get_template"
-        ) {
-            let server = self.clone();
-            return Self::run_blocking_with_structured("bro_team", move || {
-                let value = team_discovery(&server, &p)?;
-                Ok((serde_json::to_string(&value)?, value))
-            })
-            .await;
-        }
-        use orchestration::team;
-        let store_dir = &self.state.store_dir;
-        let scope = p.scope.as_deref().unwrap_or("global");
-
-        match p.action.as_str() {
-            "save_template" => {
-                let name = match &p.name {
-                    Some(n) => n,
-                    None => return Self::err_text("name is required"),
-                };
-                if scope == "project" && p.project_dir.is_none() {
-                    return Self::err_text("project_dir required for project scope");
-                }
-                let members = match &p.members {
-                    Some(m) if !m.is_empty() => m,
-                    _ => return Self::err_text("members is required"),
-                };
-                // Validate brofile names against the same accepted resolver
-                // dispatch uses; a queued, unpublished brofile does not count.
-                for m in members {
-                    match self
-                        .state
-                        .dispatch_brofile(&m.brofile, p.project_dir.as_deref())
-                    {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            return Self::err_text(&format!("Brofile not found: {}", m.brofile));
-                        }
-                        Err(error) => return Self::err_text(&error),
-                    }
-                }
-                let tp = team::Teamplate {
-                    name: name.clone(),
-                    members: members
-                        .iter()
-                        .map(|m| team::TeamplateMember {
-                            brofile: m.brofile.clone(),
-                            alias: m.alias.clone(),
-                            count: m.count.unwrap_or(1),
-                        })
-                        .collect(),
-                    advisor: None,
-                    diversity_floor: None,
-                };
-                if let Err(error) =
-                    team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref())
-                {
-                    return Self::err_text(&format!("Teamplate was not saved: {error}"));
-                }
-                Self::ok_json(&json!({"saved": name, "scope": scope}))
-            }
-            "delete_template" => {
-                let name = match &p.name {
-                    Some(n) => n,
-                    None => return Self::err_text("name is required"),
-                };
-                if scope == "project" && p.project_dir.is_none() {
-                    return Self::err_text("project_dir required for project scope");
-                }
-                match team::remove_teamplate_checked(
-                    name,
-                    scope,
-                    store_dir,
-                    p.project_dir.as_deref(),
-                ) {
-                    Ok(true) => Self::ok_json(&json!({"deleted":name})),
-                    Ok(false) => Self::err_text(&format!("Teamplate not found: {name}")),
-                    Err(error) => Self::err_text(&format!("Template removal failed: {error}")),
-                }
-            }
-            "create" => {
-                let template = match &p.template {
-                    Some(t) => t,
-                    None => return Self::err_text("template is required"),
-                };
-                // Project-first resolution: the selected project's accepted
-                // templates, then global ones only when the project view
-                // proves the name absent. The source is attributed.
-                let resolved = match self
-                    .state
-                    .resolve_config_teamplate(template, p.project_dir.as_deref())
-                {
-                    Ok(Some(resolved)) => resolved,
-                    Ok(None) => {
-                        return Self::err_text(&format!(
-                            "Teamplate not found: {template}. Resolution checked the selected project's accepted templates (when project_dir names a catalog project), then global templates; a project template queued through the checkout-owner lane counts only after it is committed and published"
-                        ));
-                    }
-                    Err(error) => return Self::err_text(&error.to_string()),
-                };
-                let tp = resolved.value;
-                if let Err(error) = validate_team_object_name(&tp.name) {
-                    return Self::err_text(&error.to_string());
-                }
-                for m in &tp.members {
-                    if let Err(error) = validate_team_object_name(&m.brofile) {
-                        return Self::err_text(&error.to_string());
-                    }
-                    match self
-                        .state
-                        .dispatch_brofile(&m.brofile, p.project_dir.as_deref())
-                    {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            return Self::err_text(&format!("Brofile not found: {}", m.brofile));
-                        }
-                        Err(error) => return Self::err_text(&error),
-                    }
-                }
-                let team_name = p
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{template}-{}", orch::now_ms()));
-                let t = match team::instantiate_team(
-                    &tp,
-                    &team_name,
-                    p.project_dir.as_deref(),
-                    store_dir,
-                ) {
-                    Ok(team) => team,
-                    Err(error) => return Self::err_text(&format!("Team was not saved: {error}")),
-                };
-                Self::ok_json(&team_create_receipt(&t, &resolved.source))
-            }
-            "dissolve" => {
-                let name = match &p.name {
-                    Some(n) => n,
-                    None => return Self::err_text("name is required"),
-                };
-                let loaded_team = match team::load_team_checked(name, store_dir) {
-                    Ok(Some(team)) => team,
-                    Ok(None) => return Self::err_text(&format!("Unknown team: {name}")),
-                    Err(error) => return Self::err_text(&format!("Team unavailable: {error}")),
-                };
-                let mut targets = Vec::new();
-                let mut skipped_terminal = 0;
-                let mut skipped_missing = 0;
-                if p.cancel_running.unwrap_or(false) {
-                    let store = self.state.task_store.read();
-                    let ids: std::collections::BTreeSet<_> = loaded_team
-                        .members
-                        .iter()
-                        .flat_map(|member| member.task_history.iter())
-                        .collect();
-                    for id in ids {
-                        match store.get(id) {
-                            Some(task) if task.inner.lock().status == orch::TaskStatus::Running => {
-                                targets.push(task)
-                            }
-                            Some(_) => skipped_terminal += 1,
-                            None => skipped_missing += 1,
-                        }
-                    }
-                }
-                let ids: Vec<_> = targets.iter().map(|task| task.id()).collect();
-                if ids.len() > 64
-                    || serde_json::to_vec(&ids).map_or(true, |bytes| bytes.len() > 16 * 1024)
-                {
-                    return Self::err_text(
-                        "Team cancellation receipt exceeds 64 tasks / 16 KiB IDs; cancel in explicit batches, then dissolve. No task or team was changed",
-                    );
-                }
-                let mut cancellations = Vec::new();
-                let mut failed = false;
-                for task in targets {
-                    let id = task.id();
-                    match orch::cancel_task(&task, &self.state.task_store, store_dir) {
-                        Ok(()) => cancellations
-                            .push(json!({"taskId":id,"outcome":"cancellation_requested"})),
-                        Err(error) => {
-                            failed = true;
-                            cancellations.push(json!({"taskId":id,"outcome":"not_cancelled", "message":orch::truncated_chars(&error,256)}));
-                        }
-                    }
-                }
-                let removal = if failed {
-                    json!({"status":"retained_after_cancel_failure"})
-                } else {
-                    match team::remove_team_checked(name, store_dir) {
-                        Ok(true) => json!({"status":"removed"}),
-                        Ok(false) => json!({"status":"already_absent"}),
-                        Err(error) => {
-                            json!({"status":"failed","message":orch::truncated_chars(&error.to_string(),256)})
-                        }
-                    }
-                };
-                let removed = matches!(
-                    removal["status"].as_str(),
-                    Some("removed" | "already_absent")
-                );
-                Self::ok_json(
-                    &json!({"team":name,"dissolved":if removed { json!(name) } else { Value::Null },
-                    "removal":removal,"cancellations":cancellations,"skipped_terminal":skipped_terminal,
-                    "skipped_missing":skipped_missing}),
-                )
-            }
-            _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
-        }
-    }
-
+    /// Stamp a named dispatch's brofile name on its task so tail, wait and
+    /// dashboard output name it.
     pub(crate) fn record_task_to_bro(&self, bro_name: &str, task: &Arc<orch::Task>) {
-        // Stamp the task with a default label up-front so brofile-only
-        // dispatches (no team match) still surface in `bro tail` with a
-        // name. Team-attributed dispatches will overwrite below with a
-        // more precise `<team>::<member>` label.
         task.inner.lock().bro_label = Some(bro_name.to_string());
-
-        let _lock = orchestration::team::lock_teams();
-        let tid = task.id();
-        let teams = orchestration::team::load_all_teams(&self.state.store_dir);
-        let Ok(bro_match_opt) = orchestration::team::resolve_bro_selector(bro_name, &teams) else {
-            return;
-        };
-        let Some(bro_match) = bro_match_opt else {
-            return;
-        };
-        let target_team = bro_match.team.name.clone();
-        let target_member_idx = bro_match.member_idx;
-        let task_sid = task.inner.lock().session_id.clone();
-
-        for mut team in teams {
-            if team.name != target_team {
-                continue;
-            }
-            let member = &mut team.members[target_member_idx];
-            member.task_history.push(tid.clone());
-            // Track the latest launch immediately. Fresh harness dispatches
-            // should already carry a concrete pre-minted session id; legacy
-            // pending values are still preserved so later team rounds fail
-            // closed instead of forking a second session.
-            member.session_id = Some(task_sid.clone());
-            // Stamp a precise team::member label on the task so the
-            // tail handler can attribute even when later resolution
-            // (find_bro_ref_for_task) hits the duplicate-name
-            // ambiguity case (two team members sharing a brofile).
-            task.inner.lock().bro_label = Some(format!("{}::{}", team.name, member.name));
-            orchestration::team::save_team(&team, &self.state.store_dir);
-            break;
-        }
     }
 }
 
@@ -952,7 +667,7 @@ fn validate_brofile_params(p: &BrofileParams) -> anyhow::Result<()> {
             .name
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("name is required"))?;
-        validate_team_object_name(name)?;
+        validate_object_name(name)?;
     }
     anyhow::ensure!(
         action == "create"
@@ -1013,292 +728,16 @@ fn brofile_selection(
     format!("brofile:{scope}:{store}:{name}")
 }
 
-fn require_team_template_locality(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<()> {
-    if matches!(
-        p.action.as_str(),
-        "save_template" | "delete_template" | "list_templates" | "get_template"
-    ) && p.scope.as_deref() == Some("project")
-        && !server.state.project_authority.is_bridge()
-    {
-        anyhow::bail!(
-            "error.team_template_locality_required: project .bro/teamplates have no remote source lane; inspect or edit them with the checkout owner's file tools, or use daemon-owned templates with scope=global and no project_dir. No project template was read or changed; passing a caller path cannot grant daemon checkout access"
-        );
-    }
-    Ok(())
-}
-
-fn validate_team_object_name(name: &str) -> anyhow::Result<()> {
+fn validate_object_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0']),
-        "name must be an exact stored team/template/brofile name, not a path"
+        "name must be an exact stored brofile name, not a path"
     );
     Ok(())
-}
-
-fn team_create_receipt(
-    team: &orchestration::team::Team,
-    source: &orchestration::project_config::ProjectConfigSource,
-) -> Value {
-    use orchestration::project_config::ProjectConfigSource;
-    let mut receipt = json!({"created":team.name, "teamplate":team.teamplate, "memberCount":team.members.len(),
-        "detail_hint":"bro_team(action=roster, name=<created>) for member pages; action=get for exact stored configuration and history"});
-    match source {
-        // Bridge mode keeps its receipt shape.
-        ProjectConfigSource::Local => {}
-        ProjectConfigSource::Global => receipt["templateScope"] = json!("global"),
-        ProjectConfigSource::GlobalFallback(_) => {
-            receipt["templateScope"] = json!("global");
-            receipt["templateSource"] = json!(source);
-        }
-        ProjectConfigSource::Project(_) => {
-            receipt["templateScope"] = json!("project");
-            receipt["templateSource"] = json!(source);
-        }
-    }
-    if team.advisor.is_some() {
-        receipt["hasAdvisor"] = json!(true);
-        receipt["advisorExecution"] = json!("retired");
-    }
-    receipt
-}
-
-/// Validate action-specific selectors before any store access. A missing
-/// project selector must never become the daemon's current directory.
-fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        p.advisor.is_none(),
-        "error.team_advisor_retired: automatic team advisors are retired; omit advisor and dispatch any review explicitly with bro_exec/bro_resume. Existing advisor configuration remains readable but is never executed"
-    );
-    anyhow::ensure!(
-        p.members.is_none() || p.action == "save_template",
-        "members require action=save_template"
-    );
-    anyhow::ensure!(
-        p.template.is_none() || p.action == "create",
-        "template requires action=create"
-    );
-    anyhow::ensure!(
-        p.cancel_running.is_none() || p.action == "dissolve",
-        "cancel_running requires action=dissolve"
-    );
-    anyhow::ensure!(
-        p.action != "dissolve" || p.project_dir.is_none(),
-        "dissolve selects an exact name; project_dir is not a filter for this mutation"
-    );
-    let template_action = matches!(
-        p.action.as_str(),
-        "save_template" | "list_templates" | "get_template" | "delete_template"
-    );
-    let list = matches!(p.action.as_str(), "list" | "list_templates" | "roster");
-    let exact = matches!(p.action.as_str(), "get" | "get_template");
-    if !list && (p.limit.is_some() || p.offset.is_some()) {
-        anyhow::bail!("limit and offset require list, list_templates, or roster");
-    }
-    if !exact && (p.cursor.is_some() || p.body_limit.is_some()) {
-        anyhow::bail!("cursor and body_limit require get or get_template");
-    }
-    if template_action {
-        match p.scope.as_deref().unwrap_or("global") {
-            "global" if p.project_dir.is_some() => {
-                anyhow::bail!("project_dir requires scope=project for template actions")
-            }
-            "global" => {}
-            "project" => {
-                let path = p.project_dir.as_deref().ok_or_else(|| anyhow::anyhow!("project_dir is required for scope=project; no daemon current-directory fallback"))?;
-                anyhow::ensure!(
-                    Path::new(path).is_absolute(),
-                    "project template directory must be absolute"
-                );
-            }
-            _ => anyhow::bail!("scope must be global or project"),
-        }
-    } else if p.scope.is_some() {
-        anyhow::bail!(
-            "scope applies only to template actions; use project_dir to filter live teams"
-        );
-    }
-    if matches!(p.action.as_str(), "get" | "get_template" | "roster") && p.name.is_none() {
-        anyhow::bail!("name is required");
-    }
-    if let Some(name) = p.name.as_deref() {
-        validate_team_object_name(name)?;
-    }
-    if let Some(template) = p.template.as_deref() {
-        validate_team_object_name(template)?;
-    }
-    if let Some(members) = &p.members {
-        for member in members {
-            validate_team_object_name(&member.brofile)?;
-        }
-    }
-    if (list || exact)
-        && (p.members.is_some() || p.template.is_some() || p.cancel_running.is_some())
-    {
-        anyhow::bail!(
-            "members, template, and cancel_running are mutation parameters, not discovery filters"
-        );
-    }
-    Ok(())
-}
-
-fn team_advisor_summary(advisor: &orchestration::team::TeamAdvisor) -> Value {
-    let mut row = json!({"name": advisor.name, "brofile": advisor.config.brofile, "mode": advisor.config.mode, "execution": "retired"});
-    if let Some(session) = &advisor.session_id {
-        row["sessionId"] = json!(session);
-    }
-    if !advisor.task_history.is_empty() {
-        row["taskCount"] = json!(advisor.task_history.len());
-    }
-    row
-}
-
-fn team_template_summary(template: &orchestration::team::Teamplate) -> Value {
-    let brofiles = template
-        .members
-        .iter()
-        .map(|member| member.brofile.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut row = json!({"name": template.name, "slotCount": template.members.len(),
-        "memberCount": template.members.iter().map(|member| u64::from(member.count)).sum::<u64>(),
-        "brofiles": brofiles.iter().take(3).collect::<Vec<_>>(),
-    });
-    if let Err(error) = orchestration::team::validate_teamplate_member_count(template) {
-        row["admissionError"] = json!(error.to_string());
-    }
-    if brofiles.len() > 3 {
-        row["omittedBrofileCount"] = json!(brofiles.len() - 3);
-    }
-    if let Some(floor) = template.diversity_floor {
-        row["diversityFloor"] = json!(floor);
-    }
-    if let Some(advisor) = &template.advisor {
-        row["advisor"] = json!({"name": advisor.display_name(), "brofile": advisor.brofile, "mode": advisor.mode, "execution": "retired"});
-    }
-    row
-}
-
-fn team_summary_page(
-    rows: Vec<Value>,
-    field: &str,
-    p: &TeamParams,
-    mut metadata: Value,
-) -> anyhow::Result<Value> {
-    let offset = p.offset.unwrap_or(0);
-    let limit = p.limit.unwrap_or(20).clamp(1, 100);
-    metadata["total"] = json!(rows.len());
-    metadata["offset"] = json!(offset);
-    metadata["limit"] = json!(limit);
-    let selected = rows
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    metadata["count"] = json!(selected.len());
-    metadata[field] = json!(selected);
-    bbox_corpus_core::response_page::bound_page(metadata, field)
-}
-
-fn team_discovery(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<Value> {
-    use orchestration::team;
-    let store = &server.state.store_dir;
-    if matches!(p.action.as_str(), "list_templates" | "get_template") {
-        let scope = p.scope.as_deref().unwrap_or("global");
-        require_team_template_locality(server, p)?;
-        if p.action == "get_template" {
-            let name = p.name.as_deref().expect("validated template name");
-            let template =
-                team::get_teamplate_checked(name, scope, store, p.project_dir.as_deref())?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Teamplate not found; use list_templates in the same scope")
-                    })?;
-            let selection = json!(["teamplate", scope, p.project_dir, template.name]).to_string();
-            return Ok(json!({"name":template.name, "scope":scope,
-                "body":super::body_page::json_body_page(&selection, &serde_json::to_value(&template)?, p.cursor.as_deref(), p.body_limit)?}));
-        }
-        let mut templates = if let Some(name) = p.name.as_deref() {
-            team::get_teamplate_checked(name, scope, store, p.project_dir.as_deref())?
-                .into_iter()
-                .collect()
-        } else {
-            team::list_teamplates_checked(scope, store, p.project_dir.as_deref())?
-        };
-        templates.sort_by(|a, b| a.name.cmp(&b.name));
-        return team_summary_page(
-            templates.iter().map(team_template_summary).collect(),
-            "templates",
-            p,
-            json!({"scope":scope, "detail_hint":"bro_team(action=get_template, name=<name>, same scope/project_dir); follow body.next_cursor"}),
-        );
-    }
-    if p.action == "list" {
-        let mut teams = if let Some(name) = p.name.as_deref() {
-            team::load_team_checked(name, store)?.into_iter().collect()
-        } else {
-            team::load_all_teams_checked(store)?
-        };
-        teams.retain(|row| {
-            p.name.as_deref().is_none_or(|name| row.name == name)
-                && p.project_dir
-                    .as_deref()
-                    .is_none_or(|project| row.project_dir.as_deref() == Some(project))
-        });
-        teams.sort_by(|a, b| a.name.cmp(&b.name));
-        let rows = teams.iter().map(|team| {
-            let mut row = json!({"name":team.name, "teamplate":team.teamplate, "memberCount":team.members.len(), "createdAt":team.created_at});
-            if let Some(project) = &team.project_dir { row["projectDir"] = json!(project); }
-            if let Some(advisor) = &team.advisor { row["advisor"] = team_advisor_summary(advisor); }
-            row
-        }).collect();
-        return team_summary_page(
-            rows,
-            "teams",
-            p,
-            json!({"detail_hint":"bro_team(action=roster, name=<name>) for members; action=get for exact JSON body pages. projectDir is a stored association, not a filesystem read handle."}),
-        );
-    }
-    let name = p.name.as_deref().expect("validated exact team selector");
-    let team = team::load_team_checked(name, store)?
-        .ok_or_else(|| anyhow::anyhow!("Team not found; use bro_team(action=list)"))?;
-    anyhow::ensure!(
-        p.project_dir
-            .as_deref()
-            .is_none_or(|project| team.project_dir.as_deref() == Some(project)),
-        "team does not match the exact project_dir filter"
-    );
-    if p.action == "get" {
-        let selection = json!(["team", name, p.project_dir]).to_string();
-        return Ok(
-            json!({"name":name, "body":super::body_page::json_body_page(&selection, &serde_json::to_value(&team)?, p.cursor.as_deref(), p.body_limit)?}),
-        );
-    }
-    let task_store = server.state.task_store.read();
-    let mut members = team.members.iter().collect::<Vec<_>>();
-    members.sort_by(|a, b| (&a.name, &a.brofile).cmp(&(&b.name, &b.brofile)));
-    let rows = members.into_iter().map(|member| {
-        let mut row = json!({"name":member.name, "brofile":member.brofile, "taskCount":member.task_history.len()});
-        if let Some(session) = &member.session_id { row["sessionId"] = json!(session); }
-        if let Some(id) = member.task_history.last() {
-            if let Some(task) = task_store.get(id) {
-                let inner = task.inner.lock();
-                row["latestTask"] = json!({"taskId":inner.id, "status":inner.status, "provider":inner.provider,
-                    "elapsed":orch::format_elapsed(inner.started_at, inner.completed_at)});
-            } else {
-                row["latestTask"] = json!({"taskId":id, "statusUnavailable":true});
-            }
-        }
-        row
-    }).collect();
-    drop(task_store);
-    let mut metadata = json!({"team":name, "teamplate":team.teamplate,
-        "detail_hint":"bro_team(action=get, name=<team>) for stored advisor configuration and task history; follow body.next_cursor. Brofile configuration expands through bro_brofile(action=get, name=<brofile>)."});
-    if let Some(advisor) = &team.advisor {
-        metadata["advisor"] = team_advisor_summary(advisor);
-    }
-    team_summary_page(rows, "members", p, metadata)
 }
 
 /// Pick the `broLabel` value for a `bro_dashboard` row:
-/// `RosterSummaryV1.label`, the task's team-shaped bro identity. The
+/// `RosterSummaryV1.label`, the task's named-dispatch bro identity. The
 /// summary's `name` field is the daemon display name and can match, but
 /// `label` is the field-by-field source.
 fn label_from_summary(s: &bro_protocol::RosterSummaryV1) -> Option<String> {
@@ -1314,523 +753,6 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
-    }
-
-    fn team_params(value: Value) -> TeamParams {
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn fixture_team(name: &str, project: &str) -> orchestration::team::Team {
-        orchestration::team::Team {
-            name: name.into(),
-            teamplate: "panel".into(),
-            project_dir: Some(project.into()),
-            created_at: 1,
-            members: vec![],
-            advisor: None,
-            diversity_floor: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn team_create_preserves_inert_legacy_advisor_without_resolving_or_launching() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let member = serde_json::from_value(json!({"name":"reviewer", "provider":"glm"})).unwrap();
-        orchestration::brofile::save_brofile(&member, "global", &server.state.store_dir, None)
-            .unwrap();
-        let template: orchestration::team::Teamplate = serde_json::from_value(json!({
-            "name":"legacy-template", "members":[{"brofile":"reviewer", "count":1}],
-            "advisor":{"brofile":"missing-advisor", "charter":"Keep this legacy charter", "context":"historical context"}
-        })).unwrap();
-        orchestration::team::save_teamplate(&template, "global", &server.state.store_dir, None)
-            .unwrap();
-        let result = server
-            .bro_team(Parameters(team_params(json!({
-                "action":"create", "name":"legacy-panel", "template":"legacy-template"
-            }))))
-            .await;
-        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
-        let receipt: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(receipt["advisorExecution"], "retired");
-        assert_eq!(server.state.task_store.read().all_tasks().len(), 0);
-        let team = orchestration::team::load_team_checked("legacy-panel", &server.state.store_dir)
-            .unwrap()
-            .unwrap();
-        let advisor = team.advisor.unwrap();
-        assert_eq!(advisor.config.charter, "Keep this legacy charter");
-        assert_eq!(
-            advisor.config.context.as_deref(),
-            Some("historical context")
-        );
-        assert!(advisor.session_id.is_none());
-        assert!(advisor.task_history.is_empty());
-        let roster = team_discovery(
-            &server,
-            &team_params(json!({"action":"roster", "name":"legacy-panel"})),
-        )
-        .unwrap();
-        assert_eq!(roster["advisor"]["execution"], "retired");
-    }
-
-    #[tokio::test]
-    async fn team_new_advisor_input_is_rejected_before_store_mutations() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        for action in ["save_template", "create"] {
-            let result = server
-                .bro_team(Parameters(team_params(json!({
-                    "action":action, "name":"rejected", "template":"irrelevant",
-                    "members":[{"brofile":"unread-member"}],
-                    "advisor":{"brofile":"unread-advisor", "charter":"New automatic work"}
-                }))))
-                .await;
-            assert_eq!(result.is_error, Some(true));
-            assert!(extract_text(&result).contains("error.team_advisor_retired"));
-            assert!(!server.state.store_dir.join("teams/rejected.json").exists());
-            assert!(
-                !server
-                    .state
-                    .store_dir
-                    .join("teamplates/rejected.json")
-                    .exists()
-            );
-            assert!(server.state.task_store.read().all_tasks().is_empty());
-        }
-    }
-
-    #[test]
-    fn team_create_receipt_omits_unbounded_member_configuration() {
-        let mut team = fixture_team("large", "worker-context");
-        team.members = (0..10000)
-            .map(|n| orchestration::team::TeamMember {
-                name: format!("member-{n}"),
-                brofile: "large-lens-reference".repeat(100),
-                session_id: None,
-                task_history: vec![],
-            })
-            .collect();
-        let receipt = team_create_receipt(
-            &team,
-            &orchestration::project_config::ProjectConfigSource::Global,
-        );
-        assert_eq!(receipt["memberCount"], 10000);
-        assert_eq!(receipt["templateScope"], "global");
-        assert!(receipt.get("members").is_none());
-        assert!(receipt.get("advisorExecution").is_none());
-        assert!(serde_json::to_vec(&receipt).unwrap().len() < 1000);
-        assert!(receipt["detail_hint"].as_str().unwrap().contains("roster"));
-    }
-
-    /// With no checkout on disk, `create` resolves the selected catalog
-    /// project's accepted template and member brofiles first, attributes a
-    /// global fallback, and refuses by name when the view is unavailable.
-    #[tokio::test]
-    async fn catalog_team_create_resolves_accepted_project_templates_first() {
-        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
-        use orchestration::{brofile, team};
-        let fixture = CatalogFixture::new();
-        let project = "p_team_accepted";
-        let scope = CatalogFixture::scope(".");
-        fixture.add_published_project(project, &scope);
-        let reviewer = json!({"name":"reviewer","provider":"deepseek"}).to_string();
-        let squad =
-            json!({"name":"squad","members":[{"brofile":"reviewer","count":2}]}).to_string();
-        fixture.install_config_publication(
-            project,
-            &scope,
-            COMMIT_ONE,
-            Some(&[
-                (".bro/brofiles/reviewer.json", reviewer.as_bytes()),
-                (".bro/teamplates/squad.json", squad.as_bytes()),
-            ]),
-        );
-        fixture.add_published_project("p_team_unpublished", &CatalogFixture::scope("other"));
-        let server = fixture.server();
-        let writer: brofile::Brofile =
-            serde_json::from_value(json!({"name":"writer","provider":"glm"})).unwrap();
-        brofile::save_brofile(&writer, "global", &server.state.store_dir, None).unwrap();
-        let global_template = team::Teamplate {
-            name: "writers".into(),
-            members: vec![team::TeamplateMember {
-                brofile: "writer".into(),
-                alias: None,
-                count: 1,
-            }],
-            advisor: None,
-            diversity_floor: None,
-        };
-        team::save_teamplate(&global_template, "global", &server.state.store_dir, None).unwrap();
-
-        let created = server
-            .bro_team(Parameters(team_params(json!({
-                "action":"create","template":"squad","name":"project-team","project_dir":project
-            }))))
-            .await;
-        assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
-        let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
-        assert_eq!(receipt["templateScope"], "project");
-        assert_eq!(receipt["templateSource"]["source"], "project");
-        assert_eq!(receipt["templateSource"]["project_id"], project);
-        assert_eq!(receipt["memberCount"], 2);
-
-        let fallback = server
-            .bro_team(Parameters(team_params(json!({
-                "action":"create","template":"writers","name":"global-team","project_dir":project
-            }))))
-            .await;
-        assert_ne!(fallback.is_error, Some(true), "{}", extract_text(&fallback));
-        let receipt: Value = serde_json::from_str(&extract_text(&fallback)).unwrap();
-        assert_eq!(receipt["templateScope"], "global");
-        assert_eq!(receipt["templateSource"]["source"], "global_fallback");
-
-        let refused = server
-            .bro_team(Parameters(team_params(json!({
-                "action":"create","template":"writers","name":"must-not-exist",
-                "project_dir":"p_team_unpublished"
-            }))))
-            .await;
-        assert_eq!(refused.is_error, Some(true));
-        assert!(
-            extract_text(&refused).contains("error.project_config_publication_unavailable"),
-            "{}",
-            extract_text(&refused)
-        );
-        assert!(team::load_team("must-not-exist", &server.state.store_dir).is_none());
-    }
-
-    #[tokio::test]
-    async fn catalog_team_mutations_refuse_project_sources_and_keep_global_worker_context() {
-        use orchestration::{brofile, team};
-        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
-        let server = fixture.server();
-        let project = fixture
-            .root()
-            .canonicalize()
-            .unwrap()
-            .join("worker-checkout");
-        std::fs::create_dir_all(&project).unwrap();
-        let project = project.to_str().unwrap();
-        let reviewer: brofile::Brofile =
-            serde_json::from_value(json!({"name":"reviewer","provider":"glm"})).unwrap();
-        brofile::save_brofile(&reviewer, "global", &server.state.store_dir, None).unwrap();
-        let mut template = team::Teamplate {
-            name: "panel".into(),
-            members: vec![team::TeamplateMember {
-                brofile: "reviewer".into(),
-                alias: None,
-                count: 2,
-            }],
-            advisor: None,
-            diversity_floor: None,
-        };
-        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
-        template.members[0].count = 99;
-        team::save_teamplate(&template, "project", &server.state.store_dir, Some(project)).unwrap();
-        let path = Path::new(project).join(".bro/teamplates/panel.json");
-        let before = std::fs::read(&path).unwrap();
-        for action in ["save_template", "delete_template"] {
-            let mut request =
-                json!({"action":action,"name":"panel","scope":"project","project_dir":project});
-            if action == "save_template" {
-                request["members"] = json!([{"brofile":"reviewer"}]);
-            }
-            let result = server.bro_team(Parameters(team_params(request))).await;
-            assert_eq!(result.is_error, Some(true));
-            assert!(extract_text(&result).contains("error.team_template_locality_required"));
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
-        let created=server.bro_team(Parameters(team_params(json!({"action":"create","template":"panel","name":"global-team","project_dir":project})))).await;
-        assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
-        let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
-        assert_eq!(receipt["memberCount"], 2);
-        assert_eq!(receipt["templateScope"], "global");
-        assert!(receipt.get("members").is_none());
-        let saved = team::load_team("global-team", &server.state.store_dir).unwrap();
-        assert_eq!(saved.project_dir.as_deref(), Some(project));
-        assert_eq!(saved.members.len(), 2);
-        // An unregistered path is worker context, never a project source.
-        assert!(matches!(
-            server.state.project_config_context(Some(project)),
-            Ok(crate::tools::project_config::ProjectConfigContext::GlobalOnly)
-        ));
-
-        template.name = "project-only".into();
-        team::save_teamplate(&template, "project", &server.state.store_dir, Some(project)).unwrap();
-        let refused=server.bro_team(Parameters(team_params(json!({"action":"create","template":"project-only","name":"must-not-exist","project_dir":project})))).await;
-        assert_eq!(refused.is_error, Some(true));
-        assert!(team::load_team("must-not-exist", &server.state.store_dir).is_none());
-
-        let local: brofile::Brofile =
-            serde_json::from_value(json!({"name":"project-reviewer","provider":"glm"})).unwrap();
-        brofile::save_brofile(&local, "project", &server.state.store_dir, Some(project)).unwrap();
-        template.name = "global-local-reference".into();
-        template.members[0].brofile = local.name;
-        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
-        let refused=server.bro_team(Parameters(team_params(json!({"action":"create","template":"global-local-reference","name":"missing-global-brofile","project_dir":project})))).await;
-        assert_eq!(refused.is_error, Some(true));
-        assert!(team::load_team("missing-global-brofile", &server.state.store_dir).is_none());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn team_discovery_filters_and_pages_without_expanding_stored_brofiles() {
-        use orchestration::team::{self, TeamMember};
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let nonexistent = root.join("not-a-checkout").to_string_lossy().into_owned();
-        for n in (0..105).rev() {
-            let team = fixture_team(
-                &format!("team-{n:03}"),
-                if n == 104 {
-                    "other-project"
-                } else {
-                    &nonexistent
-                },
-            );
-            team::save_team(&team, &server.state.store_dir);
-        }
-        let result = server
-            .bro_team(Parameters(team_params(
-                json!({"action":"list", "project_dir":nonexistent}),
-            )))
-            .await;
-        assert_ne!(result.is_error, Some(true));
-        let page: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(result.structured_content.as_ref(), Some(&page));
-        assert_eq!(page["total"], 104);
-        assert_eq!(page["count"], 20);
-        assert_eq!(page["teams"][0]["name"], "team-000");
-        assert_eq!(page["next_offset"], 20);
-        let mut params = team_params(
-            json!({"action":"list", "project_dir":nonexistent, "offset":100, "limit":1000}),
-        );
-        let tail = team_discovery(&server, &params).unwrap();
-        assert_eq!(tail["limit"], 100);
-        assert_eq!(tail["count"], 4);
-        assert!(tail["next_offset"].is_null());
-        params.name = Some("team-103".into());
-        params.offset = None;
-        params.limit = Some(0);
-        let exact = team_discovery(&server, &params).unwrap();
-        assert_eq!(exact["total"], 1);
-        assert_eq!(exact["limit"], 1);
-
-        let mut team = fixture_team("members", &nonexistent);
-        team.members = (0..105)
-            .rev()
-            .map(|n| TeamMember {
-                name: format!("member-{n:03}"),
-                brofile: "uninstalled-brofile".into(),
-                session_id: None,
-                task_history: vec![format!("old-task-{n}")],
-            })
-            .collect();
-        team::save_team(&team, &server.state.store_dir);
-        let roster = team_discovery(
-            &server,
-            &team_params(json!({"action":"roster","name":"members"})),
-        )
-        .unwrap();
-        assert_eq!(roster["count"], 20);
-        assert_eq!(roster["members"][0]["name"], "member-000");
-        assert_eq!(roster["members"][0]["latestTask"]["taskId"], "old-task-0");
-        assert_eq!(
-            roster["members"][0]["latestTask"]["statusUnavailable"],
-            true
-        );
-        assert!(roster["members"][0].get("account").is_none());
-        assert!(!Path::new(&nonexistent).exists());
-    }
-
-    #[test]
-    fn team_exact_body_recovers_oversized_advisor_configuration_and_rejects_stale_cursor() {
-        use orchestration::team::{
-            self, TeamAdvisor, TeamAdvisorConfig, Teamplate, TeamplateMember,
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let advisor = TeamAdvisorConfig {
-            brofile: "advisor".into(),
-            alias: None,
-            charter: "effective-charter-界".repeat(1000),
-            context: Some("retained-context".repeat(1000)),
-            halt_conditions: vec!["halt".repeat(1000)],
-            exit_conditions: vec![],
-            timeout_seconds: None,
-            mode: Default::default(),
-        };
-        let mut template = Teamplate {
-            name: "large".into(),
-            members: vec![TeamplateMember {
-                brofile: "reviewer".into(),
-                alias: None,
-                count: 1,
-            }],
-            advisor: Some(advisor.clone()),
-            diversity_floor: Some(2),
-        };
-        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
-        let summary =
-            team_discovery(&server, &team_params(json!({"action":"list_templates"}))).unwrap();
-        assert_eq!(summary["templates"][0]["memberCount"], 1);
-        assert_eq!(summary["templates"][0]["diversityFloor"], 2);
-        assert!(!summary.to_string().contains("effective-charter"));
-        assert!(!summary.to_string().contains("retained-context"));
-        let mut params = team_params(json!({"action":"get_template","name":"large"}));
-        let first = team_discovery(&server, &params).unwrap();
-        let original_cursor = first["body"]["next_cursor"].as_str().unwrap().to_owned();
-        let mut text = String::new();
-        loop {
-            let page = team_discovery(&server, &params).unwrap();
-            assert!(serde_json::to_vec(&page["body"]).unwrap().len() <= 4096);
-            text.push_str(page["body"]["text"].as_str().unwrap());
-            params.cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
-            if params.cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(
-            serde_json::from_str::<Value>(&text).unwrap(),
-            serde_json::to_value(&template).unwrap()
-        );
-        template.members[0].count = 3;
-        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
-        params.cursor = Some(original_cursor);
-        assert!(
-            team_discovery(&server, &params)
-                .unwrap_err()
-                .to_string()
-                .contains("changed")
-        );
-        let mut live = fixture_team("live", "stored-association");
-        live.advisor = Some(TeamAdvisor {
-            name: "advisor".into(),
-            config: advisor,
-            session_id: None,
-            task_history: vec!["retained-task".into()],
-        });
-        team::save_team(&live, &server.state.store_dir);
-        let roster = team_discovery(
-            &server,
-            &team_params(json!({"action":"roster","name":"live"})),
-        )
-        .unwrap();
-        assert!(!roster.to_string().contains("effective-charter"));
-        let exact =
-            team_discovery(&server, &team_params(json!({"action":"get","name":"live"}))).unwrap();
-        assert!(exact["body"]["next_cursor"].is_string());
-    }
-
-    #[test]
-    fn team_summary_byte_pages_resume_without_losing_rows() {
-        let rows = (0..105)
-            .map(|n| json!({"name":format!("member-{n:03}"), "brofile":"界\n".repeat(300)}))
-            .collect::<Vec<_>>();
-        let mut p = team_params(json!({"action":"roster","name":"large","limit":100}));
-        let mut seen = Vec::new();
-        loop {
-            let page =
-                team_summary_page(rows.clone(), "members", &p, json!({"team":"large"})).unwrap();
-            assert!(
-                serde_json::to_vec(&page).unwrap().len()
-                    <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
-            );
-            for row in page["members"].as_array().unwrap() {
-                seen.push(row["name"].as_str().unwrap().to_owned());
-            }
-            if let Some(next) = page["next_offset"].as_u64() {
-                p.offset = Some(next as usize);
-            } else {
-                break;
-            }
-        }
-        assert_eq!(
-            seen,
-            (0..105)
-                .map(|n| format!("member-{n:03}"))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn team_discovery_refuses_ambiguous_scope_and_reports_corrupt_records() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        for request in [
-            json!({"action":"list_templates","scope":"project"}),
-            json!({"action":"list_templates","scope":"typo"}),
-            json!({"action":"list_templates","project_dir":"/unused"}),
-            json!({"action":"list","scope":"project"}),
-            json!({"action":"get","name":"../other"}),
-            json!({"action":"roster","name":"team","cursor":"ignored"}),
-        ] {
-            assert!(validate_team_params(&team_params(request)).is_err());
-        }
-        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
-        let catalog_server = fixture.server();
-        let result=catalog_server.bro_team(Parameters(team_params(json!({"action":"list_templates","scope":"project","project_dir":"/nonexistent-owner-checkout"})))).await;
-        assert_eq!(result.is_error, Some(true));
-        assert!(extract_text(&result).contains("error.team_template_locality_required"));
-        let dir = server.state.store_dir.join("teamplates");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("broken.json"), "{").unwrap();
-        let filtered = team_discovery(
-            &server,
-            &team_params(json!({"action":"list_templates","name":"absent"})),
-        )
-        .unwrap();
-        assert_eq!(filtered["total"], 0);
-        assert!(
-            team_discovery(&server, &team_params(json!({"action":"list_templates"})))
-                .unwrap_err()
-                .to_string()
-                .contains("broken")
-        );
-    }
-
-    #[tokio::test]
-    async fn team_dissolve_reports_requested_cancellation_and_skipped_history() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let running = orch::test_task("running", orch::TaskStatus::Running, Provider::Brodex);
-        let terminal = orch::test_task("terminal", orch::TaskStatus::Completed, Provider::Brodex);
-        server
-            .state
-            .task_store
-            .write()
-            .insert("running".into(), running.clone())
-            .unwrap();
-        server
-            .state
-            .task_store
-            .write()
-            .insert("terminal".into(), terminal)
-            .unwrap();
-        let mut team = fixture_team("synthetic", "/synthetic/worker");
-        team.members.push(orchestration::team::TeamMember {
-            name: "synthetic-member".into(),
-            brofile: "synthetic".into(),
-            session_id: None,
-            task_history: vec!["running".into(), "terminal".into(), "missing".into()],
-        });
-        orchestration::team::save_team(&team, &server.state.store_dir);
-        let result = server
-            .bro_team(Parameters(team_params(
-                json!({"action":"dissolve","name":"synthetic","cancel_running":true}),
-            )))
-            .await;
-        assert_ne!(result.is_error, Some(true));
-        let value: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(
-            value["cancellations"][0]["outcome"],
-            "cancellation_requested"
-        );
-        assert_eq!(value["skipped_terminal"], 1);
-        assert_eq!(value["skipped_missing"], 1);
-        assert_eq!(value["removal"]["status"], "removed");
-        assert_eq!(running.inner.lock().status, orch::TaskStatus::Cancelled);
     }
 
     fn extract_text(result: &CallToolResult) -> String {
@@ -2358,7 +1280,7 @@ mod tests {
                 cost: Some(0.10),
                 turns: Some(4),
                 cwd: Some("/work/alpha".to_string()),
-                label: Some("team::executor".to_string()),
+                label: Some("executor".to_string()),
                 name: Some("Inspect the failing roster columns".to_string()),
                 session_id: Some(SessionId::new(format!("sess-{id}"))),
                 has_last_message: None,
@@ -2389,7 +1311,7 @@ mod tests {
                 cost: Some(0.42),
                 turns: Some(7),
                 cwd: None,
-                label: Some("team::reviewer".to_string()),
+                label: Some("reviewer".to_string()),
                 name: Some(format!("Prompt teaser {id}")),
                 session_id: Some(SessionId::new(format!("sess-{id}"))),
                 has_last_message: None,
@@ -2435,7 +1357,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: None,
-                team: None,
             }));
             assert_ne!(dash.is_error, Some(true));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
@@ -2464,7 +1385,7 @@ mod tests {
                 live["hasLastMessage"].as_bool().unwrap_or(false),
                 "live task with snippet should have hasLastMessage=true"
             );
-            assert_eq!(live["broLabel"], "team::executor");
+            assert_eq!(live["broLabel"], "executor");
             // `elapsed` is a live display; just check it parses as
             // "<n>s" or "<n>m <n>s" — anything else is a regression
             // in `format_elapsed` rather than the dashboard.
@@ -2484,7 +1405,7 @@ mod tests {
             assert_eq!(term["sessionId"], "sess-term-1");
             assert!(!term["hasResult"].as_bool().unwrap_or(true));
             assert!(!term["hasLastMessage"].as_bool().unwrap_or(true));
-            assert_eq!(term["broLabel"], "team::reviewer");
+            assert_eq!(term["broLabel"], "reviewer");
             assert_eq!(term["elapsed"], "1s");
         }
 
@@ -2501,8 +1422,6 @@ mod tests {
                 json!({"provider": ""}),
                 json!({"status": "typo"}),
                 json!({"status": ""}),
-                json!({"team": "missing-team"}),
-                json!({"team": ""}),
             ] {
                 let params: DashboardParams = serde_json::from_value(input.clone()).unwrap();
                 let result = server.bro_dashboard(Parameters(params));
@@ -2529,7 +1448,6 @@ mod tests {
             let read_page = |offset| {
                 let response = server.bro_dashboard(Parameters(DashboardParams {
                     provider: None,
-                    team: None,
                     status: None,
                     limit: Some(1),
                     offset: Some(offset),
@@ -2548,15 +1466,10 @@ mod tests {
         fn dashboard_invalid_filters_do_not_broaden_the_selection() {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
-            for (provider, status, team) in [
-                (Some("unknown"), None, None),
-                (None, Some("done"), None),
-                (None, None, Some("missing-team")),
-            ] {
+            for (provider, status) in [(Some("unknown"), None), (None, Some("done"))] {
                 let response = server.bro_dashboard(Parameters(DashboardParams {
                     provider: provider.map(str::to_string),
                     status: status.map(str::to_string),
-                    team: team.map(str::to_string),
                     limit: None,
                     offset: None,
                 }));
@@ -2592,7 +1505,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: Some("running".into()),
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2605,7 +1517,6 @@ mod tests {
                 limit: Some(20),
                 provider: Some("deepseek".into()),
                 status: None,
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2618,7 +1529,6 @@ mod tests {
                 limit: Some(20),
                 provider: Some("glm".into()),
                 status: Some("completed".into()),
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2645,7 +1555,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: Some("cancelled".into()),
-                team: None,
             }));
             assert_ne!(dash.is_error, Some(true));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
@@ -2685,7 +1594,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: None,
-                team: None,
             }));
             assert_ne!(dash.is_error, Some(true));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
@@ -2735,7 +1643,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: None,
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2774,7 +1681,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: None,
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2808,7 +1714,7 @@ mod tests {
                     let mut inner = live.inner.lock();
                     inner.started_at = t_live;
                     inner.completed_at = None;
-                    inner.bro_label = Some("team::executor".into());
+                    inner.bro_label = Some("executor".into());
                     inner.last_assistant_message = Some("hi".into());
                     inner.session_id = "sess-live-1".into();
                 }
@@ -2825,7 +1731,7 @@ mod tests {
                     inner.completed_at = Some(t_done + 1_500);
                     inner.cost_usd = Some(0.5);
                     inner.num_turns = Some(2);
-                    inner.bro_label = Some("team::reviewer".into());
+                    inner.bro_label = Some("reviewer".into());
                     inner.last_assistant_message =
                         Some("retained output without a recoverable preview".into());
                     assert!(inner.latest_assistant_preview.text().is_none());
@@ -2842,7 +1748,6 @@ mod tests {
                 limit: Some(20),
                 provider: None,
                 status: None,
-                team: None,
             }));
             let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
             let tasks = body["tasks"].as_array().unwrap();
@@ -2856,7 +1761,7 @@ mod tests {
             let live = by_id.get("live-1").expect("live-1 row");
             assert_eq!(live["provider"], "glm");
             assert_eq!(live["status"], "running");
-            assert_eq!(live["broLabel"], "team::executor");
+            assert_eq!(live["broLabel"], "executor");
             assert!(
                 !live["hasResult"].as_bool().unwrap_or(true),
                 "live task must not report hasResult"
@@ -2869,7 +1774,7 @@ mod tests {
             let done = by_id.get("done-1").expect("done-1 row");
             assert_eq!(done["provider"], "deepseek");
             assert_eq!(done["status"], "completed");
-            assert_eq!(done["broLabel"], "team::reviewer");
+            assert_eq!(done["broLabel"], "reviewer");
             assert_eq!(done["elapsed"], "1s");
             assert_eq!(done["hasResult"], true);
             assert_eq!(done["hasLastMessage"], true);

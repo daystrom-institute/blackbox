@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -30,11 +30,13 @@ fn ellipsize_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
+pub(crate) fn format_bro_line(task: &orch::Task) -> (String, bool) {
     let inner = task.inner.lock();
     let terminal = inner.status.is_terminal();
-    let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, store_dir);
-    let label = bro_name.unwrap_or_else(|| inner.id[..inner.id.len().min(8)].to_string());
+    let label = inner
+        .bro_label
+        .clone()
+        .unwrap_or_else(|| inner.id[..inner.id.len().min(8)].to_string());
     let elapsed = orch::format_elapsed(inner.started_at, inner.completed_at);
     let events = inner.observed_event_count();
     let activity = if terminal {
@@ -61,15 +63,12 @@ pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, b
     )
 }
 
-pub(crate) fn format_progress_snapshot(
-    tasks: &[Arc<orch::Task>],
-    store_dir: &Path,
-) -> (String, bool) {
+pub(crate) fn format_progress_snapshot(tasks: &[Arc<orch::Task>]) -> (String, bool) {
     let mut all_terminal = true;
     let lines: Vec<String> = tasks
         .iter()
         .map(|t| {
-            let (line, terminal) = format_bro_line(t, store_dir);
+            let (line, terminal) = format_bro_line(t);
             if !terminal {
                 all_terminal = false;
             }
@@ -266,7 +265,6 @@ pub(crate) fn spawn_progress_notifier(
     tasks: Vec<Arc<orch::Task>>,
     peer: rmcp::service::Peer<rmcp::RoleServer>,
     progress_token: rmcp::model::ProgressToken,
-    store_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tracing::info!(target: "blackbox::progress", token = ?progress_token, tasks = tasks.len(), "notifier spawned");
     tokio::spawn(async move {
@@ -275,7 +273,7 @@ pub(crate) fn spawn_progress_notifier(
             tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_TICK_SECS)).await;
             tick += 1;
 
-            let (msg, all_terminal) = format_progress_snapshot(&tasks, &store_dir);
+            let (msg, all_terminal) = format_progress_snapshot(&tasks);
 
             let send_result = peer
                 .send_notification(rmcp::model::ServerNotification::ProgressNotification(

@@ -43,7 +43,7 @@ Major code ownership boundaries:
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
 - `threads.rs` - thread store (threads and their notes).
-- `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
+- `orchestration/` - providers, brofiles, agent dispatch/resume, MCP
   injection and recursion guard.
 - `config.rs` - config loader and env override allowlist.
 
@@ -92,8 +92,8 @@ Daemon startup does not rewrite provider MCP registration.
 `BLACKBOX_MCP_NAME` for dispatch-time injection; persistent MCP config changes
 are user-owned or an explicit operator `bro_mcp` call on the `ops` surface.
 
-Installed brofiles and teams are catalog data. Agents discover them with
-`bro_brofile(action="list")` and `bro_team`; operators administer the catalog
+Installed brofiles are catalog data. Agents discover them with
+`bro_brofile(action="list")`; operators administer the catalog
 with the `bbox_artifact_*` tools on the `ops` surface. Explicit retired-kind
 artifact filters expose historical receipts without activating them.
 

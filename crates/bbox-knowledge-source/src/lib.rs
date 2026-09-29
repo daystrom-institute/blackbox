@@ -226,8 +226,9 @@ pub enum SourceLaneV1 {
     /// project's accepted binding set.
     Evidence,
     /// Repo-owned project bro configuration: `.bro/brofiles/<name>.json`,
-    /// `.bro/teamplates/<name>.json`, `.bbox/mcp.json`, and the committed
-    /// `.bbox/config.toml` its MCP enablement reporting reads. Publication
+    /// `.bbox/mcp.json`, and the committed `.bbox/config.toml` its MCP
+    /// enablement reporting reads. Retired `.bro/teamplates/<name>.json`
+    /// files from earlier collectors remain admissible and are ignored. Publication
     /// only: provisional workspace snapshots never carry it. Unlike the
     /// other lanes it is explicitly optional on the candidate, so "this
     /// producer publishes configuration and there is none" and "this
@@ -1564,6 +1565,8 @@ fn validate_full_ref(value: &str) -> Result<(), ContractError> {
 /// config-lane filename names, or `None` when it names none. The writable
 /// targets are exactly `bbox_code_source::ProjectConfigTargetV1`; the
 /// committed `.bbox/config.toml` is the one read-only input beside them.
+/// Retired `.bro/teamplates/<name>.json` files still classify so lanes that
+/// earlier collectors published keep verifying; readers ignore them.
 pub fn config_source_scope_relative_path<'a>(
     scope: &PublishedScope,
     repository_relative_filename: &'a str,
@@ -1576,7 +1579,8 @@ pub fn config_source_scope_relative_path<'a>(
             .strip_prefix('/')?
     };
     (relative == bbox_code_source::PROJECT_CONFIG_TOML_PATH
-        || bbox_code_source::ProjectConfigTargetV1::from_relative_path(relative).is_some())
+        || bbox_code_source::ProjectConfigTargetV1::from_relative_path(relative).is_some()
+        || bbox_code_source::is_retired_project_config_input(relative))
     .then_some(relative)
 }
 
@@ -3135,6 +3139,8 @@ mod tests {
                 &format!("{prefix}.bro/brofiles/reviewer.json"),
                 br#"{"name":"reviewer"}"#,
             ),
+            // A retired teamplate an earlier collector published still
+            // verifies as a configuration input.
             entry(
                 &format!("{prefix}.bro/teamplates/squad.json"),
                 br#"{"name":"squad"}"#,

@@ -69,7 +69,7 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
   `bro_status` before replacing apparently stalled work.
 - Discover providers with `bro_providers`; select a provider to list its models.
   `bro_brofile(action="list")` returns compact summaries; select a persona for detail.
-- Operators install brofiles and teams with `bbox_artifact_install` on the
+- Operators install brofiles with `bbox_artifact_install` on the
   `ops` surface, from inline artifact JSON or an HTTP(S) URL. Local caller
   paths are rejected. List before installing.
 

@@ -6,8 +6,8 @@
 //! exposes a single async mutex per `(provider, session_id)` key so
 //! every dispatch path can serialize against the same invariant.
 //!
-//! Operator-facing paths such as ad-hoc `bro_resume`, workflow durable
-//! actors, and team advisor resumes use the non-blocking path and fail
+//! Operator-facing paths such as ad-hoc `bro_resume` and workflow durable
+//! actors use the non-blocking path and fail
 //! fast with a `bro_wait` / `bro_cancel` instruction instead of
 //! silently queuing a follow-up that can outlive the caller's tool timeout.
 //!

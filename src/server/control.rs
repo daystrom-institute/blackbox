@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Query, State as AxumState};
-use axum::response::IntoResponse;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use serde::Deserialize;
@@ -551,28 +550,11 @@ pub(crate) async fn control_cancel_handler(
     axum::Json(BlackboxServer::new(state).bro_cancel(Parameters(req)))
 }
 
-pub(crate) async fn control_team_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::extract::Path(team_name): axum::extract::Path<String>,
-) -> impl axum::response::IntoResponse {
-    match orchestration::team::load_team(&team_name, &state.store_dir) {
-        Some(team) => axum::Json(json!({
-            "team": team.name,
-            "members": team.members.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
-        }))
-        .into_response(),
-        None => (
-            axum::http::StatusCode::NOT_FOUND,
-            format!("unknown team: {team_name}"),
-        )
-            .into_response(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestration::providers::Provider;
+    use axum::response::IntoResponse;
 
     /// /control/closeout (Phase 3a, design/fleet-tui/closeout-command.md §4.1)
     /// validates the request before reaching the driver: a disposition not in

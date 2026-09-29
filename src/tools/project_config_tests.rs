@@ -29,22 +29,11 @@ fn global_brofiles(server: &BlackboxServer) {
         orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
             .unwrap();
     }
-    let template = orchestration::team::Teamplate {
-        name: "global-panel".into(),
-        members: vec![orchestration::team::TeamplateMember {
-            brofile: "writer".into(),
-            alias: None,
-            count: 1,
-        }],
-        advisor: None,
-        diversity_floor: None,
-    };
-    orchestration::team::save_teamplate(&template, "global", &server.state.store_dir, None)
-        .unwrap();
 }
 
 /// A published project whose accepted configuration overrides `reviewer`,
-/// publishes one template and a project MCP filter, and disables project MCP.
+/// publishes a project MCP filter, disables project MCP, and still carries a
+/// retired teamplate an earlier collector published.
 fn accepted_fixture(scope: &PublishedScope) -> (CatalogFixture, BlackboxServer) {
     let fixture = CatalogFixture::new();
     fixture.add_published_project(PROJECT, scope);
@@ -100,14 +89,6 @@ fn accepted_view_serves_exact_scope_reads_and_project_first_resolution() {
             .collect::<Vec<_>>(),
         vec!["reviewer"]
     );
-    assert_eq!(
-        accepted
-            .snapshot
-            .teamplates()
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>(),
-        vec!["squad"]
-    );
     assert_eq!(accepted.snapshot.mcp_enabled(), Some(false));
     assert_eq!(accepted.snapshot.provenance().accepted_commit, COMMIT_ONE);
 
@@ -141,20 +122,6 @@ fn accepted_view_serves_exact_scope_reads_and_project_first_resolution() {
         .unwrap();
     assert_eq!(model(&global), "global-reviewer");
     assert_eq!(global.source, ProjectConfigSource::Global);
-
-    let template = state
-        .resolve_config_teamplate("squad", Some(PROJECT))
-        .unwrap()
-        .unwrap();
-    assert!(matches!(template.source, ProjectConfigSource::Project(_)));
-    let global_template = state
-        .resolve_config_teamplate("global-panel", Some(PROJECT))
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        global_template.source,
-        ProjectConfigSource::GlobalFallback(_)
-    ));
 
     // Dispatch filters merge the accepted project store exactly as the
     // daemon-local store merged: global, then project, then the guard.

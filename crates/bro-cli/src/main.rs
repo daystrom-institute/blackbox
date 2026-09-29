@@ -11,7 +11,7 @@
 
 //! `bro tail` — headless stream printer for agent orchestration.
 //!
-//! Selects one or more bros (by name, team, session, or provider), subscribes
+//! Selects one or more bros (by name, session, or provider), subscribes
 //! to the daemon's `/tail` SSE stream, and writes each event payload to stdout
 //! for piping, scripting, and logging. The interactive cockpit lives in
 //! `bro fleet`.
@@ -36,7 +36,6 @@ mod workspace_binding;
 #[derive(Default, Debug, Clone)]
 struct TailSelectors {
     bros: Vec<String>,
-    teams: Vec<String>,
     sessions: Vec<String>,
     providers: Vec<String>,
 }
@@ -111,15 +110,12 @@ struct AgentArgs {
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Prints one SSE data payload per stdout line. Selectors are unioned and each flag is repeatable.\n\nExamples:\n  bro tail alice bob\n  bro tail --team review-panel\n  bro tail --team A --team B\n  bro tail --team A --bro solo --bro qa\n  bro tail --session <uuid>\n  bro tail --provider codex"
+    after_help = "Prints one SSE data payload per stdout line. Selectors are unioned and each flag is repeatable.\n\nExamples:\n  bro tail reviewer writer\n  bro tail --bro reviewer --bro qa\n  bro tail --session <uuid>\n  bro tail --provider codex"
 )]
 struct TailArgs {
-    /// Specific bros to include. Accepts bare names or `team::bro`.
+    /// Specific bros to include, by the brofile name they were dispatched with.
     #[arg(long = "bro", value_name = "NAME")]
     bros: Vec<String>,
-    /// Teams to include in full.
-    #[arg(long = "team", value_name = "NAME")]
-    teams: Vec<String>,
     /// Raw sessions to tail directly.
     #[arg(long = "session", value_name = "ID")]
     sessions: Vec<String>,
@@ -137,7 +133,6 @@ impl From<TailArgs> for TailSelectors {
         bros.extend(args.positional_bros);
         Self {
             bros,
-            teams: args.teams,
             sessions: args.sessions,
             providers: args.providers,
         }
@@ -152,9 +147,6 @@ fn tail_url(sel: &TailSelectors) -> String {
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
         params.push(format!("bros={}", sel.bros.join(",")));
-    }
-    if !sel.teams.is_empty() {
-        params.push(format!("teams={}", sel.teams.join(",")));
     }
     if !sel.sessions.is_empty() {
         params.push(format!("sessions={}", sel.sessions.join(",")));
@@ -441,10 +433,6 @@ mod tests {
             "tail",
             "alpha",
             "beta",
-            "--team",
-            "red",
-            "--team",
-            "blue",
             "--bro",
             "solo",
             "--session",
@@ -458,19 +446,8 @@ mod tests {
         };
         let sel = TailSelectors::from(args);
         assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
-        assert_eq!(sel.teams, vec!["red", "blue"]);
         assert_eq!(sel.sessions, vec!["sid-123"]);
         assert_eq!(sel.providers, vec!["gemini"]);
-    }
-
-    #[test]
-    fn clap_preserves_scoped_bro_selectors() {
-        let cli = BroCli::parse_from(["bro", "tail", "--bro", "red::reviewer"]);
-        let BroCommand::Tail(args) = cli.command else {
-            panic!("expected Tail command");
-        };
-        let sel = TailSelectors::from(args);
-        assert_eq!(sel.bros, vec!["red::reviewer"]);
     }
 
     #[test]

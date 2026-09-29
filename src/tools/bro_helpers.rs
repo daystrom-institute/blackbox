@@ -1,10 +1,3 @@
-use std::path::Path;
-
-use crate::index;
-use crate::orchestration;
-use crate::orchestration::providers::Provider;
-use crate::tools::bro_runtime_params::BroRosterEntry;
-
 pub(crate) fn split_csv(s: &Option<String>) -> Vec<String> {
     s.as_deref()
         .unwrap_or("")
@@ -12,68 +5,4 @@ pub(crate) fn split_csv(s: &Option<String>) -> Vec<String> {
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty())
         .collect()
-}
-
-pub(crate) fn infer_provider_from_path(path: &Path) -> Option<Provider> {
-    let s = path.to_string_lossy();
-    let _ = s;
-    None
-}
-
-/// Roster rows resolve each member's brofile through the same project view
-/// dispatch uses: the team's project association selects the accepted
-/// configuration in catalog mode and the daemon-local checkout in bridge mode.
-/// A view that cannot answer leaves the row's provider unknown and is logged;
-/// it never falls back to another store.
-pub(crate) fn build_member_entry(
-    team: &orchestration::team::Team,
-    member: &orchestration::team::TeamMember,
-    state: &crate::server::state::SharedState,
-    config: &index::ReindexConfig,
-) -> BroRosterEntry {
-    let store_dir: &Path = &state.store_dir;
-    let brofile = state
-        .dispatch_brofile(&member.brofile, team.project_dir.as_deref())
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                team = %team.name,
-                member = %member.name,
-                error = %error,
-                "roster member brofile unavailable"
-            );
-            None
-        });
-    let provider = brofile.as_ref().map(|b| b.provider);
-    let session_id = member
-        .session_id
-        .as_ref()
-        .filter(|s| s.as_str() != "pending")
-        .cloned();
-    let jsonl_path = session_id
-        .as_deref()
-        .and_then(|sid| index::find_session_file(sid, &config.roots, config.codex_root.as_deref()))
-        .map(|p| p.to_string_lossy().into_owned());
-    BroRosterEntry {
-        bro: member.name.clone(),
-        bro_selector: format!("{}::{}", team.name, member.name),
-        team: team.name.clone(),
-        provider: provider
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        account: brofile.as_ref().and_then(|b| {
-            orchestration::brofile::effective_account(b.provider, b.account.as_deref(), store_dir)
-        }),
-        session_id,
-        jsonl_path,
-        brofile: member.brofile.clone(),
-        model: brofile.and_then(|b| b.model),
-    }
-}
-
-pub(crate) fn roster_entry_key(entry: &BroRosterEntry) -> String {
-    if let Some(ref sid) = entry.session_id {
-        format!("session::{sid}")
-    } else {
-        format!("member::{}", entry.bro_selector)
-    }
 }

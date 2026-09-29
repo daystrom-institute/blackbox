@@ -661,7 +661,7 @@ pub const MAX_CHECKOUT_MUTATIONS_PER_POLL: usize = 64;
 pub const MAX_CHECKOUT_MUTATION_PATH_BYTES: usize = 1024;
 pub const MAX_CHECKOUT_MUTATION_CONTENT_BYTES: usize = 256 * 1024;
 pub const MAX_CHECKOUT_MUTATION_REASON_BYTES: usize = 2048;
-/// Longest project configuration name (brofile or teamplate stem).
+/// Longest project configuration name (brofile stem).
 pub const MAX_PROJECT_CONFIG_NAME_BYTES: usize = 128;
 
 /// Request header a collector sends on the mutation poll to declare which
@@ -688,8 +688,6 @@ pub fn capabilities_support_guarded(header_value: &str) -> bool {
 pub enum ProjectConfigTargetV1 {
     /// `.bro/brofiles/<name>.json`
     Brofile(String),
-    /// `.bro/teamplates/<name>.json`
-    Teamplate(String),
     /// `.bbox/mcp.json`
     McpStore,
 }
@@ -699,14 +697,27 @@ pub const PROJECT_MCP_STORE_PATH: &str = ".bbox/mcp.json";
 /// view (MCP enablement), never a mutation target.
 pub const PROJECT_CONFIG_TOML_PATH: &str = ".bbox/config.toml";
 const PROJECT_BROFILES_DIR: &str = ".bro/brofiles/";
-const PROJECT_TEAMPLATES_DIR: &str = ".bro/teamplates/";
+/// Retired team templates. Configuration trees published by earlier
+/// collectors can still carry `<name>.json` files here; they stay valid
+/// configuration inputs so those trees verify, and every reader ignores them.
+const RETIRED_PROJECT_TEAMPLATES_DIR: &str = ".bro/teamplates/";
+
+/// Whether a scope-root-relative path is a retired configuration input: a
+/// `.bro/teamplates/<name>.json` file an earlier collector published. It is
+/// never a mutation target and no reader parses it.
+pub fn is_retired_project_config_input(path: &str) -> bool {
+    validate_relative_path(path).is_ok()
+        && path
+            .strip_prefix(RETIRED_PROJECT_TEAMPLATES_DIR)
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|stem| validate_project_config_name(stem).is_ok())
+}
 
 impl ProjectConfigTargetV1 {
     /// Scope-root-relative path of this target.
     pub fn relative_path(&self) -> String {
         match self {
             Self::Brofile(name) => format!("{PROJECT_BROFILES_DIR}{name}.json"),
-            Self::Teamplate(name) => format!("{PROJECT_TEAMPLATES_DIR}{name}.json"),
             Self::McpStore => PROJECT_MCP_STORE_PATH.to_string(),
         }
     }
@@ -726,10 +737,7 @@ impl ProjectConfigTargetV1 {
             validate_project_config_name(stem).ok()?;
             Some(stem.to_string())
         };
-        if let Some(name) = named(PROJECT_BROFILES_DIR) {
-            return Some(Self::Brofile(name));
-        }
-        named(PROJECT_TEAMPLATES_DIR).map(Self::Teamplate)
+        named(PROJECT_BROFILES_DIR).map(Self::Brofile)
     }
 }
 
@@ -1694,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn project_config_targets_classify_exactly_the_three_shapes() {
+    fn project_config_targets_classify_exactly_the_two_shapes() {
         for (path, target) in [
             (
                 ".bro/brofiles/reviewer.json",
@@ -1703,10 +1711,6 @@ mod tests {
             (
                 ".bro/brofiles/code-reviewer_v2.json",
                 ProjectConfigTargetV1::Brofile("code-reviewer_v2".into()),
-            ),
-            (
-                ".bro/teamplates/squad.json",
-                ProjectConfigTargetV1::Teamplate("squad".into()),
             ),
             (".bbox/mcp.json", ProjectConfigTargetV1::McpStore),
         ] {
@@ -1724,6 +1728,7 @@ mod tests {
             ".bro/brofiles/reviewer.toml",
             ".bro/brofiles/reviewer",
             ".bro/brofiles/../mcp.json",
+            ".bro/teamplates/squad.json",
             ".bro/teamplates/a/b.json",
             ".bro/mcp.json",
             ".bro/config.json",
@@ -1749,15 +1754,33 @@ mod tests {
     }
 
     #[test]
-    fn guarded_mutations_accept_only_configuration_targets() {
+    fn retired_teamplate_files_classify_as_inputs_but_never_as_targets() {
         for path in [
-            ".bro/brofiles/reviewer.json",
             ".bro/teamplates/squad.json",
-            ".bbox/mcp.json",
+            ".bro/teamplates/code_review-2.json",
         ] {
+            assert!(is_retired_project_config_input(path), "{path}");
+            assert_eq!(ProjectConfigTargetV1::from_relative_path(path), None);
+        }
+        for path in [
+            ".bro/teamplates/a/b.json",
+            ".bro/teamplates/.hidden.json",
+            ".bro/teamplates/squad.toml",
+            ".bro/teamplates/../brofiles/x.json",
+            "sub/.bro/teamplates/squad.json",
+            ".bro/brofiles/reviewer.json",
+        ] {
+            assert!(!is_retired_project_config_input(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn guarded_mutations_accept_only_configuration_targets() {
+        for path in [".bro/brofiles/reviewer.json", ".bbox/mcp.json"] {
             guarded_config_mutation(path).validate().unwrap();
         }
         for path in [
+            ".bro/teamplates/squad.json",
             ".bbox/config.toml",
             ".bbox/gaps/gap-0123abcd.json",
             ".bro/brofiles/nested/reviewer.json",

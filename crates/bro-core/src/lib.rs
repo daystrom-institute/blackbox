@@ -25,8 +25,7 @@ pub use provider::{Capability, EffortInfo, ModelInfo, Provider};
 //     tool but still go through the same spawn funnel. Same intent as
 //     AgentDispatch but with a separate UI tab so cockpit-launched tasks
 //     are visually distinguishable from peer-bros-launched ones.
-//   - `Workflow` covers team / workflow / advisor runtime
-//     dispatches (orchestrate.rs, workflow_runtime.rs, roster.rs team advisor).
+//   - `Workflow` covers workflow runtime dispatches.
 //   - `Atom` covers catalog atom invocations and resumes.
 //   - `Cron` / `Webhook` cover the scheduled / HTTP-triggered ingress paths
 //     (added in their respective slices; V1 records them as the canonical

@@ -25,8 +25,8 @@ source material:
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | Edge sidecars | Manifest, snapshots and overlays that authorize code-source activation (no in-memory edge graph) |
 | Knowledge store | Durable rules, conventions, memories, and render targets |
-| Orchestration runtime | `bro` tasks, teams, waits, and cancellation |
-| Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
+| Orchestration runtime | `bro` tasks, waits, and cancellation |
+| Artifact catalog | Installed brofiles; retired workflow, agent, atom, cron, packet and team receipts stay readable |
 
 The important boundary: operators maintain the daemon and its stores;
 agents consume the graph/search/tool surfaces through MCP.

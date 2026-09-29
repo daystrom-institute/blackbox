@@ -329,7 +329,6 @@ fn init_project_scaffolding(path: &Path, announce: bool) -> Result<PathBuf> {
     for dir in [
         "brofiles",
         "workflows",
-        "teams",
         "agents",
         "local",
         "knowledge",
@@ -1990,10 +1989,11 @@ impl Default for ConfigLaneLimits {
 
 /// Capture the project configuration inputs from the verified commit, never
 /// the working tree: the committed `.bbox/config.toml` and `.bbox/mcp.json`
-/// when present, and the direct `<name>.json` children of `.bro/brofiles`
-/// and `.bro/teamplates`. Siblings that are not configuration inputs
-/// (other extensions, nested directories, hidden names) are not
-/// configuration and are skipped; committed links fail the listing closed.
+/// when present, and the direct `<name>.json` children of `.bro/brofiles`.
+/// Siblings that are not configuration inputs (other extensions, nested
+/// directories, hidden names) are not configuration and are skipped;
+/// committed links fail the listing closed. Retired `.bro/teamplates` files
+/// are never read.
 /// An empty result is a present, empty lane.
 fn capture_config_lane(
     commit: &bbox_corpus_core::git::VerifiedCommit,
@@ -2039,32 +2039,30 @@ fn capture_config_lane(
             read(path, bytes)?;
         }
     }
-    for directory in [".bro/brofiles", ".bro/teamplates"] {
-        let directory = repository_path(directory);
-        let listed = bbox_corpus_core::git::list_verified_committed_dir_bounded(
-            commit,
-            &directory,
-            usize::try_from(limits.max_files.saturating_mul(4)).unwrap_or(usize::MAX),
-            CONFIG_LISTING_MAX_BYTES,
-        )
-        .with_context(|| format!("listing configuration directory {directory}"))?;
-        for path in listed {
-            if bbox_knowledge_source::config_source_scope_relative_path(scope, &path).is_none() {
-                continue;
-            }
-            let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
-                commit,
-                &path,
-                max_file_bytes,
-            )
-            .with_context(|| {
-                format!(
-                    "reading configuration source {path} (per-file limit {} bytes)",
-                    limits.max_file_bytes
-                )
-            })?;
-            read(path, bytes)?;
+    let directory = repository_path(".bro/brofiles");
+    let listed = bbox_corpus_core::git::list_verified_committed_dir_bounded(
+        commit,
+        &directory,
+        usize::try_from(limits.max_files.saturating_mul(4)).unwrap_or(usize::MAX),
+        CONFIG_LISTING_MAX_BYTES,
+    )
+    .with_context(|| format!("listing configuration directory {directory}"))?;
+    for path in listed {
+        if bbox_knowledge_source::config_source_scope_relative_path(scope, &path).is_none() {
+            continue;
         }
+        let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+            commit,
+            &path,
+            max_file_bytes,
+        )
+        .with_context(|| {
+            format!(
+                "reading configuration source {path} (per-file limit {} bytes)",
+                limits.max_file_bytes
+            )
+        })?;
+        read(path, bytes)?;
     }
     let mut entries = Vec::with_capacity(files.len());
     let mut lane_bytes = 0_u64;
@@ -4091,7 +4089,7 @@ mod tests {
             apply_checkout_mutation(&config, &delete).unwrap(),
             applied(None)
         );
-        const OTHER: &str = ".bro/teamplates/squad.json";
+        const OTHER: &str = ".bro/brofiles/squad.json";
         let mut previous: Option<String> = None;
         for sequence in 3..=40_u64 {
             let content = format!("{{\"name\":\"squad\",\"n\":{sequence}}}");
@@ -4424,7 +4422,7 @@ mod tests {
         let other_path = guarded(
             &scope,
             "cm-0000000000000013",
-            ".bro/teamplates/squad.json",
+            ".bro/brofiles/squad.json",
             Some("{\"name\":\"squad\"}"),
             None,
         );
@@ -4508,7 +4506,7 @@ mod tests {
             "no staged temporary file survives"
         );
         // Two competing creations from one absent base: exactly one lands.
-        let path = ".bro/teamplates/squad.json";
+        let path = ".bro/brofiles/squad.json";
         let competing = [
             guarded(&scope, "cm-0000000000000032", path, Some(V1), None),
             guarded(&scope, "cm-0000000000000033", path, Some(V2), None),
@@ -4689,6 +4687,7 @@ mod tests {
         write_file(&root, ".bro/brofiles/README.md", b"docs");
         write_file(&root, ".bro/brofiles/nested/deep.json", b"{}");
         write_file(&root, ".bro/brofiles/.hidden.json", b"{}");
+        // Retired teamplates stay in the checkout but are not captured.
         write_file(&root, ".bro/teamplates/squad.json", br#"{"name":"squad"}"#);
         write_file(&root, ".bro/accounts.json", b"{}");
         git(&root, &["add", ".bbox", ".bro"]);
@@ -4713,7 +4712,6 @@ mod tests {
                 ".bbox/config.toml",
                 ".bbox/mcp.json",
                 ".bro/brofiles/reviewer.json",
-                ".bro/teamplates/squad.json",
             ]
         );
         assert_eq!(
@@ -4729,7 +4727,7 @@ mod tests {
             V1.as_bytes()
         );
         let descriptor = captured.descriptor.config.as_ref().unwrap();
-        assert_eq!(descriptor.file_count, 4);
+        assert_eq!(descriptor.file_count, 3);
         assert_eq!(
             descriptor.manifest_sha256,
             source_manifest_sha256(SourceLaneV1::Config, config)
@@ -5220,7 +5218,6 @@ mod tests {
         for dir in [
             "brofiles",
             "workflows",
-            "teams",
             "agents",
             "local",
             "knowledge",

@@ -41,7 +41,6 @@ pub(super) fn build_http_app(
         .route("/healthz", axum::routing::get(health_probe))
         .route("/readyz", axum::routing::get(health_probe))
         .route("/tail", axum::routing::get(tail_handler))
-        .route("/roster", axum::routing::get(roster_handler))
         // Generic orchestration control plane. These are thin HTTP adapters over
         // the `bro_*` dispatch/control tools, shared by every external driver
         // (the fleet client, future bridges). The canonical namespace is
@@ -85,10 +84,6 @@ pub(super) fn build_http_app(
             axum::routing::post(control_cancel_handler),
         )
         .route(
-            "/control/team/{team_name}",
-            axum::routing::get(control_team_handler),
-        )
-        .route(
             "/admin/artifact/install",
             axum::routing::post(admin_artifact_install),
         )
@@ -120,7 +115,6 @@ pub(super) fn build_http_app(
             "/admin/brofile/upsert",
             axum::routing::post(admin_brofile_upsert),
         )
-        .route("/admin/team/upsert", axum::routing::post(admin_team_upsert))
         // Operator authority, never an MCP tool: minting a workspace binding
         // hands out the capability that selects one provisional workspace.
         // See src/server/workspace_binding_mint.rs for the verification limits.

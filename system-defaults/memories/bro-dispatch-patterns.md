@@ -17,9 +17,8 @@ The orchestration surface is small, but the workflow shapes are different enough
 If you want continuity, do not call `bro_exec` again.
 
 `bro_wait`, `bro_when_all`, and `bro_when_any` observe existing tasks without
-launching advisors or follow-up work. Team creation also starts no advisor.
-Legacy team advisor settings remain readable but inert; request any review
-explicitly with `bro_exec` or `bro_resume`.
+launching follow-up work. Request any review explicitly with `bro_exec` or
+`bro_resume`.
 
 Record the `{taskId, sessionId}` returned by every `bro_exec` and
 `bro_resume`. Use those explicit handles for later waits and resumes whenever
@@ -34,7 +33,7 @@ Starting another resume before the prior one reaches a terminal state can
 fork/corrupt provider session history.
 
 `bro_dashboard` is shared lookup state, not an ownership grant. Do not take
-over, resume, cancel, prune, or dissolve a bro/team/task created by another
+over, resume, cancel, or prune a bro/task created by another
 external session unless the user explicitly asked you to operate on that work.
 
 ## Standard patterns
@@ -53,13 +52,14 @@ when the session is polluted, genuinely lost, or intentionally independent.
 
 ### Blind deliberation
 
-1. one `bro_exec(...)` per member
-2. `bro_when_all(...)`
+1. one `bro_exec(bro=...)` per member, each naming the brofile for its role
+2. `bro_when_all(task_ids=[...])` over the returned task ids
 3. compare answers
 4. optionally `bro_resume(...)` selected members with follow-up prompts,
    but only after the selected members' current tasks are terminal
 
-Later rounds resume each member's session, so they obey the single-flight
+Later rounds resume each member's recorded session with
+`bro_resume(session_id=..., provider=...)`, so they obey the single-flight
 rule of `bro_resume`: do not send a new round to a member while that
 member's prior task is still running.
 
@@ -87,13 +87,10 @@ bro dead, cancelling, or replacing it, call `bro_status(task_id=..., tail=N)`.
 The task may be thinking, running tests, rate-limited, or waiting on a slow
 provider.
 
-## Team and brofile hygiene
+## Brofile hygiene
 
-- List before create. `bro_brofile(action="list")` before `create`; same for teams/templates.
-- Prefer named bros over raw providers so model/account/lens/session routing stays consistent.
-- Use `team::bro` when names are ambiguous across instantiated teams.
-- Dissolve ad hoc teams you created after all member tasks are terminal:
-  `bro_team(action="dissolve", name="...", cancel_running=false)`.
+- List before create. `bro_brofile(action="list")` before `create`.
+- Prefer named brofiles over raw providers so model/account/lens routing stays consistent.
 - Pruning terminal tasks is an operator action (`bro_prune` on the `ops`
   surface). Terminal status is not "done": the operator may want to resume the
   session, so leave pruning to them. Never use pruning as a substitute for
@@ -126,4 +123,4 @@ Keep these cold in this runbook:
 - orchestration shapes
 - race vs deliberation tradeoffs
 - cancellation etiquette
-- team/brofile hygiene
+- brofile hygiene

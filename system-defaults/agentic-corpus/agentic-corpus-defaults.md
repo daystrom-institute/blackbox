@@ -1,6 +1,6 @@
 # Corpus roles
 
-This directory retains useful brofile prompts and team definitions. These are
+This directory retains useful brofile prompts. These are
 optional inputs for caller-owned work; installation does not start a schedule
 or choose subsequent tasks.
 

@@ -1,11 +1,10 @@
 //! Accepted project bro configuration.
 //!
 //! In catalog mode the daemon holds no checkout authority, so repo-owned
-//! project configuration (`.bro/brofiles/<name>.json`,
-//! `.bro/teamplates/<name>.json`, `.bbox/mcp.json`, plus the committed
-//! `.bbox/config.toml` that reports MCP enablement) is read only from the
-//! project's accepted publication and written only through the checkout-owner
-//! mutation lane. This module is the typed view over that accepted lane:
+//! project configuration (`.bro/brofiles/<name>.json`, `.bbox/mcp.json`,
+//! plus the committed `.bbox/config.toml` that reports MCP enablement) is
+//! read only from the project's accepted publication and written only
+//! through the checkout-owner mutation lane. This module is the typed view over that accepted lane:
 //! parsing, exact-scope lookup, and the project-first/global resolution that
 //! dispatch uses. It never touches the filesystem for project configuration;
 //! global fallback reads only the daemon-owned global stores.
@@ -27,7 +26,6 @@ use serde::Serialize;
 
 use super::brofile::Brofile;
 use super::mcp::McpStore;
-use super::team::Teamplate;
 
 /// Why the accepted configuration view cannot answer. Every variant refuses
 /// the read: none of them proves a project override absent.
@@ -124,13 +122,12 @@ pub struct ProjectConfigProvenance {
 /// generation. Immutable: a new publication is a new snapshot.
 #[derive(Debug, Clone)]
 // The scope and exact-scope accessors serve the project-scope list/get and
-// enablement reporting of bro_brofile, bro_team and bro_mcp.
+// enablement reporting of bro_brofile and bro_mcp.
 #[allow(dead_code)]
 pub struct ProjectConfigSnapshot {
     provenance: ProjectConfigProvenance,
     scope: PublishedScope,
     brofiles: BTreeMap<String, Brofile>,
-    teamplates: BTreeMap<String, Teamplate>,
     mcp_store: Option<McpStore>,
     mcp_enabled: Option<bool>,
     accepted_bytes: BTreeMap<ProjectConfigTargetV1, String>,
@@ -143,6 +140,7 @@ impl ProjectConfigSnapshot {
     /// configuration input of `scope`, is not UTF-8, or does not parse as its
     /// type makes the whole snapshot invalid: a partial view could resolve a
     /// name to global configuration while the project meant to override it.
+    /// Retired `.bro/teamplates` files are admitted and skipped unread.
     pub fn parse<'a>(
         provenance: ProjectConfigProvenance,
         scope: &PublishedScope,
@@ -156,7 +154,6 @@ impl ProjectConfigSnapshot {
             provenance: provenance.clone(),
             scope: scope.clone(),
             brofiles: BTreeMap::new(),
-            teamplates: BTreeMap::new(),
             mcp_store: None,
             mcp_enabled: None,
             accepted_bytes: BTreeMap::new(),
@@ -170,6 +167,9 @@ impl ProjectConfigSnapshot {
                             bounded_path(filename)
                         ))
                     })?;
+            if bbox_code_source::is_retired_project_config_input(relative) {
+                continue;
+            }
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| invalid(format!("{relative} is not UTF-8 text")))?;
             if relative == PROJECT_CONFIG_TOML_PATH {
@@ -190,11 +190,6 @@ impl ProjectConfigSnapshot {
                 ProjectConfigTargetV1::Brofile(name) => {
                     snapshot
                         .brofiles
-                        .insert(name.clone(), parse_json(relative, text).map_err(invalid)?);
-                }
-                ProjectConfigTargetV1::Teamplate(name) => {
-                    snapshot
-                        .teamplates
                         .insert(name.clone(), parse_json(relative, text).map_err(invalid)?);
                 }
                 ProjectConfigTargetV1::McpStore => {
@@ -221,16 +216,6 @@ impl ProjectConfigSnapshot {
 
     pub fn brofiles(&self) -> impl Iterator<Item = (&str, &Brofile)> {
         self.brofiles
-            .iter()
-            .map(|(name, value)| (name.as_str(), value))
-    }
-
-    pub fn teamplate(&self, name: &str) -> Option<&Teamplate> {
-        self.teamplates.get(name)
-    }
-
-    pub fn teamplates(&self) -> impl Iterator<Item = (&str, &Teamplate)> {
-        self.teamplates
             .iter()
             .map(|(name, value)| (name.as_str(), value))
     }
@@ -271,6 +256,9 @@ pub enum ProjectConfigSource {
 #[derive(Debug, Clone)]
 pub struct Resolved<T> {
     pub value: T,
+    /// Which store answered; the project-scope configuration readers of
+    /// bro_brofile and bro_mcp report it.
+    #[allow(dead_code)]
     pub source: ProjectConfigSource,
 }
 
@@ -290,26 +278,6 @@ pub fn resolve_brofile(
         }
     }
     super::brofile::resolve_brofile(name, store_dir, None).map(|value| Resolved {
-        value,
-        source: fallback_source(project),
-    })
-}
-
-/// Same precedence for teamplates.
-pub fn resolve_teamplate(
-    project: Option<&ProjectConfigSnapshot>,
-    name: &str,
-    store_dir: &Path,
-) -> Option<Resolved<Teamplate>> {
-    if let Some(snapshot) = project {
-        if let Some(teamplate) = snapshot.teamplate(name) {
-            return Some(Resolved {
-                value: teamplate.clone(),
-                source: ProjectConfigSource::Project(snapshot.provenance.clone()),
-            });
-        }
-    }
-    super::team::resolve_teamplate(name, store_dir, None).map(|value| Resolved {
         value,
         source: fallback_source(project),
     })
@@ -395,9 +363,11 @@ mod tests {
                     r#"{"version":1,"servers":{},"filters":{"allow":[],"disallow":["x"]}}"#.into(),
                 ),
                 ("services/api/.bro/brofiles/reviewer.json", brofile.clone()),
+                // A retired teamplate, even one that no longer parses, is
+                // skipped rather than refusing the snapshot.
                 (
                     "services/api/.bro/teamplates/squad.json",
-                    r#"{"name":"squad","members":[{"brofile":"reviewer","count":1}]}"#.into(),
+                    "{not json sk-secret-value".into(),
                 ),
             ],
         )
@@ -407,7 +377,6 @@ mod tests {
             snapshot.brofile("reviewer").unwrap().model.as_deref(),
             Some("opus")
         );
-        assert!(snapshot.teamplate("squad").is_some());
         assert_eq!(snapshot.mcp_store().unwrap().filters.disallow, vec!["x"]);
         assert_eq!(
             snapshot.accepted_bytes(&ProjectConfigTargetV1::Brofile("reviewer".into())),
@@ -448,7 +417,6 @@ mod tests {
                 ".bro/brofiles/reviewer.json",
                 r#"{"name":"sk-secret-value"}"#,
             ),
-            (".bro/teamplates/squad.json", "{not json sk-secret-value"),
         ] {
             let error = parse(&scope("."), &[(path, bytes.into())]).unwrap_err();
             assert_eq!(error.code(), "error.project_config_invalid");

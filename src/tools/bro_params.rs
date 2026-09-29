@@ -21,10 +21,9 @@ pub(crate) struct ExecParams {
     pub(crate) request_key: Option<String>,
     /// Task instruction for the agent
     pub(crate) prompt: String,
-    /// Dispatch selector option 1: named bro instance to target. Bare names
-    /// must be unique across live teams; use `team::bro` to disambiguate.
-    /// Exactly one selector family is required: bro, provider, or runtime
-    /// allocation fields such as tier/pool/pin_*.
+    /// Dispatch selector option 1: brofile name to dispatch. Exactly one
+    /// selector family is required: bro, provider, or runtime allocation
+    /// fields such as tier/pool/pin_*.
     #[serde(default)]
     pub(crate) bro: Option<String>,
     /// Dispatch selector option 2: raw provider for ad-hoc tasks.
@@ -155,10 +154,6 @@ pub(crate) struct ResumeParams {
     pub(crate) request_key: Option<String>,
     /// Follow-up instruction
     pub(crate) prompt: String,
-    /// Named bro instance to resume. Bare names must be unique across live
-    /// teams; use `team::bro` to disambiguate.
-    #[serde(default)]
-    pub(crate) bro: Option<String>,
     /// Session ID from a prior task (requires provider)
     #[serde(default)]
     pub(crate) session_id: Option<String>,
@@ -226,12 +221,6 @@ pub(crate) struct WaitParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WhenParams {
-    /// Team name. Waits on each member's most recent task. The whole
-    /// selection is validated before waiting: unknown teams, empty teams,
-    /// members without task history, or members whose latest task was pruned
-    /// reject the call. Mutually exclusive with task_ids.
-    #[serde(default)]
-    pub(crate) team: Option<String>,
     /// Explicit task IDs. Every ID must exist; unknown or pruned IDs reject
     /// the whole selection before waiting. Duplicates are preserved: each
     /// requested occurrence gets its own result row. Maximum 64 IDs per
@@ -418,8 +407,6 @@ pub(crate) struct DashboardParams {
     #[serde(default)]
     pub(crate) provider: Option<String>,
     #[serde(default)]
-    pub(crate) team: Option<String>,
-    #[serde(default)]
     pub(crate) status: Option<String>,
     /// Page size: default 20, maximum 100.
     #[serde(default)]
@@ -590,64 +577,6 @@ pub(crate) struct BrofileParams {
     /// is Codex `/fast`; `default` clears back to backend default.
     #[serde(default)]
     pub(crate) service_tier: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TeamParams {
-    /// Operation: save_template, list_templates, get_template, delete_template,
-    /// create, list, get, dissolve, roster. Discovery lists return summary pages;
-    /// get/get_template return exact JSON body pages using body.next_cursor.
-    pub(crate) action: String,
-    /// Required for get/get_template/roster/dissolve and template writes;
-    /// optional exact name filter for list/list_templates.
-    #[serde(default)]
-    pub(crate) name: Option<String>,
-    #[serde(default)]
-    pub(crate) members: Option<Vec<TeamMemberSlot>>,
-    #[serde(default)]
-    pub(crate) template: Option<String>,
-    /// Create's worker/project association; catalog-mode create resolves only
-    /// daemon-owned global templates/brofiles. Exact stored association filter
-    /// for team list/get/roster. Template actions require scope=project and an explicit
-    /// absolute owner-host directory; catalog mode refuses project template
-    /// reads/writes because no owner transport exists.
-    #[serde(default)]
-    pub(crate) project_dir: Option<String>,
-    /// Template actions only: global (default) or project. Never filters live teams.
-    #[serde(default)]
-    pub(crate) scope: Option<String>,
-    #[serde(default)]
-    pub(crate) cancel_running: Option<bool>,
-    /// Retired input: rejected when supplied. Legacy stored advisor settings
-    /// remain readable but team create/wait operations never execute them.
-    #[serde(default)]
-    pub(crate) advisor: Option<serde_json::Value>,
-    /// Summary list/list_templates/roster page size; default 20, clamp 1..100.
-    #[serde(default)]
-    pub(crate) limit: Option<usize>,
-    /// Continue summary discovery with the returned next_offset.
-    #[serde(default)]
-    pub(crate) offset: Option<usize>,
-    /// Exact get/get_template only: pass body.next_cursor unchanged. Changed
-    /// records or selectors refuse continuation; restart without cursor.
-    #[serde(default)]
-    pub(crate) cursor: Option<String>,
-    /// Exact JSON body page byte budget; default/max 4096, minimum 4.
-    #[serde(default)]
-    pub(crate) body_limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TeamMemberSlot {
-    pub(crate) brofile: String,
-    #[serde(default)]
-    pub(crate) alias: Option<String>,
-    #[serde(default)]
-    /// Instances of this member (default 1, minimum 1); the sum of all slots
-    /// must not exceed 256. Save/create refuse before expansion or persistence.
-    pub(crate) count: Option<u32>,
 }
 
 #[cfg(test)]

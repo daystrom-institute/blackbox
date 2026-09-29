@@ -1,6 +1,6 @@
 ---
 description: Orchestrator-led implementation workflow: durable pair-programmer implementer, continuous red-team ensemble, coordinated through a bbox work-item thread the orchestrator keeps
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <task description>
 ---
 
@@ -28,11 +28,11 @@ Substantial implementation work, coordinated by the main-session orchestrator th
 ## PROTOCOL INVARIANTS
 
 - **Implementer is durable.** One `bro_exec` at start, then only `bro_resume`. A fresh `bro_exec` on a follow-up destroys the compartmentalized context that is crucible's whole point.
-- **Ensemble continuity comes from team member sessions.** Round 1 dispatches each member with `bro_exec(bro="<team>::<member>")`; every later round is `bro_resume(bro="<team>::<member>")` per member, so each reviewer keeps its own session across rounds. Resume a single member only for bilateral recovery (one reviewer died, one needs a correction).
+- **Ensemble continuity comes from each reviewer's own session.** Round 1 dispatches each member with `bro_exec(bro="<reviewer-brofile>")` and records its `taskId`/`sessionId`/provider; every later round is `bro_resume(session_id=<member sessionId>, provider=<member provider>)` per member, so each reviewer keeps its own session across rounds. Resume a single member only for bilateral recovery (one reviewer died, one needs a correction).
 - **Reviewers are blind to each other within a round.** Orchestrator is the synthesizer — quote each side back to the others in next-round prompts. Cross-pollination is deliberate when orchestrator chooses it, not a default.
 - **The orchestrator keeps the work-item thread.** Implementer and reviewers file nothing: each final answer is its report. The orchestrator appends the verdicts, disputes and decisions it acts on as thread notes (`bbox_thread(action="continue", id=<thread_id>, note=...)`), so the signal trail survives orchestrator compaction.
 - **Mechanical recursion guard stays on.** Implementer and reviewers cannot call `bro_*` — do NOT set `allow_recursion=true`. They are executors.
-- **Named-bro routing is unsafe across sibling sessions.** If a brofile has multiple recent task histories, `bro_resume(bro="...")` can pick the wrong session. Record the `taskId`/`sessionId` returned by your most recent `bro_exec` or `bro_resume` and pass it explicitly when resuming if there's any chance of ambiguity.
+- **Resume by recorded handle.** `bro_resume` takes the `session_id` and `provider` a prior dispatch returned. Record the `taskId`/`sessionId` returned by your most recent `bro_exec` or `bro_resume` for every bro in the arc.
 - **Turn discipline.** Ensemble rounds stop when a voice re-raises a prior concern: either produce concrete evidence to refute or concede. Never retreat on pressure alone, never rubber-stamp. Cap at 8 ensemble rounds per work-item before halting and escalating to the user.
 
 ---
@@ -47,7 +47,7 @@ Substantial implementation work, coordinated by the main-session orchestrator th
    bbox_thread_list(kind="work_item", project=<cwd>, stale_days=14)
    ```
 
-   If an open work-item exists on this topic, ask the user whether to resume (reuse thread_id, re-brief existing reviewer team and implementer) or open fresh.
+   If an open work-item exists on this topic, ask the user whether to resume (reuse thread_id, re-brief existing reviewer sessions and implementer) or open fresh.
 4. State the problem to the user: what's in scope, what's explicitly out, known unknowns. Wait for greenlight. **Do not auto-proceed.**
 
 ---
@@ -80,40 +80,29 @@ Commit on a working branch or stash. Record the reference. Required before the i
 
 Concrete plan: files to touch, functions to add/change, new types, migration order, test surface, rollback path, acceptance criteria as a bulleted checklist.
 
-### 2b. Instantiate the ensemble (once per crucible)
+### 2b. Choose the ensemble (once per crucible)
 
-Default team = codex + gemini via the `red_team` teamplate. Name the team instance per-topic so sibling arcs don't collide:
-
-```
-bro_team(
-  action="create",
-  template="red_team",
-  name="<topic>-review",
-  project_dir=<cwd>
-)
-```
-
-If `red_team` doesn't exist or you want a different composition, either list available teamplates:
+Default ensemble = two reviewer brofiles, one codex and one gemini (for example `red-team-codex` and `red-team-gemini`). List what exists first:
 
 ```
-bro_team(action="list")
+bro_brofile(action="list")
 ```
 
-…or build ad-hoc. Minimum viable is two cross-provider voices; three is better if Gemini's available and the topic has architectural weight.
+…or dispatch ad hoc with `provider=`. Minimum viable is two cross-provider voices; three is better if Gemini's available and the topic has architectural weight.
 
 ### 2c. Brief the ensemble (first round: carries problem space)
 
-One dispatch per member:
+One dispatch per member, recording each returned `taskId`, `sessionId` and provider:
 
 ```
 bro_exec(
-  bro="<topic>-review::<member>",
+  bro="<reviewer-brofile>",
   prompt=<FIRST-ROUND PROMPT>,
   cwd=<cwd>
 )
 ```
 
-Then `bro_when_all(team="<topic>-review")`. Reviewers retain this context across all subsequent rounds. First-round prompt shape:
+Then `bro_when_all(task_ids=[<member taskIds>])`. Reviewers retain this context across all subsequent rounds. First-round prompt shape:
 
 ```
 Task: <task_description>
@@ -146,7 +135,7 @@ position you want escalated as DISPUTE.
 ### 2d. Join
 
 ```
-bro_when_all(team="<topic>-review", timeout_seconds=600)
+bro_when_all(task_ids=[<member taskIds>], timeout_seconds=600)
 ```
 
 ### 2e. Synthesize
@@ -161,7 +150,7 @@ Classify findings: agreed / majority / minority / contradictory. Revise plan inc
 
 ### 2f. Convergence rounds (as needed)
 
-For each follow-up round, send a **delta-shaped** prompt to every member with `bro_resume(bro="<topic>-review::<member>", prompt=...)`: quote each reviewer's prior position and pose the specific remaining disagreement. Each resume continues that reviewer's session:
+For each follow-up round, send a **delta-shaped** prompt to every member with `bro_resume(session_id=<member sessionId>, provider=<member provider>, prompt=...)`: quote each reviewer's prior position and pose the specific remaining disagreement. Each resume continues that reviewer's session:
 
 ```
 ROUND 2 — plan revision.
@@ -288,7 +277,7 @@ bro_exec(
 )
 ```
 
-**Record `taskId` and `sessionId` immediately.** These are your handles for every subsequent `bro_resume` on this arc. Never rely on bare `bro:"..."` resolution alone for resume — pass the session/task explicitly when there's any chance of sibling-session ambiguity.
+**Record `taskId`, `sessionId` and provider immediately.** These are your handles for every subsequent `bro_resume` on this arc.
 
 ---
 
@@ -314,7 +303,8 @@ Ensemble may be deliberating in parallel on a disputed approach while the implem
 
 ```
 bro_resume(
-  bro="crucible-implementer",
+  session_id=<implementer sessionId>,
+  provider=<implementer provider>,
   prompt="Ensemble round on your dispute signal converged on Option B2
           (server-side X). Here's the rationale: <brief>. Apply B2 to the
           remaining slices. Prior slices (commits <SHA1>, <SHA2>) stand."
@@ -353,11 +343,12 @@ bbox_thread(action="continue", id=<thread_id>, note="Packet <X> DONE: <summary>;
 
 ### 5a. Send the audit prompt (delta-shaped: reviewers already know the plan)
 
-One resume per member, then `bro_when_all(team="<topic>-review")`:
+One resume per member, then `bro_when_all(task_ids=[<new member taskIds>])`:
 
 ```
 bro_resume(
-  bro="<topic>-review::<member>",
+  session_id=<member sessionId>,
+  provider=<member provider>,
   prompt=<AUDIT PROMPT>
 )
 ```
@@ -399,7 +390,7 @@ positions you want escalated as DISPUTE.
 ### 5b. Join + synthesize
 
 ```
-bro_when_all(team="<topic>-review", timeout_seconds=600)
+bro_when_all(task_ids=[<new member taskIds>], timeout_seconds=600)
 bbox_thread(action="continue", id=<thread_id>, note="Audit round <N>: <per-member verdicts>; disputes: <...>")
 ```
 
@@ -432,7 +423,8 @@ For each fixup round (cap: 3 rounds before escalating to user):
 
 ```
 bro_resume(
-  bro="crucible-implementer",
+  session_id=<implementer sessionId>,
+  provider=<implementer provider>,
   prompt=<FIXUP BRIEF>
 )
 ```
@@ -556,7 +548,7 @@ Carry forward signals, not raw transcripts. The new session needs memory, not ar
 
 Symptom: `bro_when_all` times out on one member, others completed.
 
-Response: for that member alone, `bro_resume(bro="<alias>", prompt="Your prior task died. Re-asking with same prompt: <prompt>")`. Then `bro_wait(task_id=<new_task_id>)`. Other members' context is intact.
+Response: for that member alone, `bro_resume(session_id=<member sessionId>, provider=<member provider>, prompt="Your prior task died. Re-asking with same prompt: <prompt>")`. Then `bro_wait(task_id=<new_task_id>)`. Other members' context is intact.
 
 ---
 

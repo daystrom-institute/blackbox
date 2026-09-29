@@ -13,7 +13,6 @@ pub mod artifacts;
 mod body_page;
 pub mod bro_helpers;
 pub mod bro_params;
-pub mod bro_runtime_params;
 pub mod config;
 pub mod dispatch;
 pub mod doctor;

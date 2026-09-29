@@ -10,7 +10,6 @@ pub mod providers;
 pub mod resume_lease;
 pub mod supervision;
 pub mod tail;
-pub mod team;
 pub mod usage_schedule;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -769,19 +768,15 @@ pub struct TaskInner {
     /// Concrete cockpit-managed worktree root for this task, if its cwd sits
     /// under a daemon-recognized managed worktree parent.
     pub managed_worktree: Option<String>,
-    /// Caller-supplied identity for the dispatched bro. Format:
-    /// `<team>::<member>` for ensemble dispatch (carries which member
-    /// of which team this task belongs to), bare `<brofile>` for
-    /// brofile-only dispatch (no team context — implementer / advisor
-    /// nodes), or `None` for legacy direct dispatches that didn't
-    /// supply context. The tail handler reads this when team-based
-    /// `find_bro_ref_for_task` returns no match, so brofile-dispatched
-    /// tasks (workflow implementer, single-bro advisor) still surface
-    /// in `bro tail` with a name instead of being anonymous.
+    /// Caller-supplied identity for the dispatched bro: the brofile name a
+    /// named dispatch used, or `None` for ad hoc provider dispatches. Tasks
+    /// persisted by older releases may carry a `<team>::<member>` label,
+    /// which is read as an opaque name. The tail handler and dashboard
+    /// surface it so named dispatches are not anonymous.
     pub bro_label: Option<String>,
     /// Daemon-owned display name for the roster/cockpit. Defaults from the
     /// first user prompt for fresh dispatches and is independent of bro_label,
-    /// which still carries bro/team identity.
+    /// which carries the named-dispatch identity.
     pub name: Option<String>,
     /// True when the latest terminal result event represented an operator
     /// interrupt rather than a natural finish. This is a cause marker layered on
@@ -3752,17 +3747,6 @@ fn spawn_harness_terminal_waiter(
                 });
             }
             _ => {}
-        }
-
-        // Propagate session ID to team members.
-        {
-            let inner = task.inner.lock();
-            if inner.session_id != "pending" {
-                let sid = inner.session_id.clone();
-                let tid = inner.id.clone();
-                drop(inner);
-                team::propagate_session_id(&tid, &sid, &store_dir);
-            }
         }
 
         request_persist(&task_store, &store_dir);

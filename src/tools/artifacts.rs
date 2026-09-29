@@ -16,16 +16,28 @@ use rmcp::{tool, tool_router};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InstallableArtifactKind {
     Brofile,
-    Team,
 }
 
 impl From<InstallableArtifactKind> for crate::artifacts::ArtifactKind {
     fn from(kind: InstallableArtifactKind) -> Self {
         match kind {
             InstallableArtifactKind::Brofile => Self::Brofile,
-            InstallableArtifactKind::Team => Self::Team,
         }
     }
+}
+
+/// Kinds whose receipts stay readable but never activate: explicit kind
+/// filters list them as retired and removal still works.
+fn retired_kind(kind: crate::artifacts::ArtifactKind) -> bool {
+    matches!(
+        kind,
+        crate::artifacts::ArtifactKind::Workflow
+            | crate::artifacts::ArtifactKind::Agent
+            | crate::artifacts::ArtifactKind::Packet
+            | crate::artifacts::ArtifactKind::Atom
+            | crate::artifacts::ArtifactKind::Cron
+            | crate::artifacts::ArtifactKind::Team
+    )
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -93,8 +105,8 @@ fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> ser
 fn artifact_metadata_view(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
     serde_json::json!({
         "kind": meta.kind, "name": meta.name, "version": meta.version,
-        "active": meta.active && !matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Packet | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
-        "retired": matches!(meta.kind, crate::artifacts::ArtifactKind::Workflow | crate::artifacts::ArtifactKind::Agent | crate::artifacts::ArtifactKind::Packet | crate::artifacts::ArtifactKind::Atom | crate::artifacts::ArtifactKind::Cron),
+        "active": meta.active && !retired_kind(meta.kind),
+        "retired": retired_kind(meta.kind),
         "installed_at": meta.installed_at,
         "content_sha256": meta.content_sha256, "project_id": meta.project_id,
         "local": meta.local, "supersedes": meta.supersedes,
@@ -156,16 +168,7 @@ fn artifact_list_page(
     if exact && (p.limit.is_some() || p.offset.is_some()) {
         anyhow::bail!("exact inventory uses cursor/body_limit; omit limit and offset");
     }
-    let retired = |kind| {
-        matches!(
-            kind,
-            crate::artifacts::ArtifactKind::Workflow
-                | crate::artifacts::ArtifactKind::Agent
-                | crate::artifacts::ArtifactKind::Packet
-                | crate::artifacts::ArtifactKind::Atom
-                | crate::artifacts::ArtifactKind::Cron
-        )
-    };
+    let retired = retired_kind;
     rows.retain(|entry| p.filters.kind.is_some() || !retired(entry.kind));
     rows.sort_by(|a, b| {
         a.kind
@@ -220,7 +223,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a brofile or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, packet, atom and cron installation is retired."
+        description = "Install a brofile from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, packet, atom, cron and team installation is retired."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
@@ -391,7 +394,7 @@ mod tests {
     use super::*;
     use crate::artifacts;
     use crate::orchestration;
-    use crate::server::routes::{install_artifact_value, restore_runtime_artifacts_from_catalog};
+    use crate::server::routes::restore_runtime_artifacts_from_catalog;
     use crate::server::state::SharedState;
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -529,6 +532,7 @@ mod tests {
             artifacts::ArtifactKind::Packet,
             artifacts::ArtifactKind::Atom,
             artifacts::ArtifactKind::Cron,
+            artifacts::ArtifactKind::Team,
         ] {
             let request = json!({"kind":kind,"artifact":{"name":"archived","version":1}});
             assert!(serde_json::from_value::<ArtifactInstallToolParams>(request).is_err());
@@ -551,6 +555,8 @@ mod tests {
         assert!(!root.join("workflows").exists());
         assert!(!root.join("agents").exists());
         assert!(!root.join("crons").exists());
+        assert!(!root.join("teamplates").exists());
+        assert!(!root.join("teams").exists());
     }
 
     #[test]
@@ -764,55 +770,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_install_team_write_failure_reports_completed_effects() {
-        for blocked_stage in ["teamplates", "teams"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().canonicalize().unwrap();
-            let server = test_server(&tmp);
-            let member: orchestration::brofile::Brofile =
-                serde_json::from_value(json!({"name": "example", "provider": "glm"})).unwrap();
-            orchestration::brofile::save_brofile(&member, "global", &server.state.store_dir, None)
-                .unwrap();
-            std::fs::create_dir_all(&server.state.store_dir).unwrap();
-            std::fs::write(server.state.store_dir.join(blocked_stage), "blocked").unwrap();
-            let p = serde_json::from_value(json!({"kind": "team", "version": "1", "artifact": {"name": "example", "members": [{"brofile": "example", "count": 1}]}})).unwrap();
-            let response = server.bbox_artifact_install(Parameters(p)).await;
-            assert_eq!(response.is_error, Some(true), "{response:?}");
-            let failure: Value =
-                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
-            assert!(!failure.to_string().contains(root.to_str().unwrap()));
-            let completed = failure["completed"].as_array().unwrap();
-            assert_eq!(
-                completed.contains(&json!("teamplate_file")),
-                blocked_stage == "teams"
-            );
-            assert_eq!(
-                failure["failed"],
-                if blocked_stage == "teams" {
-                    "team_instance"
-                } else {
-                    "teamplate_file"
-                }
-            );
-            assert!(
-                failure["not_attempted"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("catalog_persistence"))
-            );
-            assert!(
-                server
-                    .state
-                    .artifacts
-                    .read()
-                    .metadata_for(artifacts::ArtifactKind::Team, "example")
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn artifact_install_catalog_failure_reports_persisted_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -858,155 +815,6 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
-    }
-
-    async fn install_team_brofile(server: &BlackboxServer, name: &str) {
-        install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Brofile,
-                source: format!("{name}.json"),
-                name: None,
-                version: Some("1".into()),
-                supersedes: None,
-            },
-            json!({"name": name, "provider": "glm"}),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn install_team_value(
-        server: &BlackboxServer,
-        value: Value,
-        version: &str,
-    ) -> anyhow::Result<artifacts::ArtifactMetadata> {
-        install_artifact_value(
-            &server.state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Team,
-                source: "team.json".into(),
-                name: None,
-                version: Some(version.into()),
-                supersedes: None,
-            },
-            value,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn team_artifact_install_materializes_teamplate_and_team() {
-        // gap-37a280a6: install must reach the runtime stores — ensemble
-        // actors resolve instantiated teams only (load_team, no teamplate
-        // fallback), so a stored-only artifact is a dispatch-time trap.
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        install_team_brofile(&server, "tm-specialist").await;
-
-        install_team_value(
-            &server,
-            json!({
-                "name": "tm-panel",
-                "members": [{"brofile": "tm-specialist", "alias": "lens", "count": 2}]
-            }),
-            "1",
-        )
-        .await
-        .unwrap();
-
-        let store_dir = &server.state.store_dir;
-        assert!(
-            orchestration::team::resolve_teamplate("tm-panel", store_dir, None).is_some(),
-            "teamplate store written"
-        );
-        let team = orchestration::team::load_team("tm-panel", store_dir)
-            .expect("team instantiated under the teamplate's own name");
-        assert_eq!(team.members.len(), 2, "count expansion applied");
-        assert_eq!(team.members[0].name, "lens-1");
-    }
-
-    #[tokio::test]
-    async fn team_artifact_install_fails_on_missing_member_brofile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let err = install_team_value(
-            &server,
-            json!({"name": "tm-broken", "members": [{"brofile": "no-such-brofile"}]}),
-            "1",
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("member brofile not found"),
-            "got: {err:#}"
-        );
-        assert!(
-            orchestration::team::load_team("tm-broken", &server.state.store_dir).is_none(),
-            "failed install must not half-instantiate"
-        );
-    }
-
-    #[tokio::test]
-    async fn team_artifact_install_rejects_advisor_teamplates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        install_team_brofile(&server, "tm-adv").await;
-        let err = install_team_value(
-            &server,
-            json!({
-                "name": "tm-advised",
-                "members": [{"brofile": "tm-adv"}],
-                "advisor": {"brofile": "tm-adv", "charter": "watch the panel"}
-            }),
-            "1",
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("automatic team advisors are retired"),
-            "retired automatic advisors must be rejected by artifact install: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn team_artifact_reinstall_preserves_live_team_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        install_team_brofile(&server, "tm-live").await;
-        install_team_value(
-            &server,
-            json!({"name": "tm-durable", "members": [{"brofile": "tm-live"}]}),
-            "1",
-        )
-        .await
-        .unwrap();
-
-        // A member acquires live session state between installs.
-        let store_dir = server.state.store_dir.clone();
-        let mut team = orchestration::team::load_team("tm-durable", &store_dir).unwrap();
-        team.members[0].session_id = Some("sess-live".into());
-        orchestration::team::save_team(&team, &store_dir);
-
-        install_team_value(
-            &server,
-            json!({"name": "tm-durable", "members": [{"brofile": "tm-live", "count": 3}]}),
-            "2",
-        )
-        .await
-        .unwrap();
-
-        let team = orchestration::team::load_team("tm-durable", &store_dir).unwrap();
-        assert_eq!(
-            team.members[0].session_id.as_deref(),
-            Some("sess-live"),
-            "re-install must not clobber a live team's member sessions"
-        );
-        assert_eq!(team.members.len(), 1, "live roster untouched by upgrade");
-        // The refreshed teamplate IS picked up for future creates.
-        let tp = orchestration::team::resolve_teamplate("tm-durable", &store_dir, None).unwrap();
-        assert_eq!(tp.members[0].count, 3);
     }
 
     #[tokio::test]
@@ -1193,6 +1001,89 @@ mod tests {
                 .metadata_for(artifacts::ArtifactKind::Agent, "legacy-reviewer")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Team receipts and the team stores an earlier release wrote: boot
+    /// restore skips them without error, the default listing hides the
+    /// receipt, an explicit kind filter shows it as retired, removal still
+    /// works, and the inert store files are never read or rewritten.
+    #[tokio::test]
+    async fn legacy_team_artifact_and_stores_are_inert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let store_dir = server.state.store_dir.clone();
+        std::fs::create_dir_all(store_dir.join("teamplates")).unwrap();
+        std::fs::create_dir_all(store_dir.join("teams")).unwrap();
+        let teamplate = br#"{"name":"legacy-panel","members":[{"brofile":"reviewer","count":2}]}"#;
+        let team = b"{not json";
+        std::fs::write(store_dir.join("teamplates/legacy-panel.json"), teamplate).unwrap();
+        std::fs::write(store_dir.join("teams/legacy-panel.json"), team).unwrap();
+        server
+            .state
+            .artifacts
+            .write()
+            .install_value(
+                artifacts::ArtifactKind::Team,
+                "legacy-panel.json".into(),
+                &json!({"name": "legacy-panel", "version": "1",
+                    "members": [{"brofile": "reviewer", "count": 2}]}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            restore_runtime_artifacts_from_catalog(&server.state).unwrap(),
+            0
+        );
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&artifacts::ArtifactListParams {
+                kind: None,
+                name: None,
+                include_superseded: false,
+            })
+            .unwrap();
+        let unfiltered: ArtifactCatalogListParams = serde_json::from_value(json!({})).unwrap();
+        let page = artifact_list_page(rows.clone(), &unfiltered).unwrap();
+        assert!(page["artifacts"].as_array().unwrap().is_empty());
+        let filtered: ArtifactCatalogListParams =
+            serde_json::from_value(json!({"kind": "team"})).unwrap();
+        let page = artifact_list_page(rows, &filtered).unwrap();
+        assert_eq!(page["artifacts"][0]["name"], "legacy-panel");
+        assert_eq!(page["artifacts"][0]["retired"], true);
+        assert_eq!(page["artifacts"][0]["active"], false);
+
+        let dashboard =
+            server.bro_dashboard(Parameters(serde_json::from_value(json!({})).unwrap()));
+        assert_ne!(dashboard.is_error, Some(true), "{dashboard:?}");
+
+        server
+            .state
+            .artifacts
+            .write()
+            .remove_hard(artifacts::ArtifactKind::Team, "legacy-panel", false, true)
+            .unwrap();
+        assert!(
+            server
+                .state
+                .artifacts
+                .read()
+                .metadata_for(artifacts::ArtifactKind::Team, "legacy-panel")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(store_dir.join("teamplates/legacy-panel.json")).unwrap(),
+            teamplate
+        );
+        assert_eq!(
+            std::fs::read(store_dir.join("teams/legacy-panel.json")).unwrap(),
+            team
         );
     }
 }

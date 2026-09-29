@@ -1,6 +1,6 @@
 # Artifact catalog
 
-The catalog installs brofiles and teams. The `bbox_artifact_*` tools are on
+The catalog installs brofiles. The `bbox_artifact_*` tools are on
 the `ops` surface: run them from an `ops` MCP session or with
 `bro mcp call <tool> '<json>' --surface ops`. Agents discover installed
 personas with `bro_brofile(action="list")`. Supply exactly one inline
@@ -13,11 +13,10 @@ bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"br
 ```
 
 List responses contain bounded summaries. Follow `next_offset`; request
-`detail=true` for installation and supersession metadata. Team artifacts require
-their member brofiles to be installed first. Reinstallation preserves live
-sessions. Dispatch reviewers explicitly.
+`detail=true` for installation and supersession metadata.
 
-Workflow, agent, atom, cron and packet kinds cannot be installed or activated.
+Workflow, agent, atom, cron, packet and team kinds cannot be installed or
+activated.
 Their historical receipts remain readable with an explicit filter, such as
 `bbox_artifact_list(kind="workflow")`, marked `retired=true, active=false`.
 Startup does not replay them. Supersession retains old versions; removal is a

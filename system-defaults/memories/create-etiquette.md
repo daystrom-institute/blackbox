@@ -15,7 +15,6 @@ Before any create/open/save/add action that could duplicate an existing object, 
 ## Applies to
 
 - brofiles
-- teamplates / teams
 - MCP server registrations
 - work threads
 - dedupe-sensitive knowledge writes
@@ -33,8 +32,6 @@ That means create first, reconcile later is how duplicate state accumulates.
 ## Practical examples
 
 - `bro_brofile(action="list")` before `bro_brofile(action="create", ...)`
-- `bro_team(action="list_templates")` before `save_template`
-- `bro_team(action="list")` before `create`
 - `bbox_thread_list(...)` before `bbox_thread(action="open", ...)`
 - `bbox_knowledge(query="...")` before `bbox_learn(...)`
 

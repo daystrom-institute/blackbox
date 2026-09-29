@@ -1,25 +1,18 @@
 use futures::StreamExt;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
 use axum::extract::{Query, State as AxumState};
 use axum::response::IntoResponse;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::state::SharedState;
 use crate::artifacts::{
     self, ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
-use crate::index;
 use crate::orchestration;
-use crate::orchestration::providers::Provider;
 use crate::projects::ProjectRecord;
-use crate::tools::bro_helpers::{
-    build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
-};
-use crate::tools::bro_runtime_params::{BroRosterEntry, RosterQuery};
 
 /// True iff the bind host string resolves to a loopback address.
 /// Recognized: `127.0.0.0/8` literals, `localhost` (string match —
@@ -203,8 +196,9 @@ pub(crate) async fn install_artifact_from_params(
                 | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
+                | artifacts::ArtifactKind::Team
         ),
-        "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
     );
     let value = read_artifact_source(&p.source).await?;
     install_artifact_value(state, p, value).await
@@ -261,8 +255,9 @@ pub(crate) async fn install_artifact_value(
                 | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
+                | artifacts::ArtifactKind::Team
         ),
-        "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
     );
     let mut completed = Vec::new();
     let mut failed = "validation";
@@ -281,21 +276,23 @@ pub(crate) async fn install_artifact_value(
     remaining.extend(match kind {
         artifacts::ArtifactKind::Workflow => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
             );
         }
         artifacts::ArtifactKind::Packet => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
             );
         }
         artifacts::ArtifactKind::Brofile => vec!["brofile_file", "brofile_verification"],
         artifacts::ArtifactKind::Team => {
-            vec!["teamplate_file", "team_instance", "team_verification"]
+            anyhow::bail!(
+                "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
+            );
         }
         artifacts::ArtifactKind::Cron => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
             );
         }
         _ => vec![],
@@ -334,12 +331,12 @@ pub(crate) async fn install_artifact_value(
         match p.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Packet => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Brofile => {
@@ -372,71 +369,23 @@ pub(crate) async fn install_artifact_value(
                 completed.push("brofile_verification");
             }
             artifacts::ArtifactKind::Team => {
-                // A team artifact IS a teamplate. Install materializes it like
-                // its siblings (brofile → brofile store, cron → spec + loop):
-                // write the teamplate store, then instantiate the team under the
-                // teamplate's own name, so ensemble actors — which resolve
-                // instantiated teams only (`load_team`, no teamplate fallback) —
-                // can dispatch it immediately (gap-37a280a6).
-                let tp: orchestration::team::Teamplate = serde_json::from_value(value.clone())?;
-                if tp.advisor.is_some() {
-                    anyhow::bail!(
-                        "team artifact '{}' declares an advisor; automatic team advisors are \
-                     retired. Omit advisor and use explicit bro_exec or bro_resume calls",
-                        tp.name
-                    );
-                }
-                // Same fail-loud-at-install posture as agent installs: member
-                // brofiles must already exist (install brofiles before teams).
-                for member in &tp.members {
-                    if orchestration::brofile::resolve_brofile(
-                        &member.brofile,
-                        &state.store_dir,
-                        None,
-                    )
-                    .is_none()
-                    {
-                        anyhow::bail!(
-                            "team artifact '{}': member brofile not found: {} \
-                         (install brofiles before teams)",
-                            tp.name,
-                            member.brofile
-                        );
-                    }
-                }
-                completed.push("validation");
-                failed = "teamplate_file";
-                orchestration::team::save_teamplate(&tp, "global", &state.store_dir, None)?;
-                completed.push("teamplate_file");
-                failed = "team_instance";
-                // Re-install/upgrade must not clobber a live team's member
-                // sessions: instantiate only when no team holds the name yet.
-                let _lock = orchestration::team::lock_teams();
-                if orchestration::team::load_team(&tp.name, &state.store_dir).is_none() {
-                    orchestration::team::instantiate_team(&tp, &tp.name, None, &state.store_dir)?;
-                }
-                completed.push("team_instance");
-                failed = "team_verification";
-                if orchestration::team::load_team(&tp.name, &state.store_dir)
-                    .is_none_or(|saved| saved.name != tp.name)
-                {
-                    anyhow::bail!("saved team is unavailable under its installed identity");
-                }
-                completed.push("team_verification");
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Cron => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Agent => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Atom => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
         }
@@ -510,14 +459,7 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
     for entry in entries
         .into_iter()
         .filter(|entry| entry.active)
-        .filter(|entry| {
-            // Team is deliberately absent: boot-restoring teams from active
-            // artifacts would resurrect deliberately-dissolved teams
-            // (dissolution must stick; re-install is the explicit
-            // re-materialization path). Teamplate/team stores are
-            // file-backed and survive restarts on their own.
-            entry.kind == artifacts::ArtifactKind::Brofile
-        })
+        .filter(|entry| entry.kind == artifacts::ArtifactKind::Brofile)
     {
         let Some(value) = state
             .artifacts
@@ -535,7 +477,7 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
         match entry.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, agents, packets, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, agents, packets, atoms, crons and teams cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Brofile => {
@@ -576,12 +518,10 @@ pub(crate) fn deactivate_artifact(
         artifacts::ArtifactKind::Brofile => {
             orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
         }
-        artifacts::ArtifactKind::Agent => {}
-        artifacts::ArtifactKind::Atom => {}
-        artifacts::ArtifactKind::Team => {
-            // Teams are stored purely as artifacts; no separate registry to deactivate.
-        }
-        artifacts::ArtifactKind::Cron => {}
+        artifacts::ArtifactKind::Agent
+        | artifacts::ArtifactKind::Atom
+        | artifacts::ArtifactKind::Team
+        | artifacts::ArtifactKind::Cron => {}
     }
     Ok(())
 }
@@ -786,10 +726,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .count();
     let slack_channel_bindings = state.slack_channel_bindings.list(None, Some(project)).len();
     let slack_proposal_links = state.slack_proposal_links.project_ref_count(project);
-    let teams = orchestration::team::load_all_teams(&state.store_dir)
-        .iter()
-        .filter(|team| team.project_dir.as_deref() == Some(project))
-        .count();
     let gaps = state
         .gaps
         .read()
@@ -802,7 +738,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "threads": threads,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
-        "teams": teams,
         "gaps": gaps,
     }))
 }
@@ -1035,9 +970,6 @@ pub(crate) fn migrate_project_refs(
     let slack_proposal_links = state
         .slack_proposal_links
         .rename_project_refs(old_project, new_project)?;
-    let teams =
-        orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
-
     let gaps = state
         .gaps
         .write()
@@ -1047,7 +979,6 @@ pub(crate) fn migrate_project_refs(
         "threads": threads,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
-        "teams": teams,
         "gaps": gaps,
     }))
 }
@@ -1211,245 +1142,6 @@ pub(crate) async fn admin_brofile_upsert(
     axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct AdminTeamUpsertReq {
-    name: String,
-    members: Vec<AdminTeamMemberReq>,
-}
-
-/// One member in an admin team upsert: either a bare brofile name
-/// (legacy — member names auto-assigned m1..mN) or `{name, brofile}`
-/// so members carry meaningful identities. Named members matter for
-/// ensemble `${member.name}` prompt templating and whiteboard
-/// auto-apply attribution (member name = registered board agent).
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum AdminTeamMemberReq {
-    Brofile(String),
-    Named { name: String, brofile: String },
-}
-
-impl AdminTeamMemberReq {
-    fn resolved(&self, index: usize) -> (String, String) {
-        match self {
-            Self::Brofile(brofile) => (format!("m{}", index + 1), brofile.clone()),
-            Self::Named { name, brofile } => (name.clone(), brofile.clone()),
-        }
-    }
-}
-
-pub(crate) async fn admin_team_upsert(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<AdminTeamUpsertReq>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let resolved: Vec<(String, String)> = req
-        .members
-        .iter()
-        .enumerate()
-        .map(|(i, m)| m.resolved(i))
-        .collect();
-    let teamplate = orchestration::team::Teamplate {
-        name: req.name.clone(),
-        members: resolved
-            .iter()
-            .map(|(name, brofile)| orchestration::team::TeamplateMember {
-                brofile: brofile.clone(),
-                alias: Some(name.clone()),
-                count: 1,
-            })
-            .collect(),
-        advisor: None,
-        diversity_floor: None,
-    };
-    if let Err(error) =
-        orchestration::team::save_teamplate(&teamplate, "global", &state.store_dir, None)
-    {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({"error": format!("teamplate was not saved: {error}")})),
-        )
-            .into_response();
-    }
-    let team = orchestration::team::Team {
-        name: req.name.clone(),
-        teamplate: req.name.clone(),
-        members: resolved
-            .iter()
-            .map(|(name, brofile)| orchestration::team::TeamMember {
-                name: name.clone(),
-                brofile: brofile.clone(),
-                session_id: None,
-                task_history: Vec::new(),
-            })
-            .collect(),
-        advisor: None,
-        project_dir: None,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        diversity_floor: None,
-    };
-    let _lock = orchestration::team::lock_teams();
-    orchestration::team::save_team(&team, &state.store_dir);
-    axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
-}
-
-pub(crate) async fn roster_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    Query(query): Query<RosterQuery>,
-) -> Result<axum::Json<Vec<BroRosterEntry>>, axum::http::StatusCode> {
-    let store_dir = state.store_dir.clone();
-    let config = state.idx.read().reindex_config();
-
-    let wanted_teams = split_csv(&query.teams);
-    let wanted_bros = split_csv(&query.bros);
-    let wanted_sessions = split_csv(&query.sessions);
-    let wanted_providers: Vec<Provider> = split_csv(&query.providers)
-        .iter()
-        .filter_map(|p| p.parse::<Provider>().ok())
-        .collect();
-
-    let no_selectors =
-        wanted_teams.is_empty() && wanted_bros.is_empty() && wanted_sessions.is_empty();
-
-    let mut seen = std::collections::HashSet::new();
-    let mut entries = Vec::new();
-
-    // Team selectors — each contributes all members. Unknown teams are
-    // skipped silently; the empty roster speaks for itself at the CLI layer.
-    for tn in &wanted_teams {
-        if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
-            for member in &team.members {
-                let candidate = build_member_entry(&team, member, &state, &config);
-                let key = roster_entry_key(&candidate);
-                if !seen.insert(key) {
-                    continue;
-                }
-                entries.push(candidate);
-            }
-        }
-    }
-
-    // Bro selectors — include every match across all teams (deduped by team::bro).
-    if !wanted_bros.is_empty() {
-        for team in orchestration::team::load_all_teams(&store_dir) {
-            for member in &team.members {
-                if !wanted_bros.iter().any(|b| b == &member.name) {
-                    continue;
-                }
-                let candidate = build_member_entry(&team, member, &state, &config);
-                let key = roster_entry_key(&candidate);
-                if !seen.insert(key) {
-                    continue;
-                }
-                entries.push(candidate);
-            }
-        }
-    }
-
-    // Session selectors — synthetic adhoc lanes.
-    for sid in &wanted_sessions {
-        let key = format!("session::{sid}");
-        if !seen.insert(key) {
-            continue;
-        }
-        let path = index::find_session_file(sid, &config.roots, config.codex_root.as_deref());
-        let provider = path.as_deref().and_then(infer_provider_from_path);
-        entries.push(BroRosterEntry {
-            bro: sid.chars().take(8).collect(),
-            bro_selector: sid.clone(),
-            team: "adhoc".into(),
-            provider: provider
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-            account: None,
-            session_id: Some(sid.clone()),
-            jsonl_path: path.map(|p| p.to_string_lossy().into_owned()),
-            brofile: String::new(),
-            model: None,
-        });
-    }
-
-    // No selectors → full roster across every team (legacy default).
-    if no_selectors {
-        for team in orchestration::team::load_all_teams(&store_dir) {
-            for member in &team.members {
-                let candidate = build_member_entry(&team, member, &state, &config);
-                let key = roster_entry_key(&candidate);
-                if !seen.insert(key) {
-                    continue;
-                }
-                entries.push(candidate);
-            }
-        }
-    }
-
-    // Bro selectors that the team-walk above didn't resolve fall
-    // through here: we synthesize ad-hoc entries from currently-known
-    // tasks whose `bro_label` matches. This is the only path that
-    // surfaces brofile-only dispatched bros (workflow implementer /
-    // advisor nodes) — they have no team membership, so the team
-    // walk skips them. Without this, `bro tail keystone-impl` returns
-    // an empty roster and the CLI bails with "bro does not exist".
-    if !wanted_bros.is_empty() {
-        let task_store = state.task_store.read();
-        for task in task_store.all_tasks() {
-            let inner = task.inner.lock();
-            let label = match &inner.bro_label {
-                Some(l) => l.clone(),
-                None => continue,
-            };
-            // Match either bare-label (`keystone-impl`) or the
-            // `team::member` form so callers can use either.
-            let (team, member) = match label.split_once("::") {
-                Some((t, m)) => (t.to_string(), m.to_string()),
-                None => ("adhoc".to_string(), label.clone()),
-            };
-            let matches = wanted_bros.iter().any(|w| w == &member || w == &label);
-            if !matches {
-                continue;
-            }
-            let key = format!("{team}::{member}");
-            if !seen.insert(key) {
-                continue;
-            }
-            let session_id = if inner.session_id == "pending" {
-                None
-            } else {
-                Some(inner.session_id.clone())
-            };
-            let jsonl_path = session_id.as_deref().and_then(|sid| {
-                index::find_session_file(sid, &config.roots, config.codex_root.as_deref())
-                    .map(|p| p.to_string_lossy().into_owned())
-            });
-            entries.push(BroRosterEntry {
-                bro: member,
-                bro_selector: label,
-                team,
-                provider: inner.provider.to_string(),
-                account: None,
-                session_id,
-                jsonl_path,
-                brofile: String::new(),
-                model: None,
-            });
-        }
-    }
-
-    if !wanted_providers.is_empty() {
-        entries.retain(|e| {
-            e.provider
-                .parse::<Provider>()
-                .ok()
-                .map(|p| wanted_providers.contains(&p))
-                .unwrap_or(false)
-        });
-    }
-
-    Ok(axum::Json(entries))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,30 +1272,6 @@ mod tests {
             "/checkout/path",
             "p_other"
         ));
-    }
-
-    #[test]
-    fn admin_team_upsert_accepts_bare_and_named_members() {
-        let req: AdminTeamUpsertReq = serde_json::from_str(
-            r#"{"name":"t","members":[
-                "some-brofile",
-                {"name":"security","brofile":"spec-security"}
-            ]}"#,
-        )
-        .expect("mixed member shapes should parse");
-        let resolved: Vec<(String, String)> = req
-            .members
-            .iter()
-            .enumerate()
-            .map(|(i, m)| m.resolved(i))
-            .collect();
-        assert_eq!(
-            resolved,
-            vec![
-                ("m1".to_string(), "some-brofile".to_string()),
-                ("security".to_string(), "spec-security".to_string()),
-            ]
-        );
     }
 
     /// Regression for the 2026-08-25 cage index-plane deadlock:
