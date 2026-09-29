@@ -315,8 +315,6 @@ authority), not v1 migration code; it is ops-only.
 - Each Stage 6 kept item goes when its named condition holds on every live
   deployment.
 - The open decisions above.
-- A v1 import path exists before v2 merges to mainline; the proposed
-  design is [Slim v1 project catalog importer](../../daemon-runtime/slim-v1-importer.md).
 - rmcp migration Phase 0 follows this design. The
   [target-surface doc](mcp-2026-07-28-target-surface.md)'s task candidates
   and resource catalogs are revised against the surviving surface before
