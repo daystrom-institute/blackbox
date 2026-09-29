@@ -521,7 +521,6 @@ impl BlackboxServer {
             } else {
                 Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
             },
-            allow_recursion: request.allow_recursion,
             provider: Some(request.provider),
             coerce_workspace: request.coerce_workspace,
         };
@@ -899,7 +898,6 @@ impl BlackboxServer {
             } else {
                 Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
             },
-            allow_recursion,
             provider: Some(provider),
             coerce_workspace,
         };

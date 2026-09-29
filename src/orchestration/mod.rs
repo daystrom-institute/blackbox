@@ -2323,7 +2323,6 @@ pub struct AmbientContext {
     pub work_item_id: Option<String>,
     /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
     pub completion_contract: Option<String>,
-    pub allow_recursion: bool,
     /// Target provider. When set and the provider supports dispatch-time
     /// tool filtering (Claude/Copilot), the text recursion guard is
     /// omitted in favor of the mechanical filter applied at the CLI arg
@@ -8682,7 +8681,6 @@ mod tests {
             session_id: Some("sess-abc".into()),
             project_dir: Some("/repo/x".into()),
             bro_name: Some("executor".into()),
-            allow_recursion: false,
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
@@ -9221,13 +9219,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_allow_recursion_keeps_scope_without_directives() {
-        // The payload carries scope for every dispatch regardless of
-        // `allow_recursion`. Recursion guarding is mechanical (tool filter),
-        // not textual, and recursive dispatches carry no completion contract.
+    fn dispatch_context_without_contract_keeps_scope_and_no_directives() {
+        // The payload carries scope for every dispatch. Recursion guarding is
+        // mechanical (tool filter), not textual, and recursive dispatches
+        // carry no completion contract.
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
-            allow_recursion: true,
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
@@ -9270,7 +9267,6 @@ mod tests {
     #[test]
     fn dispatch_context_contract_is_the_only_directive() {
         let solo = AmbientContext {
-            allow_recursion: false,
             completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
             ..Default::default()
         };
@@ -9279,9 +9275,8 @@ mod tests {
             vec!["contract"]
         );
 
-        // No contract, recursion allowed, legacy workspace flag: no directives.
+        // No contract and the legacy workspace flag: no directives.
         let orch = AmbientContext {
-            allow_recursion: true,
             coerce_workspace: true,
             ..Default::default()
         };
