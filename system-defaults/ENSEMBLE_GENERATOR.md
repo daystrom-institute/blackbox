@@ -8,7 +8,7 @@ recon checklist, the interview questions, and the artifact specification.
 
 ## What This Produces
 
-A review ensemble is a set of 6 installable artifacts:
+A review ensemble is a set of 5 installable artifacts:
 
 1. **Workflow JSON** — the node graph (Setup → BlindPost → Validate → Debate →
    Synthesize → WriteOutput) dispatched via `bro_orchestrate_run`.
@@ -19,12 +19,10 @@ A review ensemble is a set of 6 installable artifacts:
 4. **Facilitator brofile** — orchestrator that distributes context and
    synthesizes the final review.
 5. **Panel teamplate** — the 5-member team definition matching lens aliases.
-6. **Gate packet** — participation rules for whiteboard phase transitions.
 
 The runnable design-doc-review exemplar ships alongside this document in
-`system-defaults/workflows/review/`, `system-defaults/brofiles/review/`, and
-`system-defaults/agentic-corpus/packets/design-doc-review/`. Use it as the
-starting point for tailoring.
+`system-defaults/workflows/review/` and `system-defaults/brofiles/review/`.
+Use it as the starting point for tailoring.
 
 ## The Invariant Dimension Taxonomy
 
@@ -104,7 +102,7 @@ Survey the target repo. Run these checks before asking the operator anything:
    - Any provider-specific constraints (e.g., gemini excluded)
 
 6. Existing ensemble infrastructure
-   - bbox_artifact_list → any existing workflows, brofiles, packets?
+   - bbox_artifact_list → any existing workflows or brofiles?
    - Any existing teams or teamplates?
 
 7. Transcript history
@@ -233,13 +231,11 @@ Customizations to propose based on the interview:
 - **Post-review steps:** Add follow-up nodes after `WriteReview` — trigger a
   workflow, post to a channel, run CI, gate a merge.
 - **Callback integration:** Wire `on_arc_exit` hooks for post-arc actions.
-- **Gate packet adjustments:** Modify participation rules if the panel size
-  changes (the exemplar hardcodes `post_count ≥ 5` and all 5 aliases).
 
 Ask:
 
 > "Does this workflow shape match your needs? I can add pre-review grounding
-> steps, post-review callbacks, or adjust the gate rules."
+> steps or post-review callbacks."
 
 ## Phase 5: Mint (Generate and Install Artifacts)
 
@@ -279,21 +275,11 @@ Generate the full artifact set:
    }
    ```
 
-6. **Gate packet** — participation rules:
-   - `blind_all_lenses_posted`: phase=blind, post_count≥5, all 5 aliases `has_posted`
-   - `validation_complete_with_conflicts`: phase=validate, unvalidated=0, conflict≥1
-   - `validation_complete_no_conflicts`: phase=validate, unvalidated=0, conflict=0
-   - `debate_participation_complete`: phase=debate, unreviewed=0, vote≥1
-   - `invalid_default`: catch-all
-
 ### Install Sequence
 
 ```text
 # Install each brofile
 bbox_artifact_install(kind="brofile", source="<path-to-brofile>")
-
-# Install the gate packet
-bbox_artifact_install(kind="packet", source="<path-to-packet>")
 
 # Install the panel teamplate
 bbox_artifact_install(kind="team", source="<path-to-teamplate>")
@@ -321,8 +307,6 @@ mechanics this generator uses. Fetch them via `bbox_knowledge` when needed:
   — actor kinds, transition types, hooks, vars_schema, subworkflows, wait nodes.
 - **Whiteboard API:** `bbox_knowledge(query="sm-whiteboards")`
   — phases, posts, annotations, votes, transitions, conflict detection.
-- **Design packets:** `bbox_knowledge(query="sm-rule-packets")`
-  — how to encode evaluation criteria as rule-packets.
 - **Pathology ensemble (reference):** `design/refactor-tools/pathology-ensemble-review.md`
   — the original projection of these 5 dimensions into architecture pathology.
 - **Pathology dispatch (operator guide):** `docs/pathology-dispatch.md`
@@ -343,7 +327,6 @@ A runnable exemplar ships alongside this generator:
 | Validator | `system-defaults/brofiles/review/design-doc-review-validator.json` |
 | Facilitator | `system-defaults/brofiles/review/design-doc-review-facilitator.json` |
 | Panel teamplate | `system-defaults/refactor/pathology/teamplates/design-doc-review-panel.json` |
-| Gate packet | `system-defaults/agentic-corpus/packets/design-doc-review/whiteboard-participation.json` |
 
 The design-doc-review projections:
 

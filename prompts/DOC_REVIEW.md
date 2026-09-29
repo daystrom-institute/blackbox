@@ -61,9 +61,6 @@ bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-cor
 bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-validator.json")
 bbox_artifact_install(kind="brofile", source=".bbox/brofiles/blackbox-review-facilitator.json")
 
-# Gate packet
-bbox_artifact_install(kind="packet", source=".bbox/packets/whiteboard-participation.json")
-
 # Panel teamplate + save
 bbox_artifact_install(kind="team", source=".bbox/teams/blackbox-review-panel.json")
 bro_team(action="save_template", name="blackbox-review-panel", members=[

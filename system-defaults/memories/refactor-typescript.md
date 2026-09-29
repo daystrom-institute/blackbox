@@ -44,7 +44,7 @@ bbox_refactor_status(
 
 The response includes parse health, language, file hash, top-level node kinds,
 names where tree-sitter exposes them, byte ranges, and line ranges. Use this for
-symbol extraction, move planning, review packets, and blast-radius notes.
+symbol extraction, move planning, review briefs, and blast-radius notes.
 
 2. Search and inspect neighbors before editing:
 

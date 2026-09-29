@@ -9,7 +9,7 @@ topic:
   - graph
   - design-corpus
 tags: [design-corpus, graph, gaps, campaigns, migration-plan]
-brief: "Plan only: map 19 open gap-log records onto five proposed dsg:Campaign vertices with a per-gap dsg:Inquiry or dsg:Concept stub, each SOURCED_FROM its GapRef, using the schema v2 campaign layer. No vertices are created and no gap is edited by this document."
+brief: "Plan only: map 18 open gap-log records onto five proposed dsg:Campaign vertices with a per-gap dsg:Inquiry or dsg:Concept stub, each SOURCED_FROM its GapRef, using the schema v2 campaign layer. No vertices are created and no gap is edited by this document."
 date: 2026-08-18
 ---
 
@@ -33,7 +33,7 @@ Related:
 The gap log holds durable substrate gaps as flat records: each one is a
 capability someone wanted and did not have, filed at the moment of friction.
 That is the right shape for filing and closing, and the wrong shape for
-planning: nineteen open gaps today form five recognizable initiatives, but the
+planning: eighteen open gaps today form five recognizable initiatives, but the
 grouping lives in nobody's head and in no queryable store. The gap log cannot
 say "these six gaps are one campaign, this is its status, and these two designs
 anchor it", and the design graph until now could not point back at a gap.
@@ -82,7 +82,7 @@ consumer shows up.
 
 ## The mapping
 
-Five proposed campaigns; nineteen gaps; one Inquiry or Concept stub per gap.
+Five proposed campaigns; eighteen gaps; one Inquiry or Concept stub per gap.
 "Inquiry" is used where the gap still holds an open question (what, how, or
 whether); "Concept" is used where the gap names a durable idea that already
 has a second articulation (a design doc plus the gap) and only needs a home in
@@ -122,14 +122,13 @@ git-notes sync automation, and a generic anchor-indexed lookup. Anchor design:
 
 ### Campaign 3: `campaign/eval-coverage`
 
-Summary: turn designed evaluation into standing gates: audit example sets in
-CI, the remaining probe-team question shapes, live proof of the pathology
-ensemble family, and richer per-class checker semantics. Anchor design:
+Summary: turn designed evaluation into standing gates: the remaining
+probe-team question shapes, live proof of the pathology ensemble family, and
+richer per-class checker semantics. Anchor design:
 `doc/design/corpus/agentic-corpus/retrieval-eval-harness.md`.
 
 | Gap | Title | Stub | Slug | Kind | One-line statement |
 |---|---|---|---|---|---|
-| gap-5ec87592 | Audit example sets CI integration | Inquiry | `inquiry/audit-sets-as-ci-gate` | question | Cargo test task or CI step: which runs `bbox_audit` over every `eval/audit/<domain>/*.json` at PR time without a live daemon? |
 | gap-9d84f24f | Probe-team Q2-Q8 | Inquiry | `inquiry/probe-team-remaining-shapes` | question | Dispatch the seven remaining probe-team question shapes with their checklists; what does the cold-start grounding baseline look like per shape? |
 | gap-9d0f9159 | Pathology ensemble flows unproven | Inquiry | `inquiry/pathology-ensemble-live-proof` | question | Prove the three unproven pathology flows and re-run the heterogeneous panel on real providers; requires the prod daemon host and healthy providers. |
 | gap-b45dc2d0 | Per-class checker logic beyond Any/All/First | Inquiry | `inquiry/per-class-checker-semantics` | concept | Per-query-class checker richness (at-least-n, must-include-path-validation, weighted contributions) beyond the v1 pass_strictness. |
@@ -161,7 +160,7 @@ doc id).
 | gap-fdacb6ed | Per-turn MCP tool-call budget for agentic actor | Inquiry | `inquiry/per-turn-tool-call-budget` | question | What primitive budgets tool calls per LLM turn (not per workflow node), and does the eval show the runaway-loop failure the soft prompt budget was meant to hold off? |
 | gap-a02e5c7d | VectorStore singleton refactor | Concept | `concept/vector-store-explicit-passing` | - | Thread `&VectorStore` through call sites instead of the module-level singleton so tests inject isolated stores. |
 
-Counts: 6 + 4 + 4 + 3 + 2 = 19 gaps; 14 Inquiry stubs, 5 Concept stubs.
+Counts: 6 + 4 + 3 + 3 + 2 = 18 gaps; 13 Inquiry stubs, 5 Concept stubs.
 
 Note on the Concept stubs: `dsg:Concept` requires `status` and `statement`,
 and the design-graph rule mints Concepts lazily (second articulation). Each

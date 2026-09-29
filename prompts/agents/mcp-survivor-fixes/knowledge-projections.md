@@ -18,7 +18,7 @@ Owned implementation: src/tools/knowledge.rs; crates/bbox-knowledge/src/knowledg
 A no-match global knowledge query with limit=1 returned 6,789 result bytes, mostly visibility diagnostics repeated as text and structured content. Exact system-memory/knowledge bodies and review queue records can also be unbounded.
 - Make the default reply prioritize matches plus compact scoped warning/count summaries. Preserve unavailable, stale, queued, and partial state. Avoid repeating whole diagnostics in both representations.
 - Add bounded opt-in exact diagnostic recovery that preserves the original query scope. Narrowing the project is not a substitute for recovering omitted global diagnostics.
-- Bound oversized exact knowledge/system-memory reads and review queue records with discoverable continuation, provenance and stable/content-bound cursors. Preserve progressive ranking and bounded packet/system-memory sidecars.
+- Bound oversized exact knowledge/system-memory reads and review queue records with discoverable continuation, provenance and stable/content-bound cursors. Preserve progressive ranking and the bounded system-memory sidecar.
 - Write tests for no results with many diagnostics, oversized one-record bodies, Unicode reconstruction, review pagination, stale cursors, and warning preservation.
 - Trace bbox_absorb and bbox_bootstrap consumers. Correct misleading chooser/outcome claims for inert compatibility actions; do not remove callable names or stored data solely on this audit recommendation. Report a concrete consumer-backed retirement disposition separately.
 - Leave queued owner delivery, merge/CAS, source publication, and knowledge ranking unchanged. Update only this family's public schema/chooser stanzas.

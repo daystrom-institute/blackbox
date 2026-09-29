@@ -37,10 +37,9 @@ Final report: branch, commit SHA, changed paths, acceptance cases/tests written,
 4. [Bounded graph discovery and exact schema detail](graph-projections.md), A04, A06, A10, A13.
 5. [Useful knowledge summaries and exact diagnostic recovery](knowledge-projections.md), A04, A05, A06, A08, A13.
 6. [Honest brofile and MCP configuration actions](configuration-contracts.md), A03, A04, A06, A08, A09, A10, A11.
-7. [Packet and MCP policy discovery bounds and validation](packet-surface-contracts.md), A03, A05, A06, A10, A13.
-8. [Maintenance selector parity and bounded diagnostic output](maintenance-contracts.md), A03, A06, A09, A10, A13, A14.
-9. [Compact publisher status with retained authority evidence](publisher-projections.md), A05, A06, A09, A10, A13.
-10. [Allocator persistence truth and safe specialist detail](specialist-outcomes.md), A04, A06, A10, A11, A12.
+7. [Maintenance selector parity and bounded diagnostic output](maintenance-contracts.md), A03, A06, A09, A10, A13, A14.
+8. [Compact publisher status with retained authority evidence](publisher-projections.md), A05, A06, A09, A10, A13.
+9. [Allocator persistence truth and safe specialist detail](specialist-outcomes.md), A04, A06, A10, A11, A12.
 
 The units can run concurrently. Each owns different implementation surfaces; the orchestrator resolves small shared documentation hunks during integration. No unit owns the audit record, gap status, or thread lifecycle. Runtime task/session handles are recorded in the existing host-local thread, not this durable prompt.
 

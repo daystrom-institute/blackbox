@@ -63,10 +63,10 @@ Genuinely Badgey-specific (stays with the consumer):
   budget extensions.
 - The persona: `badgey-persona` brofile lens, scout mode, wrapper command
   syntax (`commands.rs`).
-- `ProposalKind` *vocabulary* (Workflow/Packet/Brofile/Lens/Agent/
+- `ProposalKind` *vocabulary* (Workflow/Brofile/Lens/Agent/
   RedispatchTask/ArtifactPromotion) and the kind→artifact-kind mapping.
 - The `system-defaults/badgey/` artifact family (agents, brofiles, workflows,
-  packets, crons) and `eval/badgey/`.
+  crons) and `eval/badgey/`.
 
 ## 3. Target shape
 
@@ -138,7 +138,7 @@ These are the load-bearing risks; each phase below must hold them.
    stay an allowlisted, code-owned set — descriptors select from them, never
    define new ones in data.
 5. **Tool-name coupling in shipped artifacts.** `system-defaults/badgey/`
-   workflows/packets/crons call `badgey_*` tools by name through `mcp_call`,
+   workflows/crons call `badgey_*` tools by name through `mcp_call`,
    and operator muscle memory + docs do too. The `badgey_*` shim layer must
    survive until those artifacts are re-pointed (or made consumer-agnostic),
    and `tool_docs.rs` stanzas must track every shim and generic tool or the

@@ -34,7 +34,6 @@ The main operator binaries are:
 | [Performance Pathology Dispatch](perf-pathology-dispatch.md) | Caller-owned performance review |
 | [Reference Implementations](reference-implementations.md) | Historical application examples |
 | [Atoms](atoms.md) | Retired atom execution and replacements |
-| [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
 | [Refactor Tools And Atoms](refactor.md) | Harness-native structural refactor tooling |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls |
 | [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, notes, and inbox |

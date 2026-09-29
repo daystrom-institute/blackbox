@@ -286,7 +286,7 @@ The boundary from v1 remains:
 slack.com
   -> bro-slack sidecar
   -> blackboxd /webhook/slack
-  -> routing packet
+  -> webhook routing
   -> workflow / arc / bro execution
   -> Slack-aware egress
   -> slack.com Web API
@@ -294,7 +294,7 @@ slack.com
 
 The daemon still does not need to link a Slack SDK. The sidecar still
 does not run workflows. Slack-specific product behavior still belongs in
-workflow examples and routing packets.
+workflow examples and webhook routing rules.
 
 ### 5.2 Add a Slack-aware egress layer
 
@@ -447,7 +447,7 @@ Rules:
 - For interactive payloads, keep `trigger_id`, `action_id`,
   `action_value`, `view_id`, `view_state_values`, and raw body.
 
-### 5.6 Routing packet additions
+### 5.6 Webhook routing additions
 
 Add rules for:
 
@@ -807,7 +807,7 @@ Acceptance:
   - `link_shared`
 - Add top-level projected fields from section 5.5.
 - Extend `examples/slack/webhooks/slack.json` extractor.
-- Extend `examples/slack/packets/routing-slack.json`.
+- Extend the Slack webhook routing rules.
 - Add replay fixtures for every new event shape.
 
 Acceptance:

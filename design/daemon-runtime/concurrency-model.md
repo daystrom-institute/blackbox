@@ -22,10 +22,7 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > thread, allocator/cooldown off-path, /tail decoration caches, harness
 > session persist via spawn_blocking) and the §4.5 RosterView. Wave 7 added
 > bro_dashboard on RosterView, the poll-time histogram builder opt-in, and
-> atomic harness session writes. Wave 8 (2026-06-10) closed the MCP wire-head
-> tax: SurfaceDecisionCache (generation-validated, packet-store scans off the
-> request path) + idempotent packet-artifact boot restore + duplicate-packet
-> GC. Wave 9 landed **Phase 2**: the §4.3 IndexWriterActor
+> atomic harness session writes. Wave 9 landed **Phase 2**: the §4.3 IndexWriterActor
 > (src/index/writer_actor.rs) — all in-process tantivy writes serialize
 > through one actor thread; the reindex pass executes inside the actor with
 > phase-boundary drains; bbox_reindex unified onto the same pass; the
@@ -104,7 +101,7 @@ tasks.json; this doc generalizes it.
 | Generation | Stores | Idiom | Pathology |
 |---|---|---|---|
 | 1: lock-everything | notes, threads, kb (central), pins, roadmap, projects | full-store pretty-print JSON + `sync_all` + rename, executed **under the `SharedState` RwLock write guard AND a blocking flock, on a tokio worker** (e.g. src/tools/notes.rs:19 → src/notes.rs:281 → src/json_store.rs:38) | every reader of that store stalls behind an fsync; worker thread blocked; flock has no timeout |
-| 2: per-file | knowledge (repo-owned), gaps, packets, badgey proposals/journal, whiteboards, councils | per-item file + atomic rename, narrower locks | better isolation; still fsync on tokio workers |
+| 2: per-file | knowledge (repo-owned), gaps, badgey proposals/journal, whiteboards, councils | per-item file + atomic rename, narrower locks | better isolation; still fsync on tokio workers |
 | 3: journal/actor | task_store (`TaskPersister`), system_events (append-only JSONL + outbox worker) | in-memory mutate under brief lock; coalesced off-thread persist | **the correct pattern** — the only stores with no read-stall-behind-fsync |
 
 ### 1.3 Indexing plane
@@ -182,7 +179,7 @@ These are the rules new code must satisfy and migration drives old code toward:
   a brief lock; persistence requested from the owner actor. Two durability
   classes: **telemetry** (tasks, system-event fanout, slack continuity) acks
   immediately, write-behind + coalescing; **operator-durable** (knowledge,
-  threads, notes, gaps, roadmap, pins, projects, packets, artifacts) acks only
+  threads, notes, gaps, roadmap, pins, projects, artifacts) acks only
   after the actor reports durable — callers await off-worker completion, so a
   `bbox_learn` that returned ok survives a crash.
 - **I5 — Bounded memory, defined overflow.** Per-task in-memory event ring
@@ -345,7 +342,7 @@ fleet load, and Phases 0–2 remove the amplifiers first.
 - **In-memory event ring size** and whether `recentEvents` semantics change
   visibly for `bro_status tail=N` consumers (fleet client expects the current
   shape; budget already truncates, so a ring ≥ budget is shape-compatible).
-- **Whether gen-2 per-file stores (gaps, packets, badgey) also route through
+- **Whether gen-2 per-file stores (gaps, badgey) also route through
   the persister** or keep direct per-file writes behind `spawn_blocking` —
   their isolation is already decent; I2 compliance may be all they need.
 

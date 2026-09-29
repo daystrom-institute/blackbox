@@ -23,8 +23,8 @@ or system memories and link/pointer from here.
 - `docs/refactor.md` - retirement pointer for the daemon refactor MCP
   surface (now harness-native isolate bindings);
   `system-defaults/memories/refactor*.md` - language-specific protocols.
-- `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
-  `docs/rule-packets.md` - caller composition, observation and classification.
+- `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md` -
+  caller composition and observation.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/consultant-runtime.md`,
   `docs/whiteboards.md` - simple agents and retirement/history contracts.

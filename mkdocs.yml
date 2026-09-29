@@ -47,7 +47,6 @@ nav:
   - Toolbelt:
     - Workflow Engine: workflows.md
     - Atoms: atoms.md
-    - Rule Packets: rule-packets.md
     - Refactor Tools And Atoms: refactor.md
     - Bro Runtime: bro-runtime.md
     - Knowledge Store: knowledge-store.md

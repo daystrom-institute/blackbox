@@ -7,7 +7,7 @@ topic:
   - orchestration
   - phase-decomposer
 date: 2026-05-10
-status: "implemented as system-defaults/phase-decompose workflows, packets, brofiles, teamplates, fixtures, and the corpus-pathfinder agent manifest"
+status: "implemented as system-defaults/phase-decompose workflows, brofiles, teamplates, fixtures, and the corpus-pathfinder agent manifest"
 brief: "Routes oversized phase docs through scouting, evidence sizing, optional decomposition, parallel implementation, and recomposition."
 ---
 
@@ -15,8 +15,8 @@ brief: "Routes oversized phase docs through scouting, evidence sizing, optional 
 
 Date: 2026-05-10
 Status: implemented after live no-edit validation on 2026-05-16. The shipped
-surface is `system-defaults/phase-decompose` workflows, packets, brofiles,
-teamplates, fixtures, and the `corpus-pathfinder` agent manifest. Final
+surface is `system-defaults/phase-decompose` workflows, brofiles, teamplates,
+fixtures, and the `corpus-pathfinder` agent manifest. Final
 hardened live proof: `arc-5a5fd112da724ce7a06ab7d1fe007bd8` reached `Done`
 with `recompose_verdict=satisfied` after measured DAG lint, eight supervised
 no-edit subflows, and mechanical recomposition assertions. Edit/merge mediation
@@ -173,10 +173,9 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
    tool-injection overhead; those require a separate full-envelope
    measurement field if we decide to enforce them later.
 
-   Acceptance-coverage lint is not a pure packet gate today. The packet AST can
-   quantify over one array path, but cannot correlate `acceptance_criteria[*]`
-   against `sub_units[*].acceptance_subset[*]`; use a mechanical hook/tool for
-   that coverage check.
+   Acceptance-coverage lint is not a pure gate check: it must correlate
+   `acceptance_criteria[*]` against `sub_units[*].acceptance_subset[*]`, so a
+   mechanical hook/tool performs that coverage check.
 
 5. **Produce the triage verdict.** If the measured evidence payload fits
    under `target_context_window` → `fit_direct`. If it exceeds →
@@ -229,14 +228,14 @@ subworkflow imports `phase_doc_path` from the parent and exports
 (`engine.rs:2464-2570`). DAG artifacts are produced later by the
 decomposer/ensemble path, not by discovery.
 
-The discovery subworkflow node carries a `gate` packet
-(`schema.rs:120-127`). The gate's entity includes the subworkflow's exported
-vars. The gate packet reads `vars.triage_verdict` and emits the verdict
-(`fit_direct` or `needs_decompose`) as its classification. The parent's
-`Branch` transition (`schema.rs:389-395`) routes on `last_verdict` (the gate
-verdict, per `BranchSelector::GateVerdict`). This is the standard gate →
-branch routing pattern — no new mechanism needed, just an explicit gate
-packet on the discovery node.
+The discovery subworkflow node carries a `gate` (`schema.rs:120-127`). The
+gate's entity includes the subworkflow's exported vars. The gate reads
+`vars.triage_verdict` and emits the verdict (`fit_direct` or
+`needs_decompose`) as its classification. The parent's `Branch` transition
+(`schema.rs:389-395`) routes on `last_verdict` (the gate verdict, per
+`BranchSelector::GateVerdict`). This is the standard gate → branch routing
+pattern: no new mechanism is needed, just an explicit gate on the discovery
+node.
 
 ## 4. Stage 2: Ensemble decomposition
 
@@ -405,11 +404,11 @@ repair, and live mutating validation.
 | cancel_task (SIGTERM) | `src/orchestration/mod.rs` | implemented |
 | Per-event hook seam | `src/orchestration/mod.rs`, `src/orchestration/supervision.rs` | implemented |
 | Whiteboard deliberation | `src/whiteboards.rs`, `examples/whiteboard/` | implemented |
-| Policy packet (arc-level gate) | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
+| Arc-level policy gate | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Compaction anchor (rolling summary) | `src/workflow/engine.rs` | implemented |
 | Durable actor sessions | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
-| Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
+| Advisor checkpoint/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
 | Classifier workflow-backed atom pattern | `system-defaults/atoms/supervision/classifier.json`, `system-defaults/workflows/supervision/classifier.json`, `src/tools/atoms.rs` | implemented |
 | Advisor workflow-backed atom pattern | `system-defaults/atoms/supervision/advisor.json`, `system-defaults/workflows/supervision/advisor.json`, `src/tools/atoms.rs` | implemented |

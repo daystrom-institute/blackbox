@@ -37,7 +37,7 @@ Measured timing story (M-series laptop, 14 threads, warm `target/`,
 |---|---|
 | `cargo check` no-op | ~0.2s |
 | `cargo check` after a root-crate edit | ~3.3s |
-| `cargo check` after a leaf-crate edit (e.g. bbox-packets) | ~3.5s |
+| `cargo check` after a leaf-crate edit (e.g. bbox-gaps) | ~3.5s |
 | `cargo build --bin blackboxd` after a root edit (codegen+link) | ~31s |
 | `cargo nextest run --workspace` (3,700 tests) | ~24s |
 | `cargo nextest run --workspace --profile full` (3,702 tests) | ~85s |

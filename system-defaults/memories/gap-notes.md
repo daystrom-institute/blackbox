@@ -16,7 +16,7 @@ Use a gap note when the missing capability is plausibly hit by agents in other p
 
 Good triggers:
 
-- packet AST cannot express the predicate you needed
+- no primitive performs a recurring classification or check you needed
 - a refactor primitive does not exist for the language at hand
 - the workflow engine cannot express a wait / cancel / fork shape
 - the MCP surface for outside agents is too narrow or too wide for a recurring role
@@ -39,16 +39,16 @@ Call `bbox_gap` with typed parameters (no JSON envelope):
 
 ```text
 bbox_gap(
-  title="Packet AST cannot express rate predicates",
-  gap_kind="packet_ast",
+  title="No primitive classifies entities by rate within a time window",
+  gap_kind="tooling",
   domain="review-policy",
   wanted_capability="Classify entities by count/rate within a time window.",
-  dedupe_key="packet_ast/review-policy/rate-window-predicate",
+  dedupe_key="tooling/review-policy/rate-window-predicate",
   impact="medium",
   blocking_level="workaround_available",
-  missing_primitive="RateCmp / WithinWindow",
+  missing_primitive="rate-window classifier",
   fallback_used="Prose rubric plus manual review.",
-  evidence=["packet-event:gap:...", "thread-7f01324e"],
+  evidence=["thread-7f01324e"],
 )
 ```
 
@@ -66,14 +66,13 @@ On a transport-governed (locality-cutover) estate the daemon holds no checkout a
 
 `gap_kind`:
 
-- `packet_ast` — predicate the rule-packet AST cannot express
 - `tooling` — missing CLI / shell / refactor helper
 - `agent` — needed dispatchable agent that does not exist
 - `workflow` — missing arc / wait / fork / cancel shape
 - `refactor_primitive` — language-specific refactor atom
 - `mcp_surface` — wrong allow/deny shape for a recurring role
 - `ontology` — missing entity type or edge family
-- `eval_coverage` — packet or test eval cannot reach a class of cases
+- `eval_coverage` - test or eval harness cannot reach a class of cases
 - `docs_runbook` — missing rendered guidance or runbook
 
 `impact`:
@@ -101,7 +100,7 @@ Default to `medium` when unsure.
 Stable and boring. Examples:
 
 ```text
-packet_ast/review-policy/rate-window-predicate
+tooling/review-policy/rate-window-predicate
 workflow/webhook-routing/cancel-by-correlation
 refactor_primitive/java/extract-enum
 ```
@@ -111,7 +110,7 @@ refactor_primitive/java/extract-enum
 Search open gaps first with `bbox_gaps`, filtering by the typed fields:
 
 ```text
-bbox_gaps(dedupe_key="packet_ast/review-policy/rate-window-predicate")
+bbox_gaps(dedupe_key="tooling/review-policy/rate-window-predicate")
 bbox_gaps(gap_kind="mcp_surface", domain="transcripts")
 ```
 
@@ -121,10 +120,6 @@ An open gap with the same `dedupe_key` **dedupes automatically**: `bbox_gap` ret
 
 - Amend a gap in place with `bbox_gap_update` (refine title, wanted_capability, impact, evidence, notes, …) — no need to re-file.
 - Retire a stale gap in favor of a better-shaped successor with `bbox_gap_resolve(id=…, resolution="addressed", superseded_by="gap-<id>")`. This writes the structured `supersedes` / `superseded_by` link on both records.
-
-## Packet AST gaps
-
-If you are actively authoring a packet and the AST is the missing surface, use `bbox_packet_gap` directly. It records the packet event AND emits the companion gap into the gap store for you; do not double-file.
 
 ## Filing without direct MCP access
 
@@ -145,7 +140,7 @@ The resolution states are the lifecycle:
 Resolve with `bbox_gap_resolve(id="gap-…", resolution="addressed", note="…")`; the resolution text should carry the terminal reason:
 
 ```text
-implemented in commit abc123; added packet predicate WithinWindow
+implemented in commit abc123; added rate-window classifier
 rejected: application-specific TODO, not blackbox substrate
 ```
 

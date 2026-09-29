@@ -41,7 +41,7 @@ agents consume the graph/search/tool surfaces through MCP.
 - Rebuildable projections are not durable state. The index, vectors,
   edges, and git metadata can be regenerated.
 - Durable JSON stores are the source of truth for knowledge, notes,
-  threads, projects, packets, artifacts, and bro runtime state.
+  threads, projects, artifacts, and bro runtime state.
 - Embedding routes are independent. A provider/model change on one route
   does not invalidate the other routes.
 

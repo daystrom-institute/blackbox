@@ -152,7 +152,7 @@ Every current consumer is converted explicitly:
 
 - workflow `exec_read_vector_status` obtains explicit diagnostics in bounded
   route pages and preserves `max_connectivity_route` and
-  `max_connectivity_ratio`; the `embed/compaction-policy` packet therefore
+  `max_connectivity_ratio`; the workflow's compaction policy therefore
   retains its connectivity greater-than-5-percent compact trigger and
   greater-than-2-percent notify trigger end to end;
 - workflow `exec_compact_vector_partitions` retains two independent candidacy

@@ -144,7 +144,7 @@ fleetd task ownership, auth) and collected in the Decisions section.
    (tasks, resources) are projections that accelerate capable clients, not
    replacements that fork the contract.
 3. **Resources are the browse plane.** Catalogs with durable IDs and JSON
-   bodies (brofiles, teams, artifacts, atoms, packets, live tasks) get
+   bodies (brofiles, teams, artifacts, atoms, live tasks) get
    URI-addressable read projections with protocol cursor pagination. Writes
    stay tools; MCP resources are read-only, which matches our mutation
    tools' existing audit/gating shape.
@@ -332,16 +332,15 @@ as tools:
 blackbox://brofile/{name}
 blackbox://team/{name}
 blackbox://artifact/{kind}/{name}
-blackbox://packet/{id}
 blackbox://atom/{id}
-blackbox://task/{id}                     (live task state)
-blackbox://project/{project}/packet/{id} (explicit project encoding)
+blackbox://task/{id}                                (live task state)
+blackbox://project/{project}/artifact/{kind}/{name} (explicit project encoding)
 blackbox://skills/onboard-project/SKILL.md
 ```
 
 The classification rule for resource candidacy: a durable ID plus a JSON
 body that clients currently enumerate through a bounded list tool. Beyond
-the five catalogs:
+the four catalogs:
 
 - **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
   `blackbox://gap/{id}`, `blackbox://note/{id}`, `blackbox://roadmap/{id}`,
@@ -367,13 +366,13 @@ the five catalogs:
 What stays a tool: search/query surfaces (ephemeral result sets are not
 durable objects), all mutations, anything parameterized ad hoc.
 
-- Catalog boundary: the five catalogs plus live tasks. Threads are
+- Catalog boundary: the four catalogs plus live tasks. Threads are
   borderline (cheap read projection, composes with subscriptions).
   Transcripts and sessions are searchable corpora, not enumerable catalogs;
   they stay tool-served.
 - Project scoping is explicit in the URI for project-owned objects, not
   resolved against the session's `?project=`: a client scoped to project A
-  may legitimately read project B's packets, and URI-addressability beats
+  may legitimately read project B's artifacts, and URI-addressability beats
   scope-channel switching.
 - Governance: add a `resources` key to the same `[surfaces.<name>]`
   configuration table (not a separate table; operators think in surfaces,
@@ -386,7 +385,7 @@ durable objects), all mutations, anything parameterized ad hoc.
   `bbox_describe_schema(include_agents=true)`) that the 80KB cap's bytes
   telemetry exists to flag.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
-  packet compile, brofile upsert).
+  brofile upsert).
 
 ### Spill becomes a resource
 

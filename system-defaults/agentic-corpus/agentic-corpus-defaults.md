@@ -1,8 +1,8 @@
-# Corpus roles and classification examples
+# Corpus roles
 
-This directory retains useful brofile prompts, team definitions and portable
-classification packets. These are optional inputs for caller-owned work;
-installation does not start a schedule or choose subsequent tasks.
+This directory retains useful brofile prompts and team definitions. These are
+optional inputs for caller-owned work; installation does not start a schedule
+or choose subsequent tasks.
 
 Auto-digest, auto-edge, evaluation, bootstrap and embedding workflows and their
 crons are retired. Vector maintenance and storage retention run directly in the

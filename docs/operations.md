@@ -22,7 +22,7 @@ will run.
 | `~/.local/state/blackbox/blackbox-threads.json` | Work threads and their session/edge linkage | ~500KB |
 | `~/.local/state/blackbox/blackbox-pins.json` | Scoped active-arc pins | ~5KB |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
-| `~/.local/state/blackbox/packets/` | Compiled rule packets (packet JSON + audit examples) | varies |
+| `~/.local/state/blackbox/packets/` | Packet records the project catalog inventories as owner rows; nothing else reads them | varies |
 | `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed workflows, agents, brofiles) | varies |
 | `~/.local/state/blackbox/bro/` | **The entire bro directory** - see breakdown below | varies |
 | `~/.bro/slack-identities.json` | Slack user identity mappings | small |

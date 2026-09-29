@@ -24,8 +24,8 @@ Evidence chain (2026-06-10, thread-36f3cced / gap-16d79781):
   primary checkout because file tools resolve against launch cwd (original
   gap facet — since closed by host-owned worktree creation, a72a216, plus
   `project_dir → --cwd → ToolCx.root`).
-- glm's websearch flail (gap-c21e34a3) and `unwrap_jsonish` in the packet
-  compiler are the same class: models fumbling generic MCP arg shapes.
+- glm's websearch flail (gap-c21e34a3) is the same class: models fumbling
+  generic MCP arg shapes.
 
 The ambient scope block already tells dispatched agents their pre-bound ids
 (session, project, bro, thread) — as prose the model must re-type into args.

@@ -27,7 +27,7 @@ brief: "Replace the single-actor pathologist in the pathology flows with a heter
 > **replaced** with the bridgecrew-aligned model described below: an independent
 > validator with exclusion teeth, conflict-triggered debate, and unresolved
 > disagreement that survives into the correction plan. This now spans all four
-> flows (arch + perf × java + rust). The "Workflow shape", "Gate packet", and
+> flows (arch + perf × java + rust). The "Workflow shape", "Workflow gate", and
 > "Acceptance criteria" sections describe the implemented design; the prior
 > broken text has been removed.
 
@@ -337,11 +337,11 @@ gate). The ensemble is adversarial review of the atom outputs across the five
 orthogonal axes, and the validator is the independent critic that gives refutation
 teeth.
 
-## Gate packet (`pathology-review/whiteboard-participation`, v2)
+## Workflow gate (whiteboard participation)
 
-Lattice `["ready_debate","ready_skip","ready","invalid"]`; first-match evaluation;
-reads `vars.board_check.*` (the `whiteboard_summarize` output). Four rules plus the
-catch-all:
+Shared by all four flows. Lattice `["ready_debate","ready_skip","ready","invalid"]`;
+first-match evaluation; reads `vars.board_check.*` (the `whiteboard_summarize`
+output). Four rules plus the catch-all:
 
 - `blind_all_lenses_posted` → `ready` when phase=blind, post_count≥5, and all five
   lens aliases `has_posted` (participation).
@@ -377,7 +377,6 @@ omitted when nothing was refuted). The PD-dispatch handoff
 | validator brofile ×4 | `…/pathology-lens/{arch,perf}-{java,rust}-pathology-validator.json` (brodex / gpt-5.5, read-only) |
 | panel teamplate ×4 | `system-defaults/refactor/pathology/teamplates/{java,rust}-pathology-panel.json` (arch) + `{java,rust}-perf-pathology-panel.json` (perf) |
 | facilitator brofile ×4 | `{java,rust}-architecture-pathologist.json` (v2, `agent_name=facilitator`) + `{java,rust}-performance-pathologist.json` |
-| packet ×1 | `…/packets/pathology-review/whiteboard-participation.json` (v2; shared by all four flows) |
 | workflow ×4 | `system-defaults/workflows/refactor/{arch-pathology-java,arch-pathology-rust,perf-pathology-java,perf-pathology-rust}.json` (v2) |
 
 The language-agnostic `perf-pathology.json` (v1) is superseded by the two

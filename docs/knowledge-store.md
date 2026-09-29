@@ -109,8 +109,8 @@ bbox_knowledge(query="retry policy", project="/repo/x")
 bbox_knowledge(query="sm-persistence-taxonomy")
 ```
 
-It also surfaces system memories (`sm-*`) and matching packets. For scoped pins,
-use `bbox_pin(action="list")`; for notes, use `bbox_notes`; for active threads,
+It also surfaces system memories (`sm-*`). For scoped pins, use
+`bbox_pin(action="list")`; for notes, use `bbox_notes`; for active threads,
 use `bbox_thread_list`.
 
 ## Render
