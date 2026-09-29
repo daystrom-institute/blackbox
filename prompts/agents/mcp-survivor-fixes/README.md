@@ -17,7 +17,7 @@ Read PROJECT.md, applicable AGENTS.md files, [edit-only worktree rules](../edit-
 
 Do not run cargo check/build/test/nextest/clippy or compile-shaped gates in these cold checkouts. Do not override the cold-build guard or set shared build environment. The orchestrator verifies pushed refs on the cluster with lane-run.sh --ref, workspace nextest, clippy, pinned formatting and concurrency checks, then resumes the original author for corrections. Read the estate BBOX_LANE_WORK.md before any subsequently authorized heavy work.
 
-Keep changes inside your assignment. Matching tool parameter types, tests, and only your named tool's stanza in crates/bbox-tool-docs/src/tool_docs.rs may be changed as needed. That file is shared across isolated branches: make small stanza-local edits, never wholesale regeneration. Existing body/collection-page helpers are read-only shared dependencies unless the orchestrator assigns a helper change. Report cross-owner needs through bro_report rather than changing a sibling's surface.
+Keep changes inside your assignment. Matching tool parameter types, tests, and only your named tool's stanza in crates/bbox-tool-docs/src/tool_docs.rs may be changed as needed. That file is shared across isolated branches: make small stanza-local edits, never wholesale regeneration. Existing body/collection-page helpers are read-only shared dependencies unless the orchestrator assigns a helper change. Report cross-owner needs in your final report rather than changing a sibling's surface.
 
 Bounds apply to the complete serialized tool result, including escaping/structured duplication and a single oversized item. Use existing producer-owned projections and exact body readers. Preserve exact recoverability, actionable failures, scope/authority identity and truthful continuation. Do not silently trim answers or add spillfiles, persistent receipt stores, index redesigns, generic transaction/replay engines, or owner transport.
 
@@ -27,7 +27,7 @@ Retirement recommendations do not authorize data deletion or broad callable-name
 
 Do not restart/deploy shared services, send external messages, create sibling dispatches, prune tasks, or delete worktrees. Do not touch peer changes. Public artifacts must contain no private client identifiers, secrets, em dashes, or AI attribution.
 
-Report milestones with bro_report: grounded plan, implementation complete, pushed deliverable, and concrete blockers. Final report: branch, commit SHA, changed paths, acceptance cases/tests written, checks actually run, unresolved assumptions, and any contract compatibility change. Do not claim tests passed when you only wrote them.
+Final report: branch, commit SHA, changed paths, acceptance cases/tests written, checks actually run, unresolved assumptions, concrete blockers, and any contract compatibility change. Do not claim tests passed when you only wrote them.
 
 ## Ownership and dispatch units
 

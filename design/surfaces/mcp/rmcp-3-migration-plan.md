@@ -194,9 +194,9 @@ lane gates. Live probe: harness child dispatch round-trip in `Auto` mode.
 ## Phase 2: tasks extension projection
 
 Goal: capability-gated `CreateTaskResult` from `bro_exec`/`bro_resume`;
-`tasks/get` = `bro_status`; `tasks/cancel` = `bro_cancel`; `statusMessage` =
-`bro_report`. Details and the dual-shape rule live in the target-surface
-doc. Implementation notes:
+`tasks/get` = `bro_status`; `tasks/cancel` = `bro_cancel`; the daemon sets
+`statusMessage` from its own task state. Details and the dual-shape rule live
+in the target-surface doc. Implementation notes:
 
 - Adapt the orchestration `TaskStore` behind rmcp's task handler surface
   (or implement `tasks/get`/`cancel` directly over our store). Terminal

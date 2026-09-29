@@ -437,8 +437,8 @@ impl Emitter {
     }
 
     /// The builtin `report` tool's status/needs signal — drives the cockpit's
-    /// Waiting bucket and row summary (fleet-tui.md §2.2). Distinct from the
-    /// daemon's `bro_report`; the daemon's claude parser ignores `report` lines.
+    /// Waiting bucket and row summary (fleet-tui.md §2.2). The daemon's claude
+    /// parser ignores `report` lines.
     pub fn report(&self, message: &str, needs_input: bool) {
         self.write_line(json!({
             "type": "report",

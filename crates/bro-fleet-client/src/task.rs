@@ -30,7 +30,6 @@ pub struct TaskInner {
     pub session_id: String,
     pub events: Vec<Value>,
     pub last_assistant_message: Option<String>,
-    pub report_message: Option<String>,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
     pub stderr: String,
@@ -206,7 +205,6 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
                 .unwrap_or_else(|| "pending".to_string()),
             events: Vec::new(),
             last_assistant_message: task.last_message_snippet,
-            report_message: task.report,
             cost_usd: task.cost,
             num_turns: task.turns,
             stderr: task.error_teaser.unwrap_or_default(),
@@ -238,7 +236,6 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
         .map(|id| id.as_str().to_string())
         .unwrap_or_else(|| "pending".to_string());
     inner.last_assistant_message = task.last_message_snippet;
-    inner.report_message = task.report;
     inner.cost_usd = task.cost;
     inner.num_turns = task.turns;
     inner.status = task.status;
@@ -290,14 +287,12 @@ mod tests {
             has_last_message: None,
             last_message_snippet: Some("hello".to_string()),
             model: Some("gpt-test".to_string()),
-            report: Some("checking roster".to_string()),
             last_event_at: Some(42),
             origin: Origin::Cockpit,
             managed_worktree: Some("/tmp/worktree".to_string()),
             workflow_owned: false,
             started_at: Some(42),
             agent_label: Some(format!("agent-{id}")),
-            report_full: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,

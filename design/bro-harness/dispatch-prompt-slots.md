@@ -41,7 +41,7 @@ apply_brofile_lens(apply_ambient(operator_prompt, &ambient_ctx), lens)
 
 `apply_ambient` prepends `[scope]`, `[scoped pins]`, `[recall before acting]`,
 `[task shape]`, `[orchestrator]`, `[completion contract]`,
-`[milestone reporting]`, and the workspace-tools appendix; `apply_brofile_lens`
+and the workspace-tools appendix; `apply_brofile_lens`
 prepends the persona. The result rides `-p` as the **first user turn**, with the
 operator's instruction as the bare last line. On resume the ambient preamble is
 re-glued onto every follow-up (without persona — resume branches drop the lens).
@@ -57,8 +57,8 @@ Failure modes:
 2. **Authority inversion.** Daemon standing policy rides the *user* lane at the
    same authority as the task itself. No reference harness does this (§2).
 3. **Whack-a-mole calibration.** All providers share one glued string, so every
-   per-provider fix (TASK_SHAPE_HINT's E12 calibration bound, contract wording,
-   milestone placement) is wording surgery on a shared preamble. The reference
+   per-provider fix (TASK_SHAPE_HINT's E12 calibration bound, contract wording)
+   is wording surgery on a shared preamble. The reference
    harnesses each have an explicit per-model/per-transport composition seam
    (§1.3, §1.4); we have none.
 4. **Token waste.** The full preamble re-rides every resume turn in the user
@@ -213,8 +213,7 @@ to tolerate):
   "directives": [
     {"id": "recall",     "cadence": "per_turn", "text": "Recall: early in tasks…"},
     {"id": "task_shape", "cadence": "standing", "text": "Task-shape check…"},
-    {"id": "contract",   "cadence": "standing", "needs_scope": true, "text": "If something genuinely notable…"},
-    {"id": "milestone",  "cadence": "per_turn", "needs_scope": true, "text": "Report at major milestones…"}
+    {"id": "contract",   "cadence": "standing", "needs_scope": true, "text": "If something genuinely notable…"}
   ],
   "scope": {"task": "…", "session": "…", "project": "…", "bro": "…",
             "thread": "…", "work_item": "…"},
@@ -232,11 +231,9 @@ to tolerate):
   turns, where Mistral forbids trailing system messages). The cadence values
   exist because the current constants carry *empirical* calibration:
   RECALL_DIRECTIVE's doc comment records that session-start guidance
-  attention-decays within-session and per-turn injection survives;
-  MILESTONE_REPORT_HINT records that late placement is deliberate and only
-  per-turn delivery got weak models reporting (src/orchestration/mod.rs:1549,
-  1654). Moving those two to a once-per-request stable slot would discard
-  that evidence; declaring cadence lets the harness honor it in the right
+  attention-decays within-session and per-turn injection survives
+  (src/orchestration/mod.rs:1549). Moving it to a once-per-request stable
+  slot would discard that evidence; declaring cadence lets the harness honor it in the right
   native lane (§5) without learning what the text means. `needs_scope`
   (default false) declares that the text references the scope block's
   correlation keys; the harness drops `needs_scope` directives whenever no
@@ -261,7 +258,7 @@ session-intrinsic restore — review finding 5):
 - Flag absent ⇒ persona/pins and the **non-`needs_scope`** directives restore
   from session side-state (the bare-`--resume` standalone case). **`scope` is
   NEVER restored**: task_id is per-dispatch correlation data (a stale
-  `scope.task` would mis-route bbox_note/bro_report keys, which the contract
+  `scope.task` would mis-route bbox_note keys, which the contract
   directive tells the model to copy verbatim). With no current scope,
   `needs_scope` directives are dropped for the same reason — they instruct
   the model to copy keys from a block that wouldn't render. The persisted
@@ -483,7 +480,7 @@ most a few scope-delta lines (codex-shaped) or nothing extra at all
 - Live probes (gates, not smoke): (a) the gap's own reproduction —
   vibebh/mistral one-line task through the new path, assert the model acts on
   the task; (b) per-turn-cadence check — a GLM or DeepSeek multi-turn run
-  confirming bro_report milestones still fire at depth with milestone riding
+  confirming per-turn directives still bind at depth while riding
   the volatile tail (the empirical claim §4 carries), AND a vibebh after-tool
   sequence confirming per-turn directives folded into the leading block still
   bind on the turns that follow tool output (§5 chat fold caveat); (c) brodex

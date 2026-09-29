@@ -211,8 +211,8 @@ is operational work, not architecture work.
   the worker's filesystem) — considered and rejected. If the worker-side
   code-mode cell is the execution locus for all working-set analysis and
   mutation, the daemon never reaches into the workspace: it orchestrates by
-  dispatching briefs and receiving artifacts (EditSets, validation results,
-  `bro_report`s). No second contract direction, no file-RPC plane.
+  dispatching briefs and receiving artifacts (EditSets, validation results).
+  No second contract direction, no file-RPC plane.
 - The `cwd` cross-worktree heuristic — subsumed by workspace identity.
 - Per-call registry containment checks on working-set ops — the mount bounds
   the workspace.

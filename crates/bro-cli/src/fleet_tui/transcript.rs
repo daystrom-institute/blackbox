@@ -151,9 +151,7 @@ pub(super) fn render_item(
             if is_report_tool(name) && !display.show_reports {
                 return Vec::new();
             }
-            if let Some(report_lines) = render_report_tool_call(name, args, width) {
-                lines.extend(report_lines);
-            } else if let Some(edit_lines) = render_file_edit_call(name, args, width) {
+            if let Some(edit_lines) = render_file_edit_call(name, args, width) {
                 lines.extend(edit_lines);
             } else if let Some(source_lines) = render_source_tool_call(name, args, width) {
                 lines.extend(source_lines);
@@ -306,8 +304,7 @@ fn line_plain_text(line: &Line<'_>) -> String {
 fn item_is_compact_tool_call(item: &TranscriptItem, width: usize) -> bool {
     match item {
         TranscriptItem::ToolCall { name, args } if !is_internal_tool(name) => {
-            render_report_tool_call(name, args, width).is_some()
-                || render_file_edit_call(name, args, width).is_some()
+            render_file_edit_call(name, args, width).is_some()
                 || render_source_tool_call(name, args, width).is_some()
                 || compact_tool_call_text(name, args).is_some()
         }
@@ -549,26 +546,6 @@ pub(super) fn render_file_edit_call(
     Some(out)
 }
 
-pub(super) fn render_report_tool_call(
-    name: &str,
-    args: &str,
-    width: usize,
-) -> Option<Vec<Line<'static>>> {
-    if !is_report_tool(name) {
-        return None;
-    }
-    let message = extract_tool_string_arg(args, &["message", "body", "text"])?;
-    let compact = quote_flat_string(&message);
-    let max_width = width.saturating_sub(1).min(140).max(12);
-    let prefix = format!("{TOOL_CALL_GLYPH} report(");
-    let suffix = ")";
-    let available = max_width
-        .saturating_sub(prefix.chars().count() + suffix.chars().count())
-        .max(1);
-    let rendered = format!("{prefix}{}{suffix}", truncate(&compact, available));
-    Some(vec![Line::from(Span::styled(rendered, tool_call_style()))])
-}
-
 pub(super) fn render_source_tool_call(
     name: &str,
     args: &str,
@@ -693,7 +670,7 @@ fn is_exec_source_tool(name: &str) -> bool {
 }
 
 fn is_report_tool(name: &str) -> bool {
-    matches!(tool_name_leaf(name).as_str(), "bro_report" | "report")
+    tool_name_leaf(name) == "report"
 }
 
 fn tool_name_leaf(name: &str) -> String {

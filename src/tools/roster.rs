@@ -8,9 +8,7 @@ use crate::orchestration::brofile::store_identity;
 use crate::orchestration::providers::Provider;
 use crate::server::progress::extra_filters_from_params;
 use crate::server::state::BlackboxServer;
-use crate::tools::bro_params::{
-    BrofileParams, DashboardParams, ProvidersParams, ReportParams, TeamParams,
-};
+use crate::tools::bro_params::{BrofileParams, DashboardParams, ProvidersParams, TeamParams};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -65,7 +63,7 @@ impl AgentDashboardMetrics {
 impl BlackboxServer {
     #[tool(
         name = "bro_dashboard",
-        description = "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status."
+        description = "Page recent task summaries for lookup; do not take over another operator's task."
     )]
     pub(crate) fn bro_dashboard(
         &self,
@@ -237,9 +235,6 @@ impl BlackboxServer {
                 if let Some(ref label) = s.agent_label {
                     entry["agentLabel"] = Value::String(label.clone());
                 }
-                if let Some(ref report) = s.report_full {
-                    entry["report"] = bro_report_v1_to_dashboard_json(report);
-                }
                 if s.interrupted {
                     entry["interrupted"] = Value::Bool(true);
                 }
@@ -257,62 +252,6 @@ impl BlackboxServer {
             response["next_offset"] = json!(next_offset);
         }
         Self::ok_json(&response)
-    }
-
-    #[tool(
-        name = "bro_report",
-        description = "Attach the latest progress report to a task."
-    )]
-    pub(crate) fn bro_report(&self, Parameters(p): Parameters<ReportParams>) -> CallToolResult {
-        let message = p.message.trim();
-        if message.is_empty() {
-            return Self::err_text("message is required");
-        }
-
-        let task = match self.state.task_store.read().get(&p.task_id) {
-            Some(task) => task,
-            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
-        };
-
-        let report = orch::BroReport {
-            message: message.to_string(),
-            needs: p.needs.and_then(|needs| {
-                let trimmed = needs.trim().to_string();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            }),
-            data: p.data,
-            reported_at: orch::now_ms(),
-        };
-
-        if serde_json::to_vec(&report.to_json()).map_or(true, |bytes| bytes.len() > 32 * 1024) {
-            return Self::err_text(
-                "Report exceeds 32 KiB; send a concise milestone or smaller structured data. The previous report is unchanged",
-            );
-        }
-        let value = report.to_json();
-        let projected = if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 2048) {
-            value
-        } else {
-            json!({"message":super::agents::preview_text(&report.message,256),
-            "has_needs":report.needs.is_some(),"has_data":report.data.is_some(),"reportedAt":report.reported_at,
-            "detail_hint":"bro_status(task_id, detail=report) pages the exact stored report"})
-        };
-        let response = Self::ok_json(
-            &json!({"taskId":p.task_id,"report":projected,"persistence":"requested"}),
-        );
-        if response.is_error == Some(true) {
-            return response;
-        }
-        {
-            let mut inner = task.inner.lock();
-            inner.report = Some(report);
-        }
-        crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
-        response
     }
 
     #[tool(
@@ -1433,17 +1372,6 @@ fn label_from_summary(s: &bro_protocol::RosterSummaryV1) -> Option<String> {
     s.label.clone()
 }
 
-/// Dashboard reports are previews; full stable JSON pages are available via
-/// bro_status(detail=report), so arbitrary report.data never grows the list.
-fn bro_report_v1_to_dashboard_json(report: &bro_protocol::BroReportV1) -> Value {
-    orch::task_report_summary(
-        &report.message,
-        report.needs.as_deref(),
-        report.data.is_some(),
-        report.reported_at,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,7 +1379,7 @@ mod tests {
 
     use crate::artifacts;
     use crate::server::state::SharedState;
-    use crate::tools::bro_params::{AgentDispatchParams, StatusParams};
+    use crate::tools::bro_params::AgentDispatchParams;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
@@ -1930,59 +1858,6 @@ mod tests {
                 .to_string()
                 .contains("broken")
         );
-    }
-
-    #[test]
-    fn report_admission_bounds_receipts_and_preserves_previous_on_refusal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let task = orch::test_task(
-            "synthetic-report",
-            orch::TaskStatus::Running,
-            Provider::Brodex,
-        );
-        server
-            .state
-            .task_store
-            .write()
-            .insert("synthetic-report".into(), task.clone())
-            .unwrap();
-        let message = "界\"".repeat(2000);
-        let result = server.bro_report(Parameters(ReportParams {
-            task_id: "synthetic-report".into(),
-            message: message.clone(),
-            needs: None,
-            data: None,
-        }));
-        assert_ne!(result.is_error, Some(true));
-        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
-        let mut recovered = String::new();
-        let mut cursor = None;
-        loop {
-            let page = server.bro_status(Parameters(
-                serde_json::from_value(json!({
-                    "task_id":"synthetic-report","detail":"report","cursor":cursor
-                }))
-                .unwrap(),
-            ));
-            assert_ne!(page.is_error, Some(true));
-            let value: Value = serde_json::from_str(&extract_text(&page)).unwrap();
-            recovered.push_str(value["body"]["text"].as_str().unwrap());
-            cursor = value["body"]["next_cursor"].as_str().map(str::to_owned);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        let value: Value = serde_json::from_str(&recovered).unwrap();
-        assert_eq!(value["message"], message);
-        let result = server.bro_report(Parameters(ReportParams {
-            task_id: "synthetic-report".into(),
-            message: "x".repeat(40_000),
-            needs: None,
-            data: None,
-        }));
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(task.inner.lock().report.as_ref().unwrap().message, message);
     }
 
     #[tokio::test]
@@ -2583,8 +2458,8 @@ mod tests {
     mod dashboard_view {
         use super::*;
         use bro_core::{Origin, SessionId, TaskId};
+        use bro_protocol::RosterSummaryV1;
         use bro_protocol::TaskStatus as WireTaskStatus;
-        use bro_protocol::{BroReportV1, RosterSummaryV1};
 
         fn live_summary(id: &str, provider: Provider, started_at: u64) -> RosterSummaryV1 {
             RosterSummaryV1 {
@@ -2600,20 +2475,12 @@ mod tests {
                 has_last_message: None,
                 last_message_snippet: Some("hello".to_string()),
                 model: Some("glm-pro".to_string()),
-                report: Some("teaser".to_string()),
                 last_event_at: Some(started_at),
                 origin: Origin::Cockpit,
                 managed_worktree: Some("/wt/alpha".to_string()),
                 workflow_owned: false,
                 started_at: Some(started_at),
                 agent_label: Some(format!("agent-{id}@v1")),
-                report_full: Some(BroReportV1 {
-                    message: "writing focused tests".to_string(),
-                    needs: Some("review API naming".to_string()),
-                    data: None,
-                    reported_at: started_at,
-                    reported_ago: "0s".to_string(),
-                }),
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -2640,14 +2507,12 @@ mod tests {
                 has_last_message: None,
                 last_message_snippet: None,
                 model: None,
-                report: None,
                 last_event_at: Some(completed_at),
                 origin: Origin::AgentDispatch,
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: Some(started_at),
                 agent_label: Some(format!("agent-{id}@v1")),
-                report_full: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -2714,8 +2579,6 @@ mod tests {
             );
             assert_eq!(live["broLabel"], "team::executor");
             assert_eq!(live["agentLabel"], "agent-live-1@v1");
-            assert_eq!(live["report"]["message"], "writing focused tests");
-            assert_eq!(live["report"]["needs"], "review API naming");
             // `elapsed` is a live display; just check it parses as
             // "<n>s" or "<n>m <n>s" — anything else is a regression
             // in `format_elapsed` rather than the dashboard.
@@ -2738,8 +2601,6 @@ mod tests {
             assert_eq!(term["broLabel"], "team::reviewer");
             assert_eq!(term["agentLabel"], "agent-term-1@v1");
             assert_eq!(term["elapsed"], "1s");
-            // Terminal task has no report in the seed.
-            assert!(term.get("report").is_none() || term["report"].is_null());
 
             // Agents rollup: only the tasks that carry an
             // `agent_label` show up in the agents map. Each seeded
@@ -2791,14 +2652,12 @@ mod tests {
         }
 
         #[test]
-        fn dashboard_pagination_bounds_agent_rollup_and_report_payload() {
+        fn dashboard_pagination_bounds_agent_rollup() {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
             for idx in 0..4 {
                 let id = format!("task-{idx}");
-                let mut summary = live_summary(&id, Provider::Glm, 1000 + idx);
-                summary.report_full.as_mut().unwrap().data =
-                    Some(json!({"trace": "x".repeat(40000)}));
+                let summary = live_summary(&id, Provider::Glm, 1000 + idx);
                 server.state.roster_view.upsert(id, summary);
             }
             let read_page = |offset| {
@@ -2818,8 +2677,6 @@ mod tests {
             assert_eq!(second["tasks"][0]["taskId"], "task-2");
             assert_eq!(first["agents"].as_object().unwrap().len(), 1);
             assert_eq!(second["agents"].as_object().unwrap().len(), 1);
-            assert!(first["tasks"][0]["report"].get("data").is_none());
-            assert_eq!(first["tasks"][0]["report"]["detailsOmitted"], true);
             assert!(serde_json::to_vec(&first).unwrap().len() < 4096);
         }
 
@@ -3226,103 +3083,5 @@ mod tests {
         assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
         assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
         assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
-    }
-
-    // Real agent dispatch in-process (same opt-in rationale as above).
-    #[test]
-    #[ignore = "real agent dispatch; run with --ignored"]
-    fn bro_report_surfaces_latest_task_report() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let cat = &server.state.artifacts.read();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "report-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "report-agent",
-                "version": 1,
-                "manifest": {
-                    "description": "Agent for report test.",
-                    "brofile_inline": {"provider": "claude"},
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
-            agent: "report-agent".into(),
-            args: serde_json::Value::Null,
-            cwd: Some(tmp.path().to_str().unwrap().to_string()),
-            bro: None,
-            ambient: None,
-            caller_provider: None,
-            caller_session_id: None,
-            runtime: None,
-        })));
-        assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let task_id = body["task_id"].as_str().unwrap().to_string();
-
-        let report = server.bro_report(Parameters(ReportParams {
-            task_id: task_id.clone(),
-            message: "writing focused tests".into(),
-            needs: Some("review API naming".into()),
-            data: Some(serde_json::json!({"phase": "test"})),
-        }));
-        assert_ne!(report.is_error, Some(true));
-        let report_body: serde_json::Value = serde_json::from_str(&extract_text(&report)).unwrap();
-        assert_eq!(
-            report_body["report"]["message"].as_str(),
-            Some("writing focused tests")
-        );
-        assert_eq!(
-            report_body["report"]["needs"].as_str(),
-            Some("review API naming")
-        );
-        assert_eq!(
-            report_body["report"]["data"]["phase"].as_str(),
-            Some("test")
-        );
-        assert!(report_body["report"]["reportedAt"].as_u64().is_some());
-        assert!(report_body["report"]["reportedAgo"].as_str().is_some());
-
-        let dash = server.bro_dashboard(Parameters(DashboardParams {
-            offset: None,
-            limit: Some(20),
-            provider: None,
-            status: None,
-            team: None,
-        }));
-        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
-        let entry = dash_body["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["taskId"].as_str() == Some(task_id.as_str()))
-            .expect("task should appear in dashboard");
-        assert_eq!(
-            entry["report"]["message"].as_str(),
-            Some("writing focused tests")
-        );
-        assert_eq!(entry["report"]["needs"].as_str(), Some("review API naming"));
-
-        let status = server.bro_status(Parameters(StatusParams {
-            detail: None,
-            cursor: None,
-            limit: None,
-            debug: false,
-            task_id: task_id.clone(),
-            tail: None,
-        }));
-        let status_body: serde_json::Value = serde_json::from_str(&extract_text(&status)).unwrap();
-        assert_eq!(
-            status_body["report"]["message"].as_str(),
-            Some("writing focused tests")
-        );
     }
 }

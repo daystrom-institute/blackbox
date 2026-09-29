@@ -84,7 +84,7 @@ It should reuse existing bro execution machinery:
   synthesis function produces the process env from that tuple unchanged.
 - ambient prompt + completion contract handling.
 - MCP filter resolution and recursion guard.
-- task store, tail events, and `bro_report`.
+- task store and tail events.
 
 The drone selector is **not** a new dispatch path. It is a pre-dispatch decision:
 expand the pool into `(provider, account)` lanes, score them with fused

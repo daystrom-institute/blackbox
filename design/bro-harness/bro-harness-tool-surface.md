@@ -228,8 +228,7 @@ Both peers expose a plan surface and bro has none. Adopt the Codex/CC shape:
 todo_write { items: [{ content, status: pending | in_progress | completed }] }
 ```
 
-At most one `in_progress`. Cheap, improves multi-step coherence, and the daemon
-can surface it via `bro_report`/dashboards.
+At most one `in_progress`. Cheap, and improves multi-step coherence.
 
 **Durable, same mechanism as the clipboard** (operator-confirmed 2026-05-29): the
 todo list is a loop-level side-cell persisted in the `SessionStore` file

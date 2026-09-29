@@ -174,7 +174,6 @@ Work:
   - mechanical supervision full snapshot
   - bounded recent provider events
   - bounded task notes
-  - latest `bro_report`
   - bounded assistant tail
   - elapsed time and attempt metadata
 - Enforce read-only authorization by supervision run lineage.

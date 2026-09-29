@@ -53,7 +53,7 @@ Each becomes an atomic, tier-tagged clause during mining. Placeholders now:
 - **`pause_turn` / resume** — pause_turn detection and turn continuation (Anthropic;
   cf. commit `efc82bf`). `[vendor]`
 - **Recursion guard** — mechanical guard on recursive `bro_*` orchestration tools
-  for dispatch-capable providers; `bro_report` exempt; `allow_recursion` bypass. `[derived]`
+  for dispatch-capable providers; `allow_recursion` bypass. `[derived]`
 
 ## Conformance (to be wired)
 

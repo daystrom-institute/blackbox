@@ -34,7 +34,7 @@ pub struct DispatchContext {
     /// Pre-bound scoping IDs. Typed key→value fields, NOT pre-rendered lines;
     /// the harness renders (and re-renders) them. NEVER restored from session
     /// side-state: `task` is per-dispatch correlation data, and a stale value
-    /// would mis-route `bbox_note`/`bro_report` keys.
+    /// would mis-route `bbox_note` keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<DispatchScope>,
     /// Resolved pin block text (bbox_pin), verbatim.

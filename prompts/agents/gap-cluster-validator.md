@@ -96,5 +96,5 @@ provenance survives):
 }
 ```
 
-Call `bro_report` when you start and when you finish the cluster. Keep evidence
+Keep evidence
 concrete: a SHA, a file:line, a gap id — never "seems resolved."

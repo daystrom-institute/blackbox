@@ -5,7 +5,6 @@
 
 use bro_core::{BroError, Origin, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 mod dispatch;
 mod dispatch_context;
@@ -108,7 +107,6 @@ pub struct TaskSnapshot {
 /// - `model` is the resolved dispatch model persisted on `TaskInner`, with
 ///   event-buffer scraping retained only as a load-time fallback for legacy
 ///   tasks that predate the dispatch-time cache.
-/// - `report` is a bounded teaser of the latest `bro_report` message.
 /// - `last_event_at` is **not** a stored field — the daemon has no
 ///   per-event arrival stamp on V1. The handler derives it from
 ///   `max(started_at, completed_at)` (the only wall-clock fields on
@@ -133,8 +131,6 @@ pub struct RosterSummaryV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_last_message: Option<bool>,
     pub model: Option<String>,
-    #[serde(default)]
-    pub report: Option<String>,
     pub last_event_at: Option<u64>,
     /// Source of the dispatch (Slice 1b). Lets the fleet roster tab Fleet
     /// vs Dispatched vs Workflow vs Atom without re-deriving from labels.
@@ -163,13 +159,6 @@ pub struct RosterSummaryV1 {
     /// a per-task inner lock.
     #[serde(default)]
     pub agent_label: Option<String>,
-    /// Full structured `bro_report` (wave 7c). `report` is a bounded
-    /// 80-char teaser for the fleet row UI; consumers that need the
-    /// full object (`message` / `needs` / `data` / `reportedAt` /
-    /// `reportedAgo`) read it from this field. Additive+optional —
-    /// omitted for tasks that never called `bro_report`.
-    #[serde(default)]
-    pub report_full: Option<BroReportV1>,
     /// True when the latest terminal result was interrupted by operator
     /// control. Additive marker layered on top of `status=cancelled`.
     #[serde(default)]
@@ -285,26 +274,6 @@ impl ContextPressure {
     }
 }
 
-/// Structured form of a `bro_report` payload, projected into the
-/// roster summary so dashboard consumers can render the full report
-/// object without re-locking the per-task inner mutex (wave 7c).
-///
-/// The field names match `orchestration::BroReport::to_json()`:
-/// `message`, `needs` (when set), `data` (when set), `reportedAt`,
-/// `reportedAgo`. `reportedAgo` is computed at projection time
-/// against the daemon's wall clock, identical to the
-/// `BroReport::to_json()` contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BroReportV1 {
-    pub message: String,
-    #[serde(default)]
-    pub needs: Option<String>,
-    #[serde(default)]
-    pub data: Option<Value>,
-    pub reported_at: u64,
-    pub reported_ago: String,
-}
-
 /// Wire envelope for the `GET /control/roster` snapshot. The
 /// monotonic `version` field is the daemon roster generation. A client
 /// fetches this snapshot, then consumes `RosterDelta` events with
@@ -391,13 +360,11 @@ mod tests {
             has_last_message: None,
             last_message_snippet: Some("Looking at the file…".to_string()),
             model: Some("claude-opus-4-6".to_string()),
-            report: Some("Reading roster state".to_string()),
             last_event_at: Some(1_700_000_000_000),
             origin: Origin::AgentDispatch,
             workflow_owned: false,
             started_at: Some(1_700_000_000_000),
             agent_label: Some("team-x::member-y".to_string()),
-            report_full: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -420,13 +387,11 @@ mod tests {
             "session_id",
             "last_message_snippet",
             "model",
-            "report",
             "last_event_at",
             "origin",
             "workflow_owned",
             "started_at",
             "agent_label",
-            "report_full",
             "interrupted",
         ] {
             assert!(

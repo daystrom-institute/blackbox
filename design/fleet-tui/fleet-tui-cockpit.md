@@ -171,11 +171,6 @@ summary, §5). It is a harness builtin (registered in `registry.rs` beside
 mode** (Pinned tier, `PinPolicy`/`BRO_HARNESS_PIN_TOOLS`, anthropic-harness.md) so
 the agent reaches for it.
 
-It is **not** the daemon's `bro_report` (`tools/roster.rs:170`), which serves
-`bro_exec`/atom/workflow bros and is `?surface=`-gated off fleet agents
-(`server/surface.rs`). No shared field, no convergence — fleet agents are not
-bros.
-
 ### 2.3 Bounded tool results (cap + spill)
 
 A harness constraint the fleet's verbose transcript (§5.4) surfaces — a general
@@ -452,7 +447,7 @@ Substrate:
    (Claude/GLM/DeepSeek/Brodex); `build_exec_args` deliberately omits the flag
    (guarded by a unit test) so it isn't doubled.
 3. **Builtin `report` tool, fleet-pinned** (§2.2) — Waiting/summary signal on the
-   stream; `registry.rs` builtin; not `bro_report`. ✅ **Implemented** —
+   stream; `registry.rs` builtin. ✅ **Implemented** —
    `report.rs` (`ReportTool` holds its own `Emitter`, emits a `report` line);
    registered always, pinned in fleet mode via `PinPolicy::also_pin`.
 4. **Compaction machinery in bro-harness** (§2.4) — summarize older turns →

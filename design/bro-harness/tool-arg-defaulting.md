@@ -202,8 +202,7 @@ and live. The approved expansion, emitted from the same
   identical to the `pin:*.project_dir` value, since defaults fill before pins
   check and any other value would pin-conflict every elided call. Mutating
   refactor tools are deliberately not defaulted.
-- **Coordination-id defaults** — `default:mcp.bro_report.task_id` fills the
-  ambient task id (eliding it was previously a hard schema error).
+- **Coordination ids are not defaulted.**
   `bbox_thread` ids are deliberately **skipped**: the table is per-(tool,param),
   not per-action; `resolve_thread_id` prefers `id` over `name`, so a filled
   `id` would shadow name-based continue/resolve and convert missing-id errors

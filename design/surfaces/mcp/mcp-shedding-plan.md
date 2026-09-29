@@ -85,7 +85,7 @@ disposition below: each becomes one config edit.
 | Retrieval | `bbox_hybrid_search`, `bbox_context`, `bbox_messages`, `bbox_session`, `bbox_sessions_list`, `bbox_inspect_entity` | `bbox_stats` | Fold `bbox_search` into `bbox_hybrid_search`. Delete `bbox_cite`, `bbox_topics`, `bbox_discover_seed_entities`, `bbox_ref_size`. Delete `bbox_corpus_search` and repoint the harness `corpus_search` alias at `bbox_hybrid_search`. | `bbox_find_paths`, `bbox_bundle_evidence`, `bbox_describe_schema`, `bbox_tool_calls` |
 | Knowledge | `bbox_knowledge`, `bbox_learn`, `bbox_forget`, `bbox_render` | | Fold `bbox_remember` into `bbox_learn` (`render=false`). Delete `bbox_decide`, `bbox_knowledge_link`, `bbox_lint`, `bbox_review`, `bbox_absorb`, `bbox_bootstrap`. | |
 | Work tracking | `bbox_thread`, `bbox_thread_list`, `bbox_gap`, `bbox_gaps`, `bbox_gap_update`, `bbox_gap_resolve` | | Delete `bbox_inbox`, `bbox_pin` | `bbox_note`, `bbox_notes`, `bbox_note_resolve` |
-| Dispatch | `bro_exec`, `bro_resume`, `bro_status`, `bro_wait`, `bro_when_all`, `bro_when_any`, `bro_steer`, `bro_cancel`, `bro_dashboard`, `bro_providers`, `bro_brofile` | `bro_prune`, `bro_allocator_status`, `bro_allocator_trace`, `bro_allocator_probe`, `bro_mcp` | Delete `bro_retro`, `bro_broadcast`, `bro_interrupt`, `bro_agent_list`, `bro_agent_get`, `bro_agent_describe`, `bro_agent_search`, `bro_agent_dispatch` | `bro_team`, `bro_report` |
+| Dispatch | `bro_exec`, `bro_resume`, `bro_status`, `bro_wait`, `bro_when_all`, `bro_when_any`, `bro_steer`, `bro_cancel`, `bro_dashboard`, `bro_providers`, `bro_brofile` | `bro_prune`, `bro_allocator_status`, `bro_allocator_trace`, `bro_allocator_probe`, `bro_mcp` | Delete `bro_retro`, `bro_broadcast`, `bro_interrupt`, `bro_report`, `bro_agent_list`, `bro_agent_get`, `bro_agent_describe`, `bro_agent_search`, `bro_agent_dispatch` | `bro_team` |
 | Projects | `bbox_project_list` | `bbox_project_register`, `_init`, `_rename`, `_unregister`, `_eject`, `_catalog_list`, `_catalog_get`, `_attach`, `_detach`, `_default_attachment`, `_promote`, `_publisher_bind`, `_publisher_advance`, `_publisher_status`, `bbox_project_graph_list`, `_describe`, `_validate` | Delete `bbox_project_scope_migrate` (Stage 6) | |
 | Index and storage | | `bbox_reindex`, `bbox_reembed`, `bbox_embed_status`, `bbox_embed_partitions`, `bbox_storage_gc`, `bbox_storage_health`, `bbox_edge_compact`, `bbox_doctor` | Delete `bbox_storage_migrate_legacy_edges` (Stage 6) | |
 | Artifacts | | `bbox_artifact_install`, `_list`, `_remove`, `_supersede` | | Re-check once packets are gone |
@@ -93,7 +93,7 @@ disposition below: each becomes one config edit.
 | Provenance | | | Delete `bbox_blame`, `bbox_provenance_export`, `_export_plan`, `_import` (Stage 5) | |
 | Surfaces | | | Delete `bbox_mcp_surface` (Stage 1) | |
 
-End state: 28 agent-facing tools, 35 ops-only, 36 deleted or folded, 9 open.
+End state: 28 agent-facing tools, 35 ops-only, 37 deleted or folded, 8 open.
 
 Per-tool notes:
 
@@ -116,9 +116,17 @@ Per-tool notes:
   matches registration being a checkout-host operation. `doctor.rs` and
   error remediation strings that name ops-only tools switch to the CLI form
   the same way.
-- `bro_report`: the global orchestration rule that recommends catching
-  `bro_report` milestones changes with it; that text change needs operator
-  approval.
+- `bro_report`: dispatched work is followed through `bro_status`,
+  `bro_wait` and `bro_dashboard`. Its task report store, the roster
+  `report` fields, `bro_status detail=report` and the dispatch milestone
+  directive go with it.
+
+Dispatch context: the `recall`, `task_shape` and `orchestrator` directives
+and the per-turn directive cadence (protocol variant, harness volatile-lane
+injection) are removed. The completion contract is the only directive; it
+moves with the notes decision, and the directive plumbing (cadence,
+`needs_scope`, standing-slot routing) goes once it has a home. The dispatch
+context then carries persona and the `<bbox_scope>` block.
 
 Every deletion also scrubs the tool from the generated tool reference
 (`bbox-tool-docs`), system memories, prompts, docs, surface config, brofile
@@ -238,7 +246,7 @@ search on the path.
 - **Knowledge publishing machinery.** Provisional and published overlays
   and the knowledge-source crates publish project entries that already live
   in git. Revisit once Stage 4 has slimmed the model.
-- **`bbox_tool_calls`, `bro_team`, `bro_report`.** Low use; keep or delete.
+- **`bbox_tool_calls`, `bro_team`.** Low use; keep or delete.
 
 ## Sequencing
 

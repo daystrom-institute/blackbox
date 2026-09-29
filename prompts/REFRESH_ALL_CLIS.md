@@ -60,7 +60,6 @@ tweak `MINE_CLI.md`, every future refresh inherits it.
 - `pin_model`, `pin_effort: high`.
 - **Split a large CLI into 2–3 bros** by axis cluster (wire+loop / tool surfaces /
   governance) to keep each bounded; one bro per small subject is fine.
-- Tell bros to `bro_report` at start and ~50%.
 - Record every `taskId`.
 
 ## Step 4 — fan in

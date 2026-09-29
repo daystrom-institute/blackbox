@@ -275,39 +275,22 @@ pub(crate) struct StatusParams {
     #[serde(default)]
     pub(crate) tail: Option<usize>,
     /// summary (default) returns state, activity and blockers without replaying
-    /// the deliverable. result, report, and structured_exit return an exact
-    /// body page. report/structured_exit pages are JSON text: concatenate
-    /// body.text pages before parsing JSON.
+    /// the deliverable. result and structured_exit return an exact body page.
+    /// structured_exit pages are JSON text: concatenate body.text pages before
+    /// parsing JSON.
     #[serde(default)]
     pub(crate) detail: Option<String>,
-    /// Opaque next_cursor from the preceding result/report body page. A changed
+    /// Opaque next_cursor from the preceding body page. A changed
     /// body rejects the cursor so pages from different revisions cannot mix.
     #[serde(default)]
     pub(crate) cursor: Option<String>,
-    /// Maximum bytes per result/report page: default/max 4096, minimum 4.
+    /// Maximum bytes per body page: default/max 4096, minimum 4.
     #[serde(default)]
     pub(crate) limit: Option<usize>,
     /// Include accounting and execution-owner transcript coordinates. Default
     /// false. These coordinates are not caller-local filesystem paths.
     #[serde(default)]
     pub(crate) debug: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReportParams {
-    /// Task ID to attach the report to.
-    pub(crate) task_id: String,
-    /// Short human-readable progress report.
-    pub(crate) message: String,
-    /// Optional blocker, handoff need, or requested input.
-    #[serde(default)]
-    pub(crate) needs: Option<String>,
-    /// Optional structured progress data. The complete admitted report is at
-    /// most 32 KiB; larger reports refuse without replacing the previous report.
-    /// Large accepted reports recover through bro_status(detail=report).
-    #[serde(default)]
-    pub(crate) data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

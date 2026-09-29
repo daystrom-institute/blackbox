@@ -302,9 +302,7 @@ signal channel, not a progress log:
   Aggregate across sessions → per-rule adopt / feedback / silent rates, run on
   demand via the retrieval surface (`bbox_search` / `bbox_messages` / the graph).
   This is what makes the operator's hypothesis falsifiable and A/B-able, with
-  **zero** duplicated telemetry in the harness. (An earlier draft proposed an
-  in-harness `(fired, adopted)` counter + `bro_report`; that was a redundant,
-  inferior re-implementation of the corpus and was removed.)
+  **zero** duplicated telemetry in the harness.
 - **Adopt-or-explain — the decline path is a gap note.** Every delivered nudge
   carries a shared directive: if the agent declines the steer *because the tool
   is deficient* (buggy, missing a capability, wrong-shaped), it should not

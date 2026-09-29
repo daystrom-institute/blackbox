@@ -291,7 +291,7 @@ Every neuralyze logs `{source: self|advised, to, depth, message, keep_files}` an
 — the load-bearing metric — **whether the post-rewind timeline succeeded where
 the prior one failed.** A rewind that does not change the outcome is burning
 budget, and it shows in the data. Same falsifiable-on-evidence discipline as the
-hooks-doc Nudger adoption log. Surfaceable via `bro_report`.
+hooks-doc Nudger adoption log.
 
 ## Scope: context vs files
 

@@ -5045,7 +5045,7 @@ mod tests {
                 events.push(json!({"type":"content_block_delta","index":23,
                     "delta":{"type":"input_json_delta","partial_json":"{\""}}));
                 let mislabeled = json!({"type":"server_tool_use","id":"duplicate-id",
-                    "name":"web_search_prime","input":{"query":"select:mcp__blackbox__bro_report"}});
+                    "name":"web_search_prime","input":{"query":"select:mcp__blackbox__bro_status"}});
                 events.push(
                     json!({"type":"content_block_start","index":24,"content_block":mislabeled}),
                 );

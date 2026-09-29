@@ -91,8 +91,7 @@ routing facts:
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive
-`bro_*` orchestration/control tools. `bro_report` remains allowed because it is
-telemetry. `allow_recursion=true` is the explicit bypass.
+`bro_*` orchestration/control tools. `allow_recursion=true` is the explicit bypass.
 
 Provider MCP registration is no longer implicitly rewritten on daemon startup.
 `configure_dispatch_mcp_env` exports `BLACKBOX_MCP_URL` and

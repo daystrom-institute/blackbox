@@ -226,8 +226,7 @@ Discover is also where surface denial becomes visible early.
 
 The orchestration `TaskStore` is already the backend the extension models:
 durable IDs, terminal/non-terminal statuses, cooperative cancellation
-(SIGTERM is "acknowledged, not obligated"), TTL-shaped retention, status
-messages via `bro_report`.
+(SIGTERM is "acknowledged, not obligated"), and TTL-shaped retention.
 
 Mapping:
 
@@ -236,7 +235,6 @@ Mapping:
 | `CreateTaskResult` from `tools/call` | `bro_exec` / `bro_resume` (returns handle instead of blocking) |
 | `tasks/get` | `bro_status` |
 | `tasks/cancel` | `bro_cancel` (cooperative both ways) |
-| task `statusMessage` | `bro_report` |
 | `tasks/update` | does NOT map to `bro_steer` (update answers outstanding inputRequests; steer is unsolicited mid-turn input) |
 
 Dual-shape rule: `bro_exec`/`bro_resume` return pure

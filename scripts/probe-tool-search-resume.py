@@ -18,7 +18,7 @@ import uuid
 
 
 RESUME_ERROR = "error.resume_tool_schema_missing"
-REPORT_TOOL = "mcp__blackbox__bro_report"
+STATUS_TOOL = "mcp__blackbox__bro_status"
 
 
 class Probe:
@@ -28,7 +28,7 @@ class Probe:
         self.requests = []
         self.results = []
         self.pending_activation = None
-        self.report_in_catalog = True
+        self.status_in_catalog = True
         self.binary = binary.resolve(strict=True)
 
     def save(self, name, value):
@@ -104,9 +104,9 @@ class Probe:
                               "capabilities": {"tools": {}},
                               "serverInfo": {"name": "synthetic", "version": "1"}}
                 elif method == "tools/list":
-                    result = {"tools": [{"name": "bro_report", "description": "Report synthetic progress.",
-                        "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}},
-                                        "required": ["message"]}}] if probe.report_in_catalog else []}
+                    result = {"tools": [{"name": "bro_status", "description": "Read synthetic task status.",
+                        "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}},
+                                        "required": ["task_id"]}}] if probe.status_in_catalog else []}
                 else:
                     self.reply(200, {"jsonrpc": "2.0", "id": ident,
                                      "error": {"code": -32601, "message": "Unexpected method"}})
@@ -209,16 +209,16 @@ class Probe:
             self.session_files(sid)[1].write_bytes(b"")
             self.run_process("explicit-empty-without-events", ["--resume", sid], 0, refused=True)
 
-            report_sid = str(uuid.uuid4())
-            self.pending_activation = REPORT_TOOL
-            self.run_process("report-initial", ["--session-id", report_sid], 2, expected_tool=REPORT_TOOL)
-            report_baseline = self.capture(report_sid)
-            self.restore(report_sid, report_baseline)
-            self.run_process("report-resume", ["--resume", report_sid], 1, expected_tool=REPORT_TOOL)
+            status_sid = str(uuid.uuid4())
+            self.pending_activation = STATUS_TOOL
+            self.run_process("status-initial", ["--session-id", status_sid], 2, expected_tool=STATUS_TOOL)
+            status_baseline = self.capture(status_sid)
+            self.restore(status_sid, status_baseline)
+            self.run_process("status-resume", ["--resume", status_sid], 1, expected_tool=STATUS_TOOL)
 
-            self.restore(report_sid, report_baseline)
-            self.report_in_catalog = False
-            self.run_process("removed-catalog-resume", ["--resume", report_sid], 0, refused=True)
+            self.restore(status_sid, status_baseline)
+            self.status_in_catalog = False
+            self.run_process("removed-catalog-resume", ["--resume", status_sid], 0, refused=True)
             status = "pass"
         finally:
             server.shutdown()

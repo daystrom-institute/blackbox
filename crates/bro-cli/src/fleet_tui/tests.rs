@@ -198,7 +198,7 @@ fn render_transcript_can_hide_tool_responses() {
 fn render_transcript_can_hide_report_entries() {
     let items = vec![
         TranscriptItem::ToolCall {
-            name: "mcp__blackbox__bro_report".into(),
+            name: "report".into(),
             args: serde_json::json!({"message": "status update"}).to_string(),
         },
         TranscriptItem::Report {
@@ -1339,39 +1339,6 @@ fn file_edit_tool_call_renders_diff_block() {
             "+ let y = 2;",
         ]
     );
-}
-
-#[test]
-fn bro_report_tool_call_renders_compactly_and_suppresses_success_result() {
-    let items = vec![
-        TranscriptItem::ToolCall {
-            name: "mcp__blackbox__bro_report".into(),
-            args: serde_json::json!({
-                "message": "Doing foo to the bar..",
-                "task_id": "task-123",
-            })
-            .to_string(),
-        },
-        TranscriptItem::ToolResult {
-            tool: Some("mcp__blackbox__bro_report".into()),
-            content: serde_json::json!({
-                "report": {
-                    "message": "Doing foo to the bar..",
-                    "reportedAgo": "0s",
-                    "reportedAt": 123,
-                },
-                "taskId": "task-123",
-            })
-            .to_string(),
-            is_error: false,
-            rider: None,
-        },
-    ];
-    let rendered: Vec<String> = render_transcript(&items, "", &[], 100)
-        .iter()
-        .map(line_text)
-        .collect();
-    assert_eq!(rendered, vec![r#"▸ report("Doing foo to the bar..")"#]);
 }
 
 #[test]

@@ -193,7 +193,7 @@ struct AgentView {
     cwd: Option<String>,
     report_message: Option<String>,
     /// Last assistant message teaser — used as a dimmed fallback in the
-    /// roster report column when the agent never called `bro_report`.
+    /// roster report column when the agent has not called `report`.
     last_assistant_message: Option<String>,
     started_at: u64,
     last_activity_ms: Option<u64>,

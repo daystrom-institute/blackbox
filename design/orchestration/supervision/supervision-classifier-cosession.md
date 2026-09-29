@@ -70,7 +70,7 @@ phase P3b of `design/orchestration/supervision/supervision-phased-implementation
 
 - Poll the attached primary invocation/task.
 - Include current mechanical supervision telemetry.
-- Include bounded recent events, reports, notes, and terminal output snippets.
+- Include bounded recent events, notes, and terminal output snippets.
 - Enforce tail size and redaction policy.
 - Sleep between polls.
 - Apply max-poll and max-elapsed budgets.
@@ -116,7 +116,6 @@ The classifier input should be a bounded envelope:
   "recent": {
     "events": [],
     "notes": [],
-    "report": null,
     "assistant_tail": "bounded text"
   }
 }
@@ -162,7 +161,7 @@ but need a few additional primitives for a clean classifier loop:
 - observation grant: classifier can read the attached invocation/task and notes
   but cannot mutate primary state.
 - tail policy: data-owned limits for recent event count, assistant text bytes,
-  notes, and reports.
+  and notes.
 
 These are reusable workflow/runtime primitives, not classifier-specific daemon
 sidecar code.

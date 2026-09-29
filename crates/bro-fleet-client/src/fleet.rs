@@ -128,7 +128,7 @@ pub struct FleetDisplayConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_responses: Option<bool>,
 
-    /// Show `report()`/`bro_report` transcript entries in transcript views.
+    /// Show `report()` transcript entries in transcript views.
     /// Roster report state remains visible; this controls transcript rows only.
     #[serde(default, rename = "showReports", alias = "show_reports")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -585,7 +585,6 @@ impl AgentHandle {
             session_id: format!("session-{id}"),
             events: Vec::new(),
             last_assistant_message: None,
-            report_message: None,
             cost_usd: Some(0.0),
             num_turns: Some(1),
             stderr: String::new(),
@@ -631,7 +630,6 @@ impl AgentHandle {
             session_id: session_id.to_string(),
             events: Vec::new(),
             last_assistant_message: None,
-            report_message: None,
             cost_usd: None,
             num_turns: None,
             stderr: String::new(),
@@ -756,11 +754,7 @@ impl AgentHandle {
             provider: inner.provider,
             session_id: inner.session_id.clone(),
             last_assistant_message: inner.last_assistant_message.clone(),
-            // Prefer a live harness `report` line when events are present; daemon
-            // roster rows provide the persisted BroReport teaser for thin views.
-            report_message: stream
-                .report_message
-                .or_else(|| inner.report_message.clone()),
+            report_message: stream.report_message,
             needs_input: stream.needs_input,
             turn_active: stream.turn_active,
             worktree_finished: stream.worktree_finished,
@@ -1580,7 +1574,6 @@ fn daemon_task(
             session_id,
             events: Vec::new(),
             last_assistant_message: None,
-            report_message: None,
             cost_usd: None,
             num_turns: None,
             stderr,
@@ -2673,14 +2666,12 @@ mod tests {
             has_last_message: None,
             last_message_snippet: Some("hello".to_string()),
             model: Some("gpt-test".to_string()),
-            report: Some("checking roster".to_string()),
             last_event_at: Some(42),
             origin: bro_core::Origin::Cockpit,
             managed_worktree: Some("/tmp/worktree".to_string()),
             workflow_owned: false,
             started_at: Some(42),
             agent_label: Some(format!("agent-{id}")),
-            report_full: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -2735,7 +2726,6 @@ mod tests {
 
         assert_eq!(snap.name.as_deref(), Some("Prompt teaser task-1"));
         assert_eq!(snap.model.as_deref(), Some("gpt-test"));
-        assert_eq!(snap.report_message.as_deref(), Some("checking roster"));
     }
 
     #[tokio::test]

@@ -318,8 +318,8 @@ task.cancelled
 These can be emitted from the same places that currently feed `/tail`, but
 the payload should be richer and durable. `/tail` can eventually become a
 projection over system events for task lifecycle. V1 should persist only
-milestone progress: task start, task completion/failure/cancel, explicit
-`bro_report`-style progress, and workflow node boundaries. Raw provider stream
+milestone progress: task start, task completion/failure/cancel, and workflow
+node boundaries. Raw provider stream
 chunks and token deltas stay out of the journal.
 
 ### Workflow Lifecycle

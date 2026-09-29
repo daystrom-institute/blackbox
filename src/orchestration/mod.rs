@@ -737,34 +737,6 @@ impl TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BroReport {
-    pub message: String,
-    #[serde(default)]
-    pub needs: Option<String>,
-    #[serde(default)]
-    pub data: Option<Value>,
-    #[serde(rename = "reportedAt")]
-    pub reported_at: u64,
-}
-
-impl BroReport {
-    pub fn to_json(&self) -> Value {
-        let mut obj = serde_json::json!({
-            "message": self.message,
-            "reportedAt": self.reported_at,
-            "reportedAgo": format_elapsed(self.reported_at, None),
-        });
-        if let Some(ref needs) = self.needs {
-            obj["needs"] = Value::String(needs.clone());
-        }
-        if let Some(ref data) = self.data {
-            obj["data"] = data.clone();
-        }
-        obj
-    }
-}
-
 /// Shared inner state of a task, updated by background readers.
 pub struct TaskInner {
     pub id: String,
@@ -826,9 +798,6 @@ pub struct TaskInner {
     /// overwrites bro_label for team routing. Surfaced in bro_status /
     /// bro_dashboard as agentLabel alongside broLabel.
     pub agent_label: Option<String>,
-    /// Latest agent-authored progress report, set through `bro_report`
-    /// and surfaced in `bro_status` / `bro_dashboard`.
-    pub report: Option<BroReport>,
     /// True when the latest terminal result event represented an operator
     /// interrupt rather than a natural finish. This is a cause marker layered on
     /// top of `status`: finalization maps it to `Cancelled`, and status/roster
@@ -1189,7 +1158,6 @@ mod roster_view_tests {
                 bro_label: Some(format!("bro-{id}")),
                 name: None,
                 agent_label: Some(format!("agent-{id}")),
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -1231,14 +1199,12 @@ mod roster_view_tests {
             has_last_message: None,
             last_message_snippet: None,
             model: None,
-            report: None,
             last_event_at: Some(42),
             origin: bro_core::Origin::Unknown,
             managed_worktree: None,
             workflow_owned: false,
             started_at: Some(42),
             agent_label: None,
-            report_full: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -1268,14 +1234,12 @@ mod roster_view_tests {
                 has_last_message: None,
                 last_message_snippet: None,
                 model: None,
-                report: None,
                 last_event_at: None,
                 origin: bro_core::Origin::Unknown,
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
                 agent_label: None,
-                report_full: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1394,14 +1358,12 @@ mod roster_view_tests {
                 has_last_message: None,
                 last_message_snippet: None,
                 model: None,
-                report: None,
                 last_event_at: None,
                 origin: bro_core::Origin::Unknown,
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
                 agent_label: None,
-                report_full: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1494,7 +1456,6 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .text()
             .map(|s| s.chars().take(200).collect::<String>()),
         model: inner.model.clone(),
-        report: inner.report.as_ref().and_then(roster_report_teaser),
         last_event_at: Some(last_event_at),
         origin: inner.origin,
         workflow_owned: inner.workflow_owned,
@@ -1509,11 +1470,6 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // `label`. Carry both so the dashboard's row projection
         // can stay off the per-task inner mutex.
         agent_label: inner.agent_label.clone(),
-        // Wave 7c: structured report object for the dashboard's
-        // `report` row. `report` (the teaser string) stays for the
-        // fleet row UI; `report_full` carries the full
-        // `BroReport::to_json()` shape for the dashboard.
-        report_full: inner.report.as_ref().map(bro_report_to_wire),
         interrupted: inner.interrupted,
         // Error teaser for failed/cancelled tasks: the last non-empty line
         // of stderr, trimmed and capped, so the fleet cockpit zoom view can
@@ -1572,24 +1528,6 @@ fn harness_transcript_location(
     })
 }
 
-/// Project an in-memory `BroReport` to the wire-shaped
-/// `BroReportV1` (wave 7c). The dashboard's `report` row uses
-/// `BroReport::to_json()` semantics (camelCase `reportedAt` /
-/// `reportedAgo`); the wire DTO is snake_case to match the
-/// rest of `RosterSummaryV1` and to round-trip cleanly through
-/// serde defaults. `reportedAgo` is computed at projection time
-/// from the current wall clock — the dashboard is for live
-/// display, not for replay.
-fn bro_report_to_wire(report: &BroReport) -> bro_protocol::BroReportV1 {
-    bro_protocol::BroReportV1 {
-        message: report.message.clone(),
-        needs: report.needs.clone(),
-        data: report.data.clone(),
-        reported_at: report.reported_at,
-        reported_ago: format_elapsed(report.reported_at, None),
-    }
-}
-
 fn model_from_event(event: &serde_json::Value) -> Option<String> {
     event
         .get("model")
@@ -1607,7 +1545,6 @@ fn model_from_events_at_load(events: &[serde_json::Value]) -> Option<String> {
 }
 
 const DEFAULT_TASK_NAME_CHARS: usize = 60;
-const ROSTER_REPORT_TEASER_CHARS: usize = 80;
 
 fn update_model_cache_from_event(inner: &mut TaskInner, event: &serde_json::Value) {
     if inner.model.is_none() {
@@ -1626,10 +1563,6 @@ fn compact_teaser(raw: &str, max_chars: usize) -> Option<String> {
 
 pub(crate) fn default_task_name_from_prompt(prompt: &str) -> Option<String> {
     compact_teaser(prompt, DEFAULT_TASK_NAME_CHARS)
-}
-
-fn roster_report_teaser(report: &BroReport) -> Option<String> {
-    compact_teaser(&report.message, ROSTER_REPORT_TEASER_CHARS)
 }
 
 pub(crate) fn seed_task_roster_fields(
@@ -1692,7 +1625,6 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             bro_label: None,
             name: None,
             agent_label: None,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -1882,8 +1814,6 @@ struct PersistedTask {
     #[serde(default)]
     agent_label: Option<String>,
     #[serde(default)]
-    report: Option<BroReport>,
-    #[serde(default)]
     interrupted: bool,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
@@ -2023,7 +1953,6 @@ impl TaskStore {
                     bro_label: inner.bro_label.clone(),
                     name: inner.name.clone(),
                     agent_label: inner.agent_label.clone(),
-                    report: inner.report.clone(),
                     interrupted: inner.interrupted,
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
@@ -2211,7 +2140,6 @@ impl TaskStore {
                     bro_label: rec.bro_label,
                     name: rec.name,
                     agent_label: rec.agent_label,
-                    report: rec.report,
                     interrupted: rec.interrupted,
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
@@ -2360,21 +2288,6 @@ project path, not prose, not \"pending\">\n\
   project=<`project` from the `bbox_scope` block, if present>\n\
   bro=<`bro` from the `bbox_scope` block, if present>\n\
   session_id=<`session` from the `bbox_scope` block, if present>";
-
-/// Milestone-reporting directive for every dispatch. Empirically,
-/// only brodex agents called `bro_report` mid-run across 12+ fleet
-/// cockpit dispatches — GLM/DeepSeek/MiniMax rows stayed blank the
-/// entire run, leaving the cockpit blind. The reporting instruction in
-/// the rendered AGENTS.md is session-start-only and can decay at depth on
-/// weaker models, but per-turn injection is too noisy on Codex/Brodex because
-/// it appears after ordinary tool calls. Positioned late (after the completion
-/// contract, before workspace-tools) per repo convention so it stays in
-/// attention without repeating every turn.
-/// Wording is deliberately terse — shorter context survives truncation
-/// and the instruction is self-explanatory.
-pub const MILESTONE_REPORT_HINT: &str = "\
-Report at major milestones via `bro_report` with a one-line status. \
-Examples: starting implementation, tests passing, blocked on X, work complete.";
 
 /// The workload-retrospective probe prompt, injected as a fake user turn
 /// when a bro's own session is resumed by `bro_prune(retro=true)` or
@@ -2569,25 +2482,11 @@ impl AmbientContext {
                 session_id.to_string(),
             );
         }
-        // Coordination-id default (gap-ae22a6b2 item 2, operator-approved):
-        // `bro_report.task_id` is the dispatch's own task — eliding it today
-        // is a schema error, so filling the ambient id is pure recovery.
         // bbox_thread ids are deliberately NOT defaulted: the table is
         // per-(tool,param), not per-action, and `resolve_thread_id` prefers
         // `id` over `name` — a filled `id` would shadow name-based
         // continue/resolve and convert missing-id errors on resolve/promote/
         // rename into silent mutations of the ambient thread.
-        if let Some(task_id) = self
-            .task_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            defaults.insert(
-                "default:mcp.bro_report.task_id".to_string(),
-                task_id.to_string(),
-            );
-        }
 
         let cwd = self
             .project_dir
@@ -2686,10 +2585,10 @@ impl AmbientContext {
     /// Cadence declarations carry the empirical calibration the old glued
     /// preamble encoded positionally. Directives are standing by default;
     /// recurring behavioral nudges belong in the harness HookEngine/NudgeLedger
-    /// so they can be triggered and throttled by actual turn state. `contract` and
-    /// `milestone` declare `needs_scope`: their texts reference the
-    /// `bbox_scope` correlation keys, so the harness drops them whenever no
-    /// current scope exists.
+    /// so they can be triggered and throttled by actual turn state. `contract`
+    /// declares `needs_scope`: its text references the `bbox_scope`
+    /// correlation keys, so the harness drops it whenever no current scope
+    /// exists.
     pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
         use bro_protocol::{DirectiveCadence, DispatchDirective, DispatchScope};
 
@@ -2740,12 +2639,6 @@ impl AmbientContext {
                 contract,
             ));
         }
-        directives.push(directive(
-            "milestone",
-            DirectiveCadence::Standing,
-            true,
-            MILESTONE_REPORT_HINT,
-        ));
 
         let scope = DispatchScope {
             task: self.task_id.clone(),
@@ -2883,7 +2776,6 @@ fn failed_duplicate_task(
             bro_label,
             name: None,
             agent_label,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -2969,7 +2861,6 @@ pub fn spawn_in_process_task(
             bro_label,
             name: None,
             agent_label,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -3729,7 +3620,6 @@ async fn spawn_harness_child_task(
             bro_label,
             name: None,
             agent_label,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location,
@@ -5152,18 +5042,6 @@ fn task_view_json_from_inner(
     if let Some(ref label) = inner.agent_label {
         obj["agentLabel"] = Value::String(label.clone());
     }
-    if let Some(ref report) = inner.report {
-        obj["report"] = if debug {
-            report.to_json()
-        } else {
-            task_report_summary(
-                &report.message,
-                report.needs.as_deref(),
-                report.data.is_some(),
-                report.reported_at,
-            )
-        };
-    }
     if transcript_coordinates {
         if let Some(ref location) = inner.transcript_location {
             obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
@@ -5217,28 +5095,6 @@ fn task_view_json_from_inner(
 const MCP_TASK_BODY_PAGE_BYTES: usize = 4096;
 const MCP_TASK_EVENTS_BYTES: usize = 8192;
 
-pub(crate) fn task_report_summary(
-    message: &str,
-    needs: Option<&str>,
-    has_data: bool,
-    reported_at: u64,
-) -> Value {
-    let mut out = json!({
-        "message": message.chars().take(512).collect::<String>(),
-        "reportedAt": reported_at,
-    });
-    if let Some(needs) = needs {
-        out["needs"] = json!(needs.chars().take(512).collect::<String>());
-    }
-    if has_data || message.chars().count() > 512 || needs.is_some_and(|s| s.chars().count() > 512) {
-        out["detailsOmitted"] = json!(true);
-        out["detailHint"] = json!(
-            "Read the full report with bro_status(task_id=..., detail=report); follow body.next_cursor."
-        );
-    }
-    out
-}
-
 fn task_body_revision(task_id: &str, detail: &str, body: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
@@ -5284,7 +5140,7 @@ fn task_body_page(
     }
     let mut out = json!({
         "text": &text[offset..end],
-        "format": if matches!(detail, "report" | "structured_exit") { "json" } else { "text" },
+        "format": if detail == "structured_exit" { "json" } else { "text" },
         "offset": offset,
         "total_bytes": text.len(),
     });
@@ -5304,26 +5160,17 @@ pub(crate) fn mcp_task_status_json(
     tail: usize,
     debug: bool,
 ) -> anyhow::Result<Value> {
-    if !matches!(detail, "summary" | "result" | "report" | "structured_exit") {
-        anyhow::bail!("detail must be summary, result, report, or structured_exit");
+    if !matches!(detail, "summary" | "result" | "structured_exit") {
+        anyhow::bail!("detail must be summary, result, or structured_exit");
     }
     if detail == "summary" && (cursor.is_some() || limit.is_some()) {
-        anyhow::bail!("cursor and limit require detail=result, report, or structured_exit");
+        anyhow::bail!("cursor and limit require detail=result or structured_exit");
     }
     if detail != "summary" && tail > 0 {
         anyhow::bail!("tail is an event preview for detail=summary; fetch the body separately");
     }
     let inner = task.inner.lock();
     let mut out = task_view_json_from_inner(&inner, false, debug, debug);
-    // Debug diagnostics never reintroduce an unbounded full progress report.
-    if let Some(report) = inner.report.as_ref() {
-        out["report"] = task_report_summary(
-            &report.message,
-            report.needs.as_deref(),
-            report.data.is_some(),
-            report.reported_at,
-        );
-    }
     out["eventCount"] = json!(observed_event_count(&inner));
     if detail == "result" {
         let body = inner
@@ -5335,21 +5182,6 @@ pub(crate) fn mcp_task_status_json(
             &inner.id,
             detail,
             body,
-            cursor,
-            limit.unwrap_or(MCP_TASK_BODY_PAGE_BYTES),
-        )?;
-    } else if detail == "report" {
-        let report = inner
-            .report
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("task has no progress report"))?;
-        // Stable serialized source data, not report.to_json's ticking reportedAgo.
-        let body = serde_json::to_string(report)?;
-        out["detail"] = json!(detail);
-        out["body"] = task_body_page(
-            &inner.id,
-            detail,
-            &body,
             cursor,
             limit.unwrap_or(MCP_TASK_BODY_PAGE_BYTES),
         )?;
@@ -5410,9 +5242,6 @@ pub(crate) fn mcp_task_status_json(
             "transcriptAvailable",
         ] {
             fields.remove(key);
-        }
-        if detail == "report" {
-            fields.remove("report");
         }
     }
     Ok(out)
@@ -5562,7 +5391,7 @@ fn tail_str_safe(s: &str, max_bytes: usize) -> String {
 
 /// Compatibility status used by control and attached supervision. Full result
 /// bodies stay in task_result_json for workflow consumers; this projection
-/// shares the MCP deliverable and report continuation contract.
+/// shares the MCP deliverable continuation contract.
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let inner = task.inner.lock();
     let mut obj = mcp_task_result_json_from_inner(&inner);
@@ -5661,11 +5490,6 @@ pub(crate) fn control_task_status_json(
                 "GET /control/status/{taskId}?detail=structured_exit; concatenate body.text pages, then parse JSON."
             );
         }
-        if out["report"]["detailsOmitted"] == true {
-            out["report"]["detailHint"] = json!(
-                "GET /control/status/{taskId}?detail=report; concatenate body.text pages, then parse JSON."
-            );
-        }
         if out.get("stderrTruncated").is_some() {
             out["stderrHint"] = json!(
                 "GET /control/status/{taskId}?detail=stderr for exact captured stderr pages."
@@ -5687,12 +5511,6 @@ pub(crate) fn control_task_status_json(
             .last_assistant_message
             .clone()
             .ok_or_else(|| anyhow::anyhow!("task has no captured assistant result"))?,
-        "report" => serde_json::to_string(
-            inner
-                .report
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("task has no progress report"))?,
-        )?,
         "stderr" => inner.stderr.clone(),
         "events" => serde_json::to_string(&inner.events.iter().collect::<Vec<_>>())?,
         "structured_exit" => {
@@ -5710,18 +5528,14 @@ pub(crate) fn control_task_status_json(
                 .ok_or_else(|| anyhow::anyhow!("task has no workflow structured exit"))?;
             serde_json::to_string(&exit)?
         }
-        _ => anyhow::bail!(
-            "detail must be summary, result, report, structured_exit, stderr, or events"
-        ),
+        _ => anyhow::bail!("detail must be summary, result, structured_exit, stderr, or events"),
     };
     let mut page = control_body_page(&inner.id, detail, &body, cursor, limit)?;
-    page["format"] = json!(
-        if matches!(detail, "report" | "structured_exit" | "events") {
-            "json"
-        } else {
-            "text"
-        }
-    );
+    page["format"] = json!(if matches!(detail, "structured_exit" | "events") {
+        "json"
+    } else {
+        "text"
+    });
     let mut out = json!({"taskId":inner.id, "sessionId":inner.session_id, "status":inner.status, "detail":detail, "body":page});
     if detail == "events" {
         out["retainedEvents"] = json!(inner.events.retained_len());
@@ -7888,26 +7702,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn roster_summary_projects_report_teaser() {
-        let task = test_task("task-report", TaskStatus::Running, Provider::Brodex);
-        {
-            let mut inner = task.inner.lock();
-            inner.report = Some(BroReport {
-                message: "Working through the daemon roster regression and checking the report teaser projection stays bounded".to_string(),
-                needs: None,
-                data: None,
-                reported_at: now_ms(),
-            });
-        }
-
-        let report = roster_summary_from_task(&task)
-            .report
-            .expect("report teaser should be projected");
-        assert_eq!(report.chars().count(), ROSTER_REPORT_TEASER_CHARS);
-        assert!(report.starts_with("Working through the daemon roster regression"));
-    }
-
     fn task_with(status: TaskStatus, stderr: &str, events: Vec<Value>) -> Task {
         Task {
             inner: Mutex::new(TaskInner {
@@ -7933,7 +7727,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8636,7 +8429,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8677,7 +8469,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8735,7 +8526,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8792,7 +8582,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9141,7 +8930,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9293,7 +9081,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_tool_defaults_track_session_and_task_ids() {
+    fn ambient_tool_defaults_track_session_id() {
         // Session only: exactly the bbox_note.session_id default.
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
@@ -9309,20 +9097,14 @@ mod tests {
             Some("sess-abc")
         );
 
-        // Task id adds the bro_report coordination-id default.
+        // A task id carries no tool default of its own.
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
             task_id: Some("task-abc".into()),
             ..Default::default()
         };
-        let defaults = ctx.tool_arg_defaults().expect("session + task defaults");
-        assert_eq!(defaults.len(), 2);
-        assert_eq!(
-            defaults
-                .get("default:mcp.bro_report.task_id")
-                .map(String::as_str),
-            Some("task-abc")
-        );
+        let defaults = ctx.tool_arg_defaults().expect("session default");
+        assert_eq!(defaults.len(), 1);
 
         // Pending session, no task, no cwd: nothing to emit.
         let pending = AmbientContext {
@@ -9858,17 +9640,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_milestone_directive_is_standing() {
-        let payload = AmbientContext::default().dispatch_context(None);
-        let milestone = directive(&payload, "milestone");
-        assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::Standing);
-        assert!(milestone.needs_scope);
-        assert!(milestone.text.contains("bro_report"));
-    }
-
-    #[test]
     fn dispatch_context_directive_order_and_conditionals() {
-        // Solo executor: recall → task_shape → contract → milestone.
+        // Solo executor: recall → task_shape → contract.
         let solo = AmbientContext {
             allow_recursion: false,
             completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
@@ -9877,7 +9650,7 @@ mod tests {
         let payload = solo.dispatch_context(None);
         assert_eq!(
             directive_ids(&payload),
-            vec!["recall", "task_shape", "contract", "milestone"]
+            vec!["recall", "task_shape", "contract"]
         );
         let task_shape = directive(&payload, "task_shape");
         assert!(task_shape.text.contains("bbox_compile"));
@@ -9893,7 +9666,7 @@ mod tests {
         let payload = orch.dispatch_context(None);
         assert_eq!(
             directive_ids(&payload),
-            vec!["recall", "task_shape", "orchestrator", "milestone"]
+            vec!["recall", "task_shape", "orchestrator"]
         );
     }
 
@@ -9928,35 +9701,6 @@ mod tests {
     }
 
     #[test]
-    fn milestone_directive_fires_for_every_provider() {
-        // The reporting nudge is unconditional — every provider, regardless
-        // of allow_recursion / coerce_workspace / contract state — and
-        // needs_scope (its bro_report correlation rides the scope keys).
-        // Cadence is standing: per-turn reinforcement was too noisy on
-        // Codex/Brodex because it appears after ordinary tool calls.
-        for p in [
-            providers::Provider::Glm,
-            providers::Provider::Deepseek,
-            providers::Provider::Minimax,
-            providers::Provider::Brodex,
-            providers::Provider::VibeBh,
-        ] {
-            let payload = AmbientContext {
-                provider: Some(p),
-                ..Default::default()
-            }
-            .dispatch_context(None);
-            let milestone = directive(&payload, "milestone");
-            assert!(
-                milestone.text.contains("bro_report"),
-                "bro_report reference missing for provider {p:?}"
-            );
-            assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::Standing);
-            assert!(milestone.needs_scope);
-        }
-    }
-
-    #[test]
     fn test_task_result_json_completed() {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
@@ -9986,7 +9730,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10066,14 +9809,8 @@ mod tests {
                     inner.provider = Provider::Workflow;
                     inner.last_assistant_message =
                         Some(r#"{"structured_exit":{"ok":true}}"#.into());
-                    inner.report = Some(BroReport {
-                        message: "work progress".into(),
-                        needs: None,
-                        data: None,
-                        reported_at: 123,
-                    });
                 }
-                for detail in ["summary", "result", "report", "structured_exit"] {
+                for detail in ["summary", "result", "structured_exit"] {
                     let view = mcp_task_status_json(&task, detail, None, None, 0, false).unwrap();
                     assert!(view.get("context").is_none(), "{detail}: {view}");
                 }
@@ -10253,7 +9990,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10312,7 +10048,6 @@ mod tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10371,7 +10106,6 @@ mod tests {
             bro_label: None,
             name: None,
             agent_label: None,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10432,7 +10166,6 @@ mod tests {
             bro_label: None,
             name: None,
             agent_label: None,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10508,7 +10241,6 @@ mod tests {
             bro_label: None,
             name: None,
             agent_label: None,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10569,7 +10301,6 @@ mod tests {
             bro_label: None,
             name: None,
             agent_label: None,
-            report: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10612,12 +10343,6 @@ mod tests {
                 output_tokens: 100,
                 ..Default::default()
             });
-            inner.report = Some(BroReport {
-                message: "Awaiting review".into(),
-                needs: Some("Review the migration".into()),
-                data: Some(json!({"trace": "x".repeat(30000)})),
-                reported_at: 123,
-            });
             inner.transcript_location = harness_transcript_location(
                 Provider::Glm,
                 std::path::Path::new("/worker-only"),
@@ -10628,9 +10353,6 @@ mod tests {
         let summary = mcp_task_status_json(&task, "summary", None, None, 0, false).unwrap();
         assert_eq!(summary["status"], "completed");
         assert_eq!(summary["hasResult"], true);
-        assert_eq!(summary["report"]["needs"], "Review the migration");
-        assert_eq!(summary["report"]["detailsOmitted"], true);
-        assert!(summary["report"].get("data").is_none());
         for absent in [
             "result",
             "usage",
@@ -10649,7 +10371,6 @@ mod tests {
         let debug = mcp_task_status_json(&task, "summary", None, None, 0, true).unwrap();
         assert!(debug["usage"].is_object());
         assert_eq!(debug["transcriptLocationOwner"], "execution_worker");
-        assert!(debug["report"].get("data").is_none());
     }
 
     #[test]
@@ -10773,33 +10494,10 @@ mod tests {
     }
 
     #[test]
-    fn mcp_report_pages_keep_complete_data_and_stable_revision() {
+    fn mcp_status_rejects_unknown_details_and_summary_cursors() {
         let task = task_with(TaskStatus::Running, "", vec![]);
-        task.inner.lock().report = Some(BroReport {
-            message: "Progress".into(),
-            needs: Some("Review".into()),
-            data: Some(json!({"payload": "é".repeat(9000)})),
-            reported_at: 1,
-        });
-        let mut cursor: Option<String> = None;
-        let mut full = String::new();
-        loop {
-            let response =
-                mcp_task_status_json(&task, "report", cursor.as_deref(), None, 0, false).unwrap();
-            assert_eq!(response["body"]["format"], "json");
-            full.push_str(response["body"]["text"].as_str().unwrap());
-            cursor = response["body"]["next_cursor"].as_str().map(str::to_string);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        let report: Value = serde_json::from_str(&full).unwrap();
-        assert_eq!(report["data"]["payload"], "é".repeat(9000));
-        assert_eq!(report["reportedAt"], 1);
-        assert!(report.get("reportedAgo").is_none());
         assert!(mcp_task_status_json(&task, "summary", Some("bad"), None, 0, false).is_err());
         assert!(mcp_task_status_json(&task, "unknown", None, None, 0, false).is_err());
-        assert!(mcp_task_status_json(&task, "report", None, None, 1, false).is_err());
     }
 
     #[test]
@@ -10817,12 +10515,6 @@ mod tests {
             inner.origin = bro_core::Origin::Cockpit;
             inner.workflow_owned = true;
             inner.interrupted = true;
-            inner.report = Some(BroReport {
-                message: "\u{0001}".repeat(9000),
-                needs: Some("\u{0001}".repeat(9000)),
-                data: Some(json!({"payload":"large".repeat(9000)})),
-                reported_at: 1,
-            });
         }
         let status = control_task_status_json(&task, "summary", None, None, usize::MAX).unwrap();
         assert_eq!(status["status"], "failed");
@@ -10860,24 +10552,17 @@ mod tests {
         {
             let mut inner = task.inner.lock();
             inner.last_assistant_message = Some("deliverable 🦀\n".repeat(1500));
-            inner.report = Some(BroReport {
-                message: "update".into(),
-                needs: None,
-                data: Some(json!({"text":"\u{0001}".repeat(9000)})),
-                reported_at: 1,
-            });
             for idx in 0..TASK_EVENT_RING_CAPACITY + 3 {
                 inner
                     .events
                     .push(json!({"type":"assistant", "idx":idx, "message":"🦀"}));
             }
         }
-        for detail in ["result", "report", "stderr", "events"] {
+        for detail in ["result", "stderr", "events"] {
             let expected = {
                 let inner = task.inner.lock();
                 match detail {
                     "result" => inner.last_assistant_message.clone().unwrap(),
-                    "report" => serde_json::to_string(inner.report.as_ref().unwrap()).unwrap(),
                     "stderr" => inner.stderr.clone(),
                     "events" => {
                         serde_json::to_string(&inner.events.iter().collect::<Vec<_>>()).unwrap()
@@ -10914,55 +10599,6 @@ mod tests {
         assert!(control_task_status_json(&task, "events", None, None, 1).is_err());
         assert!(control_task_status_json(&task, "unknown", None, None, 0).is_err());
     }
-
-    #[test]
-    fn report_truncated_when_oversized() {
-        let huge_message = "x".repeat(16000);
-        let task = task_with(TaskStatus::Running, "", vec![]);
-        {
-            let mut inner = task.inner.lock();
-            inner.report = Some(BroReport {
-                message: huge_message.clone(),
-                needs: None,
-                data: None,
-                reported_at: now_ms(),
-            });
-        }
-        let json = task_status_json(&task, 0);
-        let report = &json["report"];
-        assert_eq!(report["detailsOmitted"], true);
-        assert!(
-            report["detailHint"]
-                .as_str()
-                .unwrap()
-                .contains("detail=report")
-        );
-        let msg = report["message"].as_str().unwrap();
-        assert!(huge_message.starts_with(msg));
-        assert!(msg.len() <= 512);
-        // The whole status object must still be valid JSON and under the 80K cap.
-        let status_str = serde_json::to_string(&json).unwrap();
-        assert!(status_str.len() <= 80 * 1024);
-    }
-
-    #[test]
-    fn report_unchanged_when_small() {
-        let task = task_with(TaskStatus::Running, "", vec![]);
-        {
-            let mut inner = task.inner.lock();
-            inner.report = Some(BroReport {
-                message: "short".into(),
-                needs: Some("input".into()),
-                data: None,
-                reported_at: now_ms(),
-            });
-        }
-        let json = task_status_json(&task, 0);
-        let report = &json["report"];
-        assert_eq!(report["message"], "short");
-        assert_eq!(report["needs"], "input");
-        assert!(report.get("reportTruncated").is_none());
-    }
 }
 
 #[cfg(test)]
@@ -10997,7 +10633,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -11044,7 +10679,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -11097,7 +10731,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -11146,7 +10779,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -11207,7 +10839,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -11261,7 +10892,6 @@ mod async_tests {
                 bro_label: None,
                 name: None,
                 agent_label: None,
-                report: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,

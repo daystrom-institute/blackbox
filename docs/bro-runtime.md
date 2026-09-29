@@ -66,7 +66,7 @@ bro_when_all(task_ids=["task-a", "task-b"], timeout_seconds=60)
 Use `bro_when_any` for races where the first useful answer wins. The losers keep
 running until you cancel them.
 
-## Status And Reporting
+## Status
 
 Use non-blocking reads when you are supervising:
 
@@ -74,18 +74,6 @@ Use non-blocking reads when you are supervising:
 bro_status(task_id="<task-id>", tail=20)
 bro_dashboard(team="bbox-red")
 ```
-
-Dispatched agents and workflow hooks should report milestones:
-
-```text
-bro_report(
-  task_id="<task-id>",
-  message="tests are running",
-  needs="none"
-)
-```
-
-`bro_dashboard` is much more useful when tasks report what they are doing.
 
 ## Cancel And Prune
 
@@ -205,7 +193,7 @@ bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")
 
 The recursion guard is mechanical. Dispatch-capable providers get deny arguments
 at process launch so ordinary dispatched agents cannot recursively spawn more
-agents. `bro_report` stays allowed because it is telemetry.
+agents.
 
 Only use `allow_recursion=true` for a bro whose job is explicitly to orchestrate
 other bros.

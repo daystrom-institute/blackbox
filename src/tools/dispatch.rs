@@ -2177,7 +2177,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_status",
-        description = "Read task progress. lastAssistantSnippet previews the latest assistant text (up to 256 characters), when known. detail=result, report, or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics."
+        description = "Read task progress. lastAssistantSnippet previews the latest assistant text (up to 256 characters), when known. detail=result or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics."
     )]
     pub(crate) fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
@@ -4159,13 +4159,15 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"synthetic provider ref
             }
             let args = std::fs::read_to_string(path).unwrap();
             let args = args.lines().collect::<Vec<_>>();
-            let argument = |flag: &str| args.windows(2).find(|pair| pair[0] == flag).unwrap()[1];
-            let context: Value = serde_json::from_str(argument("--dispatch-context")).unwrap();
-            let defaults: Value = serde_json::from_str(argument("--additional-context")).unwrap();
-            assert_eq!(
-                defaults["default:mcp.bro_report.task_id"],
-                context["scope"]["task"]
-            );
+            let argument = |flag: &str| {
+                args.windows(2)
+                    .find(|pair| pair[0] == flag)
+                    .map(|pair| pair[1])
+            };
+            let context: Value =
+                serde_json::from_str(argument("--dispatch-context").unwrap()).unwrap();
+            let defaults: Value = argument("--additional-context")
+                .map_or_else(|| json!({}), |raw| serde_json::from_str(raw).unwrap());
             assert_eq!(context["persona"], "synthetic lens");
             let name = context["scope"]["bro"].as_str().unwrap().to_string();
             if name == "resumed" {

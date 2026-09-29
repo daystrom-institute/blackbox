@@ -15,8 +15,7 @@
 //! The recursion guard is mechanical: the default filter set disallows
 //! the current blackbox MCP prefix's dispatch-capable `bro_*`
 //! orchestration tools so dispatched agents cannot spawn further
-//! sub-bros unless `allow_recursion=true`. `bro_report` is excluded so
-//! agents can publish progress telemetry.
+//! sub-bros unless `allow_recursion=true`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -395,7 +394,7 @@ impl McpFilters {
     /// Default filter set: the mechanical recursion guard. Blocks
     /// dispatch-capable `bro_*` orchestration tools so dispatched
     /// agents can't spawn sub-bros unless recursion is explicitly
-    /// allowed. Telemetry tools like `bro_report` stay visible.
+    /// allowed.
     pub fn default_recursion_guard() -> Self {
         Self {
             disallow: crate::tool_docs::recursion_guard_tool_names_prefixed(),
@@ -2429,11 +2428,6 @@ mod tests {
             eff.filters
                 .disallow
                 .contains(&"mcp__blackbox__bro_resume".to_string())
-        );
-        assert!(
-            !eff.filters
-                .disallow
-                .contains(&"mcp__blackbox__bro_report".to_string())
         );
     }
 

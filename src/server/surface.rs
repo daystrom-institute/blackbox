@@ -677,8 +677,8 @@ mod tests {
         let exec = "mcp__blackbox__bro_exec";
         let resume = "mcp__blackbox__bro_resume";
         let install = "mcp__blackbox__bbox_artifact_install";
-        let report = "mcp__blackbox__bro_report";
-        let universe: Vec<String> = [search, exec, resume, install, report]
+        let learn = "mcp__blackbox__bbox_learn";
+        let universe: Vec<String> = [search, exec, resume, install, learn]
             .into_iter()
             .map(str::to_string)
             .collect();
@@ -700,14 +700,10 @@ mod tests {
             }
         };
 
-        check("readonly", &[search], &[exec, resume, install, report]);
-        check(
-            "agent-internal",
-            &[search, report],
-            &[exec, resume, install],
-        );
+        check("readonly", &[search], &[exec, resume, install, learn]);
+        check("agent-internal", &[search, learn], &[exec, resume, install]);
         check("interactive", &[search, exec, resume], &[]);
-        check("ops", &[search, exec, resume, install, report], &[]);
+        check("ops", &[search, exec, resume, install, learn], &[]);
     }
 
     #[test]

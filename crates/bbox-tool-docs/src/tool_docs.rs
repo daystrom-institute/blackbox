@@ -822,25 +822,16 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_status",
         category: ToolCategory::Orchestration,
-        summary: "Read task progress. lastAssistantSnippet previews the latest assistant text (up to 256 characters), when known. detail=result, report, or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics.",
-        when_to_use: "Ordinary status and wait replies omit context telemetry; debug=true includes context diagnostics. Exact body reads omit repeated snippets and routine event telemetry. Default summary includes state, progress, blockers and result availability. Result, report and structured_exit detail returns body.text with format, offset and total_bytes; pages contain at most 4096 UTF-8 bytes. Replay body.next_cursor unchanged with the same task and detail. A changed body rejects the cursor; restart from its first page. Reassemble JSON report/structured_exit pages before parsing. tail applies only to summary, capped at 50 events and 8192 serialized bytes. debug adds accounting and worker-owned transcript coordinates; those coordinates are not caller file paths.",
+        summary: "Read task progress. lastAssistantSnippet previews the latest assistant text (up to 256 characters), when known. detail=result or structured_exit returns exact body pages; replay body.next_cursor to continue. debug adds execution diagnostics.",
+        when_to_use: "Ordinary status and wait replies omit context telemetry; debug=true includes context diagnostics. Exact body reads omit repeated snippets and routine event telemetry. Default summary includes state, progress, blockers and result availability. Result and structured_exit detail returns body.text with format, offset and total_bytes; pages contain at most 4096 UTF-8 bytes. Replay body.next_cursor unchanged with the same task and detail. A changed body rejects the cursor; restart from its first page. Reassemble JSON structured_exit pages before parsing. tail applies only to summary, capped at 50 events and 8192 serialized bytes. debug adds accounting and worker-owned transcript coordinates; those coordinates are not caller file paths.",
         example: None,
     },
     ToolDoc {
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
-        summary: "Page recent task summaries for lookup; do not take over another operator's task. Reports expand through bro_status.",
-        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Agent metrics cover only returned tasks, and reports are bounded previews with detail hints. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results or reports, and coordination wait tools when awaiting completion.",
+        summary: "Page recent task summaries for lookup; do not take over another operator's task.",
+        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Agent metrics cover only returned tasks. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results, and coordination wait tools when awaiting completion.",
         example: None,
-    },
-    ToolDoc {
-        name: "bro_report",
-        category: ToolCategory::Orchestration,
-        summary: "Attach the latest progress report to a task.",
-        when_to_use: "Dispatched agents call this at major milestones so bro_dashboard and bro_status show what the task last reported, what it needs, and when it last checked in. Complete reports are capped at 32 KiB before admission. Receipts above 2 KiB are compact with exact bro_status detail=report recovery. persistence=requested does not claim completed persistence.",
-        example: Some(
-            r#"bro_report(task_id="...", message="writing tests", needs="review API naming")"#,
-        ),
     },
     ToolDoc {
         name: "bro_steer",
@@ -1067,9 +1058,6 @@ a year from now with current arcs done?
 executes and resumes bro turns; it does not choose the next application step.
 - `bbox_learn` is for operator-approved, user-stated rules; `bbox_note(kind=learned)` is for \
 agent-discovered facts.
-- For long-running bro work, instruct dispatched agents \
-to call `bro_report` at major milestones. `bro_dashboard` should show the last \
-thing each bro reported, what it needs, and how long ago it checked in.
 ";
 
 fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
@@ -1096,14 +1084,11 @@ pub fn all_tool_names() -> Vec<&'static str> {
 }
 
 /// Prefixed bro_* tools blocked by the default recursion guard.
-/// `bro_report` is intentionally excluded: it is telemetry, not
-/// recursive dispatch, and dispatched agents should be able to report
-/// their own progress.
 pub fn recursion_guard_tool_names_prefixed() -> Vec<String> {
     let prefix = blackbox_mcp_prefix();
     TOOL_DOCS
         .iter()
-        .filter(|d| d.name.starts_with("bro_") && d.name != "bro_report")
+        .filter(|d| d.name.starts_with("bro_"))
         .map(|d| format!("{}{}", prefix, d.name))
         .collect()
 }

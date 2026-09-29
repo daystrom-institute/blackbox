@@ -6,10 +6,6 @@
 //! and the per-row summary. It is a harness builtin holding its own [`Emitter`]
 //! handle, registered beside the bro-tools builtins; unpinned in normal CLI mode
 //! and pinned in fleet mode (via `PinPolicy::also_pin`).
-//!
-//! It is **not** the daemon's `bro_report` MCP tool, which serves
-//! `bro_exec`/atom/workflow bros and is surface-gated off fleet agents. No
-//! shared field — fleet agents are not bros.
 
 use crate::emit::Emitter;
 use async_trait::async_trait;
