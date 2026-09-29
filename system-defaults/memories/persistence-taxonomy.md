@@ -13,8 +13,9 @@ Use the persistence layer that matches the durability, audience, and speaker of 
 - `bbox_learn` — user-stated rules, conventions, bans, defaults, or preferences that should bind future sessions. Rendered into managed memory, so every future agent sees them.
 - `bbox_remember` — useful facts worth finding later, but not worth loading every turn. Indexed only.
 - `bbox_decide` — commitments with rationale and optional supersession chain. Use when the team is locking in or reversing a design choice.
-- `bbox_pin` — persisted but scope-limited ambient context for one active session, bro, thread, or work item. Never rendered into managed memory.
 - `bbox_note` — workstream side-channel during execution. This is not durable policy memory; it is execution telemetry for the current loop.
+
+Guidance that should stay hot for the current arc is not a persistence lane: it belongs in the dispatch brief or the work-item thread (`bbox_thread`).
 
 ## Speaker matters
 
@@ -39,10 +40,10 @@ Do not store user directives as `bbox_note(kind=learned)`. That hides policy in 
 - You want searchability, not prompt residency.
 - You are unsure whether it deserves the stronger `learn` treatment.
 
-### Use `bbox_pin` when
+### Keep it in the dispatch brief or thread when
 
 - The context must stay hot across turns for one active execution lane.
-- The right audience is a matching session, bro, thread, or work item.
+- The right audience is the executor of this arc, not every future session.
 - Rendering it into repo agent files would be pollution.
 - Examples include migration-phase guidance, active-arc sequencing, and temporary executor charters.
 
@@ -70,6 +71,6 @@ Do not store user directives as `bbox_note(kind=learned)`. That hides policy in 
 
 If unsure between `learn` and `remember`, choose `remember`.
 
-If unsure between `pin` and `learn`, ask: should an unrelated future agent inherit this by default? If no, `pin`.
+If unsure whether guidance is standing policy or active-arc context, ask: should an unrelated future agent inherit this by default? If no, it goes in the dispatch brief or the work-item thread, not `learn`.
 
 If unsure between `remember` and `note`, ask: should a future session know this before it starts? If yes, `remember`. If no, `note`.

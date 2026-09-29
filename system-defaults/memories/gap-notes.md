@@ -29,7 +29,7 @@ Not a gap note:
 - missing product features
 - one-off cleanup left after the task
 - user-stated standing rules (those go to `bbox_learn` / `bbox_decide`)
-- active-arc instructions (those go to `bbox_pin` or a work-item thread)
+- active-arc instructions (those go to the dispatch brief or a work-item thread)
 
 The test: would agents in unrelated projects plausibly hit the same missing blackbox capability? If yes, gap note. If no, a normal `bbox_note(kind="followup")`.
 

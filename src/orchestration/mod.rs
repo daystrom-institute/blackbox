@@ -2421,9 +2421,6 @@ pub struct AmbientContext {
     pub bro_name: Option<String>,
     pub thread_id: Option<String>,
     pub work_item_id: Option<String>,
-    /// Scoped active-arc guidance injected from bbox_pin. Persisted on disk,
-    /// hot only for matching ambient scopes, never rendered into repo memory.
-    pub pin_block: Option<String>,
     /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
     pub completion_contract: Option<String>,
     pub allow_recursion: bool,
@@ -2657,12 +2654,6 @@ impl AmbientContext {
                 .map(str::to_string),
             directives,
             scope: (!scope.is_empty()).then_some(scope),
-            pins: self
-                .pin_block
-                .as_deref()
-                .map(str::trim_end)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
         }
     }
 }
@@ -9419,18 +9410,6 @@ mod tests {
         // system-section renderings, never "[scope] above".
         assert!(DEFAULT_COMPLETION_CONTRACT.contains("`bbox_scope` context block"));
         assert!(!DEFAULT_COMPLETION_CONTRACT.contains("[scope]"));
-    }
-
-    #[test]
-    fn dispatch_context_carries_pin_block_verbatim() {
-        let ctx = AmbientContext {
-            pin_block: Some(
-                "- [bro:executor] Active arc: validate cuts against canonical doc".into(),
-            ),
-            ..Default::default()
-        };
-        let payload = ctx.dispatch_context(None);
-        assert!(payload.pins.as_deref().unwrap().contains("Active arc"));
     }
 
     #[test]

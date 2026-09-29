@@ -25,7 +25,6 @@ pub(crate) mod transcript_source;
 // The published-view install gate lives here and is exercised from the
 // catalog tool's acceptance tests, which is why this module is crate
 // visible while its knowledge/gap siblings are not.
-mod ambient_pins;
 pub(crate) mod control;
 pub(crate) mod drain;
 pub(crate) mod knowledge_view;

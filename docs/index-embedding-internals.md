@@ -17,7 +17,7 @@ transcripts, registered projects, git history, and durable JSON stores.
 | `~/.local/state/blackbox/edges/` | Project edge sidecars | No |
 | `~/.local/state/blackbox/git_meta/` | Git indexing fingerprints | No |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and IDs | Yes |
-| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads, pins | Yes |
+| `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads | Yes |
 
 ## Tantivy index
 

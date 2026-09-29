@@ -45,8 +45,8 @@ Major code ownership boundaries:
   `find_paths`, evidence bundling, provenance).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
-- `threads.rs`, `notes.rs`, `inbox.rs`, `pins.rs`,
-  `whiteboards.rs` - coordination stores.
+- `threads.rs`, `notes.rs`, `inbox.rs`, `whiteboards.rs` - coordination
+  stores.
 - `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
   injection and recursion guard.
 - `crates/bbox-system-events/` - observation journal and broadcast, without reactions.

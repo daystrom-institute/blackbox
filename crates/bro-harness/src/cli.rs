@@ -130,11 +130,11 @@ pub struct Cli {
     pub output_schema: Option<String>,
 
     /// Typed dispatch-context payload (bro-protocol `DispatchContext` JSON):
-    /// persona, directives with declared cadence, scope IDs, pin block. The
+    /// persona, directives with declared cadence, and scope IDs. The
     /// harness owns composition — placement per transport strategy, never
     /// daemon-glued prose. Non-empty ⇒ replaces the persisted context
     /// wholesale and sets the current scope; empty/`{}` ⇒ explicit clear;
-    /// absent ⇒ persona/pins/non-`needs_scope` directives restore from session
+    /// absent ⇒ persona and non-`needs_scope` directives restore from session
     /// side-state (scope is NEVER restored). Strictly parsed — the payload is
     /// daemon-authored, so unknown fields/versions are errors. Env fallback:
     /// `BRO_HARNESS_DISPATCH_CONTEXT` (standalone binary).

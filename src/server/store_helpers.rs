@@ -188,7 +188,7 @@ impl BlackboxServer {
         let prediction = apply_packet_with(&packet, &entity, &*packet_store)?;
         if prediction.classification == "arc_bound" {
             Some(format!(
-                "\n\nNote: this content was classified arc-bound by packet {pkt} (rule: {rule}). Active-arc guidance that will not still be correct a year from now usually belongs in `bbox_pin` (scope=work_item/thread/bro/session) rather than `bbox_learn`, where it renders into every unrelated future session's CLAUDE.md. The entry was saved; review and consider pinning instead.",
+                "\n\nNote: this content was classified arc-bound by packet {pkt} (rule: {rule}). Active-arc guidance that will not still be correct a year from now usually belongs in the dispatch brief or a work-item thread rather than `bbox_learn`, where it renders into every unrelated future session's CLAUDE.md. The entry was saved; review and consider moving it there instead.",
                 pkt = packet.id,
                 rule = prediction.rule_id
             ))
@@ -518,8 +518,8 @@ mod tests {
         assert!(
             nag_arc
                 .as_deref()
-                .is_some_and(|s| s.contains("arc-bound") && s.contains("bbox_pin")),
-            "arc-bound content should produce a pin-steering nag: {nag_arc:?}"
+                .is_some_and(|s| s.contains("arc-bound") && s.contains("dispatch brief")),
+            "arc-bound content should produce a brief-steering nag: {nag_arc:?}"
         );
 
         let nag_standing = server.arc_bound_warning(None, "Prefer rustls over openssl");

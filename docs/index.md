@@ -37,7 +37,7 @@ The main operator binaries are:
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
 | [Refactor Tools And Atoms](refactor.md) | Harness-native structural refactor tooling |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls |
-| [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, notes, and inbox |
+| [Knowledge Store](knowledge-store.md) | Learn, decide, remember, render, review, notes, and inbox |
 | [Design Graph](design-graph.md) | Operate this repo's `design` project graph: verbs, authority, reads, state blocks |
 | [Transcript Retrieval](transcript-retrieval.md) | Search, cite, context, sessions, messages, topics, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |

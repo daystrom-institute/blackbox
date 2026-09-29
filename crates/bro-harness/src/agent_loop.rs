@@ -859,7 +859,7 @@ struct Session {
     /// system. The typed ledger owns versions and delivery receipts.
     instruction_system: Option<String>,
     /// Per-transport composition strategy: where persona, directives, memory,
-    /// scope, and pins land for this session's transport
+    /// and scope land for this session's transport
     /// (design/bro-harness/dispatch-prompt-slots.md §5).
     strategy: crate::context::dispatch::CompositionStrategy,
     /// Typed dispatch-context state (`--dispatch-context`): the current
@@ -1136,7 +1136,7 @@ impl Session {
         );
         // Dispatch-context resolution (dispatch-prompt-slots.md §4): the flag
         // replaces the persisted context wholesale; empty clears; absent
-        // restores persona/pins/non-`needs_scope` directives from side-state
+        // restores persona and non-`needs_scope` directives from side-state
         // with scope dropped. Strict parse — daemon-authored payloads fail
         // loudly, they do not degrade.
         let restored_budget =
@@ -2593,9 +2593,9 @@ impl Session {
     }
 
     /// Strategy-routed sections for the stable system slot. Codex-shaped:
-    /// persona + standing directives only (memory/scope/pins ride the
-    /// contextual-user lane). Vibe-shaped: memory, environment, scope, and
-    /// pins additionally fold into the leading system block, rebuilt in place
+    /// persona + standing directives only (memory/scope ride the
+    /// contextual-user lane). Vibe-shaped: memory, environment, and scope
+    /// additionally fold into the leading system block, rebuilt in place
     /// per request (vibe's `update_system_prompt` shape) — nothing
     /// context-shaped enters the user lane on that strategy.
     fn system_sections(&self) -> SystemSections {
@@ -2611,7 +2611,6 @@ impl Session {
                 &crate::context::EnvironmentContext::from_tool_cx(&self.cx),
             ));
             sections.scope = self.dispatch.scope_render();
-            sections.pins = self.dispatch.pins_render();
         }
         sections
     }
@@ -2624,7 +2623,7 @@ impl Session {
             self.emit_dispatch_context_changes_if_needed();
         } else {
             // Vibe-shaped: the leading system rebuild carries
-            // environment/scope/pins; advance the baseline silently so
+            // environment/scope; advance the baseline silently so
             // side-state stays current.
             let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
             self.reference_context_item = Some(env.to_turn_context_item());
@@ -2637,25 +2636,19 @@ impl Session {
         }
         let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
         // The emitter is strategy-aware (design §5, review round 2 blocker):
-        // on the vibe-shaped strategy memory/environment/scope/pins resolve to
+        // on the vibe-shaped strategy memory/environment/scope resolve to
         // the stable system slot, so the initial-context emitter contributes
         // NOTHING to the user lane.
         if self.strategy.context_rides_user_lane() {
             // The typed instruction batch is delivered first at the request
-            // boundary; scope, pins and environment follow before the task.
-            if self.dispatch.scope_render().is_none() && self.dispatch.emitted_scope.is_some()
-                || self.dispatch.pins_render().is_none() && self.dispatch.emitted_pins.is_some()
-            {
+            // boundary; scope and environment follow before the task.
+            if self.dispatch.scope_render().is_none() && self.dispatch.emitted_scope.is_some() {
                 self.emit_dispatch_context_changes_if_needed();
             }
             let mut sections = Vec::new();
             if let Some(scope) = self.dispatch.scope_render() {
                 self.dispatch.emitted_scope = Some(scope.clone());
                 sections.push(scope);
-            }
-            if let Some(pins) = self.dispatch.pins_render() {
-                self.dispatch.emitted_pins = Some(pins.clone());
-                sections.push(pins);
             }
             sections.push(crate::context::ContextualUserFragment::render(&env));
             if let Some(message) = crate::context::build_contextual_user_message(sections) {
@@ -2681,13 +2674,6 @@ impl Session {
                 "<bbox_scope>Prior dispatch scope has been cleared.</bbox_scope>".into()
             }));
             self.dispatch.emitted_scope = scope;
-        }
-        let pins = self.dispatch.pins_render();
-        if pins != self.dispatch.emitted_pins {
-            sections.push(pins.clone().unwrap_or_else(|| {
-                "<bbox_pins>Prior dispatch pins have been cleared.</bbox_pins>".into()
-            }));
-            self.dispatch.emitted_pins = pins;
         }
         if let Some(message) = crate::context::build_contextual_user_message(sections) {
             let text = message.text_blocks.join("\n\n");
@@ -3227,8 +3213,8 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
 
 /// Strategy-routed sections feeding the stable system slot
 /// (design/bro-harness/dispatch-prompt-slots.md §5). `explicit`, `persona`,
-/// and `standing` apply under every strategy; `memory`, `environment`,
-/// `scope`, and `pins` are filled only by the vibe-shaped strategy, where
+/// and `standing` apply under every strategy; `memory`, `environment`, and
+/// `scope` are filled only by the vibe-shaped strategy, where
 /// those classes fold into the leading system message instead of the
 /// contextual-user lane.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -3239,7 +3225,6 @@ struct SystemSections {
     memory: Option<String>,
     environment: Option<String>,
     scope: Option<String>,
-    pins: Option<String>,
 }
 
 /// Compose the effective system prompt as a cache-stable prefix plus a volatile
@@ -3247,8 +3232,8 @@ struct SystemSections {
 ///
 /// Stable ordering (both strategies; base instructions render before all of
 /// this, transport-side): explicit `--system-prompt` override → persona →
-/// standing directives → memory → pinned-tools → environment → scope → pins.
-/// The per-resume-mutable sections (scope/pins) sit at the suffix so the
+/// standing directives → memory → pinned-tools → environment → scope.
+/// The per-resume-mutable section (scope) sits at the suffix so the
 /// prefix stays byte-identical across leading-block rebuilds on the chat
 /// lane (cache vs salience trade, design §5).
 fn compose_system(
@@ -3293,7 +3278,6 @@ fn compose_system(
     }
     push_part(&mut parts, sections.environment.as_deref());
     push_part(&mut parts, sections.scope.as_deref());
-    push_part(&mut parts, sections.pins.as_deref());
     let stable = parts.join("\n\n");
 
     let mut volatile = String::new();
@@ -5983,7 +5967,6 @@ mod tests {
                 },
             ],
             scope,
-            pins: Some("PINS_UNIQUE active arc".into()),
         };
         DispatchState::from_arg(DispatchContextArg::Provided(Box::new(ctx)), &Value::Null)
     }
@@ -6008,7 +5991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_shaped_initial_context_orders_agents_scope_pins_env() {
+    async fn codex_shaped_initial_context_orders_agents_scope_env() {
         let (mut session, shared) = mk_session(vec![]);
         let _directory = install_startup_instructions(&mut session, "AGENTS_UNIQUE_RULE").await;
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
@@ -6020,7 +6003,6 @@ mod tests {
             "PER_TURN_UNIQUE",
             "AGENTS_UNIQUE_RULE",
             "<bbox_scope>",
-            "<bbox_pins>",
             "<environment_context>",
         ] {
             assert!(!stable.contains(absent), "{absent} must not ride stable");
@@ -6032,15 +6014,12 @@ mod tests {
                 "AGENTS_UNIQUE_RULE",
                 "<bbox_scope>",
                 "task: task-1",
-                "<bbox_pins>",
-                "PINS_UNIQUE",
                 "<environment_context>",
                 "hello",
             ],
         );
         assert_eq!(requests[0].last().map(String::as_str), Some("hello"));
         assert!(session.dispatch.emitted_scope.is_some());
-        assert!(session.dispatch.emitted_pins.is_some());
     }
 
     #[tokio::test]
@@ -6061,7 +6040,6 @@ mod tests {
                 "Always-available tools",
                 "<environment_context>",
                 "<bbox_scope>",
-                "<bbox_pins>",
             ],
         );
         assert!(!stable.contains("PER_TURN_UNIQUE"));
@@ -6099,7 +6077,7 @@ mod tests {
         assert_eq!(shared.pushed_users.lock().unwrap().len(), 2);
 
         // A resume re-passing a CHANGED scope ⇒ one short fragment, baseline
-        // advanced. Pins unchanged ⇒ not re-emitted.
+        // advanced.
         session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-2"));
         session.prepare_context_for_user_turn();
         {
@@ -6107,7 +6085,6 @@ mod tests {
             assert_eq!(pushed.len(), 3);
             assert!(pushed[2].starts_with("<bbox_scope>"), "{}", pushed[2]);
             assert!(pushed[2].contains("task: task-2"));
-            assert!(!pushed[2].contains("<bbox_pins>"));
         }
 
         // And it converges: same scope again ⇒ silent.
@@ -6142,7 +6119,6 @@ mod tests {
                 &[
                     "task: old-task",
                     "Prior dispatch scope has been cleared",
-                    "Prior dispatch pins have been cleared",
                     "new task",
                 ],
             );
@@ -6177,7 +6153,6 @@ mod tests {
                 request.contains("Prior dispatch scope has been cleared"),
                 absent
             );
-            assert!(!request.contains("Prior dispatch pins have been cleared"));
         }
         let (mut fresh, shared) = mk_session(vec![]);
         fresh.dispatch = DispatchState::from_arg(DispatchContextArg::Clear, &Value::Null);
@@ -6367,7 +6342,6 @@ mod tests {
                 "AGENTS_UNIQUE_RULE",
                 "<bbox_scope>",
                 "task: task-9",
-                "<bbox_pins>",
                 "<environment_context>",
                 "turn two",
             ],

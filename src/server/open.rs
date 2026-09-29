@@ -14,7 +14,6 @@ use crate::notes::Notes;
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::packets::Packets;
-use crate::pins::Pins;
 use crate::producer_claims::ProducerClaims;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
@@ -688,11 +687,6 @@ pub(super) fn open_shared_state(
     let notes_persister = StorePersister::spawn("notes", notes_store.clone(), notes_path.clone());
     tracing::info!("Notes store: {}", notes_path.display());
 
-    let pins_path = cfg.paths.pins_path.clone();
-    let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path)?));
-    let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
-    tracing::info!("Pins store: {}", pins_path.display());
-
     let checkout_mutations_path = cfg.paths.checkout_mutations_path.clone();
     let checkout_mutations_store = Arc::new(RwLock::new(CheckoutMutations::open(
         &checkout_mutations_path,
@@ -964,8 +958,6 @@ pub(super) fn open_shared_state(
         threads_persister,
         notes: notes_store,
         notes_persister,
-        pins: pins_store,
-        pins_persister,
         checkout_mutations: checkout_mutations_store,
         checkout_mutations_persister,
         producer_claims: producer_claims_store,

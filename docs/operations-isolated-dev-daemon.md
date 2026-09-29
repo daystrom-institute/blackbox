@@ -50,7 +50,7 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state_dir>/blackbox-knowledge.json` | Knowledge store |
 | `BLACKBOX_THREADS_PATH` | `<state_dir>/blackbox-threads.json` | Thread store |
 | `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Notes store |
-| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Pins store |
+| `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Legacy pin rows read by the project catalog migration |
 | `BLACKBOX_PROJECTS_PATH` | `<state_dir>/projects.json` | Project registry |
 | `BLACKBOX_GAPS_PATH` | `<state_dir>/blackbox-gaps.json` | Gap notes store |
 | `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Compiled rule packets |

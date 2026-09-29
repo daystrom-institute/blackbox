@@ -517,13 +517,6 @@ impl BlackboxServer {
             bro_name: request.ambient_bro_name.clone(),
             thread_id: None,
             work_item_id: None,
-            pin_block: self.ambient_pin_block(
-                request.cwd.as_deref(),
-                request.ambient_bro_name.as_deref(),
-                Some(session_id.as_str()),
-                None,
-                None,
-            ),
             completion_contract: if request.allow_recursion {
                 None
             } else {
@@ -904,13 +897,6 @@ impl BlackboxServer {
             bro_name: p.bro.clone(),
             thread_id: None,
             work_item_id: None,
-            pin_block: self.ambient_pin_block(
-                cwd.as_deref(),
-                p.bro.as_deref(),
-                Some(session_id.as_str()),
-                None,
-                None,
-            ),
             completion_contract: if allow_recursion {
                 None
             } else {

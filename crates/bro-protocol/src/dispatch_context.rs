@@ -3,8 +3,8 @@
 //!
 //! The daemon owns CONTENT SELECTION: which directives apply to a dispatch,
 //! each directive's empirically-calibrated reinforcement cadence, the persona
-//! resolved from the brofile, the pre-bound scope IDs, and the resolved pin
-//! block. The harness owns COMPOSITION: where each ingredient lands per
+//! resolved from the brofile, and the pre-bound scope IDs. The harness owns
+//! COMPOSITION: where each ingredient lands per
 //! transport (system stable slot, volatile tail, marker-demarcated contextual
 //! user fragments, or the vibe-shaped leading system block). This DTO is the
 //! ingredients list that crosses that boundary — typed values, never composed
@@ -12,7 +12,9 @@
 //!
 //! Parsing is deliberately strict (`deny_unknown_fields`, exact version
 //! match): the payload is daemon-authored, so garbage is a bug to surface,
-//! not input to tolerate.
+//! not input to tolerate. The one allowance is the `pins` field older
+//! daemons and persisted harness side-state carry: it is accepted and
+//! dropped.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +23,7 @@ pub const DISPATCH_CONTEXT_VERSION: u32 = 1;
 
 /// Typed ingredients for one dispatch. See module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "WireDispatchContext")]
 pub struct DispatchContext {
     /// Payload version; must equal [`DISPATCH_CONTEXT_VERSION`].
     pub v: u32,
@@ -37,9 +39,33 @@ pub struct DispatchContext {
     /// would mis-route `bbox_note` keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<DispatchScope>,
-    /// Resolved pin block text (bbox_pin), verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pins: Option<String>,
+}
+
+/// Accepted input shape for [`DispatchContext`]: its fields plus the `pins`
+/// block older payloads carry, which is dropped on conversion.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDispatchContext {
+    v: u32,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    directives: Vec<DispatchDirective>,
+    #[serde(default)]
+    scope: Option<DispatchScope>,
+    #[serde(default, rename = "pins")]
+    _pins: Option<serde::de::IgnoredAny>,
+}
+
+impl From<WireDispatchContext> for DispatchContext {
+    fn from(wire: WireDispatchContext) -> Self {
+        Self {
+            v: wire.v,
+            persona: wire.persona,
+            directives: wire.directives,
+            scope: wire.scope,
+        }
+    }
 }
 
 impl DispatchContext {
@@ -66,10 +92,7 @@ impl DispatchContext {
 
     /// Whether the payload carries anything renderable at all.
     pub fn is_empty(&self) -> bool {
-        self.persona.is_none()
-            && self.directives.is_empty()
-            && self.scope.is_none()
-            && self.pins.is_none()
+        self.persona.is_none() && self.directives.is_empty() && self.scope.is_none()
     }
 
     /// The directives that may render given the current scope state: when no
@@ -187,10 +210,24 @@ mod tests {
                 session: Some("sess-1".into()),
                 ..Default::default()
             }),
-            pins: Some("pin text".into()),
         };
         let raw = serde_json::to_string(&ctx).unwrap();
         assert_eq!(DispatchContext::parse(&raw).unwrap(), ctx);
+    }
+
+    #[test]
+    fn parse_accepts_and_drops_legacy_pins() {
+        let ctx = DispatchContext::parse(
+            r#"{"v":1,"persona":"p","scope":{"task":"t"},"pins":"- [bro:x] Active arc"}"#,
+        )
+        .unwrap();
+        assert_eq!(ctx.persona.as_deref(), Some("p"));
+        assert_eq!(
+            ctx.scope.as_ref().and_then(|s| s.task.as_deref()),
+            Some("t")
+        );
+        let reserialized = serde_json::to_value(&ctx).unwrap();
+        assert!(reserialized.get("pins").is_none(), "{reserialized}");
     }
 
     #[test]

@@ -14,7 +14,6 @@ This is the compact model:
 - Rendered files are unidirectional projections. `bbox_absorb` is a retired compatibility no-op and cannot import edits.
 - `bbox_review` accepts or rejects entries already awaiting approval in the store.
 - `bbox_lint` checks the store for contradictions, duplication, and stale structure.
-- `bbox_pin` is not part of this lifecycle. Pins stay out of rendered memory entirely.
 
 ## Normal forward path
 
@@ -55,7 +54,7 @@ not a different daemon path or hand-authored internal transport parameters.
 ## What each verb is not
 
 - `bbox_render` is not a review step. It publishes what is already approved/renderable.
-- `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," use `bbox_pin`, not render.
+- `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," put it in the dispatch brief or the work-item thread, not render.
 - `bbox_absorb` performs no import or publication.
 - `bbox_review` is not rendering. It changes whether pending entries are accepted.
 - `bbox_lint` is not a sync step. It is hygiene/diagnostics.

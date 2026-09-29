@@ -1,6 +1,6 @@
 //! Harness-side dispatch-context state: resolution of the `--dispatch-context`
-//! boundary flag, the per-transport composition strategy seam, scope/pins
-//! fragments, and the session side-state cells
+//! boundary flag, the per-transport composition strategy seam, the scope
+//! fragment, and the session side-state cells
 //! (design/bro-harness/dispatch-prompt-slots.md §4/§5/§7).
 
 use serde_json::{Value, json};
@@ -13,19 +13,19 @@ use crate::transport::TransportKind;
 /// Per-transport composition strategy — the harness analog of opencode's
 /// `provider(model)` + delivery branch and codex's PromptSlot router. One
 /// routing point decides which slot each semantic class (persona, standing
-/// directives, per-turn directives, memory, scope, pins, environment, task)
+/// directives, per-turn directives, memory, scope, environment, task)
 /// lands in; a per-provider fix becomes a strategy-arm change, not preamble
 /// surgery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionStrategy {
     /// anthropic + openai-responses: persona/standing directives in the
     /// stable system slot; per-turn directives in the volatile tail;
-    /// memory/scope/pins/environment as marker-demarcated contextual USER
+    /// memory/scope/environment as marker-demarcated contextual USER
     /// fragments with change/compaction re-emit; the task is its own user
     /// item, verbatim, last.
     CodexShaped,
     /// openai-chat (the Mistral lane): everything — persona, standing
-    /// directives, memory (AGENTS.md), environment, scope, pins — folds into
+    /// directives, memory (AGENTS.md), environment, scope — folds into
     /// the leading system message, rebuilt in place per request (vibe's
     /// `update_system_prompt` shape); the task is the only initial user
     /// message. The observed failure mode this fixes: policy and memory text
@@ -42,7 +42,7 @@ impl CompositionStrategy {
         }
     }
 
-    /// Whether memory/environment/scope/pins ride the contextual-user lane.
+    /// Whether memory/environment/scope ride the contextual-user lane.
     /// When false they resolve to the stable system slot and the
     /// initial-context emitter contributes NOTHING to the user lane.
     pub fn context_rides_user_lane(self) -> bool {
@@ -54,12 +54,12 @@ impl CompositionStrategy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchContextArg {
     /// Flag present, non-empty: the payload replaces persisted
-    /// persona/directives/pins wholesale and sets the current scope.
+    /// persona/directives wholesale and sets the current scope.
     /// Boxed: the payload dwarfs the unit variants.
     Provided(Box<DispatchContext>),
     /// Flag present but empty (`""`/`{}`): explicit clear.
     Clear,
-    /// Flag absent: restore persona/pins/directives from session side-state;
+    /// Flag absent: restore persona/directives from session side-state;
     /// scope is NEVER restored (per-dispatch correlation data).
     Absent,
 }
@@ -92,8 +92,6 @@ pub struct DispatchState {
     /// Survives restore so a resume that re-passes an identical scope emits
     /// nothing.
     pub emitted_scope: Option<String>,
-    /// Rendered `<bbox_pins>` fragment last emitted into the user lane.
-    pub emitted_pins: Option<String>,
 }
 
 impl DispatchState {
@@ -101,17 +99,14 @@ impl DispatchState {
     pub fn from_arg(arg: DispatchContextArg, prior_side: &Value) -> Self {
         let emitted = prior_side.get("dispatch_emitted").unwrap_or(&Value::Null);
         let emitted_scope = emitted["scope"].as_str().map(str::to_string);
-        let emitted_pins = emitted["pins"].as_str().map(str::to_string);
         match arg {
             DispatchContextArg::Provided(ctx) => Self {
                 context: Some(*ctx),
                 emitted_scope,
-                emitted_pins,
             },
             DispatchContextArg::Clear => Self {
                 context: None,
                 emitted_scope,
-                emitted_pins,
             },
             DispatchContextArg::Absent => {
                 // Side-cell convention: tolerant restore (absent/garbage →
@@ -128,7 +123,6 @@ impl DispatchState {
                 Self {
                     context: restored,
                     emitted_scope,
-                    emitted_pins,
                 }
             }
         }
@@ -153,13 +147,10 @@ impl DispatchState {
 
     /// Persisted form of the last-emitted user-lane baselines.
     pub fn emitted_to_side(&self) -> Value {
-        if self.emitted_scope.is_none() && self.emitted_pins.is_none() {
-            return Value::Null;
+        match &self.emitted_scope {
+            Some(scope) => json!({ "scope": scope }),
+            None => Value::Null,
         }
-        json!({
-            "scope": self.emitted_scope,
-            "pins": self.emitted_pins,
-        })
     }
 
     pub fn persona(&self) -> Option<&str> {
@@ -198,15 +189,6 @@ impl DispatchState {
         }
         Some(ScopeFragment { scope }.render())
     }
-
-    /// Rendered `<bbox_pins>` fragment for the current pin block, if any.
-    pub fn pins_render(&self) -> Option<String> {
-        let pins = self.context.as_ref()?.pins.as_deref()?;
-        if pins.trim().is_empty() {
-            return None;
-        }
-        Some(PinsFragment { pins }.render())
-    }
 }
 
 /// Pre-bound scoping IDs, demarcated so the completion contract's "copy
@@ -233,25 +215,6 @@ impl ContextualUserFragment for ScopeFragment<'_> {
             .map(|(k, v)| format!("{k}: {v}"))
             .collect();
         format!("\n{}\n", lines.join("\n"))
-    }
-}
-
-/// Scoped active-arc pin block (bbox_pin), demarcated.
-struct PinsFragment<'a> {
-    pins: &'a str,
-}
-
-impl ContextualUserFragment for PinsFragment<'_> {
-    fn role(&self) -> FragmentRole {
-        FragmentRole::User
-    }
-
-    fn markers(&self) -> (&'static str, &'static str) {
-        ("<bbox_pins>", "</bbox_pins>")
-    }
-
-    fn body(&self) -> String {
-        format!("\n{}\n", self.pins.trim_end())
     }
 }
 
@@ -290,7 +253,6 @@ mod tests {
                 },
             ],
             scope,
-            pins: Some("pin block".into()),
         }
     }
 
@@ -381,10 +343,6 @@ mod tests {
         let ctx = restored.context.as_ref().expect("context restored");
         assert_eq!(ctx.scope, None, "scope must NEVER be restored");
         assert_eq!(restored.persona(), Some("You are a reviewer"));
-        assert_eq!(
-            restored.context.as_ref().unwrap().pins.as_deref(),
-            Some("pin block")
-        );
         // needs_scope directives drop without a current scope.
         assert_eq!(restored.standing_text().unwrap(), "Task-shape check");
         assert_eq!(restored.per_turn_text().unwrap(), "Recall directive");
@@ -394,26 +352,54 @@ mod tests {
     #[test]
     fn emitted_baselines_survive_restore() {
         let side = json!({
-            "dispatch_emitted": {"scope": "<bbox_scope>\ntask: t\n</bbox_scope>", "pins": null},
+            "dispatch_emitted": {"scope": "<bbox_scope>\ntask: t\n</bbox_scope>"},
         });
         let restored = DispatchState::from_arg(DispatchContextArg::Absent, &side);
         assert_eq!(
             restored.emitted_scope.as_deref(),
             Some("<bbox_scope>\ntask: t\n</bbox_scope>")
         );
-        assert_eq!(restored.emitted_pins, None);
     }
 
     #[test]
     fn clear_retains_baselines_until_history_receives_revocations() {
         let side = json!({
             "dispatch_context": {"v": 1, "persona": "p"},
-            "dispatch_emitted": {"scope": "s", "pins": "p"},
+            "dispatch_emitted": {"scope": "s"},
         });
         let state = DispatchState::from_arg(DispatchContextArg::Clear, &side);
         assert_eq!(state.context, None);
         assert_eq!(state.context_to_side(), Value::Null);
         assert_eq!(state.emitted_to_side(), side["dispatch_emitted"]);
+    }
+
+    #[test]
+    fn legacy_side_state_with_pins_restores_without_them() {
+        let side = json!({
+            "dispatch_context": {
+                "v": 1,
+                "persona": "You are a reviewer",
+                "directives": [
+                    {"id": "contract", "cadence": "standing", "needs_scope": true, "text": "c"}
+                ],
+                "pins": "- [bro:executor] Active arc"
+            },
+            "dispatch_emitted": {"scope": "s", "pins": "legacy pin fragment"},
+        });
+        let restored = DispatchState::from_arg(DispatchContextArg::Absent, &side);
+        assert_eq!(restored.persona(), Some("You are a reviewer"));
+        assert_eq!(restored.emitted_scope.as_deref(), Some("s"));
+        assert_eq!(restored.emitted_to_side(), json!({"scope": "s"}));
+        assert_eq!(
+            restored.context_to_side(),
+            json!({
+                "v": 1,
+                "persona": "You are a reviewer",
+                "directives": [
+                    {"id": "contract", "cadence": "standing", "needs_scope": true, "text": "c"}
+                ]
+            })
+        );
     }
 
     #[test]
@@ -434,8 +420,6 @@ mod tests {
             rendered,
             "<bbox_scope>\ntask: task-1\nsession: sess-1\nproject: /repo\n</bbox_scope>"
         );
-        let pins = state.pins_render().unwrap();
-        assert_eq!(pins, "<bbox_pins>\npin block\n</bbox_pins>");
     }
 
     #[test]

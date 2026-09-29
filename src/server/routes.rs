@@ -1595,7 +1595,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|note| note.project.as_deref() == Some(project))
         .count();
-    let pins = state.pins.read().project_ref_count(project);
     let packets = state
         .packets
         .read()
@@ -1631,7 +1630,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "knowledge": knowledge,
         "threads": threads,
         "notes": notes,
-        "pins": pins,
         "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
@@ -1872,14 +1870,6 @@ pub(crate) fn migrate_project_refs(
         // This sync migration helper cannot await; notes persistence is write-behind here.
         state.notes_persister.request();
     }
-    let pins = state
-        .pins
-        .write()
-        .rename_project_refs(old_project, new_project)?;
-    if pins > 0 {
-        // This sync migration helper cannot await; pins persistence is write-behind here.
-        state.pins_persister.request();
-    }
     let packets = state
         .packets
         .read()
@@ -1906,7 +1896,6 @@ pub(crate) fn migrate_project_refs(
         "knowledge": knowledge,
         "threads": threads,
         "notes": notes,
-        "pins": pins,
         "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
