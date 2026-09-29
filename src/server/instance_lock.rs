@@ -38,10 +38,10 @@
 //! The state root keeps its lock INSIDE the directory
 //! (`<state_dir>/instance.lock`) — that is the shipped, documented path. Every
 //! other root locks through a SIBLING (`<root>.instance.lock`), because those
-//! roots are store directories with strict content policies: the packet store,
-//! for one, refuses to enumerate a directory holding a non-canonical entry, so
-//! a lock file dropped inside it would break the store it was meant to
-//! protect.
+//! roots are store directories with strict content policies: the packet tree's
+//! catalog codec, for one, refuses to enumerate a directory holding a
+//! non-canonical entry, so a lock file dropped inside it would break the store
+//! it was meant to protect.
 //!
 //! # Scope: daemon only, not the offline CLI
 //!
@@ -189,7 +189,7 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
         ),
         InstanceRoot::directory("bro home", "BRO_HOME", paths.bro_home.clone()),
         InstanceRoot::directory(
-            "rule packet store",
+            "packet tree",
             "BLACKBOX_PACKETS_DIR",
             paths.packets_dir.clone(),
         ),
@@ -717,9 +717,9 @@ mod tests {
     }
 
     /// Locks for roots other than the state root live BESIDE the root, never
-    /// inside it: the packet store refuses to enumerate a directory holding a
-    /// non-canonical entry, so a lock file dropped inside would break the
-    /// store this lock exists to protect.
+    /// inside it: the packet tree's catalog codec refuses to enumerate a
+    /// directory holding a non-canonical entry, so a lock file dropped inside
+    /// would break the store this lock exists to protect.
     #[test]
     fn only_the_state_root_carries_its_lock_inside_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -728,11 +728,8 @@ mod tests {
         let state = InstanceRoot::state_root(root.join("state"));
         assert_eq!(state.lock_path(), root.join("state").join("instance.lock"));
 
-        let packets = InstanceRoot::directory(
-            "rule packet store",
-            "BLACKBOX_PACKETS_DIR",
-            root.join("pkt"),
-        );
+        let packets =
+            InstanceRoot::directory("packet tree", "BLACKBOX_PACKETS_DIR", root.join("pkt"));
         assert_eq!(packets.lock_path(), root.join("pkt.instance.lock"));
 
         let knowledge = InstanceRoot::file(
@@ -866,7 +863,7 @@ mod tests {
             "transcript index",
             "vector store",
             "bro home",
-            "rule packet store",
+            "packet tree",
             "artifact catalog",
             "backup directory",
             "knowledge store",

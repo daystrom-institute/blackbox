@@ -47,7 +47,7 @@ pub const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum GapKind {
-    /// Predicate the rule-packet AST cannot express.
+    /// Predicate a rule AST cannot express.
     PacketAst,
     /// Missing CLI / shell / refactor helper.
     Tooling,
