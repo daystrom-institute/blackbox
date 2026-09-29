@@ -30,7 +30,7 @@ framework-dispatched agents land in them:
 - `/control/exec` — the cockpit's dispatch path (`control_exec_handler`,
   `src/server/routes.rs:872`; mounted at `src/server/mcp.rs:68`, aliased
   `/irc/exec` at `:103`) creates a task in `state.task_store`.
-- `bro_exec` / `bro_agent_dispatch` / workflow nodes / atoms create tasks in the
+- `bro_exec` / workflow nodes / atoms create tasks in the
   **same** `state.task_store` and emit to the **same** `state.tail_tx`
   (`src/tools/orchestrate.rs:175-176` threads `state.task_store.clone()` +
   `state.tail_tx.clone()`; atoms/supervision read `state.task_store`).
@@ -245,7 +245,7 @@ empty; PROJECT.md's `dispatch_origin` is an unrelated refactor-run flag). Add an
 | Creation site | `origin` |
 |---|---|
 | `control_exec_handler` (`/control/exec`, `/irc/exec`) | `Cockpit` |
-| `bro_exec` / `bro_agent_dispatch` | `AgentDispatch` |
+| `bro_exec` | `AgentDispatch` |
 | `orchestrate.rs` workflow nodes | `Workflow` |
 | atoms | `Atom` |
 | cron / webhook ingress | `Cron` / `Webhook` |
@@ -332,7 +332,7 @@ endpoint. No new task fields, no client behavior change yet.
 
 **Slice 1b — `origin` plumbing (cross-cutting; the audit IS the work).** Add
 `origin` to `TaskInner` and `bro_protocol::TaskSnapshot`, set it at every creation
-site (`/control/exec`, `bro_exec`, `bro_agent_dispatch`, workflow, atoms, cron,
+site (`/control/exec`, `bro_exec`, workflow, atoms, cron,
 webhook), persist it, and test restart-survival. This is the risk-bearing slice
 (§4.1) — call it out as a creation-site audit, not a one-liner. Tabs depend on it.
 

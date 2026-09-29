@@ -80,9 +80,9 @@ While draining:
 - Fresh dispatches are refused with a retryable error whose text starts with
   `error.maintenance_pending` and names the window (`set_at`, `reason`) plus
   `retryable=true`. Covered: `bro_exec` (including the cockpit control
-  handler), `bro_agent_dispatch`, `atom_invoke`, cron/webhook-originated
-  dispatches, and top-level workflow arc starts (`bro_orchestrate_run`,
-  `/orchestrate`, routed `start_arc`).
+  handler), `atom_invoke`, cron/webhook-originated dispatches, and top-level
+  workflow arc starts (`bro_orchestrate_run`, `/orchestrate`, routed
+  `start_arc`).
 - In-flight work continues: an already-running arc's nodes, nested
   sub-workflows and fanout children, and auto-supervision atom invocations
   are exempt (dispatch origins `workflow` and `atom` bypass the gate;

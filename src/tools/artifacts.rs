@@ -1316,4 +1316,158 @@ mod tests {
             "expected 'JSON object' in error, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn agent_install_records_filter_conflict_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let meta = install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "warning-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent where overlay conflicts are recorded.",
+                    "when_to_use": ["when testing filter warnings"],
+                    "brofile_inline": {
+                        "provider": "claude",
+                        "filters": {
+                            "allow": ["Read"],
+                            "disallow": ["Bash"]
+                        }
+                    },
+                    "filter_overlay": {
+                        "allow": ["Bash"],
+                        "disallow": ["Read"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let warnings = &meta.install_warnings;
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("Bash")),
+            "allow/disallow conflict warning missing: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Read")),
+            "disallow/allow conflict warning missing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn agent_install_stamps_embeddings_and_distilled_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let artifact = serde_json::json!({
+            "kind": "agent",
+            "name": "distilled-reviewer",
+            "version": 1,
+            "manifest": {
+                "description": "Reviews recurring code patterns.",
+                "when_to_use": ["when recurring review work appears"],
+                "anti_patterns": ["one-off typo fixes"],
+                "brofile_inline": {"provider": "claude"},
+                "provenance": {
+                    "kind": "distilled",
+                    "distilled_by": "badgey-01",
+                    "evidence_session_ids": ["session:claude:sess-1"],
+                    "created_from_threads": ["thread:thread-abc"],
+                    "accept_count": 1,
+                    "reject_count": 0
+                }
+            }
+        });
+        rt.block_on(install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "distilled-reviewer.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            artifact,
+        ))
+        .unwrap();
+
+        let stored = server
+            .state
+            .artifacts
+            .read()
+            .load_artifact_value(artifacts::ArtifactKind::Agent, "distilled-reviewer")
+            .unwrap()
+            .unwrap();
+        let embedding = &stored["manifest"]["embedding"];
+        assert_eq!(
+            embedding["components"]["primary"],
+            "agent_embed:distilled-reviewer:v1:primary"
+        );
+        assert_eq!(
+            embedding["components"]["when_to_use"],
+            "agent_embed:distilled-reviewer:v1:when_to_use"
+        );
+        assert_eq!(
+            embedding["components"]["anti_patterns"],
+            "agent_embed:distilled-reviewer:v1:anti_patterns"
+        );
+
+        let agent_ref = crate::entity_ref::EntityRef::Agent {
+            name: "distilled-reviewer".into(),
+            version: 1,
+        };
+        let edges_dir = crate::server::edge_sidecar_dir(&server.state);
+        let durable_edges: Vec<crate::edge_index::Edge> =
+            std::fs::read_to_string(edges_dir.join("explicit/agents.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(durable_edges.len(), 2);
+
+        // Artifact installation persists provenance and only nudges the
+        // single-flight watcher. It must not synchronously parse and publish
+        // the complete graph on the tool-call path.
+        let read_view = server.state.code_read_view.read().clone();
+        assert!(
+            read_view
+                .edge_index
+                .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"])
+                .is_empty()
+        );
+
+        // Simulate the watcher consuming the nudge, then prove both durable
+        // facts become queryable after the bounded rebuild.
+        crate::server::rebuild_edge_index_from_shared(&server.state, false).unwrap();
+        let published = server.state.code_read_view.read().clone();
+        let edges = published
+            .edge_index
+            .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == crate::entity_ref::EntityRef::Session {
+                    provider: "claude".into(),
+                    session_id: "sess-1".into(),
+                }
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == crate::entity_ref::EntityRef::Thread {
+                    thread_id: "thread-abc".into(),
+                }
+        }));
+    }
 }

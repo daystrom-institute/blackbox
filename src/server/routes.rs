@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::state::{BlackboxServer, SharedState};
+use super::state::SharedState;
 use crate::artifacts::{
     self, ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
@@ -702,6 +702,33 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
     Ok(restored)
 }
 
+/// Allow and disallow lists from an inline brofile's `filters` object.
+fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let filters = match inline.get("filters") {
+        Some(f) => f,
+        None => return (Vec::new(), Vec::new()),
+    };
+    let allow = filters
+        .get("allow")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let disallow = filters
+        .get("disallow")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    (allow, disallow)
+}
+
 pub(crate) fn agent_install_warnings(
     state: &Arc<SharedState>,
     manifest: &orchestration::agents::types::AgentManifest,
@@ -720,7 +747,7 @@ pub(crate) fn agent_install_warnings(
             None => (Vec::new(), Vec::new()),
         }
     } else if let Some(inline) = manifest.brofile_inline.as_ref() {
-        BlackboxServer::extract_inline_filters(inline)
+        extract_inline_filters(inline)
     } else {
         (Vec::new(), Vec::new())
     };
@@ -2290,6 +2317,7 @@ pub(crate) async fn roster_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::state::BlackboxServer;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))

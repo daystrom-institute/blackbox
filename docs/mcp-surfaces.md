@@ -90,7 +90,7 @@ a non-empty `allow` list is an explicit allowlist - only listed tools are visibl
           "bbox_learn", "bbox_remember", "bbox_decide", "bbox_pin",
           "bbox_note", "bbox_note_resolve", "bbox_forget",
           "bbox_thread", "bbox_render", "bbox_absorb",
-          "bro_exec", "bro_resume", "bro_broadcast",
+          "bro_exec", "bro_resume",
           "bro_orchestrate_run", "bro_orchestrate_author",
           "bbox_artifact_install"
         ],

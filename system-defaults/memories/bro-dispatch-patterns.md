@@ -53,19 +53,19 @@ when the session is polluted, genuinely lost, or intentionally independent.
 
 ### Blind deliberation
 
-1. `bro_broadcast(...)`
+1. one `bro_exec(...)` per member
 2. `bro_when_all(...)`
 3. compare answers
 4. optionally `bro_resume(...)` selected members with follow-up prompts,
    but only after the selected members' current tasks are terminal
 
-`bro_broadcast` resumes existing team member sessions on later rounds, so it
-obeys the same single-flight rule as `bro_resume`: do not broadcast a new
-round to a member while that member's prior task is still running.
+Later rounds resume each member's session, so they obey the single-flight
+rule of `bro_resume`: do not send a new round to a member while that
+member's prior task is still running.
 
 ### Race
 
-1. `bro_broadcast(...)` or multiple `bro_exec(...)`
+1. multiple `bro_exec(...)`
 2. `bro_when_any(...)`
 3. inspect the winning result
 4. cancel laggards only if they are clearly wasted work

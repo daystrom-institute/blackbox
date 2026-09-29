@@ -2018,17 +2018,6 @@ pub(crate) fn agent_component_entity_id(
     )
 }
 
-pub(crate) fn parse_agent_component_entity_id(
-    entity_id: &str,
-) -> Option<(AgentRef, AgentManifestComponent)> {
-    let (name, version, component) =
-        crate::embed_queue::parse_agent_component_entity_id_parts(entity_id)?;
-    Some((
-        AgentRef { name, version },
-        AgentManifestComponent::parse(&component)?,
-    ))
-}
-
 pub(crate) fn agent_component_hash(
     manifest: &AgentManifest,
     component: AgentManifestComponent,
@@ -2050,15 +2039,6 @@ impl AgentManifestComponent {
             Self::Primary => "primary",
             Self::WhenToUse => "when_to_use",
             Self::AntiPatterns => "anti_patterns",
-        }
-    }
-
-    pub(crate) fn parse(input: &str) -> Option<Self> {
-        match input {
-            "primary" => Some(Self::Primary),
-            "when_to_use" => Some(Self::WhenToUse),
-            "anti_patterns" => Some(Self::AntiPatterns),
-            _ => None,
         }
     }
 }

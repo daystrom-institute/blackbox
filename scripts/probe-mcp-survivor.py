@@ -131,15 +131,6 @@ try:
  assert server_name in inventory['servers'] and 'synthetic-secret' not in json.dumps(inventory)
  print('MCP exact server identity PASS',flush=True)
  call('bbox_artifact_list',{'kind':'agent'})
- filters=[f'tool_{n:04}_'+('界'*12) for n in range(300)]
- call('bbox_artifact_install',{'kind':'agent','artifact':{'kind':'agent','name':'synthetic-summary-agent','version':1,'manifest':{'description':'Synthetic audit fixture','when_to_use':['when testing exact MCP recovery'],'brofile_inline':{'provider':'glm','filters':{'allow':filters}},'filter_overlay':{'allow':filters,'disallow':[]}}}})
- summary=call('bro_agent_describe',{'agent':'synthetic-summary-agent'})
- assert summary['planes']['computed_merge']['status']=='computed'
- full=exact('bro_agent_describe',{'agent':'synthetic-summary-agent','detail_plane':'summary','body_limit':4096})
- assert full['planes']['computed_merge']['merged']['allow']==filters
- metadata=exact('bro_agent_describe',{'agent':'synthetic-summary-agent','detail_plane':'metadata','body_limit':512})
- assert metadata['name']=='synthetic-summary-agent'
- print('agent summary and installation metadata recovery PASS',flush=True)
  call('bro_allocator_probe',{'provider':'glm'},True)
  probe_text='Synthetic diagnostic: '+('界\n"'*1500)
  call('bro_allocator_probe',{'provider':'glm','raw_summary':probe_text})

@@ -59,6 +59,23 @@ impl AgentDashboardMetrics {
     }
 }
 
+/// Bounded preview of a free-text diagnostic field. Not a redaction: this
+/// only bounds transport size and marks truncation.
+fn preview_text(text: &str, max_bytes: usize) -> serde_json::Value {
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == text.len() {
+        return serde_json::Value::String(text.to_string());
+    }
+    serde_json::json!({
+        "text": &text[..end],
+        "text_truncated": true,
+        "total_bytes": text.len(),
+    })
+}
+
 #[tool_router(router = roster_tools)]
 impl BlackboxServer {
     #[tool(
@@ -532,7 +549,7 @@ impl BlackboxServer {
                     brofile::account_summary_row(name, account)
                 }) {
                     Ok(summary) => Self::ok_json(&json!({
-                        "account": super::agents::preview_text(name, 256),
+                        "account": preview_text(name, 256),
                         "updated": true,
                         "summary": summary,
                         "detail_hint": "bro_brofile(action=list_accounts, body_limit=4096) recovers exact identities; get_account with the original name pages redacted policy",
@@ -557,7 +574,7 @@ impl BlackboxServer {
                             p.body_limit,
                         ) {
                             Ok(body) => Self::ok_json(&json!({
-                                "name": super::agents::preview_text(name, 256),
+                                "name": preview_text(name, 256),
                                 "body": body,
                             })),
                             Err(error) => Self::err_text(&format!("Error: {error:#}")),
@@ -633,7 +650,7 @@ impl BlackboxServer {
                     return Self::err_text(&format!("Configuration was not saved: {error}"));
                 }
                 Self::ok_json(
-                    &json!({"provider":provider.as_str(), "account":super::agents::preview_text(&account, 256),
+                    &json!({"provider":provider.as_str(), "account":preview_text(&account, 256),
                     "updated":true, "detail_hint":"get_provider_default with the same provider pages the exact mapping"}),
                 )
             }
@@ -1377,9 +1394,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::artifacts;
     use crate::server::state::SharedState;
-    use crate::tools::bro_params::AgentDispatchParams;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
@@ -3014,74 +3029,5 @@ mod tests {
             assert_eq!(done["hasResult"], true);
             assert_eq!(done["hasLastMessage"], true);
         }
-    }
-
-    // Real agent dispatch in-process: contends on shared dispatch/provider
-    // state under the full parallel suite (flaky). Opt-in via `--ignored`.
-    #[test]
-    #[ignore = "real agent dispatch; run with --ignored"]
-    fn bro_dashboard_emits_agent_label() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        let cat = &server.state.artifacts.read();
-        cat.install_value(
-            artifacts::ArtifactKind::Agent,
-            "dash-agent.json".into(),
-            &serde_json::json!({
-                "kind": "agent",
-                "name": "dash-agent",
-                "version": 1,
-                "manifest": {
-                    "description": "Agent for dashboard test.",
-                    "brofile_inline": {"provider": "claude"},
-                },
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
-            agent: "dash-agent".into(),
-            args: serde_json::Value::Null,
-            cwd: Some(tmp.path().to_str().unwrap().to_string()),
-            bro: None,
-            ambient: None,
-            caller_provider: None,
-            caller_session_id: None,
-            runtime: None,
-        })));
-        assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let task_id = body["task_id"].as_str().unwrap();
-
-        let dash = server.bro_dashboard(Parameters(DashboardParams {
-            offset: None,
-            limit: Some(20),
-            provider: None,
-            status: None,
-            team: None,
-        }));
-        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
-        let tasks = dash_body["tasks"].as_array().unwrap();
-        let found = tasks.iter().find(|t| t["taskId"].as_str() == Some(task_id));
-        assert!(found.is_some(), "task should appear in dashboard");
-        let entry = found.unwrap();
-        assert_eq!(
-            entry["agentLabel"].as_str(),
-            Some("agent:dash-agent@v1"),
-            "dashboard entry should carry agentLabel: {entry}"
-        );
-        assert_eq!(
-            entry["broLabel"].as_str(),
-            Some("agent:dash-agent@v1"),
-            "dashboard entry should carry broLabel: {entry}"
-        );
-        let agent_metrics = &dash_body["agents"]["agent:dash-agent@v1"];
-        assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
-        assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
-        assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
     }
 }

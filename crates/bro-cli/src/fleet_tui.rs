@@ -4627,7 +4627,7 @@ fn err_is_broken_pipe(e: &str) -> bool {
 }
 
 /// The daemon's `/control/steer|interrupt` reject any task whose status is not
-/// `Running` with "task … is {Status}, not running" (`bro_steer`/`bro_interrupt`).
+/// `Running` with "task … is {Status}, not running".
 /// A finished bidi agent must be resumed, so this rejection trips the resume
 /// fallback instead of dead-ending with the turn lost.
 fn err_is_not_running(e: &str) -> bool {

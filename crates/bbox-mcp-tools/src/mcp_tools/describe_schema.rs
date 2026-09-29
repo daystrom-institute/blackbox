@@ -15,7 +15,6 @@ pub struct AgentSchemaEntry {
     pub cost_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_adapter: Option<String>,
-    pub example_invocation: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -287,7 +286,6 @@ mod tests {
                 anti_patterns: vec!["Large diffs".into()],
                 cost_class: "normal".into(),
                 dispatch_adapter: None,
-                example_invocation: "bro_agent_dispatch(agent=\"reviewer\", args={...})".into(),
             },
             AgentSchemaEntry {
                 name: "badge-tester".into(),
@@ -297,7 +295,6 @@ mod tests {
                 anti_patterns: vec![],
                 cost_class: "cheap".into(),
                 dispatch_adapter: Some("badgey".into()),
-                example_invocation: "bro_agent_dispatch(agent=\"badge-tester\", args={...})".into(),
             },
         ];
         let rendered = describe_schema(&BTreeMap::new(), &agents).unwrap();
@@ -310,10 +307,6 @@ mod tests {
         assert_eq!(agents_arr[0]["cost_class"].as_str(), Some("normal"));
         assert_eq!(agents_arr[0]["when_to_use"].as_array().unwrap().len(), 1);
         assert_eq!(agents_arr[0]["anti_patterns"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            agents_arr[0]["example_invocation"].as_str(),
-            Some("bro_agent_dispatch(agent=\"reviewer\", args={...})")
-        );
         assert_eq!(agents_arr[1]["dispatch_adapter"].as_str(), Some("badgey"));
 
         assert!(value.get("text").is_none());

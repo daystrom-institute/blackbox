@@ -12,7 +12,7 @@ Meta-orchestration pattern. User drives Advisor (main-session Claude); Advisor d
 User ↕ Advisor (main session)
           ↕ [bro_resume, phase-boundary reports]
       Orchestrator bro (runs crucible)
-          ↕ [bro_broadcast, bro_resume]
+          ↕ [bro_exec, bro_resume]
       Ensemble + Implementer
 ```
 
@@ -41,8 +41,8 @@ User ↕ Advisor (main session)
 
 ## PROTOCOL INVARIANTS
 
-- **Advisor discipline is the skill.** Advisor must NOT read full diffs, call `bro_broadcast`, resume the implementer directly, run tests, or deep-dive specific code. Every one of those grows Advisor's context and destroys the compartmentalization that is overmind's whole point. If Advisor reaches into operational detail, the pattern fails — treat it as a protocol violation.
-- **Orchestrator dispatch uses `allow_recursion=true`.** This is the rare legitimate meta-orchestration exception to the recursion guard. The orchestrator must be able to call `bro_broadcast` (ensemble) and `bro_exec`/`bro_resume` (implementer). Advisor sets this explicitly on dispatch; no other bro in the tree gets recursion.
+- **Advisor discipline is the skill.** Advisor must NOT read full diffs, dispatch the ensemble, resume the implementer directly, run tests, or deep-dive specific code. Every one of those grows Advisor's context and destroys the compartmentalization that is overmind's whole point. If Advisor reaches into operational detail, the pattern fails; treat it as a protocol violation.
+- **Orchestrator dispatch uses `allow_recursion=true`.** This is the rare legitimate meta-orchestration exception to the recursion guard. The orchestrator must be able to call `bro_exec`/`bro_resume` for the ensemble and the implementer. Advisor sets this explicitly on dispatch; no other bro in the tree gets recursion.
 - **Spine doc is the load-bearing artifact.** Every strategic decision, every phase boundary, every escalation is appended to the spine doc *before* anything else happens. It is what a replacement advisor (or the user, or `/takeover`) reads to bootstrap. If it's not in the spine doc, it effectively doesn't exist.
 - **Phase boundaries only.** Orchestrator does not stream to Advisor; it reports at phase boundaries with structured summaries. Advisor does not poll; it waits. This rhythm keeps Advisor's context bounded.
 - **Charter is binding.** Once Phase 0 locks scope / halt / exit with the user, those conditions govern the arc. Advisor does not silently renegotiate — if a condition needs to change mid-arc, surface the delta to the user explicitly and update the spine doc.
@@ -217,7 +217,7 @@ Self-contained. Orchestrator needs:
 - Current phase brief (the first phase from the planned sequence)
 - Arc thread id + spine doc path
 - **Report protocol** (next section, verbatim)
-- **Tool expectations:** orchestrator runs crucible internally. `allow_recursion=true` means orchestrator CAN call `bro_broadcast` (ensemble) and `bro_exec`/`bro_resume` (implementer). But it MUST NOT call `bro_exec` to spawn sibling orchestrators.
+- **Tool expectations:** orchestrator runs crucible internally. `allow_recursion=true` means orchestrator CAN call `bro_exec`/`bro_resume` for the ensemble and the implementer. But it MUST NOT call `bro_exec` to spawn sibling orchestrators.
 
 ### 2c. Report protocol (append to orchestrator brief, verbatim)
 
@@ -554,7 +554,7 @@ Charter integrity is one of the load-bearing protocols.
 These are the patterns that destroy overmind. If you catch yourself doing them, stop and re-read this section.
 
 - **Reading full diffs.** Orchestrator summarized them. If you want more detail, ask orchestrator a pointed question next resume.
-- **Calling `bro_broadcast`.** That's orchestrator's job. Ensemble is orchestrator-scope, not advisor-scope.
+- **Dispatching the ensemble.** That's orchestrator's job. Ensemble is orchestrator-scope, not advisor-scope.
 - **Directly resuming the implementer.** Implementer communicates only with orchestrator. If you want to influence implementer behavior, steer the orchestrator, and orchestrator steers the implementer.
 - **Running tests or builds.** Orchestrator handles verification. Advisor trusts reports.
 - **Deep-diving code.** Scoping recon in Phase 0b was bounded (5–10 calls). After dispatch, no more code reads unless tracking down a specific strategic question (and even then, prefer asking orchestrator).

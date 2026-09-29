@@ -94,7 +94,7 @@ impl ToolCategory {
                 "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
             }
             Self::Orchestration => {
-                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
+                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (resolves provider + account + lens + context + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again: it starts fresh with no memory). For ensembles: several `bro_exec` calls + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe/team context, pull `sm-brofile-context` via `bbox_knowledge`."
             }
             Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
@@ -802,7 +802,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_when_all",
         category: ToolCategory::Orchestration,
         summary: "Observe ALL selected tasks or team members until completion; never launches follow-up work. Use for concurrent waits after explicit dispatch.",
-        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. all_completed means every selected task reached a terminal state (failed/cancelled included); all_succeeded separately requires every task to have succeeded; outcome_counts gives the mix, and running tasks keep timed_out rows, so a timeout never becomes success. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
+        when_to_use: "Fan-out/fan-in pattern. Pair with several `bro_exec` dispatches for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. all_completed means every selected task reached a terminal state (failed/cancelled included); all_succeeded separately requires every task to have succeeded; outcome_counts gives the mix, and running tasks keep timed_out rows, so a timeout never becomes success. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
         example: None,
     },
     ToolDoc {
@@ -810,13 +810,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Block until the FIRST task completes; use for races instead of polling each task yourself.",
         when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. The whole selection is validated before waiting: team XOR task_ids, non-empty, every ID known (pruned IDs reject), at most 64 occurrences; duplicates are preserved with one row each. any_completed means at least one task reached a terminal state (failed/cancelled included); any_succeeded separately requires a successful completion; outcome_counts gives the mix, and rows keep each task's own status with timed_out for those still running. Large aggregates compact later rows behind resultsTruncated (never drop a task); read exact bodies with bro_status(detail=result,cursor=...). structuredExitOmitted requires bro_status(detail=structured_exit); follow body.next_cursor to reconstruct the JSON value.  Timeout must be finite, nonnegative and representable by the platform deadline, validated before observers. Zero is an immediate snapshot.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bro_broadcast",
-        category: ToolCategory::Orchestration,
-        summary: "Send the same prompt to every team member. `cwd` (canonical; `project_dir` deprecated alias) overrides the working directory for every member dispatch.",
-        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds. Every member keeps a receipt with identity and admission outcome (taskId/sessionId or a per-member error); over-long error text is truncated, oversized fan-out or teams whose minimal receipts cannot fit the response budget reject before any dispatch, and large aggregates compact later receipts behind receiptsTruncated without dropping any member from the reply. Later member failures remain per-member receipts and preserve earlier admitted task IDs. team_persistence separately reports persisted, unconfirmed or unchanged history. Fresh and resumed members preserve explicit brofile tool defaults; no authority opt-out is inferred. Workflow/atom-owned sessions refuse ordinary takeover, including legacy team history identity. Only tracked admissions produce taskId/history; a tracked failed setup remains recoverable through bro_status.",
         example: None,
     },
     ToolDoc {
@@ -841,15 +834,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bro_steer(task_id="...", prompt="Prefer the smaller scoped fix.")"#),
     },
     ToolDoc {
-        name: "bro_interrupt",
-        category: ToolCategory::Orchestration,
-        summary: "Interrupt a running bro-harness process; optionally queue redirect text to run after interruption repair.",
-        when_to_use: "Use when the current turn is going the wrong way and should stop now. Pass prompt for interrupt-and-redirect; omit it for a plain interrupt. This is different from bro_cancel: the live session is repaired and can continue inside the same task.",
-        example: Some(
-            r#"bro_interrupt(task_id="...", prompt="Stop that path; inspect the boundary doc first.")"#,
-        ),
-    },
-    ToolDoc {
         name: "bro_cancel",
         category: ToolCategory::Orchestration,
         summary: "Cancel a running task (SIGTERM); check bro_status first unless the user explicitly asked to stop.",
@@ -860,15 +844,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_prune",
         category: ToolCategory::Orchestration,
         summary: "Drop terminal tasks from the store + persisted tasks.json; filter by status/provider/age, or pass task_ids to drop only specific tasks you created.",
-        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard or bbox_inbox. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Pass task_ids=[…] to drop exactly the tasks you created without a status-wide sweep of the shared store (matches any terminal status unless status is also given). Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched. Pass retro=true to fire a fire-and-forget workload retrospective on each pruned task before it's dropped (see bro_retro); tune with retro_min_turns / retro_max. Rejects explicit empty task_ids and invalid providers. Freezes a maximum 256-task/24 KiB encoded-ID selection before effects; narrow larger selections. persistence=requested distinguishes admission from completion. Retro starts after tasks are dropped.",
+        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard or bbox_inbox. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Pass task_ids=[…] to drop exactly the tasks you created without a status-wide sweep of the shared store (matches any terminal status unless status is also given). Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched. Pass retro=true to fire a fire-and-forget workload retrospective on each pruned task before it's dropped (the bro self-files substrate gaps via bbox_gap only if something is worth surfacing); tune with retro_min_turns / retro_max. Rejects explicit empty task_ids and invalid providers. Freezes a maximum 256-task/24 KiB encoded-ID selection before effects; narrow larger selections. persistence=requested distinguishes admission from completion. Retro starts after tasks are dropped.",
         example: Some(r#"bro_prune(task_ids=["abc123"])"#),
-    },
-    ToolDoc {
-        name: "bro_retro",
-        category: ToolCategory::Orchestration,
-        summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task.",
-        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
-        example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {
         name: "bro_providers",
@@ -888,7 +865,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_team",
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and teams without automatic advisor execution. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages.",
-        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. New advisor arguments are rejected. Legacy advisor settings/history remain readable and are marked execution=retired in summaries; create and waits never execute them. Dispatch any reviewer explicitly with bro_exec/bro_resume. list/list_templates/roster page at default 20, maximum 100; next_offset continues with the same exact name/project filters. get/get_template return exact stored JSON: concatenate body.text pages using cursor=body.next_cursor, then parse; source changes invalidate cursors. Template scope accepts global or project. In catalog mode, project template operations refuse because legacy .bro files have no owner transport; use global templates or owner-side operations. Team creation uses global template/brofile configuration and retains project_dir as worker context. Expanded membership must be 1..256; counts outside this range refuse before allocation or persistence. Team members resume existing sessions on later broadcasts; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Wrong-action mutation fields refuse. Dissolve caps cancellation at 64 tasks/16 KiB encoded IDs before effects and reports cancellation_requested plus skipped terminal/missing history and removal status. Cancellation failure retains the team.",
+        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. New advisor arguments are rejected. Legacy advisor settings/history remain readable and are marked execution=retired in summaries; create and waits never execute them. Dispatch any reviewer explicitly with bro_exec/bro_resume. list/list_templates/roster page at default 20, maximum 100; next_offset continues with the same exact name/project filters. get/get_template return exact stored JSON: concatenate body.text pages using cursor=body.next_cursor, then parse; source changes invalidate cursors. Template scope accepts global or project. In catalog mode, project template operations refuse because legacy .bro files have no owner transport; use global templates or owner-side operations. Team creation uses global template/brofile configuration and retains project_dir as worker context. Expanded membership must be 1..256; counts outside this range refuse before allocation or persistence. Team members resume existing sessions on later turns; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Wrong-action mutation fields refuse. Dissolve caps cancellation at 64 tasks/16 KiB encoded IDs before effects and reports cancellation_requested plus skipped terminal/missing history and removal status. Cancellation failure retains the team.",
         example: Some(
             r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
         ),
@@ -904,46 +881,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     // ── Workflows ────────────────────────────────────────────────────
 
-    // ── Agents ──────────────────────────────────────────────────
-    ToolDoc {
-        name: "bro_agent_list",
-        category: ToolCategory::Orchestration,
-        summary: "List installed agents in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; bro_agent_get/bro_agent_describe reads one exact agent.",
-        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history, including retired adapter-backed manifests marked inactive. Retired manifests remain readable by exact name/ref but never appear as callable agents.",
-        example: Some(r#"bro_agent_list(include_superseded=true)"#),
-    },
-    ToolDoc {
-        name: "bro_agent_get",
-        category: ToolCategory::Orchestration,
-        summary: "Read one agent by name or agent-ref with lifecycle state, a manifest summary, and exact redacted manifest body pages.",
-        when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
-        example: Some(r#"bro_agent_get(name="reviewer")"#),
-    },
-    ToolDoc {
-        name: "bro_agent_describe",
-        category: ToolCategory::Orchestration,
-        summary: "Compact per-plane dispatch surface for one agent.",
-        when_to_use: "Pre-dispatch inspection: see the stored manifest, resolved brofile, filter overlay, the computed deny-wins merge, and the runtime planes describe does not compute (project filters, surface packet, per-dispatch overrides, recursion guard). detail_plane=manifest|brofile pages the exact redacted JSON with body.next_cursor; a missing brofile returns an actionable readiness error. Use before bro_agent_dispatch to preview the dispatch plan. detail_plane=metadata pages installation history; detail_plane=summary pages every computed filter and warning. Large default planes carry these exact-read hints.",
-        example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
-    },
-    ToolDoc {
-        name: "bro_agent_search",
-        category: ToolCategory::Orchestration,
-        summary: "Search installed agents with ranked compact previews and exact manifest recovery hints. Returned count is top-k, not total matches. debug adds bounded ranking/vector diagnostics.",
-        when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results. returned and selection=ranked_top_k describe ranking output rather than total matches. Stable name/version are preserved; descriptions and two pattern examples are bounded with original counts and omission markers. debug opts into bounded source/vector diagnostics. Byte-limited ranked-tail omissions are explicit; expand through get/describe.",
-        example: Some(
-            r#"bro_agent_search(query="review pull request for security issues", limit=3)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bro_agent_dispatch",
-        category: ToolCategory::Orchestration,
-        summary: "Dispatch a registered agent for a focused task. Resolves the brofile, merges filters, validates inputs and starts one bro turn. Custom dispatch adapters are retired and refused. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member).",
-        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Set the session's working directory with `cwd` (canonical; `project_dir` accepted as a deprecated alias). Pass runtime={...} to overlay tier/pool/pin allocation on the standard bro dispatch path. Recursion is manifest-declared: an agent whose manifest sets allow_recursion=true dispatches with the recursive bro_* tools available; there is no per-call override (ad-hoc recursive dispatch is bro_exec's allow_recursion). Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
-        example: Some(
-            r#"bro_agent_dispatch(agent="code-reviewer", cwd="/repo/x", args={"diff": "..."})"#,
-        ),
-    },
     // ── Atoms ───────────────────────────────────────────────────
 
     // ── Whiteboards ─────────────────────────────────────────────

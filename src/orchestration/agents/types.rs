@@ -1,5 +1,4 @@
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,13 +47,10 @@ pub struct AgentManifest {
     #[serde(default = "default_cost_class")]
     pub cost_class: AgentCostClass,
 
-    /// Declares this agent a fan-out orchestrator: dispatch-by-name keeps the
-    /// recursive `bro_*` orchestration/control tools available (skips the
-    /// mechanical recursion guard) and injects the standing orchestrator
-    /// directive. A role property of the agent's design, reviewed at install —
-    /// not a per-call caller decision (`bro_agent_dispatch` deliberately has
-    /// no override param; ad-hoc recursive dispatch is `bro_exec`'s
-    /// `allow_recursion`).
+    /// Declares this agent a fan-out orchestrator that keeps the recursive
+    /// `bro_*` orchestration/control tools. A role property of the agent's
+    /// design, reviewed at install; ad-hoc recursive dispatch is `bro_exec`'s
+    /// `allow_recursion`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_recursion: bool,
 
@@ -232,78 +228,12 @@ impl AgentRef {
     pub fn render(&self) -> String {
         format!("agent:{}@v{}", self.name, self.version)
     }
-
-    pub fn parse(input: &str) -> Option<Self> {
-        let input = input.trim();
-        let rest = input.strip_prefix("agent:")?;
-        if rest.contains(':') {
-            return None;
-        }
-        let (name, version_str) = rest.rsplit_once("@v")?;
-        if name.is_empty() {
-            return None;
-        }
-        let version: u32 = version_str.parse().ok()?;
-        if version == 0 {
-            return None;
-        }
-        Some(Self {
-            name: name.to_string(),
-            version,
-        })
-    }
 }
 
 impl fmt::Display for AgentRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.render())
     }
-}
-
-impl FromStr for AgentRef {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s).ok_or_else(|| format!("invalid agent ref: {s}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AgentSession
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentSession {
-    pub session_id: String,
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_dir: Option<String>,
-    pub agent: AgentRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// BadgeyAgentArgs
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)] // used by tests in same file
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BadgeyAgentArgs {
-    pub prompt: String,
-    pub badgey_id: String,
-}
-
-// ---------------------------------------------------------------------------
-// MergedFilters
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct MergedFilters {
-    #[serde(default)]
-    pub allow: Vec<String>,
-    #[serde(default)]
-    pub disallow: Vec<String>,
 }
 
 impl Default for AgentManifest {
@@ -444,68 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_ref_round_trip() {
+    fn agent_ref_renders_prefixed_version() {
         let r = AgentRef {
             name: "code-reviewer".into(),
             version: 3,
         };
         assert_eq!(r.render(), "agent:code-reviewer@v3");
-        let parsed = AgentRef::parse(&r.render()).unwrap();
-        assert_eq!(parsed, r);
-    }
-
-    #[test]
-    fn agent_ref_parse_rejects_missing_prefix() {
-        assert!(AgentRef::parse("code-reviewer@v3").is_none());
-    }
-
-    #[test]
-    fn agent_ref_parse_rejects_bad_version() {
-        assert!(AgentRef::parse("agent:reviewer@vabc").is_none());
-    }
-
-    #[test]
-    fn agent_ref_parse_rejects_empty_name() {
-        assert!(AgentRef::parse("agent:@v1").is_none());
-    }
-
-    #[test]
-    fn agent_ref_parse_rejects_colon_in_name() {
-        assert!(AgentRef::parse("agent:bad:name@v1").is_none());
-    }
-
-    #[test]
-    fn agent_ref_parse_rejects_version_zero() {
-        assert!(AgentRef::parse("agent:reviewer@v0").is_none());
-    }
-
-    #[test]
-    fn agent_ref_from_str_works() {
-        let r: AgentRef = "agent:foo@v1".parse().unwrap();
-        assert_eq!(r.name, "foo");
-        assert_eq!(r.version, 1);
-    }
-
-    #[test]
-    fn agent_ref_from_str_rejects_invalid() {
-        assert!("bad-ref".parse::<AgentRef>().is_err());
-    }
-
-    #[test]
-    fn agent_session_serde_round_trip() {
-        let session = AgentSession {
-            session_id: "sess-abc123".into(),
-            provider: "claude".into(),
-            project_dir: Some("/repo/project".into()),
-            agent: AgentRef {
-                name: "reviewer".into(),
-                version: 2,
-            },
-            task_id: Some("task-xyz".into()),
-        };
-        let json = serde_json::to_string(&session).unwrap();
-        let parsed: AgentSession = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, session);
+        assert_eq!(r.to_string(), r.render());
     }
 
     #[test]
@@ -552,17 +427,6 @@ mod tests {
         let json = serde_json::json!({});
         let result = serde_json::from_value::<AgentManifest>(json);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn badgey_agent_args_serde_round_trip() {
-        let args = BadgeyAgentArgs {
-            prompt: "Review this code".into(),
-            badgey_id: "badgey-01".into(),
-        };
-        let json = serde_json::to_string(&args).unwrap();
-        let parsed: BadgeyAgentArgs = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, args);
     }
 
     #[test]
@@ -637,74 +501,5 @@ mod tests {
     #[test]
     fn validate_when_to_use_nonempty_accepts_nonempty() {
         assert!(validate_when_to_use_nonempty(&["after writing code".into()]).is_ok());
-    }
-}
-
-impl MergedFilters {
-    pub fn merge(
-        base_allow: &[String],
-        base_disallow: &[String],
-        overlay: Option<&AgentFilterOverlay>,
-    ) -> Self {
-        let (mut allow, mut disallow) = (base_allow.to_vec(), base_disallow.to_vec());
-        if let Some(ov) = overlay {
-            allow.extend_from_slice(&ov.allow);
-            disallow.extend_from_slice(&ov.disallow);
-        }
-        let mut seen_deny = std::collections::HashSet::new();
-        let mut deduped_disallow = Vec::new();
-        for p in &disallow {
-            if seen_deny.insert(p.clone()) {
-                deduped_disallow.push(p.clone());
-            }
-        }
-        let mut deduped_allow = Vec::new();
-        let mut seen_allow = std::collections::HashSet::new();
-        for p in &allow {
-            if seen_deny.contains(p) || !seen_allow.insert(p.clone()) {
-                continue;
-            }
-            deduped_allow.push(p.clone());
-        }
-        Self {
-            allow: deduped_allow,
-            disallow: deduped_disallow,
-        }
-    }
-}
-
-#[cfg(test)]
-mod filter_merge_tests {
-    use super::*;
-    #[test]
-    fn merged_filters_merge_overlay() {
-        let merged = MergedFilters::merge(
-            &["mcp__blackbox__bbox_*".into()],
-            &["mcp__blackbox__bro_*".into()],
-            Some(&AgentFilterOverlay {
-                allow: vec!["mcp__blackbox__bbox_search".into()],
-                disallow: vec!["mcp__blackbox__bbox_forget".into()],
-            }),
-        );
-        assert_eq!(
-            merged.allow,
-            vec![
-                "mcp__blackbox__bbox_*".to_string(),
-                "mcp__blackbox__bbox_search".to_string(),
-            ]
-        );
-        assert_eq!(
-            merged.disallow,
-            vec![
-                "mcp__blackbox__bro_*".to_string(),
-                "mcp__blackbox__bbox_forget".to_string(),
-            ]
-        );
-    }
-    #[test]
-    fn merged_filters_no_overlay() {
-        let merged = MergedFilters::merge(&["a".into()], &["b".into()], None);
-        assert_eq!(merged.allow, vec!["a".to_string()]);
-        assert_eq!(merged.disallow, vec!["b".to_string()]);
     }
 }

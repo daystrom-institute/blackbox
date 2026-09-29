@@ -56,7 +56,6 @@ uses existing atom and rule-packet machinery as an explicit context producer
 5. Let atoms populate template inputs without forcing that material into
    prompt strings (workflow-backed producers deferred — see Context
    Producers).
-6. Fix the current `bro_broadcast` resume inconsistency.
 
 ## Non-Goals
 
@@ -356,13 +355,12 @@ Producer failure policy is **per-turn opt-in**, default render-without:
   *external* side effect (provider launch, `dispatch.template_resolved`
   system event emission, task-store insertion). The resume-lease table
   is a special case: current `bro_resume` acquires the lease before
-  building args (`src/tools/dispatch.rs:517`), and broadcast resume does
-  the same (`src/tools/dispatch.rs:1155`). Moving lease acquisition
+  building args (`src/tools/dispatch.rs:517`). Moving lease acquisition
   after producer success would let two concurrent resumes both run
   producers before one wins the lease — a wasted-work race. v1 keeps
   lease-first, then producer, then render, then external side effects:
 
-  1. Acquire resume lease (for `bro_resume` / broadcast resume).
+  1. Acquire resume lease (for `bro_resume`).
   2. Run producer.
   3. On `on_failure: fail` producer failure, **release the lease** and
      return `error.context_producer_failed`. The session's existing
@@ -677,20 +675,6 @@ v1; if workflow-specific context should influence rendering, the bounded
 
 Deterministic and adapter atoms do not use provider prompt templates.
 
-## Broadcast Resume Fix
-
-Current `bro_broadcast` fresh member dispatch applies ambient + lens, but
-resumed members receive the raw prompt. That differs from normal `bro_resume`,
-which reapplies ambient.
-
-With brofile templates:
-
-- fresh broadcast member uses the member brofile's first-turn template.
-- resumed broadcast member uses the member brofile's resume-turn template.
-
-This makes broadcast consistent with ordinary exec/resume while still allowing a
-minimal resume template such as `{{ prompt }}`.
-
 ## Dry Run
 
 Add:
@@ -752,8 +736,8 @@ Dry-run is non-dispatching and non-mutating end-to-end under
   mode; the flag is informational, not policy.
 
 The non-dispatching dry-run path also does not call `bro_exec`,
-`bro_resume`, `bro_broadcast`, or any other dispatch tool — the
-non-dispatching property is part of the contract, not just a behavior.
+`bro_resume`, or any other dispatch tool; the non-dispatching property is
+part of the contract, not just a behavior.
 
 Brofile validation that needs to exercise caps and failure paths should
 use `producers: "run"`. Routine "what would this look like" inspection
@@ -839,13 +823,12 @@ entry; resolution does not depend on filesystem layout alone.
 
 ### Phase 3: Dispatch Integration
 
-- Route `bro_exec`, `bro_resume`, and `bro_broadcast` through brofile templates.
+- Route `bro_exec` and `bro_resume` through brofile templates.
 - Route profile-backed atom dispatch through the target brofile template.
 - Route workflow executor/ensemble dispatch through actor brofile templates.
-- Fix broadcast resume inconsistency as part of this integration.
 - Add a regression test asserting that recursion-guard filters from
   `resolve_dispatch_filters` appear in argv for both fresh and resumed
-  broadcast members. The textual ambient layer moving into a template must
+  dispatches. The textual ambient layer moving into a template must
   not silently lift the mechanical guard.
 - Emit a `dispatch.template_resolved` system event per turn carrying brofile
   name/version, template ref/hash, and producer ref/version, so brofile
@@ -864,8 +847,8 @@ byte-equivalent (Phase 1 regression). Phase 4 then:
   deleted.
 - Deletes the `apply_ambient` / `apply_brofile_lens` Rust helpers from
   `src/orchestration/mod.rs` and removes their last call sites in
-  `src/tools/dispatch.rs` (`build_exec_prompt`, the broadcast assembler,
-  and the `bro_resume` wrap call).
+  `src/tools/dispatch.rs` (`build_exec_prompt` and the `bro_resume` wrap
+  call).
 - Removes the constants the helpers fed on (`RECALL_DIRECTIVE`,
   `TASK_SHAPE_HINT`, `ORCHESTRATOR_HINT`, `WORKSPACE_TOOLS_APPENDIX`,
   `DEFAULT_COMPLETION_CONTRACT`) or moves them into the builtin template
@@ -873,7 +856,7 @@ byte-equivalent (Phase 1 regression). Phase 4 then:
 - Adds the remaining regression suite: minimal drone rendering, resume
   template rendering, context-producer invocation with both `on_failure`
   modes, cap drop-then-warn paths, provider-default suppression warnings,
-  and broadcast fresh/resume consistency.
+  and fresh/resume consistency.
 
 ## Consensus Defaults
 

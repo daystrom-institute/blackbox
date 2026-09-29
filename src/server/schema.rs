@@ -127,7 +127,6 @@ impl BlackboxServer {
                     orchestration::agents::types::AgentCostClass::Normal => "normal",
                     orchestration::agents::types::AgentCostClass::Expensive => "expensive",
                 };
-                let example = format!("bro_agent_dispatch(agent=\"{}\", args={{...}})", s.name);
                 Some(mcp_tools::describe_schema::AgentSchemaEntry {
                     name: s.name,
                     version: s.version,
@@ -136,7 +135,6 @@ impl BlackboxServer {
                     anti_patterns: manifest.anti_patterns,
                     cost_class: cost_str.to_string(),
                     dispatch_adapter: manifest.dispatch_adapter,
-                    example_invocation: example,
                 })
             })
             .collect()
