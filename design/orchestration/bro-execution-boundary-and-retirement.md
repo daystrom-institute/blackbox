@@ -110,19 +110,8 @@ further consolidation or required primitive additions. It is a reduction target,
 not a claim that 82 tools are already gone or that all 108 survivors are approved
 unchanged. Broad families with action parameters still need action-level review.
 
-Validate the source inventory with:
-
-```sh
-python3 scripts/check-orchestration-retirement-map.py
-```
-
-During surgery, `--mode progress` allows mapped retired tools to disappear but
-rejects unmapped tools or missing survivors. At final closeout, `--mode target`
-also requires every retired tool to be absent. Deliberate scope/name changes
-must update the map and its rationale in the same commit.
-The checker recognizes explicit Rust tool attributes, including reordered
-arguments, and ignores comments/literal examples. It does not expand macros or
-replace compiled-router and deployed-catalog verification.
+The surviving catalog and its dispositions are maintained in
+[mcp-shedding-plan.md](../surfaces/mcp/mcp-shedding-plan.md).
 
 ## Keep, remove, extract
 

@@ -7,10 +7,6 @@
 {"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-99e7a909","properties":{}}
 {"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-ab3ef97f","properties":{}}
 {"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-85c45849","properties":{}}
-{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-ef78d005","properties":{}}
-{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-718d5b26","properties":{}}
-{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-f9f68f7c","properties":{}}
-{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-311023fd","properties":{}}
 {"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-5ec87592","properties":{}}
 {"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-9d84f24f","properties":{}}
 {"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-9d0f9159","properties":{}}
@@ -32,14 +28,6 @@
 {"from":"concept/file-virtual-entity","type":"dsg:SOURCED_FROM","to":"gap/gap-ab3ef97f","properties":{"note":"pulled from the gap log"}}
 {"from":"inquiry/rerank-stage-vs-per-turn-scoring","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
 {"from":"inquiry/rerank-stage-vs-per-turn-scoring","type":"dsg:SOURCED_FROM","to":"gap/gap-85c45849","properties":{"note":"pulled from the gap log"}}
-{"from":"inquiry/provenance-backfill-on-reindex","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
-{"from":"inquiry/provenance-backfill-on-reindex","type":"dsg:SOURCED_FROM","to":"gap/gap-ef78d005","properties":{"note":"pulled from the gap log"}}
-{"from":"concept/arc-produced-commit-edge","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
-{"from":"concept/arc-produced-commit-edge","type":"dsg:SOURCED_FROM","to":"gap/gap-718d5b26","properties":{"note":"pulled from the gap log"}}
-{"from":"inquiry/git-notes-sync-automation","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
-{"from":"inquiry/git-notes-sync-automation","type":"dsg:SOURCED_FROM","to":"gap/gap-f9f68f7c","properties":{"note":"pulled from the gap log"}}
-{"from":"inquiry/generic-anchor-index","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
-{"from":"inquiry/generic-anchor-index","type":"dsg:SOURCED_FROM","to":"gap/gap-311023fd","properties":{"note":"pulled from the gap log"}}
 {"from":"inquiry/audit-sets-as-ci-gate","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}
 {"from":"inquiry/audit-sets-as-ci-gate","type":"dsg:SOURCED_FROM","to":"gap/gap-5ec87592","properties":{"note":"pulled from the gap log"}}
 {"from":"inquiry/probe-team-remaining-shapes","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}

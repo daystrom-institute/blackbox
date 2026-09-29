@@ -51,21 +51,13 @@ impl InspectableEntityProvider for BrofileProvider {
         schema(
             self.entity_type(),
             &["name", "provider", "model", "effort"],
-            &[
-                "SESSION_USED_BROFILE",
-                "ARC_USED_BROFILE",
-                "BOARD_REGISTERED_AGENT",
-            ],
+            &["SESSION_USED_BROFILE"],
             &["name", "provider"],
         )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("SESSION_USED_BROFILE", false),
-            expected("ARC_USED_BROFILE", false),
-            expected("BOARD_REGISTERED_AGENT", false),
-        ]
+        vec![expected("SESSION_USED_BROFILE", false)]
     }
 
     fn recommended_next_hops(
@@ -73,14 +65,7 @@ impl InspectableEntityProvider for BrofileProvider {
         _entity: &EntityView,
         full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop> {
-        next_hops(
-            full_neighborhood,
-            &[
-                "SESSION_USED_BROFILE",
-                "ARC_USED_BROFILE",
-                "BOARD_REGISTERED_AGENT",
-            ],
-        )
+        next_hops(full_neighborhood, &["SESSION_USED_BROFILE"])
     }
 
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

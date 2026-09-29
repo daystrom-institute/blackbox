@@ -107,7 +107,6 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     match category {
         ToolCategory::Gaps => Some("sm-gap-notes"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
-        ToolCategory::StorageHealth => Some("sm-storage-health"),
         ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
         _ => None,
     }
@@ -216,7 +215,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Follow edge_page.next_cursor for more edges; property retrieves exact text in pages.",
         when_to_use: "Use after search to verify a ref and inspect relevant relations. Select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Edges page at 100 maximum; follow edge_page.next_cursor as edge_cursor with the same selection. Read a property key from properties or property_projection.omitted_keys with property=<key>; body.next_cursor continues via property_cursor. property_limit is 4..4096 UTF-8 bytes, default 4096. Cursors reject changed selections or source revisions. Full/property reads recover stored provider values; *_preview fields do not expand upstream content. Commit content is the indexed message; evidence.content_completeness marks ingestion truncation. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
         example: Some(
-            r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
+            r#"bbox_inspect_entity(entity_ref="thread:thread-abc12345", edge_types="THREAD_SPAWNED_FROM,THREAD_BLOCKED_BY", direction="both")"#,
         ),
     },
     ToolDoc {

@@ -82,11 +82,6 @@ fn edge_families() -> Vec<serde_json::Value> {
             "Use AST edges for symbol callers/callees, implementation sites, and code navigation.",
         ),
         family(
-            "Knowledge",
-            &["KNOWLEDGE_FROM_SESSION", "KNOWLEDGE_FROM_BOARD"],
-            "Use knowledge edges to move from an entry back to the session or board it came from.",
-        ),
-        family(
             "Provenance",
             &[
                 "TASK_PRODUCED_NOTE",
@@ -94,8 +89,6 @@ fn edge_families() -> Vec<serde_json::Value> {
                 "NOTE_IN_THREAD",
                 "NOTE_FROM_TASK",
                 "SESSION_USED_BROFILE",
-                "ARC_USED_BROFILE",
-                "ARC_OPENED_BOARD",
             ],
             "Use provenance edges to move from artifacts back to sessions, threads, notes, and brofiles.",
         ),

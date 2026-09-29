@@ -1,7 +1,7 @@
 ---
 title: "Ops Artifact Bundles And Doctor - Implementation Plan"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - operations

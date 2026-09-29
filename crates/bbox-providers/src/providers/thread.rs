@@ -115,9 +115,6 @@ impl InspectableEntityProvider for ThreadProvider {
                 "THREAD_BLOCKED_BY",
                 "THREAD_RELATES_TO",
                 "THREAD_SUBSUMES",
-                "ARC_USED_BROFILE",
-                "ARC_OPENED_BOARD",
-                "ARC_PRODUCED_COMMIT",
                 "NOTE_IN_THREAD",
             ],
             &["kind", "status", "project"],
@@ -131,9 +128,6 @@ impl InspectableEntityProvider for ThreadProvider {
             expected("THREAD_BLOCKED_BY", false),
             expected("THREAD_RELATES_TO", false),
             expected("THREAD_SUBSUMES", false),
-            expected("ARC_USED_BROFILE", false),
-            expected("ARC_OPENED_BOARD", false),
-            expected("ARC_PRODUCED_COMMIT", false),
             expected("NOTE_IN_THREAD", false),
         ]
     }
@@ -151,9 +145,6 @@ impl InspectableEntityProvider for ThreadProvider {
                 "THREAD_BLOCKED_BY",
                 "THREAD_RELATES_TO",
                 "THREAD_SUBSUMES",
-                "ARC_USED_BROFILE",
-                "ARC_OPENED_BOARD",
-                "ARC_PRODUCED_COMMIT",
                 "NOTE_IN_THREAD",
             ],
         )

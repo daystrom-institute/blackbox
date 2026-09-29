@@ -47,26 +47,14 @@ impl InspectableEntityProvider for KnowledgeProvider {
     fn schema(&self) -> EntitySchemaView {
         schema(
             self.entity_type(),
-            &["id", "title", "category", "scope", "status", "approval"],
-            &[
-                "SUPERSEDES",
-                "DERIVED_FROM",
-                "Contradicts",
-                "KNOWLEDGE_FROM_SESSION",
-                "KNOWLEDGE_FROM_BOARD",
-            ],
-            &["project", "category", "scope", "status"],
+            &["id", "title", "category", "scope"],
+            &[],
+            &["project", "category", "scope"],
         )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("SUPERSEDES", false),
-            expected("DERIVED_FROM", false),
-            expected("Contradicts", false),
-            expected("KNOWLEDGE_FROM_SESSION", false),
-            expected("KNOWLEDGE_FROM_BOARD", false),
-        ]
+        Vec::new()
     }
 
     fn recommended_next_hops(
@@ -74,16 +62,7 @@ impl InspectableEntityProvider for KnowledgeProvider {
         _entity: &EntityView,
         full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop> {
-        next_hops(
-            full_neighborhood,
-            &[
-                "SUPERSEDES",
-                "DERIVED_FROM",
-                "Contradicts",
-                "KNOWLEDGE_FROM_SESSION",
-                "KNOWLEDGE_FROM_BOARD",
-            ],
-        )
+        next_hops(full_neighborhood, &[])
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

@@ -96,7 +96,7 @@ impl McpClient {
 
     /// Connect to a named MCP surface (`/mcp?surface=<name>`). The daemon
     /// projects a filtered tool catalog per surface; the anonymous `default`
-    /// surface hides operator tools such as `bbox_render`.
+    /// surface hides operator tools such as `bbox_doctor`.
     pub(crate) async fn connect_surface(base_url: &str, surface: &str) -> anyhow::Result<Self> {
         Self::connect_with_initialization_headers(base_url, None, Some(surface), HeaderMap::new())
             .await

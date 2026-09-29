@@ -1,7 +1,7 @@
 ---
 title: "Ops Artifact Bundles And Doctor"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - operations
